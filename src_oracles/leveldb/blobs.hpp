@@ -18,7 +18,7 @@
 #include "ustore/utilities/algorithm.hpp" // `reservoir_sample_iterator`
 
 #include "database.hpp"           // `database_t`, `resolve_collections`, `collection_walk_t`, `get_each`, `write_many`
-#include "utilities/batches.hpp"  // `strings_arg_t`, `validate_write`, `places_of`
+#include "utilities/batches.hpp"  // `strings_arg`, `validate_write`, `places_of`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -27,7 +27,7 @@ namespace unum::ustore::oracles::leveldb {
 #pragma region Reads and Writes
 
 status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const& values, view_t const& view) {
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     place_batch_t const places = places_of(arguments);
 
     status_t const validated = validate_write(view.transaction, places, values, arguments.durability, view.watch);
@@ -42,7 +42,7 @@ status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const&
 }
 
 status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view) {
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     place_batch_t const places = places_of(arguments);
 
     status_t const validated = validate_remove(view.transaction, places, arguments.durability, view.watch);
@@ -62,7 +62,7 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
 status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
     if (!arguments.count) return {};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     place_batch_t const places = places_of(arguments);
 
     if (status_t const status = validate_read(places); status.failed()) return status;
@@ -88,7 +88,7 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
 }
 
 status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) {
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     scan_batch_t const scans {collections, strided(arguments.start_keys), arguments.wanted, arguments.count};
 
@@ -126,7 +126,7 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
     if (!arguments.offsets || !arguments.keys)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     sample_batch_t const samples {collections, arguments.wanted, arguments.count};
     status_t const resolved = resolve_collections(database, collections, arguments.count,
@@ -155,7 +155,7 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
 
 status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const&) {
     if (!arguments.count) return {};
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
     strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);

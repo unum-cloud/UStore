@@ -294,7 +294,7 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     if (arguments.edges_per_vertex && !arguments.edges_offsets)
         return {status_code_t::invalid_argument_k, "Need an output for the offsets of the edges"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, count, ustore_modality_graph_k);
         resolved.failed())
         return resolved;
@@ -367,7 +367,7 @@ status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t c
         return valid;
     if (!arguments.sources.data || !arguments.targets.data)
         return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), arguments.count,
                                                ustore_modality_graph_k);
         resolved.failed())
@@ -402,7 +402,7 @@ status_t graph_remove_edges(ustore_graph_remove_edges_t const& arguments, view_t
         return valid;
     if (!arguments.sources.data || !arguments.targets.data)
         return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), arguments.count,
                                                ustore_modality_graph_k);
         resolved.failed())
@@ -437,7 +437,7 @@ status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, vi
         return valid;
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_graph_k);
         resolved.failed())
         return resolved;
@@ -470,7 +470,7 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
     std::size_t const count = arguments.count;
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, count, ustore_modality_graph_k);
         resolved.failed())
         return resolved;

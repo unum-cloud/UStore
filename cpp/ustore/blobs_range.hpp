@@ -27,92 +27,151 @@ struct blobs_page_t {
     sz::strings_view_t values {strings_of({}, 0)};
 };
 
+/** What a scan or a cursor narrows its keys by, each part zeroed to keep every key: patterns over the values of blobs
+ *  and strings, a JSONPath or XPath filter over documents and pages, and a predicate over the keys. */
+struct match_t {
+    ustore_patterns_t patterns {};
+    ustore_bytes_view_t filter {};
+    ustore_predicate_t predicate {};
+};
+
+/** The predicate the ABI asks through @p callable, called as `callable(keys, admissions)` over spans once per page,
+ *  at @p cost; @p callable must outlive the scan or the cursor given it. */
+template <typename callable_type_>
+ustore_predicate_t predicate_of(callable_type_& callable,
+                                ustore_predicate_cost_t cost = ustore_predicate_cheap_k) noexcept {
+    auto const trampoline = [](ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count,
+                               void* state) {
+        std::size_t const size = static_cast<std::size_t>(count);
+        (*static_cast<callable_type_*>(state))(std::span<ustore_key_t const> {keys, size},
+                                               std::span<ustore_admission_t> {admissions, size});
+    };
+    return {trampoline, &callable, cost};
+}
+
+/** Copies what @p match narrows by into the arguments @p call takes, as far as they take each part. */
+template <typename call_type_>
+void narrow(call_type_& call, match_t const& match) noexcept {
+    if constexpr (requires { call.patterns; }) call.patterns = match.patterns;
+    if constexpr (requires { call.filter; }) call.filter = match.filter;
+    call.predicate = match.predicate;
+}
+
 /**
  *  @brief Owns a walk over the keys of one collection from its open until its destruction, which every pull resumes
  *      past the last key the pull before it handed out, at the view its receiver read at the open.
  *
  *  The explicit form of the streams below: every pull takes the caller's arena, which holds the page until its next
- *  call, so a binding hands the cursor any arena it keeps. It moves but never copies.
+ *  call, so a binding hands the cursor any arena it keeps. It moves but never copies. One template serves the cursors
+ *  of blobs, documents, pages and graph vertices, each spelled by its C handle and calls.
  */
-class blobs_cursor_t {
+template <typename handle_type_, typename init_type_, typename next_type_, void (*init_)(init_type_*),
+          void (*next_)(next_type_*), void (*free_)(handle_type_)>
+class keys_cursor {
 
     receiver_t receiver_ {};
-    ustore_blobs_cursor_t cursor_ = nullptr;
+    handle_type_ cursor_ = nullptr;
 
-    blobs_cursor_t(receiver_t receiver, ustore_blobs_cursor_t cursor) noexcept : receiver_(receiver), cursor_(cursor) {}
+    keys_cursor(receiver_t receiver, handle_type_ cursor) noexcept : receiver_(receiver), cursor_(cursor) {}
 
-    /** Pulls up to @p wanted keys into @p arena, with their values into @p values unless it is null. */
-    expected<std::span<ustore_key_t const>> pull_(std::size_t wanted, arena_t& arena,
-                                                  ustore_strings_view_t* values) noexcept {
+    /** Pulls up to @p wanted keys into @p arena, with their values into @p values unless it is null, the other fields
+     *  of @p next taken as they are. */
+    expected<std::span<ustore_key_t const>> pull_(std::size_t wanted, arena_t& arena, ustore_strings_view_t* values,
+                                                  next_type_ next) noexcept {
         ustore_key_t const* keys = nullptr;
         ustore_size_t written = 0;
         ustore_outcome_t outcome {};
-        ustore_blobs_cursor_next_t next {};
         next.database = receiver_.database;
         next.executor = receiver_.executor;
         next.outcome = &outcome;
         next.cursor = cursor_;
         next.keys = &keys;
-        next.values = values;
+        if constexpr (requires { next.values; }) next.values = values;
         next.written = &written;
         next.arena = arena;
         next.wanted = wanted;
-        ustore_blobs_cursor_next(&next);
+        next_(&next);
         if (status_t const status {outcome}; status.failed()) return status;
         return std::span<ustore_key_t const> {keys, static_cast<std::size_t>(written)};
     }
 
   public:
-    blobs_cursor_t() noexcept = default;
-    blobs_cursor_t(blobs_cursor_t const&) = delete;
-    blobs_cursor_t& operator=(blobs_cursor_t const&) = delete;
-    ~blobs_cursor_t() noexcept { ustore_blobs_cursor_free(cursor_); }
+    keys_cursor() noexcept = default;
+    keys_cursor(keys_cursor const&) = delete;
+    keys_cursor& operator=(keys_cursor const&) = delete;
+    ~keys_cursor() noexcept { free_(cursor_); }
 
-    blobs_cursor_t(blobs_cursor_t&& other) noexcept
+    keys_cursor(keys_cursor&& other) noexcept
         : receiver_(other.receiver_), cursor_(std::exchange(other.cursor_, nullptr)) {}
 
-    blobs_cursor_t& operator=(blobs_cursor_t&& other) noexcept {
+    keys_cursor& operator=(keys_cursor&& other) noexcept {
         std::swap(receiver_, other.receiver_);
         std::swap(cursor_, other.cursor_);
         return *this;
     }
 
-    /** Opens a walk over the keys of @p collection from @p start, at the view @p receiver reads. */
-    static expected<blobs_cursor_t> make(receiver_t receiver, ustore_collection_id_t collection,
-                                         ustore_key_t start = smallest_key_k) noexcept {
-        ustore_blobs_cursor_t cursor = nullptr;
+    /** Opens a walk over the keys of @p collection from @p start, at the view @p receiver reads, keeping the keys
+     *  @p match admits, compiled once here. */
+    static expected<keys_cursor> make(receiver_t receiver, ustore_collection_id_t collection,
+                                      ustore_key_t start = smallest_key_k, match_t const& match = {}) noexcept {
+        handle_type_ cursor = nullptr;
         ustore_outcome_t outcome {};
-        ustore_blobs_cursor_init_t init {.cursor = &cursor,
-                                         .database = receiver.database,
-                                         .outcome = &outcome,
-                                         .view = receiver.view(ustore_watch_keys_k),
-                                         .collection = collection,
-                                         .start_key = start};
-        ustore_blobs_cursor_init(&init);
+        init_type_ init {};
+        init.cursor = &cursor;
+        init.database = receiver.database;
+        init.executor = receiver.executor;
+        init.outcome = &outcome;
+        init.view = receiver.view(ustore_watch_keys_k);
+        init.collection = collection;
+        init.start_key = start;
+        narrow(init, match);
+        init_(&init);
         if (status_t const status {outcome}; status.failed()) return status;
-        return blobs_cursor_t {receiver, cursor};
+        return keys_cursor {receiver, cursor};
     }
 
     /** Pulls up to @p wanted keys into @p arena, fewer once the walk nears its end and none past it. */
     expected<std::span<ustore_key_t const>> next(std::size_t wanted, arena_t& arena) noexcept {
-        return pull_(wanted, arena, nullptr);
+        return pull_(wanted, arena, nullptr, {});
     }
 
-    /** Pulls up to @p wanted keys with their values into @p arena in one call. */
-    expected<blobs_page_t> next_pairs(std::size_t wanted, arena_t& arena) noexcept {
+    /** Pulls up to @p wanted keys with their values into @p arena in one call, the other fields of @p options, such as
+     *  the encoding pages render in, taken as they are. */
+    expected<blobs_page_t> next_pairs(std::size_t wanted, arena_t& arena, next_type_ options = {}) noexcept
+        requires requires(next_type_ next) { next.values; }
+    {
         ustore_strings_view_t values {};
-        auto [keys, status] = pull_(wanted, arena, &values);
+        auto [keys, status] = pull_(wanted, arena, &values, options);
         if (status.failed()) return status;
         return blobs_page_t {keys, strings_of(values, keys.size())};
     }
 };
 
+/** A walk over the keys of one blobs collection. */
+using blobs_cursor_t = keys_cursor<ustore_blobs_cursor_t, ustore_blobs_cursor_init_t, ustore_blobs_cursor_next_t,
+                                   &ustore_blobs_cursor_init, &ustore_blobs_cursor_next, &ustore_blobs_cursor_free>;
+
+/** A walk over the keys of one documents collection, whose pairs are whole documents. */
+using docs_cursor_t = keys_cursor<ustore_docs_cursor_t, ustore_docs_cursor_init_t, ustore_docs_cursor_next_t,
+                                  &ustore_docs_cursor_init, &ustore_docs_cursor_next, &ustore_docs_cursor_free>;
+
+/** A walk over the keys of one pages collection, whose pairs are pages rendered as their options name. */
+using pages_cursor_t = keys_cursor<ustore_pages_cursor_t, ustore_pages_cursor_init_t, ustore_pages_cursor_next_t,
+                                   &ustore_pages_cursor_init, &ustore_pages_cursor_next, &ustore_pages_cursor_free>;
+
+/** A walk over the vertices of one graph collection, which pulls keys alone. */
+using graph_vertices_cursor_t = keys_cursor<ustore_graph_vertices_cursor_t, ustore_graph_vertices_cursor_init_t,
+                                            ustore_graph_vertices_cursor_next_t, &ustore_graph_vertices_cursor_init,
+                                            &ustore_graph_vertices_cursor_next, &ustore_graph_vertices_cursor_free>;
+
 /** Scans up to @p wanted keys of @p collection from @p start into @p arena through @p scan_, the scan of one modality
- *  keyed by UUIDs, at the view @p receiver reads. */
+ *  keyed by UUIDs, at the view @p receiver reads, keeping the keys @p match admits, and writing one BM25 score per key
+ *  into @p scores when it is not null and the patterns carry weights. */
 template <typename scan_type_, void (*scan_)(scan_type_*)>
 expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, ustore_collection_id_t collection,
-                                                          ustore_key_t start, std::size_t wanted,
-                                                          arena_t& arena) noexcept {
+                                                          ustore_key_t start, std::size_t wanted, arena_t& arena,
+                                                          match_t const& match = {},
+                                                          float const** scores = nullptr) noexcept {
     ustore_length_t const* offsets = nullptr;
     ustore_key_t const* keys = nullptr;
     ustore_outcome_t outcome {};
@@ -128,6 +187,8 @@ expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, u
     scan.keys = &keys;
     scan.arena = arena;
     scan.wanted = wanted;
+    narrow(scan, match);
+    if constexpr (requires { scan.scores; }) scan.scores = scores;
     scan_(&scan);
     if (status_t const status {outcome}; status.failed()) return status;
     if (!offsets) return std::span<ustore_key_t const> {};

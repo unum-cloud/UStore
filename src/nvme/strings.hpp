@@ -48,7 +48,7 @@ template <cpu_class_t cpu_class_, typename arguments_type_>
 status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t const& texts,
                              strided_iterator<ustore_key_t const> values, view_t const& view) noexcept {
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;
@@ -87,7 +87,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;
@@ -115,7 +115,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     if (!arguments.offsets || !arguments.strings)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;

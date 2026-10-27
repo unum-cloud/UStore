@@ -100,8 +100,8 @@ using namespace unum::ustore::ram;
 
 #pragma region C ABI
 
-void ustore_database_init_ram(ustore_database_init_ram_t* arguments) { route_init(arguments, &init); }
+void ustore_database_init_ram(ustore_database_init_ram_t* arguments) { route_init<&init>(arguments); }
 
-void ustore_database_open_ram(ustore_database_open_ram_t* arguments) { route_init(arguments, &open); }
+void ustore_database_open_ram(ustore_database_open_ram_t* arguments) { route_init<&ram::open>(arguments); }
 
 #pragma endregion C ABI

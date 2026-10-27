@@ -40,7 +40,7 @@ inline constexpr page_fold_t pages_fold_k {};
  *  answers, called as `edits()`, in one transaction, the caller's or one of their own flushed when the call asks. */
 template <cpu_class_t cpu_class_, typename arguments_type_, typename edits_type_>
 status_t commit_page_edits(arguments_type_ const& arguments, view_t const& view, edits_type_&& edits) noexcept {
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), arguments.count,
                                                ustore_modality_pages_k);
         resolved.failed())

@@ -38,7 +38,8 @@
 #include "blobs_layers/docs.hpp"  // `docs_write_over_blobs`, `docs_read_over_blobs`, `docs_gist_over_blobs`
 #include "blobs_layers/graph.hpp" // `graph_read_edges_over_blobs`, `graph_write_edges_over_blobs`
 #include "blobs_layers/pages.hpp" // `pages_import_over_blobs`, `pages_read_over_blobs`
-#include "engine.hpp"             // `engine_t`, `guarded`, `route_init`, `remove_over_blobs`, `scan_over_blobs`
+#include "engine.hpp"             // `engine_t`, `guarded`, `remove_over_blobs`, `scan_over_blobs`
+#include "lib.hpp"                // `route_init`
 
 #include "database.hpp" // `database_open`, `database_describe`, `collection_create`, `snapshot_init`
 #include "blobs.hpp"    // `blobs_write`, `blobs_remove`, `blobs_read`, `blobs_scan`, `blobs_sample`
@@ -62,7 +63,7 @@ database_verbs_t const database_verbs_k {
 };
 
 /** The unchecked whole-value verbs of every collection keyed by UUIDs, which the layers over blobs reach. */
-constexpr blobs_verbs_t values_verbs_k {
+constexpr blobs_verbs<home_t::host_k> values_verbs_k {
     .write = &guarded<&blobs_write>,
     .remove = &guarded<&blobs_remove>,
     .read = &guarded<&blobs_read>,
@@ -72,7 +73,7 @@ constexpr blobs_verbs_t values_verbs_k {
 };
 
 /** The verbs of this engine's blobs collections. */
-blobs_verbs_t const blobs_verbs_k {
+blobs_verbs<home_t::host_k> const blobs_verbs_k {
     .write = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.write>,
     .remove = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.remove>,
     .read = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.read>,
@@ -82,7 +83,7 @@ blobs_verbs_t const blobs_verbs_k {
 };
 
 /** The verbs of this engine's strings collections. */
-strings_verbs_t const strings_verbs_k {
+strings_verbs<home_t::host_k> const strings_verbs_k {
     .write = &guarded<&strings_write>,
     .remove = &guarded<&strings_remove>,
     .read = &guarded<&strings_read>,
@@ -90,7 +91,7 @@ strings_verbs_t const strings_verbs_k {
 };
 
 /** The verbs of this engine's documents collections. */
-docs_verbs_t const docs_verbs_k {
+docs_verbs<home_t::host_k> const docs_verbs_k {
     .write = &docs_write_over_blobs<values_verbs_k, &resolve_modality>,
     .read = &docs_read_over_blobs<values_verbs_k, &resolve_modality>,
     .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality>,
@@ -101,7 +102,7 @@ docs_verbs_t const docs_verbs_k {
 };
 
 /** The verbs of this engine's graph collections. */
-graph_verbs_t const graph_verbs_k {
+graph_verbs<home_t::host_k> const graph_verbs_k {
     .read_edges = &graph_read_edges_over_blobs<values_verbs_k, &resolve_modality>,
     .write_edges = &graph_write_edges_over_blobs<values_verbs_k, &resolve_modality>,
     .remove_edges = &graph_remove_edges_over_blobs<values_verbs_k, &resolve_modality>,
@@ -111,7 +112,7 @@ graph_verbs_t const graph_verbs_k {
 };
 
 /** The verbs of this engine's pages collections. */
-pages_verbs_t const pages_verbs_k {
+pages_verbs<home_t::host_k> const pages_verbs_k {
     .import = &pages_import_over_blobs<values_verbs_k, &resolve_modality>,
     .insert = &pages_insert_over_blobs<values_verbs_k, &resolve_modality>,
     .remove = &pages_remove_over_blobs<values_verbs_k, &resolve_modality>,
@@ -125,11 +126,11 @@ pages_verbs_t const pages_verbs_k {
 
 engine_t const engine_k {
     .database = &database_verbs_k,
-    .blobs = &blobs_verbs_k,
-    .strings = &strings_verbs_k,
-    .docs = &docs_verbs_k,
-    .graph = &graph_verbs_k,
-    .pages = &pages_verbs_k,
+    .host = {.blobs = &blobs_verbs_k,
+             .strings = &strings_verbs_k,
+             .docs = &docs_verbs_k,
+             .graph = &graph_verbs_k,
+             .pages = &pages_verbs_k},
 };
 
 } // namespace unum::ustore::oracles::leveldb
@@ -138,5 +139,5 @@ using namespace unum::ustore;
 using namespace unum::ustore::oracles::leveldb;
 
 void ustore_database_open_leveldb(ustore_database_open_leveldb_t* arguments) {
-    route_init(arguments, &guarded<&database_open, ustore_database_open_leveldb_t, view_t>);
+    route_init<&guarded<&database_open, ustore_database_open_leveldb_t, view_t>>(arguments);
 }

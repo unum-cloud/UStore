@@ -21,7 +21,7 @@
 #include "ustore/ranges.hpp" // `strided`, `strided_iterator`
 
 #include "database.hpp"           // `database_t`, `transaction_t`, `refuse_collections`, `buffer_write`, `watch`
-#include "utilities/batches.hpp"  // `strings_arg_t`
+#include "utilities/batches.hpp"  // `strings_arg`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -34,8 +34,8 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
     strided_iterator<ustore_key_t const> const values = strided(arguments.values);
     if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their values"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
-    transaction_t* const transaction = handle_cast<transaction_t>(view.transaction);
+    database_t& database = *state_of<database_t>(arguments.database);
+    transaction_t* const transaction = state_of<transaction_t>(view.transaction);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
 
     std::shared_lock lock {database.columns_mutex};
@@ -62,8 +62,8 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
-    transaction_t* const transaction = handle_cast<transaction_t>(view.transaction);
+    database_t& database = *state_of<database_t>(arguments.database);
+    transaction_t* const transaction = state_of<transaction_t>(view.transaction);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
 
     std::shared_lock lock {database.columns_mutex};
@@ -89,7 +89,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     ::rocksdb::ReadOptions read_options;
     transaction_t* const transaction = reading_transaction(view, read_options);
     if (status_t const status = refuse_staged_watch(transaction, view.watch); status.failed()) return status;
@@ -136,7 +136,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     if (!arguments.offsets || !arguments.strings)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     ::rocksdb::ReadOptions read_options;
     read_options.fill_cache = false;
     transaction_t* const transaction = reading_transaction(view, read_options);

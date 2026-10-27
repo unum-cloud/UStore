@@ -2,11 +2,12 @@
  *  @file include/ustore/utilities/vram_nvidia_device.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
- *  @brief CUDA devices from the host: specifications, memory, NUMA placement, streams, events and buffers.
+ *  @brief CUDA devices from the host: specifications, memory, NUMA placement, streams, events, buffers and the
+ *      executor calls on one device queue through.
  *
  *  Host code over the CUDA runtime API with no kernels, so it compiles under a host compiler whenever the
- *  toolkit's headers are on the include path, and to nothing without them. Nothing here throws or keeps
- *  global state: devices enumerate into a table the caller owns.
+ *  toolkit's headers are on the include path, and to nothing without them but an executor type a build without
+ *  CUDA never spawns. Nothing here throws or keeps global state: devices enumerate into a table the caller owns.
  */
 
 #pragma once
@@ -17,6 +18,7 @@
 #include <cstdlib> // `std::strtol`
 
 #include <limits>      // `std::numeric_limits`
+#include <optional>    // `std::optional`
 #include <type_traits> // `std::true_type`
 #include <utility>     // `std::exchange`, `std::move`
 
@@ -29,9 +31,9 @@
 #include "ustore/utilities/ram_device.hpp"
 #endif
 
-#if __has_include(<cuda_runtime.h>)
-
 namespace unum::ustore::utilities {
+
+#if __has_include(<cuda_runtime.h>)
 
 #pragma region Devices
 
@@ -653,6 +655,76 @@ using cuda_pinned_buffer = cuda_buffer<element_type_, cuda_pinned_allocator<elem
 
 #pragma endregion Memory
 
-} // namespace unum::ustore::utilities
+#endif
+
+#pragma region Executors
+
+#if USTORE_WITH_CUDA
+
+/** The stream every call on one device queues on, and the ceiling on the scratch those calls walk with. Work is
+ *  queued, never waited on, so one host thread keeps the device fed. */
+class cuda_executor_t {
+  public:
+
+    /** Binds device @p ordinal, queueing on @p borrowed, a stream of the caller's on that device which outlives the
+     *  executor, or on one of its own for null; its scratch never grows past @p scratch_limit bytes, zero for no
+     *  limit. */
+    static expected<cuda_executor_t> spawn(int ordinal, cudaStream_t borrowed, std::size_t scratch_limit) noexcept {
+        st::expected<std::size_t> const visible = cuda_count_devices();
+        if (!visible) return status_t {status_code_t::device_k, "The CUDA runtime counts no devices"};
+        if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= *visible)
+            return status_t {status_code_t::device_k, "No CUDA device carries the ordinal"};
+        cuda_executor_t executor {ordinal, scratch_limit};
+        executor.stream_ = borrowed;
+        if (borrowed) return executor;
+        st::expected<cuda_stream_t> created = cuda_stream_t::make(ordinal);
+        if (!created) return status_t {status_code_t::device_k, "Failed to create a stream on the device"};
+        executor.stream_ = created->handle();
+        executor.owned_stream_.emplace(std::move(*created));
+        return executor;
+    }
+
+    /** Waits until everything queued on the stream ran, reporting a failure among it as @c device_k. */
+    status_t wait() noexcept {
+        if (cudaStreamSynchronize(stream_) != cudaSuccess)
+            return {status_code_t::device_k, "The device failed a call queued on the executor"};
+        return {};
+    }
+
+    /** The CUDA ordinal every call and arena of the executor uses. */
+    int device() const noexcept { return device_; }
+
+    /** Bytes of scratch a call may take, zero for no limit. */
+    std::size_t scratch_limit() const noexcept { return scratch_limit_; }
+
+  private:
+    cuda_executor_t(int device, std::size_t scratch_limit) noexcept : device_(device), scratch_limit_(scratch_limit) {}
+
+    /** The stream made here and destroyed with the executor, absent when the caller lent @c stream_. */
+    std::optional<cuda_stream_t> owned_stream_;
+
+    /** The stream every call queues on, owned or borrowed. */
+    cudaStream_t stream_ = nullptr;
+
+    /** The CUDA ordinal of the device. */
+    int device_ = 0;
+
+    /** Bytes of scratch a call may take, zero for no limit. */
+    std::size_t scratch_limit_ = 0;
+};
+
+#else
+
+/** What a VRAM executor holds in a build without CUDA, which never spawns one. */
+class cuda_executor_t {
+  public:
+
+    /** The CUDA ordinal every arena of the executor would use. */
+    int device() const noexcept { return 0; }
+};
 
 #endif
+
+#pragma endregion Executors
+
+} // namespace unum::ustore::utilities

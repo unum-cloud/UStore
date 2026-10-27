@@ -20,7 +20,7 @@
 #include "ustore/graph/vertex_values.hpp"   // `updated_entry_t`, `neighbors`, `insert_into_entry`, `erase_from_entry`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
-#include "engine.hpp"            // `blobs_verbs_t`, `view_t`
+#include "engine.hpp"            // `blobs_verbs<home_t::host_k>`, `view_t`
 #include "utilities/batches.hpp" // `edges_batch_t`, `strings_arg_t`
 
 namespace unum::ustore {
@@ -45,9 +45,10 @@ constexpr std::size_t ids_per_neighborship(edge_export_t export_kind) noexcept {
 
 /** Reads the values of @p count vertices through @p view with the engine's own @p values_verbs, which append to the
  *  scratch of @p view rather than rewinding it, and whose presences tell a missing vertex apart from a bare one. */
-inline expected<values_view_t> read_vertices(blobs_verbs_t const& values_verbs, ustore_database_t database,
-                                             std::size_t count, ustore_collections_view_t collections,
-                                             ustore_keys_view_t vertices, view_t const& view) noexcept {
+inline expected<values_view_t> read_vertices(blobs_verbs<home_t::host_k> const& values_verbs,
+                                             ustore_database_t database, std::size_t count,
+                                             ustore_collections_view_t collections, ustore_keys_view_t vertices,
+                                             view_t const& view) noexcept {
     ustore_octet_t const* presences = nullptr;
     ustore_strings_view_t contents {};
     ustore_blobs_read_t read {};
@@ -66,10 +67,11 @@ inline expected<values_view_t> read_vertices(blobs_verbs_t const& values_verbs, 
  *  edges when @p export_kind_ asks for them, into @p arena alone. */
 template <edge_export_t export_kind_>
 status_t export_edge_tuples( //
-    blobs_verbs_t const& values_verbs, ustore_database_t const database, ustore_size_t const vertices_count,
-    ustore_collections_view_t collections, ustore_keys_view_t vertices, ustore_vertex_roles_view_t roles,
-    ustore_vertex_degree_t const** degrees_per_vertex, ustore_length_t const** edges_offsets,
-    ustore_key_t const** neighborships_per_vertex, ustore_arena_t arena, view_t const& view) noexcept {
+    blobs_verbs<home_t::host_k> const& values_verbs, ustore_database_t const database,
+    ustore_size_t const vertices_count, ustore_collections_view_t collections, ustore_keys_view_t vertices,
+    ustore_vertex_roles_view_t roles, ustore_vertex_degree_t const** degrees_per_vertex,
+    ustore_length_t const** edges_offsets, ustore_key_t const** neighborships_per_vertex, ustore_arena_t arena,
+    view_t const& view) noexcept {
 
     edges_batch_t const read_edges {strided(collections), strided(vertices), strided(roles), vertices_count};
     auto [values, values_status] = read_vertices(values_verbs, database, vertices_count, collections, vertices, view);
@@ -146,8 +148,8 @@ status_t export_edge_tuples( //
 
 /** Reads the values of @p unique_entries into the scratch of @p view and points every entry at its own bytes. */
 inline status_t pull_and_link_for_updates( //
-    blobs_verbs_t const& values_verbs, ustore_database_t const database, strided_span<updated_entry_t> unique_entries,
-    view_t const& view) noexcept {
+    blobs_verbs<home_t::host_k> const& values_verbs, ustore_database_t const database,
+    strided_span<updated_entry_t> unique_entries, view_t const& view) noexcept {
 
     std::size_t const unique_count = unique_entries.size();
     auto const collections = unique_entries.immutable().members(&updated_entry_t::collection);
@@ -175,7 +177,7 @@ inline status_t pull_and_link_for_updates( //
 
 /** Writes the vertex values of @p entries back through the engine's own @p values_verbs, in the transaction of
  *  @p view. */
-inline status_t write_entries(blobs_verbs_t const& values_verbs, ustore_database_t const database,
+inline status_t write_entries(blobs_verbs<home_t::host_k> const& values_verbs, ustore_database_t const database,
                               std::span<updated_entry_t const> entries, ustore_durability_t const durability,
                               view_t const& view) noexcept {
     if (entries.empty()) return {};
@@ -200,7 +202,7 @@ inline status_t write_entries(blobs_verbs_t const& values_verbs, ustore_database
 
 /** Inserts or erases edges in the neighborships of both their ends, and writes every touched vertex back. */
 template <neighborhood_update_t update_, typename arguments_type_>
-status_t update_neighborhoods(blobs_verbs_t const& values_verbs, arguments_type_ const& arguments,
+status_t update_neighborhoods(blobs_verbs<home_t::host_k> const& values_verbs, arguments_type_ const& arguments,
                               view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.sources.data || !arguments.targets.data)
@@ -276,7 +278,7 @@ status_t update_neighborhoods(blobs_verbs_t const& values_verbs, arguments_type_
 }
 
 /** Removes the vertices of @p entries through the engine's own @p values_verbs, in the transaction of @p view. */
-inline status_t remove_entries(blobs_verbs_t const& values_verbs, ustore_database_t const database,
+inline status_t remove_entries(blobs_verbs<home_t::host_k> const& values_verbs, ustore_database_t const database,
                                std::span<updated_entry_t const> entries, ustore_durability_t const durability,
                                view_t const& view) noexcept {
     if (entries.empty()) return {};
@@ -293,7 +295,7 @@ inline status_t remove_entries(blobs_verbs_t const& values_verbs, ustore_databas
     return values_verbs.remove(remove, view);
 }
 
-inline status_t graph_read_edges_over_blobs(blobs_verbs_t const& values_verbs,
+inline status_t graph_read_edges_over_blobs(blobs_verbs<home_t::host_k> const& values_verbs,
                                             ustore_graph_read_edges_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.degrees_per_vertex) return {status_code_t::invalid_argument_k, "Need an output for the degrees"};
@@ -309,18 +311,18 @@ inline status_t graph_read_edges_over_blobs(blobs_verbs_t const& values_verbs,
         arguments.degrees_per_vertex, arguments.edges_offsets, nullptr, arguments.arena, view);
 }
 
-inline status_t graph_write_edges_over_blobs(blobs_verbs_t const& values_verbs,
+inline status_t graph_write_edges_over_blobs(blobs_verbs<home_t::host_k> const& values_verbs,
                                              ustore_graph_write_edges_t const& arguments, view_t const& view) noexcept {
     return update_neighborhoods<neighborhood_update_t::upsert_k>(values_verbs, arguments, view);
 }
 
-inline status_t graph_remove_edges_over_blobs(blobs_verbs_t const& values_verbs,
+inline status_t graph_remove_edges_over_blobs(blobs_verbs<home_t::host_k> const& values_verbs,
                                               ustore_graph_remove_edges_t const& arguments,
                                               view_t const& view) noexcept {
     return update_neighborhoods<neighborhood_update_t::erase_k>(values_verbs, arguments, view);
 }
 
-inline status_t graph_write_vertices_over_blobs(blobs_verbs_t const& values_verbs,
+inline status_t graph_write_vertices_over_blobs(blobs_verbs<home_t::host_k> const& values_verbs,
                                                 ustore_graph_write_vertices_t const& arguments,
                                                 view_t const& view) noexcept {
     std::size_t const count = arguments.count;
@@ -350,7 +352,7 @@ inline status_t graph_write_vertices_over_blobs(blobs_verbs_t const& values_verb
     return write_entries(values_verbs, arguments.database, missing.first(missing_count), arguments.durability, view);
 }
 
-inline status_t graph_remove_vertices_over_blobs(blobs_verbs_t const& values_verbs,
+inline status_t graph_remove_vertices_over_blobs(blobs_verbs<home_t::host_k> const& values_verbs,
                                                  ustore_graph_remove_vertices_t const& arguments,
                                                  view_t const& view) noexcept {
     if (!arguments.count) return {};
@@ -446,35 +448,35 @@ inline status_t graph_remove_vertices_over_blobs(blobs_verbs_t const& values_ver
 /** The graph verbs of an engine keeping every vertex as one value of its degrees and sorted neighborships, bound to
  *  its unchecked whole-value verbs @p values_verbs_ and its resolver @p resolve_, which refuses every collection
  *  holding another modality first. */
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t graph_read_edges_over_blobs(ustore_graph_read_edges_t const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_graph_k, view);
     return resolved.failed() ? resolved : graph_read_edges_over_blobs(values_verbs_, arguments, view);
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t graph_write_edges_over_blobs(ustore_graph_write_edges_t const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_graph_k, view);
     return resolved.failed() ? resolved : graph_write_edges_over_blobs(values_verbs_, arguments, view);
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t graph_remove_edges_over_blobs(ustore_graph_remove_edges_t const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_graph_k, view);
     return resolved.failed() ? resolved : graph_remove_edges_over_blobs(values_verbs_, arguments, view);
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t graph_write_vertices_over_blobs(ustore_graph_write_vertices_t const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_graph_k, view);
     return resolved.failed() ? resolved : graph_write_vertices_over_blobs(values_verbs_, arguments, view);
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t graph_remove_vertices_over_blobs(ustore_graph_remove_vertices_t const& arguments,
                                           view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,

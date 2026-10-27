@@ -14,13 +14,14 @@ use stringtape::BytesTape;
 use crate::db::ffi::{
     ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t, ustore_completion_t,
     ustore_database_t, ustore_durability_t, ustore_executor_t, ustore_key_t, ustore_keys_view_t, ustore_length_t,
-    ustore_octet_t, ustore_outcome_t, ustore_progress_callback_t, ustore_scan_mode_t, ustore_size_t,
-    ustore_strided_view_t, ustore_strings_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
+    ustore_octet_t, ustore_outcome_t, ustore_patterns_t, ustore_predicate_t, ustore_progress_callback_t,
+    ustore_scan_mode_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t, ustore_transaction_t,
+    ustore_view_t, ustore_watch_t,
 };
 use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
-    check, exported_slice, fail, Address, Arena, CollectionID, Collections, Durability, Key, Result, Rows, Status,
-    Strings, Tape, View,
+    check, exported_slice, fail, Address, Arena, CollectionID, Collections, Durability, Key, Matched, Matching, Result,
+    Rows, Status, Strings, Tape, View,
 };
 use crate::docs::Bitmap;
 
@@ -87,8 +88,11 @@ mod ffi {
         pub count: ustore_size_t,
         pub collections: ustore_collections_view_t,
         pub start_keys: ustore_keys_view_t,
+        pub patterns: ustore_patterns_t,
+        pub predicate: ustore_predicate_t,
         pub offsets: *mut *const ustore_length_t,
         pub keys: *mut *const ustore_key_t,
+        pub scores: *mut *const f32,
         pub arena: ustore_arena_t,
         pub wanted: ustore_size_t,
         pub mode: ustore_scan_mode_t,
@@ -107,10 +111,13 @@ mod ffi {
     pub struct ustore_blobs_cursor_init_t {
         pub cursor: *mut ustore_blobs_cursor_t,
         pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
         pub view: ustore_view_t,
         pub collection: ustore_collection_id_t,
         pub start_key: ustore_key_t,
+        pub patterns: ustore_patterns_t,
+        pub predicate: ustore_predicate_t,
     }
 
     #[repr(C)]
@@ -455,23 +462,29 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
         Completion::answer(self, verb)
     }
 
-    /// Lists up to `wanted` keys of one collection from `start` into the arena, while a [`Cursor`] walks one with its
-    /// values.
+    /// Lists up to `wanted` keys of one collection from `start` into the arena, keeping those `matching` admits, while
+    /// a [`Cursor`] walks one with its values. Weighted patterns write one BM25 score per key beside them.
     ///
     /// Calls `ustore_blobs_scan`.
-    pub fn scan<'arena>(
+    pub fn scan<'arena, 'matching>(
         &self,
         collection: CollectionID,
         start: Key,
         wanted: usize,
+        matching: Matching<'matching>,
         arena: &'arena mut Arena,
-    ) -> Completion::Answer<Scan<'arena>> {
+    ) -> Completion::Answer<Scan<'arena, 'matching>>
+    where
+        Completion: Accepts<Matching<'matching>>,
+    {
         let verb = Scan {
             collection,
             start,
             arena,
             wanted,
+            matched: Matched::new(matching),
             found: Found::default(),
+            scores: Address::default(),
         };
         Completion::answer(self, verb)
     }
@@ -522,22 +535,29 @@ impl<'view, Parent> View<'view, Parent> {
     /// The cursor holds the database open, and the transaction or snapshot this view reads through, until it is
     /// dropped.
     ///
+    /// The patterns of `matching` are compiled here once, and its predicate is asked on every pull, so it lives as long
+    /// as the cursor.
+    ///
     /// Calls `ustore_blobs_cursor_init`.
-    pub fn cursor(&self, collection: CollectionID, start: Key) -> Result<Cursor<'view>> {
+    pub fn cursor(&self, collection: CollectionID, start: Key, matching: Matching<'view>) -> Result<Cursor<'view>> {
         let mut cursor = Cursor {
             handle: ptr::null_mut(),
             database: self.database(),
             executor: self.executor(),
+            matched: Box::new(Matched::new(matching)),
             marker: PhantomData,
         };
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_blobs_cursor_init_t {
             cursor: &mut cursor.handle,
             database: self.database(),
+            executor: self.executor(),
             outcome: &mut outcome,
             view: self.view(),
             collection,
             start_key: start,
+            patterns: cursor.matched.patterns(),
+            predicate: cursor.matched.predicate(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_blobs_cursor_init(&mut arguments) };
@@ -737,17 +757,28 @@ impl Found {
 
 /// A walk over the keys of one collection; see [`View::scan`].
 #[derive(Debug)]
-pub struct Scan<'arena> {
+pub struct Scan<'arena, 'matching> {
     collection: CollectionID,
     start: Key,
     arena: &'arena mut Arena,
     wanted: usize,
+    matched: Matched<'matching>,
     found: Found,
+    scores: Address<f32>,
 }
 
-impl<'arena> Calling for Scan<'arena> {
+/// The keys one scan listed, and their BM25 scores when its patterns carried weights; see [`View::scan`].
+#[derive(Clone, Copy, Debug)]
+pub struct Scanned<'arena> {
+    /// The keys, in ascending order.
+    pub keys: &'arena [Key],
+    /// One score per key when the patterns carried weights.
+    pub scores: Option<&'arena [f32]>,
+}
+
+impl<'arena> Calling for Scan<'arena, '_> {
     type Arguments = ffi::ustore_blobs_scan_t;
-    type Output = &'arena [Key];
+    type Output = Scanned<'arena>;
 
     fn arguments<Parent, Completion>(
         &mut self,
@@ -764,8 +795,14 @@ impl<'arena> Calling for Scan<'arena> {
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
+            patterns: self.matched.patterns(),
+            predicate: self.matched.predicate(),
             offsets: &mut self.found.offsets.0,
             keys: &mut self.found.keys.0,
+            scores: match self.matched.scores() {
+                true => &mut self.scores.0,
+                false => ptr::null_mut(),
+            },
             arena: self.arena.handle,
             wanted: self.wanted as ustore_size_t,
             mode: ustore_scan_mode_t::Ordered,
@@ -778,9 +815,19 @@ impl<'arena> Calling for Scan<'arena> {
         ffi::ustore_blobs_scan(arguments)
     }
 
-    fn finish(self) -> Result<&'arena [Key]> {
+    fn raise(&mut self) {
+        self.matched.raise();
+    }
+
+    fn finish(self) -> Result<Scanned<'arena>> {
         // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`.
-        Ok(unsafe { self.found.keys() })
+        let keys = unsafe { self.found.keys() };
+        // SAFETY: a scan with weighted patterns wrote one score per key into the same arena.
+        let scores = self
+            .matched
+            .scores()
+            .then(|| unsafe { exported_slice(self.scores.0, keys.len()) });
+        Ok(Scanned { keys, scores })
     }
 }
 
@@ -906,6 +953,7 @@ pub struct Cursor<'view> {
     handle: ffi::ustore_blobs_cursor_t,
     database: ustore_database_t,
     executor: ustore_executor_t,
+    matched: Box<Matched<'view>>,
     marker: PhantomData<&'view ()>,
 }
 
@@ -955,6 +1003,7 @@ impl Cursor<'_> {
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_blobs_cursor_next(&mut arguments) };
+        self.matched.raise();
         check(outcome)?;
         // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
         Ok(unsafe { exported_slice(keys, written as usize) })
@@ -978,6 +1027,11 @@ pub struct Page<'arena> {
 }
 
 impl<'arena> Page<'arena> {
+    /// The page of `keys` and their `values`, as every pull of keys with values answers.
+    pub(crate) fn new(keys: &'arena [Key], values: Strings<'arena>) -> Self {
+        Page { keys, values }
+    }
+
     /// The keys of the page, in their order.
     pub fn keys(&self) -> &'arena [Key] {
         self.keys
@@ -1001,7 +1055,10 @@ impl<'arena> Page<'arena> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{CollectionID, Collections, Database, DropMode, Executor, Modality, RAMOptions, Status, UUID};
+    use crate::db::{
+        Admission, CollectionID, Collections, Database, DropMode, Executor, Modality, PatternKind, PredicateCost,
+        RAMOptions, Status, UUID,
+    };
     use crate::testing::{created, key, keys};
 
     /// A database whose blobs collection holds `alpha`, `beta` and `gamma` under the keys one, two and three.
@@ -1161,9 +1218,19 @@ mod tests {
         assert_eq!(read.get(0), Some(b"beta".as_slice()));
         assert_eq!(read.get(1), None);
 
-        let scanned = deferred.scan(blobs, key(2), 10, &mut arena).unwrap().wait().unwrap();
-        assert_eq!(scanned, &keys([2]));
-        assert_eq!(blocking.scan(blobs, key(0), 1, &mut arena).unwrap(), &keys([1]));
+        let scanned = deferred
+            .scan(blobs, key(2), 10, Matching::default(), &mut arena)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(scanned.keys, &keys([2]));
+        assert_eq!(
+            blocking
+                .scan(blobs, key(0), 1, Matching::default(), &mut arena)
+                .unwrap()
+                .keys,
+            &keys([1])
+        );
         let sampled = deferred.sample(blobs, 10, &mut arena).unwrap().wait().unwrap();
         assert_eq!(sampled.len(), 2);
         assert_eq!(blocking.sample(blobs, 1, &mut arena).unwrap().len(), 1);
@@ -1224,23 +1291,100 @@ mod tests {
     }
 
     #[test]
+    fn scans_match_patterns_score_weights_and_ask_predicates() {
+        let (database, blobs, mut arena) = populated();
+        let starting_with_a = Matching {
+            patterns: &["^a"],
+            ..Matching::default()
+        };
+        let matched = database
+            .head()
+            .scan(blobs, key(0), 8, starting_with_a, &mut arena)
+            .unwrap();
+        assert_eq!(matched.keys, &keys([1]));
+        assert!(matched.scores.is_none());
+
+        let weighted = Matching {
+            patterns: &["a"],
+            pattern_kind: PatternKind::Substrings,
+            weights: Some(&[1.0]),
+            ..Matching::default()
+        };
+        let scored = database.head().scan(blobs, key(0), 8, weighted, &mut arena).unwrap();
+        assert_eq!(scored.keys, &keys([1, 2, 3]));
+        // "alpha" and "gamma" hold "a" twice, "beta" once, and no length normalization applies
+        let expected = |count: f32| count * 2.2 / (count + 1.2);
+        assert_eq!(
+            scored.scores,
+            Some([expected(2.0), expected(1.0), expected(2.0)].as_slice())
+        );
+
+        let mut asked = 0;
+        let mut only_the_second = |listed: &[Key], admissions: &mut [Admission]| {
+            asked += 1;
+            for (admission, listed) in admissions.iter_mut().zip(listed) {
+                *admission = if *listed == key(2) {
+                    Admission::Admit
+                } else {
+                    Admission::Reject
+                };
+            }
+        };
+        let predicated = Matching {
+            predicate: Some(&mut only_the_second),
+            predicate_cost: PredicateCost::Expensive,
+            ..Matching::default()
+        };
+        let admitted = database.head().scan(blobs, key(0), 2, predicated, &mut arena).unwrap();
+        assert_eq!(admitted.keys, &keys([2]));
+        assert_eq!(asked, 2);
+
+        let unbalanced = Matching {
+            patterns: &["("],
+            ..Matching::default()
+        };
+        let refused = database
+            .head()
+            .scan(blobs, key(0), 8, unbalanced, &mut arena)
+            .unwrap_err();
+        assert_eq!(refused.status, Status::InvalidArgument);
+    }
+
+    #[test]
     fn scans_walk_in_key_order_and_paginate() {
         let (database, blobs, mut arena) = populated();
-        let first_page = database.head().scan(blobs, key(0), 2, &mut arena).unwrap();
+        let first_page = database
+            .head()
+            .scan(blobs, key(0), 2, Matching::default(), &mut arena)
+            .unwrap()
+            .keys;
         assert_eq!(first_page, &keys([1, 2]));
 
         let resume = first_page[first_page.len() - 1].next();
-        let second_page = database.head().scan(blobs, resume, 2, &mut arena).unwrap();
+        let second_page = database
+            .head()
+            .scan(blobs, resume, 2, Matching::default(), &mut arena)
+            .unwrap()
+            .keys;
         assert_eq!(second_page, &keys([3]));
 
         // A walk starting past the last key finds nothing.
-        assert!(database.head().scan(blobs, key(99), 2, &mut arena).unwrap().is_empty());
+        assert!(database
+            .head()
+            .scan(blobs, key(99), 2, Matching::default(), &mut arena)
+            .unwrap()
+            .keys
+            .is_empty());
     }
 
     #[test]
     fn scans_refuse_a_limit_of_nothing_to_walk() {
         let (database, blobs, mut arena) = populated();
-        let found = database.head().scan(blobs, key(0), 0, &mut arena).unwrap();
+        let found = database
+            .head()
+            .scan(blobs, key(0), 0, Matching::default(), &mut arena)
+            .unwrap()
+            .keys;
         assert!(found.is_empty(), "wanting nothing walks nothing");
     }
 
@@ -1248,7 +1392,7 @@ mod tests {
     fn cursors_resume_past_the_last_key_until_a_short_page() {
         let (database, blobs, mut arena) = populated();
         let head = database.head();
-        let mut cursor = head.cursor(blobs, key(0)).unwrap();
+        let mut cursor = head.cursor(blobs, key(0), Matching::default()).unwrap();
         let page = cursor.next_pairs(2, &mut arena).unwrap();
         assert_eq!(page.keys(), &keys([1, 2]));
         let values = (page.get(0), page.get(1), page.get(2));
@@ -1271,7 +1415,10 @@ mod tests {
         let (database, blobs, mut arena) = populated();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let snapshot = database.snapshot().unwrap();
-        let mut cursor = snapshot.on(&executor).cursor(blobs, key(0)).unwrap();
+        let mut cursor = snapshot
+            .on(&executor)
+            .cursor(blobs, key(0), Matching::default())
+            .unwrap();
         database.head().remove(blobs, keys([2]), Durability::Buffered).unwrap();
 
         let page = cursor.next_pairs(10, &mut arena).unwrap();

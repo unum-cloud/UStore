@@ -15,8 +15,9 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`, `std::swap`, `std::exchange`
 
-#include "ustore/ranges.hpp" // `strings_of`, `range`, `keys_view_t`, `bits_view_t`, `values_tape_t`
-#include "ustore/status.hpp" // `status_t`, `expected`, `deferred`
+#include "ustore/blobs_range.hpp" // `match_t`, `narrow`
+#include "ustore/ranges.hpp"      // `strings_of`, `range`, `keys_view_t`, `bits_view_t`, `values_tape_t`
+#include "ustore/status.hpp"      // `status_t`, `expected`, `deferred`
 #include "ustore/strings.h"
 #include "ustore/types.hpp" // `arena_t`, `receiver_t`, `value_view_t`
 
@@ -27,10 +28,12 @@ class deferred_strings_collection_t;
 
 #pragma region Streams
 
-/** Scans one page of up to @p limit strings of @p prefix from @p start into @p arena. */
+/** Scans one page of up to @p limit strings of @p prefix from @p start into @p arena, keeping the strings @p match
+ *  admits and writing one BM25 score per string into @p scores when it is not null and the patterns carry weights. */
 inline expected<sz::strings_view_t> scan_strings_page( //
     receiver_t const& receiver, ustore_watch_t watch, ustore_collection_id_t const& collection,
-    value_view_t const& prefix, value_view_t const& start, std::size_t limit, ustore_arena_t arena) noexcept {
+    value_view_t const& prefix, value_view_t const& start, std::size_t limit, ustore_arena_t arena,
+    match_t const& match = {}, float const** scores = nullptr) noexcept {
 
     strided_strings<value_view_t> const prefixes {{&prefix, 0}};
     strided_strings<value_view_t> const starts {{&start, 0}};
@@ -50,6 +53,8 @@ inline expected<sz::strings_view_t> scan_strings_page( //
     scan.strings = &found_strings;
     scan.arena = arena;
     scan.wanted = limit;
+    narrow(scan, match);
+    scan.scores = scores;
 
     ustore_strings_scan(&scan);
     if (status_t const status {outcome}; status.failed()) return status;
@@ -87,19 +92,24 @@ class strings_cursor_t {
         return *this;
     }
 
-    /** Opens a walk over the strings of @p prefix in @p collection from @p start, at the view @p receiver reads. */
+    /** Opens a walk over the strings of @p prefix in @p collection from @p start, at the view @p receiver reads,
+     *  keeping the strings @p match admits, compiled once here. */
     static expected<strings_cursor_t> make(receiver_t receiver, ustore_collection_id_t collection,
                                            value_view_t prefix = value_view_t::make_empty(),
-                                           value_view_t start = value_view_t::make_empty()) noexcept {
+                                           value_view_t start = value_view_t::make_empty(),
+                                           match_t const& match = {}) noexcept {
         ustore_strings_cursor_t cursor = nullptr;
         ustore_outcome_t outcome {};
         ustore_strings_cursor_init_t init {.cursor = &cursor,
                                            .database = receiver.database,
+                                           .executor = receiver.executor,
                                            .outcome = &outcome,
                                            .view = receiver.view(ustore_watch_keys_k),
                                            .collection = collection,
                                            .prefix = prefix.bytes(),
-                                           .start_string = start.bytes()};
+                                           .start_string = start.bytes(),
+                                           .patterns = match.patterns,
+                                           .predicate = match.predicate};
         ustore_strings_cursor_init(&init);
         if (status_t const status {outcome}; status.failed()) return status;
         return strings_cursor_t {receiver, cursor};

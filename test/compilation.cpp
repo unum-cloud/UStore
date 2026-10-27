@@ -349,6 +349,57 @@ std::size_t wrappers_compile(config_t const& config) {
     return failures;
 }
 
+/** Patterns, weighted scores, a documents filter and a predicate reach the scans and cursors of the C++ wrappers. */
+std::size_t wrappers_match(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(arena_status.succeeded());
+    blobs_collection_t fruits = *database.find_or_create("fruits");
+    docs_collection_t people = *database.find_or_create<docs_collection_t>("people");
+    if (failures != 0) return failures;
+    std::array<char const*, 4> const names {"Apple", "banana", "cherry", "avocado"};
+    std::array<char const*, 4> const documents {R"({"age":25})", R"({"age":40})", R"({"name":"x"})", R"({"age":31})"};
+    for (std::size_t index = 0; index != names.size(); ++index) {
+        failures += expect(fruits[key_from_integer(index + 1)].assign(names[index]).succeeded());
+        failures += expect(people[key_from_integer(index + 1)].assign(documents[index]).succeeded());
+    }
+    receiver_t const receiver = database.receiver();
+
+    std::string_view const substring = "an";
+    std::array<std::uint32_t, 2> const offsets {0, static_cast<std::uint32_t>(substring.size())};
+    float const weight = 2.0f;
+    match_t const weighted {.patterns = {.patterns = u32_tape(substring.data(), offsets.data()),
+                                         .count = 1,
+                                         .kind = ustore_pattern_substrings_k,
+                                         .weights = &weight}};
+    float const* scores = nullptr;
+    auto [scored, scored_status] = scan_keys_through<ustore_blobs_scan_t, &ustore_blobs_scan>(
+        receiver, fruits, smallest_key_k, 8, arena, weighted, &scores);
+    failures += expect(scored_status.succeeded() && scored.size() == 1 && scored[0] == key_from_integer(2));
+    failures += expect(scores != nullptr);
+    if (scores) failures += expect_near(scores[0], 2.0 * (2.0 * 2.2) / (2.0 + 1.2));
+
+    std::string_view const older = "?@.age > 30";
+    std::size_t asked = 0;
+    auto even_keys = [&](std::span<ustore_key_t const> keys, std::span<ustore_admission_t> admissions) noexcept {
+        ++asked;
+        for (std::size_t index = 0; index != keys.size(); ++index)
+            admissions[index] = keys[index].uuid.bytes[15] % 2 == 0 ? ustore_admit_k : ustore_reject_k;
+    };
+    match_t const filtered {.filter = bytes_of(older), .predicate = predicate_of(even_keys)};
+    auto [cursor, cursor_status] = docs_cursor_t::make(receiver, people, smallest_key_k, filtered);
+    failures += expect(cursor_status.succeeded());
+    if (failures != 0) return failures;
+    auto [page, page_status] = cursor.next_pairs(8, arena);
+    failures += expect(page_status.succeeded() && page.keys.size() == 2 && page.keys[1] == key_from_integer(4));
+    failures += expect(asked != 0);
+    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    return failures;
+}
+
 int main(int argc, char** argv) {
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -364,5 +415,6 @@ int main(int argc, char** argv) {
     config_t const config {options.engine, maybe_directory->path()};
 
     report(totals, "wrappers.compile", wrappers_compile, config);
+    report(totals, "wrappers.match", wrappers_match, config);
     return suite_exit_code(totals);
 }

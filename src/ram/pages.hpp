@@ -188,7 +188,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_scan_
 #pragma region Table
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-pages_verbs_t const ram_variant<cpu_class_, isolation_>::pages_verbs_k {
+pages_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::pages_verbs_k {
     .import = &serve_database<cpu_class_, isolation_, ustore_pages_import_t, strings_arg_t>,
     .insert = &serve_database<cpu_class_, isolation_, ustore_pages_insert_t, strings_arg_t>,
     .remove = &serve_database<cpu_class_, isolation_, ustore_pages_remove_t>,

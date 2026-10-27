@@ -83,7 +83,7 @@ ustore_arena_init(&(ustore_arena_init_t){.arena = &arena, .outcome = &outcome});
 ## Executors, Blocking and Deferred Calls
 
 An executor owns the threads that run calls and the scratch they use, and a `NULL` executor runs a call on the calling thread.
-Its kind must match the residency of every database it drives, and a mismatch reports `ustore_status_device_k`.
+Its kind picks where calls compute: a RAM or NVMe executor serves every engine on host threads, and a VRAM executor serves the reads and scans an engine computes on its one device, refusing changes, the control plane and every call no device tower serves yet with `ustore_status_unsupported_k`.
 `ustore_executor_for_ram` spawns its threads and holds up to `deferred_limit` deferred calls at once, 256 for zero.
 Its `ram` options name the memory domains it serves, NUMA nodes as the operating system numbers them, where `NULL` derives every domain the process may allocate on and an unknown one is refused with `ustore_status_invalid_argument_k`.
 Each thread keeps its scratch on its local domain when the options name it, and on the first named domain otherwise, as does every arena the executor makes.
@@ -91,7 +91,8 @@ Zero threads take 7/8 of the cores local to those domains, rounded down and at l
 ForkUnion spawns the threads near every domain or near one alone, so naming several domains but not all spreads them over the whole machine.
 `ustore_executor_on_pool` borrows a ForkUnion pool another library owns, which must outlive the executor, and places its scratch and arenas by the same `ram` options; a dispatch on a pool that runs another is refused, so a batch finding the pool running its lender's dispatch runs on the executor's own driver thread instead of forking over the lender.
 `ustore_executor_for_nvme` spawns the threads of the NVMe engine, and its `nvme` options tell every database `ustore_database_open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, read once at the open.
-It may borrow an executor of `ustore_executor_for_vram`, whose CUDA devices the compactions run on, and which answers `ustore_status_unsupported_k` in a library built without CUDA.
+It may borrow an executor of `ustore_executor_for_vram`, whose CUDA device and scratch limit the compactions take, and which answers `ustore_status_unsupported_k` in a library built without CUDA.
+That executor queues every call on one stream of its device, its own or one the caller lends through `stream`, so one host thread keeps the device fed.
 A call blocks by default and returns with its outcome final, while `ustore_completion_deferred_k` returns once the call is submitted:
 
 ```c

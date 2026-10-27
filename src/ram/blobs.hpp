@@ -143,7 +143,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_blobs_measu
 #pragma region Table
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-blobs_verbs_t const ram_variant<cpu_class_, isolation_>::blobs_verbs_k {
+blobs_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::blobs_verbs_k {
     .write = &guarded_by<ustore_modality_blobs_k, &resolve_modality<cpu_class_, isolation_>,
                          &serve_database<cpu_class_, isolation_, ustore_blobs_write_t, strings_arg_t>>,
     .remove = &guarded_by<ustore_modality_blobs_k, &resolve_modality<cpu_class_, isolation_>,

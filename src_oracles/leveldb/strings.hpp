@@ -19,7 +19,7 @@
 #include "ustore/ranges.hpp" // `strided`, `strided_iterator`
 
 #include "database.hpp"           // `database_t`, `string_key`, `resolve_collections`, `use_snapshot`
-#include "utilities/batches.hpp"  // `strings_arg_t`
+#include "utilities/batches.hpp"  // `strings_arg`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -32,7 +32,7 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
     strided_iterator<ustore_key_t const> const values = strided(arguments.values);
     if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their values"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
                                                   entry_layout_t::strings_to_uuids_k);
@@ -51,7 +51,7 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
                                                   entry_layout_t::strings_to_uuids_k);
@@ -68,7 +68,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     ::leveldb::ReadOptions options;
     use_snapshot(view, options);
 
@@ -105,7 +105,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     if (!arguments.offsets || !arguments.strings)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     ::leveldb::ReadOptions options;
     options.fill_cache = false;
     use_snapshot(view, options);

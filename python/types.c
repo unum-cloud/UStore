@@ -1194,13 +1194,15 @@ static char const doc_Keys[] =                                                  
     "against the next call until released. Read after a later call rewound the arena, it\n"   //
     "raises `UninitializedError`.";
 
-PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, ustore_key_t const* tape, size_t count) {
+PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, ustore_key_t const* tape, size_t count,
+                             float const* scores) {
     Keys* const instance = PyObject_New(Keys, &KeysType);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
     instance->generation = ustore_py_arena_generation(arena);
     instance->offsets = offsets;
     instance->tape = tape;
+    instance->scores = scores;
     instance->count = count;
     // The keys found are known once the call wrote the last offset, while the call still holds the arena.
     instance->shape[0] = offsets ? (Py_ssize_t)offsets[count] : 0;
@@ -1264,8 +1266,25 @@ static PyObject* Keys_get_counts(Keys* self, void* Py_UNUSED(closure)) {
     return counts;
 }
 
+static char const doc_Keys_scores[] =
+    "One BM25 score per key, in the order of the tape, when the scan's patterns carried weights, or None.";
+
+static PyObject* Keys_get_scores(Keys* self, void* Py_UNUSED(closure)) {
+    if (!self->scores) Py_RETURN_NONE;
+    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
+    PyObject* scores = PyTuple_New(self->shape[0]);
+    for (Py_ssize_t key_index = 0; scores && key_index != self->shape[0]; ++key_index) {
+        PyObject* const score = PyFloat_FromDouble((double)self->scores[key_index]);
+        if (!score) Py_CLEAR(scores);
+        else PyTuple_SET_ITEM(scores, key_index, score);
+    }
+    ustore_py_arena_unpin(self->arena);
+    return scores;
+}
+
 static PyGetSetDef Keys_getset[] = {
     {"counts", (getter)Keys_get_counts, NULL, doc_Keys_counts, NULL},
+    {"scores", (getter)Keys_get_scores, NULL, doc_Keys_scores, NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 
@@ -1419,6 +1438,10 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
     [ustore_py_enum_modality_k] = "Modality",
     [ustore_py_enum_isolation_k] = "Isolation",
     [ustore_py_enum_transport_k] = "Transport",
+    [ustore_py_enum_gds_k] = "Gds",
+    [ustore_py_enum_pattern_kind_k] = "PatternKind",
+    [ustore_py_enum_case_sensitivity_k] = "CaseSensitivity",
+    [ustore_py_enum_predicate_cost_k] = "PredicateCost",
     [ustore_py_enum_engine_k] = "Engine",
     [ustore_py_enum_role_k] = "Role",
     [ustore_py_enum_field_type_k] = "FieldType",
@@ -1443,6 +1466,10 @@ static char const* enum_spelling(ustore_py_enum_t kind, int value) {
     case ustore_py_enum_modality_k: return ustore_modality_name((ustore_modality_t)value);
     case ustore_py_enum_isolation_k: return ustore_isolation_name((ustore_isolation_t)value);
     case ustore_py_enum_transport_k: return ustore_transport_name((ustore_transport_t)value);
+    case ustore_py_enum_gds_k: return ustore_gds_name((ustore_gds_t)value);
+    case ustore_py_enum_pattern_kind_k: return ustore_pattern_kind_name((ustore_pattern_kind_t)value);
+    case ustore_py_enum_case_sensitivity_k: return ustore_case_sensitivity_name((ustore_case_sensitivity_t)value);
+    case ustore_py_enum_predicate_cost_k: return ustore_predicate_cost_name((ustore_predicate_cost_t)value);
     case ustore_py_enum_engine_k: return ustore_engine_name((ustore_engine_t)value);
     case ustore_py_enum_role_k: return ustore_vertex_role_name((ustore_vertex_role_t)value);
     case ustore_py_enum_field_type_k: return ustore_docs_field_type_name((ustore_docs_field_type_t)value);
@@ -1589,6 +1616,7 @@ static PyObject* call_answer(ustore_py_verb_t const* verb, void* call) {
         header->raised = NULL;
         return NULL;
     }
+    if (ustore_py_predicate_raise(&header->predicate) != 0) return NULL;
     return ustore_py_raise_on_outcome(&header->outcome) == 0 ? verb->answer(call) : NULL;
 }
 
@@ -1626,6 +1654,8 @@ void ustore_py_call_release(ustore_py_call_t* call) {
     call->arena = NULL;
     Py_CLEAR(call->progress);
     Py_CLEAR(call->raised);
+    Py_CLEAR(call->predicate.callable);
+    Py_CLEAR(call->predicate.raised);
 }
 
 PyObject* ustore_py_call_answer_none(void* Py_UNUSED(call)) { Py_RETURN_NONE; }
@@ -1671,6 +1701,67 @@ static ustore_continuation_t progress_trampoline(ustore_size_t finished, ustore_
 
 ustore_progress_callback_t ustore_py_progress_callback(ustore_py_call_t const* call) {
     return call->progress ? progress_trampoline : NULL;
+}
+
+int ustore_py_predicate_from_object(PyObject* object, PyObject** callable) {
+    *callable = NULL;
+    if (object == Py_None) return 0;
+    if (!PyCallable_Check(object)) {
+        PyErr_Format(PyExc_TypeError, "The 'predicate' option takes a callable or None, got %S", Py_TYPE(object));
+        return -1;
+    }
+    *callable = object;
+    return 0;
+}
+
+/**
+ *  @brief Re-enters Python for one page of the scan whose predicate is @p state, from whichever thread runs it.
+ *
+ *  The callable receives the keys as a tuple of `uuid.UUID` and answers one truthy or falsy item per key. Once it
+ *  raised, or answered the wrong number of items, every later key is rejected and the exception resurfaces.
+ */
+static void predicate_trampoline(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count,
+                                 void* state) {
+    ustore_py_predicate_t* const predicate = (ustore_py_predicate_t*)state;
+    for (ustore_size_t index = 0; index != count; ++index) admissions[index] = ustore_reject_k;
+    if (predicate->raised) return;
+    PyGILState_STATE const interpreter = PyGILState_Ensure();
+    PyObject* asked = PyTuple_New((Py_ssize_t)count);
+    for (ustore_size_t index = 0; asked && index != count; ++index) {
+        PyObject* const key = ustore_py_uuid_to_object(&keys[index].uuid);
+        if (!key) Py_CLEAR(asked);
+        else PyTuple_SET_ITEM(asked, (Py_ssize_t)index, key);
+    }
+    PyObject* const verdicts = asked ? PyObject_CallOneArg(predicate->callable, asked) : NULL;
+    PyObject* const listed = verdicts ? PySequence_Fast(verdicts, "A predicate answers a sequence") : NULL;
+    if (listed && PySequence_Fast_GET_SIZE(listed) != (Py_ssize_t)count)
+        PyErr_Format(PyExc_ValueError, "A predicate answered %zd items for %llu keys", PySequence_Fast_GET_SIZE(listed),
+                     (unsigned long long)count);
+    for (ustore_size_t index = 0; listed && !PyErr_Occurred() && index != count; ++index) {
+        int const truth = PyObject_IsTrue(PySequence_Fast_GET_ITEM(listed, (Py_ssize_t)index));
+        if (truth > 0) admissions[index] = ustore_admit_k;
+    }
+    if (PyErr_Occurred()) {
+        predicate->raised = PyErr_GetRaisedException();
+        for (ustore_size_t index = 0; index != count; ++index) admissions[index] = ustore_reject_k;
+    }
+    Py_XDECREF(listed);
+    Py_XDECREF(verdicts);
+    Py_XDECREF(asked);
+    PyGILState_Release(interpreter);
+}
+
+ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate, int cost) {
+    ustore_predicate_t const asked = {predicate_trampoline, predicate, (ustore_predicate_cost_t)cost};
+    ustore_predicate_t const none = {NULL, NULL, ustore_predicate_cheap_k};
+    return predicate->callable ? asked : none;
+}
+
+int ustore_py_predicate_raise(ustore_py_predicate_t* predicate) {
+    if (!predicate->raised) return 0;
+    PyErr_SetRaisedException(predicate->raised);
+    predicate->raised = NULL;
+    return -1;
 }
 
 #pragma endregion Calls
@@ -1812,6 +1903,8 @@ static int Deferred_traverse(Deferred* self, visitproc visit, void* arg) {
     Py_VISIT(header->arena);
     Py_VISIT(header->progress);
     Py_VISIT(header->raised);
+    Py_VISIT(header->predicate.callable);
+    Py_VISIT(header->predicate.raised);
     return 0;
 }
 
@@ -2076,8 +2169,8 @@ static PyObject* Executor_on_pool(PyObject* type, PyObject* const* args, Py_ssiz
 }
 
 static char const doc_Executor_for_nvme[] =                                                     //
-    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, vram=None, deferred_limit=0,\n"      //
-    "**sizes) answers an executor of I/O rings.\n"                                              //
+    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, deferred_limit=0, **sizes)\n"        //
+    "answers an executor of I/O rings.\n"                                                       //
     "\n"                                                                                        //
     "Runs the calls of the NVMe engine, every thread submitting and polling a ring of its\n"    //
     "own, and tells every database Database.open_nvme() opens on it how to move bytes. Every\n" //
@@ -2089,14 +2182,10 @@ static char const doc_Executor_for_nvme[] =                                     
     "Args:\n"                                                                                   //
     "  threads (int, optional): Threads to spawn; zero derives them from the cores.\n"          //
     "  transport (Transport, optional): How bytes move between the files and memory.\n"         //
-    "  vram (Executor, optional): An executor of Executor.for_vram() whose devices the\n"       //
-    "    compactions run on, kept until this one closes; None compacts on host threads.\n"      //
     "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero\n"       //
     "    takes the library's default.\n"                                                        //
     "Returns:\n"                                                                                //
-    "  Executor: The new executor.\n"                                                           //
-    "Raises:\n"                                                                                 //
-    "  DeviceError: The `vram` executor was not made by Executor.for_vram().";
+    "  Executor: The new executor.";
 
 /** The size keywords of @c Executor.for_nvme, in the order they follow its other arguments. */
 static char const* const nvme_size_names[] = {"shared_io_channels",    "queue_depth",         "request_buffer_bytes",
@@ -2106,7 +2195,6 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* args, Py_ssi
                                    PyObject* args_names_tuple) {
     static char const* const names[] = {"threads",
                                         "transport",
-                                        "vram",
                                         "deferred_limit",
                                         "shared_io_channels",
                                         "queue_depth",
@@ -2114,28 +2202,19 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* args, Py_ssi
                                         "request_buffers_count",
                                         "stream_buffer_bytes",
                                         "stream_buffers_count"};
-    PyObject* values[10];
+    PyObject* values[9];
     size_t threads = 0, deferred_limit = 0, sizes[6] = {0};
     int transport = ustore_transport_automatic_k;
-    if (factory_arguments("for_nvme", args, positional_args_count, args_names_tuple, names, values, 10, 1, 0) != 0 ||
+    if (factory_arguments("for_nvme", args, positional_args_count, args_names_tuple, names, values, 9, 1, 0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
         (values[1] &&
          ustore_py_enum_from_object(values[1], "transport", ustore_py_enum_transport_k, &transport) != 0) ||
-        (values[3] && ustore_py_size_from_object(values[3], "deferred_limit", &deferred_limit) != 0))
+        (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0))
         return NULL;
     for (size_t index = 0; index != 6; ++index)
-        if (values[4 + index] &&
-            ustore_py_size_from_object(values[4 + index], nvme_size_names[index], &sizes[index]) != 0)
+        if (values[3 + index] &&
+            ustore_py_size_from_object(values[3 + index], nvme_size_names[index], &sizes[index]) != 0)
             return NULL;
-    PyObject* const vram = values[2] && values[2] != Py_None ? values[2] : NULL;
-    if (vram && !PyObject_TypeCheck(vram, &ExecutorType)) {
-        PyErr_Format(PyExc_TypeError, "The 'vram' option takes an Executor or None, got %S", Py_TYPE(vram));
-        return NULL;
-    }
-    if (vram && !((Executor*)vram)->handle) {
-        ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed");
-        return NULL;
-    }
 
     ustore_executor_t handle = NULL;
     ustore_outcome_t outcome = {0};
@@ -2152,84 +2231,87 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* args, Py_ssi
                 .stream_buffer_bytes = (ustore_size_t)sizes[4],
                 .stream_buffers_count = (ustore_size_t)sizes[5],
             },
-        .vram = vram ? ((Executor*)vram)->handle : NULL,
         .threads = (ustore_size_t)threads,
         .deferred_limit = (ustore_size_t)deferred_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_nvme(&made);
     Py_END_ALLOW_THREADS;
-    PyObject* const made_object = executor_made(type, handle, &outcome);
-    if (made_object && vram) ((Executor*)made_object)->borrowed = Py_NewRef(vram);
-    return made_object;
+    return executor_made(type, handle, &outcome);
 }
 
-static char const doc_Executor_for_vram[] =                                                  //
-    "for_vram(devices=None, *, scratch_limit=0, deferred_limit=0) answers an executor of\n"  //
-    "CUDA devices.\n"                                                                        //
-    "\n"                                                                                     //
-    "One host thread drives each device. No engine places a database in VRAM yet, so it\n"   //
-    "serves as the `vram` of Executor.for_nvme(), whose compactions run on its devices.\n"   //
-    "Calls `ustore_executor_for_vram`.\n"                                                    //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  devices (Sequence[int], optional): CUDA ordinals; None takes every visible device.\n" //
-    "  scratch_limit (int, optional): Bytes of device memory the scratch may take on each\n" //
-    "    device; zero takes 256 MiB.\n"                                                      //
-    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero\n"    //
-    "    takes the library's default.\n"                                                     //
-    "Returns:\n"                                                                             //
-    "  Executor: The new executor.\n"                                                        //
-    "Raises:\n"                                                                              //
-    "  UnsupportedError: This build carries no CUDA devices.\n"                              //
-    "  DeviceError: No device is visible, or an ordinal names none.";
+static char const doc_Executor_for_vram[] =                                                    //
+    "for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC, deferred_limit=0) answers an\n"   //
+    "executor of one CUDA device.\n"                                                           //
+    "\n"                                                                                       //
+    "Every call queues on one stream of the device, so one host thread keeps it fed, and\n"    //
+    "every arena it makes lives there; a multi-GPU caller makes one per device.\n"             //
+    "Database.open_nvme() takes one as its `compactions`. Calls `ustore_executor_for_vram`.\n" //
+    "\n"                                                                                       //
+    "Args:\n"                                                                                  //
+    "  device (int): The CUDA ordinal of the device.\n"                                        //
+    "  scratch_limit (int, optional): Bytes of device scratch a call or a merge takes; zero\n" //
+    "    lets scratch grow as calls ask.\n"                                                    //
+    "  gds (Gds, optional): How bytes move between the drives and the device.\n"               //
+    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero\n"      //
+    "    takes the library's default.\n"                                                       //
+    "Returns:\n"                                                                               //
+    "  Executor: The new executor.\n"                                                          //
+    "Raises:\n"                                                                                //
+    "  UnsupportedError: This build carries no CUDA devices.\n"                                //
+    "  DeviceError: No device carries the ordinal.";
 
 static PyObject* Executor_for_vram(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
                                    PyObject* args_names_tuple) {
-    static char const* const names[] = {"devices", "scratch_limit", "deferred_limit"};
-    PyObject* values[3];
-    size_t scratch_limit = 0, deferred_limit = 0, devices_count = 0;
-    int32_t* devices = NULL;
-    if (factory_arguments("for_vram", args, positional_args_count, args_names_tuple, names, values, 3, 1, 0) != 0 ||
+    static char const* const names[] = {"device", "scratch_limit", "gds", "deferred_limit"};
+    PyObject* values[4];
+    size_t scratch_limit = 0, deferred_limit = 0;
+    long device = 0;
+    int gds = ustore_gds_automatic_k;
+    if (factory_arguments("for_vram", args, positional_args_count, args_names_tuple, names, values, 4, 1, 0) != 0 ||
         (values[1] && ustore_py_size_from_object(values[1], "scratch_limit", &scratch_limit) != 0) ||
-        (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0) ||
-        identifiers_from_object(values[0], "devices", &devices, &devices_count) != 0)
+        (values[2] && ustore_py_enum_from_object(values[2], "gds", ustore_py_enum_gds_k, &gds) != 0) ||
+        (values[3] && ustore_py_size_from_object(values[3], "deferred_limit", &deferred_limit) != 0))
         return NULL;
+    if (!values[0]) {
+        PyErr_SetString(PyExc_TypeError, "for_vram() needs the CUDA ordinal of its device");
+        return NULL;
+    }
+    device = PyLong_AsLong(values[0]);
+    if (device == -1 && PyErr_Occurred()) return NULL;
+    if (device < INT32_MIN || device > INT32_MAX) {
+        PyErr_SetString(PyExc_OverflowError, "The 'device' ordinal does not fit 32 bits");
+        return NULL;
+    }
 
     ustore_executor_t handle = NULL;
     ustore_outcome_t outcome = {0};
     ustore_executor_for_vram_t made = {
         .executor = &handle,
         .outcome = &outcome,
-        .devices = devices,
-        .devices_count = (ustore_size_t)devices_count,
+        .device = (int32_t)device,
         .scratch_limit = (ustore_size_t)scratch_limit,
+        .gds = (ustore_gds_t)gds,
         .deferred_limit = (ustore_size_t)deferred_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_vram(&made);
     Py_END_ALLOW_THREADS;
-    PyMem_Free(devices);
     return executor_made(type, handle, &outcome);
 }
 
 /** Frees the threads of @p executor once its calls finish, leaving the object to refuse further calls. */
 static void executor_close(Executor* executor) {
     ustore_executor_t handle = NULL;
-    PyObject* borrowed = NULL;
     ustore_py_critical_section_begin_((PyObject*)executor);
     handle = executor->handle;
     executor->handle = NULL;
-    borrowed = executor->borrowed;
-    executor->borrowed = NULL;
     ustore_py_critical_section_end_();
     if (handle) {
         Py_BEGIN_ALLOW_THREADS;
         ustore_executor_free(handle);
         Py_END_ALLOW_THREADS;
     }
-    // The borrowed executor goes only once the one borrowing it has freed its threads
-    Py_XDECREF(borrowed);
 }
 
 static void Executor_dealloc(Executor* self) {

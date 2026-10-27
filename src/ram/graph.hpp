@@ -167,7 +167,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_scan_
 #pragma region Table
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-graph_verbs_t const ram_variant<cpu_class_, isolation_>::graph_verbs_k {
+graph_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::graph_verbs_k {
     .read_edges = &serve_database<cpu_class_, isolation_, ustore_graph_read_edges_t>,
     .write_edges = &serve_database<cpu_class_, isolation_, ustore_graph_write_edges_t>,
     .remove_edges = &serve_database<cpu_class_, isolation_, ustore_graph_remove_edges_t>,

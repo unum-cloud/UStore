@@ -49,7 +49,7 @@ class scoped_arena_t {
 /** How many blocks the chain of @p arena holds. */
 std::size_t blocks_in(ustore_arena_t arena) noexcept {
     std::size_t count = 0;
-    for (arena_block_t const* block = arena->newest; block; block = block->previous) ++count;
+    for (arena_block_t const* block = host_blocks_of(arena)->newest; block; block = block->previous) ++count;
     return count;
 }
 
@@ -73,7 +73,7 @@ std::size_t arena_alignment() {
         failures += expect_eq(reinterpret_cast<std::uintptr_t>(run.data()) % arena_alignment_k, 0u);
     }
     failures += expect_eq(blocks_in(arena), 1u);
-    failures += expect_eq(arena->newest->capacity, arena_page_bytes_k);
+    failures += expect_eq(host_blocks_of(arena)->newest->capacity, arena_page_bytes_k);
 
     auto [bits, bits_status] = arena_allocate_bits(arena, 13);
     failures += expect_status(bits_status, status_code_t::success_k);
@@ -89,20 +89,20 @@ std::size_t arena_growth_and_rewind() {
 
     auto [first, first_status] = arena_allocate<byte_t>(arena, 100);
     failures += expect_status(first_status, status_code_t::success_k);
-    std::size_t const first_capacity = arena->newest->capacity;
+    std::size_t const first_capacity = host_blocks_of(arena)->newest->capacity;
 
     auto [large, large_status] = arena_allocate<byte_t>(arena, 3 * arena_page_bytes_k);
     failures += expect_status(large_status, status_code_t::success_k);
     failures += expect_eq(large.size(), 3 * arena_page_bytes_k);
     failures += expect_eq(blocks_in(arena), 2u);
-    failures += expect(arena->newest->capacity >= 2 * first_capacity);
-    failures += expect_eq(arena->newest->capacity % arena_page_bytes_k, 0u);
+    failures += expect(host_blocks_of(arena)->newest->capacity >= 2 * first_capacity);
+    failures += expect_eq(host_blocks_of(arena)->newest->capacity % arena_page_bytes_k, 0u);
 
-    std::size_t const newest_capacity = arena->newest->capacity;
+    std::size_t const newest_capacity = host_blocks_of(arena)->newest->capacity;
     arena_rewind(arena);
     failures += expect_eq(blocks_in(arena), 1u);
-    failures += expect_eq(arena->newest->capacity, newest_capacity);
-    failures += expect_eq(arena->newest->used, sizeof(arena_block_t));
+    failures += expect_eq(host_blocks_of(arena)->newest->capacity, newest_capacity);
+    failures += expect_eq(host_blocks_of(arena)->newest->used, sizeof(arena_block_t));
     return failures;
 }
 

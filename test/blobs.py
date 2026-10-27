@@ -345,6 +345,31 @@ def test_measure(view, blobs, arena):
     assert bounds.max_value_bytes >= bounds.min_value_bytes
 
 
+def test_scan_patterns_predicates_and_scores(view, blobs, arena):
+    """Patterns narrow a scan by value, weighted substrings score BM25, and a predicate admits keys page by page."""
+    view.write([1, 2, 3, 4], [b"Apple", b"banana", b"cherry", b"avocado"], collection=blobs)
+    matched = view.scan(0, 8, arena, collection=blobs, patterns=["^a"], sensitivity=ustore.CaseSensitivity.UNCASED)
+    assert list(matched[0]) == keys([1, 4])
+    scored = view.scan(
+        0, 8, arena, collection=blobs, patterns=[b"an"], pattern_kind=ustore.PatternKind.SUBSTRINGS, weights=[2.0]
+    )
+    assert list(scored[0]) == keys([2])
+    assert scored.scores == pytest.approx((2.0 * 2.0 * 2.2 / (2.0 + 1.2),))
+    asked: list[int] = []
+    admitted = view.scan(
+        0,
+        2,
+        arena,
+        collection=blobs,
+        predicate=lambda page: asked.append(len(page)) or [key.int % 2 == 0 for key in page],
+        predicate_cost=ustore.PredicateCost.EXPENSIVE,
+    )
+    assert list(admitted[0]) == keys([2, 4])
+    assert asked == [2, 2]
+    with pytest.raises(ustore.InvalidArgumentError):
+        view.scan(0, 8, arena, collection=blobs, patterns=["("])
+
+
 # endregion Scans and Samples
 
 # region Cursors
@@ -525,7 +550,7 @@ def test_close_waits_for_deferred_calls(open_database):
         assert writing.wait() is None
 
 
-def test_an_executor_serves_the_memory_domains_named(database, blobs):
+def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path):
     """Every host has NUMA node zero, an identifier no node carries is refused, and so is a null pool."""
     with ustore.Executor.for_ram(threads=1, memory_domains=[0], deferred_limit=4) as executor:
         database.on(executor).set(1, b"a", collection=blobs)
@@ -534,14 +559,15 @@ def test_an_executor_serves_the_memory_domains_named(database, blobs):
         ustore.Executor.for_ram(memory_domains=[1 << 20])
     with pytest.raises(ustore.InvalidArgumentError):
         ustore.Executor.on_pool(0)
+    # Merges take a VRAM executor alone, and a build without NVMe refuses the open before reading it
     with (
         ustore.Executor.for_nvme(1, transport=ustore.Transport.BLOCKING, queue_depth=32) as executor,
-        pytest.raises(ustore.DeviceError),
+        pytest.raises((ustore.DeviceError, ustore.UnsupportedError)),
     ):
-        ustore.Executor.for_nvme(vram=executor)
+        ustore.Database.open_nvme(tmp_path, compactions=executor)
     # A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries
     with pytest.raises((ustore.UnsupportedError, ustore.DeviceError)):
-        ustore.Executor.for_vram([1 << 20])
+        ustore.Executor.for_vram(1 << 20, gds=ustore.Gds.COMPAT)
 
 
 def test_a_database_opens_on_an_executor(engine: str, tmp_path):

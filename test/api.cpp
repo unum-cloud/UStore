@@ -31,7 +31,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_block_t`, `arena_alignment_k`
 #include "ustore/utilities/ram_device.hpp"  // `caller_exclusivity_t`, `executor_t`
 
-#include "engine.hpp"  // `engine_t`, `handle_t`, `c_handle`
+#include "engine.hpp"  // `engine_t`, `ustore_database_handle_t`
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_failure`, `expect_status`, `spin_until`
 
 using namespace unum::ustore;
@@ -848,7 +848,7 @@ std::size_t expect_only_outputs(ustore_arena_t arena, std::span<output_extent_t>
         return address(left.begin) < address(right.begin);
     });
     std::size_t tiled = 0;
-    for (arena_block_t const* block = arena->newest; block; block = block->previous) {
+    for (arena_block_t const* block = host_blocks_of(arena)->newest; block; block = block->previous) {
         std::uintptr_t const block_begin = address(block);
         std::uintptr_t end = block_begin + sizeof(arena_block_t);
         for (output_extent_t const& output : outputs) {
@@ -871,7 +871,7 @@ std::size_t expect_only_outputs(ustore_arena_t arena, std::span<output_extent_t>
  *  a second, and still tile both. */
 std::size_t expect_outgrown_outputs(ustore_arena_t arena, std::span<output_extent_t> outputs) {
     std::size_t failures = 0;
-    arena_block_t const* const newest = arena->newest;
+    arena_block_t const* const newest = host_blocks_of(arena)->newest;
     failures += expect(newest && newest->previous && !newest->previous->previous);
     if (failures != 0) return failures;
     failures += expect_eq(newest->previous->capacity, arena_page_bytes_k);
@@ -1328,10 +1328,10 @@ void leave_database(ustore_database_t) noexcept {}
 database_verbs_t const progress_database_verbs_k {.database_free = &leave_database};
 
 /** The stand-in engine's only blobs verb, a scan reporting its progress once. */
-blobs_verbs_t const progress_blobs_verbs_k {.scan = &scan_reporting_progress};
+blobs_verbs<home_t::host_k> const progress_blobs_verbs_k {.scan = &scan_reporting_progress};
 
 /** An engine serving only scans, each reporting its progress once, so a call stays unfinished while a case needs. */
-engine_t const progress_engine_k {.database = &progress_database_verbs_k, .blobs = &progress_blobs_verbs_k};
+engine_t const progress_engine_k {.database = &progress_database_verbs_k, .host = {.blobs = &progress_blobs_verbs_k}};
 
 /** How far a scan held inside its progress callback got. */
 enum class hold_stage_t : std::uint32_t {
@@ -1344,7 +1344,7 @@ enum class hold_stage_t : std::uint32_t {
 /** A deferred scan on the stand-in engine, its callback holding it until the case releases it, with what a drain of
  *  its own executor answered from inside that callback. */
 struct held_scan_t {
-    handle_t database {&progress_engine_k};
+    ustore_database_handle_t database {&progress_engine_k};
     ustore_executor_t executor = nullptr;
     hold_stage_t stage = hold_stage_t::submitted_k;
     ustore_status_t drained = ustore_status_success_k;
@@ -1378,7 +1378,7 @@ std::size_t submit_held(held_scan_t& held, ustore_executor_t executor) noexcept 
     held.arena = std::move(arena);
     held.executor = executor;
     held.scan = {
-        .database = c_handle<ustore_database_t>(&held.database),
+        .database = &held.database,
         .executor = executor,
         .outcome = &held.outcome,
         .completion = ustore_completion_deferred_k,
@@ -1901,12 +1901,11 @@ std::size_t executor_on_pool(config_t const& config) {
     return failures;
 }
 
-/** A call whose database or arena lives where its executor does not compute is refused with @c ustore_status_device_k.
- *  Host pages are the only residency a build makes, so the stand-in database and then the arena claim another. */
-std::size_t executor_residency_mismatch(config_t const&) {
+/** A call on a host executor given an arena on a device is refused with @c ustore_status_device_k, and served once
+ *  the arena lives on host pages again. A build without CUDA makes no device arena, so the case moves one by hand. */
+std::size_t executor_arena_on_device(config_t const&) {
     std::size_t failures = 0;
-    residency_t const elsewhere = static_cast<residency_t>(1);
-    handle_t database {&progress_engine_k};
+    ustore_database_handle_t database {&progress_engine_k};
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
@@ -1916,7 +1915,7 @@ std::size_t executor_residency_mismatch(config_t const&) {
     ustore_key_t const* keys = nullptr;
     ustore_outcome_t outcome {};
     ustore_blobs_scan_t scan {
-        .database = c_handle<ustore_database_t>(&database),
+        .database = &database,
         .outcome = &outcome,
         .count = 1,
         .collections = {&blobs, 0},
@@ -1925,17 +1924,12 @@ std::size_t executor_residency_mismatch(config_t const&) {
         .arena = arena,
         .wanted = 1,
     };
-    database.residency = elsewhere;
-    ustore_blobs_scan(&scan);
-    failures += expect_status(outcome, status_code_t::device_k);
-
-    database.residency = residency_t::host_k;
     ustore_arena_t const placed = arena;
-    placed->residency = elsewhere;
+    placed->memory = cuda_blocks_t {.device = 0};
     ustore_blobs_scan(&scan);
     failures += expect_status(outcome, status_code_t::device_k);
 
-    placed->residency = residency_t::host_k;
+    placed->memory = host_blocks_t {};
     ustore_blobs_scan(&scan);
     failures += expect_success(outcome);
     return failures;
@@ -1971,7 +1965,9 @@ std::size_t database_free_waits(config_t const&) {
     std::atomic_ref<hold_stage_t> const stage {held.stage};
     stage.store(hold_stage_t::released_k, std::memory_order_release);
     stage.notify_all();
-    ustore_database_free(c_handle<ustore_database_t>(&held.database));
+    // A second hold keeps the router from deleting the case's own handle once the free stops waiting
+    held.database.holds = 2;
+    ustore_database_free(&held.database);
     failures += expect(ustore_outcome_status(&held.outcome) == ustore_status_success_k);
     failures += expect(stage.load(std::memory_order_acquire) == hold_stage_t::returned_k);
     ustore_executor_free(executor);
@@ -2783,6 +2779,10 @@ std::size_t closed_set_names(config_t const&) {
     failures += expect_spellings(ustore_drop_mode_name, ustore_drop_mode_from_name, 3);
     failures += expect_spellings(ustore_isolation_name, ustore_isolation_from_name, 2);
     failures += expect_spellings(ustore_transport_name, ustore_transport_from_name, 5);
+    failures += expect_spellings(ustore_gds_name, ustore_gds_from_name, 3);
+    failures += expect_spellings(ustore_pattern_kind_name, ustore_pattern_kind_from_name, 2);
+    failures += expect_spellings(ustore_case_sensitivity_name, ustore_case_sensitivity_from_name, 2);
+    failures += expect_spellings(ustore_predicate_cost_name, ustore_predicate_cost_from_name, 2);
     failures += expect_spellings(ustore_engine_name, ustore_engine_from_name, 4);
     failures += expect_spellings(ustore_modality_name, ustore_modality_from_name, 5);
     failures += expect_spellings(ustore_vertex_role_name, ustore_vertex_role_from_name, 4);
@@ -3383,7 +3383,7 @@ std::size_t executor_memory_domains(config_t const&) {
     failures += expect_success(outcome);
     auto [arena, arena_status] = arena_t::make(executor);
     failures += expect(arena_status.succeeded());
-    if (arena_status.succeeded()) failures += expect_eq(static_cast<ustore_arena_t>(arena)->memory_domain, known);
+    if (arena_status.succeeded()) failures += expect_eq(host_blocks_of(arena)->memory_domain, known);
     ustore_executor_free(executor);
 
     // Zero threads take 7/8 of the cores of every domain the process may allocate on
@@ -3786,6 +3786,410 @@ case_result_t snapshot_save_recorded(config_t const& config) {
     return failures;
 }
 
+/** Counts the calls of a predicate admitting every key whose last byte is even, and the keys it was asked about. */
+struct even_keys_predicate_t {
+    std::size_t calls = 0;
+    std::size_t asked = 0;
+};
+
+/** Admits every key of @p keys whose last byte is even, counting the call in @p state. */
+void admit_even_keys(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count,
+                     void* state) noexcept {
+    even_keys_predicate_t& counted = *static_cast<even_keys_predicate_t*>(state);
+    ++counted.calls;
+    counted.asked += count;
+    for (ustore_size_t index = 0; index != count; ++index)
+        admissions[index] = keys[index].uuid.bytes[15] % 2 == 0 ? ustore_admit_k : ustore_reject_k;
+}
+
+/** A predicate narrows every scan page by page: each page of @c wanted listed keys asks it once, cheap or expensive,
+ *  and the scan keeps listing until @c wanted keys survive or the collection ends. */
+std::size_t scan_predicate_per_page(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "scan_predicate_per_page.blobs", ustore_modality_blobs_k);
+    auto [graph, graph_status] = create_collection(database, "scan_predicate_per_page.graph", ustore_modality_graph_k);
+    failures += expect(blobs_status.succeeded() && graph_status.succeeded());
+    if (failures != 0) return failures;
+
+    std::array<ustore_key_t, 10> keys {};
+    for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = key_from_integer(1 + index);
+    failures += write_text(database, blobs, keys, "value");
+    ustore_outcome_t outcome {};
+    ustore_graph_write_vertices_t write_vertices {.database = database,
+                                                  .outcome = &outcome,
+                                                  .count = keys.size(),
+                                                  .collections = {&graph, 0},
+                                                  .vertices = {keys.data(), sizeof(ustore_key_t)}};
+    ustore_graph_write_vertices(&write_vertices);
+    failures += expect_success(outcome);
+
+    for (ustore_predicate_cost_t const cost : {ustore_predicate_cheap_k, ustore_predicate_expensive_k}) {
+        even_keys_predicate_t counted;
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* found = nullptr;
+        ustore_blobs_scan_t scan {.database = database,
+                                  .outcome = &outcome,
+                                  .count = 1,
+                                  .collections = {&blobs, 0},
+                                  .predicate = {&admit_even_keys, &counted, cost},
+                                  .offsets = &offsets,
+                                  .keys = &found,
+                                  .arena = arena,
+                                  .wanted = 3};
+        ustore_blobs_scan(&scan);
+        failures += expect_success(outcome);
+        if (failures != 0) return failures;
+        // Pages [1,3] and [4,6] keep 2, 4 and 6, so the third page is never listed
+        failures += expect_eq(offsets[1], 3u);
+        failures += expect(found[0] == keys[1] && found[1] == keys[3] && found[2] == keys[5]);
+        failures += expect_eq(counted.calls, 2u);
+        failures += expect_eq(counted.asked, 6u);
+
+        even_keys_predicate_t vertices_counted;
+        ustore_graph_scan_vertices_t vertices {.database = database,
+                                               .outcome = &outcome,
+                                               .count = 1,
+                                               .collections = {&graph, 0},
+                                               .predicate = {&admit_even_keys, &vertices_counted, cost},
+                                               .offsets = &offsets,
+                                               .keys = &found,
+                                               .arena = arena,
+                                               .wanted = 4};
+        ustore_graph_scan_vertices(&vertices);
+        failures += expect_success(outcome);
+        if (failures != 0) return failures;
+        // Pages [1,4], [5,8] and the short [9,10] keep the five even vertices, of which four fit
+        failures += expect_eq(offsets[1], 4u);
+        failures += expect(found[3] == keys[7]);
+        failures += expect_eq(vertices_counted.calls, 2u);
+    }
+
+    ustore_length_t const* offsets = nullptr;
+    ustore_key_t const* found = nullptr;
+    ustore_blobs_scan_t refused {.database = database,
+                                 .outcome = &outcome,
+                                 .count = 1,
+                                 .collections = {&blobs, 0},
+                                 .predicate = {&admit_even_keys, nullptr, static_cast<ustore_predicate_cost_t>(7)},
+                                 .offsets = &offsets,
+                                 .keys = &found,
+                                 .arena = arena,
+                                 .wanted = 3};
+    ustore_blobs_scan(&refused);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+    return failures;
+}
+
+/** An unordered scan of a collection written once lists the same set of keys as the ordered one. */
+std::size_t scan_unordered_matches_ordered(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    auto [other_arena, other_arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded() && other_arena_status.succeeded());
+    if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "scan_unordered.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
+    if (failures != 0) return failures;
+    std::array<ustore_key_t, 40> keys {};
+    for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = key_from_integer(7000 + index * 13);
+    failures += write_text(database, blobs, keys, "value");
+
+    auto list = [&](ustore_scan_mode_t mode, ustore_arena_t into, std::span<ustore_key_t const>& listed) {
+        ustore_outcome_t outcome {};
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* found = nullptr;
+        ustore_blobs_scan_t scan {.database = database,
+                                  .outcome = &outcome,
+                                  .count = 1,
+                                  .collections = {&blobs, 0},
+                                  .offsets = &offsets,
+                                  .keys = &found,
+                                  .arena = into,
+                                  .wanted = keys.size() * 2,
+                                  .mode = mode};
+        ustore_blobs_scan(&scan);
+        std::size_t const listing_failures = expect_success(outcome) + expect(offsets != nullptr);
+        if (!listing_failures) listed = {found + offsets[0], found + offsets[1]};
+        return listing_failures;
+    };
+    std::span<ustore_key_t const> ordered, unordered;
+    failures += list(ustore_scan_ordered_k, arena, ordered);
+    failures += list(ustore_scan_unordered_k, other_arena, unordered);
+    if (failures != 0) return failures;
+    failures += expect_eq(ordered.size(), keys.size());
+    std::array<ustore_key_t, keys.size()> sorted {};
+    failures += expect_eq(unordered.size(), keys.size());
+    if (failures != 0) return failures;
+    std::copy(unordered.begin(), unordered.end(), sorted.begin());
+    std::sort(sorted.begin(), sorted.end());
+    failures += expect(std::equal(sorted.begin(), sorted.end(), ordered.begin(), ordered.end()));
+    return failures;
+}
+
+/** Documents, pages and vertices each walk through a cursor of their own, page after page, with a predicate compiled
+ *  once at init narrowing every page, and documents and pages read their values in the same pull. */
+std::size_t cursors_per_modality(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    auto [docs, docs_status] = create_collection(database, "cursors.docs", ustore_modality_docs_k);
+    auto [graph, graph_status] = create_collection(database, "cursors.graph", ustore_modality_graph_k);
+    auto [pages, pages_status] = create_collection(database, "cursors.pages", ustore_modality_pages_k);
+    failures += expect(docs_status.succeeded() && graph_status.succeeded() && pages_status.succeeded());
+    if (failures != 0) return failures;
+
+    std::array<ustore_key_t, 5> keys {};
+    for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = key_from_integer(2400 + index);
+    std::string_view const text = R"({"a":1})";
+    strided_strings<std::string_view> const documents {{&text, 0}};
+    ustore_outcome_t outcome {};
+    ustore_docs_write_t write_documents {.database = database,
+                                         .outcome = &outcome,
+                                         .count = keys.size(),
+                                         .collections = {&docs, 0},
+                                         .keys = {keys.data(), sizeof(ustore_key_t)},
+                                         .values = documents.view()};
+    ustore_docs_write(&write_documents);
+    failures += expect_success(outcome);
+    ustore_graph_write_vertices_t write_vertices {.database = database,
+                                                  .outcome = &outcome,
+                                                  .count = keys.size(),
+                                                  .collections = {&graph, 0},
+                                                  .vertices = {keys.data(), sizeof(ustore_key_t)}};
+    ustore_graph_write_vertices(&write_vertices);
+    failures += expect_success(outcome);
+    std::string_view const markup = "<a/>";
+    strided_strings<std::string_view> const markups {{&markup, 0}};
+    ustore_pages_import_t import {};
+    import.database = database, import.outcome = &outcome, import.count = keys.size(), import.collections = {&pages, 0};
+    import.keys = {keys.data(), sizeof(ustore_key_t)}, import.values = markups.view();
+    import.encoding = ustore_page_encoding_xml_k;
+    ustore_pages_import(&import);
+    failures += expect_success(outcome);
+    if (failures != 0) return failures;
+
+    // Keys 2400 to 2404 hold three even ones, which pages of two hand out as two and then one
+    auto walk = [&]<typename init_type_, typename next_type_, typename cursor_type_>(
+                    void (*init)(init_type_*), void (*next)(next_type_*), void (*free)(cursor_type_),
+                    ustore_collection_id_t collection) {
+        std::size_t walk_failures = 0;
+        even_keys_predicate_t counted;
+        cursor_type_ cursor = nullptr;
+        init_type_ opened {};
+        opened.cursor = &cursor, opened.database = database, opened.outcome = &outcome;
+        opened.collection = collection, opened.start_key = keys[0];
+        opened.predicate = {&admit_even_keys, &counted, ustore_predicate_expensive_k};
+        init(&opened);
+        walk_failures += expect_success(outcome);
+        if (walk_failures) return walk_failures;
+        std::array<std::size_t, 3> const pulled {2, 1, 0};
+        for (std::size_t const expected_count : pulled) {
+            ustore_key_t const* found = nullptr;
+            ustore_strings_view_t values {};
+            ustore_size_t written = 0;
+            next_type_ pull {};
+            pull.database = database, pull.outcome = &outcome, pull.cursor = cursor, pull.keys = &found;
+            pull.written = &written, pull.arena = arena, pull.wanted = 2;
+            if constexpr (requires { pull.values; }) pull.values = &values;
+            if constexpr (requires { pull.outputs_encoding; }) pull.outputs_encoding = ustore_page_encoding_xml_k;
+            next(&pull);
+            walk_failures += expect_success(outcome);
+            walk_failures += expect_eq(written, expected_count);
+            if (written) walk_failures += expect(found[0].uuid.bytes[15] % 2 == 0);
+            if constexpr (requires { pull.values; })
+                if (written) walk_failures += expect(tape_written(values));
+        }
+        free(cursor);
+        return walk_failures;
+    };
+    failures += walk(&ustore_docs_cursor_init, &ustore_docs_cursor_next, &ustore_docs_cursor_free, docs);
+    failures += walk(&ustore_pages_cursor_init, &ustore_pages_cursor_next, &ustore_pages_cursor_free, pages);
+    failures += walk(&ustore_graph_vertices_cursor_init, &ustore_graph_vertices_cursor_next,
+                     &ustore_graph_vertices_cursor_free, graph);
+    return failures;
+}
+
+/** Patterns narrow blobs and strings scans by their values, filters narrow documents and pages, a pattern that does not
+ *  compile is refused with StringZilla's message, and a cursor keeps the patterns it compiled at init. */
+std::size_t scan_patterns_and_filters(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "scan_patterns.blobs", ustore_modality_blobs_k);
+    auto [docs, docs_status] = create_collection(database, "scan_patterns.docs", ustore_modality_docs_k);
+    auto [pages, pages_status] = create_collection(database, "scan_patterns.pages", ustore_modality_pages_k);
+    failures += expect(blobs_status.succeeded() && docs_status.succeeded() && pages_status.succeeded());
+    if (failures != 0) return failures;
+
+    std::array<ustore_key_t, 4> keys {};
+    for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = key_from_integer(3100 + index);
+    std::array<std::string_view, 4> const fruits {"Apple", "banana", "cherry", "avocado"};
+    std::array<std::string_view, 4> const documents {R"({"age":25})", R"({"age":40})", R"({"name":"x"})",
+                                                     R"({"age":31})"};
+    std::array<std::string_view, 4> const markups {"<a><b/></a>", "<a/>", "<c><b>t</b></c>", "<a><c/></a>"};
+    ustore_outcome_t outcome {};
+    for (std::size_t index = 0; index != keys.size(); ++index)
+        failures += write_text(database, blobs, {&keys[index], 1}, fruits[index]);
+    strided_strings<std::string_view> const documents_view {strided(documents).begin()};
+    ustore_docs_write_t write_documents {.database = database,
+                                         .outcome = &outcome,
+                                         .count = keys.size(),
+                                         .collections = {&docs, 0},
+                                         .keys = {keys.data(), sizeof(ustore_key_t)},
+                                         .values = documents_view.view()};
+    ustore_docs_write(&write_documents);
+    failures += expect_success(outcome);
+    strided_strings<std::string_view> const markups_view {strided(markups).begin()};
+    ustore_pages_import_t import {};
+    import.database = database, import.outcome = &outcome, import.count = keys.size(), import.collections = {&pages, 0};
+    import.keys = {keys.data(), sizeof(ustore_key_t)}, import.values = markups_view.view();
+    import.encoding = ustore_page_encoding_xml_k;
+    ustore_pages_import(&import);
+    failures += expect_success(outcome);
+    if (failures != 0) return failures;
+
+    // Lists through @p scan with its match fields set by @p narrow, comparing with the indices of @p wanted
+    auto expect_matched = [&]<typename scan_type_>(void (*scan)(scan_type_*), ustore_collection_id_t collection,
+                                                   auto&& narrow, std::initializer_list<std::size_t> wanted,
+                                                   status_code_t refused = status_code_t::success_k) {
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* found = nullptr;
+        scan_type_ arguments {};
+        arguments.database = database, arguments.outcome = &outcome, arguments.count = 1;
+        arguments.collections = {&collection, 0}, arguments.offsets = &offsets, arguments.keys = &found;
+        arguments.arena = arena, arguments.wanted = 8;
+        narrow(arguments);
+        scan(&arguments);
+        if (refused != status_code_t::success_k) return expect_status(status_t {outcome}, refused);
+        std::size_t listing_failures = expect_success(outcome) + expect(offsets != nullptr);
+        if (listing_failures) return listing_failures;
+        listing_failures += expect_eq(static_cast<std::size_t>(offsets[1]), wanted.size());
+        std::size_t position = 0;
+        for (std::size_t const index : wanted)
+            if (position < offsets[1]) listing_failures += expect(found[position++] == keys[index]);
+        return listing_failures;
+    };
+    // Every call reuses one pair of offsets, read only while the call compiles its patterns
+    std::array<std::uint32_t, 2> offsets {};
+    auto patterns_of = [&](std::string_view const& text, ustore_pattern_kind_t kind,
+                           ustore_case_sensitivity_t sensitivity = ustore_cased_k) {
+        offsets = {0, static_cast<std::uint32_t>(text.size())};
+        return ustore_patterns_t {.patterns = u32_tape(text.data(), offsets.data()),
+                                  .count = 1,
+                                  .kind = kind,
+                                  .sensitivity = sensitivity};
+    };
+    std::string_view const starts_with_a = "^a";
+    std::string_view const an = "an";
+    std::string_view const unbalanced = "(";
+    failures += expect_matched(
+        &ustore_blobs_scan, blobs,
+        [&](ustore_blobs_scan_t& scan) { scan.patterns = patterns_of(starts_with_a, ustore_pattern_regex_k); }, {3});
+    failures += expect_matched(&ustore_blobs_scan, blobs,
+                               [&](ustore_blobs_scan_t& scan) {
+                                   scan.patterns = patterns_of(starts_with_a, ustore_pattern_regex_k, ustore_uncased_k);
+                               },
+                               {0, 3});
+    failures += expect_matched(
+        &ustore_blobs_scan, blobs,
+        [&](ustore_blobs_scan_t& scan) { scan.patterns = patterns_of(an, ustore_pattern_substrings_k); }, {1});
+    failures += expect_matched(
+        &ustore_blobs_scan, blobs,
+        [&](ustore_blobs_scan_t& scan) { scan.patterns = patterns_of(unbalanced, ustore_pattern_regex_k); }, {},
+        status_code_t::invalid_argument_k);
+
+    // A weighted substring scores BM25 with no length normalization: "banana" holds "an" twice, overlapping or not
+    float const weight = 2.0f;
+    float const* scores = nullptr;
+    failures += expect_matched(&ustore_blobs_scan, blobs,
+                               [&](ustore_blobs_scan_t& scan) {
+                                   scan.patterns = patterns_of(an, ustore_pattern_substrings_k);
+                                   scan.patterns.weights = &weight;
+                                   scan.scores = &scores;
+                               },
+                               {1});
+    failures += expect(scores != nullptr);
+    if (scores) failures += expect_near(scores[0], 2.0 * (2.0 * 2.2) / (2.0 + 1.2));
+    failures += expect_matched(
+        &ustore_blobs_scan, blobs,
+        [&](ustore_blobs_scan_t& scan) {
+            scan.patterns = patterns_of(starts_with_a, ustore_pattern_regex_k);
+            scan.patterns.weights = &weight;
+        },
+        {}, status_code_t::invalid_argument_k);
+
+    auto [strings, strings_status] = create_collection(database, "scan_patterns.strings", ustore_modality_strings_k);
+    failures += expect(strings_status.succeeded());
+    strided_strings<std::string_view> const fruits_view {strided(fruits).begin()};
+    ustore_strings_write_t write_strings {.database = database,
+                                          .outcome = &outcome,
+                                          .count = keys.size(),
+                                          .collections = {&strings, 0},
+                                          .strings = fruits_view.view(),
+                                          .values = {keys.data(), sizeof(ustore_key_t)}};
+    ustore_strings_write(&write_strings);
+    failures += expect_success(outcome);
+    ustore_length_t const* strings_offsets = nullptr;
+    ustore_strings_view_t listed {};
+    ustore_strings_scan_t strings_scan {.database = database,
+                                        .outcome = &outcome,
+                                        .count = 1,
+                                        .collections = {&strings, 0},
+                                        .patterns = patterns_of(starts_with_a, ustore_pattern_regex_k),
+                                        .offsets = &strings_offsets,
+                                        .strings = &listed,
+                                        .arena = arena,
+                                        .wanted = 8};
+    ustore_strings_scan(&strings_scan);
+    failures += expect_success(outcome);
+    // Strings come in byte order, where "Apple" sorts first but only "avocado" starts with a lowercase "a"
+    failures += expect(strings_offsets && strings_offsets[1] == 1 && tape_string(listed, 0).length == 7);
+
+    std::string_view const older = "?@.age > 30";
+    std::string_view const holds_b = "//b";
+    failures += expect_matched(&ustore_docs_scan, docs,
+                               [&](ustore_docs_scan_t& scan) { scan.filter = bytes_of(older); }, {1, 3});
+    failures += expect_matched(&ustore_pages_scan, pages,
+                               [&](ustore_pages_scan_t& scan) { scan.filter = bytes_of(holds_b); }, {0, 2});
+
+    ustore_blobs_cursor_t cursor = nullptr;
+    ustore_blobs_cursor_init_t opened {.cursor = &cursor,
+                                       .database = database,
+                                       .outcome = &outcome,
+                                       .collection = blobs,
+                                       .start_key = keys[0],
+                                       .patterns = patterns_of(an, ustore_pattern_substrings_k)};
+    ustore_blobs_cursor_init(&opened);
+    failures += expect_success(outcome);
+    if (failures != 0) return failures;
+    ustore_key_t const* found = nullptr;
+    ustore_size_t written = 0;
+    ustore_blobs_cursor_next_t pull {.database = database,
+                                     .outcome = &outcome,
+                                     .cursor = cursor,
+                                     .keys = &found,
+                                     .written = &written,
+                                     .arena = arena,
+                                     .wanted = 1};
+    ustore_blobs_cursor_next(&pull);
+    failures += expect_success(outcome);
+    failures += expect(written == 1 && found[0] == keys[1]);
+    ustore_blobs_cursor_next(&pull);
+    failures += expect_success(outcome);
+    failures += expect_eq(written, 0u);
+    ustore_blobs_cursor_free(cursor);
+    return failures;
+}
+
 int main(int argc, char** argv) {
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -3842,7 +4246,11 @@ int main(int argc, char** argv) {
     report(totals, "executor.contended_arena", executor_contended_arena, config);
     report(totals, "executor.contended_transaction", executor_contended_transaction, config);
     report(totals, "executor.on_pool", executor_on_pool, config);
-    report(totals, "executor.residency_mismatch", executor_residency_mismatch, config);
+    report(totals, "executor.arena_on_device", executor_arena_on_device, config);
+    report(totals, "scan.predicate_per_page", scan_predicate_per_page, config);
+    report(totals, "scan.unordered_matches_ordered", scan_unordered_matches_ordered, config);
+    report(totals, "cursor.per_modality", cursors_per_modality, config);
+    report(totals, "scan.patterns_and_filters", scan_patterns_and_filters, config);
     report(totals, "outcome.wait_blocks", outcome_wait_blocks, config);
     report(totals, "database.free_waits", database_free_waits, config);
     report(totals, "database.init_on_executor", database_init_on_executor, config);

@@ -398,6 +398,13 @@ typedef struct ustore_docs_scan_t {
     /** Smallest key every scan may return, where @c NULL data starts at the first key. */
     ustore_keys_view_t start_keys;
 
+    /** Optional JSONPath, or a bare root filter such as @c ?@.age>30, that every listed document matches, shared by
+     *  every scan; a zeroed view lists every key. */
+    ustore_bytes_view_t filter;
+
+    /** Optional verdict on the listed keys, asked once per page as its @c cost says; host executors only. */
+    ustore_predicate_t predicate;
+
     /** Output for @c count plus one offsets into @c keys, the last one closing the final scan, inside @c arena. */
     ustore_length_t const** offsets;
 
@@ -426,6 +433,112 @@ typedef struct ustore_docs_scan_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_docs_scan(ustore_docs_scan_t* arguments);
+
+/**
+ *  @brief An opaque handle to a walk over the document keys of one collection, which every pull resumes past the
+ *      last key the pull before it handed out, as @c ustore_blobs_cursor_t walks.
+ *
+ *  It holds its database open, and the transaction or snapshot it reads through, until @c ustore_docs_cursor_free, and
+ *  serves one pull at a time, so a second pull naming it finishes @c ustore_status_contended_k.
+ */
+typedef struct ustore_docs_cursor_handle_t* ustore_docs_cursor_t;
+
+/** The arguments of @c ustore_docs_cursor_init. */
+typedef struct ustore_docs_cursor_init_t {
+
+    /** Output for the new cursor, which the caller frees with @c ustore_docs_cursor_free; @c NULL on failure. */
+    ustore_docs_cursor_t* cursor;
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor of the kind every pull runs on, which picks the side the walk computes on, where @c NULL walks on host
+     *  executors; a pull on another kind of executor reports @c ustore_status_device_k. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final on return. */
+    ustore_outcome_t* outcome;
+
+    /** What the walk sees, where @c NULL is the head, read pull by pull. */
+    ustore_view_t view;
+
+    /** Docs collection to walk. */
+    ustore_collection_id_t collection;
+
+    /** Smallest key the walk returns. */
+    ustore_key_t start_key;
+
+    /** Optional JSONPath or bare root filter every document the walk hands out matches, copied and compiled here
+     *  once; a zeroed view walks every key. */
+    ustore_bytes_view_t filter;
+
+    /** Optional verdict on the keys of every page, asked as its @c cost says; host executors only. */
+    ustore_predicate_t predicate;
+
+} ustore_docs_cursor_init_t;
+
+/**
+ *  @brief Opens a walk over the document keys of one collection, compiling its filter once and reading nothing
+ *      until its first pull.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_docs_cursor_init(ustore_docs_cursor_init_t* arguments);
+
+/** The arguments of @c ustore_docs_cursor_next, which pulls the next page of a walk, with the documents when asked,
+ *  in one call. */
+typedef struct ustore_docs_cursor_next_t {
+
+    /** The database the cursor was opened on. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** The cursor to advance, which a pull that fails or is cancelled leaves where it was. */
+    ustore_docs_cursor_t cursor;
+
+    /** Output for the keys of the page in their order, inside @c arena. */
+    ustore_key_t const** keys;
+
+    /** Optional output for the whole documents as a tape inside @c arena, where a key removed at the head between the
+     *  listing and the read of one pull reads as an empty document; @c NULL skips them. */
+    ustore_strings_view_t* values;
+
+    /** Output for the keys written, zero once the walk is exhausted; zeroed on failure. */
+    ustore_size_t* written;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** Most keys the page holds, where a page of fewer exhausts the walk. */
+    ustore_size_t wanted;
+
+    /** Optional callback reporting the one pull, which may cancel it before the cursor advances. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
+
+} ustore_docs_cursor_next_t;
+
+/**
+ *  @brief Pulls the next page of a walk, and the documents of its keys when asked.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_docs_cursor_next(ustore_docs_cursor_next_t* arguments);
+
+/**
+ *  @brief Waits until every deferred call naming the cursor finishes, then frees it, giving back the holds it kept on
+ *      its database and on the transaction or snapshot it reads through.
+ *  @param[inout] cursor The cursor to be freed; @c NULL is safe.
+ */
+USTORE_EXPORT void ustore_docs_cursor_free(ustore_docs_cursor_t cursor);
 
 /** The arguments of @c ustore_docs_sample, which draws up to @c wanted document keys uniformly at random from every
  *  collection, exporting no documents, so a read or a gather follows the sample. */

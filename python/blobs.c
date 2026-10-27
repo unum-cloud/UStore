@@ -488,14 +488,88 @@ PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* args, Py_ssize_t
 
 #pragma region Scans
 
-/** Walks the keywords of a scan, which takes the order its keys come in and a progress callable beside the shared
- *  ones. */
+/** What a scan or a cursor matches, as its keywords named it, every object borrowed from the arguments. */
+typedef struct scan_match_t {
+
+    /** The sequence of `str` or bytes-like patterns, or NULL. */
+    PyObject* patterns;
+
+    /** The `PatternKind` the patterns are matched as. */
+    int kind;
+
+    /** The `CaseSensitivity` of the patterns. */
+    int sensitivity;
+
+    /** The sequence of one weight per substring pattern, or NULL. */
+    PyObject* weights;
+
+    /** The JSONPath or XPath filter as `str` or bytes, or NULL. */
+    PyObject* filter;
+
+    /** The predicate callable, or NULL. */
+    PyObject* predicate;
+
+    /** The `PredicateCost` placing the predicate. */
+    int cost;
+} scan_match_t;
+
+/** Reads one match keyword into @p match, answering 1 when @p name is one, 0 when it is not, -1 failing. */
+static int scan_match_from_keyword(PyObject* name, PyObject* value, scan_match_t* match) {
+    if (PyUnicode_CompareWithASCIIString(name, "patterns") == 0) {
+        match->patterns = value == Py_None ? NULL : value;
+        return 1;
+    }
+    if (PyUnicode_CompareWithASCIIString(name, "weights") == 0) {
+        match->weights = value == Py_None ? NULL : value;
+        return 1;
+    }
+    if (PyUnicode_CompareWithASCIIString(name, "filter") == 0) {
+        match->filter = value == Py_None ? NULL : value;
+        return 1;
+    }
+    if (PyUnicode_CompareWithASCIIString(name, "pattern_kind") == 0)
+        return ustore_py_enum_from_object(value, "pattern_kind", ustore_py_enum_pattern_kind_k, &match->kind) == 0 ? 1
+                                                                                                                   : -1;
+    if (PyUnicode_CompareWithASCIIString(name, "sensitivity") == 0)
+        return ustore_py_enum_from_object(value, "sensitivity", ustore_py_enum_case_sensitivity_k,
+                                          &match->sensitivity) == 0
+                   ? 1
+                   : -1;
+    if (PyUnicode_CompareWithASCIIString(name, "predicate") == 0)
+        return ustore_py_predicate_from_object(value, &match->predicate) == 0 ? 1 : -1;
+    if (PyUnicode_CompareWithASCIIString(name, "predicate_cost") == 0)
+        return ustore_py_enum_from_object(value, "predicate_cost", ustore_py_enum_predicate_cost_k, &match->cost) == 0
+                   ? 1
+                   : -1;
+    return 0;
+}
+
+/** Refuses the match keywords @p modality takes none of, as only blobs scans take patterns and documents a filter. */
+static int scan_match_admitted(scan_match_t const* match, ustore_modality_t modality) {
+    if (match->patterns && modality != ustore_modality_blobs_k) {
+        PyErr_SetString(PyExc_TypeError, "Only scans of blobs take patterns");
+        return -1;
+    }
+    if (match->weights && !match->patterns) {
+        PyErr_SetString(PyExc_TypeError, "Weights score patterns, which the call names none of");
+        return -1;
+    }
+    if (match->filter && modality != ustore_modality_docs_k) {
+        PyErr_SetString(PyExc_TypeError, "Only scans of documents take a filter");
+        return -1;
+    }
+    return 0;
+}
+
+/** Walks the keywords of a scan, which takes the order its keys come in, a progress callable and what it matches
+ *  beside the shared ones. */
 static int scan_options_from_keywords(ustore_py_context_t const* context, PyObject* const* args,
                                       Py_ssize_t positional_args_count, PyObject* args_names_tuple,
-                                      ustore_py_verb_options_t* options, ustore_scan_mode_t* mode,
-                                      PyObject** progress) {
+                                      ustore_py_verb_options_t* options, ustore_scan_mode_t* mode, PyObject** progress,
+                                      scan_match_t* match) {
     ustore_py_verb_options_init(options);
     *progress = NULL;
+    memset(match, 0, sizeof(*match));
     int chosen = ustore_scan_ordered_k;
     Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
     for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
@@ -504,6 +578,9 @@ static int scan_options_from_keywords(ustore_py_context_t const* context, PyObje
         int const consumed = ustore_py_verb_option_from_keyword(context, name, args[args_progress], options);
         if (consumed < 0) return -1;
         if (consumed > 0) continue;
+        int const matched = scan_match_from_keyword(name, args[args_progress], match);
+        if (matched < 0) return -1;
+        if (matched > 0) continue;
         int read = -1;
         if (PyUnicode_CompareWithASCIIString(name, "mode") == 0)
             read = ustore_py_enum_from_object(args[args_progress], "mode", ustore_py_enum_scan_mode_k, &chosen);
@@ -533,17 +610,103 @@ typedef struct keys_call_t {
 
     /** Output slot for the keys every task found, inside the arena. */
     ustore_key_t const* keys;
+
+    /** Output slot for the BM25 scores of the keys, inside the arena, when the patterns carry weights. */
+    float const* scores;
+
+    /** The bytes of the patterns, borrowed until the call finishes. */
+    ustore_py_contents_t patterns;
+
+    /** The patterns as bytes, `str` ones encoded to UTF-8, held until the call finishes, or NULL. */
+    PyObject* encoded;
+
+    /** One weight per pattern, copied, or NULL. */
+    float* weights;
+
+    /** The filter as bytes, held until the call finishes, or NULL. */
+    PyObject* filter;
 } keys_call_t;
 
 static PyObject* keys_answer(void* erased) {
     keys_call_t const* const call = (keys_call_t const*)erased;
-    return ustore_py_keys_new(call->call.arena, call->offsets, call->keys, call->tasks);
+    return ustore_py_keys_new(call->call.arena, call->offsets, call->keys, call->tasks, call->scores);
 }
 
 static void keys_release(void* erased) {
     keys_call_t* const call = (keys_call_t*)erased;
     ustore_py_keys_release(&call->starts);
+    ustore_py_contents_release(&call->patterns);
+    Py_CLEAR(call->encoded);
+    Py_CLEAR(call->filter);
+    PyMem_Free(call->weights);
+    call->weights = NULL;
     ustore_py_call_release(&call->call);
+}
+
+/** The bytes of @p object, a `str` encoded to UTF-8 or a bytes-like object as it is, as a new reference. */
+static PyObject* match_bytes(PyObject* object, char const* field) {
+    if (PyUnicode_Check(object)) return PyUnicode_AsUTF8String(object);
+    if (PyObject_CheckBuffer(object)) return Py_NewRef(object);
+    PyErr_Format(PyExc_TypeError, "The '%s' option takes str or bytes-like items, got %S", field, Py_TYPE(object));
+    return NULL;
+}
+
+/** Gathers into @p call what @p match names, borrowing its patterns, copying its weights and holding its filter until
+ *  the call finishes, then writes the ABI's spelling of them into @p patterns and @p filter. */
+static int match_fill(keys_call_t* call, scan_match_t const* match, ustore_patterns_t* patterns,
+                      ustore_bytes_view_t* filter) {
+    call->call.predicate.callable = Py_XNewRef(match->predicate);
+    if (match->patterns) {
+        PyObject* const listed = PySequence_Tuple(match->patterns);
+        if (!listed) return -1;
+        Py_ssize_t const count = PyTuple_GET_SIZE(listed);
+        call->encoded = PyTuple_New(count);
+        for (Py_ssize_t index = 0; call->encoded && index != count; ++index) {
+            PyObject* const encoded = match_bytes(PyTuple_GET_ITEM(listed, index), "patterns");
+            if (!encoded) Py_CLEAR(call->encoded);
+            else PyTuple_SET_ITEM(call->encoded, index, encoded);
+        }
+        Py_DECREF(listed);
+        if (!call->encoded ||
+            ustore_py_contents_reserve(&call->patterns, (size_t)count, ustore_py_contents_per_task_k) != 0)
+            return -1;
+        for (Py_ssize_t index = 0; index != count; ++index)
+            if (ustore_py_contents_borrow(PyTuple_GET_ITEM(call->encoded, index), &call->patterns) != 0) return -1;
+        patterns->patterns = call->patterns.view;
+        patterns->count = (ustore_size_t)count;
+        patterns->kind = (ustore_pattern_kind_t)match->kind;
+        patterns->sensitivity = (ustore_case_sensitivity_t)match->sensitivity;
+        if (match->weights) {
+            PyObject* const weights = PySequence_Tuple(match->weights);
+            if (!weights) return -1;
+            if (PyTuple_GET_SIZE(weights) != count) {
+                Py_DECREF(weights);
+                PyErr_SetString(PyExc_ValueError, "Weights count one per pattern");
+                return -1;
+            }
+            call->weights = PyMem_New(float, (size_t)count + 1);
+            for (Py_ssize_t index = 0; call->weights && index != count; ++index)
+                call->weights[index] = (float)PyFloat_AsDouble(PyTuple_GET_ITEM(weights, index));
+            Py_DECREF(weights);
+            if (!call->weights) {
+                PyErr_NoMemory();
+                return -1;
+            }
+            if (PyErr_Occurred()) return -1;
+            patterns->weights = call->weights;
+        }
+    }
+    if (match->filter) {
+        call->filter = match_bytes(match->filter, "filter");
+        if (!call->filter) return -1;
+        Py_buffer view;
+        if (PyObject_GetBuffer(call->filter, &view, PyBUF_SIMPLE) != 0) return -1;
+        // The held object keeps the bytes in place, so the view outlives the released export
+        filter->data = (uint8_t const*)view.buf;
+        filter->length = (ustore_size_t)view.len;
+        PyBuffer_Release(&view);
+    }
+    return 0;
 }
 
 // A batch of no tasks answers an empty tape, and the ABI takes no starts for no tasks, so it is final at once.
@@ -586,11 +749,18 @@ static ustore_py_verb_t const docs_sample_verb = {sizeof(keys_call_t), docs_samp
  *  @p arena for their keys. */
 static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                            ustore_modality_t modality, size_t wanted, ustore_scan_mode_t mode, PyObject* progress,
-                           keys_call_t* call, PyObject* arena) {
+                           scan_match_t const* match, keys_call_t* call, PyObject* arena) {
     if (ustore_py_arena_claim(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, &scan_verb, call);
     call->call.collection = options->collection;
     call->call.progress = Py_XNewRef(progress);
     call->tasks = call->starts.count;
+    scan_match_t const nothing = {0};
+    if (!match) match = &nothing;
+    ustore_patterns_t patterns = {0};
+    ustore_bytes_view_t filter = {0};
+    if (scan_match_admitted(match, modality) != 0 || match_fill(call, match, &patterns, &filter) != 0)
+        return ustore_py_call_discard(context, &scan_verb, call);
+    ustore_predicate_t const predicate = ustore_py_predicate_of(&call->call.predicate, match->cost);
     if (modality == ustore_modality_docs_k) {
         ustore_docs_scan_t scan = {
             .database = context->database_handle,
@@ -601,6 +771,8 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
             .count = call->tasks,
             .collections = {&call->call.collection, 0},
             .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
+            .filter = filter,
+            .predicate = predicate,
             .offsets = &call->offsets,
             .keys = &call->keys,
             .arena = ustore_py_arena_handle(call->call.arena),
@@ -621,6 +793,7 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
             .count = call->tasks,
             .collections = {&call->call.collection, 0},
             .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
+            .predicate = predicate,
             .offsets = &call->offsets,
             .keys = &call->keys,
             .arena = ustore_py_arena_handle(call->call.arena),
@@ -640,8 +813,11 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
         .count = call->tasks,
         .collections = {&call->call.collection, 0},
         .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
+        .patterns = patterns,
+        .predicate = predicate,
         .offsets = &call->offsets,
         .keys = &call->keys,
+        .scores = patterns.weights ? &call->scores : NULL,
         .arena = ustore_py_arena_handle(call->call.arena),
         .wanted = wanted,
         .mode = mode,
@@ -672,16 +848,24 @@ char const doc_scan[] =                                                         
     "Raises:\n"                                                                              //
     "  CancelledError: The progress callable stopped the scan.";
 
-PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
-                              ustore_modality_t modality, ustore_key_t const* start, size_t wanted,
-                              ustore_scan_mode_t mode, PyObject* progress, PyObject* arena) {
+/** Runs one scan of @p modality from @p start, narrowed by what @p match names when it is not NULL. */
+static PyObject* keys_scan_matched(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                                   ustore_modality_t modality, ustore_key_t const* start, size_t wanted,
+                                   ustore_scan_mode_t mode, PyObject* progress, scan_match_t const* match,
+                                   PyObject* arena) {
     keys_call_t stack;
     keys_call_t* const call = ustore_py_call_open(context, &scan_verb, &stack);
     if (!call) return NULL;
     call->starts.inline_keys[0] = *start;
     call->starts.keys = call->starts.inline_keys;
     call->starts.count = 1;
-    return keys_scan(context, options, modality, wanted, mode, progress, call, arena);
+    return keys_scan(context, options, modality, wanted, mode, progress, match, call, arena);
+}
+
+PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                              ustore_modality_t modality, ustore_key_t const* start, size_t wanted,
+                              ustore_scan_mode_t mode, PyObject* progress, PyObject* arena) {
+    return keys_scan_matched(context, options, modality, start, wanted, mode, progress, NULL, arena);
 }
 
 PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -693,15 +877,16 @@ PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* args, Py_ssize_
     ustore_py_verb_options_t options;
     ustore_scan_mode_t mode = ustore_scan_ordered_k;
     PyObject* progress = NULL;
-    if (scan_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options, &mode,
-                                   &progress) != 0)
+    scan_match_t match;
+    if (scan_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options, &mode, &progress,
+                                   &match) != 0)
         return NULL;
 
     ustore_key_t start = {0};
     size_t wanted = 0;
     if (ustore_py_key_from_object(args[0], &start) != 0) return NULL;
     if (ustore_py_size_from_object(args[1], "wanted", &wanted) != 0) return NULL;
-    return ustore_py_keys_scan(&context, &options, modality, &start, wanted, mode, progress, args[2]);
+    return keys_scan_matched(&context, &options, modality, &start, wanted, mode, progress, &match, args[2]);
 }
 
 PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -741,8 +926,9 @@ PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* args, Py_ssi
     ustore_py_verb_options_t options;
     ustore_scan_mode_t mode = ustore_scan_ordered_k;
     PyObject* progress = NULL;
-    if (scan_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options, &mode,
-                                   &progress) != 0)
+    scan_match_t match;
+    if (scan_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options, &mode, &progress,
+                                   &match) != 0)
         return NULL;
 
     size_t wanted = 0;
@@ -752,7 +938,7 @@ PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* args, Py_ssi
     if (!call) return NULL;
     if (ustore_py_keys_from_object(args[0], &call->starts) != 0)
         return ustore_py_call_discard(&context, &scan_verb, call);
-    return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, call, args[2]);
+    return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, &match, call, args[2]);
 }
 
 /** Runs @p tasks samples of up to @p wanted keys each through the sample of @p modality, claiming @p arena for their
@@ -966,14 +1152,22 @@ PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_
 
 #pragma region Cursors
 
-/** A walk over the keys of one collection, pulled page by page into the arena each pull names. */
+/** A walk over the keys of one collection of blobs, documents or graph vertices, pulled page by page into the arena
+ *  each pull names. */
 typedef struct Cursor {
 
     /** The object header every instance carries. */
     PyObject ob_base;
 
-    /** The cursor, NULL once closed, or the address of @c cursor_lent while a pull holds it. */
-    ustore_blobs_cursor_t handle;
+    /** The cursor of the modality @c modality names, NULL once closed, or the address of @c cursor_lent while a pull
+     *  holds it. */
+    void* handle;
+
+    /** Which cursor of the ABI @c handle is: blobs, documents or graph vertices. */
+    ustore_modality_t modality;
+
+    /** The predicate the walk compiled at init, which every pull asks, and what it raised. */
+    ustore_py_predicate_t predicate;
 
     /** The database the cursor was opened on, which the cursor holds open in C. */
     ustore_database_t database;
@@ -1120,6 +1314,10 @@ typedef struct pull_call_t {
 } pull_call_t;
 
 static void pull_submit(void* arguments) { ustore_blobs_cursor_next((ustore_blobs_cursor_next_t*)arguments); }
+static void docs_pull_submit(void* arguments) { ustore_docs_cursor_next((ustore_docs_cursor_next_t*)arguments); }
+static void vertices_pull_submit(void* arguments) {
+    ustore_graph_vertices_cursor_next((ustore_graph_vertices_cursor_next_t*)arguments);
+}
 
 static PyObject* pull_answer_keys(void* erased) {
     pull_call_t const* const call = (pull_call_t const*)erased;
@@ -1140,6 +1338,14 @@ static ustore_py_verb_t const pull_keys_verb = {sizeof(pull_call_t), pull_submit
 /** A pull answering the keys with their values. */
 static ustore_py_verb_t const pull_pairs_verb = {sizeof(pull_call_t), pull_submit, pull_answer_pairs, pull_release};
 
+// A pull of documents or vertices answers as a pull of blobs does
+static ustore_py_verb_t const docs_pull_keys_verb = {sizeof(pull_call_t), docs_pull_submit, pull_answer_keys,
+                                                     pull_release};
+static ustore_py_verb_t const docs_pull_pairs_verb = {sizeof(pull_call_t), docs_pull_submit, pull_answer_pairs,
+                                                      pull_release};
+static ustore_py_verb_t const vertices_pull_keys_verb = {sizeof(pull_call_t), vertices_pull_submit, pull_answer_keys,
+                                                         pull_release};
+
 /** Stands in the handle slot of a cursor while one pull holds its handle, refusing another pull or a close. */
 static char cursor_lent;
 
@@ -1148,16 +1354,20 @@ static char cursor_lent;
  *  @return 0 on success, -1 with a @c ContendedError set while a pull holds the handle.
  */
 static int cursor_close(Cursor* self) {
-    ustore_blobs_cursor_t const lent = (ustore_blobs_cursor_t)(void*)&cursor_lent;
-    ustore_blobs_cursor_t handle = NULL;
+    void* const lent = (void*)&cursor_lent;
+    void* handle = NULL;
     ustore_py_critical_section_begin_((PyObject*)self);
     handle = self->handle;
     if (handle != lent) self->handle = NULL;
     ustore_py_critical_section_end_();
     if (handle == lent) return ustore_py_raise(ustore_status_contended_k, "A pull of this cursor is still running");
     if (!handle) return 0;
+    ustore_modality_t const modality = self->modality;
     Py_BEGIN_ALLOW_THREADS;
-    ustore_blobs_cursor_free(handle);
+    if (modality == ustore_modality_docs_k) ustore_docs_cursor_free((ustore_docs_cursor_t)handle);
+    else if (modality == ustore_modality_graph_k)
+        ustore_graph_vertices_cursor_free((ustore_graph_vertices_cursor_t)handle);
+    else ustore_blobs_cursor_free((ustore_blobs_cursor_t)handle);
     Py_END_ALLOW_THREADS;
     return 0;
 }
@@ -1166,35 +1376,86 @@ static void Cursor_dealloc(Cursor* self) {
     // No pull can hold the handle, since every pull holds the cursor.
     cursor_close(self);
     Py_XDECREF((PyObject*)self->executor);
+    Py_XDECREF(self->predicate.callable);
+    Py_XDECREF(self->predicate.raised);
     PyObject_Free(self);
 }
 
 /** Pulls the next page of the cursor @p handle, which @p self lent its pull, as @p verb answers it. */
-static PyObject* cursor_pull(Cursor* self, ustore_blobs_cursor_t handle, size_t wanted, PyObject* arena,
-                             ustore_py_verb_t const* verb, PyObject* progress) {
+static PyObject* cursor_pull(Cursor* self, void* handle, size_t wanted, PyObject* arena, int values,
+                             PyObject* progress) {
     if (self->executor && !self->executor->handle) {
         ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed");
         return NULL;
     }
+    if (values && self->modality == ustore_modality_graph_k) {
+        PyErr_SetString(PyExc_TypeError, "A walk over vertices pulls keys alone");
+        return NULL;
+    }
+    ustore_py_verb_t const* const verb = self->modality == ustore_modality_docs_k
+                                             ? (values ? &docs_pull_pairs_verb : &docs_pull_keys_verb)
+                                         : self->modality == ustore_modality_graph_k ? &vertices_pull_keys_verb
+                                         : values                                    ? &pull_pairs_verb
+                                                                                     : &pull_keys_verb;
     ustore_py_context_t const context = {.executor = self->executor, .completion = ustore_completion_blocking_k};
     pull_call_t stack;
     pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
     if (ustore_py_arena_claim(arena, &call->call.arena) != 0) return ustore_py_call_discard(&context, verb, call);
     call->call.progress = Py_XNewRef(progress);
-    ustore_blobs_cursor_next_t next = {
-        .database = self->database,
-        .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
-        .cursor = handle,
-        .keys = &call->keys,
-        .values = verb == &pull_pairs_verb ? &call->values : NULL,
-        .written = &call->written,
-        .arena = ustore_py_arena_handle(call->call.arena),
-        .wanted = wanted,
-        .progress = ustore_py_progress_callback(&call->call),
-        .progress_state = &call->call,
-    };
-    return ustore_py_call_run(&context, verb, call, &next);
+    PyObject* page = NULL;
+    if (self->modality == ustore_modality_docs_k) {
+        ustore_docs_cursor_next_t next = {
+            .database = self->database,
+            .executor = ustore_py_context_executor(&context),
+            .outcome = &call->call.outcome,
+            .cursor = (ustore_docs_cursor_t)handle,
+            .keys = &call->keys,
+            .values = values ? &call->values : NULL,
+            .written = &call->written,
+            .arena = ustore_py_arena_handle(call->call.arena),
+            .wanted = wanted,
+            .progress = ustore_py_progress_callback(&call->call),
+            .progress_state = &call->call,
+        };
+        page = ustore_py_call_run(&context, verb, call, &next);
+    }
+    else if (self->modality == ustore_modality_graph_k) {
+        ustore_graph_vertices_cursor_next_t next = {
+            .database = self->database,
+            .executor = ustore_py_context_executor(&context),
+            .outcome = &call->call.outcome,
+            .cursor = (ustore_graph_vertices_cursor_t)handle,
+            .keys = &call->keys,
+            .written = &call->written,
+            .arena = ustore_py_arena_handle(call->call.arena),
+            .wanted = wanted,
+            .progress = ustore_py_progress_callback(&call->call),
+            .progress_state = &call->call,
+        };
+        page = ustore_py_call_run(&context, verb, call, &next);
+    }
+    else {
+        ustore_blobs_cursor_next_t next = {
+            .database = self->database,
+            .executor = ustore_py_context_executor(&context),
+            .outcome = &call->call.outcome,
+            .cursor = (ustore_blobs_cursor_t)handle,
+            .keys = &call->keys,
+            .values = values ? &call->values : NULL,
+            .written = &call->written,
+            .arena = ustore_py_arena_handle(call->call.arena),
+            .wanted = wanted,
+            .progress = ustore_py_progress_callback(&call->call),
+            .progress_state = &call->call,
+        };
+        page = ustore_py_call_run(&context, verb, call, &next);
+    }
+    // What the walk's predicate raised outranks the page the pull answered
+    if (self->predicate.raised) {
+        Py_CLEAR(page);
+        ustore_py_predicate_raise(&self->predicate);
+    }
+    return page;
 }
 
 static char const doc_Cursor[] =                                                              //
@@ -1234,16 +1495,15 @@ static PyObject* Cursor_next(Cursor* self, PyObject* const* args, Py_ssize_t pos
     Py_ssize_t const args_names_count = ustore_py_args_names_count_checked("next", positional_args_count,
                                                                            args_names_tuple, 2);
     if (args_names_count < 0) return NULL;
-    ustore_py_verb_t const* verb = &pull_keys_verb;
+    int values = 0;
     PyObject* progress = NULL;
     for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
         PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
         PyObject* const value = args[positional_args_count + names_progress];
         int read = -1;
         if (PyUnicode_CompareWithASCIIString(name, "values") == 0) {
-            int const asked = PyObject_IsTrue(value);
-            verb = asked > 0 ? &pull_pairs_verb : &pull_keys_verb;
-            read = asked < 0 ? -1 : 0;
+            values = PyObject_IsTrue(value);
+            read = values < 0 ? -1 : 0;
         }
         else if (PyUnicode_CompareWithASCIIString(name, "progress") == 0)
             read = ustore_py_progress_from_object(value, &progress);
@@ -1253,8 +1513,8 @@ static PyObject* Cursor_next(Cursor* self, PyObject* const* args, Py_ssize_t pos
     size_t wanted = 0;
     if (ustore_py_size_from_object(args[0], "wanted", &wanted) != 0) return NULL;
 
-    ustore_blobs_cursor_t const lent = (ustore_blobs_cursor_t)(void*)&cursor_lent;
-    ustore_blobs_cursor_t handle = NULL;
+    void* const lent = (void*)&cursor_lent;
+    void* handle = NULL;
     ustore_py_critical_section_begin_((PyObject*)self);
     handle = self->handle;
     if (handle) self->handle = lent;
@@ -1264,7 +1524,7 @@ static PyObject* Cursor_next(Cursor* self, PyObject* const* args, Py_ssize_t pos
                         handle ? "Another pull of this cursor is running" : "The cursor is closed");
         return NULL;
     }
-    PyObject* const page = cursor_pull(self, handle, wanted, args[1], verb, progress);
+    PyObject* const page = cursor_pull(self, handle, wanted, args[1], values, progress);
     ustore_py_critical_section_begin_((PyObject*)self);
     self->handle = handle;
     ustore_py_critical_section_end_();
@@ -1308,56 +1568,167 @@ PyTypeObject CursorType = {
     .tp_methods = Cursor_methods,
 };
 
-char const doc_cursor[] =                                                                    //
-    "cursor(start=0, /, *, collection) answers a Cursor.\n"                                  //
-    "\n"                                                                                     //
-    "Opens a walk over the keys of one collection from `start` upwards, reading nothing\n"   //
-    "until its first pull, which `Cursor.next` makes into an arena of its own. Every pull\n" //
-    "blocks on the receiver's executor, or on the calling thread. The cursor holds its\n"    //
-    "database open, and the transaction or snapshot it reads through, until it closes.\n"    //
-    "Calls `ustore_blobs_cursor_init`.\n"                                                    //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  start (KeyLike, optional): The smallest key the walk returns.\n"                      //
-    "  collection (UUID | str): The collection, by identifier or by name.\n"                 //
-    "Returns:\n"                                                                             //
+char const doc_cursor[] =                                                                      //
+    "cursor(start=0, /, *, collection, patterns=None, pattern_kind=PatternKind.REGEX,\n"       //
+    "sensitivity=CaseSensitivity.CASED, predicate=None, predicate_cost=PredicateCost.CHEAP)\n" //
+    "answers a Cursor.\n"                                                                      //
+    "\n"                                                                                       //
+    "Opens a walk over the keys of one collection from `start` upwards, reading nothing\n"     //
+    "until its first pull, which `Cursor.next` makes into an arena of its own. Every pull\n"   //
+    "blocks on the receiver's executor, or on the calling thread. The cursor holds its\n"      //
+    "database open, and the transaction or snapshot it reads through, until it closes.\n"      //
+    "Calls `ustore_blobs_cursor_init`.\n"                                                      //
+    "\n"                                                                                       //
+    "Args:\n"                                                                                  //
+    "  start (KeyLike, optional): The smallest key the walk returns.\n"                        //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                   //
+    "  patterns (Sequence[str | bytes], optional): Patterns every value the walk hands out\n"  //
+    "    matches, compiled once here.\n"                                                       //
+    "  predicate (Callable[[tuple[UUID, ...]], Sequence], optional): Asked once per page\n"    //
+    "    about its keys, answering a truthy item for every key the walk keeps.\n"              //
+    "Returns:\n"                                                                               //
     "  Cursor: The walk, pulled page by page.";
 
-PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                               PyObject* args_names_tuple) {
+char const doc_docs_cursor[] =                                                                    //
+    "docs_cursor(start=0, /, *, collection, filter=None, predicate=None,\n"                       //
+    "predicate_cost=PredicateCost.CHEAP) answers a Cursor over documents.\n"                      //
+    "\n"                                                                                          //
+    "Walks as `cursor()` does, every page keeping the documents `filter`, a JSONPath or a bare\n" //
+    "root filter such as `?@.age > 30`, matches, and its pulls reading whole documents when\n"    //
+    "asked. Calls `ustore_docs_cursor_init`.";
+
+char const doc_graph_vertices_cursor[] =                                                         //
+    "graph_vertices_cursor(start=0, /, *, collection, predicate=None,\n"                         //
+    "predicate_cost=PredicateCost.CHEAP) answers a Cursor over vertices.\n"                      //
+    "\n"                                                                                         //
+    "Walks the vertices of one graph collection as `cursor()` walks keys, its pulls answering\n" //
+    "keys alone. Calls `ustore_graph_vertices_cursor_init`.";
+
+/** Opens a walk of @p modality as the receiver @p self names, from the start and with the match its arguments give. */
+static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                             PyObject* args_names_tuple, char const* name, ustore_modality_t modality) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (positional_args_count > 1) {
-        PyErr_Format(PyExc_TypeError, "cursor() takes the start alone by position, received %zd arguments",
+        PyErr_Format(PyExc_TypeError, "%s() takes the start alone by position, received %zd arguments", name,
                      positional_args_count);
         return NULL;
     }
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    ustore_py_verb_options_init(&options);
+    scan_match_t match;
+    memset(&match, 0, sizeof(match));
+    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
+    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
+        PyObject* const keyword = PyTuple_GET_ITEM(args_names_tuple, names_progress);
+        PyObject* const value = args[positional_args_count + names_progress];
+        int const consumed = ustore_py_verb_option_from_keyword(&context, keyword, value, &options);
+        if (consumed < 0) return NULL;
+        if (consumed > 0) continue;
+        int const matched = scan_match_from_keyword(keyword, value, &match);
+        if (matched < 0) return NULL;
+        if (matched == 0) {
+            PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", keyword);
+            return NULL;
+        }
+    }
+    if (scan_match_admitted(&match, modality) != 0) return NULL;
+    if (match.weights) {
+        PyErr_SetString(PyExc_TypeError, "A cursor writes no scores, so it takes no weights");
         return NULL;
+    }
     ustore_key_t start = {0};
     if (positional_args_count == 1 && ustore_py_key_from_object(args[0], &start) != 0) return NULL;
 
     Cursor* const cursor = PyObject_New(Cursor, &CursorType);
     if (!cursor) return NULL;
     cursor->handle = NULL;
+    cursor->modality = modality;
+    cursor->predicate.callable = Py_XNewRef(match.predicate);
+    cursor->predicate.raised = NULL;
     cursor->database = context.database_handle;
     cursor->executor = (Executor*)Py_XNewRef((PyObject*)context.executor);
+    // The patterns and the filter are compiled at init, so they are borrowed only while it runs
+    keys_call_t gathered;
+    memset(&gathered, 0, sizeof(gathered));
+    ustore_patterns_t patterns = {0};
+    ustore_bytes_view_t filter = {0};
+    ustore_predicate_t const predicate = ustore_py_predicate_of(&cursor->predicate, match.cost);
+    scan_match_t borrowed = match;
+    borrowed.predicate = NULL;
+    if (match_fill(&gathered, &borrowed, &patterns, &filter) != 0) {
+        keys_release(&gathered);
+        Py_DECREF(cursor);
+        return NULL;
+    }
     ustore_outcome_t outcome = {0};
-    ustore_blobs_cursor_init_t init = {
-        .cursor = &cursor->handle,
-        .database = context.database_handle,
-        .outcome = &outcome,
-        .view = context.view,
-        .collection = options.collection,
-        .start_key = start,
-    };
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_blobs_cursor_init(&init);
-    Py_END_ALLOW_THREADS;
+    if (modality == ustore_modality_docs_k) {
+        ustore_docs_cursor_init_t init = {
+            .cursor = (ustore_docs_cursor_t*)&cursor->handle,
+            .database = context.database_handle,
+            .executor = ustore_py_context_executor(&context),
+            .outcome = &outcome,
+            .view = context.view,
+            .collection = options.collection,
+            .start_key = start,
+            .filter = filter,
+            .predicate = predicate,
+        };
+        Py_BEGIN_ALLOW_THREADS;
+        ustore_docs_cursor_init(&init);
+        Py_END_ALLOW_THREADS;
+    }
+    else if (modality == ustore_modality_graph_k) {
+        ustore_graph_vertices_cursor_init_t init = {
+            .cursor = (ustore_graph_vertices_cursor_t*)&cursor->handle,
+            .database = context.database_handle,
+            .executor = ustore_py_context_executor(&context),
+            .outcome = &outcome,
+            .view = context.view,
+            .collection = options.collection,
+            .start_key = start,
+            .predicate = predicate,
+        };
+        Py_BEGIN_ALLOW_THREADS;
+        ustore_graph_vertices_cursor_init(&init);
+        Py_END_ALLOW_THREADS;
+    }
+    else {
+        ustore_blobs_cursor_init_t init = {
+            .cursor = (ustore_blobs_cursor_t*)&cursor->handle,
+            .database = context.database_handle,
+            .executor = ustore_py_context_executor(&context),
+            .outcome = &outcome,
+            .view = context.view,
+            .collection = options.collection,
+            .start_key = start,
+            .patterns = patterns,
+            .predicate = predicate,
+        };
+        Py_BEGIN_ALLOW_THREADS;
+        ustore_blobs_cursor_init(&init);
+        Py_END_ALLOW_THREADS;
+    }
+    keys_release(&gathered);
     if (ustore_py_raise_on_outcome(&outcome) == 0) return (PyObject*)cursor;
     Py_DECREF(cursor);
     return NULL;
+}
+
+PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                               PyObject* args_names_tuple) {
+    return cursor_open(self, args, positional_args_count, args_names_tuple, "cursor", ustore_modality_blobs_k);
+}
+
+PyObject* ustore_py_api_docs_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                    PyObject* args_names_tuple) {
+    return cursor_open(self, args, positional_args_count, args_names_tuple, "docs_cursor", ustore_modality_docs_k);
+}
+
+PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                              PyObject* args_names_tuple) {
+    return cursor_open(self, args, positional_args_count, args_names_tuple, "graph_vertices_cursor",
+                       ustore_modality_graph_k);
 }
 
 #pragma endregion Cursors

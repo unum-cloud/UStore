@@ -191,11 +191,22 @@ typedef struct ustore_strings_scan_t {
     /** Smallest string every scan may return, which paginates a walk of one prefix; a zeroed view starts first. */
     ustore_strings_view_t start_strings;
 
+    /** Optional patterns every listed string matches, shared by every scan of the call; zeroed lists every string. */
+    ustore_patterns_t patterns;
+
+    /** Optional verdict on the keys the listed strings map onto, asked once per page as its @c cost says; host
+     *  executors only. */
+    ustore_predicate_t predicate;
+
     /** Output for @c count plus one offsets into @c strings, the last one closing the final scan, inside @c arena. */
     ustore_length_t const** offsets;
 
     /** Output for the found strings as a tape inside @c arena, scan after scan. */
     ustore_strings_view_t* strings;
+
+    /** Optional output for one BM25 score per listed string when @c patterns carry weights, inside @c arena; @c NULL
+     *  skips them. */
+    float const** scores;
 
     /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
     ustore_arena_t arena;
@@ -239,6 +250,10 @@ typedef struct ustore_strings_cursor_init_t {
     /** An open database. */
     ustore_database_t database;
 
+    /** Executor of the kind every pull runs on, which picks the side the walk computes on, where @c NULL walks on host
+     *  executors; a pull on another kind of executor reports @c ustore_status_device_k. */
+    ustore_executor_t executor;
+
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
 
@@ -253,6 +268,12 @@ typedef struct ustore_strings_cursor_init_t {
 
     /** Smallest string the walk returns, copied, where a zeroed view starts at the first string of the prefix. */
     ustore_bytes_view_t start_string;
+
+    /** Optional patterns every string the walk hands out matches, compiled here once; zeroed walks every string. */
+    ustore_patterns_t patterns;
+
+    /** Optional verdict on the keys of the strings of every page, asked as its @c cost says; host executors only. */
+    ustore_predicate_t predicate;
 
 } ustore_strings_cursor_init_t;
 

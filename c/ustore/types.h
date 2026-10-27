@@ -75,7 +75,7 @@
  *
  *  Callers lend memory, never a way to allocate it: no allocator callback crosses the interface, and
  *  every pointer a caller passes is an input, classified through the driver once per call. Payload
- *  belongs to the handle, placed by its constructor's residency, as @c ustore_database_open_nvme
+ *  belongs to the handle, placed by its constructor, as @c ustore_database_open_nvme
  *  places it on its drives. Scratch and staging belong to the executor, placed at its creation and
  *  grown to a high-water mark. Every output whose length scales with the call lands in an arena:
  *  values, presences, offsets, keys, identifiers, degrees, edges, bounds and columns alike. Only
@@ -85,7 +85,7 @@
  *  Executors make arenas. @c ustore_arena_init places one where its executor computes, decided once,
  *  and a @c NULL executor makes host pages for calls on the calling thread. A call rewinds the arena it
  *  is given, invalidating the previous call's outputs, and writes views into it, and any verb may reuse
- *  any arena of its residency, one call at a time. Blocking calls borrow the arena; deferred calls hold
+ *  any arena its executor made, one call at a time. Blocking calls borrow the arena; deferred calls hold
  *  it until final. Shorthand with no place for an arena, such as @c db[key] or @c key @c in @c db, makes a
  *  one-off arena through @c ustore_arena_init and frees it with its result: slower than reuse, and
  *  stateless.
@@ -391,10 +391,72 @@ typedef enum ustore_continuation_t {
  */
 typedef ustore_continuation_t (*ustore_progress_callback_t)(ustore_size_t finished, ustore_size_t total, void* state);
 
+/** What the strings of a @c ustore_patterns_t are matched as. */
+typedef enum ustore_pattern_kind_t {
+
+    /** Regular expressions, of which a listed value matches at least one somewhere. */
+    ustore_pattern_regex_k = 0,
+
+    /** Literal substrings, of which a listed value holds at least one, found together through Aho-Corasick. */
+    ustore_pattern_substrings_k = 1,
+
+} ustore_pattern_kind_t;
+
+/** The canonical spelling of a pattern kind, as @c ustore_pattern_regex_k spells "regex", or "unrecognized". */
+USTORE_EXPORT char const* ustore_pattern_kind_name(ustore_pattern_kind_t kind);
+
+/** Reads a pattern kind back from its canonical spelling; @c ustore_pattern_regex_k when unrecognized. */
+USTORE_EXPORT ustore_pattern_kind_t ustore_pattern_kind_from_name(ustore_bytes_view_t name);
+
+/** Whether patterns compare bytes as they are or after Unicode case folding. */
+typedef enum ustore_case_sensitivity_t {
+
+    /** Bytes as they are. */
+    ustore_cased_k = 0,
+
+    /** Full Unicode case folding of both the patterns and the values. */
+    ustore_uncased_k = 1,
+
+} ustore_case_sensitivity_t;
+
+/** The canonical spelling of a case sensitivity, as @c ustore_uncased_k spells "uncased", or "unrecognized". */
+USTORE_EXPORT char const* ustore_case_sensitivity_name(ustore_case_sensitivity_t sensitivity);
+
+/** Reads a case sensitivity back from its canonical spelling; @c ustore_cased_k when unrecognized. */
+USTORE_EXPORT ustore_case_sensitivity_t ustore_case_sensitivity_from_name(ustore_bytes_view_t name);
+
+/**
+ *  @brief Patterns a scan keeps the values or strings matching, shared by every task of the call and compiled once per
+ *      call or once per cursor.
+ *
+ *  A zeroed structure matches everything. Patterns that fail to compile refuse the call with
+ *  @c ustore_status_invalid_argument_k, carrying StringZilla's message.
+ */
+typedef struct ustore_patterns_t {
+
+    /** The patterns, where a zeroed view matches everything. */
+    ustore_strings_view_t patterns;
+
+    /** Number of strings in @c patterns. */
+    ustore_size_t count;
+
+    /** What the patterns are matched as. */
+    ustore_pattern_kind_t kind;
+
+    /** Whether matching folds case. */
+    ustore_case_sensitivity_t sensitivity;
+
+    /** Optional weight of every substring pattern, which turns on BM25 scores; refused with regexes. */
+    float const* weights;
+
+} ustore_patterns_t;
+
 /**
  *  @brief An opaque handle to the threads or I/O rings that run calls, shared by any number of databases.
  *
- *  Its kind must match the residency of every database it drives; a mismatch reports @c ustore_status_device_k.
+ *  Its kind picks where calls compute: host threads for every engine, or one device for the reads and scans an engine
+ *  computes there, where a change, the control plane and every call no device tower serves yet answer
+ *  @c ustore_status_unsupported_k, and an arena or cursor of another kind of executor @c ustore_status_device_k.
  *  Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted
  *  before it finishes, and before any submitted after it starts. Databases stay freely concurrent. A blocking call
  *  runs on the calling thread, while one driver thread hands deferred calls in batches to the executor's threads.
@@ -408,6 +470,16 @@ typedef ustore_continuation_t (*ustore_progress_callback_t)(ustore_size_t finish
  *  caller has seen final. From inside a progress callback its own executor runs, @c ustore_executor_drain and a
  *  blocking call on that executor report @c ustore_status_contended_k, so nothing waits on itself. Frees cannot
  *  report, so @c ustore_executor_free is never called there, nor the free of a handle a deferred call names.
+ *
+ *  The library stages only to change layout on the side that computes, or to make pageable memory
+ *  DMA-able, and never routes device bytes through the host:
+ *
+ *      Case                                          Action
+ *      Device inputs on the executor's device        read in place
+ *      Device inputs needing padding or a cast       a device-to-device copy or a cast kernel
+ *      Pinned or managed host inputs                 a direct asynchronous upload
+ *      Pageable host inputs                          the pinned bounce buffer, then an upload
+ *      Outputs in an arena on the executor's device  the kernel writes them directly
  */
 typedef struct ustore_executor_handle_t* ustore_executor_t;
 
@@ -580,10 +652,6 @@ typedef struct ustore_executor_for_nvme_t {
     /** How the databases it opens move bytes; copied, not borrowed. */
     ustore_nvme_options_t nvme;
 
-    /** Executor of @c ustore_executor_for_vram whose devices the compactions of the databases it opens run on,
-     *  borrowed until this executor is freed, where @c NULL compacts on host threads. */
-    ustore_executor_t vram;
-
     /** Threads to spawn, each owning one submission ring, where zero derives them from the cores. */
     ustore_size_t threads;
 
@@ -597,9 +665,30 @@ typedef struct ustore_executor_for_nvme_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  A database @c ustore_database_open_nvme opens on it moves bytes as @c nvme names, which the open reads once, so the
- *  executor may be freed before the databases it opened.
+ *  executor may be freed before the databases it opened. Where its merges run is the open's own @c compactions.
  */
 USTORE_EXPORT void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments);
+
+/** How a VRAM executor moves bytes between the drives and its device through GPUDirect Storage. */
+typedef enum ustore_gds_t {
+
+    /** Direct transfers where the @c nvidia_fs driver is loaded, and cuFile's compatibility mode elsewhere. */
+    ustore_gds_automatic_k = 0,
+
+    /** Direct transfers, refused with @c ustore_status_device_k where the driver is absent. */
+    ustore_gds_direct_k = 1,
+
+    /** cuFile's compatibility mode, which bounces through host pages it manages. */
+    ustore_gds_compat_k = 2,
+
+} ustore_gds_t;
+
+/** The canonical spelling of a GPUDirect Storage mode, as @c ustore_gds_compat_k spells "compat", or
+ *  "unrecognized". */
+USTORE_EXPORT char const* ustore_gds_name(ustore_gds_t gds);
+
+/** Reads a GPUDirect Storage mode back from its canonical spelling; @c ustore_gds_automatic_k when unrecognized. */
+USTORE_EXPORT ustore_gds_t ustore_gds_from_name(ustore_bytes_view_t name);
 
 /** The arguments of @c ustore_executor_for_vram. */
 typedef struct ustore_executor_for_vram_t {
@@ -610,16 +699,19 @@ typedef struct ustore_executor_for_vram_t {
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
 
-    /** CUDA ordinals of the devices the executor computes on, copied by the call, where @c NULL takes every visible
-     *  device, and an ordinal no device carries is refused with @c ustore_status_device_k. */
-    int32_t const* devices;
+    /** The CUDA ordinal every call and arena of this executor uses; an ordinal no device carries is refused with
+     *  @c ustore_status_device_k. */
+    int32_t device;
 
-    /** Entries of @c devices, where zero takes every visible device as @c NULL does. */
-    ustore_size_t devices_count;
+    /** The @b optional borrowed @c cudaStream_t on @c device, which must outlive the executor; @c NULL creates one.
+     *  One stream per device is the whole design. */
+    void* stream;
 
-    /** Bytes of device memory the executor's scratch and staging may take on each device, where zero takes a
-     *  default of 256 MiB. */
+    /** The @b optional ceiling on the device scratch a call or a merge takes; zero lets scratch grow as calls ask. */
     ustore_size_t scratch_limit;
+
+    /** How reads and compactions move bytes between the drives and the device. */
+    ustore_gds_t gds;
 
     /** Deferred calls the executor holds at once, sizing its deferred table, where zero takes a default. */
     ustore_size_t deferred_limit;
@@ -627,12 +719,16 @@ typedef struct ustore_executor_for_vram_t {
 } ustore_executor_for_vram_t;
 
 /**
- *  @brief Creates an executor of CUDA devices, one host thread driving each, or reports @c ustore_status_unsupported_k
- *      in a library built without CUDA and @c ustore_status_device_k on a machine without a device.
+ *  @brief Opens one submission stream on @c device, or borrows the caller's, driven by one host thread, or reports
+ *      @c ustore_status_unsupported_k in a library built without CUDA and @c ustore_status_device_k on a machine
+ *      without the device.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  No engine places a database in VRAM yet, so a call it runs and an arena it makes are refused with
- *  @c ustore_status_device_k and @c ustore_status_unsupported_k; an NVMe executor borrows it for compactions.
+ *  Every call queues on that stream in order, so one host thread keeps the device fed, and a multi-GPU caller makes
+ *  one executor per device. Its calls read through an engine's device verbs, which refuse changes and the control
+ *  plane, and every call no device tower serves yet, with @c ustore_status_unsupported_k, and arenas it makes live on
+ *  its device. @c ustore_database_open_nvme takes one as its @c compactions, reading its device and scratch limit
+ *  once.
  */
 USTORE_EXPORT void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments);
 
@@ -679,9 +775,10 @@ USTORE_EXPORT void ustore_executor_free(ustore_executor_t executor);
  *
  *  A @c NULL arena is refused with @c ustore_status_invalid_argument_k, and so is a call whose inputs point into the
  *  arena it is about to rewind. An arena serves one call at a time, so a second call naming it finishes
- *  @c ustore_status_contended_k, and a deferred one does so at submission. A call on another residency or device than
- *  the arena's reports @c ustore_status_device_k. A blocking call borrows the arena until it returns, and a deferred
- *  one holds it until final. A call that fails, is cancelled, or has nothing to report leaves its outputs @c NULL.
+ *  @c ustore_status_contended_k, and a deferred one does so at submission. A call whose executor computes on host
+ *  threads given an arena on a device, or on another device than the arena's, reports @c ustore_status_device_k.
+ *  A blocking call borrows the arena until it returns, and a deferred one holds it until final. A call that fails,
+ *  is cancelled, or has nothing to report leaves its outputs @c NULL.
  */
 typedef struct ustore_arena_handle_t* ustore_arena_t;
 

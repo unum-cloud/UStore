@@ -519,3 +519,17 @@ def test_binding_refusals(view, docs, call, failure: type):
 
 
 # endregion Refusals
+
+
+def test_docs_filters_narrow_scans_and_cursors(view, docs, arena):
+    """A JSONPath root filter narrows a scan, and a documents cursor keeps the documents its filter matched, page by
+    page, with their bodies when asked."""
+    view.docs_write([1, 2, 3, 4], ['{"age": 25}', '{"age": 40}', '{"name": "x"}', '{"age": 31}'], collection=docs)
+    older = view.docs_scan(0, 8, arena, collection=docs, filter="?@.age > 30")
+    assert [key.int for key in older[0]] == [2, 4]
+    with view.docs_cursor(collection=docs, filter="?@.age > 30") as cursor:
+        page = cursor.next(1, arena, values=True)
+        assert [key.int for key in page] == [2]
+        assert json.loads(bytes(page.values[0])) == {"age": 40}
+        assert [key.int for key in cursor.next(1, arena)] == [4]
+        assert not cursor.next(1, arena)

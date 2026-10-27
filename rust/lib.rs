@@ -193,6 +193,7 @@ pub mod collection;
 pub mod db;
 pub mod docs;
 pub mod graph;
+pub mod pages;
 pub mod strings;
 
 #[cfg(test)]
@@ -205,17 +206,19 @@ pub use stringtape;
 extern crate forkunion as _;
 extern crate stringzilla as _;
 
-pub use blobs::{Cursor, Entry, Measurement, Page, Values};
+pub use blobs::{Cursor, Entry, Measurement, Page, Scanned, Values};
 pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{
-    key_unknown, version, Arena, Blocking, CollectionID, Collections, CommitStamp, DataDirectory, Database, Deferred,
-    DeferredView, Deferring, Description, DropMode, Durability, Engine, Error, Executor, IOOptions, Isolation, Key,
-    LevelDBOptions, Modality, Mood, NVMEOptions, ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions,
-    Snapshot, Status, Tape, Transaction, Transport, View, Wait, Watch, UUID,
+    key_unknown, version, Admission, Arena, Blocking, CaseSensitivity, CollectionID, Collections, CommitStamp,
+    DataDirectory, Database, Deferred, DeferredView, Deferring, Description, DropMode, Durability, Engine, Error,
+    Executor, Gds, IOOptions, Isolation, Key, LevelDBOptions, Matching, Modality, Mood, NVMEOptions, PatternKind,
+    PredicateCallback, PredicateCost, ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions, Snapshot,
+    Status, Tape, Transaction, Transport, View, Wait, Watch, UUID,
 };
 pub use docs::{
-    Binary, Bitmap, Column, ColumnFormat, Columns, Document, DocumentEntry, FieldAddress, FieldEntry, FieldFormat,
-    Half, Json, KeyedBy, Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
+    Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, Document, DocumentEntry, FieldAddress, FieldEntry,
+    FieldFormat, Half, Json, KeyedBy, Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
 };
-pub use graph::{default_edge_id, degree_missing, Degree, Edge, Neighborhoods, Role, Roles};
+pub use graph::{default_edge_id, degree_missing, Degree, Edge, GraphVerticesCursor, Neighborhoods, Role, Roles};
+pub use pages::{PageEncoding, PagesCursor};
 pub use strings::Names;

@@ -53,7 +53,7 @@
 #include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`
 
-#include "engine.hpp"             // `blobs_verbs_t`, `view_t`
+#include "engine.hpp"             // `blobs_verbs<home_t::host_k>`, `view_t`
 #include "lib.hpp"                // `stringzilla_capabilities`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `places_of`, `validate_remove`
 #include "utilities/outputs.hpp"  // `read_outputs_t`
@@ -208,8 +208,9 @@ expected<touched_pages_t> read_touched_pages(lander_type_ const& land, place_bat
 
 /** Reads the trees of the pages at @p places through @p view with the engine's own @p values_verbs, appending to its
  *  scratch rather than rewinding it. */
-inline expected<values_view_t> read_page_values(blobs_verbs_t const& values_verbs, ustore_database_t database,
-                                                place_batch_t const& places, view_t const& view) noexcept {
+inline expected<values_view_t> read_page_values(blobs_verbs<home_t::host_k> const& values_verbs,
+                                                ustore_database_t database, place_batch_t const& places,
+                                                view_t const& view) noexcept {
     ustore_octet_t const* presences = nullptr;
     ustore_strings_view_t contents {};
     ustore_blobs_read_t read {};
@@ -226,7 +227,7 @@ inline expected<values_view_t> read_page_values(blobs_verbs_t const& values_verb
 
 /** Writes every tree of @p pages that exists in one write through @p view with the engine's own @p values_verbs, then
  *  removes the pages that stopped existing. */
-inline status_t write_touched_pages(blobs_verbs_t const& values_verbs, ustore_database_t database,
+inline status_t write_touched_pages(blobs_verbs<home_t::host_k> const& values_verbs, ustore_database_t database,
                                     std::span<touched_page_t> pages, ustore_durability_t durability,
                                     ustore_watch_t watch, view_t const& view) noexcept {
     ustore_arena_t const scratch = view.scratch;
@@ -286,7 +287,7 @@ inline status_t write_touched_pages(blobs_verbs_t const& values_verbs, ustore_da
 struct rewritten_pages_t {
     static constexpr ustore_watch_t reads_watch_k = ustore_watch_keys_k;
 
-    blobs_verbs_t const& values_verbs;
+    blobs_verbs<home_t::host_k> const& values_verbs;
     ustore_database_t database;
 
     /** Reads the trees of the pages at @p places through @p view. */
@@ -306,7 +307,7 @@ struct rewritten_pages_t {
 struct appended_edits_t {
     static constexpr ustore_watch_t reads_watch_k = ustore_watch_none_k;
 
-    blobs_verbs_t const& values_verbs;
+    blobs_verbs<home_t::host_k> const& values_verbs;
     ustore_database_t database;
 
     /** The chain of every page the call touched, in the scratch of the call. */
@@ -544,7 +545,7 @@ status_t serve_remove_attributes(ustore_pages_remove_attributes_t const& argumen
 /** The edit chains of the page edit calls of an engine keeping a page as its edits, checked and applied over the pages
  *  read unwatched through @p values_verbs, so concurrent edits of one page both land, leaving the chain of every page
  *  the call touched in the scratch of the call for the engine to commit. */
-inline expected<std::span<page_edits_t const>> pages_import_edits(blobs_verbs_t const& values_verbs,
+inline expected<std::span<page_edits_t const>> pages_import_edits(blobs_verbs<home_t::host_k> const& values_verbs,
                                                                   ustore_pages_import_t const& arguments,
                                                                   strings_arg_t const& values,
                                                                   view_t const& view) noexcept {
@@ -555,7 +556,7 @@ inline expected<std::span<page_edits_t const>> pages_import_edits(blobs_verbs_t 
     return chains;
 }
 
-inline expected<std::span<page_edits_t const>> pages_insert_edits(blobs_verbs_t const& values_verbs,
+inline expected<std::span<page_edits_t const>> pages_insert_edits(blobs_verbs<home_t::host_k> const& values_verbs,
                                                                   ustore_pages_insert_t const& arguments,
                                                                   strings_arg_t const& values,
                                                                   view_t const& view) noexcept {
@@ -566,7 +567,7 @@ inline expected<std::span<page_edits_t const>> pages_insert_edits(blobs_verbs_t 
     return chains;
 }
 
-inline expected<std::span<page_edits_t const>> pages_remove_edits(blobs_verbs_t const& values_verbs,
+inline expected<std::span<page_edits_t const>> pages_remove_edits(blobs_verbs<home_t::host_k> const& values_verbs,
                                                                   ustore_pages_remove_t const& arguments,
                                                                   view_t const& view) noexcept {
     std::span<page_edits_t const> chains;
@@ -575,7 +576,7 @@ inline expected<std::span<page_edits_t const>> pages_remove_edits(blobs_verbs_t 
     return chains;
 }
 
-inline expected<std::span<page_edits_t const>> pages_move_edits(blobs_verbs_t const& values_verbs,
+inline expected<std::span<page_edits_t const>> pages_move_edits(blobs_verbs<home_t::host_k> const& values_verbs,
                                                                 ustore_pages_move_t const& arguments,
                                                                 view_t const& view) noexcept {
     std::span<page_edits_t const> chains;
@@ -584,7 +585,7 @@ inline expected<std::span<page_edits_t const>> pages_move_edits(blobs_verbs_t co
     return chains;
 }
 
-inline expected<std::span<page_edits_t const>> pages_splice_edits(blobs_verbs_t const& values_verbs,
+inline expected<std::span<page_edits_t const>> pages_splice_edits(blobs_verbs<home_t::host_k> const& values_verbs,
                                                                   ustore_pages_splice_t const& arguments,
                                                                   strings_arg_t const& values,
                                                                   view_t const& view) noexcept {
@@ -596,8 +597,8 @@ inline expected<std::span<page_edits_t const>> pages_splice_edits(blobs_verbs_t 
 }
 
 inline expected<std::span<page_edits_t const>> pages_set_attributes_edits(
-    blobs_verbs_t const& values_verbs, ustore_pages_set_attributes_t const& arguments, strings_arg_t const& fields,
-    strings_arg_t const& values, view_t const& view) noexcept {
+    blobs_verbs<home_t::host_k> const& values_verbs, ustore_pages_set_attributes_t const& arguments,
+    strings_arg_t const& fields, strings_arg_t const& values, view_t const& view) noexcept {
     std::span<page_edits_t const> chains;
     status_t const status = serve_set_attributes(arguments, fields, values, view,
                                                  appended_edits_t {values_verbs, arguments.database, chains});
@@ -606,8 +607,8 @@ inline expected<std::span<page_edits_t const>> pages_set_attributes_edits(
 }
 
 inline expected<std::span<page_edits_t const>> pages_remove_attributes_edits(
-    blobs_verbs_t const& values_verbs, ustore_pages_remove_attributes_t const& arguments, strings_arg_t const& fields,
-    view_t const& view) noexcept {
+    blobs_verbs<home_t::host_k> const& values_verbs, ustore_pages_remove_attributes_t const& arguments,
+    strings_arg_t const& fields, view_t const& view) noexcept {
     std::span<page_edits_t const> chains;
     status_t const status = serve_remove_attributes(arguments, fields, view,
                                                     appended_edits_t {values_verbs, arguments.database, chains});
@@ -670,7 +671,7 @@ status_t read_pages(ustore_pages_read_t const& arguments, view_t const& view, re
 /** The page verbs of an engine keeping every page as one value, its dense element tree, bound to its unchecked
  *  whole-value verbs @p values_verbs_ and its resolver @p resolve_, which refuses every collection holding another
  *  modality first. */
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_import_over_blobs(ustore_pages_import_t const& arguments, strings_arg_t const& values,
                                  view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
@@ -679,7 +680,7 @@ status_t pages_import_over_blobs(ustore_pages_import_t const& arguments, strings
     return serve_import(arguments, values, view, rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_insert_over_blobs(ustore_pages_insert_t const& arguments, strings_arg_t const& values,
                                  view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
@@ -688,7 +689,7 @@ status_t pages_insert_over_blobs(ustore_pages_insert_t const& arguments, strings
     return serve_insert(arguments, values, view, rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_remove_over_blobs(ustore_pages_remove_t const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_pages_k, view);
@@ -696,7 +697,7 @@ status_t pages_remove_over_blobs(ustore_pages_remove_t const& arguments, view_t 
     return serve_remove(arguments, view, rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_move_over_blobs(ustore_pages_move_t const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_pages_k, view);
@@ -704,7 +705,7 @@ status_t pages_move_over_blobs(ustore_pages_move_t const& arguments, view_t cons
     return serve_move(arguments, view, rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_splice_over_blobs(ustore_pages_splice_t const& arguments, strings_arg_t const& values,
                                  view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
@@ -713,7 +714,7 @@ status_t pages_splice_over_blobs(ustore_pages_splice_t const& arguments, strings
     return serve_splice(arguments, values, view, rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_set_attributes_over_blobs(ustore_pages_set_attributes_t const& arguments, strings_arg_t const& fields,
                                          strings_arg_t const& values, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
@@ -722,7 +723,7 @@ status_t pages_set_attributes_over_blobs(ustore_pages_set_attributes_t const& ar
     return serve_set_attributes(arguments, fields, values, view, rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_remove_attributes_over_blobs(ustore_pages_remove_attributes_t const& arguments,
                                             strings_arg_t const& fields, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
@@ -731,7 +732,7 @@ status_t pages_remove_attributes_over_blobs(ustore_pages_remove_attributes_t con
     return serve_remove_attributes(arguments, fields, view, rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <blobs_verbs_t const& values_verbs_, auto resolve_>
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_read_over_blobs(ustore_pages_read_t const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_pages_k, view);

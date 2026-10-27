@@ -60,6 +60,6 @@ using namespace unum::ustore::nvme;
 
 #pragma region C ABI
 
-void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments) { route_init(arguments, &open); }
+void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments) { route_init<&nvme::open>(arguments); }
 
 #pragma endregion C ABI

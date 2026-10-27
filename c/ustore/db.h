@@ -112,6 +112,57 @@ typedef struct ustore_lengths_view_t {
 
 } ustore_lengths_view_t;
 
+/** Whether a predicate keeps a listed key or passes over it, numbered as USearch numbers its admissions. */
+typedef enum ustore_admission_t {
+
+    /** Pass over the key. */
+    ustore_reject_k = 0,
+
+    /** Keep the key among the listed ones. */
+    ustore_admit_k = 1,
+
+} ustore_admission_t;
+
+/** Admits or rejects @p count listed keys at once, never zero, writing one admission per key into @p admissions, a
+ *  buffer the library owns for the call. Runs on the thread running the call, never concurrently with itself within
+ *  one call. */
+typedef void (*ustore_predicate_callback_t)(ustore_key_t const* keys, ustore_admission_t* admissions,
+                                            ustore_size_t count, void* state);
+
+/** How costly one predicate call is, which decides where in a scan it is asked. */
+typedef enum ustore_predicate_cost_t {
+
+    /** Asked once per page of listed keys, before patterns or filters read any value, so it narrows those reads. */
+    ustore_predicate_cheap_k = 0,
+
+    /** Asked once per page about the keys patterns and filters kept, for handlers that pay per call, such as a lookup
+     *  in an external database. */
+    ustore_predicate_expensive_k = 1,
+
+} ustore_predicate_cost_t;
+
+/** The canonical spelling of a predicate cost, as @c ustore_predicate_expensive_k spells "expensive", or
+ *  "unrecognized". */
+USTORE_EXPORT char const* ustore_predicate_cost_name(ustore_predicate_cost_t cost);
+
+/** Reads a predicate cost back from its canonical spelling; @c ustore_predicate_cheap_k when unrecognized. */
+USTORE_EXPORT ustore_predicate_cost_t ustore_predicate_cost_from_name(ustore_bytes_view_t name);
+
+/** The caller's verdict on the keys a scan lists, which host executors alone ask: a device executor refuses a call
+ *  carrying one with @c ustore_status_device_k. */
+typedef struct ustore_predicate_t {
+
+    /** The optional handler, where @c NULL admits every key. */
+    ustore_predicate_callback_t callback;
+
+    /** Opaque pointer passed to every @c callback call. */
+    void* state;
+
+    /** Where in a scan @c callback is asked. */
+    ustore_predicate_cost_t cost;
+
+} ustore_predicate_t;
+
 /** How durable the writes a call publishes are once the call finishes. */
 typedef enum ustore_durability_t {
 
@@ -141,7 +192,8 @@ typedef enum ustore_scan_mode_t {
     /** Keys come in order, each once, and only while present. */
     ustore_scan_ordered_k = 0,
 
-    /** Keys may come out of order, deleted or repeated, to speed up the read after the scan; has no effect yet. */
+    /** Keys may come out of order, deleted or repeated, as each partition or run is walked on its own with no merge
+     *  across them, so a page of fewer than all keys cannot resume where it ended. */
     ustore_scan_unordered_k = 1,
 
 } ustore_scan_mode_t;
@@ -387,6 +439,10 @@ typedef struct ustore_database_open_nvme_t {
 
     /** Entries of @c data_directories. */
     ustore_size_t data_directories_count;
+
+    /** Executor of @c ustore_executor_for_vram whose device, scratch budget and GPUDirect Storage mode every merge of
+     *  the database takes, read once here, so it may be freed afterwards; @c NULL merges on host threads. */
+    ustore_executor_t compactions;
 
     /** Bytes of host memory the engine may pin and cache. */
     ustore_size_t memory_limit;

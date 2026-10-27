@@ -201,6 +201,10 @@ typedef enum ustore_py_enum_t {
     ustore_py_enum_modality_k,
     ustore_py_enum_isolation_k,
     ustore_py_enum_transport_k,
+    ustore_py_enum_gds_k,
+    ustore_py_enum_pattern_kind_k,
+    ustore_py_enum_case_sensitivity_k,
+    ustore_py_enum_predicate_cost_k,
     ustore_py_enum_engine_k,
     ustore_py_enum_role_k,
     ustore_py_enum_field_type_k,
@@ -286,9 +290,6 @@ typedef struct Executor {
 
     /** The executor, or NULL once it has been closed. */
     ustore_executor_t handle;
-
-    /** The executor this one borrows, as an NVMe one borrows a VRAM one, released once this one closes, or NULL. */
-    PyObject* borrowed;
 } Executor;
 
 /**
@@ -357,6 +358,16 @@ typedef struct ustore_py_context_t {
     ustore_completion_t completion;
 } ustore_py_context_t;
 
+/** A predicate the caller passed a scan or a cursor, re-entered from whichever thread runs the call. */
+typedef struct ustore_py_predicate_t {
+
+    /** The callable admitting keys, held, or NULL when the caller passed none. */
+    PyObject* callable;
+
+    /** The first exception @c callable raised, which outranks the call's own status; NULL while none has. */
+    PyObject* raised;
+} ustore_py_predicate_t;
+
 /** What every call keeps until it finishes, leading its verb's call: on the stack while it blocks, inside its
  *  @c Deferred once submitted. */
 typedef struct ustore_py_call_t {
@@ -375,6 +386,9 @@ typedef struct ustore_py_call_t {
 
     /** The first exception @c progress raised, which outranks the cancellation it turned into; NULL while none has. */
     PyObject* raised;
+
+    /** The predicate a scan asks about the keys it lists, and what it raised. */
+    ustore_py_predicate_t predicate;
 } ustore_py_call_t;
 
 /** How a verb runs a call it filled: the bytes its call takes, how it reaches the library, answers and lets go. */
@@ -543,6 +557,9 @@ typedef struct Keys {
 
     /** The keys every task found, laid end to end. */
     ustore_key_t const* tape;
+
+    /** One BM25 score per key when the scan's patterns carried weights, or NULL. */
+    float const* scores;
 
     /** Tasks the scan or sample carried. */
     size_t count;
@@ -845,6 +862,18 @@ int ustore_py_progress_from_object(PyObject* object, PyObject** progress);
 ustore_progress_callback_t ustore_py_progress_callback(ustore_py_call_t const* call);
 
 /**
+ *  @brief Reads @p object, a callable or None, as the predicate of a scan or a cursor.
+ *  @return 0 on success, -1 with a @c TypeError set otherwise.
+ */
+int ustore_py_predicate_from_object(PyObject* object, PyObject** callable);
+
+/** The C predicate re-entering the callable @p predicate holds, asked at @p cost, zeroed when it holds none. */
+ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate, int cost);
+
+/** Raises what the callable of @p predicate raised, answering -1, or answers 0 when it raised nothing. */
+int ustore_py_predicate_raise(ustore_py_predicate_t* predicate);
+
+/**
  *  @brief Reads one UUID from a `uuid.UUID`, 16 raw bytes, canonical UUID text or a non-negative integer.
  *  @param[in] object The identifier in any of those spellings.
  *  @param[out] uuid The sixteen bytes it spells, an integer big-endian as `uuid.UUID(int=n)` spells it.
@@ -958,7 +987,8 @@ int ustore_py_present(ustore_octet_t const* presences, size_t task_index);
  *      claims.
  *  @return A new reference, or NULL with an exception set.
  */
-PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, ustore_key_t const* tape, size_t count);
+PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, ustore_key_t const* tape, size_t count,
+                             float const* scores);
 
 /**
  *  @brief Builds a read-only @c memoryview over memory a call of @p generation wrote into @p arena, which pins the
@@ -1321,6 +1351,8 @@ extern char const doc_sample[];
 extern char const doc_sample_batch[];
 extern char const doc_measure[];
 extern char const doc_cursor[];
+extern char const doc_docs_cursor[];
+extern char const doc_graph_vertices_cursor[];
 extern char const doc_get[];
 extern char const doc_set[];
 extern char const doc_remove[];
@@ -1355,6 +1387,10 @@ PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* args, Py_s
                                      PyObject* args_names_tuple);
 PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                 PyObject* args_names_tuple);
+PyObject* ustore_py_api_docs_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                    PyObject* args_names_tuple);
+PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                              PyObject* args_names_tuple);
 PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                PyObject* args_names_tuple);
 PyObject* ustore_py_api_get(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,

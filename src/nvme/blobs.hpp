@@ -37,7 +37,7 @@ status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const&
     if (status_t const status = validate_write(view.transaction, places, values, arguments.durability, view.watch);
         status.failed() || !arguments.count)
         return status;
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, places.collections_begin, places.size(),
                                                ustore_modality_blobs_k);
         resolved.failed())
@@ -64,7 +64,7 @@ status_t remove_values(ustore_blobs_remove_t const& arguments, view_t const& vie
     if (status_t const status = validate_remove(view.transaction, places, arguments.durability, view.watch);
         status.failed() || !arguments.count)
         return status;
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     return serve_write(state, view, arguments.durability, places.size(), 1, watch_schedule_t::never_k,
                        [&](call_access<cpu_class_> const& access) noexcept -> status_t {
                            for (std::size_t index = 0; index != places.size(); ++index) {
@@ -94,7 +94,7 @@ status_t read_values(ustore_blobs_read_t const& arguments, view_t const& view) n
     if (!arguments.count) return {};
     place_batch_t const places = places_of(arguments);
     if (status_t const status = validate_read(places); status.failed()) return status;
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
@@ -118,14 +118,15 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) no
     return read_values<cpu_class_>(arguments, view);
 }
 
-/** Scans keys as ordered walks of the store of each collection, a graph's being its vertices, watching what a
- *  transaction hands out, for a caller whose resolver checked the collections. */
+/** Scans keys as ordered walks of the store of each collection, or run by run for an unordered scan outside a
+ *  transaction, a graph's being its vertices, watching what a transaction hands out, for a caller whose resolver
+ *  checked the collections. */
 template <cpu_class_t cpu_class_>
 status_t scan_values(ustore_blobs_scan_t const& arguments, view_t const& view) noexcept {
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     scan_batch_t const scans {collections, strided(arguments.start_keys), arguments.wanted, arguments.count};
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
@@ -135,11 +136,17 @@ status_t scan_values(ustore_blobs_scan_t const& arguments, view_t const& view) n
         scan_task_t const scan = scans[task];
         outputs.open_task(task);
         found.clear();
-        if (scan.limit != 0)
-            if (status_t const collected = collect_keys(access, scan.collection, stored_of(scan.start_key.uuid),
-                                                        scan.limit, found);
-                collected.failed())
-                return collected;
+        stored_key_t const from = stored_of(scan.start_key.uuid);
+        // An unordered scan walks each run alone outside a transaction, whose own deltas merge only in order
+        status_t collected;
+        if (scan.limit != 0 && arguments.mode == ustore_scan_unordered_k && !access.transaction)
+            collected = collect_keys_unordered(access, scan.collection, from, scan.limit, found);
+        if (scan.limit != 0 && (arguments.mode != ustore_scan_unordered_k || access.transaction ||
+                                collected == status_code_t::contended_k)) {
+            found.clear();
+            collected = collect_keys(access, scan.collection, from, scan.limit, found);
+        }
+        if (collected.failed()) return collected;
         for (std::size_t index = 0; index != found.size(); ++index)
             if (status_t const pushed = outputs.push(key_of(found[index])); pushed.failed()) return pushed;
         if (status_t const watched = watch_keys(access, scan.collection, std::span<stored_key_t const> {found});
@@ -194,7 +201,7 @@ status_t sample_values(ustore_blobs_sample_t const& arguments, view_t const& vie
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     sample_batch_t const samples {collections, arguments.wanted, arguments.count};
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
     auto const now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -250,7 +257,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
     strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
-    database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_blobs_k);
         resolved.failed())
         return resolved;

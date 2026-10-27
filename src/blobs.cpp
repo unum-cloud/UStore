@@ -8,49 +8,41 @@
 
 #include <cstddef> // `std::size_t`
 
+#include <variant> // `std::get_if`
+
 #include "ustore/blobs.h" // `ustore_blobs_write_t`, `ustore_blobs_cursor_next_t`
 
-#include "lib.hpp" // `route`, `open_cursor`, `free_cursor`, `blobs_cursor_t`
+#include "lib.hpp" // `route`, `open_cursor`, `free_cursor`, `ustore_blobs_cursor_handle_t`
 
 namespace unum::ustore {
 
-status_t pull(engine_t const& engine, ustore_blobs_cursor_next_t const& arguments, blobs_cursor_t& cursor,
+status_t pull(engine_t const& engine, ustore_blobs_cursor_next_t const& arguments, ustore_blobs_cursor_handle_t& cursor,
               view_t const& view) noexcept {
     if (!arguments.keys || !arguments.written)
         return {status_code_t::invalid_argument_k, "Need outputs for the keys and the count written"};
-    if (arguments.values && !engine.blobs->read)
+    if (arguments.values && !engine.host.blobs->read)
         return {status_code_t::unsupported_k, "The engine does not implement this call"};
-    ustore_length_t const* offsets = nullptr;
-    ustore_key_t const* listed = nullptr;
-    if (!cursor.exhausted && arguments.wanted) {
-        ustore_blobs_scan_t const scan {.database = arguments.database,
-                                        .count = 1,
-                                        .collections = {&cursor.collection, 0},
-                                        .start_keys = {&cursor.start_key, 0},
-                                        .offsets = &offsets,
-                                        .keys = &listed,
-                                        .arena = view.scratch,
-                                        .wanted = arguments.wanted};
-        if (status_t const status = engine.blobs->scan(scan, view); status.failed()) return status;
-    }
-    std::size_t const written = offsets ? offsets[1] : 0;
+    keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
+    std::variant<ustore_key_t, exhausted_t> resume;
+    if (status_t const status = list_cursor_keys<ustore_blobs_scan_t>(
+            engine, arguments.database, cursor, arguments.wanted, arguments.arena, view, survivors, resume);
+        status.failed())
+        return status;
+    arena_rewind(arguments.arena);
+    std::size_t const written = survivors.size();
     if (written && arguments.values) {
         ustore_blobs_read_t const read {.database = arguments.database,
                                         .count = written,
-                                        .collections = {&cursor.collection, 0},
-                                        .keys = {listed, sizeof(ustore_key_t)},
+                                        .collections = {&cursor.cursor.collection, 0},
+                                        .keys = {survivors.data(), sizeof(ustore_key_t)},
                                         .values = arguments.values,
                                         .arena = arguments.arena};
-        if (status_t const status = engine.blobs->read(read, view); status.failed()) return status;
+        if (status_t const status = engine.host.blobs->read(read, view); status.failed()) return status;
     }
-    auto [keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, {listed, written});
+    auto [keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, survivors);
     if (keys_status.failed()) return keys_status;
     if (!progress_t {arguments.progress, arguments.progress_state, 1}.advance(1)) return progress_cancelled_k;
-
-    // A page short of what it wanted reached the end of the collection, and so did one ending at the last key
-    ustore_key_t const* const last = written ? listed + written - 1 : nullptr;
-    if (written < arguments.wanted || (last && *last == largest_key_k)) cursor.exhausted = true;
-    else if (last) cursor.start_key = key_after(*last);
+    cursor.position = resume;
     *arguments.keys = keys.data();
     *arguments.written = written;
     return {};
@@ -58,27 +50,18 @@ status_t pull(engine_t const& engine, ustore_blobs_cursor_next_t const& argument
 
 } // namespace unum::ustore
 
-void ustore_blobs_write(ustore_blobs_write_t* arguments) { route<&engine_t::blobs, &blobs_verbs_t::write>(arguments); }
-void ustore_blobs_remove(ustore_blobs_remove_t* arguments) {
-    route<&engine_t::blobs, &blobs_verbs_t::remove>(arguments);
-}
-void ustore_blobs_read(ustore_blobs_read_t* arguments) { route<&engine_t::blobs, &blobs_verbs_t::read>(arguments); }
-void ustore_blobs_scan(ustore_blobs_scan_t* arguments) { route<&engine_t::blobs, &blobs_verbs_t::scan>(arguments); }
-void ustore_blobs_sample(ustore_blobs_sample_t* arguments) {
-    route<&engine_t::blobs, &blobs_verbs_t::sample>(arguments);
-}
-void ustore_blobs_measure(ustore_blobs_measure_t* arguments) {
-    route<&engine_t::blobs, &blobs_verbs_t::measure>(arguments);
-}
-void ustore_blobs_cursor_next(ustore_blobs_cursor_next_t* arguments) {
-    route<&engine_t::blobs, &blobs_verbs_t::scan>(arguments);
-}
+void ustore_blobs_write(ustore_blobs_write_t* arguments) { route(arguments); }
+void ustore_blobs_remove(ustore_blobs_remove_t* arguments) { route(arguments); }
+void ustore_blobs_read(ustore_blobs_read_t* arguments) { route(arguments); }
+void ustore_blobs_scan(ustore_blobs_scan_t* arguments) { route(arguments); }
+void ustore_blobs_sample(ustore_blobs_sample_t* arguments) { route(arguments); }
+void ustore_blobs_measure(ustore_blobs_measure_t* arguments) { route(arguments); }
+void ustore_blobs_cursor_next(ustore_blobs_cursor_next_t* arguments) { route(arguments); }
 
 void ustore_blobs_cursor_init(ustore_blobs_cursor_init_t* arguments) {
-    auto [cursor,
-          status] = open_cursor<ustore_blobs_cursor_handle_t, &engine_t::blobs, &blobs_verbs_t::scan>(*arguments);
+    auto [cursor, status] = open_cursor<ustore_blobs_cursor_handle_t, blobs_verbs, ustore_blobs_scan_t>(*arguments);
     if (status.failed()) return finish(*arguments->outcome, status);
-    cursor->start_key = arguments->start_key;
+    cursor->position = arguments->start_key;
     *arguments->cursor = cursor;
     finish(*arguments->outcome, {});
 }

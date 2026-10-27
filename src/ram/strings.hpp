@@ -146,7 +146,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_sca
 #pragma region Table
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-strings_verbs_t const ram_variant<cpu_class_, isolation_>::strings_verbs_k {
+strings_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::strings_verbs_k {
     .write = &serve_database<cpu_class_, isolation_, ustore_strings_write_t, strings_arg_t>,
     .remove = &serve_database<cpu_class_, isolation_, ustore_strings_remove_t, strings_arg_t>,
     .read = &serve_database<cpu_class_, isolation_, ustore_strings_read_t, strings_arg_t>,

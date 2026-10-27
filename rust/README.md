@@ -126,7 +126,7 @@ assert_eq!(values.get(0), Some(b"Ada".as_slice()));
 // submit four scans, each into an arena of its own, then await each
 let mut arenas = (0..4).map(|_| Arena::new_in(&executor)).collect::<Result<Vec<_>, _>>()?;
 let scans = arenas.iter_mut().zip(starts)
-    .map(|(arena, start)| deferred.scan(people, start, 1000, arena)).collect::<Result<Vec<_>, _>>()?;
+    .map(|(arena, start)| deferred.scan(people, start, 1000, Matching::default(), arena)).collect::<Result<Vec<_>, _>>()?;
 for scan in scans { consume(scan.await?); }
 
 transaction.deferred(&executor).write(people, (keys, names), Durability::Buffered)?.await?;
@@ -192,7 +192,7 @@ The scratch of each thread and every arena the executor makes live on those doma
 Zero threads take 7/8 of the cores those domains carry, leaving the rest to the driver thread, to blocking calls and to the background work of RocksDB and LevelDB, and a zero `deferred_limit` takes 256.
 `Executor::on_pool` borrows the threads of a ForkUnion `fu_pool_t`, so several libraries in one process share them, and is `unsafe`, since the pool must outlive the executor.
 `Executor::for_nvme` spawns the threads of the NVMe engine, one I/O ring apiece, and its `IOOptions` tell every database opened on it how to move bytes: the transport, the channels and their buffers.
-It may own an executor of `Executor::for_vram`, whose CUDA devices its compactions run on, which fails with `Status::Unsupported` in a library built without CUDA.
+`Executor::for_vram` drives one CUDA device through one stream, its own or one the caller lends, failing with `Status::Unsupported` in a library built without CUDA, and is `unsafe`, since a lent stream must outlive the executor; `NVMEOptions::compactions` places an NVMe database's merges on it.
 `View::on` names the executor and keeps the view blocking, so its verbs answer exactly as they do on the calling thread.
 `Executor::drain` waits for every call submitted before the drain began and leaves the threads in `Mood::Parked` or `Mood::Spinning` whenever they next go idle, and dropping the executor drains it.
 
@@ -217,7 +217,7 @@ let others = database.head().read(people, &[grace], &mut arena)?; // refused whi
 println!("{:?}", values.get(0));
 
 let (mut found, mut fetched) = (Arena::new()?, Arena::new()?);     // two live results, two arenas
-for &key in database.head().scan(people, ada, 100, &mut found)? {
+for &key in database.head().scan(people, ada, 100, Matching::default(), &mut found)?.keys {
     consume(database.head().read(people, &[key], &mut fetched)?);  // rewinds fetched, never found
 }
 ```
@@ -359,7 +359,7 @@ A `Collections::Each` whose length is not the length of the batch is refused wit
 Beneath the collections, every verb takes a batch, names its collections by identifier, and hands back what its call produced.
 
 ```rust
-use ustore::{Arena, CollectionID, RAMOptions, Database, Durability, Entry, Key, Modality};
+use ustore::{Arena, CollectionID, RAMOptions, Database, Durability, Entry, Key, Matching, Modality};
 
 let database = Database::init_ram(&RAMOptions::default())?;
 let mut arena = Arena::new()?;
@@ -388,7 +388,7 @@ let entries = [Entry::new(ada, b"rewritten"), Entry::new(kent, b"")];
 database.head().write(people, &entries, Durability::Buffered)?;
 database.head().remove(people, &[grace], Durability::Buffered)?;
 
-let first = database.head().scan(people, Key::from(0u64), 100, &mut arena)?;
+let first = database.head().scan(people, Key::from(0u64), 100, Matching::default(), &mut arena)?.keys;
 let measured = database.head().measure(people, ada, kent, &mut arena)?;
 ```
 
@@ -398,7 +398,7 @@ let measured = database.head().measure(people, ada, kent, &mut arena)?;
 A `Cursor` walks one collection page by page, each pull landing in the arena it is given, with the values of its keys when it asks for them:
 
 ```rust
-let mut cursor = database.head().on(&executor).cursor(people, Key::from(0u64))?;
+let mut cursor = database.head().on(&executor).cursor(people, Key::from(0u64), Matching::default())?;
 loop {
     let page = cursor.next_pairs(1024, &mut arena)?;
     for (index, key) in page.keys().iter().enumerate() {

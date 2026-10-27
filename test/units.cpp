@@ -31,7 +31,7 @@
 
 #include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
 
-#include "engine.hpp"      // `engine_t`, `handle_t`, `c_handle`, `view_t`
+#include "engine.hpp"      // `engine_t`, `ustore_database_handle_t`, `view_t`
 #include "harness.hpp"     // `suite_exit_code`, `expect`, `expect_eq`, `expect_status`, `spin_until`
 #include "pages/model.hpp" // `model_page_t`, `model_edit_t`, `node_spec_t`
 
@@ -2746,10 +2746,10 @@ void leave_database(ustore_database_t) noexcept {}
 database_verbs_t const progress_database_verbs_k {.database_free = &leave_database};
 
 /** The stand-in engine's only blobs verb, a scan reporting its progress once. */
-blobs_verbs_t const progress_blobs_verbs_k {.scan = &scan_reporting_progress};
+blobs_verbs<home_t::host_k> const progress_blobs_verbs_k {.scan = &scan_reporting_progress};
 
 /** An engine serving only scans, each reporting its progress once, so a call stays unfinished while a case needs. */
-engine_t const progress_engine_k {.database = &progress_database_verbs_k, .blobs = &progress_blobs_verbs_k};
+engine_t const progress_engine_k {.database = &progress_database_verbs_k, .host = {.blobs = &progress_blobs_verbs_k}};
 
 /** How far a scan held inside its progress callback got. */
 enum class hold_stage_t : std::uint32_t {
@@ -2761,7 +2761,7 @@ enum class hold_stage_t : std::uint32_t {
 /** A deferred scan on the stand-in engine, its callback holding it until the case releases it, and everything its
  *  arguments point to, while the arguments themselves die at submission. */
 struct held_scan_t {
-    handle_t database {&progress_engine_k};
+    ustore_database_handle_t database {&progress_engine_k};
     hold_stage_t stage = hold_stage_t::submitted_k;
     ustore_outcome_t outcome {};
     ustore_key_t start_key {};
@@ -2785,7 +2785,7 @@ std::size_t submit_held(held_scan_t& held, ustore_executor_t executor) noexcept 
     if (arena_status.failed()) return expect(arena_status.succeeded());
     held.arena = std::move(arena);
     ustore_blobs_scan_t scan {
-        .database = c_handle<ustore_database_t>(&held.database),
+        .database = &held.database,
         .executor = executor,
         .outcome = &held.outcome,
         .completion = ustore_completion_deferred_k,

@@ -35,8 +35,8 @@
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`
 #include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `growth_status`
 
-#include "engine.hpp"             // `engine_t`, `handle_t`, `handle_cast`
-#include "utilities/batches.hpp"  // `strings_arg_t`, `validate_write`, `places_of`
+#include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `state_of`
+#include "utilities/batches.hpp"  // `strings_arg`, `validate_write`, `places_of`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `collection_list_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -149,7 +149,7 @@ class collection_walk_t {
 extern engine_t const engine_k;
 
 /** The open database and its options. */
-struct database_t : handle_t {
+struct database_t {
 
     /** Options the database opened with, reused to create the databases snapshots save. */
     ::leveldb::Options options;
@@ -161,8 +161,8 @@ struct database_t : handle_t {
     std::mutex collections_mutex;
 };
 
-/** A snapshot handle, pinning one LevelDB snapshot of its database until freed. */
-struct snapshot_t : handle_t {
+/** What a snapshot holds, behind its snapshot handle, pinning one LevelDB snapshot of its database until freed. */
+struct snapshot_t {
 
     /** The database the snapshot was taken of, which releases it. */
     database_t* database = nullptr;
@@ -219,7 +219,7 @@ status_t resolve_collections(database_t& database, strided_iterator<ustore_colle
  *  @c admit_modality refuses for @p modality, looking each run of tasks on one collection up once. */
 status_t refuse_modalities(ustore_database_t handle, ustore_collections_view_t collections, ustore_size_t count,
                            ustore_modality_t modality) {
-    database_t& database = *handle_cast<database_t>(handle);
+    database_t& database = *state_of<database_t>(handle);
     strided_iterator<ustore_collection_id_t const> const tasks = strided(collections);
     std::string held;
     for (std::size_t task_index = 0; task_index != count; ++task_index) {
@@ -239,7 +239,7 @@ status_t resolve_modality(ustore_database_t database, ustore_collections_view_t 
 
 /** Points @p options at the snapshot @p view names, leaving them at the head for any other view. */
 void use_snapshot(view_t const& view, ::leveldb::ReadOptions& options) noexcept {
-    if (view.snapshot) options.snapshot = handle_cast<snapshot_t>(view.snapshot)->native;
+    if (view.snapshot) options.snapshot = state_of<snapshot_t>(view.snapshot)->native;
 }
 
 /** The bytes of memory LevelDB estimates the database holds. */
@@ -352,7 +352,8 @@ status_t database_open(ustore_database_open_leveldb_t const& arguments, view_t c
     if (directory_exists_status.failed()) return directory_exists_status;
     if (!root_exists) return {status_code_t::not_found_k, "Root isn't a directory"};
 
-    std::unique_ptr<database_t> database {new (std::nothrow) database_t};
+    std::unique_ptr<ustore_database_handle_t> handle {new (std::nothrow) ustore_database_handle_t {}};
+    std::unique_ptr<database_t> database {handle ? new (std::nothrow) database_t : nullptr};
     if (!database) return {status_code_t::out_of_memory_k, "Failed to allocate the database"};
     database->options.compression = ::leveldb::kNoCompression;
     database->options.create_if_missing = true;
@@ -361,15 +362,15 @@ status_t database_open(ustore_database_open_leveldb_t const& arguments, view_t c
     native_status_t const status = native_t::Open(database->options, root, &native);
     if (!status.ok()) return {status_code_t::io_k, "Failed to open LevelDB"};
     database->native.reset(native);
-    database->engine = &engine_k;
-    *arguments.database = c_handle<ustore_database_t>(database.release());
+    handle->engine = &engine_k, handle->state = database.release();
+    *arguments.database = handle.release();
     return {};
 }
 
 /** Reports the engine with LevelDB's estimates of the memory it holds and of the bytes its files take, and no count of
  *  the keys, which LevelDB keeps none of. */
 status_t database_describe(ustore_database_describe_t const& arguments, view_t const&) {
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     auto [memory_bytes, memory_status] = memory_usage(database);
     if (memory_status.failed()) return memory_status;
     // Every stored key, both system collections included, sorts below one byte past the largest UUID
@@ -394,21 +395,22 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
 status_t snapshot_init(ustore_snapshot_init_t const& arguments, view_t const&) {
     if (!arguments.snapshot) return {status_code_t::invalid_argument_k, "Need an output for the snapshot"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
-    std::unique_ptr<snapshot_t> snapshot {new (std::nothrow) snapshot_t};
+    database_t& database = *state_of<database_t>(arguments.database);
+    std::unique_ptr<ustore_snapshot_handle_t> handle {new (std::nothrow) ustore_snapshot_handle_t {}};
+    std::unique_ptr<snapshot_t> snapshot {handle ? new (std::nothrow) snapshot_t : nullptr};
     if (!snapshot) return {status_code_t::out_of_memory_k, "Failed to allocate the snapshot handle"};
     snapshot->native = database.native->GetSnapshot();
     if (!snapshot->native) return {status_code_t::internal_k, "Failed to take a snapshot"};
-    snapshot->engine = &engine_k;
     snapshot->database = &database;
     // LevelDB keeps a snapshot's sequence number behind its private interface
     if (arguments.read_stamp) *arguments.read_stamp = 0;
-    *arguments.snapshot = c_handle<ustore_snapshot_t>(snapshot.release());
+    handle->engine = &engine_k, handle->state = snapshot.release();
+    *arguments.snapshot = handle.release();
     return {};
 }
 
 status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& view) {
-    database_t& database = *handle_cast<database_t>(database_of(arguments));
+    database_t& database = *state_of<database_t>(database_of(arguments));
     ::leveldb::ReadOptions scan_options;
     scan_options.fill_cache = false;
     use_snapshot(view, scan_options);
@@ -503,7 +505,7 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
     if (arguments.name.data && name.empty()) return {status_code_t::invalid_argument_k, "A name is never empty"};
 
     // The entry and the name reach the log in one batch, so a crash keeps both or neither
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     std::lock_guard lock {database.collections_mutex};
     std::string name_key;
     if (!name.empty()) {
@@ -534,7 +536,7 @@ status_t collection_drop(ustore_collection_drop_t const& arguments, view_t const
         arguments.mode != ustore_drop_values_k)
         return {status_code_t::invalid_argument_k, "Unknown drop mode"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     if (arguments.mode == ustore_drop_collection_k) {
         std::lock_guard lock {database.collections_mutex};
         return drop_collection(database, arguments.collection);
@@ -550,7 +552,7 @@ status_t collection_drop(ustore_collection_drop_t const& arguments, view_t const
 status_t collection_list(ustore_collection_list_t const& arguments, view_t const& view) {
     if (!arguments.written) return {status_code_t::invalid_argument_k, "Need an output for the collections written"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     ::leveldb::ReadOptions options;
     options.fill_cache = false;
     use_snapshot(view, options);
@@ -578,7 +580,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     if (!names || !arguments.collections)
         return {status_code_t::invalid_argument_k, "Need the names and an output for the identifiers"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     ::leveldb::ReadOptions options;
     use_snapshot(view, options);
 
@@ -617,7 +619,7 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const&)
     if (mode != ustore_drop_collection_k && mode != ustore_drop_pairs_k && mode != ustore_drop_values_k)
         return {status_code_t::invalid_argument_k, "Unknown drop mode"};
 
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     std::lock_guard lock {database.collections_mutex};
     ::leveldb::WriteOptions buffered;
     ::leveldb::WriteOptions synced;
@@ -659,7 +661,7 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const&)
  *  collections, each flushing the memtable ahead of it, and reports one unit per collection, as LevelDB measures no
  *  memtable. */
 status_t database_compact(ustore_database_compact_t const& arguments, view_t const&) {
-    database_t& database = *handle_cast<database_t>(arguments.database);
+    database_t& database = *state_of<database_t>(arguments.database);
     // The collections system collection lists every collection in the order of their identifiers, which is key order
     st::basic_vector<ustore_collection_id_t> bounds;
     st::status_t grown = st::status_t::success_k;
@@ -692,10 +694,10 @@ status_t database_compact(ustore_database_compact_t const& arguments, view_t con
 
 #pragma region Memory
 
-void database_free(ustore_database_t database) noexcept { delete handle_cast<database_t>(database); }
+void database_free(ustore_database_t database) noexcept { delete state_of<database_t>(database); }
 
 void snapshot_free(ustore_snapshot_t handle) noexcept {
-    snapshot_t* const snapshot = handle_cast<snapshot_t>(handle);
+    snapshot_t* const snapshot = state_of<snapshot_t>(handle);
     snapshot->database->native->ReleaseSnapshot(snapshot->native);
     delete snapshot;
 }

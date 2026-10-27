@@ -37,6 +37,9 @@ type DataDirectory = PathLikeOrStr | tuple[PathLikeOrStr, int]
 type Progress = Callable[[int, int], bool | None]
 """Called with the units a call finished and the units it finishes in all, from whichever thread runs it but never two
 at once; None or a truthy answer carries on, any other falsy one cancels, and a raise cancels and re-raises."""
+type Predicate = Callable[[tuple[UUID, ...]], Sequence[object]]
+"""Called with the keys one page of a scan or a pull listed, from whichever thread runs it, answering one truthy item
+per key kept; a raise rejects the rest and re-raises once the call is final."""
 
 __version__: str
 edge_id_default: UUID
@@ -126,6 +129,34 @@ class Transport(IntEnum):
     LINUX_URING = 2
     LINUX_AIO = 3
     LINUX_SPDK = 4
+
+class PatternKind(IntEnum):
+    """What the patterns of a scan or a cursor are matched as, valued as `ustore_pattern_kind_t`."""
+
+    REGEX = 0
+    SUBSTRINGS = 1
+
+class CaseSensitivity(IntEnum):
+    """Whether patterns compare bytes as they are or after Unicode case folding, valued as
+    `ustore_case_sensitivity_t`."""
+
+    CASED = 0
+    UNCASED = 1
+
+class PredicateCost(IntEnum):
+    """Where a scan asks its predicate: before patterns and filters read values, or last, valued as
+    `ustore_predicate_cost_t`."""
+
+    CHEAP = 0
+    EXPENSIVE = 1
+
+class Gds(IntEnum):
+    """How an executor of `Executor.for_vram` moves bytes between the drives and its device, valued as
+    `ustore_gds_t`."""
+
+    AUTOMATIC = 0
+    DIRECT = 1
+    COMPAT = 2
 
 class Engine(IntEnum):
     """The engine serving a database, as `describe()` reports it, valued as `ustore_engine_t`."""
@@ -274,6 +305,7 @@ class Keys:
     """The keys one batch scan or sample wrote into an `Arena`, viewing it until it rewinds."""
 
     counts: tuple[int, ...]
+    scores: tuple[float, ...] | None
 
     def __len__(self) -> int: ...
     def __getitem__(self, task: int) -> tuple[UUID, ...]: ...
@@ -428,7 +460,6 @@ class Executor:
         threads: int = 0,
         *,
         transport: Transport = Transport.AUTOMATIC,
-        vram: Executor | None = None,
         deferred_limit: int = 0,
         shared_io_channels: int = 0,
         queue_depth: int = 0,
@@ -438,13 +469,20 @@ class Executor:
         stream_buffers_count: int = 0,
     ) -> Self:
         """Threads each driving an I/O ring for the NVMe engine, telling every database `Database.open_nvme` opens on
-        it how to move bytes, where every zero size keeps the engine's default, and compacting on the devices of
-        `vram`, which it keeps until it closes. Calls `ustore_executor_for_nvme`."""
+        it how to move bytes, where every zero size keeps the engine's default. Calls `ustore_executor_for_nvme`."""
 
     @classmethod
-    def for_vram(cls, devices: Sequence[int] | None = None, *, scratch_limit: int = 0, deferred_limit: int = 0) -> Self:
-        """Host threads driving the CUDA `devices`, every visible one for None, which an NVMe executor compacts on,
-        refused with `UnsupportedError` in a build without CUDA. Calls `ustore_executor_for_vram`."""
+    def for_vram(
+        cls,
+        device: int,
+        *,
+        scratch_limit: int = 0,
+        gds: Gds = Gds.AUTOMATIC,
+        deferred_limit: int = 0,
+    ) -> Self:
+        """One stream on the CUDA `device` every call queues on, fed by one host thread, which `Database.open_nvme`
+        takes as its `compactions`, refused with `UnsupportedError` in a build without CUDA; zero `scratch_limit` lets
+        scratch grow as calls ask. Calls `ustore_executor_for_vram`."""
 
     def drain(self, mood: Mood = Mood.PARKED) -> None:
         """Waits for every call submitted before the drain began, setting what the threads do once idle."""
@@ -562,9 +600,43 @@ class _Reads:
     def contains(self, key: KeyLike, *, collection: CollectionLike) -> bool:
         """Reads one presence into a one-off arena."""
 
-    def cursor(self, start: KeyLike = 0, /, *, collection: CollectionLike) -> Cursor:
+    def cursor(
+        self,
+        start: KeyLike = 0,
+        /,
+        *,
+        collection: CollectionLike,
+        patterns: Sequence[str | bytes] | None = None,
+        pattern_kind: PatternKind = PatternKind.REGEX,
+        sensitivity: CaseSensitivity = CaseSensitivity.CASED,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
+    ) -> Cursor:
         """A walk over the keys of one collection from `start`, reading nothing until its first pull, whose every pull
         blocks as this receiver's calls do. Calls `ustore_blobs_cursor_init`."""
+
+    def docs_cursor(
+        self,
+        start: KeyLike = 0,
+        /,
+        *,
+        collection: CollectionLike,
+        filter: str | bytes | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
+    ) -> Cursor:
+        """A walk over documents, keeping those `filter` matches. Calls `ustore_docs_cursor_init`."""
+
+    def graph_vertices_cursor(
+        self,
+        start: KeyLike = 0,
+        /,
+        *,
+        collection: CollectionLike,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
+    ) -> Cursor:
+        """A walk over the vertices of one graph collection. Calls `ustore_graph_vertices_cursor_init`."""
 
     def scan(
         self,
@@ -576,6 +648,12 @@ class _Reads:
         collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
+        patterns: Sequence[str | bytes] | None = None,
+        pattern_kind: PatternKind = PatternKind.REGEX,
+        sensitivity: CaseSensitivity = CaseSensitivity.CASED,
+        weights: Sequence[float] | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys: ...
     def scan_batch(
         self,
@@ -587,6 +665,12 @@ class _Reads:
         collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
+        patterns: Sequence[str | bytes] | None = None,
+        pattern_kind: PatternKind = PatternKind.REGEX,
+        sensitivity: CaseSensitivity = CaseSensitivity.CASED,
+        weights: Sequence[float] | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys:
         """One scan per start, reporting the scans finished to `progress`."""
     def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys: ...
@@ -624,6 +708,9 @@ class _Reads:
         collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
+        filter: str | bytes | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys: ...
     def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
         """Up to `wanted` document keys drawn at random, which a `docs_read` or a `docs_gather` follows."""
@@ -645,6 +732,8 @@ class _Reads:
         collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys: ...
 
 @type_check_only
@@ -782,6 +871,7 @@ class Database(_Writes, _Receivers):
         *,
         executor: Executor | None = None,
         data_directories: Sequence[DataDirectory] = (),
+        compactions: Executor | None = None,
         memory_limit: int = 0,
         transaction_max_bytes: int = 0,
         transaction_max_deltas: int = 0,
@@ -794,7 +884,8 @@ class Database(_Writes, _Receivers):
         collection_value_max_size: int = 0,
     ) -> Self:
         """A database on the NVMe engine, where every zero size keeps the engine's default, opened blocking on
-        `executor`, which tells it how to move bytes when `Executor.for_nvme` made it."""
+        `executor`, which tells it how to move bytes when `Executor.for_nvme` made it, merging on the device of
+        `compactions` when `Executor.for_vram` made it."""
     def __enter__(self) -> Self: ...
     def __exit__(
         self,
@@ -971,6 +1062,12 @@ class DeferredView:
         collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
+        patterns: Sequence[str | bytes] | None = None,
+        pattern_kind: PatternKind = PatternKind.REGEX,
+        sensitivity: CaseSensitivity = CaseSensitivity.CASED,
+        weights: Sequence[float] | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]: ...
     def scan_batch(
         self,
@@ -982,6 +1079,12 @@ class DeferredView:
         collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
+        patterns: Sequence[str | bytes] | None = None,
+        pattern_kind: PatternKind = PatternKind.REGEX,
+        sensitivity: CaseSensitivity = CaseSensitivity.CASED,
+        weights: Sequence[float] | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
         """The `Deferred` of one scan per start, whose `progress` runs on the executor's threads."""
     def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]: ...
@@ -1024,6 +1127,9 @@ class DeferredView:
         collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
+        filter: str | bytes | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]: ...
     def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]: ...
     def graph_read_edges(
@@ -1043,6 +1149,8 @@ class DeferredView:
         collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]: ...
     def collection_find(self, name: str, arena: Arena, /) -> Deferred[UUID]: ...
     def collection_list(self, arena: Arena, /) -> Deferred[tuple[UUID, ...]]: ...

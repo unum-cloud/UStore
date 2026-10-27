@@ -47,7 +47,7 @@
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`
 #include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_copy`, `arena_allocator`
 
-#include "engine.hpp"             // `engine_t`, `handle_t`, `handle_cast`, `view_t`
+#include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `state_of`, `view_t`
 #include "lib.hpp"                // `cpu_class_t`, `atomic_ref_for_cpu_class`, `atomic_ref_of`, `waiter_of`
 #include "utilities/batches.hpp"  // `scan_batch_t`, `strings_arg_t`, `edges_batch_t`, `places_of`, `edges_of`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `strings_read_outputs_t`, `scan_outputs_t`
@@ -147,19 +147,19 @@ struct ram_variant {
     static database_verbs_t const database_verbs_k;
 
     /** The verbs of this class's blobs collections. */
-    static blobs_verbs_t const blobs_verbs_k;
+    static blobs_verbs<home_t::host_k> const blobs_verbs_k;
 
     /** The verbs of this class's strings collections. */
-    static strings_verbs_t const strings_verbs_k;
+    static strings_verbs<home_t::host_k> const strings_verbs_k;
 
     /** The verbs of this class's documents collections. */
-    static docs_verbs_t const docs_verbs_k;
+    static docs_verbs<home_t::host_k> const docs_verbs_k;
 
     /** The verbs of this class's graph collections. */
-    static graph_verbs_t const graph_verbs_k;
+    static graph_verbs<home_t::host_k> const graph_verbs_k;
 
     /** The verbs of this class's pages collections. */
-    static pages_verbs_t const pages_verbs_k;
+    static pages_verbs<home_t::host_k> const pages_verbs_k;
 
     /** The table every handle of a database of this class and isolation is stamped with, so the router refuses a
      *  handle of another. */
@@ -169,9 +169,9 @@ struct ram_variant {
     static status_t open(ustore_database_t* database, std::string_view directory) noexcept;
 };
 
-/** Everything a database at @p isolation_ holds, which is the database handle of the C ABI. */
+/** Everything a database at @p isolation_ holds, behind its database handle of the C ABI. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-struct database_state : handle_t {
+struct database_state {
 
     /** The order every store commits in. */
     order_t order;
@@ -192,15 +192,15 @@ struct database_state : handle_t {
     /** Directory the image persists in, empty for a volatile database. */
     sz::string_t directory;
 
-    database_state() noexcept : handle_t {&ram_variant<cpu_class_, isolation_>::engine_k} {}
+    database_state() noexcept = default;
     database_state(database_state const&) = delete;
     database_state& operator=(database_state const&) = delete;
     ~database_state() noexcept;
 };
 
-/** A transaction handle of the C ABI. */
+/** What a transaction holds, behind its transaction handle of the C ABI. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-struct transaction_handle : handle_t {
+struct transaction_state {
 
     /** The database the transaction runs against. */
     database_state<cpu_class_, isolation_>& state;
@@ -208,14 +208,15 @@ struct transaction_handle : handle_t {
     /** The transaction over every store it reaches. */
     collections_transaction_of<cpu_class_, isolation_> transaction;
 
-    transaction_handle(database_state<cpu_class_, isolation_>& owner,
-                       collections_transaction_of<cpu_class_, isolation_>&& opened) noexcept
-        : handle_t {&ram_variant<cpu_class_, isolation_>::engine_k}, state(owner), transaction(std::move(opened)) {}
+    transaction_state(database_state<cpu_class_, isolation_>& owner,
+                      collections_transaction_of<cpu_class_, isolation_>&& opened) noexcept
+        : state(owner), transaction(std::move(opened)) {}
 };
 
-/** A snapshot handle of the C ABI, whose claim pins the stamp every read through it answers at until it is freed. */
+/** What a snapshot holds, behind its snapshot handle of the C ABI, whose claim pins the stamp every read through it
+ *  answers at until it is freed. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-struct snapshot_handle : handle_t {
+struct snapshot_state {
 
     /** The database the snapshot reads. */
     database_state<cpu_class_, isolation_>& state;
@@ -223,8 +224,7 @@ struct snapshot_handle : handle_t {
     /** The claim on the newest stamp published when the snapshot opened. */
     claim_t claim;
 
-    explicit snapshot_handle(database_state<cpu_class_, isolation_>& owner) noexcept
-        : handle_t {&ram_variant<cpu_class_, isolation_>::engine_k}, state(owner) {}
+    explicit snapshot_state(database_state<cpu_class_, isolation_>& owner) noexcept : state(owner) {}
 };
 
 #pragma endregion Handles
@@ -343,6 +343,14 @@ struct transaction_view {
         return transaction.range_from(lower, callback);
     }
 
+    /** Hands @p callback every entry partition by partition, merging nothing, as an unordered scan walks. */
+    template <typename callback_type_>
+    store_status_t for_each(callback_type_&& callback) const noexcept
+        requires requires { transaction.for_each(callback); }
+    {
+        return transaction.for_each(callback);
+    }
+
     store_status_t prepare(std::size_t count) const noexcept { return transaction.reserve(count); }
 
     template <typename key_type_>
@@ -448,7 +456,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_, typename action_type_>
 auto with_source(database_state<cpu_class_, isolation_>& state, view_t const& view, action_type_&& action) noexcept {
     if (view.snapshot) {
         reader_source<cpu_class_, isolation_> source {
-            state, handle_cast<snapshot_handle<cpu_class_, isolation_>>(view.snapshot)->claim.snapshot()};
+            state, state_of<snapshot_state<cpu_class_, isolation_>>(view.snapshot)->claim.snapshot()};
         return action(source);
     }
     if (!view.transaction) {
@@ -456,7 +464,7 @@ auto with_source(database_state<cpu_class_, isolation_>& state, view_t const& vi
         reader_source<cpu_class_, isolation_> source {state, state.order.take_snapshot(claim)};
         return action(source);
     }
-    auto& transaction = handle_cast<transaction_handle<cpu_class_, isolation_>>(view.transaction)->transaction;
+    auto& transaction = state_of<transaction_state<cpu_class_, isolation_>>(view.transaction)->transaction;
     transaction_source<cpu_class_, isolation_> source {state, transaction, watches_reads<isolation_>(view.watch)};
     return action(source);
 }
@@ -536,7 +544,7 @@ status_t resolve_modality(ustore_database_t database, ustore_collections_view_t 
                           ustore_modality_t modality, view_t const& view) noexcept {
     strided_iterator<ustore_collection_id_t const> const tasks = strided(collections);
     status_t outcome;
-    database_state<cpu_class_, isolation_>& state = *handle_cast<database_state<cpu_class_, isolation_>>(database);
+    database_state<cpu_class_, isolation_>& state = *state_of<database_state<cpu_class_, isolation_>>(database);
     store_status_t const resolved = with_source(state, view, [&](auto& source) noexcept -> store_status_t {
         for (std::size_t index = 0; index != count; ++index) {
             if (index != 0 && tasks[index] == tasks[index - 1]) continue;
@@ -616,19 +624,24 @@ store_status_t watch_keys(view_type_ const& view, scan_outputs_t& outputs, std::
 }
 
 /** Appends up to the limit of @p scan keys of a collection of @p entry_type_, from its start key on, halting with
- *  @p outcome when the scratch refuses. */
+ *  @p outcome when the scratch refuses. An unordered scan walks partition by partition where @p view offers it, and
+ *  merges them otherwise, which is one order an unordered scan may take. */
 template <typename entry_type_, typename view_type_>
-store_status_t scan_window(view_type_ const& view, scan_task_t scan, scan_outputs_t& outputs,
+store_status_t scan_window(view_type_ const& view, scan_task_t scan, ustore_scan_mode_t mode, scan_outputs_t& outputs,
                            status_t& outcome) noexcept {
     std::size_t const first = outputs.size();
     if (scan.limit == 0) return store_status_t::success_k;
-    store_status_t const walked = view.range_from(
-        entry_for<entry_type_>(scan.start_key), [&](entry_type_ const& entry) noexcept -> walk_control_t {
-            if (!is_listed(entry)) return walk_control_t::resume_k;
-            outcome = outputs.push(listed_key(entry));
-            if (outcome.failed()) return walk_control_t::halt_k;
-            return outputs.size() - first == scan.limit ? walk_control_t::halt_k : walk_control_t::resume_k;
-        });
+    auto const take = [&](entry_type_ const& entry) noexcept -> walk_control_t {
+        if (!is_listed(entry) || listed_key(entry) < scan.start_key) return walk_control_t::resume_k;
+        outcome = outputs.push(listed_key(entry));
+        if (outcome.failed()) return walk_control_t::halt_k;
+        return outputs.size() - first == scan.limit ? walk_control_t::halt_k : walk_control_t::resume_k;
+    };
+    store_status_t walked = store_status_t::success_k;
+    if constexpr (requires { view.for_each(take); })
+        walked = mode == ustore_scan_unordered_k ? view.for_each(take)
+                                                 : view.range_from(entry_for<entry_type_>(scan.start_key), take);
+    else walked = view.range_from(entry_for<entry_type_>(scan.start_key), take);
     if (st::failed(walked) || outcome.failed()) return walked;
     return watch_keys<entry_type_>(view, outputs, first);
 }
@@ -850,7 +863,7 @@ status_t serve_write(database_state<cpu_class_, isolation_>& state, ustore_durab
         return {status_code_t::invalid_argument_k, "A transaction flushes at commit, not at a write"};
     status_t outcome;
     if (view.transaction) {
-        auto& transaction = handle_cast<transaction_handle<cpu_class_, isolation_>>(view.transaction)->transaction;
+        auto& transaction = state_of<transaction_state<cpu_class_, isolation_>>(view.transaction)->transaction;
         transaction_source<cpu_class_, isolation_> source {state, transaction, watches_reads<isolation_>(view.watch)};
         return reported(stage_runs(source, outcome), outcome);
     }
@@ -1646,8 +1659,8 @@ status_t scan_keys(database_state<cpu_class_, isolation_>& state, arguments_type
                                     if (!store) return store.status();
                                     for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
                                         outputs.open_task(task);
-                                        store_status_t const scanned = scan_window<entry_type_>(*store, scans[task],
-                                                                                                outputs, outcome);
+                                        store_status_t const scanned = scan_window<entry_type_>(
+                                            *store, scans[task], arguments.mode, outputs, outcome);
                                         if (st::failed(scanned) || outcome.failed()) return scanned;
                                         if (!progress.advance(1)) outcome = progress_cancelled_k;
                                     }
@@ -1777,12 +1790,14 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_snapshot_init_t const& arguments,
                view_t const&) noexcept {
     if (!arguments.snapshot) return {status_code_t::invalid_argument_k, "Need an output for the snapshot"};
-    auto* const handle = new (std::nothrow) snapshot_handle<cpu_class_, isolation_>(state);
-    if (!handle) return {status_code_t::out_of_memory_k, "Failed to allocate the snapshot"};
-    state.order.take_snapshot(handle->claim);
+    std::unique_ptr<ustore_snapshot_handle_t> handle {new (std::nothrow) ustore_snapshot_handle_t {}};
+    auto* const snapshot = handle ? new (std::nothrow) snapshot_state<cpu_class_, isolation_>(state) : nullptr;
+    if (!snapshot) return {status_code_t::out_of_memory_k, "Failed to allocate the snapshot"};
+    handle->engine = &ram_variant<cpu_class_, isolation_>::engine_k, handle->state = snapshot;
+    state.order.take_snapshot(snapshot->claim);
     atomic_ref_of<cpu_class_, std::size_t>(state.open_snapshots).fetch_add(1, std::memory_order_release);
-    if (arguments.read_stamp) *arguments.read_stamp = handle->claim.snapshot();
-    *arguments.snapshot = c_handle<ustore_snapshot_t>(handle);
+    if (arguments.read_stamp) *arguments.read_stamp = snapshot->claim.snapshot();
+    *arguments.snapshot = handle.release();
     return {};
 }
 
@@ -1795,7 +1810,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_snapshot_sa
         return {status_code_t::out_of_memory_k, "Failed to copy the save path"};
     if (path.empty() || !names_directory(path.c_str()))
         return {status_code_t::not_found_k, "The save path isn't a directory"};
-    return write_image(state, handle_cast<snapshot_handle<cpu_class_, isolation_>>(view.snapshot)->claim.snapshot(),
+    return write_image(state, state_of<snapshot_state<cpu_class_, isolation_>>(view.snapshot)->claim.snapshot(),
                        path.c_str(), arguments.progress, arguments.progress_state);
 }
 
@@ -1938,16 +1953,20 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_transaction
                view_t const& view) noexcept {
     if (status_t const status = validate_transaction_begin(arguments.transaction); status.failed()) return status;
     if (view.transaction) {
-        auto* const handle = handle_cast<transaction_handle<cpu_class_, isolation_>>(view.transaction);
-        store_status_t const reset = handle->transaction.reset();
-        free_unreachable(handle->state);
+        auto* const transaction = state_of<transaction_state<cpu_class_, isolation_>>(view.transaction);
+        store_status_t const reset = transaction->transaction.reset();
+        free_unreachable(transaction->state);
         return translate(reset);
     }
     auto opened = collections_transaction_of<cpu_class_, isolation_>::make(state.order);
     if (!opened) return translate(opened.status());
-    auto* const handle = new (std::nothrow) transaction_handle<cpu_class_, isolation_>(state, std::move(*opened));
-    if (!handle) return {status_code_t::out_of_memory_k, "Failed to allocate the transaction"};
-    *arguments.transaction = c_handle<ustore_transaction_t>(handle);
+    std::unique_ptr<ustore_transaction_handle_t> handle {new (std::nothrow) ustore_transaction_handle_t {}};
+    auto* const transaction = handle ? new (std::nothrow)
+                                           transaction_state<cpu_class_, isolation_>(state, std::move(*opened))
+                                     : nullptr;
+    if (!transaction) return {status_code_t::out_of_memory_k, "Failed to allocate the transaction"};
+    handle->engine = &ram_variant<cpu_class_, isolation_>::engine_k, handle->state = transaction;
+    *arguments.transaction = handle.release();
     return {};
 }
 
@@ -1963,7 +1982,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>&, ustore_transaction_stage_t const& arguments,
                view_t const& view) noexcept {
     if (!view.transaction) return {status_code_t::uninitialized_k, "Transaction is uninitialized"};
-    auto& transaction = handle_cast<transaction_handle<cpu_class_, isolation_>>(view.transaction)->transaction;
+    auto& transaction = state_of<transaction_state<cpu_class_, isolation_>>(view.transaction)->transaction;
     if (store_status_t const staged = stage_once<cpu_class_, isolation_>(transaction); st::failed(staged))
         return translate(staged);
     if (arguments.read_stamp) *arguments.read_stamp = transaction.snapshot();
@@ -1976,7 +1995,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_transaction
                view_t const& view) noexcept {
     if (status_t const status = validate_transaction_commit(view.transaction, arguments.durability); status.failed())
         return status;
-    auto& transaction = handle_cast<transaction_handle<cpu_class_, isolation_>>(view.transaction)->transaction;
+    auto& transaction = state_of<transaction_state<cpu_class_, isolation_>>(view.transaction)->transaction;
     if (store_status_t const staged = stage_once<cpu_class_, isolation_>(transaction); st::failed(staged))
         return translate(staged);
     if (store_status_t const committed = transaction.commit(); st::failed(committed)) return translate(committed);
@@ -1992,7 +2011,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>&, ustore_transaction_rollback_t const&,
                view_t const& view) noexcept {
     if (!view.transaction) return {status_code_t::uninitialized_k, "Transaction is uninitialized"};
-    auto& transaction = handle_cast<transaction_handle<cpu_class_, isolation_>>(view.transaction)->transaction;
+    auto& transaction = state_of<transaction_state<cpu_class_, isolation_>>(view.transaction)->transaction;
     if (transaction.staging() != staging_t::staged_k) return {};
     return translate(transaction.rollback());
 }
@@ -2006,34 +2025,34 @@ status_t serve(database_state<cpu_class_, isolation_>&, ustore_transaction_rollb
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename arguments_type_, typename... strings_types_>
 status_t serve_database(arguments_type_ const& arguments, strings_types_ const&... strings,
                         view_t const& view) noexcept {
-    return serve(*handle_cast<database_state<cpu_class_, isolation_>>(database_of(arguments)), arguments, strings...,
+    return serve(*state_of<database_state<cpu_class_, isolation_>>(database_of(arguments)), arguments, strings...,
                  view);
 }
 
-/** Frees @p transaction, releasing the stamp it claimed, and the stores only it still reached. */
+/** Frees the transaction behind @p handle, releasing the stamp it claimed, and the stores only it still reached. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-void transaction_free(ustore_transaction_t transaction) noexcept {
-    auto* const handle = handle_cast<transaction_handle<cpu_class_, isolation_>>(transaction);
-    database_state<cpu_class_, isolation_>& state = handle->state;
-    delete handle;
+void transaction_free(ustore_transaction_t handle) noexcept {
+    auto* const transaction = state_of<transaction_state<cpu_class_, isolation_>>(handle);
+    database_state<cpu_class_, isolation_>& state = transaction->state;
+    delete transaction;
     free_unreachable(state);
 }
 
-/** Gives back the count @p snapshot holds and frees it, releasing the stamp it claimed, and the stores only it still
- *  reached. */
+/** Gives back the count the snapshot behind @p handle holds and frees it, releasing the stamp it claimed, and the
+ *  stores only it still reached. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-void snapshot_free(ustore_snapshot_t snapshot) noexcept {
-    auto* const handle = handle_cast<snapshot_handle<cpu_class_, isolation_>>(snapshot);
-    database_state<cpu_class_, isolation_>& state = handle->state;
+void snapshot_free(ustore_snapshot_t handle) noexcept {
+    auto* const snapshot = state_of<snapshot_state<cpu_class_, isolation_>>(handle);
+    database_state<cpu_class_, isolation_>& state = snapshot->state;
     atomic_ref_of<cpu_class_, std::size_t>(state.open_snapshots).fetch_sub(1, std::memory_order_release);
-    delete handle;
+    delete snapshot;
     free_unreachable(state);
 }
 
 /** Persists @p database ahead of freeing it, which every snapshot and transaction of it must precede. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 void database_free(ustore_database_t database) noexcept {
-    auto* const state = handle_cast<database_state<cpu_class_, isolation_>>(database);
+    auto* const state = state_of<database_state<cpu_class_, isolation_>>(database);
     [[maybe_unused]] status_t const persisted = persist(*state);
     delete state;
 }
@@ -2061,22 +2080,22 @@ database_verbs_t const ram_variant<cpu_class_, isolation_>::database_verbs_k {
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 engine_t const ram_variant<cpu_class_, isolation_>::engine_k {
     .database = &database_verbs_k,
-    .blobs = &blobs_verbs_k,
-    .strings = &strings_verbs_k,
-    .docs = &docs_verbs_k,
-    .graph = &graph_verbs_k,
-    .pages = &pages_verbs_k,
+    .host = {.blobs = &blobs_verbs_k,
+             .strings = &strings_verbs_k,
+             .docs = &docs_verbs_k,
+             .graph = &graph_verbs_k,
+             .pages = &pages_verbs_k},
 };
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t ram_variant<cpu_class_, isolation_>::open(ustore_database_t* database, std::string_view directory) noexcept {
-    auto* const state = new (std::nothrow) database_state<cpu_class_, isolation_>();
+    std::unique_ptr<ustore_database_handle_t> handle {new (std::nothrow) ustore_database_handle_t {}};
+    std::unique_ptr<database_state<cpu_class_, isolation_>> state {
+        handle ? new (std::nothrow) database_state<cpu_class_, isolation_>() : nullptr};
     if (!state) return {status_code_t::out_of_memory_k, "Failed to allocate the database"};
-    if (status_t const status = open_database(*state, directory); status.failed()) {
-        delete state;
-        return status;
-    }
-    *database = c_handle<ustore_database_t>(state);
+    if (status_t const status = open_database(*state, directory); status.failed()) return status;
+    handle->engine = &ram_variant<cpu_class_, isolation_>::engine_k, handle->state = state.release();
+    *database = handle.release();
     return {};
 }
 

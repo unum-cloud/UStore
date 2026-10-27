@@ -133,7 +133,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_sample
 #pragma region Table
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-docs_verbs_t const ram_variant<cpu_class_, isolation_>::docs_verbs_k {
+docs_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::docs_verbs_k {
     .write = &serve_database<cpu_class_, isolation_, ustore_docs_write_t, strings_arg_t, strings_arg_t>,
     .read = &serve_database<cpu_class_, isolation_, ustore_docs_read_t, strings_arg_t>,
     .gist = &serve_database<cpu_class_, isolation_, ustore_docs_gist_t>,

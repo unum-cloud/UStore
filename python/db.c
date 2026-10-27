@@ -85,16 +85,21 @@ static ustore_bytes_view_t path_bytes(PyObject* path) {
     return bytes;
 }
 
-/** Reads @p object, an @c Executor or None, as the executor the init runs on. */
-static int opening_executor(opening_t* opening, PyObject* object) {
+/** Reads @p object, an @c Executor or None, into @p executor, naming @p field in a refusal. */
+static int executor_option(PyObject* object, char const* field, ustore_executor_t* executor) {
     if (object == Py_None) return 0;
     if (!PyObject_TypeCheck(object, &ExecutorType)) {
-        PyErr_Format(PyExc_TypeError, "The 'executor' option takes an Executor or None, got %S", Py_TYPE(object));
+        PyErr_Format(PyExc_TypeError, "The '%s' option takes an Executor or None, got %S", field, Py_TYPE(object));
         return -1;
     }
-    opening->executor = ((Executor*)object)->handle;
-    if (opening->executor) return 0;
+    *executor = ((Executor*)object)->handle;
+    if (*executor) return 0;
     return ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed");
+}
+
+/** Reads @p object, an @c Executor or None, as the executor the init runs on. */
+static int opening_executor(opening_t* opening, PyObject* object) {
+    return executor_option(object, "executor", &opening->executor);
 }
 
 /**
@@ -427,10 +432,13 @@ static char const doc_Database_open_nvme[] =                                    
     "    the calling thread.\n"                                                                 //
     "  data_directories (Sequence): Directories the volumes fill, each a path or a\n"           //
     "    (path, max_bytes) pair; none keeps one volume inside the directory.\n"                 //
+    "  compactions (Executor, optional): An executor of Executor.for_vram() whose device and\n" //
+    "    scratch limit every merge takes, read once here; None merges on host threads.\n"       //
     "Returns:\n"                                                                                //
     "  Database: The opened database.\n"                                                        //
     "Raises:\n"                                                                                 //
-    "  UnsupportedError: This build carries no NVMe engine.";
+    "  UnsupportedError: This build carries no NVMe engine.\n"                                  //
+    "  DeviceError: The `compactions` executor was not made by Executor.for_vram().";
 
 static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* args, Py_ssize_t positional_args_count,
                                     PyObject* args_names_tuple) {
@@ -454,6 +462,8 @@ static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* 
         else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(&opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "data_directories") == 0)
             read = opening_data_directories(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "compactions") == 0)
+            read = executor_option(value, "compactions", &open_nvme.compactions);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
     }
@@ -1692,6 +1702,9 @@ static PyMethodDef Database_methods[] = {
     {"compact", (PyCFunction)(void (*)(void))Database_compact, ustore_py_method_flags_k, doc_Database_compact},
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"cursor", (PyCFunction)(void (*)(void))ustore_py_api_cursor, ustore_py_method_flags_k, doc_cursor},
+    {"docs_cursor", (PyCFunction)(void (*)(void))ustore_py_api_docs_cursor, ustore_py_method_flags_k, doc_docs_cursor},
+    {"graph_vertices_cursor", (PyCFunction)(void (*)(void))ustore_py_api_graph_vertices_cursor,
+     ustore_py_method_flags_k, doc_graph_vertices_cursor},
 
     {"collection_create", (PyCFunction)(void (*)(void))Database_collection_create, ustore_py_method_flags_k,
      doc_Database_collection_create},
@@ -1785,6 +1798,9 @@ static PyMethodDef Transaction_methods[] = {
     {"watched", (PyCFunction)(void (*)(void))receiver_watched, METH_NOARGS, doc_watched},
     {"unwatched", (PyCFunction)(void (*)(void))receiver_unwatched, METH_NOARGS, doc_unwatched},
     {"cursor", (PyCFunction)(void (*)(void))ustore_py_api_cursor, ustore_py_method_flags_k, doc_cursor},
+    {"docs_cursor", (PyCFunction)(void (*)(void))ustore_py_api_docs_cursor, ustore_py_method_flags_k, doc_docs_cursor},
+    {"graph_vertices_cursor", (PyCFunction)(void (*)(void))ustore_py_api_graph_vertices_cursor,
+     ustore_py_method_flags_k, doc_graph_vertices_cursor},
 
     {"read", (PyCFunction)(void (*)(void))ustore_py_api_read, ustore_py_method_flags_k, doc_read},
     {"write", (PyCFunction)(void (*)(void))ustore_py_api_write, ustore_py_method_flags_k, doc_write},
@@ -1848,6 +1864,9 @@ static PyGetSetDef Snapshot_getset[] = {
 static PyMethodDef Snapshot_methods[] = {
     {"save", (PyCFunction)(void (*)(void))Snapshot_save, ustore_py_method_flags_k, doc_Snapshot_save},
     {"cursor", (PyCFunction)(void (*)(void))ustore_py_api_cursor, ustore_py_method_flags_k, doc_cursor},
+    {"docs_cursor", (PyCFunction)(void (*)(void))ustore_py_api_docs_cursor, ustore_py_method_flags_k, doc_docs_cursor},
+    {"graph_vertices_cursor", (PyCFunction)(void (*)(void))ustore_py_api_graph_vertices_cursor,
+     ustore_py_method_flags_k, doc_graph_vertices_cursor},
     {"close", (PyCFunction)(void (*)(void))Snapshot_close, METH_NOARGS, doc_Snapshot_close},
     {"__enter__", (PyCFunction)(void (*)(void))Snapshot_enter, METH_NOARGS, NULL},
     {"__exit__", (PyCFunction)(void (*)(void))Snapshot_exit, ustore_py_method_flags_k, NULL},
@@ -1915,6 +1934,9 @@ static PyMethodDef View_methods[] = {
     {"compact", (PyCFunction)(void (*)(void))Database_compact, ustore_py_method_flags_k, doc_Database_compact},
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"cursor", (PyCFunction)(void (*)(void))ustore_py_api_cursor, ustore_py_method_flags_k, doc_cursor},
+    {"docs_cursor", (PyCFunction)(void (*)(void))ustore_py_api_docs_cursor, ustore_py_method_flags_k, doc_docs_cursor},
+    {"graph_vertices_cursor", (PyCFunction)(void (*)(void))ustore_py_api_graph_vertices_cursor,
+     ustore_py_method_flags_k, doc_graph_vertices_cursor},
     {"collection_find", (PyCFunction)(void (*)(void))Database_collection_find, METH_FASTCALL,
      doc_Database_collection_find},
     {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_O, doc_Database_collection_list},

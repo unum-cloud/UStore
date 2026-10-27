@@ -196,11 +196,21 @@ typedef struct ustore_blobs_scan_t {
     /** Smallest key every scan may return, where @c NULL data starts at the first key. */
     ustore_keys_view_t start_keys;
 
+    /** Optional patterns the value of every listed key matches, shared by every scan; zeroed lists every key. */
+    ustore_patterns_t patterns;
+
+    /** Optional verdict on the listed keys, asked once per page as its @c cost says; host executors only. */
+    ustore_predicate_t predicate;
+
     /** Output for @c count plus one offsets into @c keys, the last one closing the final scan, inside @c arena. */
     ustore_length_t const** offsets;
 
     /** Output for the found keys, scan after scan, inside @c arena. */
     ustore_key_t const** keys;
+
+    /** Optional output for one BM25 score per listed key when @c patterns carry weights, inside @c arena; @c NULL
+     *  skips them. */
+    float const** scores;
 
     /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
     ustore_arena_t arena;
@@ -245,6 +255,10 @@ typedef struct ustore_blobs_cursor_init_t {
     /** An open database. */
     ustore_database_t database;
 
+    /** Executor of the kind every pull runs on, which picks the side the walk computes on, where @c NULL walks on host
+     *  executors; a pull on another kind of executor reports @c ustore_status_device_k. */
+    ustore_executor_t executor;
+
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
 
@@ -256,6 +270,12 @@ typedef struct ustore_blobs_cursor_init_t {
 
     /** Smallest key the walk returns. */
     ustore_key_t start_key;
+
+    /** Optional patterns every value the walk hands out matches, compiled here once; zeroed walks every key. */
+    ustore_patterns_t patterns;
+
+    /** Optional verdict on the keys of every page, asked as its @c cost says; host executors only. */
+    ustore_predicate_t predicate;
 
 } ustore_blobs_cursor_init_t;
 

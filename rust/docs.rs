@@ -81,17 +81,18 @@ use std::str::FromStr;
 
 use stringtape::CharsTape;
 
-use crate::blobs::Values;
+use crate::blobs::{Page, Values};
 use crate::db::ffi::{
-    ustore_arena_t, ustore_byte_t, ustore_bytes_view_t, ustore_collections_view_t, ustore_completion_t,
-    ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_keys_view_t, ustore_length_t,
-    ustore_octet_t, ustore_outcome_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t,
-    ustore_transaction_t, ustore_view_t, ustore_watch_t,
+    ustore_arena_t, ustore_byte_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t,
+    ustore_completion_t, ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_key_t,
+    ustore_keys_view_t, ustore_length_t, ustore_octet_t, ustore_outcome_t, ustore_predicate_t,
+    ustore_progress_callback_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t, ustore_transaction_t,
+    ustore_view_t, ustore_watch_t,
 };
 use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
-    exported_slice, fail, read_spelling, spelling, Address, Arena, Collections, Durability, Error, Key, Result, Rows,
-    Status, Strings, View, UUID,
+    check, exported_slice, fail, read_spelling, spelling, Address, Arena, CollectionID, Collections, Durability, Error,
+    Key, Matched, Matching, Result, Rows, Status, Strings, View, UUID,
 };
 
 // region: Raw Declarations
@@ -195,7 +196,46 @@ mod ffi {
         pub outputs_types: *const ustore_enum_t,
     }
 
+    #[repr(C)]
+    pub struct ustore_docs_cursor_handle_t {
+        _private: [u8; 0],
+    }
+
+    pub type ustore_docs_cursor_t = *mut ustore_docs_cursor_handle_t;
+
+    #[repr(C)]
+    pub struct ustore_docs_cursor_init_t {
+        pub cursor: *mut ustore_docs_cursor_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub view: ustore_view_t,
+        pub collection: ustore_collection_id_t,
+        pub start_key: ustore_key_t,
+        pub filter: ustore_bytes_view_t,
+        pub predicate: ustore_predicate_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_docs_cursor_next_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub cursor: ustore_docs_cursor_t,
+        pub keys: *mut *const ustore_key_t,
+        pub values: *mut ustore_strings_view_t,
+        pub written: *mut ustore_size_t,
+        pub arena: ustore_arena_t,
+        pub wanted: ustore_size_t,
+        pub progress: ustore_progress_callback_t,
+        pub progress_state: *mut c_void,
+    }
+
     extern "C" {
+        pub fn ustore_docs_cursor_init(arguments: *mut ustore_docs_cursor_init_t);
+        pub fn ustore_docs_cursor_next(arguments: *mut ustore_docs_cursor_next_t);
+        pub fn ustore_docs_cursor_free(cursor: ustore_docs_cursor_t);
         pub fn ustore_docs_write(arguments: *mut ustore_docs_write_t);
         pub fn ustore_docs_remove(arguments: *mut ustore_docs_remove_t);
         pub fn ustore_docs_read(arguments: *mut ustore_docs_read_t);
@@ -1458,6 +1498,23 @@ mod tests {
         (database, docs, Arena::new().unwrap())
     }
 
+    #[test]
+    fn filters_narrow_documents_cursors() {
+        let (database, docs, mut arena) = populated();
+        let graces = Matching {
+            filter: Some(r#"?@.name == "Grace""#),
+            ..Matching::default()
+        };
+        let head = database.head();
+        let mut cursor = head.docs_cursor(docs, key(0), graces).unwrap();
+        let page = cursor.next_pairs(8, &mut arena).unwrap();
+        assert_eq!(page.keys(), &keys([2]));
+        assert!(std::str::from_utf8(page.get(0).unwrap())
+            .unwrap()
+            .contains("Rear Admiral"));
+        assert!(cursor.next(8, &mut arena).unwrap().is_empty());
+    }
+
     /// The text of the field at `index`, or `None` when it is absent.
     fn text<'arena>(values: &Values<'arena>, index: usize) -> Option<&'arena str> {
         values.get(index).map(|bytes| std::str::from_utf8(bytes).unwrap())
@@ -2172,3 +2229,115 @@ mod tests {
 }
 
 // endregion: Tests
+
+// region: Cursors
+
+/// A walk over the keys of one documents collection, which every pull resumes past the last key the pull before it handed out, as a
+/// [`crate::Cursor`] walks blobs, keeping the keys its [`Matching`] admits.
+///
+/// Mirrors `ustore_docs_cursor_t`; dropping it calls `ustore_docs_cursor_free`.
+#[derive(Debug)]
+pub struct DocsCursor<'view> {
+    handle: ffi::ustore_docs_cursor_t,
+    database: ustore_database_t,
+    executor: ustore_executor_t,
+    matched: Box<Matched<'view>>,
+    marker: PhantomData<&'view ()>,
+}
+
+impl<'view, Parent> View<'view, Parent> {
+    /// Opens a walk over the keys of one documents collection from `start`, compiling what `matching` names once, whose predicate lives
+    /// as long as the cursor.
+    ///
+    /// Calls `ustore_docs_cursor_init`.
+    pub fn docs_cursor(
+        &self,
+        collection: CollectionID,
+        start: Key,
+        matching: Matching<'view>,
+    ) -> Result<DocsCursor<'view>> {
+        let mut cursor = DocsCursor {
+            handle: ptr::null_mut(),
+            database: self.database(),
+            executor: self.executor(),
+            matched: Box::new(Matched::new(matching)),
+            marker: PhantomData,
+        };
+        let mut outcome = ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_docs_cursor_init_t {
+            cursor: &mut cursor.handle,
+            database: self.database(),
+            executor: self.executor(),
+            outcome: &mut outcome,
+            view: self.view(),
+            collection,
+            start_key: start,
+            filter: cursor.matched.filter(),
+            predicate: cursor.matched.predicate(),
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
+        unsafe { ffi::ustore_docs_cursor_init(&mut arguments) };
+        check(outcome).map(|()| cursor)
+    }
+}
+
+impl DocsCursor<'_> {
+    /// Pulls up to `wanted` next keys into `arena`, fewer once the walk nears its end and none past it.
+    ///
+    /// Calls `ustore_docs_cursor_next`.
+    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<&'arena [Key]> {
+        self.pull(wanted, arena, ptr::null_mut())
+    }
+
+    /// Pulls up to `wanted` next keys with their whole documents into `arena` in one call.
+    ///
+    /// Calls `ustore_docs_cursor_next`.
+    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Page<'arena>> {
+        let mut values = ustore_strings_view_t::default();
+        let keys = self.pull(wanted, arena, &mut values)?;
+        // SAFETY: the pull succeeded, writing a value per key as a tape into the arena borrowed for `'arena`.
+        let values = unsafe { Strings::exported(values, keys.len())? };
+        Ok(Page::new(keys, values))
+    }
+
+    /// Pulls a page of keys into `arena`, with their values into `values` unless it is null.
+    fn pull<'arena>(
+        &mut self,
+        wanted: usize,
+        arena: &'arena mut Arena,
+        values: *mut ustore_strings_view_t,
+    ) -> Result<&'arena [Key]> {
+        let mut keys: *const ustore_key_t = ptr::null();
+        let mut written: ustore_size_t = 0;
+        let mut outcome = ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_docs_cursor_next_t {
+            database: self.database,
+            executor: self.executor,
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            cursor: self.handle,
+            keys: &mut keys,
+            values,
+            written: &mut written,
+            arena: arena.handle,
+            wanted: wanted as ustore_size_t,
+            progress: None,
+            progress_state: ptr::null_mut(),
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
+        unsafe { ffi::ustore_docs_cursor_next(&mut arguments) };
+        self.matched.raise();
+        check(outcome)?;
+        // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
+        Ok(unsafe { exported_slice(keys, written as usize) })
+    }
+}
+
+impl Drop for DocsCursor<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from a successful init, or is the null a failed one leaves, which the free ignores.
+        unsafe { ffi::ustore_docs_cursor_free(self.handle) };
+    }
+}
+
+// endregion: Cursors

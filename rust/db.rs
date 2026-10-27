@@ -77,6 +77,7 @@ pub(crate) mod ffi {
     pub type ustore_durability_t = super::Durability;
     pub type ustore_watch_t = super::Watch;
     pub type ustore_mood_t = super::Mood;
+    pub type ustore_gds_t = super::Gds;
     pub type ustore_key_t = super::Key;
     pub type ustore_byte_t = u8;
     pub type ustore_length_t = u64;
@@ -303,6 +304,52 @@ pub(crate) mod ffi {
     pub type ustore_progress_callback_t =
         Option<unsafe extern "C" fn(ustore_size_t, ustore_size_t, *mut c_void) -> ustore_enum_t>;
 
+    /// Patterns a scan keeps the values or strings matching, where a zeroed structure matches everything.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct ustore_patterns_t {
+        pub patterns: ustore_strings_view_t,
+        pub count: ustore_size_t,
+        pub kind: ustore_enum_t,
+        pub sensitivity: ustore_enum_t,
+        pub weights: *const f32,
+    }
+
+    impl Default for ustore_patterns_t {
+        fn default() -> Self {
+            ustore_patterns_t {
+                patterns: ustore_strings_view_t::default(),
+                count: 0,
+                kind: 0,
+                sensitivity: 0,
+                weights: ptr::null(),
+            }
+        }
+    }
+
+    /// A predicate admitting or rejecting a page of listed keys, writing one `ustore_admission_t` per key.
+    pub type ustore_predicate_callback_t =
+        Option<unsafe extern "C" fn(*const ustore_key_t, *mut ustore_enum_t, ustore_size_t, *mut c_void)>;
+
+    /// The caller's verdict on the keys a scan lists, where a null callback admits every key.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct ustore_predicate_t {
+        pub callback: ustore_predicate_callback_t,
+        pub state: *mut c_void,
+        pub cost: ustore_enum_t,
+    }
+
+    impl Default for ustore_predicate_t {
+        fn default() -> Self {
+            ustore_predicate_t {
+                callback: None,
+                state: ptr::null_mut(),
+                cost: 0,
+            }
+        }
+    }
+
     pub const USTORE_CONTINUE_K: ustore_enum_t = 0;
     pub const USTORE_CANCEL_K: ustore_enum_t = 1;
 
@@ -349,7 +396,6 @@ pub(crate) mod ffi {
         pub executor: *mut ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
         pub nvme: ustore_nvme_options_t,
-        pub vram: ustore_executor_t,
         pub threads: ustore_size_t,
         pub deferred_limit: ustore_size_t,
     }
@@ -358,9 +404,10 @@ pub(crate) mod ffi {
     pub struct ustore_executor_for_vram_t {
         pub executor: *mut ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
-        pub devices: *const i32,
-        pub devices_count: ustore_size_t,
+        pub device: i32,
+        pub stream: *mut c_void,
         pub scratch_limit: ustore_size_t,
+        pub gds: ustore_gds_t,
         pub deferred_limit: ustore_size_t,
     }
 
@@ -436,6 +483,7 @@ pub(crate) mod ffi {
         pub directory: ustore_bytes_view_t,
         pub data_directories: *const ustore_data_directory_t,
         pub data_directories_count: ustore_size_t,
+        pub compactions: ustore_executor_t,
         pub memory_limit: ustore_size_t,
         pub transaction_max_bytes: ustore_size_t,
         pub transaction_max_deltas: ustore_size_t,
@@ -614,6 +662,14 @@ pub(crate) mod ffi {
         pub fn ustore_drop_mode_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_isolation_name(isolation: ustore_enum_t) -> *const c_char;
         pub fn ustore_isolation_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_pattern_kind_name(kind: ustore_enum_t) -> *const c_char;
+        pub fn ustore_pattern_kind_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_case_sensitivity_name(sensitivity: ustore_enum_t) -> *const c_char;
+        pub fn ustore_case_sensitivity_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_predicate_cost_name(cost: ustore_enum_t) -> *const c_char;
+        pub fn ustore_predicate_cost_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_gds_name(gds: ustore_enum_t) -> *const c_char;
+        pub fn ustore_gds_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_transport_name(transport: ustore_enum_t) -> *const c_char;
         pub fn ustore_transport_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_engine_name(engine: ustore_enum_t) -> *const c_char;
@@ -1590,6 +1646,47 @@ impl FromStr for Isolation {
     }
 }
 
+/// How an executor of [`Executor::for_vram`] moves bytes between the drives and its device through GPUDirect Storage,
+/// as `ustore_gds_t` spells it.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Gds {
+    /// Direct transfers where the `nvidia_fs` driver is loaded, and cuFile's compatibility mode elsewhere.
+    #[default]
+    Automatic = 0,
+    /// Direct transfers, refused with [`Status::Device`] where the driver is absent.
+    Direct = 1,
+    /// cuFile's compatibility mode, which bounces through host pages it manages.
+    Compat = 2,
+}
+
+impl Gds {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(Gds::Automatic),
+            1 => Some(Gds::Direct),
+            2 => Some(Gds::Compat),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Gds {
+    /// Calls `ustore_gds_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_gds_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for Gds {
+    type Err = Error;
+
+    /// Calls `ustore_gds_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(text, ffi::ustore_gds_from_name, ffi::ustore_gds_name, Gds::from_raw)
+    }
+}
+
 /// How the NVMe engine moves bytes between its files and memory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Transport {
@@ -1755,6 +1852,9 @@ pub struct NVMEOptions<'path> {
     /// The database moves bytes as one of [`Executor::for_nvme`] says, read once at the open, and with that call's
     /// defaults for any other executor and for none.
     pub executor: Option<&'path Executor>,
+    /// The executor of [`Executor::for_vram`] whose device and scratch limit every merge takes, read once at the open;
+    /// `None` merges on host threads.
+    pub compactions: Option<&'path Executor>,
     /// Bytes of host memory the engine may pin and cache.
     pub memory_limit: u64,
     /// Bytes a transaction may buffer before it must commit.
@@ -2024,6 +2124,7 @@ impl Database {
             directory: options.directory.as_bytes().into(),
             data_directories: data_directories.as_ptr(),
             data_directories_count: data_directories.len() as ffi::ustore_size_t,
+            compactions: executor_handle(options.compactions),
             memory_limit: options.memory_limit,
             transaction_max_bytes: options.transaction_max_bytes,
             transaction_max_deltas: options.transaction_max_deltas as ffi::ustore_size_t,
@@ -2507,6 +2608,303 @@ impl sealed::Calling for Compact<'_> {
 
 // endregion: Views
 
+// region: Matching
+
+/// Whether a predicate keeps a listed key or passes over it, as `ustore_admission_t` spells it.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Admission {
+    /// Pass over the key.
+    #[default]
+    Reject = 0,
+    /// Keep the key among the listed ones.
+    Admit = 1,
+}
+
+/// What the patterns of a [`Matching`] are matched as, as `ustore_pattern_kind_t` spells it.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum PatternKind {
+    /// Regular expressions, of which a value matches at least one somewhere.
+    #[default]
+    Regex = 0,
+    /// Literal substrings, of which a value holds at least one.
+    Substrings = 1,
+}
+
+/// Whether patterns compare bytes as they are or after Unicode case folding, as `ustore_case_sensitivity_t` spells it.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum CaseSensitivity {
+    /// Bytes as they are.
+    #[default]
+    Cased = 0,
+    /// Full Unicode case folding of both the patterns and the values.
+    Uncased = 1,
+}
+
+/// Where a scan asks its predicate, as `ustore_predicate_cost_t` spells it.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum PredicateCost {
+    /// Once per page, before patterns or filters read any value, so it narrows those reads.
+    #[default]
+    Cheap = 0,
+    /// Once per page about the keys patterns and filters kept, for handlers that pay per call.
+    Expensive = 1,
+}
+
+impl PatternKind {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(PatternKind::Regex),
+            1 => Some(PatternKind::Substrings),
+            _ => None,
+        }
+    }
+}
+
+impl CaseSensitivity {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(CaseSensitivity::Cased),
+            1 => Some(CaseSensitivity::Uncased),
+            _ => None,
+        }
+    }
+}
+
+impl PredicateCost {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(PredicateCost::Cheap),
+            1 => Some(PredicateCost::Expensive),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for PatternKind {
+    /// Calls `ustore_pattern_kind_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_pattern_kind_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for PatternKind {
+    type Err = Error;
+
+    /// Calls `ustore_pattern_kind_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_pattern_kind_from_name,
+            ffi::ustore_pattern_kind_name,
+            PatternKind::from_raw,
+        )
+    }
+}
+
+impl fmt::Display for CaseSensitivity {
+    /// Calls `ustore_case_sensitivity_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_case_sensitivity_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for CaseSensitivity {
+    type Err = Error;
+
+    /// Calls `ustore_case_sensitivity_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_case_sensitivity_from_name,
+            ffi::ustore_case_sensitivity_name,
+            CaseSensitivity::from_raw,
+        )
+    }
+}
+
+impl fmt::Display for PredicateCost {
+    /// Calls `ustore_predicate_cost_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_predicate_cost_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for PredicateCost {
+    type Err = Error;
+
+    /// Calls `ustore_predicate_cost_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_predicate_cost_from_name,
+            ffi::ustore_predicate_cost_name,
+            PredicateCost::from_raw,
+        )
+    }
+}
+
+/// A caller's verdict on one page of listed keys, writing one [`Admission`] per key, every one starting as
+/// [`Admission::Reject`].
+///
+/// It runs on whichever thread runs the call, never on two at once within one call, so it owes `Send` and may be
+/// `FnMut`. A panic inside it rejects the rest of the call's keys and resurfaces once the call is final.
+///
+/// Mirrors `ustore_predicate_callback_t`.
+pub type PredicateCallback<'handler> = dyn FnMut(&[Key], &mut [Admission]) + Send + 'handler;
+
+/// What a scan or a cursor narrows its keys by, every part left empty to keep every key: patterns over the values of
+/// blobs, a JSONPath or XPath filter over documents and pages, and a predicate over the keys.
+///
+/// Mirrors the `patterns`, `filter` and `predicate` fields of `ustore_blobs_scan_t` and its kin.
+#[derive(Default)]
+pub struct Matching<'matching> {
+    /// The patterns every listed value matches one of, compiled once per call or once per cursor.
+    pub patterns: &'matching [&'matching str],
+    /// What the patterns are matched as.
+    pub pattern_kind: PatternKind,
+    /// Whether matching folds case.
+    pub sensitivity: CaseSensitivity,
+    /// One weight per substring pattern, which turns on BM25 scores.
+    pub weights: Option<&'matching [f32]>,
+    /// The JSONPath, root filter or XPath every listed document or page matches.
+    pub filter: Option<&'matching str>,
+    /// The caller's verdict on the keys of every page.
+    pub predicate: Option<&'matching mut PredicateCallback<'matching>>,
+    /// Where the predicate is asked.
+    pub predicate_cost: PredicateCost,
+}
+
+impl fmt::Debug for Matching<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Matching")
+            .field("patterns", &self.patterns)
+            .field("pattern_kind", &self.pattern_kind)
+            .field("sensitivity", &self.sensitivity)
+            .field("weights", &self.weights)
+            .field("filter", &self.filter)
+            .field("predicate", &self.predicate.is_some())
+            .field("predicate_cost", &self.predicate_cost)
+            .finish()
+    }
+}
+
+/// The matching one call or cursor lends the library, and the first panic its predicate raised, which resurfaces once
+/// the call is final, since unwinding out of an `extern "C"` frame aborts.
+pub(crate) struct Matched<'matching> {
+    matching: Matching<'matching>,
+    panic: Option<Box<dyn Any + Send>>,
+}
+
+impl<'matching> Matched<'matching> {
+    pub(crate) fn new(matching: Matching<'matching>) -> Self {
+        Matched { matching, panic: None }
+    }
+
+    /// The patterns as the ABI takes them, viewing what `self` borrows.
+    pub(crate) fn patterns(&self) -> ffi::ustore_patterns_t {
+        let patterns = self.matching.patterns;
+        if patterns.is_empty() {
+            return ffi::ustore_patterns_t::default();
+        }
+        ffi::ustore_patterns_t {
+            patterns: ffi::ustore_strings_view_t::accessor(str_views, patterns.as_ptr().cast()),
+            count: patterns.len() as ffi::ustore_size_t,
+            kind: self.matching.pattern_kind as ffi::ustore_enum_t,
+            sensitivity: self.matching.sensitivity as ffi::ustore_enum_t,
+            weights: self.matching.weights.map_or(ptr::null(), <[f32]>::as_ptr),
+        }
+    }
+
+    /// The filter as the ABI takes it, viewing what `self` borrows.
+    pub(crate) fn filter(&self) -> ffi::ustore_bytes_view_t {
+        self.matching
+            .filter
+            .map_or_else(ffi::ustore_bytes_view_t::default, |filter| filter.as_bytes().into())
+    }
+
+    /// Whether the patterns carry weights, so a scan writes scores.
+    pub(crate) fn scores(&self) -> bool {
+        self.matching.weights.is_some()
+    }
+
+    /// The predicate as the ABI takes it, addressing `self`, which stays in place until the call or the cursor ends.
+    pub(crate) fn predicate(&mut self) -> ffi::ustore_predicate_t {
+        match self.matching.predicate {
+            Some(_) => ffi::ustore_predicate_t {
+                callback: Some(predicate_trampoline),
+                state: ptr::from_mut(self).cast(),
+                cost: self.matching.predicate_cost as ffi::ustore_enum_t,
+            },
+            None => ffi::ustore_predicate_t::default(),
+        }
+    }
+
+    /// Re-raises the first panic the predicate raised, once the call is final.
+    pub(crate) fn raise(&mut self) {
+        if let Some(panic) = self.panic.take() {
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
+
+impl fmt::Debug for Matched<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Matched")
+            .field("matching", &self.matching)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Writes the view of every `&str` that `indices` names out of the slice `handle` addresses.
+unsafe extern "C" fn str_views(
+    handle: *const c_void,
+    indices: *const ffi::ustore_size_t,
+    count: ffi::ustore_size_t,
+    views: *mut ffi::ustore_bytes_view_t,
+) {
+    let texts = handle.cast::<&str>();
+    for slot in 0..count as usize {
+        let text = *texts.add(*indices.add(slot) as usize);
+        *views.add(slot) = text.as_bytes().into();
+    }
+}
+
+/// Runs the predicate of the [`Matched`] at `state` over one page, rejecting every key on a panic.
+///
+/// # Safety
+/// `state` addresses the `Matched` of the call or cursor the predicate was passed to, which nothing else reaches until
+/// the callback returns, and `keys` and `admissions` hold `count` entries each.
+unsafe extern "C" fn predicate_trampoline(
+    keys: *const ffi::ustore_key_t,
+    admissions: *mut ffi::ustore_enum_t,
+    count: ffi::ustore_size_t,
+    state: *mut c_void,
+) {
+    let matched = &mut *state.cast::<Matched<'_>>();
+    let count = count as usize;
+    // SAFETY: the library wrote a rejection into every admission, a valid `Admission` of the same width.
+    let admissions = std::slice::from_raw_parts_mut(admissions.cast::<Admission>(), count);
+    let Some(handler) = matched.matching.predicate.as_mut() else {
+        return;
+    };
+    if matched.panic.is_some() {
+        return;
+    }
+    let keys = std::slice::from_raw_parts(keys, count);
+    if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| handler(keys, &mut *admissions))) {
+        admissions.fill(Admission::Reject);
+        matched.panic = Some(panic);
+    }
+}
+
+// endregion: Matching
+
 // region: Progress
 
 /// A periodic report of the units a call finished and the units it finishes if it runs to the end, where
@@ -2739,6 +3137,7 @@ impl<const COUNT: usize> sealed::Accepts<[Edge; COUNT]> for Deferring {}
 impl sealed::Accepts<Collections<'static>> for Deferring {}
 impl sealed::Accepts<Roles<'static>> for Deferring {}
 impl sealed::Accepts<Option<&'static mut ProgressCallback<'static>>> for Deferring {}
+impl sealed::Accepts<Matching<'static>> for Deferring {}
 
 impl sealed::Writable for Database {}
 impl sealed::Writable for Transaction<'_> {}
@@ -2863,8 +3262,6 @@ struct Lent<Verb: sealed::Calling> {
 #[derive(Debug)]
 pub struct Executor {
     handle: ffi::ustore_executor_t,
-    /// The executor of [`Executor::for_vram`] an NVMe one borrows, freed after it.
-    vram: Option<Box<Executor>>,
 }
 
 // SAFETY: `types.h` shares an executor between any number of databases and threads.
@@ -2925,47 +3322,55 @@ impl Executor {
 
     /// Spawns the threads of the NVMe engine, each submitting and polling its own I/O ring, where zero `threads`
     /// derives them from the cores, and tells every database [`Database::open_nvme`] opens on it to move bytes as
-    /// `io` says, compacting on the devices of `vram`, which it keeps until it is dropped.
+    /// `io` says.
     ///
     /// Calls `ustore_executor_for_nvme`.
-    pub fn for_nvme(threads: usize, io: &IOOptions, vram: Option<Executor>, deferred_limit: usize) -> Result<Self> {
+    pub fn for_nvme(threads: usize, io: &IOOptions, deferred_limit: usize) -> Result<Self> {
         let mut handle: ffi::ustore_executor_t = ptr::null_mut();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_for_nvme_t {
             executor: &mut handle,
             outcome: &mut outcome,
             nvme: nvme_options(io),
-            vram: vram.as_ref().map_or(ptr::null_mut(), |borrowed| borrowed.handle),
             threads: threads as ffi::ustore_size_t,
             deferred_limit: deferred_limit as ffi::ustore_size_t,
         };
-        // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and the new executor
-        // keeps `vram` until it is dropped.
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_executor_for_nvme(&mut arguments) };
-        let mut made = Executor::created(handle, outcome)?;
-        made.vram = vram.map(Box::new);
-        Ok(made)
+        Executor::created(handle, outcome)
     }
 
-    /// Spawns one host thread driving each CUDA device of `devices`, every visible one when empty, with
-    /// `scratch_limit` bytes of device memory on each, or 256 MiB for zero, which an executor of
-    /// [`Executor::for_nvme`] compacts on, or fails with [`Status::Unsupported`] in a build without CUDA and with
-    /// [`Status::Device`] for an ordinal no device carries.
+    /// Opens one submission stream on the CUDA device `device`, or borrows the caller's `stream`, all of it driven by
+    /// one host thread - which is why this takes no thread count - moving bytes as `gds` says. Zero `scratch_limit`
+    /// lets scratch grow as calls ask. It fails with [`Status::Unsupported`] in a build without CUDA and with
+    /// [`Status::Device`] for an ordinal no device carries. [`NVMEOptions::compactions`] places the merges of an NVMe
+    /// database on it.
     ///
     /// Calls `ustore_executor_for_vram`.
-    pub fn for_vram(devices: &[i32], scratch_limit: usize, deferred_limit: usize) -> Result<Self> {
+    ///
+    /// # Safety
+    /// `stream` must be null or a live CUDA stream on `device` that outlives the executor.
+    pub unsafe fn for_vram(
+        device: i32,
+        stream: *mut c_void,
+        scratch_limit: usize,
+        gds: Gds,
+        deferred_limit: usize,
+    ) -> Result<Self> {
         let mut handle: ffi::ustore_executor_t = ptr::null_mut();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_for_vram_t {
             executor: &mut handle,
             outcome: &mut outcome,
-            devices: devices.as_ptr(),
-            devices_count: devices.len() as ffi::ustore_size_t,
+            device,
+            stream,
             scratch_limit: scratch_limit as ffi::ustore_size_t,
+            gds,
             deferred_limit: deferred_limit as ffi::ustore_size_t,
         };
-        // SAFETY: every pointer in `arguments` outlives the call, which is final on return and copies the devices.
-        unsafe { ffi::ustore_executor_for_vram(&mut arguments) };
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and the caller vouches
+        // for the stream.
+        ffi::ustore_executor_for_vram(&mut arguments);
         Executor::created(handle, outcome)
     }
 
@@ -2974,7 +3379,7 @@ impl Executor {
         check(outcome)?;
         match handle.is_null() {
             true => Err(fail(Status::Internal, "the library returned no executor and no error")),
-            false => Ok(Executor { handle, vram: None }),
+            false => Ok(Executor { handle }),
         }
     }
 
@@ -3638,9 +4043,12 @@ mod tests {
             transport: Transport::Blocking,
             ..IOOptions::default()
         };
-        drop(Executor::for_nvme(1, &blocking, None, 0).unwrap());
+        drop(Executor::for_nvme(1, &blocking, 0).unwrap());
         // A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries.
-        let devices = Executor::for_vram(&[1 << 20], 0, 0).unwrap_err().status;
+        // SAFETY: a null stream lends nothing, so the executor creates its own.
+        let devices = unsafe { Executor::for_vram(1 << 20, ptr::null_mut(), 0, Gds::Automatic, 0) }
+            .unwrap_err()
+            .status;
         assert!(devices == Status::Unsupported || devices == Status::Device);
 
         // Zero threads derive their count from the cores of every domain.
@@ -4082,7 +4490,12 @@ mod tests {
         for mut arena in [Arena::new().unwrap(), Arena::new_in(&executor).unwrap()] {
             let head = database.head().on(&executor);
             assert_eq!(head.read(names, keys([1, 2]), &mut arena).unwrap().get(1), None);
-            assert_eq!(head.scan(names, key(0), 10, &mut arena).unwrap(), &keys([1]));
+            assert_eq!(
+                head.scan(names, key(0), 10, Matching::default(), &mut arena)
+                    .unwrap()
+                    .keys,
+                &keys([1])
+            );
             assert_eq!(head.docs_gist(people, keys([1]), &mut arena).unwrap().len(), 1);
             let listed = head.collection_list(&mut arena).unwrap();
             assert!(listed.len() == 2 && listed.contains(&people) && listed.contains(&names));
@@ -4179,7 +4592,7 @@ mod tests {
         let scan = database
             .head()
             .deferred(&executor)
-            .scan(blobs, key(0), 100_000, &mut arena)
+            .scan(blobs, key(0), 100_000, Matching::default(), &mut arena)
             .unwrap();
         let lent = scan.lent;
         std::mem::forget(scan);
@@ -4188,7 +4601,7 @@ mod tests {
         drop(database);
         let scan = Deferred { lent };
         assert_eq!(scan.status(), Ok(()));
-        assert_eq!(scan.wait().unwrap().len(), 100_000);
+        assert_eq!(scan.wait().unwrap().keys.len(), 100_000);
     }
 
     #[test]
@@ -4199,12 +4612,19 @@ mod tests {
         let scan = database
             .head()
             .deferred(&executor)
-            .scan(blobs, key(0), 100_000, &mut arena)
+            .scan(blobs, key(0), 100_000, Matching::default(), &mut arena)
             .unwrap();
         drop(scan);
 
         // The drop waited for the scan to release the arena, so the next call through it is not contended.
-        assert_eq!(database.head().scan(blobs, key(0), 1, &mut arena).unwrap(), &keys([0]));
+        assert_eq!(
+            database
+                .head()
+                .scan(blobs, key(0), 1, Matching::default(), &mut arena)
+                .unwrap()
+                .keys,
+            &keys([0])
+        );
     }
 
     #[test]
@@ -4215,7 +4635,9 @@ mod tests {
         let mut measured = Arena::new_in(&executor).unwrap();
         let head = database.head().deferred(&executor);
 
-        let scan = head.scan(blobs, key(0), 100_000, &mut scanned).unwrap();
+        let scan = head
+            .scan(blobs, key(0), 100_000, Matching::default(), &mut scanned)
+            .unwrap();
         let refused = head.measure(blobs, key(0), key(9), &mut measured).unwrap();
         assert_eq!(
             refused.status(),
@@ -4223,7 +4645,7 @@ mod tests {
             "a refused call is final at once"
         );
         assert_eq!(refused.wait().unwrap_err().status, Status::Contended);
-        assert_eq!(scan.wait().unwrap().len(), 100_000);
+        assert_eq!(scan.wait().unwrap().keys.len(), 100_000);
         head.measure(blobs, key(0), key(9), &mut measured)
             .unwrap()
             .wait()

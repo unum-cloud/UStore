@@ -19,7 +19,7 @@
 
 #include "ustore/db.h" // `ustore_database_describe_t`, `ustore_transaction_init_t`, `ustore_collection_create_t`
 
-#include "lib.hpp" // `route`, `route_init`, `tagged_view`, `release_parent`, `enumerator_spelling`
+#include "lib.hpp" // `route`, `tagged_view`, `release_parent`, `enumerator_spelling`
 
 namespace unum::ustore {
 
@@ -90,60 +90,21 @@ expected<ustore_collection_id_t> mint_collection_id() noexcept {
     return id;
 }
 
-template void route_init(ustore_database_init_ram_t*,
-                         status_t (*)(ustore_database_init_ram_t const&, view_t const&) noexcept) noexcept;
-template void route_init(ustore_database_open_ram_t*,
-                         status_t (*)(ustore_database_open_ram_t const&, view_t const&) noexcept) noexcept;
-template void route_init(ustore_database_open_rocksdb_t*,
-                         status_t (*)(ustore_database_open_rocksdb_t const&, view_t const&) noexcept) noexcept;
-template void route_init(ustore_database_view_rocksdb_t*,
-                         status_t (*)(ustore_database_view_rocksdb_t const&, view_t const&) noexcept) noexcept;
-template void route_init(ustore_database_open_leveldb_t*,
-                         status_t (*)(ustore_database_open_leveldb_t const&, view_t const&) noexcept) noexcept;
-template void route_init(ustore_database_open_nvme_t*,
-                         status_t (*)(ustore_database_open_nvme_t const&, view_t const&) noexcept) noexcept;
-
 } // namespace unum::ustore
 
-void ustore_database_describe(ustore_database_describe_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::describe>(arguments);
-}
-void ustore_database_clear(ustore_database_clear_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::clear>(arguments);
-}
-void ustore_database_compact(ustore_database_compact_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::compact>(arguments);
-}
-void ustore_snapshot_init(ustore_snapshot_init_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::snapshot_init>(arguments);
-}
-void ustore_snapshot_save(ustore_snapshot_save_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::snapshot_save>(arguments);
-}
-void ustore_collection_list(ustore_collection_list_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::collection_list>(arguments);
-}
-void ustore_collection_create(ustore_collection_create_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::collection_create>(arguments);
-}
-void ustore_collection_find(ustore_collection_find_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::collection_find>(arguments);
-}
-void ustore_collection_drop(ustore_collection_drop_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::collection_drop>(arguments);
-}
-void ustore_transaction_init(ustore_transaction_init_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::transaction_init>(arguments);
-}
-void ustore_transaction_stage(ustore_transaction_stage_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::transaction_stage>(arguments);
-}
-void ustore_transaction_commit(ustore_transaction_commit_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::transaction_commit>(arguments);
-}
-void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments) {
-    route<&engine_t::database, &database_verbs_t::transaction_rollback>(arguments);
-}
+void ustore_database_describe(ustore_database_describe_t* arguments) { route(arguments); }
+void ustore_database_clear(ustore_database_clear_t* arguments) { route(arguments); }
+void ustore_database_compact(ustore_database_compact_t* arguments) { route(arguments); }
+void ustore_snapshot_init(ustore_snapshot_init_t* arguments) { route(arguments); }
+void ustore_snapshot_save(ustore_snapshot_save_t* arguments) { route(arguments); }
+void ustore_collection_list(ustore_collection_list_t* arguments) { route(arguments); }
+void ustore_collection_create(ustore_collection_create_t* arguments) { route(arguments); }
+void ustore_collection_find(ustore_collection_find_t* arguments) { route(arguments); }
+void ustore_collection_drop(ustore_collection_drop_t* arguments) { route(arguments); }
+void ustore_transaction_init(ustore_transaction_init_t* arguments) { route(arguments); }
+void ustore_transaction_stage(ustore_transaction_stage_t* arguments) { route(arguments); }
+void ustore_transaction_commit(ustore_transaction_commit_t* arguments) { route(arguments); }
+void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments) { route(arguments); }
 
 ustore_view_t ustore_transaction_view(ustore_transaction_t transaction, ustore_watch_t watch) {
     return tagged_view(transaction, watch == ustore_watch_none_k ? view_tag_t::blind_k : view_tag_t::watching_k);
@@ -168,19 +129,19 @@ ustore_modality_t ustore_modality_from_name(ustore_bytes_view_t name) { return v
 
 void ustore_transaction_free(ustore_transaction_t transaction) {
     if (!transaction) return;
-    wait_deferred_calls(handle_cast<handle_t>(transaction)->deferred_calls);
-    release_parent(view_t {.transaction = transaction});
+    wait_deferred_calls(transaction->deferred_calls);
+    release_parent(transaction);
 }
 
 void ustore_snapshot_free(ustore_snapshot_t snapshot) {
     if (!snapshot) return;
-    wait_deferred_calls(handle_cast<handle_t>(snapshot)->deferred_calls);
-    release_parent(view_t {.snapshot = snapshot});
+    wait_deferred_calls(snapshot->deferred_calls);
+    release_parent(snapshot);
 }
 
 void ustore_database_free(ustore_database_t database) {
     if (!database) return;
-    wait_deferred_calls(handle_cast<handle_t>(database)->deferred_calls);
+    wait_deferred_calls(database->deferred_calls);
     release_hold(database);
 }
 

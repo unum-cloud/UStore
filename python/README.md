@@ -148,8 +148,8 @@ arena = ustore.Arena(executor)                          # outputs of calls on th
 ```
 
 `Executor.on_pool(pool, /, *, memory_domains=None, deferred_limit=0)` borrows a ForkUnion `fu_pool_t` another library already runs, given as the integer address `ctypes` or `cffi` hands over, so one process keeps one set of threads; the pool must outlive the executor.
-`Executor.for_nvme(threads=0, *, transport=Transport.AUTOMATIC, vram=None, deferred_limit=0, **sizes)` makes the I/O rings of the NVMe engine, and tells every database `open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, each size keyword naming a field of `ustore_nvme_options_t`.
-`Executor.for_vram(devices=None, *, scratch_limit=0, deferred_limit=0)` drives CUDA devices, which an NVMe executor given it as `vram` compacts on, and raises `UnsupportedError` in a build without CUDA.
+`Executor.for_nvme(threads=0, *, transport=Transport.AUTOMATIC, deferred_limit=0, **sizes)` makes the I/O rings of the NVMe engine, and tells every database `open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, each size keyword naming a field of `ustore_nvme_options_t`.
+`Executor.for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC, deferred_limit=0)` drives one CUDA device through one stream every call queues on, whose merges `Database.open_nvme(..., compactions=...)` takes, and raises `UnsupportedError` in a build without CUDA.
 
 Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted before it finishes.
 A deferred submission that finds the table full finishes with `Status.CONTENDED` and raises `ContendedError` once awaited.
