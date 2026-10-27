@@ -143,7 +143,6 @@ def test_members_are_named_by_the_library():
     assert max(ustore.Status) is ustore.Status.CAPACITY_EXHAUSTED
     assert (ustore.Isolation.STRICT_SERIALIZABLE, ustore.Transport.LINUX_URING) == (0, 2)
     assert [engine.name for engine in ustore.Engine] == ["RAM", "ROCKSDB", "LEVELDB", "NVME"]
-    assert ustore.version().count(".") == 2
 
 
 def test_modes_accept_plain_integers(database, blobs):

@@ -2,21 +2,22 @@
  *  @file src/nvme/docs.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief The document writes of the C ABI over the docs stores of `include/ustore/docs/nvme_store.hpp`, for the NVMe
- *      engine's table.
+ *  @brief The document writes of the C ABI over the docs stores of
+ *      <tt>include/ustore/docs/nvme_store.hpp</tt>, for the NVMe engine's table.
  *
- *  These calls build on the accesses, the writes and the collection lookups of `src/nvme/database.hpp`. A write
- *  addressing any collection but a docs one is refused. An upsert of a whole document writes it, JSON as written and
- *  any other type printed as JSON, and reads nothing. An update, an insertion, a patch, a merge, and an upsert of a
- *  field each append one @c json_delta_t to the document's change delta, after replaying it over the document as the
- *  transaction sees it, read and watched. A modification that would fail answers as the read-modify-write of
- *  `src/blobs_layers/docs.hpp` does and never lands, and a commit that changed the document since conflicts, so no
- *  change delta carries a @c json_delta_t that fails.
+ *  These calls build on the accesses, the writes and the collection lookups of
+ *  <tt>src/nvme/database.hpp</tt>. A write addressing any collection but a docs one is refused. An
+ *  upsert of a whole document writes it, JSON as written and any other type printed as JSON, and
+ *  reads nothing. An update, an insertion, a patch, a merge, and an upsert of a field each append
+ *  one @c json_delta_t to the document's change delta, after replaying it over the document as the
+ *  transaction sees it, read and watched. A modification that would fail answers as the
+ *  read-modify-write of <tt>src/blobs_layers/docs.hpp</tt> does and never lands, and a commit that
+ *  changed the document since conflicts, so no change delta carries a @c json_delta_t that fails.
  *
  *  The tasks of one call on one document apply in task order, each seeing the ones before it, and a call whose tasks
  *  leave a document known whole, past a whole upsert or over a document of no bytes, writes that document, since a
  *  change delta over no bytes would fold as over a missing document. Reads take the read paths of
- *  `src/blobs_layers/docs.hpp` over the engine's own reads of the docs store, which fold the deltas.
+ *  <tt>src/blobs_layers/docs.hpp</tt> over the engine's own reads of the docs store, which fold the deltas.
  */
 
 #pragma once

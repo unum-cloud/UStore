@@ -158,7 +158,7 @@ enum class spdk_transport_t : std::uint8_t {
 
 /**
  *  @brief The number on the @p key line of a @c /proc/meminfo-shaped @p text, or zero when it has none.
- *  @param[in] text The whole file, or any text shaped like it, with lines of the form `Key: value`.
+ *  @param[in] text The whole file, or any text shaped like it, with lines of the form <tt>Key: value</tt>.
  *  @param[in] key The line to read, matched in full rather than as a prefix of a longer name.
  *  @return The decimal value that follows the colon, ignoring the unit that may follow it.
  */
@@ -197,7 +197,7 @@ enum class spdk_transport_t : std::uint8_t {
 }
 
 /**
- *  @brief Names the driver a @c /sys/bus/pci/devices/<address>/driver link resolves to.
+ *  @brief Names the driver a PCI device's @c driver link under @c /sys/bus/pci/devices resolves to.
  *  @param[in] link The link target, which is a relative path whose last component is the driver.
  *  @return Which driver holds the device, @c unbound_k for an empty link.
  */
@@ -762,7 +762,7 @@ class linux_spdk_disk {
 
     /**
      *  @brief Makes the calling thread the one that polls @p queue pair.
-     *  @param[in] queue pair The queue pair this thread has just taken over, with nothing outstanding on it.
+     *  @param[in] queue_pair The queue pair this thread has just taken over, with nothing outstanding on it.
      *
      *  @note A queue pair carries no lock, so a second thread polling one corrupts its tracker list
      *      in silence; that is why a handover is announced and why the queue pair must be empty first.
@@ -777,7 +777,7 @@ class linux_spdk_disk {
 
     /**
      *  @brief Frees @p queue pair once it has nothing outstanding, and empties the handle.
-     *  @param[inout] queue pair The queue pair to return, surrendered on success and untouched on failure.
+     *  @param[in,out] queue_pair The queue pair to return, surrendered on success and untouched on failure.
      *
      *  @note The admin queue is polled first, so an abort issued for this queue pair finishes before the
      *      queue pair it names is gone.
@@ -843,7 +843,7 @@ class linux_spdk_disk {
 
     /**
      *  @brief Gives @p registered memory back, refusing while it is still a target of requests in flight.
-     *  @param[inout] registered memory The range to give back, surrendered on success.
+     *  @param[in,out] registered_memory The range to give back, surrendered on success.
      */
     status_t unregister_memory(registered_memory_t& registered_memory) noexcept {
         registered_memory_slot_t* const slot = slot_of_(registered_memory);
@@ -878,7 +878,7 @@ class linux_spdk_disk {
 
     /**
      *  @brief Gives the namespace back, refusing while requests against it are still in flight.
-     *  @param[inout] descriptor The target to give back, surrendered on success.
+     *  @param[in,out] descriptor The target to give back, surrendered on success.
      */
     status_t unregister_medium(registered_medium_t& descriptor) noexcept {
         registered_medium_slot_t* const slot = slot_of_(descriptor);
@@ -898,7 +898,7 @@ class linux_spdk_disk {
 
     /**
      *  @brief Takes as much of @p requests as @p queue pair still has credit for, and never waits.
-     *  @param[in] queue pair The queue pair submitting, held by the calling thread.
+     *  @param[in] queue_pair The queue pair submitting, held by the calling thread.
      *  @param[in] requests The batch, of which a prefix is taken.
      *  @return How many were taken, which is zero on a full queue and never a reason to block.
      */
@@ -959,7 +959,7 @@ class linux_spdk_disk {
 
     /**
      *  @brief Polls @p queue pair and copies what finished into @p into.
-     *  @param[in] queue pair The queue pair polling, held by the calling thread that submitted on it.
+     *  @param[in] queue_pair The queue pair polling, held by the calling thread that submitted on it.
      *  @param[out] into Room for completions, which bounds how many one call moves.
      *  @return How many completions were moved, which is zero when nothing has landed.
      *
@@ -984,7 +984,7 @@ class linux_spdk_disk {
 
     /**
      *  @brief Asks the controller to abort everything @p queue pair has in flight, which it may refuse.
-     *  @param[in] queue pair The queue pair to stop, whose started commands still run to their own end.
+     *  @param[in] queue_pair The queue pair to stop, whose started commands still run to their own end.
      *
      *  @note A refused abort is not an error here: the requests finish normally and @c drain polls
      *      until they do, so a queue pair still sees exactly one completion per request it submitted.
@@ -1003,7 +1003,7 @@ class linux_spdk_disk {
 
     /**
      *  @brief Finishes and discards everything @p queue pair has outstanding, so its buffers may be freed.
-     *  @param[in] queue pair The queue pair to empty, which may be cancelled or still running.
+     *  @param[in] queue_pair The queue pair to empty, which may be cancelled or still running.
      */
     status_t drain(queue_pair_t const& queue_pair) noexcept {
         queue_pair_slot_t const* const slot = slot_of_(queue_pair);

@@ -66,6 +66,21 @@ typedef struct ustore_strings_write_t {
 /**
  *  @brief Writes a batch of strings and the keys they map onto.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
+ *    table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_invalid_argument_k The @c collections, @c strings or @c values are missing,
+ *    the strings come in an unknown layout, the @c transaction belongs to another engine or is
+ *    staged, a flushed write names a @c transaction on the RAM engine, or a collection holds another
+ *    modality.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
+ *    transaction holds a string.
+ *  - @c ustore_status_capacity_exhausted_k The strings outgrow one NVMe run file.
  */
 USTORE_EXPORT void ustore_strings_write(ustore_strings_write_t* arguments);
 
@@ -107,6 +122,21 @@ typedef struct ustore_strings_remove_t {
 /**
  *  @brief Removes a batch of strings with their values.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
+ *    table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_invalid_argument_k The @c collections or @c strings are missing, the strings
+ *    come in an unknown layout, the @c transaction belongs to another engine or is staged, a
+ *    flushed remove names a @c transaction on the RAM engine, or a collection holds another
+ *    modality.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
+ *    transaction holds a string.
+ *  - @c ustore_status_capacity_exhausted_k The strings outgrow one NVMe run file.
  */
 USTORE_EXPORT void ustore_strings_remove(ustore_strings_remove_t* arguments);
 
@@ -153,6 +183,20 @@ typedef struct ustore_strings_read_t {
 /**
  *  @brief Reads the keys a batch of strings map onto.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or @c strings are missing,
+ *    the strings come in an unknown layout, the @c view was made by neither view constructor or
+ *    belongs to another engine, a watching read goes through a staged transaction, or a collection
+ *    holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
+ *    call yet.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  */
 USTORE_EXPORT void ustore_strings_read(ustore_strings_read_t* arguments);
 
@@ -228,6 +272,23 @@ typedef struct ustore_strings_scan_t {
 /**
  *  @brief Scans a batch of prefixes.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
+ *    prefixes or start strings come in an unknown layout, a pattern kind, a case sensitivity or a
+ *    predicate cost is unknown, the @c mode is unknown under @c patterns or a predicate, the
+ *    @c patterns do not compile, the @c view was made by neither view constructor or belongs to
+ *    another engine, a watching scan goes through a staged transaction, or a collection holds
+ *    another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, or a device
+ *    executor is given a predicate.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
+ *    call yet.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  */
 USTORE_EXPORT void ustore_strings_scan(ustore_strings_scan_t* arguments);
 
@@ -280,6 +341,14 @@ typedef struct ustore_strings_cursor_init_t {
 /**
  *  @brief Opens a walk over the strings of one prefix, reading nothing until its first pull.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made by
+ *    neither view constructor or reads another database, a pattern kind, a case sensitivity or a
+ *    predicate cost is unknown, or the @c patterns do not compile.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k A device @c executor is given @c patterns.
+ *  - @c ustore_status_device_k A device @c executor is given a predicate.
  */
 USTORE_EXPORT void ustore_strings_cursor_init(ustore_strings_cursor_init_t* arguments);
 
@@ -329,13 +398,26 @@ typedef struct ustore_strings_cursor_next_t {
 /**
  *  @brief Pulls the next page of a walk, and the values of its strings when asked.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or an output is @c NULL, the
+ *    cursor walks another database, a watching pull goes through a staged transaction, or the
+ *    collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, or a cursor opened
+ *    for a device is pulled on host threads.
+ *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine walks yet.
+ *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
  */
 USTORE_EXPORT void ustore_strings_cursor_next(ustore_strings_cursor_next_t* arguments);
 
 /**
  *  @brief Waits until every deferred call naming the cursor finishes, then frees it, giving back the holds it kept on
  *      its database and on the transaction or snapshot it reads through.
- *  @param[inout] cursor The cursor to be freed; @c NULL is safe.
+ *  @param[in,out] cursor The cursor to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_strings_cursor_free(ustore_strings_cursor_t cursor);
 

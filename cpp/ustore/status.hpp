@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date July 4, 2022
  *  @brief Statuses with static messages and the expected wrapper that every fallible C++ call returns, re-exported from
- *      `ustore/utilities/types.hpp`, and the deferred call that a call submitted to an executor answers.
+ *      <tt>ustore/utilities/types.hpp</tt>, and the deferred call that a call submitted to an executor answers.
  */
 
 #pragma once

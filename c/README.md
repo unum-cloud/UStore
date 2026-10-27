@@ -24,7 +24,7 @@ Every verb serves only collections of its own modality, and answers `ustore_stat
 
 ## Installation
 
-UStore builds with CMake into two libraries from one source list, each holding the in-memory engine and every engine the build enables through `USTORE_WITH_ROCKSDB`, `USTORE_WITH_LEVELDB` and `USTORE_BUILD_NVME`:
+UStore builds with CMake into two libraries from one source list, each holding the in-memory engine and every engine the build enables through `USTORE_WITH_ROCKSDB`, `USTORE_WITH_LEVELDB` and `USTORE_WITH_NVME`:
 
 - __The archive__, `ustore_static`, linked as `ustore::static` or its alias `ustore::ustore`, carries the objects of the small libraries every build needs: ForkUnion, StringZilla, yyjson and fmt.
   The storage engines' own libraries, RocksDB, LevelDB and liburing, stay archives of their own, installed beside it as `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`, which `ustore::static` links, so a CMake consumer still names one target.
@@ -32,7 +32,7 @@ UStore builds with CMake into two libraries from one source list, each holding t
 - __The shared library__, `ustore_shared`, linked as `ustore::shared`, links them privately and exports only the functions the headers mark `USTORE_EXPORT`, which its consumers import on Windows through the `USTORE_SHARED` definition the target hands them.
 
 Each engine is its own object of the archive, so a program links only the engines it opens.
-`USTORE_BUILD_NVME` stays off until the NVMe sources are ported to this interface.
+`USTORE_WITH_NVME` stays off until the NVMe sources are ported to this interface.
 
 ```cmake
 FetchContent_Declare(

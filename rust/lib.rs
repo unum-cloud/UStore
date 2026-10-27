@@ -187,6 +187,12 @@
 //! snapshot.view().remove(people, [Key::from(1u64)], Durability::Buffered)?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
+//!
+//! File: rust/lib.rs
+//! Author: Ash Vardanian
+//! Date: September 16, 2026
+
+#![warn(missing_docs)]
 
 pub mod blobs;
 pub mod collection;

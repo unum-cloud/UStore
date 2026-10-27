@@ -338,8 +338,8 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
  *  Every round ends at a checkpoint where all threads stop, the main thread replays the committed writes in
  *  stamp order, compares the replay against the database, and clears it for the next round.
  *
- *  @param[inout] run Database, logs and thread slots the run allocated once.
- *  @param[inout] executor Pool of exactly the workload's thread count.
+ *  @param[in,out] run Database, logs and thread slots the run allocated once.
+ *  @param[in,out] executor Pool of exactly the workload's thread count.
  *  @param[in] workload Mix, threads and transactions of every round.
  *  @param[in] checkpoints Most rounds to run.
  *  @param[in] slice Time after which no further round starts; the first round always runs.

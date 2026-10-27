@@ -109,8 +109,13 @@ class graph_read_collection_t {
         return found != ustore_vertex_degree_missing_k;
     }
 
-    /** Marks in @p presences, one bit per vertex, which of @p vertices are present, including those without any edges,
-     *  reading their degrees into @p arena. */
+    /**
+     *  Marks in @p presences, one bit per vertex, which of @p vertices are present, including those without any edges,
+     *  reading their degrees into @p arena.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p presences hold fewer bits than @p vertices.
+     */
     expected<bits_view_t> present( //
         strided_span<ustore_key_t const> const& vertices, std::span<ustore_octet_t> presences, arena_t& arena,
         ustore_watch_t watch = ustore_watch_keys_k) noexcept {

@@ -3,6 +3,10 @@
 //! Names resolve in two phases: a name maps onto a collection once, and every other call addresses
 //! the collection by its identifier. Each engine keeps the names apart from every collection, so no
 //! identifier reaches them.
+//!
+//! File: rust/strings.rs
+//! Author: Ash Vardanian
+//! Date: September 16, 2026
 
 use std::iter::Copied;
 use std::ptr;

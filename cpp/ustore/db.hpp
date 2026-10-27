@@ -43,6 +43,8 @@ using collections_list_t = std::span<ustore_collection_id_t const>;
  *  Names resolve in two phases, so this is the only place a name reaches the database, and every other
  *  call addresses its collection by the identifier this returns.
  *
+ *  @param[in] receiver The receiver whose snapshot the name is read at, or the head when it names none.
+ *  @param[in] name The collection's name.
  *  @param[out] modality What the collection holds, written when given.
  */
 inline expected<ustore_collection_id_t> collection_named(receiver_t const& receiver, std::string_view name,
@@ -73,8 +75,14 @@ inline expected<ustore_collection_id_t> collection_named(receiver_t const& recei
     return collections[0];
 }
 
-/** Reads the collection @p name was given, as the overload above, refusing one that holds another modality than
- *  @p modality with @c status_code_t::invalid_argument_k. */
+/**
+ *  Reads the collection @p name was given, as the overload above, refusing one that holds another modality than
+ *  @p modality.
+ *
+ *  @par Statuses:
+ *  - @c status_code_t::not_found_k No collection carries @p name.
+ *  - @c status_code_t::invalid_argument_k The collection holds another modality than @p modality.
+ */
 inline expected<ustore_collection_id_t> collection_named(receiver_t const& receiver, std::string_view name,
                                                          ustore_modality_t modality) noexcept {
     ustore_modality_t held {};
@@ -813,8 +821,13 @@ class database_ref_t {
         return collection_ {receiver_, collection};
     }
 
-    /** The collection named @p name, refusing one that holds another modality than @p collection_ with
-     *  @c status_code_t::invalid_argument_k. */
+    /**
+     *  The collection named @p name, refusing one that holds another modality than @p collection_.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::not_found_k No collection carries @p name.
+     *  - @c status_code_t::invalid_argument_k The collection holds another modality than @p collection_.
+     */
     template <typename collection_ = blobs_collection_t>
     expected<collection_> find(std::string_view name) noexcept {
         auto [found, find_status] = collection_named(receiver_, name, collection_::modality_k);
@@ -846,8 +859,13 @@ class database_ref_t {
         return status_t {outcome};
     }
 
-    /** Empties every collection at once, as @p mode names. The RAM and RocksDB engines refuse to drop the collections
-     *  while a snapshot is open, answering @c status_code_t::invalid_argument_k. */
+    /**
+     *  Empties every collection at once, as @p mode names.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The RAM and RocksDB engines refuse to drop the collections while a
+     *    snapshot is open.
+     */
     status_t clear(ustore_drop_mode_t mode) noexcept {
         ustore_outcome_t outcome {};
         ustore_database_clear_t database_clear {};

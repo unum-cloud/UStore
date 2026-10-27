@@ -64,6 +64,10 @@
 //! posters.blobs().set(Key::from(1u64), b"\x89PNG")?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
+//!
+//! File: rust/collection.rs
+//! Author: Ash Vardanian
+//! Date: October 7, 2026
 
 use crate::blobs::{Entry, Values};
 use crate::db::sealed::Writable;

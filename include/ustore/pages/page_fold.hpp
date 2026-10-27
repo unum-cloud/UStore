@@ -122,7 +122,7 @@ class page_state {
     }
 };
 
-/** The fold of pages, fitting the fold concept of `ustore/utilities/folds.hpp`: apply, compose and closes. */
+/** The fold of pages, fitting the fold concept of <tt>ustore/utilities/folds.hpp</tt>: apply, compose and closes. */
 struct page_fold_t {
 
     /**

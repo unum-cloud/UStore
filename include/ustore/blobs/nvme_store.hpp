@@ -123,7 +123,7 @@ class value_cache {
      *  @brief A cache holding what @p capacity_bytes of @p constraint afford of values @p value_size wide.
      *  @param[in] capacity_bytes Bytes the cache may take, where zero leaves it holding nothing.
      *  @param[in] value_size Bytes one value takes, which is its widest for a variable-width layout.
-     *  @param[inout] constraint The budget the cached bytes are charged to, which must outlive the cache.
+     *  @param[in,out] constraint The budget the cached bytes are charged to, which must outlive the cache.
      */
     [[nodiscard]] static value_cache of(std::size_t capacity_bytes, stored_value_size_t value_size,
                                         resource_constraint<atomic_reference_>& constraint) noexcept {
@@ -149,6 +149,9 @@ class value_cache {
 
     /**
      *  @brief Copies the value cached for the version of @p stored_key stamped @p stamp into @p into, when it fits.
+     *  @param[in] stored_key The key whose cached value is wanted.
+     *  @param[in] stamp The stamp of the version wanted.
+     *  @param[out] into Room for the value's bytes.
      *  @param[out] size Bytes copied, untouched unless the copy is kept.
      *  @return Whether the slot held that version from the first load of its sequence to the last, so the copy is kept.
      */
@@ -457,10 +460,10 @@ class nvme_store {
 
     /**
      *  @brief An empty store over @p volume, whose memory is charged to @p constraint.
-     *  @param[inout] volume The volume every run lands on, borrowed and outliving the store.
+     *  @param[in,out] volume The volume every run lands on, borrowed and outliving the store.
      *  @param[in] config The bounds of the memory runs, the cache bound and the shape of the tree below.
-     *  @param[inout] constraint The budget the memory runs and the cache are charged to.
-     *  @param[inout] ledger The stamps the store's writes carry and its readers pin, outliving the store.
+     *  @param[in,out] constraint The budget the memory runs and the cache are charged to.
+     *  @param[in,out] ledger The stamps the store's writes carry and its readers pin, outliving the store.
      */
     static expected<nvme_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
                                       ledger_t& ledger) noexcept {
@@ -550,7 +553,7 @@ class nvme_store {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, which needs only the value's own bytes.
-     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the read is submitted and completed on, held by the calling thread.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
@@ -609,7 +612,7 @@ class nvme_store {
 
     /**
      *  @brief Reads the values of @p stored_keys, refilling the channel as completions retire.
-     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from a removal.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
@@ -748,9 +751,12 @@ class nvme_store {
      *  @brief Hands @p visitor the newest version at or below @p stamp of every key from @p from up that the run at
      *      @p run_index of @p counted carries, in that run's order, with no other run consulted.
      *  @param[in] counted The runs as @c count_runs counted them, which the index names one of.
+     *  @param[in] run_index Which of the counted runs to walk.
+     *  @param[in] from The first key to hand out.
      *  @param[in] visitor Called as @c visitor(stored_key, state, size) inside the epochs, answering whether the walk
      *      carries on, so it must not block; a change answers @c changed_k with its own bytes.
      *  @param[in] stamp The stamp a reader is pinned at, which every run of one scan should share.
+     *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
      *  @retval contended_k A flush, a compaction or a merge of memory runs rearranged the runs since they were counted.
      *  @retval invalid_argument_k The index names no run counted.
      */
@@ -946,7 +952,7 @@ class nvme_store {
 
     /**
      *  @brief Writes one value per key as one commit of its own, flushing first as @c insert does.
-     *  @param[inout] channel The channel a flush writes on, held by the writer.
+     *  @param[in,out] channel The channel a flush writes on, held by the writer.
      *  @param[in] stored_keys The keys to write, in any order and with repeats taking the last value.
      *  @param[in] stored_values The values back to back, in the order their keys name them.
      *  @param[in] sizes Bytes of every value, one per key, which must add up to @p stored_values.
@@ -1061,8 +1067,8 @@ class nvme_store {
 
     /**
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
-     *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
-     *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
+     *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
+     *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device lane.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
      */
@@ -1214,8 +1220,11 @@ class nvme_store {
     /**
      *  @brief Folds the versions of @p stored_key at or below @p read's stamp, collected newest first down to the first
      *      that closes the chain, into the value a reader at that stamp sees.
+     *  @param[in] read The read whose stamp bounds the versions folded.
+     *  @param[in] stored_key The key whose versions are folded.
      *  @param[in] bytes_of Called as @c bytes_of(run, position, bytes) for a version a level holds at a sorted
      *      position, viewing its bytes in the key slot or in @p arena, answering a status.
+     *  @param[in,out] arena Where the bytes the fold reads and writes are allocated.
      *  @param[out] value The folded value, viewing a memory run, a key slot, or @p arena.
      *  @return What the key carries, or the status a read or the fold refused it with.
      */
@@ -1405,7 +1414,7 @@ class nvme_store {
      *  @brief Lays the deltas of @p flushed out as one run's key slots, kinds and the bytes they locate.
      *  @param[in] flushed The memory runs, newest first.
      *  @param[in] survival Which older versions a reader or a mount still needs, as a merge would decide.
-     *  @param[inout] arena Where the values of folded changes sit until the run is written.
+     *  @param[in,out] arena Where the values of folded changes sit until the run is written.
      *  @param[out] key_slots The key slots in ascending order of their keys, as a run takes them.
      *  @param[out] stamps The stamp of every key slot, the versions of one key newest first.
      *  @param[out] kinds The @c delta_kind_t of every key slot, in the same order.

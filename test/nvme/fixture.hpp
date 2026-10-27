@@ -685,7 +685,7 @@ std::size_t run_on_mount(suite_totals_t& totals, basic_mount<disk_type_> const& 
 
 /**
  *  @brief Runs @p cases on @p transport, or reports through @p totals why they did not run.
- *  @param[inout] totals Where the transport's mount and every case report.
+ *  @param[in,out] totals Where the transport's mount and every case report.
  *  @param[in] transport The ring to mount, skipped when @c --transports names others.
  *  @param[in] medium The paths, the selection and the seed the flags gave.
  *  @param[in] config The numbers every fixture of the suite mounts with.

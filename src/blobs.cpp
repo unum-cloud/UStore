@@ -2,8 +2,8 @@
  *  @file src/blobs.cpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief Implements `c/ustore/blobs.h`: routing the binary calls to their engine, and the cursors walking the keys
- *      of one collection.
+ *  @brief Implements <tt>c/ustore/blobs.h</tt>: routing the binary calls to their engine, and the
+ *      cursors walking the keys of one collection.
  */
 
 #include <cstddef> // `std::size_t`

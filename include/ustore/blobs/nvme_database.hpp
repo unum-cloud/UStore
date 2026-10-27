@@ -869,7 +869,7 @@ class database_transaction {
 
     /**
      *  @brief A transaction started at the newest stamp @p manager has published, which it pins until it dies.
-     *  @param[inout] manager The registry that orders and conflict-checks it, outliving it.
+     *  @param[in,out] manager The registry that orders and conflict-checks it, outliving it.
      *  @param[in] deltas The deltas it fills, already sized to its configuration.
      *  @param[in] resources The budget its watched keys are charged to.
      */
@@ -1707,8 +1707,8 @@ class basic_database {
 
     /**
      *  @brief Opens every collection @p router already names, or starts an empty schema.
-     *  @param[inout] router The volumes every run lands on, borrowed and outliving the database.
-     *  @param[inout] channels The queue pairs every call borrows one of, borrowed and outliving the database.
+     *  @param[in,out] router The volumes every run lands on, borrowed and outliving the database.
+     *  @param[in,out] channels The queue pairs every call borrows one of, borrowed and outliving the database.
      *  @param[in] config The delta bounds a transaction takes when its caller names none.
      *  @param[in] compactor What every merge runs on: the calling thread, or a device lane the caller owns, which
      *      outlives the database.
@@ -2152,10 +2152,15 @@ class basic_database {
      *  @brief Hands @p visitor the newest version at or below @p stamp of every key from @p from up in the run at
      *      @p run_index of @p counted, as @c runs_count counted the runs of @p id, consulting no other run, so a key
      *      another run removed or repeats is still handed out.
+     *  @param[in] id The collection whose run is walked.
+     *  @param[in] counted The runs as @c runs_count counted them, which the index names one of.
+     *  @param[in] run_index Which of the counted runs to walk.
+     *  @param[in] from The first key to hand out.
      *  @param[in] visitor Called as @c visitor(stored_key, state, size) inside the epochs, answering whether the walk
      *      carries on, so it must not block; a caller bounds one call's work by answering false and resuming past the
      *      last key.
      *  @param[in] stamp The stamp a reader is pinned at, which every run of one scan should share.
+     *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
      *  @retval contended_k A flush, a compaction or a merge rearranged the runs since they were counted, so the scan
      *      counts them again or walks in order.
      */
@@ -2867,7 +2872,7 @@ class basic_database {
 
     /**
      *  @brief Replaces the blob @p name with @p bytes, sealing it only once they are durable.
-     *  @param[inout] channel The channel the bytes are queued and flushed on, held by the calling thread.
+     *  @param[in,out] channel The channel the bytes are queued and flushed on, held by the calling thread.
      *  @param[in] name The bytes the blob is named by, which no other blob of this database holds.
      *  @param[in] kind What the blob is, which is how a later mount enumerates it.
      *  @param[in] bytes The whole image, which must fit in one block of @p channel.

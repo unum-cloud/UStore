@@ -36,6 +36,10 @@
 //! database.head().graph_remove_edges(follows, found.edges(), Durability::Buffered)?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
+//!
+//! File: rust/graph.rs
+//! Author: Ash Vardanian
+//! Date: September 18, 2026
 
 use std::ffi::{c_char, c_void};
 use std::fmt;

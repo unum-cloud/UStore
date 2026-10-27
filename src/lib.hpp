@@ -5,14 +5,16 @@
  *  @brief The router every exported call of the C ABI goes through, to the engine behind its database or transaction
  *      handle, shared by the one source per public header.
  *
- *  Each engine defines only its own `ustore_database_init_*`, `ustore_database_open_*` and `ustore_database_view_*`,
- *  which stamp every handle they hand out with its @c engine_t, so one library holds every engine it was built with
- *  and a program links only those it opens. The opens of an engine the build lacks are defined in `src/db.cpp` and
- *  refuse, so every program links against every build, and every other one names its engine's open as the template
- *  argument of @c route_init, which routes it as any call. Every call of the table is `noexcept`, so nothing here
- *  catches. The router claims the arena and the transaction of a call, refuses a change to a database opened
- *  read-only, then runs the call on the calling thread, blocking on its executor, or copies it into the executor's
- *  deferred table, and finishes its outcome only after the engine returns.
+ *  Each engine defines only its own @c ustore_database_init_*, @c ustore_database_open_* and
+ *  @c ustore_database_view_*, which stamp every handle they hand out with its @c engine_t, so one
+ *  library holds every engine it was built with and a program links only those it opens. The opens
+ *  of an engine the build lacks are defined in <tt>src/db.cpp</tt> and refuse, so every program
+ *  links against every build, and every other one names its engine's open as the template argument
+ *  of @c route_init, which routes it as any call. Every call of the table is @c noexcept, so
+ *  nothing here catches. The router claims the arena and the transaction of a call, refuses a
+ *  change to a database opened read-only, then runs the call on the calling thread, blocking on its
+ *  executor, or copies it into the executor's deferred table, and finishes its outcome only after
+ *  the engine returns.
  *
  *  A call keeps whatever it needs only while it runs in a scratch, so its arena holds only its outputs. Each pool
  *  thread of an executor and its blocking caller keep one scratch, rewound before every call and kept at its
@@ -83,7 +85,7 @@ struct cursor_t {
     /** Whether a pull fills the cursor, so a second pull naming it finds it contended. */
     claim_t claim = claim_t::free_k;
 
-    /** Deferred pulls naming the cursor that are not final, through `std::atomic_ref`. */
+    /** Deferred pulls naming the cursor that are not final, through @c std::atomic_ref. */
     std::uint32_t deferred_calls = 0;
 
     /** Where the walk's match was compiled once, freed with the cursor. */
@@ -143,9 +145,10 @@ enum_type_ value_in(enumerator_spelling<enum_type_> const (&names)[count_], usto
 
 #pragma region CPU Classes
 
-/** The CPU families UStore ships variants for, named as USearch names them. Each class bundles the wait instruction
- *  and the atomics its silicon generation guarantees; the engines inline no compute kit, so only a class whose waiter
- *  or atomic reference differs from its parent's carries a variant. */
+/** The CPU families UStore ships variants for, named as USearch names them. Each class bundles the
+ *  wait instruction and the atomics its silicon generation guarantees; the engines inline no
+ *  compute kit, so only a class whose waiter or atomic reference differs from its parent's carries
+ *  a variant. */
 enum class cpu_class_t : std::uint32_t {
     unknown_k = 0,
 
@@ -155,8 +158,8 @@ enum class cpu_class_t : std::uint32_t {
     /** Haswell-class x86, and every x86-64 core this engine runs on: @c PAUSE between attempts. */
     intel_haswell_k,
 
-    /** Sierra Forest-class x86 - the E-core Xeons, and Diamond Rapids after them: @c TPAUSE waits and
-     *  @c CMPCCXADD conditional adds. */
+    /** Sierra Forest-class x86 - the E-core Xeons, and Diamond Rapids after them: @c TPAUSE waits
+     *  and @c CMPCCXADD conditional adds. */
     intel_sierra_k,
 
     /** Graviton2-class Arm - Neoverse N1: @c YIELD between attempts. */
@@ -169,8 +172,8 @@ enum class cpu_class_t : std::uint32_t {
     aws_g5_k,
 };
 
-/** The class a refused rung degrades to - the next one down its own lineage, which is the class a variant must be
- *  distinct from to earn instantiation. */
+/** The class a refused rung degrades to - the next one down its own lineage, which is the class a
+ *  variant must be distinct from to earn instantiation. */
 constexpr cpu_class_t parent_class_of(cpu_class_t cpu_class) noexcept {
     switch (cpu_class) {
     case cpu_class_t::intel_sierra_k: return cpu_class_t::intel_haswell_k;
@@ -180,9 +183,9 @@ constexpr cpu_class_t parent_class_of(cpu_class_t cpu_class) noexcept {
     }
 }
 
-/** The wait instruction one CPU class pairs: x86 spins @c PAUSE, the WAITPKG Xeons arm @c TPAUSE, Arm spins
- *  @c YIELD and the Armv8.7 classes arm @c WFET, everything else yields - as does any class whose
- *  @c FORKUNION_TARGET_<BIT> is off in the probe list. */
+/** The wait instruction one CPU class pairs: x86 spins @c PAUSE, the WAITPKG Xeons arm @c TPAUSE,
+ *  Arm spins @c YIELD and the Armv8.7 classes arm @c WFET, everything else yields - as does any
+ *  class whose @c FORKUNION_TARGET_<BIT> is off in the probe list. */
 template <cpu_class_t cpu_class_>
 struct waiter_for_cpu_class {
     using type = fu::standard_yield_t;
@@ -220,9 +223,10 @@ struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
 template <cpu_class_t cpu_class_>
 using waiter_of = typename waiter_for_cpu_class<cpu_class_>::type;
 
-/** The atomic reference one CPU class pairs: single-instruction LSE read-modify-writes under RCpc acquiring loads on
- *  the Armv8.3+ classes and conditional adds on the CMPCCXADD Xeons - the floors, the older classes, and any class
- *  whose @c FORKUNION_TARGET_<BIT> is off in the probe list take the standard one. */
+/** The atomic reference one CPU class pairs: single-instruction LSE read-modify-writes under RCpc
+ *  acquiring loads on the Armv8.3+ classes and conditional adds on the CMPCCXADD Xeons - the
+ *  floors, the older classes, and any class whose @c FORKUNION_TARGET_<BIT> is off in the probe
+ *  list take the standard one. */
 template <cpu_class_t cpu_class_>
 struct atomic_ref_for_cpu_class {
     template <typename value_type_>
@@ -263,13 +267,13 @@ struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
 template <cpu_class_t cpu_class_, typename value_type_>
 using atomic_ref_of = typename atomic_ref_for_cpu_class<cpu_class_>::template type<value_type_>;
 
-/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause: the runtime confirms nothing
- *  about them. */
+/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause: the runtime
+ *  confirms nothing about them. */
 inline constexpr fu::capabilities_t baseline_hints_k = fu::capability_x86_pause_k | fu::capability_arm64_yield_k |
                                                        fu::capability_risc5_pause_k;
 
-/** Lowers one CPU class onto ForkUnion's mask - the bits the runtime must confirm before the class's waiter and
- *  atomic reference are trusted, read off the two types themselves. */
+/** Lowers one CPU class onto ForkUnion's mask - the bits the runtime must confirm before the
+ *  class's waiter and atomic reference are trusted, read off the two types themselves. */
 template <cpu_class_t cpu_class_>
 constexpr fu::capabilities_t forkunion_capabilities_of() noexcept {
     constexpr fu::capabilities_t waits_k = waiter_of<cpu_class_>::capability_k;
@@ -277,8 +281,8 @@ constexpr fu::capabilities_t forkunion_capabilities_of() noexcept {
     return static_cast<fu::capabilities_t>((waits_k | atomics_k) & ~baseline_hints_k);
 }
 
-/** Whether the build compiled the variants of @p cpu_class, as CMake decided and told every unit through
- *  @c USTORE_TARGET_<CLASS>; a ladder never picks a class without one. */
+/** Whether the build compiled the variants of @p cpu_class, as CMake decided and told every unit
+ *  through @c USTORE_TARGET_<CLASS>; a ladder never picks a class without one. */
 constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
     switch (cpu_class) {
     case cpu_class_t::serial_k: return true;
@@ -301,8 +305,8 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
     }
 }
 
-/** Whether one compiled class is distinct from the class it degrades to: another waiter or another atomic reference,
- *  the one fact justifying its variant. */
+/** Whether one compiled class is distinct from the class it degrades to: another waiter or another
+ *  atomic reference, the one fact justifying its variant. */
 template <cpu_class_t cpu_class_>
 consteval bool rung_advances() noexcept {
     constexpr cpu_class_t parent_k = parent_class_of(cpu_class_);
@@ -350,7 +354,7 @@ inline sz_kernel_sort_order_t stringzilla_sort_order() noexcept {
 
 #pragma endregion CPU Classes
 
-/** The tag `ustore_transaction_view` and `ustore_snapshot_view` set in the low bits of a handle. */
+/** The tag @c ustore_transaction_view and @c ustore_snapshot_view set in the low bits of a handle. */
 enum class view_tag_t : std::uintptr_t {
     head_k = 0,
     watching_k = 1,
@@ -399,8 +403,8 @@ inline ustore_transaction_t carried(ustore_transaction_t const* transaction) noe
 /** The snapshot a call reads, or null, which an output for a new snapshot never matches. */
 inline ustore_snapshot_t viewed(ustore_snapshot_t snapshot) noexcept { return snapshot; }
 
-/** Decodes what @p arguments read through into @p view, answering false for a view neither view constructor made. A
- *  pull reads through the view its cursor opened with. */
+/** Decodes what @p arguments read through into @p view, answering false for a view neither view
+ *  constructor made. A pull reads through the view its cursor opened with. */
 template <typename arguments_type_>
 bool decode_call(arguments_type_ const& arguments, view_t& view) noexcept {
     if constexpr (requires { arguments.cursor->cursor.view; }) return decode_view(arguments.cursor->cursor.view, view);
@@ -441,8 +445,8 @@ inline void release_hold(ustore_database_t database) noexcept {
     delete database;
 }
 
-/** Drops one hold on @p parent, a transaction or a snapshot, if any, freeing it through its engine with the last,
- *  which gives back the hold it kept on its database. */
+/** Drops one hold on @p parent, a transaction or a snapshot, if any, freeing it through its engine
+ *  with the last, which gives back the hold it kept on its database. */
 template <typename handle_type_>
 void release_parent(handle_type_* parent) noexcept {
     if (!parent || !drop_hold(parent)) return;
@@ -458,8 +462,8 @@ void release_parent(handle_type_* parent) noexcept {
 template <typename type_, typename... types_>
 constexpr bool one_of_k = (std::is_same_v<type_, types_> || ...);
 
-/** Whether a call changes its database, which one opened read-only refuses: every call naming a transaction, as reads
- *  name views instead, and the calls on whole collections. */
+/** Whether a call changes its database, which one opened read-only refuses: every call naming a
+ *  transaction, as reads name views instead, and the calls on whole collections. */
 template <typename arguments_type_>
 constexpr bool changes_database_k = requires(arguments_type_ const& arguments) { arguments.transaction; } ||
                                     one_of_k<arguments_type_, ustore_collection_create_t, ustore_collection_drop_t,
@@ -645,8 +649,9 @@ inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_scan_t const& 
 /** Strings an accessor writes per block, so the indices it reads fit on the stack of the thread running the call. */
 constexpr std::size_t accessor_block_k = 64;
 
-/** Reads @p input for its engine into @p strings, refusing a layout no constant names and gathering into @p scratch
- *  the views an accessor writes, so the accessor runs on the thread running the call and never after it is final. */
+/** Reads @p input for its engine into @p strings, refusing a layout no constant names and gathering
+ *  into @p scratch the views an accessor writes, so the accessor runs on the thread running the
+ *  call and never after it is final. */
 inline status_t gather_strings(ragged_input_t const& input, ustore_arena_t scratch, strings_arg_t& strings) noexcept {
     ustore_strings_view_t const& view = input.view;
     strings.view = view;
@@ -702,8 +707,9 @@ status_t pull(engine_t const& engine, ustore_pages_cursor_next_t const& argument
 status_t pull(engine_t const& engine, ustore_graph_vertices_cursor_next_t const& arguments,
               ustore_graph_vertices_cursor_handle_t& cursor, view_t const& view) noexcept;
 
-/** Pulls the next page of the walk @p arguments name through @p engine, as the blobs pull does, resuming past the last
- *  string at that string followed by a zero byte, the smallest string after it. */
+/** Pulls the next page of the walk @p arguments name through @p engine, as the blobs pull does,
+ *  resuming past the last string at that string followed by a zero byte, the smallest string after
+ *  it. */
 status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& arguments,
               ustore_strings_cursor_handle_t& cursor, view_t const& view) noexcept;
 
@@ -719,8 +725,8 @@ auto host_engine_of(cursor_type_& cursor) noexcept {
     return std::get_if<0>(&cursor.engine);
 }
 
-/** The keys @p cursor walks, pulled into @p survivors through @p engine as one page of @p wanted, advancing
- *  @p resume past them, for every pull over keys. */
+/** The keys @p cursor walks, pulled into @p survivors through @p engine as one page of @p wanted,
+ *  advancing @p resume past them, for every pull over keys. */
 template <typename scan_type_, typename cursor_type_>
 status_t list_cursor_keys(engine_t const& engine, ustore_database_t database, cursor_type_& cursor, std::size_t wanted,
                           ustore_arena_t arena, view_t const& view, keyed_survivors_t& survivors,
@@ -770,8 +776,8 @@ ustore_transaction_t transaction_of(arguments_type_ const& arguments) noexcept {
     return decode_call(arguments, view) ? view.transaction : nullptr;
 }
 
-/** The deferred count of the cursor @p arguments pull, or of the transaction or snapshot they read through, or null
- *  for none, as the cursor's holds keep what it reads through alive. */
+/** The deferred count of the cursor @p arguments pull, or of the transaction or snapshot they read
+ *  through, or null for none, as the cursor's holds keep what it reads through alive. */
 template <typename arguments_type_>
 std::uint32_t* named_calls_of(arguments_type_ const& arguments) noexcept {
     if constexpr (requires { arguments.cursor; }) return &arguments.cursor->cursor.deferred_calls;
@@ -783,8 +789,8 @@ std::uint32_t* named_calls_of(arguments_type_ const& arguments) noexcept {
     }
 }
 
-/** The deferred counts of the database, the transaction, snapshot or cursor, and the arena @p arguments name, each
- *  null when absent. */
+/** The deferred counts of the database, the transaction, snapshot or cursor, and the arena
+ *  @p arguments name, each null when absent. */
 template <typename arguments_type_>
 std::array<std::uint32_t*, 3> deferred_counts_of(arguments_type_ const& arguments) noexcept {
     ustore_arena_t const arena = arena_of(arguments);
@@ -815,8 +821,8 @@ inline home_t home_of(ustore_executor_handle_t const* executor) noexcept {
                                                                                  : home_t::host_k;
 }
 
-/** Whether @p arena lives where calls on @p executor compute: host pages for host executors, the device of a VRAM
- *  executor for its calls. */
+/** Whether @p arena lives where calls on @p executor compute: host pages for host executors, the
+ *  device of a VRAM executor for its calls. */
 inline bool arena_serves(ustore_executor_handle_t const* executor, ustore_arena_t arena) noexcept {
     cuda_executor_t const* const device = executor ? std::get_if<cuda_executor_t>(&executor->device) : nullptr;
     if (!device) return std::holds_alternative<host_blocks_t>(arena->memory);
@@ -824,9 +830,9 @@ inline bool arena_serves(ustore_executor_handle_t const* executor, ustore_arena_
     return blocks && blocks->device == device->device();
 }
 
-/** Claims the arena, the cursor and the transaction of @p arguments, holding none when one serves another call, and
- *  refusing a call that needs an arena or a cursor and names none, or whose arena lives where its executor does not
- *  compute. */
+/** Claims the arena, the cursor and the transaction of @p arguments, holding none when one serves
+ *  another call, and refusing a call that needs an arena or a cursor and names none, or whose arena
+ *  lives where its executor does not compute. */
 template <typename arguments_type_>
 status_t take_claims(arguments_type_ const& arguments) noexcept {
     if constexpr (requires { arguments.cursor; })
@@ -1202,8 +1208,9 @@ struct verb_slot<ustore_pages_scan_t> {
 
 #pragma region Serving
 
-/** Hands @p visitor the device executor of @p view, as `visitor(device)` for a VRAM executor and `visitor()` for
- *  every host one, so a verb takes its home's executor as its last argument. */
+/** Hands @p visitor the device executor of @p view, as <tt>visitor(device)</tt> for a VRAM executor
+ *  and <tt>visitor()</tt> for every host one, so a verb takes its home's executor as its last
+ *  argument. */
 template <typename visitor_type_>
 status_t visit_home(view_t const& view, visitor_type_&& visitor) noexcept {
     ustore_executor_t const executor = view.executor;
@@ -1212,8 +1219,8 @@ status_t visit_home(view_t const& view, visitor_type_&& visitor) noexcept {
     return visitor();
 }
 
-/** Calls @p verb on @p arguments with every ragged input gathered on the host into the scratch @p view works in, then
- *  @p view and the executor of the verb's home. */
+/** Calls @p verb on @p arguments with every ragged input gathered on the host into the scratch
+ *  @p view works in, then @p view and the executor of the verb's home. */
 template <typename verb_type_, typename arguments_type_, typename... executors_types_>
 status_t call_staged(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
                      executors_types_&... executor) noexcept {
@@ -1229,9 +1236,10 @@ status_t call_staged(verb_type_ verb, arguments_type_ const& arguments, view_t c
     else return verb(arguments, view, executor...);
 }
 
-/** Serves @p arguments on the engine of their database, in the scratch and on the executor thread @p runner names,
- *  through the verb table of its executor's home, refusing what no engine may see, and handing every
- *  ragged input to the engine readable in any layout. A pull serves through its cursor. */
+/** Serves @p arguments on the engine of their database, in the scratch and on the executor thread
+ *  @p runner names, through the verb table of its executor's home, refusing what no engine may see,
+ *  and handing every ragged input to the engine readable in any layout. A pull serves through its
+ *  cursor. */
 template <typename arguments_type_>
 status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept {
     ustore_database_t const database = database_of(arguments);
@@ -1357,8 +1365,8 @@ inline bool runs_here(ustore_executor_handle_t& executor) noexcept {
     return false;
 }
 
-/** Runs @p body on the calling thread as runner @p thread_index of @p executor, over its scratch, recorded there while
- *  it does. */
+/** Runs @p body on the calling thread as runner @p thread_index of @p executor, over its scratch,
+ *  recorded there while it does. */
 template <typename body_type_>
 void run_as(ustore_executor_handle_t& executor, std::size_t thread_index, body_type_&& body) noexcept {
     runner_t& runner = executor.runners[thread_index];
@@ -1373,8 +1381,9 @@ inline pool_view_t view_of(std::variant<executor_t, lent_pool_t> const& pool) no
     return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
 }
 
-/** Serves @p arguments in the scratch and on the thread @p runner names and releases their claims, leaving the
- *  outputs of a failed call null or zero, and answers the status their outcome is to finish with. */
+/** Serves @p arguments in the scratch and on the thread @p runner names and releases their claims,
+ *  leaving the outputs of a failed call null or zero, and answers the status their outcome is to
+ *  finish with. */
 template <typename arguments_type_>
 status_t serve_and_release(arguments_type_& arguments, view_t const& runner) noexcept {
     status_t const status = serve(arguments, runner);
@@ -1396,9 +1405,9 @@ void run(call_type_* call, view_t const& runner) noexcept {
     finish(*call->outcome, serve_(*call, runner));
 }
 
-/** Runs @p call on the calling thread over a scratch made for it alone, as a call without an executor keeping scratch
- *  needs: its first page lies on the stack, so a small call allocates nothing, and the blocks it grows into are freed
- *  once the call is final. */
+/** Runs @p call on the calling thread over a scratch made for it alone, as a call without an
+ *  executor keeping scratch needs: its first page lies on the stack, so a small call allocates
+ *  nothing, and the blocks it grows into are freed once the call is final. */
 template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void run_alone(call_type_* call) noexcept {
     alignas(arena_alignment_k) byte_t page[arena_page_bytes_k];
@@ -1408,8 +1417,8 @@ void run_alone(call_type_* call) noexcept {
     arena_free_blocks(scratch, first);
 }
 
-/** Serves the copy @p erased holds on the thread @p runner names into @p result, leaving its outcome and its deferred
- *  counts to the driver, which frees the copy's table position first. */
+/** Serves the copy @p erased holds on the thread @p runner names into @p result, leaving its
+ *  outcome and its deferred counts to the driver, which frees the copy's table position first. */
 template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void run_deferred(void* erased, deferred_result_t& result, view_t const& runner) noexcept {
     call_type_& call = *std::get_if<call_type_>(static_cast<deferred_arguments_t*>(erased));
@@ -1475,8 +1484,8 @@ void dispatch(call_type_* call) noexcept {
     submit<call_type_, serve_>(*executor, call);
 }
 
-/** Leaves the outputs of @p arguments null or zero and claims what they hold, then dispatches them to the verb their
- *  type names. */
+/** Leaves the outputs of @p arguments null or zero and claims what they hold, then dispatches them
+ *  to the verb their type names. */
 template <typename arguments_type_>
 void route(arguments_type_* arguments) noexcept {
     if constexpr (requires { clear_outputs(*arguments); }) clear_outputs(*arguments);
@@ -1503,8 +1512,8 @@ void route_init(arguments_type_* arguments) noexcept {
 
 #pragma region Cursor Lifetimes
 
-/** Opens the engine of a walk over @p scan_type_ at @p home_, compiling what @p arguments match once into
- *  @p compiled. */
+/** Opens the engine of a walk over @p scan_type_ at @p home_, compiling what @p arguments match
+ *  once into @p compiled. */
 template <home_t home_, template <home_t> typename verbs_type_, typename scan_type_, typename arguments_type_>
 expected<cursor_engines<verbs_type_>> open_cursor_home(engine_t const& engine, arguments_type_ const& arguments,
                                                        ustore_arena_t compiled) noexcept {
@@ -1528,9 +1537,10 @@ expected<cursor_engines<verbs_type_>> open_cursor_engine(engine_t const& engine,
     return open_cursor_home<home_t::host_k, verbs_type_, scan_type_>(engine, arguments, compiled);
 }
 
-/** Opens a cursor of @p cursor_type_ over the walk @p arguments describe, holding their database and the transaction
- *  or snapshot their view reads through, at their executor's home, and refusing a database whose engine lacks the verb
- *  serving @p scan_type_ there, a match that does not compile, or a view of another database. */
+/** Opens a cursor of @p cursor_type_ over the walk @p arguments describe, holding their database
+ *  and the transaction or snapshot their view reads through, at their executor's home, and refusing
+ *  a database whose engine lacks the verb serving @p scan_type_ there, a match that does not
+ *  compile, or a view of another database. */
 template <typename cursor_type_, template <home_t> typename verbs_type_, typename scan_type_, typename arguments_type_>
 expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noexcept {
     if (!arguments.cursor)
@@ -1584,8 +1594,8 @@ void free_cursor(cursor_type_* cursor) noexcept {
 
 using namespace unum::ustore;
 
-/** What @c ustore_blobs_cursor_t points to: a walk over the keys of one blobs collection, resumed at the key after
- *  the last one it handed out. */
+/** What @c ustore_blobs_cursor_t points to: a walk over the keys of one blobs collection, resumed
+ *  at the key after the last one it handed out. */
 struct ustore_blobs_cursor_handle_t {
     cursor_t cursor;
 
@@ -1596,8 +1606,8 @@ struct ustore_blobs_cursor_handle_t {
     cursor_engines<blobs_verbs> engine;
 };
 
-/** What @c ustore_docs_cursor_t points to: a walk over the keys of one documents collection, resumed as the blobs
- *  walk is. */
+/** What @c ustore_docs_cursor_t points to: a walk over the keys of one documents collection,
+ *  resumed as the blobs walk is. */
 struct ustore_docs_cursor_handle_t {
     cursor_t cursor;
 
@@ -1608,8 +1618,8 @@ struct ustore_docs_cursor_handle_t {
     cursor_engines<docs_verbs> engine;
 };
 
-/** What @c ustore_pages_cursor_t points to: a walk over the keys of one pages collection, resumed as the blobs walk
- *  is. */
+/** What @c ustore_pages_cursor_t points to: a walk over the keys of one pages collection, resumed
+ *  as the blobs walk is. */
 struct ustore_pages_cursor_handle_t {
     cursor_t cursor;
 
@@ -1620,8 +1630,8 @@ struct ustore_pages_cursor_handle_t {
     cursor_engines<pages_verbs> engine;
 };
 
-/** What @c ustore_graph_vertices_cursor_t points to: a walk over the vertices of one graph collection, resumed as the
- *  blobs walk is. */
+/** What @c ustore_graph_vertices_cursor_t points to: a walk over the vertices of one graph
+ *  collection, resumed as the blobs walk is. */
 struct ustore_graph_vertices_cursor_handle_t {
     cursor_t cursor;
 
@@ -1632,8 +1642,8 @@ struct ustore_graph_vertices_cursor_handle_t {
     cursor_engines<graph_verbs> engine;
 };
 
-/** What @c ustore_strings_cursor_t points to: a walk over the strings of one prefix, resumed at the string after the
- *  last one it handed out. */
+/** What @c ustore_strings_cursor_t points to: a walk over the strings of one prefix, resumed at the
+ *  string after the last one it handed out. */
 struct ustore_strings_cursor_handle_t {
 
     /** What the walk holds and reads. */

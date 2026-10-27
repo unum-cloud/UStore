@@ -67,6 +67,22 @@ typedef struct ustore_blobs_write_t {
 /**
  *  @brief Writes a batch of values.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
+ *    table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_invalid_argument_k The @c collections, @c keys or @c values are missing, the
+ *    values come in an unknown layout, the @c transaction belongs to another engine or is staged,
+ *    the @c durability or @c watch is unknown, a flushed write names a @c transaction,
+ *    @c ustore_watch_none_k comes without one, or a collection holds another modality.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
+ *    transaction holds a key.
+ *  - @c ustore_status_malformed_k A key or value falls outside what its NVMe collection admits.
+ *  - @c ustore_status_capacity_exhausted_k The values outgrow the NVMe transaction's buffer.
  */
 USTORE_EXPORT void ustore_blobs_write(ustore_blobs_write_t* arguments);
 
@@ -108,6 +124,22 @@ typedef struct ustore_blobs_remove_t {
 /**
  *  @brief Removes a batch of keys with their values.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
+ *    table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_invalid_argument_k The @c collections or @c keys are missing, the
+ *    @c transaction belongs to another engine or is staged, the @c durability or @c watch is
+ *    unknown, a flushed remove names a @c transaction, @c ustore_watch_none_k comes without one, or
+ *    a collection holds another modality.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
+ *    transaction holds a key.
+ *  - @c ustore_status_malformed_k A key falls outside what its NVMe collection admits.
+ *  - @c ustore_status_capacity_exhausted_k The removes outgrow the NVMe transaction's buffer.
  */
 USTORE_EXPORT void ustore_blobs_remove(ustore_blobs_remove_t* arguments);
 
@@ -160,6 +192,20 @@ typedef struct ustore_blobs_read_t {
 /**
  *  @brief Reads a batch of values.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or @c keys are missing, the
+ *    @c view was made by neither view constructor or belongs to another engine, a watching read goes
+ *    through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, a callback blocks on the executor running
+ *    it, or an NVMe value keeps changing size across reads.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
+ *    call yet.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_blobs_read(ustore_blobs_read_t* arguments);
 
@@ -232,6 +278,22 @@ typedef struct ustore_blobs_scan_t {
 /**
  *  @brief Scans a batch of key ranges.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
+ *    @c mode, a pattern kind, a case sensitivity or a predicate cost is unknown, the @c patterns do
+ *    not compile, the @c view was made by neither view constructor or belongs to another engine, a
+ *    watching scan goes through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, or a device
+ *    executor is given a predicate.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, a callback blocks on the executor running
+ *    it, or an NVMe value keeps changing size across reads.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
+ *    call yet.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_blobs_scan(ustore_blobs_scan_t* arguments);
 
@@ -282,6 +344,14 @@ typedef struct ustore_blobs_cursor_init_t {
 /**
  *  @brief Opens a walk over the keys of one collection, reading nothing until its first pull.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made by
+ *    neither view constructor or reads another database, a pattern kind, a case sensitivity or a
+ *    predicate cost is unknown, or the @c patterns do not compile.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k A device @c executor is given @c patterns.
+ *  - @c ustore_status_device_k A device @c executor is given a predicate.
  */
 USTORE_EXPORT void ustore_blobs_cursor_init(ustore_blobs_cursor_init_t* arguments);
 
@@ -331,13 +401,27 @@ typedef struct ustore_blobs_cursor_next_t {
 /**
  *  @brief Pulls the next page of a walk, and the values of its keys when asked.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output is
+ *    @c NULL, the cursor walks another database, a watching pull goes through a staged
+ *    transaction, or the collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, or a cursor opened
+ *    for a device is pulled on host threads.
+ *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
+ *    another call, the executor's deferred table is full, a callback blocks on the executor running
+ *    it, or an NVMe value keeps changing size across reads.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine walks yet.
+ *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_blobs_cursor_next(ustore_blobs_cursor_next_t* arguments);
 
 /**
  *  @brief Waits until every deferred call naming the cursor finishes, then frees it, giving back the holds it kept on
  *      its database and on the transaction or snapshot it reads through.
- *  @param[inout] cursor The cursor to be freed; @c NULL is safe.
+ *  @param[in,out] cursor The cursor to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_blobs_cursor_free(ustore_blobs_cursor_t cursor);
 
@@ -383,6 +467,20 @@ typedef struct ustore_blobs_sample_t {
 /**
  *  @brief Samples keys from a batch of collections.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
+ *    @c view was made by neither view constructor or belongs to another engine, a watching sample
+ *    goes through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, a callback blocks on the executor running
+ *    it, or an NVMe value keeps changing size across reads.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
+ *    call yet.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_blobs_sample(ustore_blobs_sample_t* arguments);
 
@@ -443,6 +541,20 @@ typedef struct ustore_blobs_measure_t {
 /**
  *  @brief Estimates the entries and the space inside a batch of key ranges.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena or the @c collections are missing, the
+ *    @c view was made by neither view constructor or belongs to another engine, a watching measure
+ *    goes through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
+ *    call yet.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_blobs_measure(ustore_blobs_measure_t* arguments);
 

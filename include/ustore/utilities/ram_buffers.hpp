@@ -68,7 +68,7 @@ struct ustore_arena_handle_t {
     /** Whether a call fills the arena, so a second call naming it finds it contended. */
     claim_t claim = claim_t::free_k;
 
-    /** Deferred calls naming the arena that are not final, through `std::atomic_ref`. */
+    /** Deferred calls naming the arena that are not final, through @c std::atomic_ref. */
     std::uint32_t deferred_calls = 0;
 
     /** Host pages for the calls of a host executor, or one device's memory for those of a VRAM executor. */

@@ -9,7 +9,7 @@
  *  A text value views the tail of its @c argv entry, so it is null-terminated; list items are not.
  *  A value that does not parse prints @c --flag="value" @c does @c not @c parse, @c expected @c <grammar>.
  *
- *  @code
+ *  @code{.cpp}
  *  bytes_t memory_limit {64 << 20};
  *  std::string_view directory;
  *  std::array<std::string_view, 2> const formats {"ndjson", "csv"};

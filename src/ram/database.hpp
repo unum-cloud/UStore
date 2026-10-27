@@ -61,8 +61,8 @@ using namespace unum::ustore::utilities;
 
 #pragma region Stores
 
-/** The store of one collection at @p isolation_, whose partition locks own their words through the atomic reference of
- *  @p cpu_class_ and wait through its waiter. */
+/** The store of one collection at @p isolation_, whose partition locks own their words through the
+ *  atomic reference of @p cpu_class_ and wait through its waiter. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 using collection_store_of =
     collection_store<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
@@ -134,9 +134,10 @@ inline bool names_directory(char const* path) noexcept {
 
 #pragma region Handles
 
-/** The RAM engine of one CPU class and isolation level, whose stores own their words through the class's atomic
- *  reference and wait through its waiter. Each table is defined beside the calls it names, so the explicit
- *  instantiation in `src/ram/variants_<class>.cpp` compiles every call of the class there. */
+/** The RAM engine of one CPU class and isolation level, whose stores own their words through the
+ *  class's atomic reference and wait through its waiter. Each table is defined beside the calls it
+ *  names, so the explicit instantiation in <tt>src/ram/variants_&lt;class&gt;.cpp</tt> compiles
+ *  every call of the class there. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct ram_variant {
 
@@ -161,8 +162,8 @@ struct ram_variant {
     /** The verbs of this class's pages collections. */
     static pages_verbs<home_t::host_k> const pages_verbs_k;
 
-    /** The table every handle of a database of this class and isolation is stamped with, so the router refuses a
-     *  handle of another. */
+    /** The table every handle of a database of this class and isolation is stamped with, so the
+     *  router refuses a handle of another. */
     static engine_t const engine_k;
 
     /** Opens a database of this class and isolation into @p database, persisting in @p directory unless it is empty. */
@@ -182,8 +183,9 @@ struct database_state {
     /** The names system collection: every collection's name mapped onto its UUID. */
     keys_by_string_store_of<cpu_class_, isolation_> collection_ids_by_name {order};
 
-    /** Stores the collections system collection no longer lists, linked through @c collection_store::next_retired
-     *  and freed once no reader holds a stamp older than the one they were retired at. */
+    /** Stores the collections system collection no longer lists, linked through
+     *  @c collection_store::next_retired and freed once no reader holds a stamp older than the one
+     *  they were retired at. */
     collection_store_of<cpu_class_, isolation_>* retired {nullptr};
 
     /** Snapshots handed out and not yet freed, which a reset refuses to run beside. */
@@ -213,8 +215,8 @@ struct transaction_state {
         : state(owner), transaction(std::move(opened)) {}
 };
 
-/** What a snapshot holds, behind its snapshot handle of the C ABI, whose claim pins the stamp every read through it
- *  answers at until it is freed. */
+/** What a snapshot holds, behind its snapshot handle of the C ABI, whose claim pins the stamp every
+ *  read through it answers at until it is freed. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct snapshot_state {
 
@@ -231,8 +233,8 @@ struct snapshot_state {
 
 #pragma region Retirement
 
-/** Retires @p store at @p commit_stamp, which the collections system collection stopped listing it at, to be freed
- *  once no reader holds an older stamp. */
+/** Retires @p store at @p commit_stamp, which the collections system collection stopped listing it
+ *  at, to be freed once no reader holds an older stamp. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 void retire(database_state<cpu_class_, isolation_>& state, collection_store_of<cpu_class_, isolation_>* store,
             generation_t commit_stamp) noexcept {
@@ -314,8 +316,8 @@ struct reader_view {
     }
 };
 
-/** Reads through the part a transaction joined a store with, watching what it hands out when a snapshot-isolated
- *  call asks, as a strictly serializable one records every read already. */
+/** Reads through the part a transaction joined a store with, watching what it hands out when a
+ *  snapshot-isolated call asks, as a strictly serializable one records every read already. */
 template <typename transaction_type_>
 struct transaction_view {
 
@@ -359,8 +361,8 @@ struct transaction_view {
     }
 };
 
-/** The stores a call outside any transaction reads, each at the one stamp a claim of the call or of a snapshot
- *  pins. */
+/** The stores a call outside any transaction reads, each at the one stamp a claim of the call or of
+ *  a snapshot pins. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct reader_source {
 
@@ -429,8 +431,8 @@ struct transaction_source {
     }
 };
 
-/** Whether reads of a transaction at @p isolation_ watch what they hand out when a call asks for @p watch, where a
- *  strictly serializable one records every read already. */
+/** Whether reads of a transaction at @p isolation_ watch what they hand out when a call asks for
+ *  @p watch, where a strictly serializable one records every read already. */
 template <isolation_t isolation_>
 constexpr ustore_watch_t watches_reads(ustore_watch_t watch) noexcept {
     return isolation_ == isolation_t::snapshot_k && watch == ustore_watch_keys_k ? ustore_watch_keys_k
@@ -499,9 +501,10 @@ store_status_t resolve(source_type_& source, ustore_collection_id_t const& colle
 /**
  *  @brief Hands @p action every run of tasks naming one collection, with the store of that collection.
  *
- *  Resolves each run once through @p source, refusing a collection the collections system collection does not list,
- *  and stops at the first failure @p action answers or reports. @p action is invoked as `action(entries, first, end)`
- *  with the concrete store and the tasks [ @p first, @p end ) it serves.
+ *  Resolves each run once through @p source, refusing a collection the collections system
+ *  collection does not list, and stops at the first failure @p action answers or reports. @p action
+ *  is invoked as <tt>action(entries, first, end)</tt> with the concrete store and the tasks [
+ *  @p first, @p end ) it serves.
  */
 template <typename source_type_, typename action_type_>
 store_status_t for_each_run(source_type_& source, strided_iterator<ustore_collection_id_t const> collections,
@@ -537,8 +540,8 @@ inline store_status_t refused_modality(status_t& outcome) noexcept {
     return store_status_t::invalid_argument_k;
 }
 
-/** The resolver of this engine at @p isolation_, which every checked verb and every layer over blobs runs first,
- *  reading the collections system collection as @p view sees it. */
+/** The resolver of this engine at @p isolation_, which every checked verb and every layer over
+ *  blobs runs first, reading the collections system collection as @p view sees it. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t resolve_modality(ustore_database_t database, ustore_collections_view_t collections, ustore_size_t count,
                           ustore_modality_t modality, view_t const& view) noexcept {
@@ -611,8 +614,8 @@ store_status_t read_keys(view_type_ const& view, place_batch_t const& places, st
     return store_status_t::success_k;
 }
 
-/** Watches the entries of the keys @p outputs hold from @p first on, which only a watching view records, once the
- *  walk that found them let go of its partitions. */
+/** Watches the entries of the keys @p outputs hold from @p first on, which only a watching view
+ *  records, once the walk that found them let go of its partitions. */
 template <typename entry_type_, typename view_type_>
 store_status_t watch_keys(view_type_ const& view, scan_outputs_t& outputs, std::size_t first) noexcept {
     if (!view.watches()) return store_status_t::success_k;
@@ -623,9 +626,10 @@ store_status_t watch_keys(view_type_ const& view, scan_outputs_t& outputs, std::
     return store_status_t::success_k;
 }
 
-/** Appends up to the limit of @p scan keys of a collection of @p entry_type_, from its start key on, halting with
- *  @p outcome when the scratch refuses. An unordered scan walks partition by partition where @p view offers it, and
- *  merges them otherwise, which is one order an unordered scan may take. */
+/** Appends up to the limit of @p scan keys of a collection of @p entry_type_, from its start key
+ *  on, halting with @p outcome when the scratch refuses. An unordered scan walks partition by
+ *  partition where @p view offers it, and merges them otherwise, which is one order an unordered
+ *  scan may take. */
 template <typename entry_type_, typename view_type_>
 store_status_t scan_window(view_type_ const& view, scan_task_t scan, ustore_scan_mode_t mode, scan_outputs_t& outputs,
                            status_t& outcome) noexcept {
@@ -664,8 +668,8 @@ struct sample_generator_t {
     }
 };
 
-/** Appends a uniform reservoir of up to the limit of @p sample keys of a collection of @p entry_type_, halting with
- *  @p outcome when the scratch refuses. */
+/** Appends a uniform reservoir of up to the limit of @p sample keys of a collection of
+ *  @p entry_type_, halting with @p outcome when the scratch refuses. */
 template <typename entry_type_, typename view_type_>
 store_status_t sample_window(view_type_ const& view, sample_task_t sample, sample_generator_t& generator,
                              scan_outputs_t& outputs, status_t& outcome) noexcept {
@@ -764,8 +768,8 @@ store_status_t scan_strings(view_type_ const& view, std::string_view prefix, std
 
 #pragma region Writes
 
-/** Stages @p content under @p key into @p transaction, which may be a store publishing it at once, as the blob, the
- *  document or the page an entry of @p entry_type_ holds. */
+/** Stages @p content under @p key into @p transaction, which may be a store publishing it at once,
+ *  as the blob, the document or the page an entry of @p entry_type_ holds. */
 template <typename entry_type_, typename transaction_type_>
 store_status_t stage_upsert(transaction_type_& transaction, ustore_key_t const& key, value_view_t content) noexcept {
     auto [copied, copy_blob_status] = copy_blob(content);
@@ -853,9 +857,9 @@ store_status_t commit_group(database_state<cpu_class_, isolation_>& state, stage
     return committed;
 }
 
-/** Stages @p stage_runs into the transaction @p view carries, or commits it as a transaction of its own and persists
- *  it when @p durability asks, for every call that writes. @p stage_runs is invoked as `stage_runs(source, outcome)`
- *  and may refuse the call through the outcome. */
+/** Stages @p stage_runs into the transaction @p view carries, or commits it as a transaction of its
+ *  own and persists it when @p durability asks, for every call that writes. @p stage_runs is
+ *  invoked as <tt>stage_runs(source, outcome)</tt> and may refuse the call through the outcome. */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename stage_runs_type_>
 status_t serve_write(database_state<cpu_class_, isolation_>& state, ustore_durability_t durability, view_t const& view,
                      stage_runs_type_&& stage_runs) noexcept {
@@ -875,8 +879,9 @@ status_t serve_write(database_state<cpu_class_, isolation_>& state, ustore_durab
     return {};
 }
 
-/** Hands @p stage every run of @p count tasks on a collection whose store holds @p entry_type_ through @p source, with
- *  the part of the transaction over that store, refusing a collection of any other modality. */
+/** Hands @p stage every run of @p count tasks on a collection whose store holds @p entry_type_
+ *  through @p source, with the part of the transaction over that store, refusing a collection of
+ *  any other modality. */
 template <typename entry_type_, typename source_type_, typename stage_type_>
 store_status_t stage_runs_of(source_type_& source, strided_iterator<ustore_collection_id_t const> collections,
                              std::size_t count, status_t& outcome, stage_type_&& stage) noexcept {
@@ -892,8 +897,8 @@ store_status_t stage_runs_of(source_type_& source, strided_iterator<ustore_colle
                         });
 }
 
-/** Removes the keys @p arguments name from collections whose stores hold @p entry_type_, committing a batch outside a
- *  transaction atomically, where a key already gone stays gone. */
+/** Removes the keys @p arguments name from collections whose stores hold @p entry_type_, committing
+ *  a batch outside a transaction atomically, where a key already gone stays gone. */
 template <typename entry_type_, cpu_class_t cpu_class_, isolation_t isolation_, typename arguments_type_>
 status_t remove_keys(database_state<cpu_class_, isolation_>& state, arguments_type_ const& arguments,
                      view_t const& view) noexcept {
@@ -913,8 +918,9 @@ status_t remove_keys(database_state<cpu_class_, isolation_>& state, arguments_ty
  *  @brief Serves a read-modify-write of documents or pages through @c serve_write, reading and writing in one
  *      transaction: the caller's, or one of the call's own, retried on conflicts.
  *
- *  @p modify is invoked as `modify(source, failure)` on every attempt and answers the status of the call, recording
- *  into `failure` the first failure of the stores, which a commit retries when it is a conflict.
+ *  @p modify is invoked as <tt>modify(source, failure)</tt> on every attempt and answers the status
+ *  of the call, recording into @c failure the first failure of the stores, which a commit retries
+ *  when it is a conflict.
  */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename modify_type_>
 status_t serve_read_modify_write(database_state<cpu_class_, isolation_>& state, ustore_durability_t durability,
@@ -965,8 +971,8 @@ store_status_t collect_collections(view_type_ const& view,
     return st::failed(walked) ? walked : appended;
 }
 
-/** The stores a change of the collections system collection installs and those it takes out, so its commit retires
- *  the latter and its failure frees the former. */
+/** The stores a change of the collections system collection installs and those it takes out, so its
+ *  commit retires the latter and its failure frees the former. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct collections_change {
 
@@ -997,8 +1003,9 @@ struct collections_change {
     }
 };
 
-/** Commits @p stage_change as one change of the collections system collection, retiring what it took out at its
- *  stamp or freeing what it installed, invoking @p stage_change as `stage_change(source, change)` on every attempt. */
+/** Commits @p stage_change as one change of the collections system collection, retiring what it
+ *  took out at its stamp or freeing what it installed, invoking @p stage_change as
+ *  <tt>stage_change(source, change)</tt> on every attempt. */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename stage_change_type_>
 store_status_t commit_collections_change(database_state<cpu_class_, isolation_>& state,
                                          stage_change_type_&& stage_change) noexcept {
@@ -1021,8 +1028,8 @@ store_status_t commit_collections_change(database_state<cpu_class_, isolation_>&
     return store_status_t::success_k;
 }
 
-/** Stages collection @p id holding @p modality under @p name in a store @p change installs, refusing a name another
- *  collection carries. */
+/** Stages collection @p id holding @p modality under @p name in a store @p change installs,
+ *  refusing a name another collection carries. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 store_status_t stage_collection(transaction_source<cpu_class_, isolation_>& source,
                                 collections_change<cpu_class_, isolation_>& change, ustore_collection_id_t id,
@@ -1127,8 +1134,8 @@ store_status_t stage_emptied_values(transaction_type_& transaction) noexcept {
     return store_status_t::success_k;
 }
 
-/** Stages emptying every value of @p collection, keeping its keys, which a graph holds none of, and refusing a strings
- *  collection, whose values are the keys its strings map onto. */
+/** Stages emptying every value of @p collection, keeping its keys, which a graph holds none of, and
+ *  refusing a strings collection, whose values are the keys its strings map onto. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 store_status_t stage_values_emptied(transaction_source<cpu_class_, isolation_>& source,
                                     ustore_collection_id_t collection, status_t& outcome) noexcept {
@@ -1263,8 +1270,8 @@ inline std::size_t saved_bytes(string_pair_t const& pair) noexcept {
 }
 inline std::size_t saved_bytes(half_edge_t const&) noexcept { return sizeof(half_edge_t); }
 
-/** Counts into @p count the entries @p store holds at @p read_stamp, and adds the bytes of their keys and values to
- *  @p bytes. */
+/** Counts into @p count the entries @p store holds at @p read_stamp, and adds the bytes of their
+ *  keys and values to @p bytes. */
 template <typename store_type_>
 store_status_t tally_entries(store_type_ const& store, generation_t read_stamp, std::uint64_t& count,
                              std::size_t& bytes) noexcept {
@@ -1275,8 +1282,9 @@ store_status_t tally_entries(store_type_ const& store, generation_t read_stamp, 
     });
 }
 
-/** Writes how many entries @p store holds at @p read_stamp, then every one of them, adding the bytes of their keys and
- *  values to @p bytes, and clearing @p written when any of it misses @p file. */
+/** Writes how many entries @p store holds at @p read_stamp, then every one of them, adding the
+ *  bytes of their keys and values to @p bytes, and clearing @p written when any of it misses
+ *  @p file. */
 template <typename store_type_>
 store_status_t write_entries(std::FILE* file, store_type_ const& store, generation_t read_stamp, std::size_t& bytes,
                              bool& written) noexcept {
@@ -1292,8 +1300,9 @@ store_status_t write_entries(std::FILE* file, store_type_ const& store, generati
         });
 }
 
-/** Writes the image of every collection of @p state at @p read_stamp into @p directory, reporting the bytes of the keys
- *  and values written to @p progress after each collection, whose cancellation removes the partial image. */
+/** Writes the image of every collection of @p state at @p read_stamp into @p directory, reporting
+ *  the bytes of the keys and values written to @p progress after each collection, whose
+ *  cancellation removes the partial image. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t write_image(database_state<cpu_class_, isolation_>& state, generation_t read_stamp, char const* directory,
                      ustore_progress_callback_t progress = nullptr, void* progress_state = nullptr) noexcept {
@@ -1516,8 +1525,8 @@ status_t reset_database(database_state<cpu_class_, isolation_>& state) noexcept 
     return translate(reset);
 }
 
-/** Empties every value of every collection, keeping the keys, which a graph holds none of, and leaving every strings
- *  collection as it is, whose values are keys. */
+/** Empties every value of every collection, keeping the keys, which a graph holds none of, and
+ *  leaving every strings collection as it is, whose values are keys. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t clear_values(database_state<cpu_class_, isolation_>& state) noexcept {
     status_t outcome;
@@ -1568,8 +1577,8 @@ sample_batch_t samples_of(arguments_type_ const& arguments) noexcept {
 
 #pragma region Calls of Every Modality
 
-/** Implements the read of whole values from collections whose stores hold @p entry_type_, refusing any other, copying
- *  every value into the caller's arena once. */
+/** Implements the read of whole values from collections whose stores hold @p entry_type_, refusing
+ *  any other, copying every value into the caller's arena once. */
 template <typename entry_type_, cpu_class_t cpu_class_, isolation_t isolation_, typename arguments_type_>
 status_t read_values(database_state<cpu_class_, isolation_>& state, arguments_type_ const& arguments,
                      view_t const& view) noexcept {
@@ -1637,8 +1646,8 @@ status_t read_into_scratch(source_type_& source, place_batch_t const& places, vi
     return outputs.finish(read);
 }
 
-/** Implements the scan of collections whose stores hold @p entry_type_, refusing any other, as ordered walks of each
- *  collection's keys, a graph's being its vertices. */
+/** Implements the scan of collections whose stores hold @p entry_type_, refusing any other, as
+ *  ordered walks of each collection's keys, a graph's being its vertices. */
 template <typename entry_type_, cpu_class_t cpu_class_, isolation_t isolation_, typename arguments_type_>
 status_t scan_keys(database_state<cpu_class_, isolation_>& state, arguments_type_ const& arguments,
                    view_t const& view) noexcept {
@@ -1672,8 +1681,8 @@ status_t scan_keys(database_state<cpu_class_, isolation_>& state, arguments_type
     return outputs.finish(arguments);
 }
 
-/** Implements the sample of collections whose stores hold @p entry_type_, refusing any other, as a reservoir filled
- *  from a walk of each collection's keys. */
+/** Implements the sample of collections whose stores hold @p entry_type_, refusing any other, as a
+ *  reservoir filled from a walk of each collection's keys. */
 template <typename entry_type_, cpu_class_t cpu_class_, isolation_t isolation_, typename arguments_type_>
 status_t sample_keys(database_state<cpu_class_, isolation_>& state, arguments_type_ const& arguments,
                      view_t const& view) noexcept {
@@ -1753,8 +1762,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_cl
     }
 }
 
-/** Implements @c ustore_database_compact, reclaiming unreachable versions of every store, freeing unreachable retired
- *  stores and rewriting the image, reporting one unit per collection, as the versions it frees carry no byte count. */
+/** Implements @c ustore_database_compact, reclaiming unreachable versions of every store, freeing
+ *  unreachable retired stores and rewriting the image, reporting one unit per collection, as the
+ *  versions it frees carry no byte count. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_compact_t const& arguments,
                view_t const&) noexcept {
@@ -1818,8 +1828,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_snapshot_sa
 
 #pragma region Collection Calls
 
-/** Implements @c ustore_collection_list as a walk of the collections system collection at the head or at a snapshot,
- *  whose entries carry the modalities and the names. */
+/** Implements @c ustore_collection_list as a walk of the collections system collection at the head
+ *  or at a snapshot, whose entries carry the modalities and the names. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_list_t const& arguments,
                view_t const& view) noexcept {
@@ -1838,8 +1848,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_
     return outputs.finish(arguments);
 }
 
-/** Implements @c ustore_collection_create as one commit of the entry, its fresh store and the name, a named
- *  collection persisted at once as a flushed write would be. */
+/** Implements @c ustore_collection_create as one commit of the entry, its fresh store and the name,
+ *  a named collection persisted at once as a flushed write would be. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_create_t const& arguments,
                view_t const&) noexcept {
@@ -1863,8 +1873,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_
     return {};
 }
 
-/** Implements @c ustore_collection_drop: forgetting the collection and retiring its store, giving it a fresh empty
- *  store, or emptying its values. */
+/** Implements @c ustore_collection_drop: forgetting the collection and retiring its store, giving
+ *  it a fresh empty store, or emptying its values. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_drop_t const& arguments,
                view_t const&) noexcept {
@@ -1946,8 +1956,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_
 
 #pragma region Transaction Calls
 
-/** Implements @c ustore_transaction_init, opening a transaction or resetting the one it reuses onto a fresh
- *  snapshot. */
+/** Implements @c ustore_transaction_init, opening a transaction or resetting the one it reuses onto
+ *  a fresh snapshot. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_transaction_init_t const& arguments,
                view_t const& view) noexcept {
@@ -2005,8 +2015,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_transaction
     return {};
 }
 
-/** Implements @c ustore_transaction_rollback, pulling the staged writes back into the transaction, which may then
- *  stage again, while one never staged has nothing to withdraw. */
+/** Implements @c ustore_transaction_rollback, pulling the staged writes back into the transaction,
+ *  which may then stage again, while one never staged has nothing to withdraw. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>&, ustore_transaction_rollback_t const&,
                view_t const& view) noexcept {
@@ -2020,8 +2030,8 @@ status_t serve(database_state<cpu_class_, isolation_>&, ustore_transaction_rollb
 
 #pragma region Table
 
-/** Serves a call on the database @p arguments address, whose handle the table of @p cpu_class_ at @p isolation_
- *  stamped, with the ragged inputs the router gathered for it. */
+/** Serves a call on the database @p arguments address, whose handle the table of @p cpu_class_ at
+ *  @p isolation_ stamped, with the ragged inputs the router gathered for it. */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename arguments_type_, typename... strings_types_>
 status_t serve_database(arguments_type_ const& arguments, strings_types_ const&... strings,
                         view_t const& view) noexcept {
@@ -2038,8 +2048,8 @@ void transaction_free(ustore_transaction_t handle) noexcept {
     free_unreachable(state);
 }
 
-/** Gives back the count the snapshot behind @p handle holds and frees it, releasing the stamp it claimed, and the
- *  stores only it still reached. */
+/** Gives back the count the snapshot behind @p handle holds and frees it, releasing the stamp it
+ *  claimed, and the stores only it still reached. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 void snapshot_free(ustore_snapshot_t handle) noexcept {
     auto* const snapshot = state_of<snapshot_state<cpu_class_, isolation_>>(handle);

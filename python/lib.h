@@ -706,7 +706,7 @@ int ustore_py_raise_from_cause(PyObject* kind, char const* format, ...);
 
 /**
  *  @brief Readies every exception type and adds it to @p module.
- *  @param[inout] module The extension module under construction.
+ *  @param[in,out] module The extension module under construction.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 int ustore_py_register_errors(PyObject* module);
@@ -922,7 +922,7 @@ int ustore_py_keys_from_subscript(PyObject* object, ustore_py_keys_t* batch);
 
 /**
  *  @brief Releases whatever @c ustore_py_keys_from_object acquired.
- *  @param[inout] batch The batch to release.
+ *  @param[in,out] batch The batch to release.
  */
 void ustore_py_keys_release(ustore_py_keys_t* batch);
 
@@ -967,7 +967,7 @@ int ustore_py_contents_from_tape(PyObject* object, ustore_py_contents_t* batch);
 
 /**
  *  @brief Releases every buffer @p batch borrowed, the block they shared and the tape it held.
- *  @param[inout] batch The batch to release.
+ *  @param[in,out] batch The batch to release.
  */
 void ustore_py_contents_release(ustore_py_contents_t* batch);
 
@@ -1175,7 +1175,7 @@ void ustore_py_read_release(void* call);
  *  @param[in] context The receiver the read runs through.
  *  @param[in] options The collection and knobs the read carries.
  *  @param[in] verb How the read answers, the verb @p call was opened with.
- *  @param[inout] call What @c ustore_py_call_open answered, its keys gathered and its subscript set for one key.
+ *  @param[in,out] call What @c ustore_py_call_open answered, its keys gathered and its subscript set for one key.
  *  @param[in] arena The @c Arena the outputs land in, claimed here.
  *  @return The answer of @p verb, or its @c Deferred; NULL with an exception set otherwise.
  */
@@ -1308,7 +1308,7 @@ extern ustore_py_verb_t const ustore_py_docs_read_objects_verb;
  *  @brief Reads the documents gathered into @p call: the core of `docs_read` and of `Collection.docs[key]`.
  *  @param[in] type How every value is spelled, JSON text or a printed string.
  *  @param[in] verb How the read answers, the verb @p call was opened with.
- *  @param[inout] call What @c ustore_py_call_open answered, its keys gathered, and its field and subscript set as the
+ *  @param[in,out] call What @c ustore_py_call_open answered, its keys gathered, and its field and subscript set as the
  *      caller wants them.
  *  @param[in] arena The @c Arena the outputs land in, claimed here.
  *  @return The answer of @p verb, or its @c Deferred; NULL with an exception set otherwise.

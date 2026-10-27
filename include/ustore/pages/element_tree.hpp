@@ -244,7 +244,7 @@ struct page_attribute_t {
     string_span_t value {};
 };
 
-/** The preorder positions `[first, first + count)` of a subtree inside a dense form. */
+/** The preorder positions <tt>[first, first + count)</tt> of a subtree inside a dense form. */
 struct page_subtree_t {
     std::uint32_t first = 0;
     std::uint32_t count = 0;
@@ -359,7 +359,7 @@ class page_view_t {
         return load_u32(directory_ + std::size_t(low) * page_directory_bytes_k + 16);
     }
 
-    /** The preorder positions `[first, first + count)` of the subtree rooted at @p key, empty when missing. */
+    /** The preorder positions <tt>[first, first + count)</tt> of the subtree rooted at @p key, empty when missing. */
     page_subtree_t subtree(element_key_t const& key) const noexcept {
         std::uint32_t const position = find(key);
         if (position == no_element_k) return {};

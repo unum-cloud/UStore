@@ -54,7 +54,7 @@ using namespace unum::ustore::utilities;
 
 #pragma region Store
 
-/** The key every collection of this engine stores: the 16 bytes of the C ABI's key, ordered like `memcmp`. */
+/** The key every collection of this engine stores: the 16 bytes of the C ABI's key, ordered like @c memcmp. */
 using stored_key_t = st::key128_t;
 
 /** The mount the volumes of a store of @p cpu_class_ are opened over, which lends it its router and channels. */
@@ -169,7 +169,7 @@ template <cpu_class_t cpu_class_>
 using strings_transaction_of = nvme_transaction<database_of<cpu_class_>, strings_store_of<cpu_class_>>;
 
 /** The collections system collection, mapping every collection's UUID onto its name, which no minted UUIDv7 spells,
- *  as its byte 6 is `0x7X`. */
+ *  as its byte 6 is @c 0x7X. */
 inline constexpr ustore_collection_id_t collections_collection_k {
     {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD}}};
 
@@ -754,7 +754,7 @@ status_t settle(database_state<cpu_class_>& state, ustore_durability_t durabilit
  *  @param[in] bytes The bytes those writes take, a hint the buffer doubles past when @p writes outgrows it.
  *  @param[in] schedule Whether @p writes watches what it reads, which a read-modify-write needs.
  *
- *  @p writes is invoked as `writes(access)` on every attempt, and a failure it answers ends the call.
+ *  @p writes is invoked as <tt>writes(access)</tt> on every attempt, and a failure it answers ends the call.
  */
 template <cpu_class_t cpu_class_, typename writes_type_>
 status_t commit_alone(database_state<cpu_class_>& state, ustore_arena_t scratch, std::size_t count, std::size_t bytes,

@@ -1,4 +1,9 @@
-"""GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices."""
+"""GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices.
+
+File: python/ustore/__init__.py
+Author: Ash Vardanian
+Date: July 25, 2023
+"""
 
 from enum import IntEnum
 

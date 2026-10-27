@@ -388,7 +388,12 @@ class strings_collection_t : public strings_read_collection_t {
         return assign({&text, 1}, {&key, 1}, durability);
     }
 
-    /** Upserts the keys a batch of strings map onto, one per string. */
+    /**
+     *  Upserts the keys a batch of strings map onto, one per string.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p texts and @p keys differ in count.
+     */
     status_t assign(std::span<value_view_t const> texts, std::span<ustore_key_t const> keys,
                     ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
         if (texts.size() != keys.size())
@@ -577,6 +582,9 @@ class deferred_strings_read_collection_t {
      *  @param[in] starts None to start every page at its prefix, or the smallest string of every page, which the page
      *      holds too when the collection does.
      *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p starts are neither empty nor one per prefix.
      */
     deferred<strings_scan_t> scan(values_tape_t prefixes, std::size_t limit, arena_t& arena, values_tape_t starts = {},
                                   ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
@@ -616,6 +624,9 @@ class deferred_strings_collection_t : public deferred_strings_read_collection_t 
      *  @param[in] texts Strings to write, owned by the call until it is final.
      *  @param[in] keys One key per string, owned by the call until it is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p texts and @p keys differ in count.
      */
     template <owned_array_concept<ustore_key_t> keys_type_>
     deferred<strings_write_t> write(values_tape_t texts, keys_type_ keys,

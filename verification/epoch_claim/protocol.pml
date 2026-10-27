@@ -6,52 +6,18 @@
  *      one word, odd while held and even while free, taken by a @c fetch_or and stepped by its holder.
  *
  *  The claim orders a database's maintenance, catalog and blob writes. @c take_if_free is a
- *  sequentially consistent fence, then a @c fetch_or of the held bit with an acquire: an even word
- *  became odd and the caller holds it, an odd one is written back unchanged and the caller returns
- *  at once. @c take repeats the same @c fetch_or, parked on the odd value it read between attempts.
- *  @c release adds one with a release, which steps the odd epoch to the next even one, then fences
- *  and notifies. @c wait_until_released reads the epoch with an acquire and, while it reads odd,
- *  parks on that very value, so it wakes once that holder lets go, whoever takes the claim next.
- *  No compare-exchange is spelled anywhere.
+ *  sequentially consistent fence, then a @c fetch_or of the held bit with an acquire. @c release
+ *  adds one with a release, which steps the odd epoch to the next even one, then fences and
+ *  notifies. With @c waiting at @c handoff, a releasing holder hands the claim to the first
+ *  announced thread after its own index rather than letting it go.
  *
- *  With @c waiting at @c handoff, a blocking taker that finds the claim held announces itself in a
- *  word of its own, indexed by its thread, and a releasing holder hands the claim to the first
- *  announced thread after its own index rather than letting it go. Only the owner writes
- *  @c announced, and writes @c idle back once it holds the claim, whether handed it or not; only a
- *  holder writes @c handed. The taker stores @c announced, fences, and tries the @c fetch_or once
- *  more, so a holder whose fenced scan missed the announcement has not let go when the taker parks.
- *  A handing holder stores @c handed with @c handoff_order, then steps the epoch by
- *  @c handoff_step with @c release_order, odd to the next odd, so the claim never reads free in
- *  between and every caller parked on the epoch still wakes, then fences and notifies. A holder
- *  that finds nobody announced lets go as before, and with @c release_look looks once more after
- *  its fence, as @c release_claim_ looks at the views: finding an announcement, it takes the claim
- *  back with @c take_if_free and hands it over. With @c release_scan false the scan before letting
- *  go is skipped and the look alone hands the claim. An announced taker parks on its announcement
- *  until it reads @c handed, or with @c announced_wait at @c until_stepped on the epoch, retrying
- *  the @c fetch_or after every step.
- *
- *  Every take that wins counts itself into @c holders and asserts it is alone, a taker reading
- *  itself handed the claim counts itself in the same way, and every release or handoff counts its
- *  holder out, so one holder at a time is checked in every scenario beside this file. A scenario
- *  that starts with the claim held seeds the epoch odd and @c holders at one. A blocking taker is
- *  @c queued from its announcement, or under @c retried from its first refused attempt, until it
- *  holds the claim, which a scenario's gate reads without ordering anything.
- *
- *  A sequentially consistent fence has no inline in `weak_memory.pml`, whose views carry only
- *  release and acquire, so @c fence_seq_cst stands in an acquire-release read-modify-write of the
- *  one word @c fences that every such fence touches. Two of them are ordered like any two writes to
- *  one word, and the later one acquires everything before the earlier one, which is the store
- *  buffering RC11's fences forbid; it is stronger than a fence only in carrying the earlier thread's
- *  whole view, and never in what a mutant drops. `client.cpp` runs the real fences under RC11 and
- *  IMM.
- *
- *  Every park is the futex-style @c wait_on of `monitor_wait.pml`, woken only by the notify that
- *  ends @c release or a handoff, and its reload is @c std::atomic_ref::wait's relaxed load.
- *
- *  Include before the scenario's roles; every scenario defines its shape first.
+ *  - One holder at a time is checked in every scenario beside this file.
+ *  - No compare-exchange is spelled anywhere.
+ *  - @c fence_seq_cst stands in an acquire-release read-modify-write of the one word @c fences.
+ *  - Every park is the futex-style @c wait_on of `monitor_wait.pml`.
  */
-#include "../../forkunion/verification/weak_memory.pml"
-#include "../../forkunion/verification/monitor_wait.pml"
+#include <weak_memory.pml>
+#include <monitor_wait.pml>
 
 /** The words: the claim's epoch, the word standing in for every sequentially consistent fence, one
  *  announcement per thread, then the one word each scenario guards: a commit's published view, a
@@ -83,7 +49,9 @@
 #define until_handed 0
 #define until_stepped 1
 
-/** The values of an announcement: its thread wants nothing, waits for the claim, or was handed it. */
+/** The values of an announcement: its thread wants nothing, waits for the claim, or was handed it.
+ *  Only the owner writes @c announced, and writes @c idle back once it holds the claim, whether
+ *  handed it or not; only a holder writes @c handed. */
 #define idle 0
 #define announced 1
 #define handed 2
@@ -132,9 +100,6 @@
 #if announced_wait != until_handed && announced_wait != until_stepped
 #error "announced_wait is until_handed or until_stepped"
 #endif
-#ifndef release_scan
-#define release_scan true
-#endif
 #ifndef release_look
 #define release_look true
 #endif
@@ -144,6 +109,9 @@
 #ifndef handoff_order
 #define handoff_order order_release
 #endif
+
+/** The fenced scan before letting go; without it the look alone hands the claim. */
+#define release_scan true
 
 #define held(value) ((value) % 2 == 1)
 
@@ -158,7 +126,10 @@ bool retaken[thread_count];   // the look took the claim back to hand it over
 hidden int fenced;            // scratch: the value a fence's stand-in read
 hidden int glanced;           // scratch: what a scan step or a retake read
 
-/** A sequentially consistent fence: an acquire-release read-modify-write of @c fences. */
+/** A sequentially consistent fence: an acquire-release read-modify-write of @c fences. Two of them
+ *  are ordered like any two writes to one word, and the later one acquires everything before the
+ *  earlier one, which is the store buffering RC11's fences forbid; it is stronger than a fence only
+ *  in carrying the earlier thread's whole view, and never in what a mutant drops. */
 inline fence_seq_cst(t) { read_modify_write(t, fences, order_acq_rel, fenced, 0) }
 
 /** The held bit set with @c take_order, which writes an odd word back unchanged; @p seen is what it
@@ -196,7 +167,8 @@ inline wait_until_changed(t, seen, now) {
 }
 
 /** The epoch read with an acquire, and while it reads held, a park until it moves:
- *  @c maintenance_claim::wait_until_released. */
+ *  @c maintenance_claim::wait_until_released. It parks on that very value, so it wakes once that
+ *  holder lets go, whoever takes the claim next. */
 inline wait_until_released(t, seen, now) {
     load(t, epoch, order_acquire, seen);
     if
@@ -231,7 +203,9 @@ inline wait_until_handed(t, now) {
 
 /** The announcement, the fence, and the @c fetch_or retried until it holds the claim or reads
  *  itself handed it, parked between attempts as @c announced_wait says; the announcement is
- *  written back to @c idle once it holds the claim. */
+ *  written back to @c idle once it holds the claim. The taker stores @c announced, fences, and
+ *  tries the @c fetch_or once more, so a holder whose fenced scan missed the announcement has not
+ *  let go when the taker parks. */
 inline take_announced(t, seen, now) {
     atomic { store(t, announcement(t), order_relaxed, announced); queued[t] = true };
     fence_seq_cst(t);
@@ -315,8 +289,9 @@ inline let_go(t) {
 }
 
 /** The claim handed to the thread @c successor names: @c handed stored with @c handoff_order, the
- *  epoch stepped by @c handoff_step with @c release_order, then the fence and the notify on the
- *  announcement and on the epoch. */
+ *  epoch stepped by @c handoff_step with @c release_order, odd to the next odd, so the claim never
+ *  reads free in between and every caller parked on the epoch still wakes, then the fence and the
+ *  notify on the announcement and on the epoch. */
 inline hand_over(t) {
     atomic { holders--; store(t, announcement(successor[t]), handoff_order, handed) };
     add_no_return(t, epoch, release_order, handoff_step);
@@ -335,7 +310,9 @@ inline hand_over(t) {
 
 /** @c maintenance_claim::release: under @c retried the epoch let go; under @c handoff the fenced
  *  scan and the handoff, else the epoch let go, the look, and on an announcement the claim taken
- *  back and scanned for again. */
+ *  back and scanned for again. With @c release_look the holder looks once more after its fence, as
+ *  @c release_claim_ looks at the views: finding an announcement, it takes the claim back with
+ *  @c take_if_free and hands it over. */
 inline release(t) {
     if
     :: waiting == retried -> let_go(t)

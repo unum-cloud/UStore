@@ -2,8 +2,8 @@
  *  @file src/ram/strings.hpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
- *  @brief The strings calls of the C ABI over the strings stores of `src/ram/database.hpp`, for the in-memory engine's
- *      tables.
+ *  @brief The strings calls of the C ABI over the strings stores of <tt>src/ram/database.hpp</tt>,
+ *      for the in-memory engine's tables.
  */
 
 #pragma once

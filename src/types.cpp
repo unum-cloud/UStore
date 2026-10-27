@@ -2,8 +2,8 @@
  *  @file src/types.cpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief Implements `c/ustore/types.h`: outcomes, the spelling of statuses and moods, the version, executors with
- *      their drivers, and arenas.
+ *  @brief Implements <tt>c/ustore/types.h</tt>: outcomes, the spelling of statuses and moods, the
+ *      version, executors with their drivers, and arenas.
  */
 
 #include <cstddef> // `std::size_t`

@@ -2,14 +2,15 @@
  *  @file src/ram/docs.hpp
  *  @author Ash Vardanian
  *  @date October 25, 2026
- *  @brief The documents calls of the C ABI over the documents stores of `src/ram/database.hpp`, for the in-memory
- *      engine's tables.
+ *  @brief The documents calls of the C ABI over the documents stores of
+ *      <tt>src/ram/database.hpp</tt>, for the in-memory engine's tables.
  *
- *  Every document is its JSON text, filed under its key in the documents store of its collection. A write passes whole
- *  JSON upserts through, and any other modification reads the documents it touches, applies
- *  `ustore/docs/json_patch.hpp` and writes the new text back, inside one SmashTable transaction: the caller's, or one
- *  of the call's own, retried on conflicts. Reads, gists and gathers take the paths of `src/blobs_layers/docs.hpp`
- *  over the documents as the view sees them. A call naming a collection of another modality is refused.
+ *  Every document is its JSON text, filed under its key in the documents store of its collection. A
+ *  write passes whole JSON upserts through, and any other modification reads the documents it
+ *  touches, applies <tt>ustore/docs/json_patch.hpp</tt> and writes the new text back, inside one
+ *  SmashTable transaction: the caller's, or one of the call's own, retried on conflicts. Reads,
+ *  gists and gathers take the paths of <tt>src/blobs_layers/docs.hpp</tt> over the documents as the
+ *  view sees them. A call naming a collection of another modality is refused.
  */
 
 #pragma once

@@ -1,1 +1,0 @@
-.. mdinclude:: ../src/README.md

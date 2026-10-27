@@ -9,40 +9,39 @@
  *  relieved; otherwise it tries the claim, flushes under it if taken, and if not, waits until the
  *  holder lets go and reads the pressure again. The flusher starts holding the claim and runs
  *  @c rounds rounds of a flush, a release and a blocking @c take, then keeps the last claim it took
- *  for good, which is a flusher retaking back to back for ever: every later round would replay the
- *  last one. Before each flush it waits until the committer is parked or done, so the committer
- *  always gets to run while the claim is held, and a committer that stays parked has been starved
- *  by the retakes rather than by the scheduler.
+ *  for good.
  *
- *  The committer makes progress: it never stays parked once the flusher stops, which a starved one
- *  does, and the search reports it `stuck`.
+ *  - The committer makes progress: it never stays parked once the flusher stops.
  *
  *  @verify pass sc,rc11,far
- *  @verify stuck sc,rc11 release_step=cleared: the epoch's release steps it to a value no holder
- *      has held; a plain flag cleared to zero is set back to one by the flusher's retake before the
- *      woken committer reloads it, so its wait reads the very value it parked on and parks again,
- *      round after round
- *  @verify stuck sc,rc11 stalled_wait=until_taken: @c make_room_ waits for the holder's release
- *      and reads the pressure again, rather than for the claim itself; blocked in @c take, the
- *      committer wakes on every release yet finds the claim retaken, and the flush that already
- *      relieved it is never read, epoch or flag, which is how any blocking taker fares against a
- *      flusher retaking back to back
+ *  @verify stuck sc,rc11 release_step=cleared: a plain flag cleared to zero is set back to one by
+ *      the flusher's retake before the woken committer reloads it, so its wait reads the very value
+ *      it parked on and parks again
+ *  @verify stuck sc,rc11 stalled_wait=until_taken: blocked in @c take, the committer wakes on every
+ *      release yet finds the claim retaken, and the flush that already relieved it is never read
  *  @verify stuck sc stalled_wait=until_taken release_step=cleared: the design this claim replaced,
  *      a flag and a blocking take, starves the same way
- *  @verify pass sc rounds=1: under sequential memory the committer leaves within one round, since
- *      the release it wakes on comes after the flush that relieved it
+ *  @verify pass sc rounds=1: under sequential memory the committer leaves within one round
  *  @verify stuck rc11 rounds=1: the wake's reload is relaxed, so the woken committer may read the
- *      pressure stale; its next attempt acquires the flush through the retake's read-modify-write
- *      and parks on the retake, and it leaves only after one more release, which a single round
- *      never gives it
+ *      pressure stale
  *  @verify pass rc11 rounds=1 wake_order=order_acquire: reloaded with an acquire, the wake
- *      synchronizes with the release it saw, or with the retake continuing that release's
- *      sequence, and the woken committer reads the flush at once
+ *      synchronizes with the release it saw
+ *  @verify pass sc,rc11,far waiting=handoff: @c make_room_ only tries the claim and never
+ *      announces, so the committer still wakes on the epoch's step
+ *  @verify stuck rc11,far waiting=handoff release_look=false: with no look after letting go, nobody
+ *      hands it the claim and it parks on its announcement for good
+ *  @verify pass sc,rc11,far waiting=handoff release_look=false announced_wait=until_stepped: an
+ *      announced flusher parked on the epoch wakes on the committer's step and retries the
+ *      @c fetch_or
  */
 #define thread_count 2
-#define location_count 4
+#define location_count (4 + thread_count)
+#ifdef waiting // set only to handoff, whose value the protocol defines after the shape
+#define history_depth 20
+#else
 #define history_depth 9
-#include "protocol.pml"
+#endif
+#include <epoch_claim/protocol.pml>
 
 bool committer_done; // the committer saw the pressure relieved
 

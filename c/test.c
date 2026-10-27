@@ -5,8 +5,8 @@
  *  @brief Calls the C ABI from plain C11 once per shape of its arguments, so a header that only a C++ compiler accepts
  *      fails to build, and a shape the library misreads fails the run.
  */
-#include <stdio.h>  // `fprintf`, `snprintf`, `stderr`
-#include <string.h> // `memcmp`, `memset`, `strcmp`, `strlen`
+#include <stdio.h>  // `fprintf`, `stderr`
+#include <string.h> // `memcmp`, `memset`, `strlen`
 
 #include <stddef.h> // `size_t`, `NULL`
 #include <stdint.h> // `uint32_t`, `uint64_t`
@@ -410,12 +410,9 @@ int main(void) {
     failures += expect_success(&outcome, __LINE__);
     failures += expect(description.keys == 0, __LINE__);
 
-    // Names spell every closed set and read back, and the version spells the macros
+    // Names spell every closed set and read back
     ustore_bytes_view_t const graph_name = bytes_of(ustore_modality_name(ustore_modality_graph_k));
     failures += expect(ustore_modality_from_name(graph_name) == ustore_modality_graph_k, __LINE__);
-    char version[32];
-    snprintf(version, sizeof(version), "%d.%d.%d", USTORE_VERSION_MAJOR, USTORE_VERSION_MINOR, USTORE_VERSION_PATCH);
-    failures += expect(strcmp(version, ustore_version_name()) == 0, __LINE__);
 
     ustore_arena_free(arena);
     ustore_database_free(database);

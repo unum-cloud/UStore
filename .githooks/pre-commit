@@ -19,7 +19,7 @@ export LC_ALL=C # Byte-wise regexes, immune to the committer's locale
 rejection_count=0
 project_include_prefix="ustore"
 sibling_projects='numkong|stringzilla|forkunion|smashtable|usearch|ucall|uform'
-cmake_published_variables="USTORE_IS_MAIN_PROJECT"
+cmake_published_variables=""
 cmake_third_party_variables="FETCHCONTENT_QUIET YYJSON_INSTALL FMT_MODULE"
 
 # Prints the reason and the first offending lines, and counts the rejection.
@@ -151,9 +151,10 @@ check_sibling_justification() {
 
 # Markdown structure inside a docblock - `* ## Class Specs`, `* - Copyable: Yes.`, `* 1. First` - prints literally in
 # Doxygen and hides what the tags would say. Headings become prose, and specs become @note, @throws or @param lines.
+# The one list left is the `- @c status` bullets under `@par Statuses:`.
 check_markdown_docblocks() {
     local structure
-    structure=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*\*[[:space:]]+(#{1,4}[[:space:]]|-[[:space:]]|[0-9]+\.[[:space:]])' || true)
+    structure=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*\*[[:space:]]+(#{1,4}[[:space:]]|-[[:space:]]+[^@[:space:]]|[0-9]+\.[[:space:]])' || true)
     [ -z "$structure" ] || fail "$structure" \
         "$file puts a Markdown heading or list inside a docblock - use Doxygen tags such as @note," \
         "            @throws and @param, or plain sentences:"
@@ -173,15 +174,15 @@ check_tables_aligned_not_piped() {
 
 # region Doxygen Blocks
 
-# Every @param declares its direction - [in]/[out]/[inout] - so a reader knows whether the callee
-# reads, writes, or mutates the argument. A bare @param and the comma form @param[in,out] are both
-# rejected; the one spelling for a mutated argument is @param[inout].
+# Every @param declares its direction - [in]/[out]/[in,out] - so a reader knows whether the callee
+# reads, writes, or mutates the argument. A bare @param and the [inout] spelling are both
+# rejected; the one spelling for a mutated argument is @param[in,out].
 check_param_directions() {
     local bare
-    bare=$(printf '%s\n' "$added" | grep -E '@param' | grep -vE '@param\[(in|out|inout)\]' || true)
+    bare=$(printf '%s\n' "$added" | grep -E '@param' | grep -vE '@param\[(in|out|in,out)\]' || true)
     [ -z "$bare" ] || fail "$bare" \
-        "$file has a @param without an [in]/[out]/[inout] direction - never a bare @param" \
-        "            nor the comma form @param[in,out] (write @param[inout]):"
+        "$file has a @param without an [in], [out] or [in,out] direction, or writes [inout]," \
+        "            which Clang rejects:"
 }
 
 # Doxygen renders @b / @c, not Markdown: `__bold__` / `**bold**` in a `/** */` or `//` comment print
@@ -210,6 +211,20 @@ check_doxygen_glued() {
         "            never \`(@c foo)\`; a highlighter only sees a command that follows whitespace:"
 }
 
+# Clang hovers print the backticks of a docblock literally, so a docblock names code with @c, @p or <tt>
+# by token class; backticks stay in `//` comments, and code samples inside @code are exempt.
+check_docblock_code_spans_not_backticked() {
+    local spans
+    spans=$(printf '%s\n' "$added" | awk '
+        /@endcode/ { code = 0; next }
+        /@code/ { code = 1; next }
+        code { next }
+        /^\+[[:space:]]*(\/\*\*|\*|\/\/\/)/ && /`/ { print }')
+    [ -z "$spans" ] || fail "$spans" \
+        "$file has a backtick span in a docblock - write @c name, @p parameter or <tt>punctuated token</tt>;" \
+        "            backticks stay in // comments:"
+}
+
 # Doxygen text aligned into columns by hand - `@brief  Text`, `@param[in] a     Text` - drifts out of
 # line with the first edit to a neighbor, so one space follows a command and one the name it documents.
 check_doxygen_columns_unaligned() {
@@ -224,23 +239,31 @@ check_doxygen_columns_unaligned() {
 
 # An `@section` line reads as a heading only when air surrounds it: the comment lines directly
 # above and below must be empty (`*` alone). Spacing is context, not a line, so this reads the
-# whole staged file and reports only the headings the commit itself added.
+# whole staged file and reports only the headings the commit itself added. A `@par` section reads the
+# same way: an empty comment line above it, and below it unless it ends the docblock.
 check_section_spacing() {
-    grep -q '@section' "$staged_blob" || return 0
+    grep -q '@section\|@par' "$staged_blob" || return 0
     local cramped
     cramped=$(awk '
         NR == FNR { added[$1 + 0]; next }
         { lines[FNR] = $0; last = FNR }
         END {
-            for (i = 1; i <= last; ++i)
+            for (i = 1; i <= last; ++i) {
                 if (lines[i] ~ /@section/ && (i in added)) {
                     if (lines[i - 1] !~ /^[[:space:]]*\*[[:space:]]*$/) printf "line %d: no empty comment line above the @section\n", i
                     if (lines[i + 1] !~ /^[[:space:]]*\*[[:space:]]*$/) printf "line %d: no empty comment line below the @section\n", i
                 }
+                if (lines[i] ~ /^[[:space:]]*\*[[:space:]]*@par([^a-z]|$)/ && (i in added)) {
+                    if (lines[i - 1] !~ /^[[:space:]]*\*[[:space:]]*$/ && lines[i - 1] !~ /^[[:space:]]*\/\*\*[[:space:]]*$/) printf "line %d: no empty comment line above the @par\n", i
+                    for (j = i + 1; j <= last; ++j)
+                        if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*$/ || lines[j] ~ /\*\// || lines[j] ~ /^[[:space:]]*\*[[:space:]]*@(brief|param|tparam|return|returns|retval|note|warning|sa|see|throws|pre|post|par|section|code)([^a-z]|$)/) break
+                    if (lines[j] !~ /^[[:space:]]*\*[[:space:]]*$/ && lines[j] !~ /\*\//) printf "line %d: no empty comment line below the @par section\n", i
+                }
+            }
         }' "$staged_lines_path" "$staged_blob")
     [ -z "$cramped" ] || fail "$cramped" \
-        "$file crams an @section against its neighbors - keep one empty comment line" \
-        "            above and below every @section heading:"
+        "$file crams an @section or @par against its neighbors - keep one empty comment line" \
+        "            above and below every @section heading, and around every @par section that does not end the docblock:"
 }
 
 # A docblock reads as the start of something only when air sits above it, with no exception: an opening
@@ -277,7 +300,7 @@ check_lone_brief() {
                 for (j = i; j <= last; ++j) {
                     if (j in added) touched = 1
                     if (lines[j] ~ /@brief/) brief = 1
-                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(param|tparam|return|retval|sa|see|note|file|author|date|section|code)([^a-z]|$)/) section = 1
+                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(param|tparam|return|retval|par|sa|see|note|file|author|date|section|code)([^a-z]|$)/) section = 1
                     if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*$/) blank = 1
                     if (lines[j] ~ /\*\//) break
                 }
@@ -304,7 +327,7 @@ check_brief_length() {
                 span = 1
                 for (j = i + 1; j <= last; ++j) {
                     if (lines[j] !~ /^[[:space:]]*\*[[:space:]]{5,}[^[:space:]]/) break
-                    if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*@(param|tparam|return|retval|sa|see|note|file|author|date|section|code)([^a-z]|$)/) break
+                    if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*@(param|tparam|return|retval|par|sa|see|note|file|author|date|section|code)([^a-z]|$)/) break
                     ++span
                 }
                 if (span > 3 && (i in added)) printf "line %d: @brief runs %d lines\n", i, span
@@ -559,7 +582,7 @@ check_docblock_brackets() {
                 tagged = 0; touched = 0; single = (lines[i] ~ /\*\//)
                 for (j = i; j <= last; ++j) {
                     if (j in added) touched = 1
-                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(brief|param|tparam|return|retval|sa|see|note|file|author|date|section|code)([^a-z]|$)/) tagged = 1
+                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(brief|param|tparam|return|retval|par|sa|see|note|file|author|date|section|code)([^a-z]|$)/) tagged = 1
                     if (lines[j] ~ /\*\//) break
                 }
                 bare_open = (lines[i] ~ /^[[:space:]]*\/\*\*[[:space:]]*$/)
@@ -973,6 +996,17 @@ check_deque() {
         "$file uses std::deque - reach for reserved unique_ptr vectors, arenas, or ForkUnion containers:"
 }
 
+# `std::filesystem` throws, allocates paths behind the caller's back, and is missing or partial on several
+# targets the bindings ship to. The library and its bindings reach files through the C library and mmap views;
+# only the test, benchmark and tool harnesses may include `<filesystem>`.
+check_filesystem_in_library() {
+    local hits
+    hits=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
+        grep -E '\bstd::filesystem\b|#[[:space:]]*include[[:space:]]*<filesystem>' || true)
+    [ -z "$hits" ] || fail "$hits" \
+        "$file uses std::filesystem in library code - it is allowed only in test/, bench/ and tools/ harnesses:"
+}
+
 # Reinterpreting copies in C++ sources - a `memcpy` between two objects whose byte count is one
 # object's `sizeof` is a type pun, and `std::bit_cast` states it outright. Byte moves keep their
 # memcpy: a runtime-sized bulk copy, or one object serialized into or out of a byte run.
@@ -1137,6 +1171,27 @@ check_annotate_release_before_unlock() {
     [ -z "$misplaced" ] || fail "$misplaced" \
         "$file misplaces the release of a probed word - write annotate_release(&word) immediately" \
         "            before annotate_unlock_started(&word), never inside the bracket:"
+}
+
+# Types share state through members they own and free functions they call; a base class hides who owns what and
+# couples every derived type to its layout. Trait specializations and formatters keep their bases.
+check_inheritance() {
+    local hits
+    hits=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' | sed 's/::/~~/g' |
+        grep -E '^\+[[:space:]]*(template[[:space:]]*<.*>[[:space:]]*)?(struct|class)[[:space:]]+[A-Za-z_][A-Za-z0-9_<>~, ]*[[:space:]]*(final[[:space:]]*)?:[[:space:]]*(public|protected|private|[A-Za-z_])' |
+        sed 's/~~/::/g' |
+        grep -vE 'formatter<|std::(true|false)_type|std::integral_constant|std::bool_constant|enum[[:space:]]+(struct|class)' || true)
+    [ -z "$hits" ] || fail "$hits" "$file derives a type - hold the shared part as a member, or share a free function:"
+}
+
+# A lock added to make something work is a redesign postponed: partition the ownership, publish through an atomic
+# protocol on a ForkUnion reference, or wait through the class's waiter.
+check_new_mutexes() {
+    local hits
+    hits=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
+        grep -E '\bstd::(recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex\b|\bfu::spin_mutex_t\b|#[[:space:]]*include[[:space:]]*<(shared_)?mutex>' || true)
+    [ -z "$hits" ] || fail "$hits" \
+        "$file adds a mutex - ask first, or protect the state by ownership or an atomic protocol:"
 }
 
 # endregion Concurrency and Atomics
@@ -1466,6 +1521,7 @@ judge_path() {
         check_param_directions
         check_markdown_doxygen
         check_doxygen_glued
+        check_docblock_code_spans_not_backticked
         check_doxygen_columns_unaligned
         check_section_spacing
         check_docblock_spacing
@@ -1554,6 +1610,23 @@ judge_path() {
     *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
         check_namespace_directories
         check_namespace_reopened
+        ;;
+    esac
+    case "$file" in
+    include/* | src/* | c/* | cpp/* | python/*)
+        case "$file" in
+        *.c | *.h | *.cpp | *.hpp | *.cu | *.cuh | *.hip | *.cc | *.cxx | *.mm) check_filesystem_in_library ;;
+        esac
+        ;;
+    esac
+    case "$file" in
+    include/* | src/*)
+        case "$file" in
+        *.h | *.cpp | *.hpp | *.cu | *.cuh | *.hip | *.cc | *.cxx)
+            check_inheritance
+            check_new_mutexes
+            ;;
+        esac
         ;;
     esac
     case "$file" in

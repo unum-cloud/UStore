@@ -5,8 +5,9 @@
  *  @brief The vocabulary every template here speaks: statuses and the expected wrapper, UUIDs, keys and collection
  *      IDs with their orders, hashes and spellings, edges, value views, integer rounding, and the waiter.
  *
- *  The statuses and @c expected are re-exported into `unum::ustore` here, and `cpp/ustore/types.hpp` re-exports the
- *  rest, so the C++ SDK and these templates name one set of types.
+ *  The statuses and @c expected are re-exported into @c unum::ustore here, and
+ *  <tt>cpp/ustore/types.hpp</tt> re-exports the rest, so the C++ SDK and these templates name one
+ *  set of types.
  */
 
 #pragma once
@@ -110,7 +111,14 @@ using byte_t = std::byte;
 
 #pragma region Statuses
 
-/** What went wrong, with one enumerator per @c ustore_status_t that the C header documents. */
+/** What went wrong, with one enumerator per @c ustore_status_t that the C header documents.
+ *  Statuses fall into five categories. Resources: @c out_of_memory_k, @c io_k and @c device_k.
+ *  Input: @c invalid_argument_k and @c malformed_k. State: @c uninitialized_k, @c read_only_k,
+ *  @c unsupported_k, @c not_found_k, @c already_exists_k, @c write_conflict_k, @c read_conflict_k,
+ *  @c phantom_conflict_k, @c capacity_exhausted_k and @c contended_k. Interruptions: @c cancelled_k
+ *  and @c deferred_k. Defects: @c internal_k. Any verb that allocates, binds a device or touches a
+ *  file may also return a Resources status; any verb taking a progress callback may return
+ *  @c cancelled_k. A verb's own block lists only what its contract adds. */
 enum class status_code_t : int {
     success_k = ustore_status_success_k,
     deferred_k = ustore_status_deferred_k,
@@ -282,8 +290,8 @@ constexpr bool operator==(expected<value_type_> const& result, comparable_type_ 
 
 #pragma region Identifier Arithmetic
 
-/** The UUID spelling @p integer big-endian in its last eight bytes, so UUIDs made from integers order as the
- *  integers, exactly as Python's `uuid.UUID(int=integer)` does. */
+/** The UUID spelling @p integer big-endian in its last eight bytes, so UUIDs made from integers
+ *  order as the integers, exactly as Python's <tt>uuid.UUID(int=integer)</tt> does. */
 constexpr ustore_uuid_t uuid_from_integer(std::uint64_t integer) noexcept {
     ustore_uuid_t uuid {};
     for (unsigned index = 0; index != 8; ++index)
@@ -310,8 +318,8 @@ inline constexpr ustore_key_t smallest_key_k {};
 inline constexpr ustore_key_t largest_key_k {
     {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
 
-/** The key right after @p key in their order, where a scan resuming past @p key starts; the last key has none and
- *  wraps to the first. */
+/** The key right after @p key in their order, where a scan resuming past @p key starts; the last
+ *  key has none and wraps to the first. */
 constexpr ustore_key_t key_after(ustore_key_t key) noexcept {
     for (unsigned index = 16; index != 0; --index)
         if (++key.uuid.bytes[index - 1] != 0) break;
@@ -342,10 +350,10 @@ struct uuid_hash_t {
 
 #pragma region Identifier Text
 
-/** Characters the canonical `8-4-4-4-12` text of a UUID takes, dashes included. */
+/** Characters the canonical @c 8-4-4-4-12 text of a UUID takes, dashes included. */
 inline constexpr std::size_t uuid_text_length_k = 36;
 
-/** Writes the canonical lowercase `8-4-4-4-12` text of @p uuid into @p text, without a terminator. */
+/** Writes the canonical lowercase @c 8-4-4-4-12 text of @p uuid into @p text, without a terminator. */
 constexpr void uuid_to_text(ustore_uuid_t const& uuid, std::span<char, uuid_text_length_k> text) noexcept {
     constexpr char digits_k[] = "0123456789abcdef";
     std::size_t position = 0;
@@ -356,8 +364,8 @@ constexpr void uuid_to_text(ustore_uuid_t const& uuid, std::span<char, uuid_text
     }
 }
 
-/** Reads @p text as canonical UUID text in either case, or as a non-negative decimal integer, which spells as
- *  @c uuid_from_integer does. */
+/** Reads @p text as canonical UUID text in either case, or as a non-negative decimal integer, which
+ *  spells as @c uuid_from_integer does. */
 inline expected<ustore_uuid_t> uuid_from_text(std::string_view text) noexcept {
     status_t const malformed {status_code_t::invalid_argument_k, "Neither UUID text nor a non-negative integer"};
     ustore_uuid_t uuid {};
@@ -565,7 +573,8 @@ constexpr std::size_t bits_in_byte_k = 8;
 /** The power of two just above the highest set bit of @p value. */
 inline std::size_t next_power_of_two(std::size_t value) noexcept { return std::bit_floor(value) << 1; }
 
-/** @p value divided by @p divisor and rounded up, without the overflow `value + divisor - 1` risks near the limit. */
+/** @p value divided by @p divisor and rounded up, without the overflow <tt>value + divisor - 1</tt>
+ *  risks near the limit. */
 template <std::unsigned_integral integer_>
 constexpr integer_ divide_round_up(integer_ value, std::type_identity_t<integer_> divisor) noexcept {
     return static_cast<integer_>(value / divisor + (value % divisor != 0));

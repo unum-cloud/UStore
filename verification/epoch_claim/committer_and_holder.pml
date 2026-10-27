@@ -7,31 +7,30 @@
  *
  *  The committer is @c maintain after a commit: its view is published with a release, then
  *  @c take_if_free, and once it holds the claim it maintains, which reads its own view. The holder
- *  starts with the claim and runs @c release_claim_: the release, one look at the views with an
- *  acquire, and only if a view is due, @c take_if_free again and the maintenance under it. The two
- *  sides are store buffering across two words, the view and the epoch, so neither the release nor
- *  the acquire closes it, and only a fence on each side does.
+ *  starts with the claim and runs @c release_claim_. The two sides are store buffering across two
+ *  words, the view and the epoch, so neither the release nor the acquire closes it, and only a
+ *  fence on each side does.
  *
- *  No maintenance is lost: once both are done, someone maintained holding the claim with the view
- *  visible.
+ *  - No maintenance is lost: once both are done, someone maintained holding the claim with the view visible.
  *
  *  @verify pass sc,rc11,far
- *  @verify fail rc11,far try_fence=false: @c take_if_free fences before its @c fetch_or; without
- *      it, the committer's view is still in its store buffer when the @c fetch_or reads the claim
- *      held, and the holder's look after its own fence reads the view from before the commit, so
- *      nobody maintains it
- *  @verify fail rc11,far release_fence=false: @c release fences after its add; without it, the
- *      holder's look reads the view from before the commit while the committer's @c fetch_or,
- *      fenced, read the claim still held, so nobody maintains it
- *  @verify pass sc try_fence=false release_fence=false: sequential memory has no store buffer, so
- *      the protocol needs the fences only under weaker memory
- *  @verify pass rc11 release_step=cleared: a plain flag closes the same race, since the look only
- *      asks whether the release came before the attempt and never which holder it was
+ *  @verify fail rc11,far try_fence=false: the holder's look after its own fence reads the view from
+ *      before the commit, so nobody maintains it
+ *  @verify fail rc11,far release_fence=false: without it, the holder's look reads the view from
+ *      before the commit, so nobody maintains it
+ *  @verify pass sc try_fence=false release_fence=false: sequential memory has no store buffer
+ *  @verify pass rc11 release_step=cleared: a plain flag closes the same race
+ *  @verify pass sc,rc11,far waiting=handoff: a release that finds nobody announced lets go and
+ *      looks as before
  */
 #define thread_count 2
-#define location_count 3
+#define location_count (3 + thread_count)
+#ifdef waiting // set only to handoff, whose value the protocol defines after the shape
+#define history_depth 14
+#else
 #define history_depth 6
-#include "protocol.pml"
+#endif
+#include <epoch_claim/protocol.pml>
 
 bool maintained; // someone maintained holding the claim and reading the view
 byte finished;   // the roles that are done

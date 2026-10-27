@@ -10,31 +10,41 @@
  *  holder reads the tally relaxed, checks it counts every holder before it, and writes it back one
  *  higher, relaxed as well, so only the claim's acquire and release carry it between holders.
  *
- *  One holder at a time, every holder reads its predecessors' writes, and nobody parks for good:
- *  every taker's park ends with a release's notify.
- *
- *  Fairness is not asserted here, since two takers and one trier release the claim only as often
- *  as they take it; a taker against a holder retaking back to back is `stalled_committer.pml`'s
- *  `stalled_wait=until_taken` line, which starves.
+ *  - One holder at a time, and every holder reads its predecessors' writes.
+ *  - Nobody parks for good: every taker's park ends with a release's notify.
+ *  - Fairness is not asserted here.
  *
  *  @verify pass sc,rc11,far
- *  @verify fail rc11 take_order=order_relaxed: the @c fetch_or that takes the claim acquires;
- *      relaxed, the next holder reads the tally from before the last holder's increment
- *  @verify fail rc11 release_order=order_relaxed: the add that releases the claim releases;
- *      relaxed, the next holder reads the tally from before the last holder's increment
- *  @verify stuck far release_order=order_relaxed: a relaxed add is posted as RAO-INT's @c aadd,
- *      so the release's notify goes out before the add lands; the takers arriving in between read
- *      the epoch still held and park, and the add landing later notifies nobody
- *  @verify stuck sc recheck=false: a parked taker re-checks the epoch after it arms, as the futex
- *      does under its lock; without it, a release landing between the taker's load and its park
- *      notifies nobody, and the taker sleeps for good
- *  @verify pass sc,rc11 release_step=cleared: with finite holders a flag starves nobody, since the
- *      last release leaves it cleared and every parked taker wakes to it
+ *  @verify fail rc11 take_order=order_relaxed: relaxed, the next holder reads the tally from before
+ *      the last holder's increment
+ *  @verify fail rc11 release_order=order_relaxed: relaxed, the next holder reads the tally from
+ *      before the last holder's increment
+ *  @verify stuck far release_order=order_relaxed: the takers arriving in between read the epoch
+ *      still held and park, and the add landing later notifies nobody
+ *  @verify stuck sc recheck=false: without it, a release landing between the taker's load and its
+ *      park notifies nobody, and the taker sleeps for good
+ *  @verify pass sc,rc11 release_step=cleared: with finite holders a flag starves nobody
+ *  @verify pass sc waiting=handoff: a taker refused once announces itself and a releasing holder
+ *      hands it the claim
+ *  @verify stuck sc,rc11,far waiting=handoff release_look=false: with no look after letting go,
+ *      nobody hands it the claim
+ *  @verify pass sc waiting=handoff release_look=false announced_wait=until_stepped: parked on the
+ *      epoch instead, the announced taker wakes on the holder's step and retries the @c fetch_or
+ *  @verify fail sc,rc11,far waiting=handoff handoff_step=1: stepped by one it reads free, and a
+ *      @c take_if_free takes the claim beside the taker it was handed to
+ *  @verify fail rc11,far waiting=handoff handoff_order=order_relaxed: relaxed, the handed taker
+ *      reads the tally from before its predecessor's increment
+ *  @verify pass sc waiting=handoff handoff_order=order_relaxed: sequential memory carries the
+ *      predecessor's increment to the handed taker without the release
  */
 #define thread_count 3
-#define location_count 5
+#define location_count (5 + thread_count)
+#ifdef waiting // set only to handoff, whose value the protocol defines after the shape
+#define history_depth 22
+#else
 #define history_depth 10
-#include "protocol.pml"
+#endif
+#include <epoch_claim/protocol.pml>
 
 byte admitted; // holders so far, the tally's due
 

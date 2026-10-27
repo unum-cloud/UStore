@@ -106,7 +106,10 @@ enum class keep_t : std::uint8_t {
 /**
  *  @brief Orders @p deltas by their strings through @p sort_order and keeps one delta of every string, the first or
  *      the last given as @p keep says, packed at the front in string order.
+ *  @param[in,out] deltas The deltas to order, which end up with the kept ones packed at the front.
  *  @param[in] sort_order The StringZilla sort kernel src/ picked for the CPU, which orders bytes like @c memcmp.
+ *  @param[in] keep Whether the first or the last delta given for a string is the one kept.
+ *  @param[in] allocator Where the room for the order comes from.
  *  @return How many deltas were kept, or the status a kernel or the room for the order refused.
  */
 template <typename delta_type_, typename allocator_type_>
@@ -174,7 +177,9 @@ class sealed_deltas {
     /**
      *  @brief Sorts @p deltas by string in place through @p sort_order and copies them, strings and bytes alike, into
      *      columns on @p allocator.
+     *  @param[in,out] deltas The deltas to seal, which end up sorted.
      *  @param[in] sort_order The StringZilla sort kernel src/ picked for the CPU.
+     *  @param[in] allocator Where the columns are allocated.
      *  @retval invalid_argument_k No deltas, two deltas of one string, a removal carrying bytes, or a write carrying
      *      anything but one 16-byte value.
      *  @retval capacity_exhausted_k More string and value bytes than one sorted run file holds.
@@ -397,9 +402,11 @@ class memory_run {
     /**
      *  @brief The run one merge makes of @p versions, which come in string order with the versions of a string newest
      *      first, for runs of one tier it replaces.
+     *  @param[in] versions The versions to merge, in string order with the versions of a string newest first.
      *  @param[in] oldest_stamp The oldest stamp of the runs it replaces, which the run keeps covering where that
      *      version did not survive, so neighbouring runs still never overlap.
      *  @param[in] tier The tier of the runs it replaces, which the run is one above.
+     *  @param[in] allocator Where the merged run's columns are allocated.
      */
     static expected<memory_run> merged(std::span<stamped_delta_t const> versions, transaction_stamp_t oldest_stamp,
                                        std::uint32_t tier, allocator_t allocator = {}) noexcept {

@@ -246,10 +246,10 @@ class nvme_store {
 
     /**
      *  @brief An empty store over @p volume, whose memory is charged to @p constraint.
-     *  @param[inout] volume The volume every run lands on, borrowed and outliving the store.
+     *  @param[in,out] volume The volume every run lands on, borrowed and outliving the store.
      *  @param[in] config The bounds of the memory runs and the shape of the tree below.
-     *  @param[inout] constraint The budget the memory runs are charged to.
-     *  @param[inout] ledger The stamps the store's writes carry and its readers pin, outliving the store.
+     *  @param[in,out] constraint The budget the memory runs are charged to.
+     *  @param[in,out] ledger The stamps the store's writes carry and its readers pin, outliving the store.
      */
     static expected<nvme_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
                                       ledger_t& ledger) noexcept {
@@ -293,6 +293,7 @@ class nvme_store {
     /**
      *  @brief Whether anything carries @p text, copying its 16-byte value into @p value from a memory run or from a
      *      cell, with no I/O.
+     *  @param[in] text The string to look up.
      *  @param[out] value The value, written only for @c written_k.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
@@ -323,7 +324,11 @@ class nvme_store {
 
     /**
      *  @brief Copies the 16-byte value of @p text into @p into, as a database asks of every store, with no I/O.
+     *  @param[in] text The string to look up.
+     *  @param[out] into Room for the value's bytes.
      *  @param[out] size Bytes written, which is zero for every failure.
+     *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
+     *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
      *  @return @c not_found_k for a miss or a removal, @c invalid_argument_k for a buffer shorter than 16 bytes.
      */
     status_t select(io_channel_t&, std::string_view text, std::span<byte_t> into, stored_value_size_t& size,
@@ -339,7 +344,11 @@ class nvme_store {
     /**
      *  @brief Reads into @p page up to @c strings_page_k strings starting with @p prefix and not below @p from, in
      *      order, each with what its newest version at or below @p stamp carries, a removal included.
+     *  @param[in] prefix What every string of the page starts with.
+     *  @param[in] from The first string the page may hold.
      *  @param[in] stamp A stamp a reader pins, whose versions every merge keeps, so a walk reads every page at it.
+     *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
+     *  @param[out] page The strings read, each with what its newest version carries.
      *
      *  Every run gets a cursor over its window, newest first: the memory runs, then level zero youngest first, then
      *  the deeper levels. The page takes the smallest key among them, answers it from the first cursor holding a
@@ -642,8 +651,8 @@ class nvme_store {
 
     /**
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
-     *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
-     *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
+     *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
+     *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] compactor The compactor the database picked at open, which the tree passes over for runs carrying
      *      tails, as no device compaction is compiled for them.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.

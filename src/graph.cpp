@@ -2,7 +2,7 @@
  *  @file src/graph.cpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
- *  @brief Implements `c/ustore/graph.h`: routes every graph call to the graph verbs of the engine serving its
+ *  @brief Implements <tt>c/ustore/graph.h</tt>: routes every graph call to the graph verbs of the engine serving its
  *      database, and spells the vertex roles.
  */
 

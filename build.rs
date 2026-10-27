@@ -5,23 +5,20 @@
 //! storage engines. The sibling crates hand CMake their trees, and ForkUnion and StringZilla link their
 //! own archives, so the UStore archive leaves their objects out. The `ram` engine always builds; the
 //! `rocksdb`, `leveldb` and `nvme` features add theirs, and a missing one refuses to open at run time.
+//!
+//! File: build.rs
+//! Author: Ash Vardanian
+//! Date: September 16, 2026
 
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
 
-/// Every CMake option this crate sets, paired with the Cargo feature naming it - `None` stays off, since no
-/// feature turns it on.
-const KNOWN_OPTIONS: &[(&str, Option<&str>)] = &[
-    ("USTORE_WITH_ROCKSDB", Some("rocksdb")),
-    ("USTORE_WITH_LEVELDB", Some("leveldb")),
-    ("USTORE_WITH_SPDK", None),
-    ("USTORE_BUILD_TEST", None),
-    ("USTORE_BUILD_BENCH", None),
-    ("USTORE_BUILD_TOOLS", None),
-    ("USTORE_BUILD_LIB_PYTHON", None),
-    ("USTORE_BUILD_NVME", Some("nvme")),
-    ("USTORE_BUILD_CUDA", None),
+/// Every CMake option a Cargo feature turns on, paired with that feature.
+const KNOWN_OPTIONS: &[(&str, &str)] = &[
+    ("USTORE_WITH_ROCKSDB", "rocksdb"),
+    ("USTORE_WITH_LEVELDB", "leveldb"),
+    ("USTORE_WITH_NVME", "nvme"),
 ];
 
 /// The paths whose contents rebuild the libraries.
@@ -51,18 +48,20 @@ fn sibling_source(links: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if env::var_os("DOCS_RS").is_some() {
+        return Ok(());
+    }
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
 
     let mut build = cmake::Config::new(&manifest);
     build
-        .define("USTORE_BUILD_LIB_C", "ON")
+        .define("USTORE_BUILD_SHARED", "ON")
         .define("USTORE_INSTALL", "ON")
         .define("CMAKE_INSTALL_LIBDIR", "lib")
         .define("USTORE_BUNDLE_SIBLINGS", "OFF")
         .always_configure(false);
     for (option, feature) in KNOWN_OPTIONS {
-        let enabled = feature.is_some_and(feature_enabled);
-        build.define(*option, if enabled { "ON" } else { "OFF" });
+        build.define(*option, if feature_enabled(feature) { "ON" } else { "OFF" });
     }
     for (variable, links) in [
         ("FETCHCONTENT_SOURCE_DIR_FORKUNION", "forkunion"),

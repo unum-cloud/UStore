@@ -30,6 +30,9 @@ git config core.hooksPath .githooks
 The `release` and `relwithdebinfo` presets build with whatever toolchain the environment provides, MSVC, AppleClang, GCC or Clang.
 `debug`, `check`, `dev`, `trace`, `tsan`, `profile` and `cuda` take Clang and lld, whose sanitizer, tracing and line-table flags they use.
 `cuda` also hands Clang to `nvcc` as its host compiler, so the CUDA units mangle their templates like the C++ ones that link them.
+`dev` is the everyday tree `.clangd` reads: every CPU target at `-O2` with line tables.
+`trace` is `dev` plus `-ftime-trace`, writing a `.json` beside every object to show where compile time goes.
+`check` turns warnings into errors through `USTORE_WERROR`, and suites, benchmarks and tools are off unless a preset or `-D` asks for them.
 
 ## Layout and Namespaces
 
@@ -130,8 +133,9 @@ The arenas place their blocks with `fu_allocate_on_domain_id` and release them w
 - Docblock text sits two spaces past its asterisk, as in ` *  @brief`, and a continuation indents two more.
 - Declarations are documented with `/** */`, never with a bare `//` line above them, and every `/**` has an empty line above it.
 - A block that is one unstructured paragraph carries no `@brief`: `/** What it is. */`.
-- Every `@param` states its direction: `@param[in]`, `@param[out]` or `@param[inout]`.
-- No Markdown inside docblocks — no headings, bullets or `__bold__`; use `@note`, `@throws`, `@c`, `@p` and plain sentences.
+- Every `@param` states its direction: `@param[in]`, `@param[out]` or `@param[in,out]`.
+- No Markdown inside docblocks — no headings, bullets or `__bold__`, bar the `- @c status` list of `@par Statuses:`; use `@note`, `@throws`, `@c`, `@p` and plain sentences.
+- A closing `@par Statuses:` block lists only the statuses a verb's contract adds, while resource failures, cancellation, deferral and defects are covered once by the categories in the `ustore_status_t` docblock.
 - A code span inside a docblock is `@c token`, a shape or a range is `@b [minimum,maximum]` with the whitespace inside the brackets squeezed out, and a span too long for either becomes plain prose; backticks stay in `//` line comments and in the trailing comments of `#include` lines.
 - Backticks mark code, identifiers and literal values, never notation such as a mapping written with an arrow.
 - Prose arrows in comments and Markdown are → with a space on each side, never the ASCII `->`.
@@ -199,7 +203,7 @@ A function the headers declare without `USTORE_EXPORT` links against the archive
 
 ## Python Builds
 
-`pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `USTORE_BUILD_LIB_PYTHON=ON` and suites, benchmarks and tools off, then installs the `ustore_python` target into the wheel.
+`pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `USTORE_BUILD_PYTHON=ON`, leaving suites, benchmarks and tools at their default off, then installs the `ustore_python` target into the wheel.
 `python/CMakeLists.txt` defines that target as the C11 extension `ustore.lib` from `python/lib.c` and one source per C header beside it, linked against `ustore::static` and installed into the `python/ustore/` package, and the build tree lives in `build_python/`.
 Python suites sit in `test/` beside the C++ ones as `<topic>.py`, named so no module shadows a library it imports, and `pytest` collects every module there, running each case once per engine in `ustore.engines_compiled()`.
 
@@ -218,7 +222,7 @@ An engine is left out through `CMAKE_ARGS` or `--config-settings=cmake.define.US
 
 `Cargo.toml` and `build.rs` at the root build the crate from `rust/lib.rs`, and `build.rs` compiles no C or C++ itself.
 The crate's own usage is described in [`rust/README.md`](rust/README.md).
-It configures CMake with `USTORE_BUILD_LIB_C=ON`, `USTORE_INSTALL=ON` and suites off, installs into `OUT_DIR`, and links the `ustore_static` archive with the archives of the engines its features enable, and the target's C++ standard library.
+It configures CMake with `USTORE_BUILD_SHARED=ON` and `USTORE_INSTALL=ON`, installs into `OUT_DIR`, and links the `ustore_static` archive with the archives of the engines its features enable, and the target's C++ standard library.
 
 - __RAM__ always builds, in the `ustore_static` archive the crate links.
 - __rocksdb and leveldb__ are default features, each adding its engine to that library; without one, its `Database::open_*` fails with `Status::Unsupported`.

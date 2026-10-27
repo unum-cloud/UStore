@@ -6,6 +6,7 @@ authors = ["Ash Vardanian <info@unum.cloud>"]
 description = "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
 license = "Apache-2.0"
 repository = "https://github.com/unum-cloud/UStore"
+documentation = "https://docs.rs/ustore"
 links = "ustore"
 include = [
   "/Cargo.toml",
@@ -47,3 +48,6 @@ stringzilla = { version = "6.0.0-rc.1", default-features = false }
 
 [build-dependencies]
 cmake = "0.1"
+
+[package.metadata.docs.rs]
+features = ["serde"]

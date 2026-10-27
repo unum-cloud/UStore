@@ -4,6 +4,10 @@
 //! and values as a tape or through an accessor over the entries carrying them, so nothing is staged on the way in;
 //! outputs land in the [`Arena`] the call borrows, so nothing is copied on the way out. A blocking view takes borrowed
 //! or owned inputs, while a deferred one takes only owned ones, and both borrow the arena.
+//!
+//! File: rust/blobs.rs
+//! Author: Ash Vardanian
+//! Date: September 16, 2026
 
 use std::ffi::c_void;
 use std::marker::PhantomData;

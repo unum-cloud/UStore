@@ -2,6 +2,10 @@
 //!
 //! The pages modality is reached through its walk alone: a [`PagesCursor`] lists the keys of one pages collection,
 //! keeping those its filter, an XPath in StringZilla's subset, matches, with the pages rendered when asked.
+//!
+//! File: rust/pages.rs
+//! Author: Ash Vardanian
+//! Date: October 27, 2026
 
 use std::marker::PhantomData;
 use std::ptr;

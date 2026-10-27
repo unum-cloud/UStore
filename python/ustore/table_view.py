@@ -7,6 +7,10 @@ while a column without one is decoded from JSON. Every call reads into a one-off
 gathered column keeps alive for as long as Pandas holds it. Verbs that change columns, such as
 assignment, `update`, `drop`, `rename` and `merge_from`, write through to the store instead of
 answering a changed copy.
+
+File: python/ustore/table_view.py
+Author: Ash Vardanian
+Date: September 18, 2026
 """
 
 from __future__ import annotations
@@ -135,9 +139,11 @@ class RowSelection:
     """The rows of a table by key, as `table.loc[[key, ...]]` selects them."""
 
     def __init__(self, table: Table) -> None:
+        """Wraps the table whose rows this selects by key."""
         self.table = table
 
     def __getitem__(self, keys: Sequence[KeyLike]) -> SelectedRows:
+        """The rows of the given keys, to update."""
         return SelectedRows(self.table, keys)
 
 
@@ -145,6 +151,7 @@ class SelectedRows:
     """The rows `Table.loc` selected, which `update` merges fields into."""
 
     def __init__(self, table: Table, keys: Sequence[KeyLike]) -> None:
+        """Wraps the table and the keys of the selected rows."""
         self.table = table
         self.keys = keys
 
@@ -217,19 +224,23 @@ class Table:
         return list(found)
 
     def __len__(self) -> int:
+        """The number of documents in the view."""
         return len(self.index)
 
     @property
     def shape(self) -> tuple[int, int]:
+        """The number of documents and columns."""
         return len(self.index), len(self.columns)
 
     @property
     def size(self) -> int:
+        """The number of cells, documents times columns."""
         rows, columns = self.shape
         return rows * columns
 
     @property
     def empty(self) -> bool:
+        """Whether the view holds no document or no column."""
         return 0 in self.shape
 
     # endregion Shape
@@ -248,6 +259,7 @@ class Table:
         return self.derive(columns=selection)
 
     def head(self, count: int = 5) -> Table:
+        """A view of the first count documents."""
         return self.derive(index=self.index[:count])
 
     def sample(self, count: int) -> Table:
@@ -303,12 +315,15 @@ class Table:
         return pandas.concat(self.page_frame(list(rows), columns) for rows in batched(keys, page))
 
     def to_csv(self, path_or_buffer: Any = None, **options: Any) -> str | None:
+        """Exports the view as CSV through pandas, returning the text when no destination is given."""
         return self.to_pandas().to_csv(path_or_buffer, **options)
 
     def to_json(self, path_or_buffer: Any = None, **options: Any) -> str | None:
+        """Exports the view as JSON through pandas, returning the text when no destination is given."""
         return self.to_pandas().to_json(path_or_buffer, **options)
 
     def to_parquet(self, path: Any, **options: Any) -> None:
+        """Exports the view as a Parquet file through pandas."""
         self.to_pandas().to_parquet(path, **options)
 
     # endregion Exports

@@ -287,6 +287,9 @@ class deferred_blobs_collection_t : public deferred_blobs_read_collection_t {
      *  @param[in] keys Keys to write, owned by the call until it is final.
      *  @param[in] values One value per key, owned by the call until it is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p keys and @p values differ in count.
      */
     template <owned_array_concept<ustore_key_t> keys_type_>
     deferred<blobs_write_t> write(keys_type_ keys, values_tape_t values,

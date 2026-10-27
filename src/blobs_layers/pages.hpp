@@ -6,13 +6,13 @@
  *      its pages.
  *
  *  Every page reads as one value in its collection, its current shape: the dense element tree of
- *  `ustore/pages/element_tree.hpp` under the page key, so rendering a page is one read and one decode.
+ *  <tt>ustore/pages/element_tree.hpp</tt> under the page key, so rendering a page is one read and one decode.
  *
  *  An edit call reads the trees of the pages it touches and applies its tasks in order by the forgiving rules of
- *  `page_fold.hpp`, then hands the pages to a lander. An engine keeping every page as one value, served by the
- *  `*_over_blobs` verbs, reads the pages watched in a transaction, writes every tree back in one write, then removes
+ *  <tt>page_fold.hpp</tt>, then hands the pages to a lander. An engine keeping every page as one value, served by the
+ *  @c *_over_blobs verbs, reads the pages watched in a transaction, writes every tree back in one write, then removes
  *  the pages the call removed. The in-memory engine lands them the same way into its pages stores, inside one
- *  transaction. An engine keeping a page as its edits takes the chains of the `*_edits` calls, which read the pages
+ *  transaction. An engine keeping a page as its edits takes the chains of the @c *_edits calls, which read the pages
  *  unwatched, since the fold lets concurrent edits of one page land, and commits the edits of every page as one
  *  chain. An edit naming a missing page answers @c status_code_t::not_found_k, as a modification of a missing
  *  document does, while an edit of a missing element inside a page does nothing, as the fold does for racing edits.
@@ -74,7 +74,7 @@ using page_state_t = pages::page_state<page_allocator_t>;
 
 static_assert(sizeof(ustore_key_t) == sizeof(pages::element_key_t));
 
-/** The edits one page call made to one page, in task order, as a chain of `ustore/pages/page_edits.hpp`. */
+/** The edits one page call made to one page, in task order, as a chain of <tt>ustore/pages/page_edits.hpp</tt>. */
 struct page_edits_t {
     ustore_collection_id_t collection;
     ustore_key_t key;
@@ -112,8 +112,8 @@ inline std::uint64_t task_length(ustore_lengths_view_t lengths, std::size_t inde
 /** The bytes of @p value, empty for a missing one. */
 inline std::span<byte_t const> bytes_in(value_view_t value) noexcept { return {value.begin(), value.end()}; }
 
-/** The markup encoding @p encoding names, refusing HTML, Markdown and JSON as unsupported for now and any other value
- *  as unknown. */
+/** The markup encoding @p encoding names, refusing HTML, Markdown and JSON as unsupported for now
+ *  and any other value as unknown. */
 inline expected<pages::page_encoding_t> markup_encoding(ustore_page_encoding_t const& encoding) noexcept {
     // A C caller may pass any integer, which C++ may not load as the enum, so only the referenced bits are read
     switch (std::bit_cast<std::underlying_type_t<ustore_page_encoding_t>>(encoding)) {
@@ -152,8 +152,8 @@ inline bool needs_page(pages::edit_t const& edit) noexcept {
 
 #pragma region Touched Pages
 
-/** A page an edit call touches: where it lives, its tree as edited so far, whether it existed before the call, and the
- *  edits the call made to it, in task order. */
+/** A page an edit call touches: where it lives, its tree as edited so far, whether it existed
+ *  before the call, and the edits the call made to it, in task order. */
 struct touched_page_t {
     collection_key_t place;
     page_state_t state;
@@ -170,8 +170,8 @@ struct touched_pages_t {
     std::span<std::size_t> pages_of_tasks;
 };
 
-/** Reads the pages @p places address through @p view with the reads of @p land, each distinct page once, decoding
- *  every tree. */
+/** Reads the pages @p places address through @p view with the reads of @p land, each distinct page
+ *  once, decoding every tree. */
 template <typename lander_type_>
 expected<touched_pages_t> read_touched_pages(lander_type_ const& land, place_batch_t const& places,
                                              view_t const& view) noexcept {
@@ -206,8 +206,8 @@ expected<touched_pages_t> read_touched_pages(lander_type_ const& land, place_bat
     return touched_pages_t {pages, pages_of_tasks};
 }
 
-/** Reads the trees of the pages at @p places through @p view with the engine's own @p values_verbs, appending to its
- *  scratch rather than rewinding it. */
+/** Reads the trees of the pages at @p places through @p view with the engine's own @p values_verbs,
+ *  appending to its scratch rather than rewinding it. */
 inline expected<values_view_t> read_page_values(blobs_verbs<home_t::host_k> const& values_verbs,
                                                 ustore_database_t database, place_batch_t const& places,
                                                 view_t const& view) noexcept {
@@ -225,8 +225,8 @@ inline expected<values_view_t> read_page_values(blobs_verbs<home_t::host_k> cons
     return values_view_t {places.count, presences, contents};
 }
 
-/** Writes every tree of @p pages that exists in one write through @p view with the engine's own @p values_verbs, then
- *  removes the pages that stopped existing. */
+/** Writes every tree of @p pages that exists in one write through @p view with the engine's own
+ *  @p values_verbs, then removes the pages that stopped existing. */
 inline status_t write_touched_pages(blobs_verbs<home_t::host_k> const& values_verbs, ustore_database_t database,
                                     std::span<touched_page_t> pages, ustore_durability_t durability,
                                     ustore_watch_t watch, view_t const& view) noexcept {
@@ -281,9 +281,9 @@ inline status_t write_touched_pages(blobs_verbs<home_t::host_k> const& values_ve
     return values_verbs.remove(remove, view);
 }
 
-/** Lands an edit call on an engine keeping every page as one value, reading the pages watched through its own
- *  @c values_verbs, as a transaction watches the pages it rewrites whatever the caller asked of the writes, and
- *  writing every tree back through them. */
+/** Lands an edit call on an engine keeping every page as one value, reading the pages watched
+ *  through its own @c values_verbs, as a transaction watches the pages it rewrites whatever the
+ *  caller asked of the writes, and writing every tree back through them. */
 struct rewritten_pages_t {
     static constexpr ustore_watch_t reads_watch_k = ustore_watch_keys_k;
 
@@ -302,8 +302,9 @@ struct rewritten_pages_t {
     }
 };
 
-/** Lands an edit call on an engine keeping a page as its edits, reading the pages unwatched through its own
- *  @c values_verbs and encoding the edits of every page as one chain into @c chains, which the engine commits. */
+/** Lands an edit call on an engine keeping a page as its edits, reading the pages unwatched through
+ *  its own @c values_verbs and encoding the edits of every page as one chain into @c chains, which
+ *  the engine commits. */
 struct appended_edits_t {
     static constexpr ustore_watch_t reads_watch_k = ustore_watch_none_k;
 
@@ -343,10 +344,11 @@ concept edit_maker =
  *  @brief Applies the edit @p make_edit answers for every task of @p arguments, in order, to the pages they name, read
  *      through @p land, and lands them through @p land.
  *
- *  A lander answers `read(places, view)`, the trees of the pages at @c places as values appended to the scratch, read
- *  as its @c reads_watch_k asks, and lands the edited pages when called as `land(arguments, pages, view)`. Refuses an
- *  edit of a missing page, other than an import or the removal of a whole page, with @c status_code_t::not_found_k,
- *  and writes nothing on any failure.
+ *  A lander answers <tt>read(places, view)</tt>, the trees of the pages at @c places as values
+ *  appended to the scratch, read as its @c reads_watch_k asks, and lands the edited pages when
+ *  called as <tt>land(arguments, pages, view)</tt>. Refuses an edit of a missing page, other than
+ *  an import or the removal of a whole page, with @c status_code_t::not_found_k, and writes nothing
+ *  on any failure.
  */
 template <typename arguments_type_, edit_maker make_edit_type_, typename lander_type_>
 status_t edit_pages(arguments_type_ const& arguments, view_t const& view, make_edit_type_&& make_edit,
@@ -542,9 +544,10 @@ status_t serve_remove_attributes(ustore_pages_remove_attributes_t const& argumen
 
 #pragma region Page Calls
 
-/** The edit chains of the page edit calls of an engine keeping a page as its edits, checked and applied over the pages
- *  read unwatched through @p values_verbs, so concurrent edits of one page both land, leaving the chain of every page
- *  the call touched in the scratch of the call for the engine to commit. */
+/** The edit chains of the page edit calls of an engine keeping a page as its edits, checked and
+ *  applied over the pages read unwatched through @p values_verbs, so concurrent edits of one page
+ *  both land, leaving the chain of every page the call touched in the scratch of the call for the
+ *  engine to commit. */
 inline expected<std::span<page_edits_t const>> pages_import_edits(blobs_verbs<home_t::host_k> const& values_verbs,
                                                                   ustore_pages_import_t const& arguments,
                                                                   strings_arg_t const& values,
@@ -616,8 +619,9 @@ inline expected<std::span<page_edits_t const>> pages_remove_attributes_edits(
     return chains;
 }
 
-/** Implements @c ustore_pages_read over the trees @p read_trees answers, called as `read_trees()` for the pages the
- *  call names, task by task, as values appended to the scratch. */
+/** Implements @c ustore_pages_read over the trees @p read_trees answers, called as
+ *  <tt>read_trees()</tt> for the pages the call names, task by task, as values appended to the
+ *  scratch. */
 template <typename read_trees_type_>
 status_t read_pages(ustore_pages_read_t const& arguments, view_t const& view, read_trees_type_&& read_trees) noexcept {
     if (!arguments.count) return {};
@@ -668,9 +672,9 @@ status_t read_pages(ustore_pages_read_t const& arguments, view_t const& view, re
 
 #pragma region Pages over Blobs
 
-/** The page verbs of an engine keeping every page as one value, its dense element tree, bound to its unchecked
- *  whole-value verbs @p values_verbs_ and its resolver @p resolve_, which refuses every collection holding another
- *  modality first. */
+/** The page verbs of an engine keeping every page as one value, its dense element tree, bound to
+ *  its unchecked whole-value verbs @p values_verbs_ and its resolver @p resolve_, which refuses
+ *  every collection holding another modality first. */
 template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_import_over_blobs(ustore_pages_import_t const& arguments, strings_arg_t const& values,
                                  view_t const& view) noexcept {

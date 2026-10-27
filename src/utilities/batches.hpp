@@ -17,7 +17,7 @@ namespace unum::ustore::utilities {
 
 #pragma region Argument Packs
 
-/** Reads string `index` of a ragged input in any layout, the accessor's views gathered into scratch beforehand. */
+/** Reads string @c index of a ragged input in any layout, the accessor's views gathered into scratch beforehand. */
 struct strings_arg_t {
 
     /** The input as the caller passed it. */

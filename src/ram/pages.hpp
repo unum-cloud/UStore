@@ -2,14 +2,15 @@
  *  @file src/ram/pages.hpp
  *  @author Ash Vardanian
  *  @date October 25, 2026
- *  @brief The pages calls of the C ABI over the pages stores of `src/ram/database.hpp`, for the in-memory engine's
- *      tables.
+ *  @brief The pages calls of the C ABI over the pages stores of <tt>src/ram/database.hpp</tt>, for
+ *      the in-memory engine's tables.
  *
- *  Every page is its dense element tree, filed under its key in the pages store of its collection. An edit call reads
- *  the trees of the pages it touches, watched, applies its tasks by `ustore/pages/page_edits.hpp` through the paths of
- *  `src/blobs_layers/pages.hpp`, and writes every new tree back or erases the pages it removed, inside one SmashTable
- *  transaction: the caller's, or one of the call's own, retried on conflicts. A read renders the trees as the view
- *  sees them. A call naming a collection of another modality is refused.
+ *  Every page is its dense element tree, filed under its key in the pages store of its collection.
+ *  An edit call reads the trees of the pages it touches, watched, applies its tasks by
+ *  <tt>ustore/pages/page_edits.hpp</tt> through the paths of <tt>src/blobs_layers/pages.hpp</tt>,
+ *  and writes every new tree back or erases the pages it removed, inside one SmashTable
+ *  transaction: the caller's, or one of the call's own, retried on conflicts. A read renders the
+ *  trees as the view sees them. A call naming a collection of another modality is refused.
  */
 
 #pragma once
@@ -29,8 +30,8 @@ namespace unum::ustore::ram {
 
 #pragma region Page Calls
 
-/** Reads the trees of the pages at @p places through @p source watching as @p view asks, appending them to its
- *  scratch, and recording into @p failure the failure of the stores. */
+/** Reads the trees of the pages at @p places through @p source watching as @p view asks, appending
+ *  them to its scratch, and recording into @p failure the failure of the stores. */
 template <typename source_type_>
 expected<values_view_t> read_page_trees(source_type_& source, place_batch_t const& places, view_t const& view,
                                         store_status_t& failure) noexcept {
@@ -41,9 +42,10 @@ expected<values_view_t> read_page_trees(source_type_& source, place_batch_t cons
     return values_view_t {places.count, presences, trees};
 }
 
-/** Lands an edit call on the pages stores of a transaction, reading the pages watched, as a transaction watches the
- *  pages it rewrites whatever the caller asked of the writes, and staging every new tree, recording into @c failure
- *  the first failure of the stores, which a commit retries when it is a conflict. */
+/** Lands an edit call on the pages stores of a transaction, reading the pages watched, as a
+ *  transaction watches the pages it rewrites whatever the caller asked of the writes, and staging
+ *  every new tree, recording into @c failure the first failure of the stores, which a commit
+ *  retries when it is a conflict. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct pages_in_store {
     static constexpr ustore_watch_t reads_watch_k = ustore_watch_keys_k;
@@ -89,8 +91,8 @@ struct pages_in_store {
     }
 };
 
-/** Serves an edit call of @p arguments through @p serve_edits, called as `serve_edits(land)` with the lander of the
- *  pages stores, inside one transaction. */
+/** Serves an edit call of @p arguments through @p serve_edits, called as <tt>serve_edits(land)</tt>
+ *  with the lander of the pages stores, inside one transaction. */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename arguments_type_, typename serve_edits_type_>
 status_t edit_in_store(database_state<cpu_class_, isolation_>& state, arguments_type_ const& arguments,
                        view_t const& view, serve_edits_type_&& serve_edits) noexcept {

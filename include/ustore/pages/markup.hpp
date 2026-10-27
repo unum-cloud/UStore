@@ -5,20 +5,23 @@
  *  @brief Markup in and out of element trees: XML and plain text imported through an own tokenizer and rendered back,
  *      and XPath spans over rendered XML through StringZilla's subdocuments.
  *
- *  The tokenizer reads elements, attributes, character data, CDATA sections and comments, skips the XML declaration,
- *  processing instructions and a DOCTYPE without an internal subset, and refuses what well-formed XML forbids as
- *  @c status_code_t::malformed_k, as `c/ustore/pages.h` answers a fragment that does not parse: unbalanced tags, a
- *  repeated attribute, a `<` inside an attribute value, `]]>` inside character data, and any `&` starting neither
- *  one of the five predefined entities nor a reference to a character XML allows. Those are decoded in one batch
- *  per document by StringZilla's HTML unescape.
+ *  The tokenizer reads elements, attributes, character data, CDATA sections and comments, skips the
+ *  XML declaration, processing instructions and a DOCTYPE without an internal subset, and refuses
+ *  what well-formed XML forbids as @c status_code_t::malformed_k, as <tt>c/ustore/pages.h</tt>
+ *  answers a fragment that does not parse: unbalanced tags, a repeated attribute, a <tt>&lt;</tt>
+ *  inside an attribute value, <tt>]]&gt;</tt> inside character data, and any <tt>&amp;</tt>
+ *  starting neither one of the five predefined entities nor a reference to a character XML allows.
+ *  Those are decoded in one batch per document by StringZilla's HTML unescape.
  *
  *  The tree follows the character data: an element's text before its first child is its own text run, every later run
  *  becomes a text element, CDATA joins the run around it, and the root holds no text of its own, so a fragment's
  *  leading text lands as an element of its own. Attribute values keep their whitespace unnormalized.
  *
- *  Rendering escapes `&`, `<` and `>` in text and `&`, `<` and `"` in attributes, writes elements without content as
- *  `<name/>`, and renders an element without a name, such as the root, as its content alone. Importing a rendering
- *  renders it again byte for byte. HTML, Markdown and the JSON tree answer @c status_code_t::unsupported_k for now.
+ *  Rendering escapes <tt>&amp;</tt>, <tt>&lt;</tt> and <tt>&gt;</tt> in text and <tt>&amp;</tt>,
+ *  <tt>&lt;</tt> and <tt>"</tt> in attributes, writes elements without content as
+ *  <tt>&lt;name/&gt;</tt>, and renders an element without a name, such as the root, as its content
+ *  alone. Importing a rendering renders it again byte for byte. HTML, Markdown and the JSON tree
+ *  answer @c status_code_t::unsupported_k for now.
  */
 
 #pragma once
@@ -58,7 +61,7 @@ enum class page_encoding_t : std::uint8_t {
     json_k = 4,
 };
 
-/** Where an element's rendering spans in its output, from its `<` through its end tag. */
+/** Where an element's rendering spans in its output, from its <tt>&lt;</tt> through its end tag. */
 struct element_span_t {
 
     /** The element rendered. */
@@ -167,8 +170,8 @@ constexpr bool xml_character(std::uint32_t code) noexcept {
            (code >= 0xE000 && code <= 0xFFFD) || (code >= 0x10000 && code <= 0x10FFFF);
 }
 
-/** Whether every `&` of @p run starts one of the five predefined entities or a character reference to a character XML
- *  allows, as well-formed XML without a DOCTYPE subset needs. */
+/** Whether every <tt>&amp;</tt> of @p run starts one of the five predefined entities or a character
+ *  reference to a character XML allows, as well-formed XML without a DOCTYPE subset needs. */
 constexpr bool references_well_formed(std::string_view run) noexcept {
     for (std::size_t at = run.find('&'); at != std::string_view::npos; at = run.find('&', at + 1)) {
         std::size_t const end = run.find(';', at + 1);
@@ -197,13 +200,13 @@ constexpr bool references_well_formed(std::string_view run) noexcept {
 /** What a token of XML is. */
 enum class xml_token_kind_t : std::uint8_t {
 
-    /** A start tag, `<name ...>`. */
+    /** A start tag, <tt>&lt;name ...&gt;</tt>. */
     open_k = 0,
 
-    /** An empty-element tag, `<name .../>`. */
+    /** An empty-element tag, <tt>&lt;name .../&gt;</tt>. */
     empty_k = 1,
 
-    /** An end tag, `</name>`. */
+    /** An end tag, <tt>&lt;/name&gt;</tt>. */
     close_k = 2,
 
     /** Character data between markup. */
@@ -230,8 +233,8 @@ struct xml_token_t {
     std::uint32_t first_attribute = 0;
     std::uint32_t attributes_count = 0;
 
-    /** The string of the unescaped character data in the tokenizer's tape, or @c no_element_k when nothing was
-     *  escaped. */
+    /** The string of the unescaped character data in the tokenizer's tape, or @c no_element_k when
+     *  nothing was escaped. */
     std::uint32_t unescaped = no_element_k;
 };
 
@@ -477,8 +480,13 @@ class xml_tokenizer {
 
 /**
  *  @brief Replaces @p tree with @p xml parsed under a root keyed @p root_key, every element placed at @p placement.
+ *  @param[in] xml The document to parse.
+ *  @param[in] root_key The key of the root element.
+ *  @param[in] placement Where every element is placed.
  *  @param[in] mint Called once per element in document order for its key, so an insertion can hand out the given
  *      key first and minted ones after.
+ *  @param[out] tree The element tree, replacing what it held.
+ *  @param[in] capabilities What the CPU runs, which bounds the kernel picked.
  */
 template <typename allocator_type_, typename mint_type_>
 status_t import_xml(std::string_view xml, element_key_t const& root_key, placement_t placement, mint_type_&& mint,
@@ -561,8 +569,8 @@ status_t import_text(std::string_view text, element_key_t const& root_key, place
     return tree.append(tree.root(), mint(), element_kind_t::text_k, {}, text, placement).status();
 }
 
-/** Replaces @p tree with @p markup in @p encoding, unescaping through the StringZilla kernels @p capabilities allow,
- *  answering @c status_code_t::unsupported_k for HTML, Markdown and JSON. */
+/** Replaces @p tree with @p markup in @p encoding, unescaping through the StringZilla kernels
+ *  @p capabilities allow, answering @c status_code_t::unsupported_k for HTML, Markdown and JSON. */
 template <typename allocator_type_, typename mint_type_>
 status_t import_markup(page_encoding_t encoding, std::string_view markup, element_key_t const& root_key,
                        placement_t placement, mint_type_&& mint, element_tree<allocator_type_>& tree,
@@ -587,7 +595,8 @@ status_t append_bytes(st::basic_vector<char, output_allocator_type_>& output, st
     return {};
 }
 
-/** Appends @p bytes to @p output with `&`, `<` and `>` escaped, and `"` too inside an attribute. */
+/** Appends @p bytes to @p output with <tt>&amp;</tt>, <tt>&lt;</tt> and <tt>&gt;</tt> escaped, and
+ *  <tt>"</tt> too inside an attribute. */
 template <typename output_allocator_type_>
 status_t append_escaped(st::basic_vector<char, output_allocator_type_>& output, std::string_view bytes,
                         bool inside_attribute) noexcept {
@@ -697,8 +706,8 @@ status_t render_xml(element_tree<tree_allocator_type_> const& tree, element_inde
         });
 }
 
-/** Appends the text of every element and text element under @p from to @p output in document order, comments
- *  dropped. */
+/** Appends the text of every element and text element under @p from to @p output in document order,
+ *  comments dropped. */
 template <typename tree_allocator_type_, typename output_allocator_type_>
 status_t render_text(element_tree<tree_allocator_type_> const& tree, element_index_t from,
                      st::basic_vector<char, output_allocator_type_>& output) noexcept {
@@ -709,8 +718,8 @@ status_t render_text(element_tree<tree_allocator_type_> const& tree, element_ind
     return {};
 }
 
-/** Appends the subtree of @p from to @p output in @p encoding, answering @c status_code_t::unsupported_k for HTML,
- *  Markdown and JSON. */
+/** Appends the subtree of @p from to @p output in @p encoding, answering
+ *  @c status_code_t::unsupported_k for HTML, Markdown and JSON. */
 template <typename tree_allocator_type_, typename output_allocator_type_>
 status_t render_markup(element_tree<tree_allocator_type_> const& tree, element_index_t from, page_encoding_t encoding,
                        st::basic_vector<char, output_allocator_type_>& output) noexcept {
@@ -727,9 +736,12 @@ status_t render_markup(element_tree<tree_allocator_type_> const& tree, element_i
 
 /**
  *  @brief Every node of @p xml that one of @p paths selects, as StringZilla's XPath subset defines them, through the
- *      best kernel of `stringzilla/subdocuments.h` that @p capabilities allow.
+ *      best kernel of <tt>stringzilla/subdocuments.h</tt> that @p capabilities allow.
+ *  @param[in] xml The document, which needs one root element.
+ *  @param[in] paths The paths to select by.
  *  @param[out] matches The matches by start offset, then by path, each spanning an element through its end tag, an
  *      attribute value, or a text node.
+ *  @param[in] capabilities What the CPU runs, which bounds the kernel picked.
  *  @return @c status_code_t::malformed_k for a path outside the subset or malformed XML, which needs one root element.
  */
 template <typename allocator_type_>

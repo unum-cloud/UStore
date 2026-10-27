@@ -2,12 +2,13 @@
  *  @file src/nvme/graph.hpp
  *  @author Ash Vardanian
  *  @date December 1, 2022
- *  @brief The graph calls of the C ABI over the graph stores of `include/ustore/graph/nvme_store.hpp`, for the NVMe
- *      engine's table.
+ *  @brief The graph calls of the C ABI over the graph stores of
+ *      <tt>include/ustore/graph/nvme_store.hpp</tt>, for the NVMe engine's table.
  *
- *  These calls build on the accesses, the writes and the collection lookups of `src/nvme/database.hpp`. Every vertex
- *  is one key of its graph collection, holding the half-edges of `include/ustore/graph/adjacency_fold.hpp`, and every
- *  edge is a half-edge filed under each of its ends.
+ *  These calls build on the accesses, the writes and the collection lookups of
+ *  <tt>src/nvme/database.hpp</tt>. Every vertex is one key of its graph collection, holding the
+ *  half-edges of <tt>include/ustore/graph/adjacency_fold.hpp</tt>, and every edge is a half-edge
+ *  filed under each of its ends.
  *
  *  A write appends one change delta per touched vertex and reads nothing, so two transactions adding edges to one
  *  vertex both commit. What a write does depend on is watched, as a read is: a vertex an edge or a vertex write

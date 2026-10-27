@@ -445,7 +445,7 @@ class single_collection_database_snapshot {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, which needs only the value's own bytes.
-     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the read is submitted and completed on, held by the calling thread.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
@@ -457,7 +457,7 @@ class single_collection_database_snapshot {
 
     /**
      *  @brief Reads the values of @p stored_keys, refilling the channel as completions retire.
-     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from a removal.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
@@ -530,7 +530,7 @@ class single_collection_database_transaction {
 
     /**
      *  @brief A transaction started at the newest stamp @p manager has published, which it pins until it dies.
-     *  @param[inout] manager The registry this transaction stages and commits through, outliving it.
+     *  @param[in,out] manager The registry this transaction stages and commits through, outliving it.
      *  @param[in] deltas The deltas the uncommitted writes land in, moved in and owned from here on.
      *  @param[in] resources The budget the watched keys are charged to.
      */
@@ -689,7 +689,7 @@ class single_collection_database_transaction {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, from this transaction or from the database.
-     *  @param[inout] channel The channel a read of the database is submitted and completed on, held by the caller.
+     *  @param[in,out] channel The channel a read of the database is submitted and completed on, held by the caller.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
@@ -724,7 +724,7 @@ class single_collection_database_transaction {
 
     /**
      *  @brief Reads the values of @p stored_keys, this transaction's own writes ahead of the database.
-     *  @param[inout] channel The channel a read of the database is submitted and completed on, held by the caller.
+     *  @param[in,out] channel The channel a read of the database is submitted and completed on, held by the caller.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from a removal.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
@@ -1054,10 +1054,10 @@ class basic_single_collection_database {
 
     /**
      *  @brief Opens a database over @p volume, creating its schema blob when the volume holds none.
-     *  @param[inout] volume The volume every run and blob lands on, borrowed and outliving the database.
-     *  @param[inout] writing_channel The channel every write, flush and commit runs on, borrowed for the database's
+     *  @param[in,out] volume The volume every run and blob lands on, borrowed and outliving the database.
+     *  @param[in,out] writing_channel The channel every write, flush and commit runs on, borrowed for the database's
      *      life.
-     *  @param[inout] merging_channel The second channel a compaction writes its new runs on, which is not @p
+     *  @param[in,out] merging_channel The second channel a compaction writes its new runs on, which is not @p
      *      writing_channel.
      *  @param[in] config The collection's bounds and the transaction defaults.
      *  @param[in] resources The budget the conflict record, the roster and every transaction's writes are charged to.
@@ -1138,7 +1138,7 @@ class basic_single_collection_database {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, which needs only the value's own bytes.
-     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the read is submitted and completed on, held by the calling thread.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
@@ -1151,7 +1151,7 @@ class basic_single_collection_database {
 
     /**
      *  @brief Reads the values of @p stored_keys, refilling the channel as completions retire.
-     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from a removal.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.

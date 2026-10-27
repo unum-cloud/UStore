@@ -334,7 +334,7 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Binds @p queue pair and its ring to the calling thread, which is how a moved queue pair changes hands.
-     *  @param[in] queue pair The queue pair this thread has just taken over, with nothing outstanding on it.
+     *  @param[in] queue_pair The queue pair this thread has just taken over, with nothing outstanding on it.
      *
      *  @note The ring moves with the queue pair, which must be empty before it moves, since completions of
      *      requests the thread before submitted would land with a thread that never tracked them.
@@ -354,7 +354,7 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Takes @p queue pair back once it has nothing outstanding, and empties the handle.
-     *  @param[inout] queue pair The queue pair to return, surrendered on success and untouched on failure.
+     *  @param[in,out] queue_pair The queue pair to return, surrendered on success and untouched on failure.
      */
     status_t release_queue_pair(queue_pair_t& queue_pair) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
@@ -409,7 +409,7 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Gives @p registered memory back, refusing while the kernel may still be writing into it.
-     *  @param[inout] registered memory The range to give back, surrendered on success.
+     *  @param[in,out] registered_memory The range to give back, surrendered on success.
      */
     status_t unregister_memory(registered_memory_t& registered_memory) noexcept {
         registered_memory_slot_t* const slot = slot_of_(registered_memory);
@@ -465,7 +465,7 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Closes @p registered medium, refusing while requests against it are still in flight.
-     *  @param[inout] registered medium The medium to give back, surrendered on success.
+     *  @param[in,out] registered_medium The medium to give back, surrendered on success.
      */
     status_t unregister_medium(registered_medium_t& registered_medium) noexcept {
         registered_medium_slot_t* const slot = slot_of_(registered_medium);
@@ -488,7 +488,7 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Takes as much of @p requests as @p queue pair still has credit for, and never waits.
-     *  @param[in] queue pair The queue pair submitting, held by the calling thread.
+     *  @param[in] queue_pair The queue pair submitting, held by the calling thread.
      *  @param[in] requests The batch, of which a prefix is taken.
      *  @return How many were taken, which is zero on a full ring and never a reason to block.
      */
@@ -562,7 +562,7 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Runs this ring's pending completion work and copies what landed into @p into.
-     *  @param[in] queue pair The queue pair polling, held by the calling thread that submitted on it.
+     *  @param[in] queue_pair The queue pair polling, held by the calling thread that submitted on it.
      *  @param[out] into Room for completions, which bounds how many one call moves.
      *  @return How many completions were moved, which is zero when nothing has landed.
      *
@@ -589,7 +589,7 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Asks the kernel to stop everything @p queue pair has in flight, which poll reports cancelled.
-     *  @param[in] queue pair The queue pair to stop, whose started requests still run to their own end.
+     *  @param[in] queue_pair The queue pair to stop, whose started requests still run to their own end.
      *
      *  @note The cancelling entry posts a completion of its own, which poll recognises and drops, so
      *      the queue pair still sees exactly one completion per request it submitted.
@@ -613,7 +613,7 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Finishes and discards everything @p queue pair has outstanding, so its buffers may be freed.
-     *  @param[in] queue pair The queue pair to empty, which may be cancelled or still running.
+     *  @param[in] queue_pair The queue pair to empty, which may be cancelled or still running.
      */
     status_t drain(queue_pair_t const& queue_pair) noexcept {
         queue_pair_slot_t const* const slot = slot_of_(queue_pair);

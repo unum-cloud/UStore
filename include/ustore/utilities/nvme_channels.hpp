@@ -97,8 +97,8 @@ class registered_memory_arena {
 
     /**
      *  @brief Allocates, charges and registers one arena against @p disk.
-     *  @param[inout] disk The ring the arena is pinned in, which must outlive the arena.
-     *  @param[inout] constraint The budget the whole arena is charged to, once.
+     *  @param[in,out] disk The ring the arena is pinned in, which must outlive the arena.
+     *  @param[in,out] constraint The budget the whole arena is charged to, once.
      *  @param[in] config Bytes and placement, both fixed from here on.
      *  @return The arena, or @c out_of_memory_k when the budget or the allocator refuses it.
      */
@@ -572,7 +572,7 @@ class basic_io_channel_pool {
 
     /**
      *  @brief Opens one channel per executor thread plus @p shared_io_channels more, over @p range.
-     *  @param[inout] disk The ring every channel queue pairs from, which must outlive the pool.
+     *  @param[in,out] disk The ring every channel queue pairs from, which must outlive the pool.
      *  @param[in] range The registered range the channels carve their blocks out of, outliving the pool.
      *  @param[in] threads Executor threads, each of which gets a channel of its own.
      *  @param[in] shared_io_channels Channels threads outside the executor claim, at least one.

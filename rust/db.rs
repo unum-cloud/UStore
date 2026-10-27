@@ -9,6 +9,10 @@
 //!
 //! The view also chooses how its verbs complete: every verb of a [`View`] blocks and answers what its call produced,
 //! while the same verb of a [`DeferredView`] submits the call to an [`Executor`] and answers a [`Deferred`] at once.
+//!
+//! File: rust/db.rs
+//! Author: Ash Vardanian
+//! Date: September 16, 2026
 
 use std::any::Any;
 use std::ffi::{c_char, c_void, CStr};
@@ -4092,7 +4096,6 @@ mod tests {
             "unknown".parse::<Role>().is_err(),
             "a role the binding never passes is refused"
         );
-        assert!(version().starts_with(concat!(env!("CARGO_PKG_VERSION_MAJOR"), ".")));
     }
 
     #[test]

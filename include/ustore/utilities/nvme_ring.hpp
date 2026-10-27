@@ -317,10 +317,8 @@ class countdown {
     }
 
     /**
-     *  @brief Waits until every part reports or one fails, running @p task between polls.
+     *  @brief Waits until every part reports or one fails.
      *
-     *  @param[in] task What the waiting thread does while it waits, which is the executor's own
-     *      work where there is any; the default hands the core back to the scheduler.
      *  @return Whether every part succeeded.
      */
     bool wait() noexcept {
@@ -887,7 +885,7 @@ enum class file_id_t : int {
     invalid_k = -1,
 };
 
-/** Whether a file operation blocks the caller or completes through `io_uring`. */
+/** Whether a file operation blocks the caller or completes through @c io_uring. */
 enum class execution_policy_t {
     sync_k,
     async_k,
@@ -1593,8 +1591,8 @@ inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
 
 /**
  *  @brief Reaps until @p wanted completions are in @p into, or the spin budget runs out.
- *  @param[inout] disk The ring the queue pair polls from.
- *  @param[in] queue pair The queue pair whose completions are wanted, held by the calling thread.
+ *  @param[in,out] disk The ring the queue pair polls from.
+ *  @param[in] queue_pair The queue pair whose completions are wanted, held by the calling thread.
  *  @param[out] into Room for the completions, which bounds how many may be wanted.
  *  @param[in] wanted Completions to wait for, at most the size of @p into.
  *  @param[in] spins_limit Spins before the wait gives up, which a healthy ring never reaches.

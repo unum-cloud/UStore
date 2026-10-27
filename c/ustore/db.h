@@ -47,8 +47,8 @@ typedef struct ustore_view_handle_t* ustore_view_t;
 /**
  *  @brief Sixteen bytes naming one thing everywhere, ordered as their bytes and compared with @c memcmp.
  *
- *  An integer spells as its 128-bit big-endian bytes, as Python's `uuid.UUID(int=...)` does, so identifiers made from
- *  integers order as the integers.
+ *  An integer spells as its 128-bit big-endian bytes, as Python's <tt>uuid.UUID(int=...)</tt> does,
+ *  so identifiers made from integers order as the integers.
  */
 typedef struct ustore_uuid_t {
     uint8_t bytes[16];
@@ -290,6 +290,13 @@ typedef struct ustore_database_init_ram_t {
 /**
  *  @brief Starts an empty database of the in-memory engine, which persists nowhere.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_device_k The executor computes on a device.
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, or the isolation is
+ *    unknown.
  */
 USTORE_EXPORT void ustore_database_init_ram(ustore_database_init_ram_t* arguments);
 
@@ -320,6 +327,16 @@ typedef struct ustore_database_open_ram_t {
  *  @brief Serves a directory in place through the in-memory engine, loading the image it holds, if any, and rewriting
  *      it whole on a flushed commit and on close.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_device_k The executor computes on a device.
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_invalid_argument_k The @c directory is empty, the @c database output is
+ *    @c NULL, or the isolation is unknown.
+ *  - @c ustore_status_not_found_k The directory does not exist.
+ *  - @c ustore_status_malformed_k The image has an unknown format, is truncated or names an unknown
+ *    modality.
  */
 USTORE_EXPORT void ustore_database_open_ram(ustore_database_open_ram_t* arguments);
 
@@ -349,8 +366,20 @@ typedef struct ustore_database_open_rocksdb_t {
 
 } ustore_database_open_rocksdb_t;
 
-/** Serves a directory in place through the RocksDB engine, creating the database when it holds none, or reports
- *  @c ustore_status_unsupported_k in a library built without the engine. */
+/**
+ *  Serves a directory in place through the RocksDB engine, creating the database when it holds none.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_unsupported_k The library was built without the engine.
+ *  - @c ustore_status_device_k The executor computes on a device.
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
+ *    empty, or the counted @c data_directories are @c NULL or one has an empty path.
+ *  - @c ustore_status_not_found_k The directory does not exist.
+ *  - @c ustore_status_malformed_k A column family or a collections entry is of another layout or
+ *    corrupt.
+ */
 USTORE_EXPORT void ustore_database_open_rocksdb(ustore_database_open_rocksdb_t* arguments);
 
 /** The arguments of @c ustore_database_view_rocksdb. */
@@ -380,13 +409,23 @@ typedef struct ustore_database_view_rocksdb_t {
 } ustore_database_view_rocksdb_t;
 
 /**
- *  @brief Serves a directory in place through the RocksDB engine, read-only, or reports
- *      @c ustore_status_unsupported_k in a library built without the engine.
+ *  @brief Serves a directory in place through the RocksDB engine, read-only.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  The database reads the state its directory held at open, and refuses every call that would change it with
  *  @c ustore_status_read_only_k: writes, removes, transactions, collection creates and drops, clears and compactions.
  *  Snapshots and their saves still serve.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_unsupported_k The library was built without the engine.
+ *  - @c ustore_status_device_k The executor computes on a device.
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
+ *    empty, or the counted @c data_directories are @c NULL or one has an empty path.
+ *  - @c ustore_status_not_found_k The directory does not exist.
+ *  - @c ustore_status_malformed_k A column family or a collections entry is of another layout or
+ *    corrupt, the system collections are missing, or a crashed create or drop left a family behind.
  */
 USTORE_EXPORT void ustore_database_view_rocksdb(ustore_database_view_rocksdb_t* arguments);
 
@@ -410,8 +449,18 @@ typedef struct ustore_database_open_leveldb_t {
 
 } ustore_database_open_leveldb_t;
 
-/** Serves a directory in place through the LevelDB engine, creating the database when it holds none, or reports
- *  @c ustore_status_unsupported_k in a library built without the engine. */
+/**
+ *  Serves a directory in place through the LevelDB engine, creating the database when it holds none.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_unsupported_k The library was built without the engine.
+ *  - @c ustore_status_device_k The executor computes on a device.
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, or the @c directory is
+ *    empty.
+ *  - @c ustore_status_not_found_k The directory does not exist.
+ */
 USTORE_EXPORT void ustore_database_open_leveldb(ustore_database_open_leveldb_t* arguments);
 
 /** The arguments of @c ustore_database_open_nvme, where every zero size or count keeps the engine's default. */
@@ -476,8 +525,26 @@ typedef struct ustore_database_open_nvme_t {
 
 } ustore_database_open_nvme_t;
 
-/** Serves a directory in place through the NVMe engine, or reports @c ustore_status_unsupported_k in a library built
- *  without it. */
+/**
+ *  Serves a directory in place through the NVMe engine.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_unsupported_k The library was built without the engine, SPDK is asked for,
+ *    the volumes or the schema have another format version, or the @c compactions executor is given
+ *    to a library built without CUDA.
+ *  - @c ustore_status_device_k The executor computes on a device, or the @c compactions executor is
+ *    no VRAM one.
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
+ *    empty, the counted @c data_directories are @c NULL, one has an empty path or a path past the
+ *    platform's limit, the transport is unknown, or a size or count is out of range.
+ *  - @c ustore_status_out_of_memory_k The @c memory_limit refuses the arena or the channels.
+ *  - @c ustore_status_not_found_k The directory does not exist.
+ *  - @c ustore_status_capacity_exhausted_k The drives need more queue pairs or targets than a volume
+ *    holds, the @c memory_limit leaves no block per channel, or every shared channel is taken.
+ *  - @c ustore_status_malformed_k The volumes or the schema are corrupt.
+ */
 USTORE_EXPORT void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments);
 
 /** What an open database reports about itself in one call, where every size is the engine's estimate, and zero where
@@ -528,6 +595,14 @@ typedef struct ustore_database_describe_t {
 /**
  *  @brief Reports the engine of an open database, what it supports and how much it holds.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_invalid_argument_k The @c description output is @c NULL, on the RAM and NVMe
+ *    engines.
  */
 USTORE_EXPORT void ustore_database_describe(ustore_database_describe_t* arguments);
 
@@ -556,8 +631,20 @@ typedef struct ustore_database_clear_t {
  *  @brief Empties every collection at once, as @c ustore_collection_drop empties one.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  The RAM and RocksDB engines refuse to drop the collections while a snapshot is open, with
- *  @c ustore_status_invalid_argument_k, since the snapshot belongs to its holder.
+ *  The RAM and RocksDB engines refuse to drop the collections while a snapshot is open, since the snapshot belongs
+ *  to its holder.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_invalid_argument_k The @c mode is unknown, or a snapshot is open while
+ *    @c ustore_drop_collection_k drops the collections on the RAM and RocksDB engines.
+ *  - @c ustore_status_not_found_k A listed collection was dropped meanwhile, on the NVMe engine.
+ *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, on the RAM and NVMe
+ *    engines.
  */
 USTORE_EXPORT void ustore_database_clear(ustore_database_clear_t* arguments);
 
@@ -592,6 +679,13 @@ typedef struct ustore_database_compact_t {
  *  The work runs one collection at a time, and its progress counts the bytes of the collections compacted where the
  *  engine measures them, as RocksDB does, and one unit per collection elsewhere. A cancelled compaction stops between
  *  collections, keeping what it compacted.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
  */
 USTORE_EXPORT void ustore_database_compact(ustore_database_compact_t* arguments);
 
@@ -621,6 +715,13 @@ typedef struct ustore_snapshot_init_t {
 /**
  *  @brief Pins a point-in-time state of the database until @c ustore_snapshot_free releases it.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_invalid_argument_k The @c snapshot output is @c NULL.
  */
 USTORE_EXPORT void ustore_snapshot_init(ustore_snapshot_init_t* arguments);
 
@@ -658,6 +759,16 @@ typedef struct ustore_snapshot_save_t {
  *  create @c path, while the RAM engine writes its image into the directory @c path names. Its progress counts the
  *  bytes of the keys and values saved, and a save its progress callback cancels removes what it wrote, as a failed
  *  one does.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_uninitialized_k The @c snapshot is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_invalid_argument_k The @c path is empty on the NVMe engine, or RocksDB finds a
+ *    database there already.
+ *  - @c ustore_status_not_found_k The @c path is no directory on the RAM engine, or a collection was
+ *    dropped meanwhile on the NVMe engine.
  */
 USTORE_EXPORT void ustore_snapshot_save(ustore_snapshot_save_t* arguments);
 
@@ -775,6 +886,16 @@ typedef struct ustore_collection_list_t {
 /**
  *  @brief Lists the collections of the database.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena or the @c written output is @c NULL, or the
+ *    @c snapshot belongs to another engine.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena serves another call, the executor's deferred table is
+ *    full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A listed collection was dropped meanwhile, on the NVMe engine.
  */
 USTORE_EXPORT void ustore_collection_list(ustore_collection_list_t* arguments);
 
@@ -783,12 +904,11 @@ USTORE_EXPORT void ustore_collection_list(ustore_collection_list_t* arguments);
  *      identifier addressing it.
  *
  *  Runs at the head of the database. A name is recorded with the collection in one step and survives a crash beside
- *  it, and a name another collection carries, even one a concurrent creator took first, fails the call with
- *  @c ustore_status_already_exists_k and creates nothing. Each engine keeps the names in the system collection
+ *  it, and a name another collection carries, even one a concurrent creator took first, fails the call and creates
+ *  nothing. Each engine keeps the names in the system collection
  *  @c _names and every collection's modality and name in @c _collections, which no identifier reaches, and a name
  *  resolves in two phases: once through @c ustore_collection_find, and from then on by identifier, as no other call
- *  carries one. A name starting with `_` is reserved for system collections and refused with
- *  @c ustore_status_invalid_argument_k.
+ *  carries one. A name starting with @c _ is reserved for system collections and refused.
  */
 typedef struct ustore_collection_create_t {
 
@@ -804,7 +924,7 @@ typedef struct ustore_collection_create_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Optional name no other collection carries and not starting with `_`, where a zeroed view creates a collection
+    /** Optional name no other collection carries and not starting with @c _, where a zeroed view creates a collection
      *  without one. */
     ustore_bytes_view_t name;
 
@@ -819,6 +939,21 @@ typedef struct ustore_collection_create_t {
 /**
  *  @brief Creates an empty collection, named or not.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_invalid_argument_k The @c modality is unknown, the @c name starts with @c _ or
+ *    is empty with non-null data, or the @c collection output is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, or a documents, graph or
+ *    pages collection is asked of an NVMe database whose values share one size.
+ *  - @c ustore_status_already_exists_k Another collection carries the @c name.
+ *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, on the RAM and NVMe
+ *    engines.
+ *  - @c ustore_status_capacity_exhausted_k The name outgrows the NVMe schema's record, or every
+ *    shared channel is taken.
  */
 USTORE_EXPORT void ustore_collection_create(ustore_collection_create_t* arguments);
 
@@ -871,6 +1006,15 @@ typedef struct ustore_collection_find_t {
 /**
  *  @brief Reads the collections a batch of names address.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena or the @c collections output is @c NULL, the
+ *    @c names come in an unknown layout, or the @c snapshot belongs to another engine.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena serves another call, the executor's deferred table is
+ *    full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
  */
 USTORE_EXPORT void ustore_collection_find(ustore_collection_find_t* arguments);
 
@@ -901,6 +1045,19 @@ typedef struct ustore_collection_drop_t {
 /**
  *  @brief Removes or clears a collection.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
+ *    executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_invalid_argument_k The @c mode is unknown, or @c ustore_drop_values_k empties
+ *    a strings collection.
+ *  - @c ustore_status_not_found_k No collection carries the identifier, a system one included.
+ *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, on the RAM and NVMe
+ *    engines.
+ *  - @c ustore_status_capacity_exhausted_k Every shared channel is taken on the NVMe engine.
  */
 USTORE_EXPORT void ustore_collection_drop(ustore_collection_drop_t* arguments);
 
@@ -930,6 +1087,16 @@ typedef struct ustore_transaction_init_t {
 /**
  *  @brief Begins a transaction, or resets an existing one.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The transaction reset serves another call, the executor's deferred
+ *    table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine has no
+ *    transactions, as LevelDB has none.
+ *  - @c ustore_status_invalid_argument_k The @c transaction output is @c NULL, or the transaction
+ *    reset belongs to another database.
  */
 USTORE_EXPORT void ustore_transaction_init(ustore_transaction_init_t* arguments);
 
@@ -969,6 +1136,24 @@ typedef struct ustore_transaction_stage_t {
 /**
  *  @brief Stages a transaction as the first phase of a two-phase commit.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The transaction serves another call, the executor's deferred table
+ *    is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database or the @c transaction is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine has no
+ *    transactions, as LevelDB has none.
+ *  - @c ustore_status_invalid_argument_k A failed RocksDB stage left the transaction needing a reset.
+ *  - @c ustore_status_write_conflict_k Another commit changed a key this transaction wrote, or, on
+ *    the NVMe engine, any key, range or prefix it watched or a collection it touched.
+ *  - @c ustore_status_read_conflict_k Another commit changed a key this transaction read, on the RAM
+ *    and RocksDB engines.
+ *  - @c ustore_status_phantom_conflict_k Another commit changed a window this transaction walked, on
+ *    the strictly serializable RAM engine.
+ *  - @c ustore_status_not_found_k A collection the transaction touched was dropped, on RocksDB.
+ *  - @c ustore_status_malformed_k A value outgrows what its NVMe collection admits.
+ *  - @c ustore_status_capacity_exhausted_k The strings outgrow one NVMe run file.
  */
 USTORE_EXPORT void ustore_transaction_stage(ustore_transaction_stage_t* arguments);
 
@@ -1003,6 +1188,25 @@ typedef struct ustore_transaction_commit_t {
 /**
  *  @brief Commits a transaction.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The transaction serves another call, the executor's deferred table
+ *    is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database or the @c transaction is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine has no
+ *    transactions, as LevelDB has none.
+ *  - @c ustore_status_invalid_argument_k The @c durability is unknown, or a failed RocksDB stage left
+ *    the transaction needing a reset.
+ *  - @c ustore_status_write_conflict_k Another commit changed a key this transaction wrote, or, on
+ *    the NVMe engine, any key, range or prefix it watched or a collection it touched.
+ *  - @c ustore_status_read_conflict_k Another commit changed a key this transaction read, on the RAM
+ *    and RocksDB engines.
+ *  - @c ustore_status_phantom_conflict_k Another commit changed a window this transaction walked, on
+ *    the strictly serializable RAM engine.
+ *  - @c ustore_status_not_found_k A collection the transaction touched was dropped, on RocksDB.
+ *  - @c ustore_status_malformed_k A value outgrows what its NVMe collection admits.
+ *  - @c ustore_status_capacity_exhausted_k The strings outgrow one NVMe run file.
  */
 USTORE_EXPORT void ustore_transaction_commit(ustore_transaction_commit_t* arguments);
 
@@ -1030,27 +1234,36 @@ typedef struct ustore_transaction_rollback_t {
  *  @brief Withdraws a stage, releasing whatever it claimed, while keeping the reads and writes, so the transaction
  *      can stage again or be reset through @c ustore_transaction_init.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The transaction serves another call, the executor's deferred table
+ *    is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_uninitialized_k The @c database or the @c transaction is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine has no
+ *    transactions, as LevelDB has none.
+ *  - @c ustore_status_invalid_argument_k A failed RocksDB stage left the transaction needing a reset.
  */
 USTORE_EXPORT void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments);
 
 /**
  *  @brief Waits until every deferred call naming the transaction finishes, then resets it and frees its memory with
  *      every view of it once no cursor reads through it.
- *  @param[inout] transaction The transaction to be freed; @c NULL is safe.
+ *  @param[in,out] transaction The transaction to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_transaction_free(ustore_transaction_t transaction);
 
 /**
  *  @brief Waits until every deferred call naming the snapshot finishes, then releases it, unpinning the versions
  *      only it kept, and frees its memory with every view of it once no cursor reads through it.
- *  @param[inout] snapshot The snapshot to be freed; @c NULL is safe.
+ *  @param[in,out] snapshot The snapshot to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_snapshot_free(ustore_snapshot_t snapshot);
 
 /**
  *  @brief Waits until every deferred call naming the database finishes, then closes it and frees its memory once
  *      no transaction, snapshot or cursor of it holds it open, while the data persists on disk.
- *  @param[inout] database The database to be closed; @c NULL is safe.
+ *  @param[in,out] database The database to be closed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_database_free(ustore_database_t database);
 

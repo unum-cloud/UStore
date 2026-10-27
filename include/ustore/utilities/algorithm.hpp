@@ -31,9 +31,9 @@ std::size_t offset_in_sorted(range_ const& sorted, wanted_ const& wanted) noexce
 
 /**
  *  Appends up to @p limit keys drawn uniformly over a RocksDB or LevelDB iterator to @p outputs.
- *  @param[inout] iterator Engine iterator, rewound to the first key before sampling.
+ *  @param[in,out] iterator Engine iterator, rewound to the first key before sampling.
  *  @param[in] limit The most keys the sample draws, fewer only when the collection holds fewer.
- *  @param[inout] outputs The outputs the drawn keys land on, after the keys they already hold, which @c push a key,
+ *  @param[in,out] outputs The outputs the drawn keys land on, after the keys they already hold, which @c push a key,
  *      answering a status, and address a key with @c operator[].
  *  @see https://en.wikipedia.org/wiki/Reservoir_sampling
  */
@@ -163,6 +163,8 @@ static_assert(sorted_128_cursor_concept<sorted_128_cursor_t>);
 
 /**
  *  @brief Calls @p callback with every key both walks hold, once each and in order, leapfrogging the walk that lags.
+ *  @param[in,out] first The first walk, advanced as it is read.
+ *  @param[in,out] second The second walk, advanced as it is read.
  *  @param[in] callback Takes the shared key and answers a status, where a failure stops the walk and is returned.
  */
 template <sorted_128_cursor_concept first_cursor_, sorted_128_cursor_concept second_cursor_, typename callback_type_>
@@ -200,6 +202,8 @@ inline std::size_t intersect_sorted_128(std::span<ustore_key_t const> first, std
 /**
  *  @brief Walks the union of two sorted spans of keys once, calling @p callback with every distinct key and whether
  *      each span holds it, which serves unions, differences and symmetric differences alike.
+ *  @param[in] first The first sorted span.
+ *  @param[in] second The second sorted span.
  *  @param[in] callback Takes the key, then whether the first and the second span hold it, and answers a status, where
  *      a failure stops the walk and is returned.
  */

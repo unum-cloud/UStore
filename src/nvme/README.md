@@ -118,7 +118,7 @@ Commits are ordered by the stamps the ledger issues, which keeps a transaction t
 ## The C ABI
 
 `variants.hpp` fills every verb table of `src/engine.hpp` the RAM engine fills over one `database`, its graph, docs and pages collections through stores of their own, each refusing collections of any other modality.
-`USTORE_BUILD_NVME` adds the engine to the `ustore` library and `nvme` to the engines every suite runs with `--engine`.
+`USTORE_WITH_NVME` adds the engine to the `ustore` library and `nvme` to the engines every suite runs with `--engine`.
 
 - An open names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte.
 - The executor of `ustore_executor_for_nvme` names the transport, the channels and their buffers, and the VRAM executor compactions run on, read once at the open; any other executor and none keep the defaults.

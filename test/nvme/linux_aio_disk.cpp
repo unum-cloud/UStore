@@ -44,7 +44,7 @@ constexpr std::uint64_t deep_volume_bytes_k = 32ull * 1024ull * 1024ull;
 
 /**
  *  @brief Takes a queue pair of @p depth, registers @p bytes of aligned memory, runs @p body and gives both back.
- *  @param[inout] disk The mounted disk the queue pair and the range come from.
+ *  @param[in,out] disk The mounted disk the queue pair and the range come from.
  *  @param[in] bytes Bytes of buffer to register, which the body addresses through the registered memory.
  *  @param[in] depth Requests the queue pair keeps in flight.
  *  @param[in] body Called with the queue pair, the registered memory and the buffer it covers.

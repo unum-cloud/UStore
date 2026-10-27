@@ -36,10 +36,10 @@ if (NOT leveldb_POPULATED)
 
     # Should not be set globally, but just for this target!
     FetchContent_Populate(leveldb)
-    add_subdirectory(${leveldb_SOURCE_DIR} ${leveldb_BINARY_DIR} EXCLUDE_FROM_ALL)
+    add_subdirectory(${leveldb_SOURCE_DIR} ${leveldb_BINARY_DIR} EXCLUDE_FROM_ALL SYSTEM)
     # LevelDB's own sources keep -Werror -Wthread-safety, which it would otherwise impose on every consumer.
     set_property(TARGET leveldb PROPERTY INTERFACE_COMPILE_OPTIONS "")
     add_library(leveldb::leveldb ALIAS leveldb)
 endif ()
 
-include_directories(${leveldb_SOURCE_DIR}/include)
+include_directories(SYSTEM ${leveldb_SOURCE_DIR}/include)

@@ -548,8 +548,11 @@ constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, so
 /**
  *  @brief Lays the value @p bytes a fold wrote for @p record into @p folded, the bytes of a merge's folded values, or
  *      into its inline key slot, so the copy plan and the new run read it where @p record now names it.
+ *  @param[in] bytes The value the fold wrote.
  *  @param[in] value_stride Bytes every value of a fixed-width layout takes, which a folded removal fills with zeros.
  *  @param[in] folded_run The index past every source run, which names the folded bytes.
+ *  @param[in,out] record The survivor, which now names where its value is.
+ *  @param[out] folded The bytes of the merge's folded values, or the inline key slot when the value fits it.
  */
 template <typename key_slot_type_, typename folded_type_>
 st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t value_stride, std::uint32_t folded_run,
@@ -589,6 +592,7 @@ st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t val
  *  @param[in] upper The upper LSM level's views, whose value offsets locate the values of a variable width.
  *  @param[in] lower The lower LSM level's views.
  *  @param[in] value_stride Bytes every value of a fixed-width layout takes, which locates its values by position.
+ *  @param[in,out] sorted_runs The planned sorted runs, each of which has its range count set.
  *  @param[out] ranges The copy ranges of every run in turn, replacing what it held.
  */
 template <typename key_slot_type_, typename record_type_, typename sorted_runs_type_, typename ranges_type_>
@@ -650,11 +654,13 @@ st::status_t plan_value_copies(record_type_ const* survivors,
  *  versions of one key never straddle two runs, since a sorted level answers a key from the one run whose bounds
  *  hold it: a cut moves back to where the key begins, or past where it ends when it began the run.
  *
+ *  @param[in] key_slots_count How many survivors there are to cut.
+ *  @param[in] bounds The capacity and file limit every sorted run holds to.
  *  @param[in] read_prefix Called as @c read_prefix(index, bytes) to write the stored value bytes of the first @c index
  *      survivors.
  *  @param[in] shares_key Called as @c shares_key(index, shared) to say whether survivor @c index carries the key
  *      survivor @c index - 1 does.
- *  @param[out] sorted runs The planned sorted runs, replacing what it held.
+ *  @param[out] sorted_runs The planned sorted runs, replacing what it held.
  */
 template <typename key_slot_type_, typename prefix_reader_type_, typename key_sharing_type_, typename sorted_runs_type_>
 st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t const& bounds,
@@ -775,8 +781,12 @@ struct folded_versions_t {
 /**
  *  @brief The versions that fold into the surviving change at @p head of @p merged: the dropped versions of its key
  *      behind it, up to the first a reader still tells apart from the version before it.
+ *  @param[in] kind Which compaction this is, which decides whether it writes the bottom level.
+ *  @param[in] stamps The stamps that tell which versions a reader still tells apart.
  *  @param[in] merged The merged records, in key order with the versions of a key newest first.
  *  @param[in] kept Whether each merged record survives.
+ *  @param[in] merged_count How many records @p merged holds.
+ *  @param[in] head The index in @p merged of the surviving change.
  */
 template <typename record_type_>
 constexpr folded_versions_t folded_versions(compaction_kind_t kind, compaction_stamps_t const& stamps,
@@ -796,8 +806,13 @@ constexpr folded_versions_t folded_versions(compaction_kind_t kind, compaction_s
 /**
  *  @brief Folds the versions @p versions names into the surviving change at @p head of @p merged, newest first, until
  *      one closes it, and at the bottom applies a change left open onto nothing, as every compactor folds on the host.
+ *  @param[in] fold The fold that combines the versions into one change.
+ *  @param[in] merged The merged records, in key order with the versions of a key newest first.
+ *  @param[in] head The index in @p merged of the surviving change.
+ *  @param[in] versions The versions to fold, as @c folded_versions found them.
  *  @param[in] value_of Called as @c value_of(record, bytes) to view the value of a merged record, answering an
  *      @c st::status_t, with any bytes it reads allocated from @p arena.
+ *  @param[in,out] arena Where the bytes the fold reads and writes are allocated.
  *  @param[out] folded What the change folds to, a write, a removal or a change, its bytes in @p arena or a record.
  */
 template <typename record_type_, utilities::fold_concept fold_type_, typename value_of_type_>

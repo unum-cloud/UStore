@@ -2768,8 +2768,7 @@ std::size_t expect_spellings(char const* (*name_of)(enum_type_), enum_type_ (*fr
     return failures;
 }
 
-/** Every closed set spells each of its enumerators and reads every spelling back, and the version spells the numbers
- *  @c ustore_version reports. */
+/** Every closed set spells each of its enumerators and reads every spelling back. */
 std::size_t closed_set_names(config_t const&) {
     std::size_t failures = 0;
     failures += expect_spellings(ustore_mood_name, ustore_mood_from_name, 2);
@@ -2791,9 +2790,6 @@ std::size_t closed_set_names(config_t const&) {
     failures += expect_spellings(ustore_page_encoding_name, ustore_page_encoding_from_name, 5);
     failures += expect(std::string_view {ustore_isolation_name(ustore_isolation_strict_serializable_k)} ==
                        "strict-serializable");
-    int major = 0, minor = 0, patch = 0;
-    ustore_version(&major, &minor, &patch);
-    failures += expect(fmt::format("{}.{}.{}", major, minor, patch) == ustore_version_name());
     return failures;
 }
 

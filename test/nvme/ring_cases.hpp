@@ -974,9 +974,9 @@ void ring_cases(suite_totals_t& totals, char const* transport, disk_type_& disk,
 
 /**
  *  @brief Registers one volume on @p disk, runs @p body against it, and gives the medium back.
- *  @param[inout] totals Where the registered memory and its release report under @p name.
+ *  @param[in,out] totals Where the registered memory and its release report under @p name.
  *  @param[in] name The case label of the registered memory itself.
- *  @param[inout] disk The mounted ring the volume is registered on.
+ *  @param[in,out] disk The mounted ring the volume is registered on.
  *  @param[in] request The volume to register, which a RAM device allocates and a file device opens.
  *  @param[in] body What to run against the registered medium, reporting its own cases.
  */

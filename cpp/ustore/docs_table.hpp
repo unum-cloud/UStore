@@ -111,8 +111,8 @@ class column_view_varlen {
 
 /** Column view matching how @p element_ is stored. */
 template <typename element_>
-using column_view = std::conditional_t<variable_length_element_concept<element_>, //
-                                       column_view_varlen<element_>, column_view_scalar<element_>>;
+using column_view = std::conditional_t<variable_length_element_concept<element_>, column_view_varlen<element_>,
+                                       column_view_scalar<element_>>;
 
 /** Column whose type is known only at runtime, viewed as a typed column through @c as. */
 class column_view_t {

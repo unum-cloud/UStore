@@ -1,4 +1,9 @@
-"""Walks every key of a collection page by page, which the NetworkX and Pandas views both build on."""
+"""Walks every key of a collection page by page, which the NetworkX and Pandas views both build on.
+
+File: python/ustore/keys.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 from __future__ import annotations
 
@@ -37,9 +42,7 @@ def scan_keys(
     page: int = PAGE_KEYS,
     modality: Modality = Modality.BLOBS,
 ) -> Iterator[UUID]:
-    """Yields every key of `collection`, which holds `modality`, in ascending order through the scans of that
-    modality, each page resuming past the last key of the one before it, holding one page at a time in one arena,
-    made where the view's calls run, for the walk's whole life."""
+    """Yields every key of `collection`, which holds `modality`, in ascending order through the scans of that modality, each page resuming past the last key of the one before it, holding one page at a time in one arena, made where the view's calls run, for the walk's whole life."""
     arena = Arena(view.executor if isinstance(view, View) else None)
     scan = {Modality.DOCS: view.docs_scan, Modality.GRAPH: view.graph_scan_vertices}.get(modality, view.scan)
     start = KEY_MIN

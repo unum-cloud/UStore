@@ -71,6 +71,10 @@
 //! assert_eq!(gathered.rows(), paths.len());
 //! # Ok::<(), ustore::Error>(())
 //! ```
+//!
+//! File: rust/docs.rs
+//! Author: Ash Vardanian
+//! Date: September 18, 2026
 
 use std::borrow::Cow;
 use std::ffi::{c_char, c_int, c_void};

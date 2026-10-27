@@ -1041,11 +1041,50 @@ class DeferredView:
     def __getitem__(self, name: str) -> Collection:
         """The collection `name` addresses, whose `blobs[key]` and `docs[key]` answer a `Deferred`."""
 
-    def on(self, executor: Executor) -> View: ...
-    def deferred(self, executor: Executor) -> DeferredView: ...
-    def watched(self) -> DeferredView: ...
-    def unwatched(self) -> DeferredView: ...
-    def read(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Values]: ...
+    def on(self, executor: Executor) -> View:
+        """on(executor) answers a View whose calls block on the executor.
+
+        Every call runs after the ones submitted to the executor before it finishes, so a read
+        through it sees what earlier deferred writes wrote.
+
+        Args:
+          executor (Executor): The threads that run the calls.
+        """
+
+    def deferred(self, executor: Executor) -> DeferredView:
+        """deferred(executor) answers a DeferredView whose calls the executor runs meanwhile.
+
+        Every verb of it submits its call and answers a Deferred at once.
+
+        Args:
+          executor (Executor): The threads that run the calls.
+        """
+
+    def watched(self) -> DeferredView:
+        """watched() answers a view of the transaction whose calls record the keys they touch for conflicts."""
+
+    def unwatched(self) -> DeferredView:
+        """unwatched() answers a view of the transaction whose calls record nothing, so they never fail its commit."""
+
+    def read(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Values]:
+        """read(keys, arena, *, collection) answers a Values tape.
+
+        Reads a batch of binary values in one call, which no sequence of single reads
+        matches for throughput. Nothing is copied: the tape sits in the arena, and indexing
+        the answer gives a memoryview over the stored bytes, or None for an absent key.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The keys to read, as a sequence, a contiguous
+            buffer of 16-byte keys, which is read in place, or one of 64-bit integers.
+          arena (Arena): Where the tape lands, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+        Returns:
+          Values: One entry per key, in the order they were asked for.
+        Raises:
+          ContendedError: The arena serves another call or exports a buffer.
+          Error: Whatever the engine reported.
+        """
+
     def get(self, key: KeyLike, *, collection: CollectionLike) -> Deferred[bytes | None]:
         """The `Deferred` of a copy of one value, owning the one-off arena it reads into."""
 
@@ -1068,7 +1107,28 @@ class DeferredView:
         weights: Sequence[float] | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
-    ) -> Deferred[Keys]: ...
+    ) -> Deferred[Keys]:
+        """scan(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)
+        answers a Keys tape.
+
+        Lists up to `wanted` keys from `start` upwards. Values are not exported, so a read
+        follows the scan, or a `cursor()` walks a collection with its values instead.
+
+        Args:
+          start (KeyLike): The smallest key the scan may return.
+          wanted (int): Most keys the scan returns.
+          arena (Arena): Where the keys land, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+          mode (ScanMode, optional): `ScanMode.UNORDERED` lets keys come out of order,
+            removed or repeated, to speed up the read after the scan; no engine uses it yet.
+          progress (Callable[[int, int], bool | None], optional): Called with the scans
+            finished and the scans in all; a falsy answer other than None cancels the call.
+        Returns:
+          Keys: One run of keys, in ascending order.
+        Raises:
+          CancelledError: The progress callable stopped the scan.
+        """
+
     def scan_batch(
         self,
         starts: KeysLike,
@@ -1087,13 +1147,55 @@ class DeferredView:
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
         """The `Deferred` of one scan per start, whose `progress` runs on the executor's threads."""
-    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]: ...
-    def sample_batch(
-        self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike
-    ) -> Deferred[Keys]: ...
+    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+        """sample(wanted, arena, *, collection) answers a Keys tape.
+
+        Draws keys uniformly at random from one collection, which is how a workload picks
+        entries it has no list of.
+
+        Args:
+          wanted (int): Most keys to draw.
+          arena (Arena): Where the keys land, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+        Returns:
+          Keys: One run of keys, in no particular order.
+        """
+
+    def sample_batch(self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+        """sample_batch(count, wanted, arena, *, collection) answers a Keys tape.
+
+        Draws `count` independent samples in one call, all from the one collection named,
+        which is how a workload builds several random batches without paying for a call each.
+
+        Args:
+          count (int): Samples to draw.
+          wanted (int): Most keys every sample draws.
+          arena (Arena): Where the keys land, rewound by this call.
+          collection (UUID | str): The one collection every sample draws from, by
+            identifier or by name.
+        Returns:
+          Keys: One run of keys per sample, in no particular order.
+        """
+
     def measure(
         self, start: KeyLike, end: KeyLike, arena: Arena, /, *, collection: CollectionLike
-    ) -> Deferred[Measurement]: ...
+    ) -> Deferred[Measurement]:
+        """measure(start, end, arena, *, collection) answers a Measurement.
+
+        Estimates what a key range holds without walking it, so the answers are bounds
+        rather than counts.
+
+        Args:
+          start (KeyLike): First key of the range.
+          end (KeyLike): Last key of the range.
+          arena (Arena): Where the bounds land before they are copied out, rewound by this
+            call.
+          collection (UUID | str): The collection, by identifier or by name.
+        Returns:
+          Measurement: The lower and upper bounds on the entries, the bytes of their values,
+          and the space they take on disk.
+        """
+
     def docs_read(
         self,
         keys: KeysLike,
@@ -1103,10 +1205,40 @@ class DeferredView:
         collection: CollectionLike,
         field: str | None = None,
         outputs_type: FieldType = FieldType.JSON,
-    ) -> Deferred[Values]: ...
-    def docs_gist(
-        self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike
-    ) -> Deferred[tuple[str, ...]]: ...
+    ) -> Deferred[Values]:
+        """docs_read(keys, arena, *, collection, field=None, outputs_type=FieldType.JSON)
+        answers a Values tape.
+
+        Reads whole documents, or one field of each, as JSON text or as printed strings. Whole
+        documents read as JSON pass straight through from the engine, so nothing is parsed.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The keys to read.
+          arena (Arena): Where the tape lands, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+          field (str, optional): A top-level key or a JSON Pointer to read inside every
+            document; None reads whole documents.
+          outputs_type (FieldType, optional): `FieldType.JSON` for JSON text, or
+            `FieldType.STR` to print scalars as text.
+        Returns:
+          Values: One entry per key, None where the document or the field is absent.
+        """
+
+    def docs_gist(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> Deferred[tuple[str, ...]]:
+        """docs_gist(keys, arena, *, collection) answers a tuple of JSON Pointers.
+
+        Lists every distinct path to a leaf across the requested documents, in the order they
+        were first met, which is how a table learns the columns its documents hold.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The documents to inspect.
+          arena (Arena): Where the paths land before they are copied out, rewound by this
+            call.
+          collection (UUID | str): The collection, by identifier or by name.
+        Returns:
+          tuple[str, ...]: One JSON Pointer per leaf, such as '/user/name'.
+        """
+
     def docs_gather(
         self,
         keys: KeysLike,
@@ -1116,7 +1248,26 @@ class DeferredView:
         /,
         *,
         collection: CollectionLike,
-    ) -> Deferred[Columns]: ...
+    ) -> Deferred[Columns]:
+        """docs_gather(keys, fields, outputs_types, arena, *, collection) answers Columns.
+
+        Reads every field of every document into typed columns, converting each value on a
+        best-effort basis and recording what was found, converted, or could not be.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The documents, the rows of every column.
+          fields (Sequence[str]): Top-level keys or JSON Pointers, the columns of the result.
+          outputs_types (FieldType | Sequence[FieldType]): One type per field, or one for
+            every field: a fixed-width scalar from `FieldType.BOOL` to `FieldType.U8`,
+            `FieldType.UUID`, `FieldType.STR` or `FieldType.BIN`. A `FieldType.F16` column
+            exports as a half-precision view NumPy reads as float16, and a `FieldType.UUID`
+            column as sixteen bytes per document.
+          arena (Arena): Where the columns land, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+        Returns:
+          Columns: One column per field, each holding one entry per document.
+        """
+
     def docs_scan(
         self,
         start: KeyLike,
@@ -1130,15 +1281,91 @@ class DeferredView:
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
-    ) -> Deferred[Keys]: ...
-    def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]: ...
+    ) -> Deferred[Keys]:
+        """docs_scan(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)
+        answers a Keys tape.
+
+        Lists up to `wanted` document keys from `start` upwards, as `scan` lists the keys of
+        blobs. Documents are not exported, so a `docs_read` follows the scan.
+
+        Args:
+          start (KeyLike): The smallest key the scan may return.
+          wanted (int): Most keys the scan returns.
+          arena (Arena): Where the keys land, rewound by this call.
+          collection (UUID | str): The docs collection, by identifier or by name.
+          mode (ScanMode, optional): In what order the keys come, as `scan` takes it.
+          progress (Callable[[int, int], bool | None], optional): Called with the scans
+            finished and the scans in all; a falsy answer other than None cancels the call.
+        Returns:
+          Keys: One run of keys, in ascending order.
+        Raises:
+          CancelledError: The progress callable stopped the scan.
+        """
+
+    def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+        """docs_sample(wanted, arena, *, collection) answers a Keys tape.
+
+        Draws document keys uniformly at random from one collection, as `sample` draws the keys
+        of blobs. Documents are not exported, so a `docs_read` or a `docs_gather` follows.
+
+        Args:
+          wanted (int): Most keys to draw.
+          arena (Arena): Where the keys land, rewound by this call.
+          collection (UUID | str): The docs collection, by identifier or by name.
+        Returns:
+          Keys: One run of keys, in no particular order.
+        """
+
     def graph_read_edges(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
-    ) -> Deferred[Neighborhoods]: ...
+    ) -> Deferred[Neighborhoods]:
+        """graph_read_edges(vertices, arena, *, role=Role.ANY, collection) answers Neighborhoods.
+
+        Reads every edge a batch of vertices takes part in. The edges of one vertex come sorted
+        by neighbour; with both roles the outgoing ones precede the incoming ones.
+
+        Args:
+          vertices (Sequence[KeyLike] | buffer): The vertices whose edges are read.
+          arena (Arena): Where the degrees and the edges land, rewound by this call.
+          role (Role, optional): `Role.SOURCE` for the edges a vertex leaves by, `Role.TARGET`
+            for those it is entered by, or `Role.ANY` for both, which is how an undirected
+            graph asks.
+          collection (UUID | str): The graph collection, by identifier or by name.
+        Returns:
+          Neighborhoods: One run of (source, target, edge) triples per vertex, None where it is
+          absent.
+        """
+
     def graph_degrees(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
-    ) -> Deferred[tuple[int | None, ...]]: ...
-    def graph_contains(self, vertex: KeyLike, /, *, collection: CollectionLike) -> Deferred[bool]: ...
+    ) -> Deferred[tuple[int | None, ...]]:
+        """graph_degrees(vertices, arena, *, role=Role.ANY, collection) answers a tuple.
+
+        Counts the edges of a batch of vertices without exporting them.
+
+        Args:
+          vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.
+          arena (Arena): Where the degrees land before they are copied out, rewound by this
+            call.
+          role (Role, optional): The role of every vertex, as `graph_read_edges` takes it.
+          collection (UUID | str): The graph collection, by identifier or by name.
+        Returns:
+          tuple[int | None, ...]: The degree of every vertex, None where it is absent.
+        """
+
+    def graph_contains(self, vertex: KeyLike, /, *, collection: CollectionLike) -> Deferred[bool]:
+        """graph_contains(vertex, *, collection) answers a bool.
+
+        Whether a vertex is present, read as its degree through a one-off arena, which a
+        loop avoids with `graph_degrees` and an arena of its own.
+
+        Args:
+          vertex (KeyLike): The vertex to look for.
+          collection (UUID | str): The graph collection, by identifier or by name.
+        Returns:
+          bool: Whether the vertex is present.
+        """
+
     def graph_scan_vertices(
         self,
         start: KeyLike,
@@ -1151,13 +1378,119 @@ class DeferredView:
         progress: Progress | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
-    ) -> Deferred[Keys]: ...
-    def collection_find(self, name: str, arena: Arena, /) -> Deferred[UUID]: ...
-    def collection_list(self, arena: Arena, /) -> Deferred[tuple[UUID, ...]]: ...
-    def save(self, path: PathLikeOrStr, /, *, progress: Progress | None = None) -> Deferred[None]: ...
-    def clear(self, mode: DropMode, /) -> Deferred[None]: ...
-    def compact(self, *, progress: Progress | None = None) -> Deferred[None]: ...
-    def describe(self) -> Deferred[Description]: ...
+    ) -> Deferred[Keys]:
+        """graph_scan_vertices(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)
+        answers a Keys tape.
+
+        Lists up to `wanted` vertices from `start` upwards, those without edges included.
+        Edges are not exported, so a `graph_read_edges` follows the scan.
+
+        Args:
+          start (KeyLike): The smallest vertex the scan may return.
+          wanted (int): Most vertices the scan returns.
+          arena (Arena): Where the vertices land, rewound by this call.
+          collection (UUID | str): The graph collection, by identifier or by name.
+          mode (ScanMode, optional): In what order the vertices come, as `scan` takes it.
+          progress (Callable[[int, int], bool | None], optional): Called with the scans
+            finished and the scans in all; a falsy answer other than None cancels the call.
+        Returns:
+          Keys: One run of vertices, in ascending order.
+        Raises:
+          CancelledError: The progress callable stopped the scan.
+        """
+
+    def collection_find(self, name: str, arena: Arena, /) -> Deferred[UUID]:
+        """collection_find(name, arena) answers the identifier the name addresses.
+
+        Reads the name at the snapshot of a snapshot, and at the head otherwise, since a
+        transaction never creates or drops collections.
+
+        Args:
+          name (str): The name to resolve.
+          arena (Arena): Where the lookup lands before it is copied out, rewound by this
+            call.
+        Returns:
+          UUID: The identifier addressing the collection.
+        Raises:
+          NotFoundError: No collection carries the name.
+        """
+
+    def collection_list(self, arena: Arena, /) -> Deferred[tuple[UUID, ...]]:
+        """collection_list(arena) answers the identifiers of every collection.
+
+        Lists the collections at the snapshot of a snapshot, and at the head otherwise.
+        System collections are never listed, and collection_names answers the names.
+
+        Args:
+          arena (Arena): Where the listing lands before it is copied out, rewound by this
+            call.
+        Returns:
+          tuple[UUID, ...]: One identifier per collection.
+        """
+
+    def save(self, path: PathLikeOrStr, /, *, progress: Progress | None = None) -> Deferred[None]:
+        """save(path, *, progress=None) answers None.
+
+        Writes the snapshot out as a new database of the same engine, holding exactly the
+        collections and names the snapshot records, which that engine's open then serves.
+        RocksDB and LevelDB create the directory, while the RAM engine writes its image into
+        the directory the path names. Calls `ustore_snapshot_save`.
+
+        Args:
+          path (str | bytes | PathLike): The directory the saved database lands in.
+          progress (Callable[[int, int], bool | None], optional): Called with the bytes of the
+            keys and values saved and the bytes in all. A falsy answer other than None stops
+            the save, which removes what it wrote.
+        Raises:
+          CancelledError: The progress callable stopped the save.
+          UnsupportedError: The engine saves no snapshots.
+        """
+
+    def clear(self, mode: DropMode, /) -> Deferred[None]:
+        """clear(mode) answers None.
+
+        Empties every collection at once at the head, as `collection_drop` empties one. Calls
+        `ustore_database_clear`.
+
+        Args:
+          mode (DropMode): `DropMode.PAIRS` removes every key and value and keeps the
+            collections, `DropMode.COLLECTION` drops every collection with its name, and
+            `DropMode.VALUES` empties every value and keeps the keys.
+        Raises:
+          InvalidArgumentError: The RAM and RocksDB engines drop no collection while a
+            snapshot is open, since the snapshot belongs to its holder.
+          ReadOnlyError: The database was opened read-only.
+        """
+
+    def compact(self, *, progress: Progress | None = None) -> Deferred[None]:
+        """compact(*, progress=None) answers None.
+
+        Reclaims the space overwritten and removed data still takes, one collection at a time:
+        RocksDB and LevelDB flush and compact their trees, and the RAM engine frees the
+        versions no reader needs and rewrites its image. Calls `ustore_database_compact`.
+
+        Args:
+          progress (Callable[[int, int], bool | None], optional): Called with the units
+            compacted and the units in all, bytes where the engine measures them, as RocksDB
+            does, and collections elsewhere. A falsy answer other than None stops between
+            collections, keeping what was compacted.
+        Raises:
+          CancelledError: The progress callable stopped the compaction.
+          ReadOnlyError: The database was opened read-only.
+        """
+
+    def describe(self) -> Deferred[Description]:
+        """describe() answers a Description.
+
+        Reports the engine serving the database, what it supports, its isolation, and the
+        keys, memory and disk it holds, every size the engine's estimate and zero where it
+        keeps none. Calls `ustore_database_describe`.
+
+        Returns:
+          Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes` and
+          `disk_bytes` of the database.
+        """
+
     def write(
         self,
         keys: KeysLike,
@@ -1165,7 +1498,28 @@ class DeferredView:
         *,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> Deferred[None]: ...
+    ) -> Deferred[None]:
+        """write(keys, values, *, collection, durability=Durability.BUFFERED) answers None.
+
+        Upserts a batch of binary values in one call. Every value is borrowed for the
+        length of the call rather than copied, so a memory-mapped buffer reaches the engine
+        untouched.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The keys to write.
+          values (Sequence[bytes-like] | bytes-like | tape): One value per key, a tape of
+            them, or a single bytes-like object broadcast to every key. A tape is an Arrow
+            `binary`, `large_binary`, `string` or `large_string` array, such as `Values`, or
+            a `(data, offsets)` tuple of buffers with unsigned 32-bit or 64-bit offsets, and
+            passes without a copy. None is refused, since `remove` removes keys.
+          collection (UUID | str): The collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        Raises:
+          TypeError: A value is None or exports no buffer.
+          Error: Whatever the engine reported.
+        """
+
     def set(
         self,
         key: KeyLike,
@@ -1173,14 +1527,40 @@ class DeferredView:
         *,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> Deferred[None]: ...
+    ) -> Deferred[None]:
+        """set(key, value, *, collection, durability=Durability.BUFFERED) answers None.
+
+        Upserts one binary value.
+
+        Args:
+          key (KeyLike): The key to write.
+          value (bytes-like): The bytes to store, borrowed rather than copied.
+          collection (UUID | str): The collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        Raises:
+          TypeError: The value is None or exports no buffer.
+        """
+
     def remove(
         self,
         keys: KeyLike | KeysLike,
         *,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> Deferred[None]: ...
+    ) -> Deferred[None]:
+        """remove(keys, *, collection, durability=Durability.BUFFERED) answers None.
+
+        Removes a batch of keys with their values, or one key given on its own, while
+        `docs_remove` removes documents.
+
+        Args:
+          keys (KeyLike | Sequence[KeyLike] | buffer): The keys to remove.
+          collection (UUID | str): The collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
+
     def docs_write(
         self,
         keys: KeysLike | None,
@@ -1192,14 +1572,61 @@ class DeferredView:
         type: FieldType = FieldType.JSON,
         id_field: str | None = None,
         durability: Durability = Durability.BUFFERED,
-    ) -> Deferred[None]: ...
+    ) -> Deferred[None]:
+        """docs_write(keys, documents, *, collection, field=None, modification=Modification.UPSERT,
+                   type=FieldType.JSON, id_field=None, durability=Durability.BUFFERED) answers None.
+
+        Writes a batch of JSON documents, or one field inside each of them. Every document is
+        borrowed for the length of the call rather than copied.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from
+            `id_field` of its document.
+          documents (Sequence[str | bytes-like | object] | str | bytes-like | dict | tape): One
+            document per key, a tape of them, or one document broadcast to every key. Text,
+            bytes and a tape, as `write` takes one, are JSON already, while a dict, a list or a
+            number inside a sequence is serialized. None is refused: `remove` removes whole
+            documents, and a merge with a JSON null removes a field. Under a fixed-width `type`,
+            a contiguous buffer of one scalar per key is a column, which reaches the store
+            without being printed as JSON and parsed back.
+          collection (UUID | str): The collection, by identifier or by name.
+          field (str, optional): A top-level key or a JSON Pointer such as '/user/name' to
+            write inside every document; None writes whole documents.
+          modification (Modification, optional): An upsert, update or insert, an RFC 6902
+            `Modification.PATCH` or an RFC 7386 `Modification.MERGE`.
+          type (FieldType, optional): How every document is spelled: `FieldType.JSON`,
+            `FieldType.STR` for a plain string, `FieldType.NULL`, or the raw bytes of
+            `FieldType.BOOL`, `FieldType.F64`, `FieldType.F32`, `FieldType.I64` through
+            `FieldType.U8`.
+          id_field (str, optional): The field holding every key when `keys` is None.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        Raises:
+          TypeError: A document is None.
+          MalformedError: A document does not parse, or its `id_field` holds no integer.
+          NotFoundError: A field is written inside a document that does not exist.
+          AlreadyExistsError: An insert names a document that already exists.
+        """
+
     def docs_remove(
         self,
         keys: KeyLike | KeysLike,
         *,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> Deferred[None]: ...
+    ) -> Deferred[None]:
+        """docs_remove(keys, *, collection, durability=Durability.BUFFERED) answers None.
+
+        Removes a batch of whole documents, or one given on its own; a patch or a merge removes
+        fields inside them instead.
+
+        Args:
+          keys (KeyLike | Sequence[KeyLike] | buffer): The keys of the documents to remove.
+          collection (UUID | str): The docs collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
+
     def graph_write_edges(
         self,
         sources: KeysLike,
@@ -1208,7 +1635,23 @@ class DeferredView:
         edges: KeysLike | None = None,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> Deferred[None]: ...
+    ) -> Deferred[None]:
+        """graph_write_edges(sources, targets, *, edges=None, collection,
+                          durability=Durability.BUFFERED) answers None.
+
+        Inserts a batch of edges, creating the vertices they connect. An edge already present
+        is kept, so writing the same batch twice changes nothing.
+
+        Args:
+          sources (Sequence[KeyLike] | buffer): The vertex every edge leaves.
+          targets (Sequence[KeyLike] | buffer): The vertex every edge enters.
+          edges (Sequence[KeyLike] | buffer, optional): The identifier of every edge, which tells
+            apart several edges between one pair; None gives every edge `edge_id_default`.
+          collection (UUID | str): The graph collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
+
     def graph_remove_edges(
         self,
         sources: KeysLike,
@@ -1217,10 +1660,37 @@ class DeferredView:
         edges: KeysLike | None = None,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> Deferred[None]: ...
+    ) -> Deferred[None]:
+        """graph_remove_edges(sources, targets, *, edges=None, collection,
+                           durability=Durability.BUFFERED) answers None.
+
+        Removes a batch of edges and keeps the vertices they connected, even once isolated.
+
+        Args:
+          sources (Sequence[KeyLike] | buffer): The vertex every edge leaves.
+          targets (Sequence[KeyLike] | buffer): The vertex every edge enters.
+          edges (Sequence[KeyLike] | buffer, optional): The identifier of every edge; None removes
+            the edges that were given `edge_id_default`.
+          collection (UUID | str): The graph collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
+
     def graph_write_vertices(
         self, vertices: KeysLike, *, collection: CollectionLike, durability: Durability = Durability.BUFFERED
-    ) -> Deferred[None]: ...
+    ) -> Deferred[None]:
+        """graph_write_vertices(vertices, *, collection, durability=Durability.BUFFERED)
+        answers None.
+
+        Inserts a batch of vertices without edges, keeping those already present.
+
+        Args:
+          vertices (Sequence[KeyLike] | buffer): The vertices to insert.
+          collection (UUID | str): The graph collection, by identifier or name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
+
     def graph_remove_vertices(
         self,
         vertices: KeysLike,
@@ -1228,8 +1698,46 @@ class DeferredView:
         role: Role = Role.ANY,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> Deferred[None]: ...
-    def commit(self, durability: Durability = Durability.BUFFERED) -> Deferred[int]: ...
-    def stage(self) -> Deferred[int]: ...
+    ) -> Deferred[None]:
+        """graph_remove_vertices(vertices, *, role=Role.ANY, collection,
+                              durability=Durability.BUFFERED) answers None.
+
+        Removes a batch of vertices together with every edge they take part in.
+
+        Args:
+          vertices (Sequence[KeyLike] | buffer): The vertices to remove.
+          role (Role, optional): The role every vertex plays, which only a joining graph between
+            two collections needs; `Role.ANY` otherwise.
+          collection (UUID | str): The graph collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
+
+    def commit(self, durability: Durability = Durability.BUFFERED) -> Deferred[int]:
+        """commit(durability=Durability.BUFFERED) answers the commit stamp.
+
+        Applies every staged change, or none of them. The contents are kept whatever the
+        outcome, so a rejected transaction can be inspected or replayed.
+
+        Args:
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        Returns:
+          int: The commit stamp, this commit's position in commit order, which every snapshot
+          whose read stamp is at or above it sees.
+        Raises:
+          ConflictError: A concurrent writer touched what this transaction watched.
+        """
+
+    def stage(self) -> Deferred[int]:
+        """stage() answers the read stamp.
+
+        Runs the first phase of a two-phase commit, after which a commit publishes the
+        work. Staging reserves no position in commit order.
+
+        Returns:
+          int: The read stamp, the stamp the transaction reads at and its commit validates
+          against, which is no greater than the commit stamp the commit then answers.
+        """
 
 # endregion: Handles

@@ -365,6 +365,9 @@ class deferred_docs_read_collection_t {
      *  @param[in] fields None for whole documents, one field for every key, or one per key.
      *  @param[in] type Format the values are exported in.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p fields are neither none, one, nor one per key.
      */
     template <owned_array_concept<ustore_key_t> keys_type_>
     deferred<docs_read_t> read(keys_type_ keys, arena_t& arena, values_tape_t fields = {},
@@ -429,6 +432,9 @@ class deferred_docs_read_collection_t {
      *  @param[in] types Type every column converts its field into, one per field.
      *  @param[in] arena Memory the columns land in, borrowed until the call is final, which the table views.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p types and @p fields differ in count.
      */
     template <owned_array_concept<ustore_key_t> keys_type_, owned_array_concept<ustore_docs_field_type_t> types_type_>
     deferred<docs_gather_t> gather(keys_type_ keys, values_tape_t fields, types_type_ types, arena_t& arena,
@@ -483,6 +489,10 @@ class deferred_docs_collection_t : public deferred_docs_read_collection_t {
      *  @param[in] modification Whether the values upsert, update or insert, or patch or merge what they find.
      *  @param[in] type Format the values arrive in.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p keys and @p values differ in count, or the
+     *    @p fields are neither none, one, nor one per key.
      */
     template <owned_array_concept<ustore_key_t> keys_type_>
     deferred<docs_write_t> write(keys_type_ keys, values_tape_t values, values_tape_t fields = {},

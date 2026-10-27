@@ -2,8 +2,8 @@
  *  @file src/strings.cpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief Implements `c/ustore/strings.h`: routing the strings calls to their engine, and the cursors walking the
- *      strings of one prefix.
+ *  @brief Implements <tt>c/ustore/strings.h</tt>: routing the strings calls to their engine, and
+ *      the cursors walking the strings of one prefix.
  */
 
 #include <cstddef> // `std::size_t`

@@ -2,7 +2,7 @@
  *  @file src/docs.cpp
  *  @author Ash Vardanian
  *  @date December 26, 2022
- *  @brief Implements `c/ustore/docs.h`: routes every document call to the docs verbs of the engine serving its
+ *  @brief Implements <tt>c/ustore/docs.h</tt>: routes every document call to the docs verbs of the engine serving its
  *      database, and spells the document field types and modifications.
  */
 

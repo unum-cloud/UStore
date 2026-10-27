@@ -8,17 +8,18 @@
  *  mapped onto values for blobs, onto JSON text for documents and onto dense element trees for pages, strings mapped
  *  onto 16-byte keys for strings, and the half-edges of a graph. Documents and pages are edited in place, each edit
  *  reading, modifying and writing them back inside one transaction. No stored key carries its collection. The
- *  `_collections` system collection maps every collection's UUID onto its name and its store, whose kind says its
- *  modality, and the `_names` system collection, a store of the strings kind, maps every name onto its collection's
+ *  @c _collections system collection maps every collection's UUID onto its name and its store, whose kind says its
+ *  modality, and the @c _names system collection, a store of the strings kind, maps every name onto its collection's
  *  UUID. Every store is built into one commit order, so a transaction spanning any number of them publishes under one
  *  stamp and a snapshot reads all of them at it. Dropping a collection retires its store at the drop's stamp, and the
  *  store is freed once no reader holds an older one. A database with a directory persists as one binary image,
  *  rewritten whole on a flush and on close.
  *
  *  Every CPU class this build compiled has a variant per isolation level, its calls instantiated in
- *  `src/ram/variants_<class>.cpp` with the class's atomic reference and waiter, which the partition locks own their
- *  words through. An open walks the classes newest first and takes the first one the machine confirms, ending on the
- *  serial floor, and every handle the variant hands out carries its table.
+ *  <tt>src/ram/variants_&lt;class&gt;.cpp</tt> with the class's atomic reference and waiter, which
+ *  the partition locks own their words through. An open walks the classes newest first and takes
+ *  the first one the machine confirms, ending on the serial floor, and every handle the variant
+ *  hands out carries its table.
  */
 
 #include <string_view> // `std::string_view`

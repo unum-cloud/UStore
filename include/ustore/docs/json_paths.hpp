@@ -5,12 +5,14 @@
  *  @brief Document fields translated into JSONPath and extracted by StringZilla's subdocuments engine in one pass over
  *      a batch of documents, into typed values the reads and gathers of documents convert, with no other parser.
  *
- *  A field is a JSON Pointer when it starts with a slash and a top-level key otherwise, and an empty field addresses
- *  the whole document. Each field compiles into one JSONPath, `$['a']['b']`, where a token spelling an array index
- *  becomes the union `['0',0]`, as a pointer resolves it. One engine compiles the paths of every field of a call,
- *  entering only the first member of each name as a pointer does, and one `sz_subdocuments_find` pass over the
- *  documents the cells read locates the node of every cell. The first byte of each node tells what it holds, strings
- *  then unescape in one batch, and numbers parse as yyjson parses them inside a document.
+ *  A field is a JSON Pointer when it starts with a slash and a top-level key otherwise, and an
+ *  empty field addresses the whole document. Each field compiles into one JSONPath,
+ *  <tt>$['a']['b']</tt>, where a token spelling an array index becomes the union <tt>['0',0]</tt>,
+ *  as a pointer resolves it. One engine compiles the paths of every field of a call, entering only
+ *  the first member of each name as a pointer does, and one @c sz_subdocuments_find pass over the
+ *  documents the cells read locates the node of every cell. The first byte of each node tells what
+ *  it holds, strings then unescape in one batch, and numbers parse as yyjson parses them inside a
+ *  document.
  *
  *  A document the engine finds malformed fails the call, comments and NaN or Infinity among it, though a container no
  *  path enters is skipped unread. A value read as JSON prints canonically at the top level, and a container prints
@@ -91,7 +93,7 @@ inline status_t append_quoted_name(st::basic_vector<char, arena_allocator<char>>
     return append_to_path(path, "'");
 }
 
-/** Whether @p token is an array index as yyjson's pointer reads one: `0`, or digits without a leading zero. */
+/** Whether @p token is an array index as yyjson's pointer reads one: @c 0, or digits without a leading zero. */
 inline bool is_index_token(std::string_view token, std::uint64_t& index) noexcept {
     if (token.empty() || token.size() > 16 || (token[0] == '0' && token.size() > 1)) return false;
     index = 0;
@@ -258,8 +260,8 @@ inline std::string_view tape_string(sz_strings_span_t const& tape, std::size_t i
  *  @param[in] documents The documents the cells address, read in place.
  *  @param[in] fields The fields the cells address, each a JSON Pointer, a top-level key, or empty for the document.
  *  @param[in] cells_count How many cells there are.
- *  @param[in] cell_of Called as `cell_of(index)`, answering the @c field_cell_t of cell @p index.
- *  @param[in] capabilities The StringZilla kernels the running CPU allows, which `src/` probes once.
+ *  @param[in] cell_of Called as <tt>cell_of(index)</tt>, answering the @c field_cell_t of cell @p index.
+ *  @param[in] capabilities The StringZilla kernels the running CPU allows, which @c src/ probes once.
  *  @param[in] scratch Holds the engine, the columns and every value, until it rewinds.
  *  @param[out] cells The value of every cell, missing where a document or its field is.
  *  @retval malformed_k A document a cell reads breaks RFC 8259, or a string's escapes do not decode.

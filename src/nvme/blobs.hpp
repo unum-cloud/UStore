@@ -2,7 +2,7 @@
  *  @file src/nvme/blobs.hpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief The blobs calls of the C ABI over the stores of `src/nvme/database.hpp`, for the NVMe engine's table.
+ *  @brief The blobs calls of the C ABI over the stores of <tt>src/nvme/database.hpp</tt>, for the NVMe engine's table.
  */
 
 #pragma once

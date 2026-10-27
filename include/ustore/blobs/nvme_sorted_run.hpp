@@ -310,6 +310,8 @@ class sorted_run_layout {
 
 /**
  *  @brief Packs @p stamps, each raised to @p floor, into the column a run saves in its trailer.
+ *  @param[in] stamps The stamps of the run's key slots.
+ *  @param[in] floor The stamp each is raised to at least.
  *  @param[out] newest The newest stamp packed, or @p floor for none.
  */
 inline expected<stamps_column_t> pack_stamps(std::span<std::uint64_t const> stamps, std::uint64_t floor,
@@ -441,8 +443,8 @@ class lsm_sorted_run {
 
     /**
      *  @brief Writes a whole run into a fresh reservation of @p volume and records it under @p content_id.
-     *  @param[inout] volume The volume the blob is reserved on, borrowed and outliving the run.
-     *  @param[inout] channel The channel the sections are queued on, held by the calling thread.
+     *  @param[in,out] volume The volume the blob is reserved on, borrowed and outliving the run.
+     *  @param[in,out] channel The channel the sections are queued on, held by the calling thread.
      *  @param[in] content_id The identifier the run is named by, which must name no blob yet.
      *  @param[in] key_slots The key slots in ascending order of their keys, the versions of one key newest first, which
      *      the index is laid from.
@@ -540,8 +542,8 @@ class lsm_sorted_run {
     /**
      *  @brief Reads the header, the whole index, the value offsets, the tails and the trailer of @p blob, which is
      *      everything a run keeps in memory.
-     *  @param[inout] volume The volume the run reads through afterwards, borrowed and outliving it.
-     *  @param[inout] channel The channel the header and the index are read on, held by the calling thread.
+     *  @param[in,out] volume The volume the run reads through afterwards, borrowed and outliving it.
+     *  @param[in,out] channel The channel the header and the index are read on, held by the calling thread.
      *  @param[in] blob The reservation the run occupies, as a lookup or a router handed it over.
      *  @return The run, or @c status_code_t::malformed_k for a blob shorter than the run it claims.
      */
@@ -752,7 +754,7 @@ class lsm_sorted_run {
 
     /**
      *  @brief Reads the values of the key slots at @p positions, refilling the channel as completions retire.
-     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] positions Sorted positions of the key slots whose values are wanted.
      *  @param[in] sink Called as @c sink(request, offset, bytes) while the channel still owns the block.
      *  @return Success, or the first failure any of the blocks reported.
@@ -778,7 +780,9 @@ class lsm_sorted_run {
 
     /**
      *  @brief Copies the value of the key slot at sorted @p position into @p into, which holds at least its bytes.
-     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the read is submitted and completed on, held by the calling thread.
+     *  @param[in] position The key slot's place in the run's sorted order.
+     *  @param[out] into Room for the value's bytes.
      *  @return Success, or the first failure any of the blocks reported.
      */
     status_t read_value(io_channel_t& channel, std::uint64_t position, std::span<byte_t> into) const noexcept {

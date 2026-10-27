@@ -2,12 +2,13 @@
  *  @file include/ustore/pages/page_edits.hpp
  *  @author Ash Vardanian
  *  @date October 16, 2026
- *  @brief The edit record of every page call of `c/ustore/pages.h` and its serialized delta form.
+ *  @brief The edit record of every page call of <tt>c/ustore/pages.h</tt> and its serialized delta form.
  *
- *  An edit is one task of one call, stamped with its commit and its position inside it. It names its element, parent
- *  and anchor by key, and carries what it needs to apply without reading anything else: an import or an insertion
- *  carries its parsed fragment in the dense form of `element_tree.hpp`, keys already minted, so applying never parses
- *  markup and replaying always lands the same keys.
+ *  An edit is one task of one call, stamped with its commit and its position inside it. It names
+ *  its element, parent and anchor by key, and carries what it needs to apply without reading
+ *  anything else: an import or an insertion carries its parsed fragment in the dense form of
+ *  <tt>element_tree.hpp</tt>, keys already minted, so applying never parses markup and replaying
+ *  always lands the same keys.
  *
  *  A delta is a chain of edits back to back, oldest first, each little-endian. Every edit starts with a modification
  *  byte, the commit stamp, the task sequence and the element key. Insertions and moves add the parent and anchor keys,
@@ -221,6 +222,7 @@ inline std::size_t encode_into(edit_t const& edit, byte_t* target) noexcept {
 
 /**
  *  @brief Reads the edit at the front of @p bytes, viewing its field and value inside @p bytes.
+ *  @param[in] bytes The encoded edits, the first of which is read.
  *  @param[out] consumed Bytes the edit took, on success.
  *  @return The edit, or @c status_code_t::malformed_k for a truncated record, an unknown modification, or a field or
  *      value past 4 GiB.

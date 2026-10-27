@@ -1,39 +1,24 @@
-========
-Overview
-========
-.. mdinclude:: ../README.md
+UStore Reference
+================
+
+Every public symbol, generated from the documentation comments in the sources.
+Guides for each language live at `unum.cloud/docs/ustore <https://unum.cloud/docs/ustore>`_.
+Rust symbols are on `docs.rs <https://docs.rs/ustore>`_.
 
 .. toctree::
-   :hidden:
+   :caption: C
+   :maxdepth: 1
 
-   self
-
-.. toctree::
-   :hidden:
-   :caption: C and C++
-
-   c/index
-   cpp/index
+   c/reference
 
 .. toctree::
-   :hidden:
-   :caption: Bindings
+   :caption: C++
+   :maxdepth: 1
 
-   python/index
-   rust/index
-
-.. toctree::
-   :hidden:
-   :caption: Internals
-
-   engines
-   nvme
-   tests
-   benchmarks
-   contributing
+   cpp/reference
 
 .. toctree::
-   :hidden:
-   :caption: Index
+   :caption: Python
+   :maxdepth: 1
 
-   genindex
+   python/reference

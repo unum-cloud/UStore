@@ -2,8 +2,8 @@
  *  @file src/nvme/strings.hpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief The strings calls of the C ABI over the strings stores of `src/nvme/database.hpp`, for the NVMe engine's
- *      table.
+ *  @brief The strings calls of the C ABI over the strings stores of <tt>src/nvme/database.hpp</tt>,
+ *      for the NVMe engine's table.
  */
 
 #pragma once

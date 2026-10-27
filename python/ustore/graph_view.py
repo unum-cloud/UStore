@@ -13,6 +13,10 @@ spelling of a key the binding accepts names them on the way in.
 A multigraph gives every edge an identifier of its own, which is the key NetworkX reports; a simple
 graph does too once it keeps edge attributes, and otherwise stores every edge under
 `edge_id_default`.
+
+File: python/ustore/graph_view.py
+Author: Ash Vardanian
+Date: September 18, 2026
 """
 
 from __future__ import annotations
@@ -66,23 +70,29 @@ class NodeView:
     """The vertices of a graph: iterable, sized, and callable for their attributes, as `Graph.nodes` is."""
 
     def __init__(self, graph: Graph) -> None:
+        """Wraps the graph whose vertices this views."""
         self.graph = graph
 
     def __iter__(self) -> Iterator[UUID]:
+        """Every vertex in ascending order."""
         return iter(self.graph)
 
     def __len__(self) -> int:
+        """The number of vertices."""
         return len(self.graph)
 
     def __contains__(self, node: KeyLike) -> bool:
+        """Whether the vertex is present."""
         return node in self.graph
 
     def __getitem__(self, node: KeyLike) -> Attributes:
+        """The attributes of a vertex, raising KeyError when it is absent."""
         if node not in self.graph:
             raise KeyError(node)
         return self.graph.read_attributes(self.graph.nodes_collection, [node])[0]
 
     def __call__(self, data: bool | str = False, default: Any = None) -> Iterator[UUID] | Iterator[tuple[UUID, Any]]:
+        """Every vertex, or each with its attributes, or with the one attribute named by data."""
         if data is False:
             return iter(self.graph)
         return self._with_data(data, default)
@@ -98,6 +108,7 @@ class EdgeView:
     """The edges of a graph: iterable, sized, and callable for keys and attributes, as `Graph.edges` is."""
 
     def __init__(self, graph: Graph) -> None:
+        """Wraps the graph whose edges this views."""
         self.graph = graph
 
     def __iter__(self) -> Iterator[tuple[UUID, ...]]:
@@ -105,9 +116,11 @@ class EdgeView:
         return self(keys=self.graph.MULTIGRAPH)
 
     def __len__(self) -> int:
+        """The number of edges."""
         return self.graph.number_of_edges()
 
     def __contains__(self, edge: tuple[KeyLike, KeyLike]) -> bool:
+        """Whether the edge is present."""
         return self.graph.has_edge(*edge)
 
     def __call__(
@@ -117,6 +130,7 @@ class EdgeView:
         keys: bool = False,
         default: Any = None,
     ) -> Iterator[tuple[Any, ...]]:
+        """Every edge of the vertices in nbunch, with its key, its attributes or the one attribute named by data."""
         if keys and not self.graph.MULTIGRAPH:
             raise TypeError("Only a multigraph reports edge keys")
         for page in batched(self.graph.edge_triples(nbunch), PAGE_KEYS):
@@ -140,17 +154,20 @@ class DegreeView:
     """Degrees of vertices in one role: indexable by vertex, iterable as pairs, callable with weights."""
 
     def __init__(self, graph: Graph, role: Role, weight: str | None = None, nodes: list[KeyLike] | None = None) -> None:
+        """Wraps the graph, the role of the degrees counted, the weight attribute to sum and the vertices to cover."""
         self.graph = graph
         self.role = role
         self.weight = weight
         self.nodes = nodes
 
     def __getitem__(self, node: KeyLike) -> int | float:
+        """The degree of one vertex, raising KeyError when it is absent."""
         if node not in self.graph:
             raise KeyError(node)
         return next(self._degrees([node]))[1]
 
     def __iter__(self) -> Iterator[tuple[KeyLike, int | float]]:
+        """Every vertex paired with its degree, a page of vertices at a time."""
         pages = batched(self.graph if self.nodes is None else self.nodes, PAGE_KEYS)
         for page in pages:
             yield from self._degrees(list(page))
@@ -158,6 +175,7 @@ class DegreeView:
     def __call__(
         self, nbunch: KeyLike | Iterable[KeyLike] | None = None, weight: str | None = None
     ) -> int | float | DegreeView:
+        """The degree of one vertex, or the degrees of the vertices in nbunch, summing the weight attribute when named."""
         if nbunch is not None and is_one_key(nbunch):
             return DegreeView(self.graph, self.role, weight)[nbunch]
         return DegreeView(self.graph, self.role, weight, None if nbunch is None else list(nbunch))
@@ -206,9 +224,11 @@ class Graph:
         self.next_edge_id: int | None = None
 
     def is_directed(self) -> bool:
+        """Whether the edges are directed."""
         return self.DIRECTED
 
     def is_multigraph(self) -> bool:
+        """Whether several keyed edges may join two vertices."""
         return self.MULTIGRAPH
 
     @property
@@ -242,12 +262,15 @@ class Graph:
     # region Vertices
 
     def __iter__(self) -> Iterator[UUID]:
+        """Every vertex in ascending order."""
         return scan_keys(self.blocking, self.graph_collection, modality=Modality.GRAPH)
 
     def __len__(self) -> int:
+        """The number of vertices."""
         return sum(1 for _ in self)
 
     def __contains__(self, node: KeyLike) -> bool:
+        """Whether the vertex is present."""
         return self.blocking.graph_contains(node, collection=self.graph_collection)
 
     def __getitem__(self, node: KeyLike) -> dict[UUID, Any]:
@@ -266,9 +289,11 @@ class Graph:
 
     @property
     def nodes(self) -> NodeView:
+        """The vertices as a view, iterable and callable for their attributes."""
         return NodeView(self)
 
     def number_of_nodes(self) -> int:
+        """The number of vertices."""
         return len(self)
 
     def has_node(self, node: KeyLike) -> bool | Deferred[bool]:
@@ -278,6 +303,7 @@ class Graph:
         return node in self
 
     def add_node(self, node: KeyLike, **attributes: Any) -> None:
+        """Inserts one vertex, merging attributes into it."""
         self.add_nodes_from([node], **attributes)
 
     def add_nodes_from(self, nodes: KeysLike | Iterable[KeyLike], **attributes: Any) -> None:
@@ -292,6 +318,7 @@ class Graph:
             self.merge_attributes(self.nodes_collection, keys, [attributes])
 
     def remove_node(self, node: KeyLike) -> None:
+        """Removes one vertex with its edges, raising KeyError when it is absent."""
         if node not in self:
             raise KeyError(node)
         self.remove_nodes_from([node])
@@ -404,6 +431,7 @@ class Graph:
         return identifiers
 
     def add_edge(self, source: KeyLike, target: KeyLike, **attributes: Any) -> None:
+        """Inserts one edge, merging attributes into it."""
         self.add_edges_from_arrays([source], [target], **attributes)
 
     def add_edges_from(self, ebunch: Iterable[tuple[Any, ...]], **attributes: Any) -> None:
@@ -447,10 +475,12 @@ class Graph:
         return len(removed)
 
     def remove_edge(self, source: KeyLike, target: KeyLike) -> None:
+        """Removes one edge, raising KeyError when it is absent."""
         if self.remove_edges_from_arrays([source], [target]) == 0:
             raise KeyError((source, target))
 
     def remove_edges_from(self, ebunch: Iterable[tuple[KeyLike, ...]]) -> None:
+        """Removes every edge of the (source, target) pairs, or keyed triples in a multigraph."""
         for edge in ebunch:
             key = edge[2] if self.MULTIGRAPH and len(edge) > 2 else None
             self.remove_edges_from_arrays([edge[0]], [edge[1]], None if key is None else [key])
@@ -481,25 +511,28 @@ class Graph:
     def read_edges(
         self, vertices: KeyLike | Sequence[KeyLike], role: Role = Role.ANY
     ) -> Neighborhoods | Deferred[Neighborhoods]:
-        """The edges of every vertex in `role`, as the stored (source, target, edge) triples, or the `Deferred` of
-        them over a deferred view, viewing a one-off arena that lives as long as they do."""
+        """The edges of every vertex in `role`, as the stored (source, target, edge) triples, or the `Deferred` of them over a deferred view, viewing a one-off arena that lives as long as they do."""
         batch = [vertices] if is_one_key(vertices) else vertices
         return self.view.graph_read_edges(batch, Arena(), role=role, collection=self.graph_collection)
 
     @property
     def edges(self) -> EdgeView:
+        """The edges as a view, iterable and callable for keys and attributes."""
         return EdgeView(self)
 
     def has_edge(self, source: KeyLike, target: KeyLike, key: KeyLike | None = None) -> bool:
+        """Whether an edge joins the two vertices, with the given key when one is named."""
         between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
         return any(key is None or edge == as_key(key) for _, _, edge in between)
 
     def number_of_edges(self, source: KeyLike | None = None, target: KeyLike | None = None) -> int:
+        """The number of edges in the graph, or between the two vertices when both are named."""
         if source is None or target is None:
             return sum(degree for _, degree in DegreeView(self, Role.SOURCE))
         return len(self.stored_between([source]).get(self.canonical_pair(source, target), []))
 
     def size(self, weight: str | None = None) -> int | float:
+        """The number of edges, or their summed weight attribute when one is named."""
         if weight is None:
             return self.number_of_edges()
         return sum(attributes.get(weight, 1) for _, _, attributes in self.edges(data=True))
@@ -509,6 +542,7 @@ class Graph:
         return iter(sorted({target for _, target, _ in self.edge_triples(node)}))
 
     def get_edge_data(self, source: KeyLike, target: KeyLike, default: Any = None) -> Any:
+        """The attributes of the first edge joining the two vertices, or default when none does."""
         between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
         if not between:
             return default
@@ -516,6 +550,7 @@ class Graph:
 
     @property
     def degree(self) -> DegreeView:
+        """The degrees of the vertices counted over both roles of every edge."""
         return DegreeView(self, Role.ANY)
 
     def clear_edges(self) -> None:
@@ -546,6 +581,7 @@ class Graph:
     # region Attribute Maps
 
     def get_node_attributes(self, name: str) -> dict[UUID, Any]:
+        """The value of the named attribute for every vertex holding it."""
         return {node: found[name] for node, found in self.nodes(data=True) if name in found}
 
     def set_node_attributes(self, values: Any, name: str | None = None) -> None:
@@ -574,6 +610,7 @@ class Graph:
         return between[0][2]
 
     def get_edge_attributes(self, name: str) -> dict[tuple[UUID, ...], Any]:
+        """The value of the named attribute for every edge holding it, keyed by edge."""
         labelled: dict[tuple[UUID, ...], Any] = {}
         for page in batched(self.edge_triples(None), PAGE_KEYS):
             attributes = self.read_attributes(self.edges_collection, [edge for _, _, edge in page])
@@ -606,18 +643,22 @@ class DiGraph(Graph):
     DIRECTED = True
 
     def successors(self, node: KeyLike) -> Iterator[UUID]:
+        """The vertices an edge leads to from the vertex, as neighbors does."""
         return self.neighbors(node)
 
     def predecessors(self, node: KeyLike) -> Iterator[UUID]:
+        """The distinct vertices an edge leads from to the vertex, in ascending order."""
         found = self.blocking.graph_read_edges([node], Arena(), role=Role.TARGET, collection=self.graph_collection)
         return iter(sorted({source for source, _, _ in triples_of(found, 0)}))
 
     @property
     def in_degree(self) -> DegreeView:
+        """The degrees of the vertices counted over the edges reaching them."""
         return DegreeView(self, Role.TARGET)
 
     @property
     def out_degree(self) -> DegreeView:
+        """The degrees of the vertices counted over the edges leaving them."""
         return DegreeView(self, Role.SOURCE)
 
 
@@ -636,6 +677,7 @@ class MultiGraph(Graph):
             raise KeyError((source, target, key))
 
     def get_edge_data(self, source: KeyLike, target: KeyLike, key: KeyLike | None = None, default: Any = None) -> Any:
+        """The attributes of the edges joining the two vertices, keyed by edge, or of the one with the given key."""
         between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
         identifiers = [edge for _, _, edge in between if key is None or edge == as_key(key)]
         if not identifiers:

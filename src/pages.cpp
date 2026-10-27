@@ -2,8 +2,8 @@
  *  @file src/pages.cpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief Implements `c/ustore/pages.h`: routes every page call to the pages verbs of the engine serving its database,
- *      and spells the page encodings.
+ *  @brief Implements <tt>c/ustore/pages.h</tt>: routes every page call to the pages verbs of the
+ *      engine serving its database, and spells the page encodings.
  */
 
 #include "ustore/pages.h" // `ustore_page_encoding_t`

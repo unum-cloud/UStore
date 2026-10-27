@@ -2,21 +2,24 @@
  *  @file src/nvme/variants.hpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief Embedded on-disk engine over the LSM templates of `include/ustore/blobs/`, one NVMe collection per
+ *  @brief Embedded on-disk engine over the LSM templates of <tt>include/ustore/blobs/</tt>, one NVMe collection per
  *      collection of the C ABI, served by one variant per CPU class.
  *
- *  Every call is a template on the CPU class, whose atomic reference and waiter instantiate the store, and
- *  @c nvme_variant names the table of one class and its open. Its members are defined below it, so the explicit
- *  instantiation in `src/nvme/variants_<class>.cpp` compiles every call of the class there, and the @c extern one in
- *  `src/nvme/engine.cpp` keeps them out of the unit that picks the class.
+ *  Every call is a template on the CPU class, whose atomic reference and waiter instantiate the
+ *  store, and @c nvme_variant names the table of one class and its open. Its members are defined
+ *  below it, so the explicit instantiation in <tt>src/nvme/variants_&lt;class&gt;.cpp</tt> compiles
+ *  every call of the class there, and the @c extern one in <tt>src/nvme/engine.cpp</tt> keeps them
+ *  out of the unit that picks the class.
  *
- *  One mount opens the volumes and one database of 16-byte keys lives on them. Every collection of the C ABI is one
- *  collection of that database under the same UUID, and two more are the engine's own system collections. The
- *  collections system collection, `collections_collection_k`, maps every other collection's UUID onto its name, while
- *  the store schema records its modality, which a mount needs before it opens the collection. The names system
- *  collection, `names_collection_k`, maps every name onto the bare UUID of its collection. A strings
- *  collection, and the names, live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole
- *  strings, each mapped onto a 16-byte key held in its cell, and a transaction's strings ride in the share of it every
+ *  One mount opens the volumes and one database of 16-byte keys lives on them. Every collection of
+ *  the C ABI is one collection of that database under the same UUID, and two more are the engine's
+ *  own system collections. The collections system collection, @c collections_collection_k, maps
+ *  every other collection's UUID onto its name, while the store schema records its modality, which
+ *  a mount needs before it opens the collection. The names system collection,
+ *  @c names_collection_k, maps every name onto the bare UUID of its collection. A strings
+ *  collection, and the names, live in the strings store of
+ *  <tt>include/ustore/strings/nvme_store.hpp</tt>, keyed by whole strings, each mapped onto a
+ *  16-byte key held in its cell, and a transaction's strings ride in the share of it every
  *  transaction here joins.
  *
  *  Every write of a caller goes through a transaction of the database, the caller's or one the call commits alone, so
@@ -32,7 +35,7 @@
  *  wrote, and every range it walked, the keys it did not find included, against every commit since its start, all
  *  under the ledger's leader word, and lands under a stamp drawn after that check: committed transactions are strictly
  *  serializable in the order of their stamps. Watching nothing, a transaction still reads one snapshot, but its writes
- *  land unchecked and the last writer wins. `describe` reports snapshot isolation, as the C ABI does for every engine
+ *  land unchecked and the last writer wins. @c describe reports snapshot isolation, as the C ABI does for every engine
  *  but the in-memory one.
  *
  *  A staged transaction holds the ledger's leader word, which every other commit waits for, so a stage only checks

@@ -256,7 +256,7 @@ class adjacency_graph_t {
     /**
      *  @brief Lays out @p entries as compressed rows, summing the weights of repeated pairs.
      *
-     *  @param[inout] entries Every edge in both directions, sorted in place; a self-loop appears twice.
+     *  @param[in,out] entries Every edge in both directions, sorted in place; a self-loop appears twice.
      */
     static expected<adjacency_graph_t> make(st::basic_vector<weighted_entry_t>& entries) noexcept {
         std::sort(entries.begin(), entries.end(), entry_precedes);
@@ -406,7 +406,7 @@ struct score_t {
  *
  *  Sweeps until no vertex moves, scoring a move by the standard gain that only the moved vertex's
  *  neighborhood and the two communities' summed degrees enter.
- *  @param[inout] graph The graph one level runs over, whose neighborhoods it reads repeatedly.
+ *  @param[in,out] graph The graph one level runs over, whose neighborhoods it reads repeatedly.
  */
 template <typename graph_type_>
 expected<level_t> optimize_level(graph_type_& graph) noexcept {
@@ -550,7 +550,7 @@ struct run_result_t {
  *
  *  A coarse level's modularity is the modularity of the partition it stands for on the original graph,
  *  so the run reports scores and counts rather than flattening the levels back into one partition.
- *  @param[inout] graph The finest graph, read once per sweep of the first level.
+ *  @param[in,out] graph The finest graph, read once per sweep of the first level.
  *  @param[in] settings Supplies the growth threshold and the ceiling on levels.
  */
 template <typename graph_type_>

@@ -2,8 +2,8 @@
  *  @file src/engine.hpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief The verb tables every engine fills, which the router of `src/lib.hpp` routes each handle through, and the
- *      handles of databases, transactions, snapshots and executors.
+ *  @brief The verb tables every engine fills, which the router of <tt>src/lib.hpp</tt> routes each
+ *      handle through, and the handles of databases, transactions, snapshots and executors.
  */
 
 #pragma once
@@ -276,7 +276,7 @@ inline constexpr home_tables<home_t::vram_nvidia_k> unsupported_vram_tables_k {
 /**
  *  @brief One engine: its database verbs, and one table of modality verbs per home.
  *
- *  Every verb is `noexcept` and answers a status, which the router publishes into the caller's outcome: the in-house
+ *  Every verb is @c noexcept and answers a status, which the router publishes into the caller's outcome: the in-house
  *  engines never throw, and an oracle wraps each call of its library in @c guarded. Every ragged input arrives
  *  readable in any layout, in the order its argument structure names them, since the router gathers what an accessor
  *  writes.
@@ -346,7 +346,7 @@ inline status_t admit_modality(ustore_modality_t held, ustore_modality_t served)
  *  @brief Serves @p serve_, an unchecked verb of one engine, after @p resolve_, that engine's resolver, refuses every
  *      collection of the call holding no @p modality_.
  *
- *  Every engine's resolver is called as `resolve_(database, collections, count, modality, view)`, refusing a
+ *  Every engine's resolver is called as <tt>resolve_(database, collections, count, modality, view)</tt>, refusing a
  *  collection it does not list, as @p view sees it, and one @c admit_modality refuses.
  */
 template <ustore_modality_t modality_, auto resolve_, auto serve_, typename arguments_type_>
@@ -536,7 +536,7 @@ struct deferred_slot_t {
     deferred_arguments_t arguments;
 
     /** Serves @c arguments in a runner's scratch and on its thread into a result for the driver to publish, as
-     *  `run_deferred` does. */
+     *  @c run_deferred does. */
     void (*run)(void* arguments, deferred_result_t& result, view_t const& runner) noexcept = nullptr;
 
     /** The call's place among every call on the executor, blocking ones included. */
@@ -562,7 +562,7 @@ enum class driver_state_t : std::uint32_t {
 /** Where an executor runs calls: one pool thread, or the calling thread of a blocking call. */
 struct runner_t {
 
-    /** The thread running a call here, empty while idle, through `std::atomic_ref`. */
+    /** The thread running a call here, empty while idle, through @c std::atomic_ref. */
     std::thread::id thread;
 
     /** The scratch every call run here works in, freed with the executor. */
@@ -584,11 +584,11 @@ struct ustore_database_handle_t {
     /** Whether calls may change the database, as an open or a view set it. */
     access_t access = access_t::read_write_k;
 
-    /** Deferred calls naming the database that have not finished, through `std::atomic_ref`. */
+    /** Deferred calls naming the database that have not finished, through @c std::atomic_ref. */
     std::uint32_t deferred_calls = 0;
 
     /** The caller's hold plus one per transaction, snapshot or cursor keeping the database open, through
-     *  `std::atomic_ref`. */
+     *  @c std::atomic_ref. */
     std::uint32_t holds = 1;
 };
 
@@ -600,10 +600,10 @@ struct ustore_transaction_handle_t {
     ustore_database_t database = nullptr;
     claim_t claim = claim_t::free_k;
 
-    /** Deferred calls naming the transaction that have not finished, through `std::atomic_ref`. */
+    /** Deferred calls naming the transaction that have not finished, through @c std::atomic_ref. */
     std::uint32_t deferred_calls = 0;
 
-    /** The caller's hold plus one per cursor reading through the transaction, through `std::atomic_ref`. */
+    /** The caller's hold plus one per cursor reading through the transaction, through @c std::atomic_ref. */
     std::uint32_t holds = 1;
 };
 
@@ -613,10 +613,10 @@ struct ustore_snapshot_handle_t {
     void* state = nullptr;
     ustore_database_t database = nullptr;
 
-    /** Deferred calls naming the snapshot that have not finished, through `std::atomic_ref`. */
+    /** Deferred calls naming the snapshot that have not finished, through @c std::atomic_ref. */
     std::uint32_t deferred_calls = 0;
 
-    /** The caller's hold plus one per cursor reading through the snapshot, through `std::atomic_ref`. */
+    /** The caller's hold plus one per cursor reading through the snapshot, through @c std::atomic_ref. */
     std::uint32_t holds = 1;
 };
 

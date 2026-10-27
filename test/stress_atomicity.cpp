@@ -219,8 +219,8 @@ std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t cons
  *  Each thread picks its own value per batch, so once all threads finish a round every batch must hold one value
  *  in all of its keys, whichever thread won it. Every round ends by clearing the database, so the next starts empty.
  *
- *  @param[inout] run Database, keys and thread slots the run allocated once.
- *  @param[inout] executor Pool of exactly the configuration's thread count.
+ *  @param[in,out] run Database, keys and thread slots the run allocated once.
+ *  @param[in,out] executor Pool of exactly the configuration's thread count.
  *  @param[in] batches Batches every round writes.
  *  @param[in] checkpoints Most rounds to run.
  *  @param[in] slice Time after which no further round starts; the first round always runs.

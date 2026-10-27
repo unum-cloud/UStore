@@ -46,7 +46,7 @@ Issues = "https://github.com/unum-cloud/UStore/issues"
 build-dir = "build_python/{wheel_tag}"
 build.targets = ["ustore_python"]
 cmake.build-type = "Release"
-cmake.version = ">=3.25"
+cmake.version = ">=3.28"
 install.components = ["ustore_python"]
 minimum-version = "build-system.requires"
 sdist.exclude = [
@@ -91,12 +91,9 @@ sdist.include = [
 wheel.packages = ["python/ustore"]
 
 [tool.scikit-build.cmake.define]
-USTORE_BUILD_BENCH = "OFF"
-USTORE_BUILD_LIB_PYTHON = "ON"
-USTORE_BUILD_NVME = "ON"
-USTORE_BUILD_TEST = "OFF"
-USTORE_BUILD_TOOLS = "OFF"
+USTORE_BUILD_PYTHON = "ON"
 USTORE_WITH_LEVELDB = "ON"
+USTORE_WITH_NVME = "ON"
 USTORE_WITH_ROCKSDB = "ON"
 
 # Groups rather than extras, so none of this reaches the published wheel's metadata.
@@ -128,11 +125,16 @@ testpaths = ["test"]
 xfail_strict = true
 
 [tool.ruff.lint]
-extend-select = ["I", "TID"]
+extend-select = ["D", "I", "TID"]
 
 [tool.ruff.lint.per-file-ignores]
 # cmake-format evaluates its profile with `section` already in scope.
 ".cmake-format.py" = ["F821"]
+"!python/**" = ["D"]
+"*.pyi" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

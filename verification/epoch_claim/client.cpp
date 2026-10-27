@@ -11,42 +11,31 @@
  *  @c std::atomic_ref::wait performs, which GenMC reads as one blocked read, and a park that never
  *  ends is a liveness violation. The three scenarios are the Spin scenarios beside this file.
  *
- *  @c committer_and_holder publishes a commit's view, then calls @c take_if_free, against the
- *  holder's @c release_claim_, so no maintenance is lost. @c explicit_verbs runs two blocking takers
- *  and one trier, each holder adding one to a plain tally, so a broken exclusion or a stale tally is a
- *  data race GenMC reports. @c stalled_committer runs @c make_room_ against a flusher that releases
- *  and retakes the claim @c rounds times, then keeps it. The flusher flushes only once the committer
- *  has parked on the epoch the flusher holds, or is done, which a relaxed ghost word the committer
- *  writes before it parks reports without ordering anything.
- *
  *  @verify pass sc,tso,rc11,imm committer_and_holder
- *  @verify fail rc11,imm committer_and_holder_try_fence_false: @c take_if_free fences before its
- *      @c fetch_or; without it the view's store and the acquiring @c fetch_or reorder, under IMM as
- *      on Arm's @c ldseta, and the holder's look reads the view from before the commit
- *  @verify fail rc11,imm committer_and_holder_release_fence_false: @c release fences after its add;
- *      without it the releasing add and the look's acquire load reorder, under IMM as on Arm's
- *      @c staddl and @c ldar, and the committer's fenced @c fetch_or still reads the claim held
+ *  @verify fail rc11,imm committer_and_holder_try_fence_false: without it the view's store and the acquiring
+ *      @c fetch_or reorder, under IMM as on Arm's @c ldseta, and the holder's look reads the view from before
+ *      the commit
+ *  @verify fail rc11,imm committer_and_holder_release_fence_false: without it the releasing add and the
+ *      look's acquire load reorder, under IMM as on Arm's @c staddl and @c ldar
  *  @verify pass sc,tso committer_and_holder_try_fence_false: on x86 the @c fetch_or is a locked
  *      instruction, which drains the store buffer like the fence it replaces
  *  @verify pass sc,tso committer_and_holder_release_fence_false: on x86 the releasing add is a
  *      locked instruction as well
  *  @verify pass sc,tso,rc11,imm explicit_verbs
- *  @verify fail rc11,imm explicit_verbs_take_order_relaxed: the @c fetch_or that takes the claim
- *      acquires; relaxed, the next holder's tally races with the last holder's increment
- *  @verify fail rc11,imm explicit_verbs_release_order_relaxed: the add that releases the claim
- *      releases; relaxed, the next holder's tally races with the last holder's increment
+ *  @verify fail rc11,imm explicit_verbs_take_order_relaxed: relaxed, the next holder's tally races with the
+ *      last holder's increment
+ *  @verify fail rc11,imm explicit_verbs_release_order_relaxed: relaxed, the next holder's tally races with
+ *      the last holder's increment
  *  @verify pass sc,tso,rc11,imm stalled_committer
- *  @verify stuck sc,rc11,imm stalled_committer_release_step_cleared: a flag cleared to zero is set
- *      back to one by the flusher's retake, so the woken committer's wait reads the value it parked
- *      on and parks again, and once the flusher keeps the claim it parks for good
+ *  @verify stuck sc,rc11,imm stalled_committer_release_step_cleared: the woken committer's wait reads the
+ *      value it parked on and parks again, and once the flusher keeps the claim it parks for good
  *  @verify stuck sc,rc11,imm stalled_committer_stalled_wait_until_taken: blocked in @c take, the
  *      committer finds the claim retaken after every release and never reads the flush that
- *      relieved it, which is how any blocking taker fares against a flusher retaking back to back
+ *      relieved it
  *  @verify pass sc,tso stalled_committer_rounds_1: the woken committer reads the flush at once,
  *      since the release it woke on follows it
  *  @verify stuck rc11,imm stalled_committer_rounds_1: the wake's reload is relaxed, so the woken
- *      committer may read the pressure stale and park on the retake, leaving only after one more
- *      release, which a single round never gives it
+ *      committer may read the pressure stale and park on the retake
  *  @verify pass rc11,imm stalled_committer_rounds_1_wake_order_acquire: reloaded with an acquire,
  *      the wake synchronizes with the release it saw and the woken committer reads the flush
  */

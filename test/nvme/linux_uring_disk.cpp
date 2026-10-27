@@ -75,7 +75,7 @@ expected<std::uint64_t> registered_capacity(disk_type_& disk, medium_options_t c
 
 /**
  *  @brief Leases the ring, registers @p bytes of aligned memory, runs @p body and gives both back.
- *  @param[inout] disk The mounted ring the queue pair and the range come from.
+ *  @param[in,out] disk The mounted ring the queue pair and the range come from.
  *  @param[in] bytes Bytes of buffer to register, which the body addresses through the registered_memory.
  *  @param[in] body Called with the queue pair, the registered memory and the buffer it covers.
  */

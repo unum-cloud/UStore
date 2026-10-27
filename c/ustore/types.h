@@ -180,7 +180,8 @@ typedef struct ustore_bytes_view_t {
 
 } ustore_bytes_view_t;
 
-/** Writes the view of every string `indices[i]` into `views[i]`, for strings no tape holds, and accepts any
+/** Writes the view of every string <tt>indices[i]</tt> into <tt>views[i]</tt>, for strings no tape holds, and accepts
+ *  any
  *  @p count. */
 typedef void (*ustore_strings_get_t)(void const* handle, ustore_size_t const* indices, ustore_size_t count,
                                      ustore_bytes_view_t* views);
@@ -251,7 +252,17 @@ typedef struct ustore_strings_view_t {
 } ustore_strings_view_t;
 
 /** What went wrong, in one vocabulary shared by every engine and binding. Shared statuses carry USearch's numbers,
- *  leaving 3, 4, 5, 11 and 13 unused, and UStore's own follow from 18. */
+ *  leaving 3, 4, 5, 11 and 13 unused, and UStore's own follow from 18.
+ *
+ *  Statuses fall into five categories. Resources: @c ustore_status_out_of_memory_k, @c ustore_status_io_k and
+ *  @c ustore_status_device_k. Input: @c ustore_status_invalid_argument_k and @c ustore_status_malformed_k. State:
+ *  @c ustore_status_uninitialized_k, @c ustore_status_read_only_k, @c ustore_status_unsupported_k,
+ *  @c ustore_status_not_found_k, @c ustore_status_already_exists_k, @c ustore_status_write_conflict_k,
+ *  @c ustore_status_read_conflict_k, @c ustore_status_phantom_conflict_k, @c ustore_status_capacity_exhausted_k and
+ *  @c ustore_status_contended_k. Interruptions: @c ustore_status_cancelled_k and @c ustore_status_deferred_k.
+ *  Defects: @c ustore_status_internal_k. Any verb that allocates, binds a device or touches a file may also return a
+ *  Resources status; any verb taking a progress callback may return @c ustore_status_cancelled_k. A verb's own block
+ *  lists only what its contract adds. */
 typedef enum ustore_status_t {
 
     /** The call succeeded; @c message carries nothing. */
@@ -343,10 +354,13 @@ USTORE_EXPORT ustore_status_t ustore_outcome_wait(ustore_outcome_t* outcome);
  *  @brief Reads the status of @p outcome without waiting, with the acquire ordering its final store pairs with, so a
  *      final status also publishes every output of the call.
  *  @param[in] outcome An outcome passed to a call.
- *  @return @c ustore_status_deferred_k while the call is not final, then its final status.
+ *  @return The final status once the call is final.
  *
  *  The one way to poll: the status word is atomic only by this contract, so a caller reading the field directly
  *  needs an atomic load its language may not offer on foreign memory.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_deferred_k The call is not final.
  */
 USTORE_EXPORT ustore_status_t ustore_outcome_status(ustore_outcome_t* outcome);
 
@@ -365,8 +379,12 @@ typedef enum ustore_completion_t {
  *  a value no status carries. */
 USTORE_EXPORT char const* ustore_status_name(ustore_status_t status);
 
-/** Reads a status back from its canonical spelling, answering @c ustore_status_invalid_argument_k for a name no
- *  status carries. */
+/**
+ *  Reads a status back from its canonical spelling.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k No status carries the @p name.
+ */
 USTORE_EXPORT ustore_status_t ustore_status_from_name(ustore_bytes_view_t name);
 
 /** Whether the call a progress callback watches carries on or unwinds. */
@@ -547,6 +565,13 @@ typedef struct ustore_executor_for_ram_t {
  *  callers' threads, and to the background flushes and compactions of RocksDB and LevelDB. The threads interleave
  *  across the compute domains local to the memory domains named, where ForkUnion spawns near them: every domain the
  *  process may allocate on, or one alone. Naming several but not all spreads them over the whole machine.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, a memory domain
+ *    identifier names no domain, or ForkUnion refuses an argument.
+ *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
+ *    are asked of a build without them, or the operating system denies ForkUnion an operation.
+ *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments);
 
@@ -578,6 +603,13 @@ typedef struct ustore_executor_on_pool_t {
  *
  *  A dispatch on a pool that runs another is refused, so a batch finding the pool running its lender's dispatch runs
  *  on the executor's own driver thread instead of forking over the lender.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, a memory domain
+ *    identifier names no domain, or ForkUnion refuses the @c pool or another argument.
+ *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, or the operating
+ *    system denies ForkUnion an operation.
+ *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments);
 
@@ -666,6 +698,13 @@ typedef struct ustore_executor_for_nvme_t {
  *
  *  A database @c ustore_database_open_nvme opens on it moves bytes as @c nvme names, which the open reads once, so the
  *  executor may be freed before the databases it opened. Where its merges run is the open's own @c compactions.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the transport is
+ *    unknown, or ForkUnion refuses an argument.
+ *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
+ *    are asked of a build without them, or the operating system denies ForkUnion an operation.
+ *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments);
 
@@ -719,9 +758,7 @@ typedef struct ustore_executor_for_vram_t {
 } ustore_executor_for_vram_t;
 
 /**
- *  @brief Opens one submission stream on @c device, or borrows the caller's, driven by one host thread, or reports
- *      @c ustore_status_unsupported_k in a library built without CUDA and @c ustore_status_device_k on a machine
- *      without the device.
+ *  @brief Opens one submission stream on @c device, or borrows the caller's, driven by one host thread.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  Every call queues on that stream in order, so one host thread keeps the device fed, and a multi-GPU caller makes
@@ -729,6 +766,14 @@ typedef struct ustore_executor_for_vram_t {
  *  plane, and every call no device tower serves yet, with @c ustore_status_unsupported_k, and arenas it makes live on
  *  its device. @c ustore_database_open_nvme takes one as its @c compactions, reading its device and scratch limit
  *  once.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the @c gds mode is
+ *    unknown, or ForkUnion refuses an argument.
+ *  - @c ustore_status_unsupported_k The library was built without CUDA, the process may allocate on
+ *    no memory domain, or the operating system denies ForkUnion an operation.
+ *  - @c ustore_status_device_k No device carries the ordinal.
+ *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments);
 
@@ -749,13 +794,17 @@ typedef struct ustore_executor_drain_t {
 /**
  *  @brief Waits for every call submitted before the drain began, so later submissions never delay it.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c mood is unknown.
+ *  - @c ustore_status_contended_k A callback drains the executor running it.
  */
 USTORE_EXPORT void ustore_executor_drain(ustore_executor_drain_t* arguments);
 
 /**
  *  @brief Drains every call, then frees the executor's threads, rings and scratch, and hands a borrowed pool back to
  *      its lender; @c NULL is safe, and it cannot fail, so takes no outcome.
- *  @param[inout] executor The executor to be freed; invalid afterwards.
+ *  @param[in,out] executor The executor to be freed; invalid afterwards.
  *
  *  Waits until every call running on the executor, blocking or deferred, is final. Arenas it made stay valid, each
  *  keeping its memory until freed.
@@ -804,12 +853,15 @@ typedef struct ustore_arena_init_t {
  *
  *  Nothing is allocated until a call writes into it. An arena may outlive the executor that made it: it keeps its own
  *  memory, and the device that memory lives on, until it is freed.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena output is @c NULL.
  */
 USTORE_EXPORT void ustore_arena_init(ustore_arena_init_t* arguments);
 
 /**
  *  @brief Frees the arena and every output in it; @c NULL is safe, and it cannot fail, so takes no outcome.
- *  @param[inout] arena The arena to be freed; invalid afterwards.
+ *  @param[in,out] arena The arena to be freed; invalid afterwards.
  *
  *  Waits until every deferred call naming the arena is final.
  */

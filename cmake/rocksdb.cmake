@@ -72,7 +72,7 @@ if (NOT rocksdb_POPULATED)
         CACHE INTERNAL ""
     )
     FetchContent_Populate(rocksdb)
-    add_subdirectory(${rocksdb_SOURCE_DIR} ${rocksdb_BINARY_DIR} EXCLUDE_FROM_ALL)
+    add_subdirectory(${rocksdb_SOURCE_DIR} ${rocksdb_BINARY_DIR} EXCLUDE_FROM_ALL SYSTEM)
     add_library(rocksdb::rocksdb ALIAS rocksdb)
     # RocksDB loads fixed-width integers from unaligned addresses on purpose, and exempts those loads from the
     # undefined-behavior sanitizer only when told a sanitized build is running
@@ -87,4 +87,4 @@ if (NOT rocksdb_POPULATED)
     endif ()
 endif ()
 
-include_directories(${rocksdb_SOURCE_DIR}/include)
+include_directories(SYSTEM ${rocksdb_SOURCE_DIR}/include)

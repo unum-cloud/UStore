@@ -1,53 +1,39 @@
 /**
- *  The order a sorted run reaches disk in, as the Storage I/O section of `v1.md` fixes it: an
- *  extent is written, flushed, recorded in the catalog, and then the catalog is synced, so an
- *  extent missing from the catalog is free after a crash.
+ *  @file verification/durability.pml
+ *  @author Ash Vardanian
+ *  @date September 18, 2026
+ *  @brief Spin model of the write, flush, record and catalog order, with a crash at every step.
  *
- *  Two volumes publish a catalog two ways, and this models both. A `directory_volume_t` keeps its
- *  catalog in the metadata directory and replaces it by rename, which is atomic on every
- *  filesystem. An `extent_volume_t` has no directory to rename in, so it keeps two slots in the
- *  volume itself: an image is written whole into the older slot, flushed, and from that instant it
- *  is the newer one. A torn image fails the checksum its header carries over the whole image, so a
- *  mount rejects it and reads the other slot, which is what a failed rename left behind. Both are
- *  one atomic publication here, which is what the two properties turn on.
+ *  An extent is written, flushed, recorded in the catalog, and the catalog synced, so an extent
+ *  missing from the catalog is free after a crash. Both volumes publish the catalog atomically:
+ *  `directory_volume_t` by rename, `extent_volume_t` by a checksummed slot swap. One writer takes
+ *  `extents` extents through five stages while a power process may cut the run at any step.
+ *  It assumes the catalog rename is atomic and that a write is whole blocks, and checks neither.
  *
- *  `src/nvme/catalog.hpp` carries the record and slot layout, and `src/nvme/volume.hpp` the order
- *  below; `src/nvme/extent_allocator.hpp` places an extent and holds no state of its own, since the
- *  free map is rebuilt from the catalog at mount.
+ *  - `catalog_entry_has_durable_bytes`: no catalog entry points at bytes that never landed.
+ *  - `acknowledged_extent_survives`: no acknowledged extent is lost.
  *
- *  Shape: one writer takes `extents` extents through five stages each, and a power process may
- *  cut the run at any point. Two extents is enough for a crash to land between one extent's
- *  catalog sync and the next extent's write, which is the only ordering the second extent can
- *  spoil for the first.
- *
- *  Abstracted away: the bytes themselves, since an extent is durable or it is not; the free
- *  range tree, since a crash leaves every extent outside the durable catalog free by
- *  definition; partial writes, since the transport's aligned slab writes whole blocks; and the
- *  atomicity of the catalog replacement, which a rename gives outright and two slots give through
- *  a checksum over the whole image, and which the model takes as given by running the sync in one
- *  step unless a knob breaks it. Everything not durable is discarded by the crash, which the
- *  model expresses by never reading a cached flag once the writer has stopped.
- *
- *  Properties, checked over the state a crash leaves behind:
- *  - `catalog_entry_has_durable_bytes`: recovery never finds an extent in the catalog whose
- *    bytes never reached the medium, which would hand a reader a hole.
- *  - `acknowledged_extent_survives`: recovery never loses an extent the writer acknowledged,
- *    which the catalog claims and whose bytes are durable.
- *
- *  Knobs, each of which must fail:
- *  - `-Dwithout_flush_before_sync` syncs the catalog before flushing the bytes, and a crash in
- *    between records an extent that is not there.
- *  - `-Dwithout_catalog_sync` leaves the catalog record in the page cache and acknowledges
- *    anyway, and a crash loses an extent the writer promised.
- *  - `-Dwithout_catalog_checksum` publishes a slot whose records were only partly copied, which is
- *    what an `extent_volume_t` does if its header carries no checksum over the image: a crash
- *    mid-image leaves some records durable and the rest not, and recovery reads the fragment as a
- *    whole catalog. Without this knob the model would keep passing for a design that dropped the
- *    checksum, since the atomic block hides the only failure the checksum prevents.
+ *  @verify pass sc
+ *  @verify pass sc extents=3
+ *  @verify fail sc flush_before_sync=false: a crash between sync and flush records missing bytes
+ *  @verify fail sc catalog_sync=false: an acknowledged extent stays in the page cache and is lost
+ *  @verify fail sc catalog_checksum=false: a torn image reads as a whole catalog
  */
 
 #ifndef extents
 #define extents 2
+#endif
+
+#ifndef flush_before_sync
+#define flush_before_sync true
+#endif
+
+#ifndef catalog_sync
+#define catalog_sync true
+#endif
+
+#ifndef catalog_checksum
+#define catalog_checksum true
 #endif
 
 #define write_stage 0
@@ -70,42 +56,35 @@ bit writer_finished = 0;
 bit power_finished = 0;
 
 // A rename, or a slot swap behind an image checksum, publishes the whole catalog at once.
-#if defined(without_catalog_sync)
 inline sync_catalog() {
-    skip
-}
-#elif defined(without_catalog_checksum)
-inline sync_catalog() {
-    // A torn image publishes a prefix: each record lands durable or it does not.
-    for (record : 0 .. extents - 1) {
-        if
-        :: catalog_durable[record] = catalog_cached[record]
-        :: skip
-        fi
-    }
-}
-#else
-inline sync_catalog() {
-    atomic {
+    if
+    :: !catalog_sync -> skip
+    :: catalog_sync && !catalog_checksum ->
+        // A torn image publishes a prefix: each record lands durable or it does not.
         for (record : 0 .. extents - 1) {
-            catalog_durable[record] = catalog_cached[record]
+            if
+            :: catalog_durable[record] = catalog_cached[record]
+            :: skip
+            fi
         }
-    }
+    :: atomic {
+        catalog_sync && catalog_checksum ->
+            for (record : 0 .. extents - 1) {
+                catalog_durable[record] = catalog_cached[record]
+            }
+       }
+    fi
 }
-#endif
 
 inline durable_step(stage, extent) {
     if
     :: stage == write_stage -> bytes_cached[extent] = 1
-#ifdef without_flush_before_sync
-    :: stage == 1 -> catalog_cached[extent] = 1
-    :: stage == 2 -> sync_catalog()
-    :: stage == 3 -> bytes_durable[extent] = bytes_cached[extent]
-#else
-    :: stage == 1 -> bytes_durable[extent] = bytes_cached[extent]
-    :: stage == 2 -> catalog_cached[extent] = 1
-    :: stage == 3 -> sync_catalog()
-#endif
+    :: stage == 1 && flush_before_sync -> bytes_durable[extent] = bytes_cached[extent]
+    :: stage == 2 && flush_before_sync -> catalog_cached[extent] = 1
+    :: stage == 3 && flush_before_sync -> sync_catalog()
+    :: stage == 1 && !flush_before_sync -> catalog_cached[extent] = 1
+    :: stage == 2 && !flush_before_sync -> sync_catalog()
+    :: stage == 3 && !flush_before_sync -> bytes_durable[extent] = bytes_cached[extent]
     :: stage == acknowledge_stage -> acknowledged[extent] = 1
     fi
 }

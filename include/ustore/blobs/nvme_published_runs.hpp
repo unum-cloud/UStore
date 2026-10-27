@@ -691,10 +691,10 @@ class published_runs {
 
     /**
      *  @brief Mounts an empty tree over @p volume and publishes a view naming it alone.
-     *  @param[inout] volume The volume every run lands on, borrowed and outliving the runs.
+     *  @param[in,out] volume The volume every run lands on, borrowed and outliving the runs.
      *  @param[in] config The bounds of the memory runs and the shape of the tree below.
-     *  @param[inout] constraint The budget the memory runs are charged to.
-     *  @param[inout] ledger The stamps the store's writes carry and its readers pin, outliving the runs.
+     *  @param[in,out] constraint The budget the memory runs are charged to.
+     *  @param[in,out] ledger The stamps the store's writes carry and its readers pin, outliving the runs.
      */
     status_t mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
                    ledger_t& ledger) noexcept {
@@ -976,8 +976,8 @@ class published_runs {
 
     /**
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
-     *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
-     *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
+     *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
+     *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device lane.
      *  @param[in] fold What a change delta does, which composes the changes no reader tells apart.
      *  @param[in] device_fold What composes the changes of the merge on a device, or @c no_device_fold_t where nothing
@@ -1202,6 +1202,7 @@ class published_runs {
      *  @brief Takes the leader word, publishes a view naming @p merged where exactly the runs of @p group sat, moves
      *      those runs into @p away, and lets the word go, which returns once no reader can reach them.
      *  @param[in] group The runs merged, newest first, which commits since may have put newer runs ahead of.
+     *  @param[in,out] merged The run that replaces them, moved into the published view.
      *  @param[out] away Room reserved for the runs of @p group, which the caller frees.
      *  @param[in] horizon The stamp published when the merge began, which a head reader below it reads past.
      */

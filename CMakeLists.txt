@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.28)
 
 file(READ "VERSION" ustore_version_)
 string(STRIP ${ustore_version_} ustore_version_)
@@ -12,14 +12,8 @@ project(
     DESCRIPTION "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
 )
 
-# Determine if UStore is built as a subproject (using `add_subdirectory`) or if it is the main project
-set(USTORE_IS_MAIN_PROJECT OFF)
-if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
-    set(USTORE_IS_MAIN_PROJECT ON)
-endif ()
-
 # Git does not run hooks shipped inside a clone, so configuring the build points `core.hooksPath` at `.githooks`.
-if (USTORE_IS_MAIN_PROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+if (PROJECT_IS_TOP_LEVEL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     execute_process(
         COMMAND git config core.hooksPath .githooks
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -37,13 +31,13 @@ option(USTORE_INSTALL "Install CMake targets" OFF)
 option(USTORE_WITH_ROCKSDB "Use RocksDB for a persistent engine" OFF)
 option(USTORE_WITH_LEVELDB "Use LevelDB for a persistent engine" OFF)
 option(USTORE_WITH_SPDK "Use SPDK for user-space NVMe access in NVMe" OFF)
+option(USTORE_WITH_NVME "Compile the in-tree NVMe engine" OFF)
 
-option(USTORE_BUILD_TEST "Compile the C++ suites in test/" ${USTORE_IS_MAIN_PROJECT})
-option(USTORE_BUILD_BENCH "Compile the C++ benchmarks in bench/" ${USTORE_IS_MAIN_PROJECT})
+option(USTORE_BUILD_TEST "Compile the C++ suites in test/" OFF)
+option(USTORE_BUILD_BENCH "Compile the C++ benchmarks in bench/" OFF)
 option(USTORE_BUILD_TOOLS "Compile the CLI and the dataset tools in tools/" OFF)
-option(USTORE_BUILD_LIB_C "Compile a native library for the C interface, one per engine" OFF)
-option(USTORE_BUILD_LIB_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
-option(USTORE_BUILD_NVME "Compile the in-tree NVMe engine" OFF)
+option(USTORE_BUILD_SHARED "Compile the static and shared C libraries in the default build" OFF)
+option(USTORE_BUILD_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
 option(USTORE_BUILD_CUDA "Compile NVMe's GPU compaction" OFF)
 option(USTORE_WERROR "Treat compiler warnings as errors" OFF)
 option(USTORE_BUNDLE_SIBLINGS "Copy the ForkUnion and StringZilla objects into ustore_static; Cargo links their own" ON)
@@ -103,6 +97,7 @@ else ()
         ustore_warnings
         INTERFACE
             "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Wpedantic;-Wno-unknown-pragmas;-Wno-missing-field-initializers>"
+            "$<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<CXX_COMPILER_ID:Clang,AppleClang>>:-Wdocumentation>"
     )
     if (USTORE_WERROR)
         target_compile_options(ustore_warnings INTERFACE -Werror)
@@ -177,10 +172,10 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/yyjson.cmake")
 function (ustore_sibling name_)
     string(TOUPPER ${name_} name_upper_)
     if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt")
-        add_subdirectory(${name_} EXCLUDE_FROM_ALL)
+        add_subdirectory(${name_} EXCLUDE_FROM_ALL SYSTEM)
     elseif (DEFINED FETCHCONTENT_SOURCE_DIR_${name_upper_})
         add_subdirectory(
-            "${FETCHCONTENT_SOURCE_DIR_${name_upper_}}" "${CMAKE_CURRENT_BINARY_DIR}/${name_}" EXCLUDE_FROM_ALL
+            "${FETCHCONTENT_SOURCE_DIR_${name_upper_}}" "${CMAKE_CURRENT_BINARY_DIR}/${name_}" EXCLUDE_FROM_ALL SYSTEM
         )
     else ()
         message(FATAL_ERROR "ustore: initialize the ${name_} submodule or set FETCHCONTENT_SOURCE_DIR_${name_upper_}")
@@ -188,8 +183,6 @@ function (ustore_sibling name_)
 endfunction ()
 
 # ForkUnion's C ABI, linked statically into every engine and suite
-set(FORKUNION_BUILD_TEST OFF)
-set(FORKUNION_INSTALL OFF)
 ustore_sibling(forkunion)
 # Every UStore thread runs inside ForkUnion's compiled pool, whose barriers ThreadSanitizer sees only once that archive
 # is instrumented as well
@@ -198,23 +191,11 @@ if (USTORE_BUILD_SANITIZERS STREQUAL "thread")
 endif ()
 
 # SmashTable's containers, header-only
-set(SMASHTABLE_BUILD_TEST OFF)
-set(SMASHTABLE_BUILD_CUDA OFF)
-set(SMASHTABLE_INSTALL OFF)
 ustore_sibling(smashtable)
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
 # the running CPU supports. NumKong is unused today; wiring it in later is the same add_subdirectory plus a
 # numkong::header link, once something includes its headers.
-set(STRINGZILLA_BUILD_TEST OFF)
-set(STRINGZILLA_BUILD_BENCH OFF)
-set(STRINGZILLA_BUILD_SHARED OFF)
-set(STRINGZILLA_BUILD_STATIC ON)
-set(STRINGZILLA_BUILD_CUDA OFF)
-set(STRINGZILLA_INSTALL OFF)
-# StringZilla arms sanitizers in Debug by default, which leaves its archive needing a runtime the consumers' link lines
-# do not carry.
-set(STRINGZILLA_BUILD_SANITIZERS OFF)
 ustore_sibling(stringzilla)
 
 # The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
@@ -307,7 +288,7 @@ function (ustore_cpu_class class_ target_macro_)
     endif ()
     set(advances_ FALSE)
     foreach (capability_ IN LISTS arg_UNPARSED_ARGUMENTS)
-        if (fu_target_${capability_}_compiles)
+        if (forkunion_target_${capability_}_compiles)
             set(advances_ TRUE)
         endif ()
     endforeach ()
@@ -334,9 +315,9 @@ ustore_cpu_class(aws_g2 AWS_G2 OVER serial arm64_yield)
 ustore_cpu_class(apple_m2 APPLE_M2 OVER aws_g2 arm64_lse arm64_rcpc)
 ustore_cpu_class(aws_g5 AWS_G5 OVER apple_m2 arm64_wfet)
 
-# Without `USTORE_BUILD_LIB_C`, the libraries build only for the targets that link them
-if (NOT USTORE_BUILD_LIB_C AND NOT USTORE_INSTALL)
-    set(ustore_lib_c_exclusion_ EXCLUDE_FROM_ALL)
+# Without `USTORE_BUILD_SHARED`, the libraries build only for the targets that link them
+if (NOT USTORE_BUILD_SHARED AND NOT USTORE_INSTALL)
+    set(ustore_library_exclusion_ EXCLUDE_FROM_ALL)
 endif ()
 
 # One library holds the C ABI and every engine the build enables, each opened through its own `ustore_database_*` calls;
@@ -364,7 +345,7 @@ foreach (class_ IN LISTS ustore_cpu_classes_)
     list(APPEND ustore_ram_variants_ src/ram/variants_${class_}.cpp)
 endforeach ()
 # Both libraries link one copy of every CPU class's engine, compiled position-independent once
-add_library(ustore_ram_variants OBJECT ${ustore_lib_c_exclusion_} ${ustore_ram_variants_})
+add_library(ustore_ram_variants OBJECT ${ustore_library_exclusion_} ${ustore_ram_variants_})
 set_target_properties(ustore_ram_variants PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ustore_ram_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_})
 list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_ram_variants>)
@@ -372,13 +353,13 @@ list(APPEND ustore_compiled_objects_ ustore_ram_variants)
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
-if (${USTORE_BUILD_NVME})
+if (${USTORE_WITH_NVME})
     list(APPEND ustore_sources_ src/nvme/engine.cpp)
     foreach (class_ IN LISTS ustore_cpu_classes_)
         list(APPEND ustore_nvme_variants_ src/nvme/variants_${class_}.cpp)
     endforeach ()
     # Both libraries link one copy of every CPU class's engine, compiled position-independent once
-    add_library(ustore_nvme_variants OBJECT ${ustore_lib_c_exclusion_} ${ustore_nvme_variants_})
+    add_library(ustore_nvme_variants OBJECT ${ustore_library_exclusion_} ${ustore_nvme_variants_})
     set_target_properties(ustore_nvme_variants PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_link_libraries(ustore_nvme_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_})
     list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_nvme_variants>)
@@ -418,10 +399,10 @@ foreach (dependency_ IN LISTS ustore_dependencies_)
     endif ()
     list(APPEND ustore_dependency_links_ $<BUILD_INTERFACE:${dependency_}>)
 endforeach ()
-add_library(ustore_static STATIC ${ustore_lib_c_exclusion_} ${ustore_sources_} ${ustore_dependency_objects_})
+add_library(ustore_static STATIC ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_dependency_objects_})
 add_library(ustore::static ALIAS ustore_static)
 add_library(ustore::ustore ALIAS ustore_static)
-add_library(ustore_shared SHARED ${ustore_lib_c_exclusion_} ${ustore_sources_})
+add_library(ustore_shared SHARED ${ustore_library_exclusion_} ${ustore_sources_})
 add_library(ustore::shared ALIAS ustore_shared)
 set_target_properties(ustore_static PROPERTIES EXPORT_NAME static)
 set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
@@ -517,7 +498,7 @@ if (${USTORE_BUILD_TEST})
 
     # The storage suites build with the NVMe engine they test. The storage ring stands outside the per-engine loop: it
     # links no engine, only the siblings it is written against.
-    if (${USTORE_BUILD_NVME})
+    if (${USTORE_WITH_NVME})
         set(ustore_storage_test_names_
             "ring"
             "channels"
@@ -810,6 +791,6 @@ if (${USTORE_BUILD_BENCH})
     )
 endif ()
 
-if (${USTORE_BUILD_LIB_PYTHON})
+if (${USTORE_BUILD_PYTHON})
     add_subdirectory(python)
 endif ()

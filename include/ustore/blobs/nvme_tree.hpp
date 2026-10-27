@@ -1504,9 +1504,9 @@ class lsm_level_merger {
 
     /**
      *  @brief Merges @p request.upper into @p request.lower and writes the survivors as a new sorted level.
-     *  @param[inout] volume The volume the new runs are reserved on, which every source run also lives on.
-     *  @param[inout] reading_channel The channel the source values are gathered on, held by the calling thread.
-     *  @param[inout] writing_channel The channel the new runs are written on, which must not be @p reading_channel.
+     *  @param[in,out] volume The volume the new runs are reserved on, which every source run also lives on.
+     *  @param[in,out] reading_channel The channel the source values are gathered on, held by the calling thread.
+     *  @param[in,out] writing_channel The channel the new runs are written on, which must not be @p reading_channel.
      *  @param[in] request Which levels merge, what the new runs may grow to, and where the compaction runs.
      *  @param[in] fold How the collection's changes compose and apply, which reads their values on
      *      @p reading_channel before any is gathered.
@@ -2293,7 +2293,7 @@ class lsm_tree {
 
     /**
      *  @brief Looks @p stored_keys up in @p taken and reads their values, refilling the channel as reads retire.
-     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
+     *  @param[in,out] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] taken The level set every lookup runs against.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key was, which separates a miss from a removed value.
@@ -2389,7 +2389,7 @@ class lsm_tree {
 
     /**
      *  @brief Writes @p key_slots and @p stored_values as one run and publishes it onto level zero.
-     *  @param[inout] channel The channel the run is written on, held by the calling thread.
+     *  @param[in,out] channel The channel the run is written on, held by the calling thread.
      *  @param[in] key_slots The key slots in ascending order of their keys, as a flush drained them from memory runs.
      *  @param[in] stamps The stamp of every key slot, in the same order.
      *  @param[in] kinds The @c delta_kind_t of every key slot, in the same order.
@@ -2429,7 +2429,7 @@ class lsm_tree {
 
     /**
      *  @brief Opens the runs @p runs names and publishes them as the level set of this tree.
-     *  @param[inout] channel The channel every run's header and index is read on, held by the calling thread.
+     *  @param[in,out] channel The channel every run's header and index is read on, held by the calling thread.
      *  @param[in] runs The runs in the order their levels hold them, which is oldest first on level zero.
      *  @param[in] published What to call once the restored set is current, as a flush does.
      *  @return Success, or the status that stopped it with the empty level set still current.
@@ -2474,8 +2474,8 @@ class lsm_tree {
 
     /**
      *  @brief Merges the shallowest level that is over its bounds into the level below it and publishes it.
-     *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
-     *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
+     *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
+     *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] placement Where the compaction runs, which a collection leaves automatic.
      *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device lane.
      *  @param[in] cancellation The word the merge reads between blocks, or null for a merge nobody stops.

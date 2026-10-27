@@ -83,7 +83,7 @@ A graph collection lives in the graph store of `include/ustore/graph/nvme_store.
 A docs collection lives in the docs store of `include/ustore/docs/nvme_store.hpp`, whose field writes, patches and merges append `json_fold_t` change deltas through `src/nvme/docs.hpp`.
 A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold_t` change deltas that the `*_edits` calls of `src/blobs_layers/pages.hpp` encode and `src/nvme/pages.hpp` commits.
 Reads of documents and pages take the read paths of `src/blobs_layers/docs.hpp` and `src/blobs_layers/pages.hpp` over the engine's own reads of those stores, which fold the change deltas.
-`USTORE_BUILD_NVME` is off by default, and the Python package turns it on; what follows is a v1 target:
+`USTORE_WITH_NVME` is off by default, and the Python package turns it on; what follows is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.
 - __SIMD point lookups__ — sorted run indexes, micro-sets and ring buffers become SmashTable components with compile-time SIMD kits, one artifact carrying all of them and a database choosing one when it opens.

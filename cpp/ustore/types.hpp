@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date July 4, 2022
  *  @brief Locations, arenas, stamps, receivers, executors and progress callables shared by every C++ wrapper, beside
- *      the identifiers, edges and value views it re-exports from `ustore/utilities/types.hpp`.
+ *      the identifiers, edges and value views it re-exports from <tt>ustore/utilities/types.hpp</tt>.
  */
 
 #pragma once

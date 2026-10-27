@@ -10,10 +10,11 @@
  *  documents read, with no other parser. Gists and modifications parse every document with yyjson. All of it lives in
  *  the scratch of the call, so the arena of the request holds only its outputs.
  *
- *  Every call takes the documents of one engine as an object answering `read(places, view)`, the binary documents at
- *  @c places as a @c json_documents_t appended to the scratch, and `write(places, values, durability, view)`. The
- *  `*_over_blobs` verbs bind them to the unchecked whole-value verbs of one engine, and the in-memory engine binds them
- *  to its documents stores inside one transaction.
+ *  Every call takes the documents of one engine as an object answering <tt>read(places, view)</tt>,
+ *  the binary documents at @c places as a @c json_documents_t appended to the scratch, and
+ *  <tt>write(places, values, durability, view)</tt>. The @c *_over_blobs verbs bind them to the
+ *  unchecked whole-value verbs of one engine, and the in-memory engine binds them to its documents
+ *  stores inside one transaction.
  */
 
 #pragma once

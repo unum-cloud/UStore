@@ -61,7 +61,7 @@
     {
       "label": "Build Debug NVMe Test",
       "detail": "Unit suite on NVMe, which configures only once src/nvme compiles",
-      "command": "cmake --preset debug -DUSTORE_BUILD_NVME=ON && cmake --build --preset debug --target ustore_test_units",
+      "command": "cmake --preset debug -DUSTORE_WITH_NVME=ON && cmake --build --preset debug --target ustore_test_units",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -133,7 +133,7 @@
     {
       "label": "Build Debug NVMe Benchmark",
       "detail": "Twitter benchmark on NVMe, which configures only once src/nvme compiles",
-      "command": "cmake --preset profile -DUSTORE_BUILD_NVME=ON && cmake --build --preset profile --target ustore_bench_twitter",
+      "command": "cmake --preset profile -DUSTORE_WITH_NVME=ON && cmake --build --preset profile --target ustore_bench_twitter",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]

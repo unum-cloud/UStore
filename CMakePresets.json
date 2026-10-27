@@ -2,7 +2,7 @@
   "version": 6,
   "cmakeMinimumRequired": {
     "major": 3,
-    "minor": 25,
+    "minor": 28,
     "patch": 0
   },
   "configurePresets": [
@@ -40,16 +40,15 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "USTORE_BUILD_SANITIZERS": "address",
         "USTORE_BUILD_TEST": "ON",
-        "USTORE_BUILD_BENCH": "OFF",
         "USTORE_BUILD_TOOLS": "ON",
-        "USTORE_BUILD_LIB_C": "ON"
+        "USTORE_BUILD_SHARED": "ON"
       }
     },
     {
       "name": "check",
       "inherits": "llvm",
       "displayName": "Check - fastest compile cycle",
-      "description": "Does it still compile, nothing more: -O0 without debug information over every UStore target.",
+      "description": "Does it still compile, nothing more: -O0 without debug information over every UStore target, with warnings as errors.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
@@ -58,7 +57,8 @@
         "USTORE_BUILD_TEST": "ON",
         "USTORE_BUILD_BENCH": "ON",
         "USTORE_BUILD_TOOLS": "ON",
-        "USTORE_BUILD_LIB_C": "ON"
+        "USTORE_BUILD_SHARED": "ON",
+        "USTORE_WERROR": "ON"
       }
     },
     {
@@ -69,9 +69,8 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "USTORE_BUILD_TEST": "ON",
-        "USTORE_BUILD_BENCH": "OFF",
         "USTORE_BUILD_TOOLS": "ON",
-        "USTORE_BUILD_LIB_C": "ON"
+        "USTORE_BUILD_SHARED": "ON"
       }
     },
     {
@@ -84,7 +83,7 @@
         "USTORE_BUILD_TEST": "ON",
         "USTORE_BUILD_BENCH": "ON",
         "USTORE_BUILD_TOOLS": "ON",
-        "USTORE_BUILD_LIB_C": "ON"
+        "USTORE_BUILD_SHARED": "ON"
       }
     },
     {
@@ -96,10 +95,8 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
-        "USTORE_BUILD_TEST": "OFF",
         "USTORE_BUILD_BENCH": "ON",
-        "USTORE_BUILD_TOOLS": "OFF",
-        "USTORE_BUILD_LIB_C": "ON"
+        "USTORE_BUILD_SHARED": "ON"
       }
     },
     {
@@ -110,10 +107,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "USTORE_BUILD_SANITIZERS": "thread",
-        "USTORE_BUILD_TEST": "ON",
-        "USTORE_BUILD_BENCH": "OFF",
-        "USTORE_BUILD_TOOLS": "OFF",
-        "USTORE_BUILD_LIB_C": "OFF"
+        "USTORE_BUILD_TEST": "ON"
       }
     },
     {
@@ -128,7 +122,7 @@
         "USTORE_BUILD_TEST": "ON",
         "USTORE_BUILD_BENCH": "ON",
         "USTORE_BUILD_TOOLS": "ON",
-        "USTORE_BUILD_LIB_C": "ON"
+        "USTORE_BUILD_SHARED": "ON"
       }
     },
     {
@@ -138,7 +132,7 @@
       "description": "The dev tree plus the NVMe engine and its CUDA compaction, compiled for the GPUs of this machine alone.",
       "cacheVariables": {
         "CMAKE_CUDA_FLAGS_RELWITHDEBINFO": "-O2 -lineinfo -DNDEBUG",
-        "USTORE_BUILD_NVME": "ON",
+        "USTORE_WITH_NVME": "ON",
         "CMAKE_CUDA_HOST_COMPILER": "clang++",
         "USTORE_BUILD_CUDA": "ON",
         "USTORE_CUDA_ARCHITECTURES": "native"

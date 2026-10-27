@@ -27,16 +27,18 @@ struct blobs_page_t {
     sz::strings_view_t values {strings_of({}, 0)};
 };
 
-/** What a scan or a cursor narrows its keys by, each part zeroed to keep every key: patterns over the values of blobs
- *  and strings, a JSONPath or XPath filter over documents and pages, and a predicate over the keys. */
+/** What a scan or a cursor narrows its keys by, each part zeroed to keep every key: patterns over
+ *  the values of blobs and strings, a JSONPath or XPath filter over documents and pages, and a
+ *  predicate over the keys. */
 struct match_t {
     ustore_patterns_t patterns {};
     ustore_bytes_view_t filter {};
     ustore_predicate_t predicate {};
 };
 
-/** The predicate the ABI asks through @p callable, called as `callable(keys, admissions)` over spans once per page,
- *  at @p cost; @p callable must outlive the scan or the cursor given it. */
+/** The predicate the ABI asks through @p callable, called as <tt>callable(keys, admissions)</tt>
+ *  over spans once per page, at @p cost; @p callable must outlive the scan or the cursor given
+ *  it. */
 template <typename callable_type_>
 ustore_predicate_t predicate_of(callable_type_& callable,
                                 ustore_predicate_cost_t cost = ustore_predicate_cheap_k) noexcept {
@@ -74,8 +76,8 @@ class keys_cursor {
 
     keys_cursor(receiver_t receiver, handle_type_ cursor) noexcept : receiver_(receiver), cursor_(cursor) {}
 
-    /** Pulls up to @p wanted keys into @p arena, with their values into @p values unless it is null, the other fields
-     *  of @p next taken as they are. */
+    /** Pulls up to @p wanted keys into @p arena, with their values into @p values unless it is
+     *  null, the other fields of @p next taken as they are. */
     expected<std::span<ustore_key_t const>> pull_(std::size_t wanted, arena_t& arena, ustore_strings_view_t* values,
                                                   next_type_ next) noexcept {
         ustore_key_t const* keys = nullptr;
@@ -110,8 +112,8 @@ class keys_cursor {
         return *this;
     }
 
-    /** Opens a walk over the keys of @p collection from @p start, at the view @p receiver reads, keeping the keys
-     *  @p match admits, compiled once here. */
+    /** Opens a walk over the keys of @p collection from @p start, at the view @p receiver reads,
+     *  keeping the keys @p match admits, compiled once here. */
     static expected<keys_cursor> make(receiver_t receiver, ustore_collection_id_t collection,
                                       ustore_key_t start = smallest_key_k, match_t const& match = {}) noexcept {
         handle_type_ cursor = nullptr;
@@ -135,8 +137,8 @@ class keys_cursor {
         return pull_(wanted, arena, nullptr, {});
     }
 
-    /** Pulls up to @p wanted keys with their values into @p arena in one call, the other fields of @p options, such as
-     *  the encoding pages render in, taken as they are. */
+    /** Pulls up to @p wanted keys with their values into @p arena in one call, the other fields of
+     *  @p options, such as the encoding pages render in, taken as they are. */
     expected<blobs_page_t> next_pairs(std::size_t wanted, arena_t& arena, next_type_ options = {}) noexcept
         requires requires(next_type_ next) { next.values; }
     {
@@ -164,9 +166,10 @@ using graph_vertices_cursor_t = keys_cursor<ustore_graph_vertices_cursor_t, usto
                                             ustore_graph_vertices_cursor_next_t, &ustore_graph_vertices_cursor_init,
                                             &ustore_graph_vertices_cursor_next, &ustore_graph_vertices_cursor_free>;
 
-/** Scans up to @p wanted keys of @p collection from @p start into @p arena through @p scan_, the scan of one modality
- *  keyed by UUIDs, at the view @p receiver reads, keeping the keys @p match admits, and writing one BM25 score per key
- *  into @p scores when it is not null and the patterns carry weights. */
+/** Scans up to @p wanted keys of @p collection from @p start into @p arena through @p scan_, the
+ *  scan of one modality keyed by UUIDs, at the view @p receiver reads, keeping the keys @p match
+ *  admits, and writing one BM25 score per key into @p scores when it is not null and the patterns
+ *  carry weights. */
 template <typename scan_type_, void (*scan_)(scan_type_*)>
 expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, ustore_collection_id_t collection,
                                                           ustore_key_t start, std::size_t wanted, arena_t& arena,
@@ -195,8 +198,9 @@ expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, u
     return std::span<ustore_key_t const> {keys + offsets[0], keys + offsets[1]};
 }
 
-/** Scans up to @p wanted keys of @p collection, which holds @p modality, from @p start into @p arena through the scan
- *  of that modality: the documents, the vertices, the pages or the keys of blobs. */
+/** Scans up to @p wanted keys of @p collection, which holds @p modality, from @p start into
+ *  @p arena through the scan of that modality: the documents, the vertices, the pages or the keys
+ *  of blobs. */
 inline expected<std::span<ustore_key_t const>> scan_keys(receiver_t receiver, ustore_modality_t modality,
                                                          ustore_collection_id_t collection, ustore_key_t start,
                                                          std::size_t wanted, arena_t& arena) noexcept {
@@ -213,11 +217,12 @@ inline expected<std::span<ustore_key_t const>> scan_keys(receiver_t receiver, us
     }
 }
 
-/** A stream over the keys of one collection that pulls them in pages through the scan of its modality, each page
- *  resuming past the last key of the one before it. It keeps the arena holding the page in hand, so it moves but never
- *  copies, and prefers @c seek to being rebuilt. As shorthand for a range-based loop, which has no place for an arena,
- *  it owns that one arena for its lifetime. A page short of the read-ahead ends the stream, and a default-constructed
- *  stream is at the end. */
+/** A stream over the keys of one collection that pulls them in pages through the scan of its
+ *  modality, each page resuming past the last key of the one before it. It keeps the arena holding
+ *  the page in hand, so it moves but never copies, and prefers @c seek to being rebuilt. As
+ *  shorthand for a range-based loop, which has no place for an arena, it owns that one arena for
+ *  its lifetime. A page short of the read-ahead ends the stream, and a default-constructed stream
+ *  is at the end. */
 class keys_stream_t {
 
     friend class graph_stream_t;
@@ -269,8 +274,9 @@ class keys_stream_t {
     keys_stream_t(keys_stream_t const&) = delete;
     keys_stream_t& operator=(keys_stream_t const&) = delete;
 
-    /** Opens a stream over the keys of @p collection, which holds @p modality, from @p start, pulling @p read_ahead of
-     *  them a page into an arena of its own, made where the executor of @p receiver computes. */
+    /** Opens a stream over the keys of @p collection, which holds @p modality, from @p start,
+     *  pulling @p read_ahead of them a page into an arena of its own, made where the executor of
+     *  @p receiver computes. */
     static expected<keys_stream_t> make(receiver_t receiver, ustore_collection_id_t collection, ustore_key_t start,
                                         std::size_t read_ahead = default_read_ahead_k,
                                         ustore_modality_t modality = ustore_modality_blobs_k) noexcept {
@@ -323,9 +329,10 @@ class keys_stream_t {
     }
 };
 
-/** A stream over the keys and values of one collection that pulls both in pages from a cursor, in one call per page.
- *  As shorthand for a range-based loop, which has no place for an arena, it owns that one arena for its lifetime,
- *  where @c blobs_cursor_t takes the caller's per pull. A default-constructed stream is at the end. */
+/** A stream over the keys and values of one collection that pulls both in pages from a cursor, in
+ *  one call per page. As shorthand for a range-based loop, which has no place for an arena, it owns
+ *  that one arena for its lifetime, where @c blobs_cursor_t takes the caller's per pull. A
+ *  default-constructed stream is at the end. */
 class pairs_stream_t {
 
     receiver_t receiver_ {};
@@ -364,8 +371,8 @@ class pairs_stream_t {
     pairs_stream_t(pairs_stream_t const&) = delete;
     pairs_stream_t& operator=(pairs_stream_t const&) = delete;
 
-    /** Opens a stream over the pairs of @p collection from @p start, pulling @p read_ahead of them a page into an arena
-     *  of its own, made where the executor of @p receiver computes. */
+    /** Opens a stream over the pairs of @p collection from @p start, pulling @p read_ahead of them
+     *  a page into an arena of its own, made where the executor of @p receiver computes. */
     static expected<pairs_stream_t> make(receiver_t receiver, ustore_collection_id_t collection, ustore_key_t start,
                                          std::size_t read_ahead = default_read_ahead_k) noexcept {
         auto [arena, arena_status] = arena_t::make(receiver.executor);
@@ -438,8 +445,8 @@ struct size_estimates_t {
     size_range_t bytes_on_disk;
 };
 
-/** A slice of keys in one collection, which streams its keys through the scan of the collection's @c modality, and,
- *  in a blobs collection, streams its pairs and estimates its size. */
+/** A slice of keys in one collection, which streams its keys through the scan of the collection's
+ *  @c modality, and, in a blobs collection, streams its pairs and estimates its size. */
 class blobs_range_t {
 
     receiver_t receiver_;

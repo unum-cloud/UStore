@@ -267,7 +267,12 @@ class docs_ref : public docs_read_ref<locations_type_> {
         return any_write(std::forward<values_argument_type_>(values), ustore_docs_modify_upsert_k, type, durability);
     }
 
-    /** Removes the documents whole, refusing locations that name a field, which a patch or a merge removes. */
+    /**
+     *  Removes the documents whole, refusing locations that name a field, which a patch or a merge removes.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k A location names a field.
+     */
     status_t remove(ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
         decltype(auto) places = this->locations_store_.ref();
         ustore_size_t const count = keys_extractor_t {}.count(places);

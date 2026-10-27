@@ -234,12 +234,12 @@ NVMe keeps no write-ahead log, so a crash loses the commits its memory runs held
 RocksDB takes a transaction's snapshot at its first read or write rather than when it began, and stages by locking and validating every watched read and buffered write against that snapshot, then preparing the writes into its log.
 LevelDB has no transactions.
 
-The engines build into one library, offered as the `ustore_static` archive and the `ustore_shared` library, which holds `ram` and every engine enabled through `USTORE_BUILD_NVME`, `USTORE_WITH_ROCKSDB` and `USTORE_WITH_LEVELDB`.
+The engines build into one library, offered as the `ustore_static` archive and the `ustore_shared` library, which holds `ram` and every engine enabled through `USTORE_WITH_NVME`, `USTORE_WITH_ROCKSDB` and `USTORE_WITH_LEVELDB`.
 
 An engine reports itself through `ustore_database_describe`: its name, what it supports, its isolation, and its estimates of the keys, memory and disk the data takes.
 The C++ `database_t` exposes the capability bits as `supports_transactions`, `supports_snapshots` and `supports_collections`.
 `ustore_database_clear` empties every collection at once, and `ustore_database_compact` reclaims the space overwritten and removed data still takes.
-NVMe's sources are not yet ported to the current C ABI, so `USTORE_BUILD_NVME` stays off until they build.
+NVMe's sources are not yet ported to the current C ABI, so `USTORE_WITH_NVME` stays off until they build.
 Once ported, NVMe runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_BUILD_CUDA`; [`src/nvme/README.md`](src/nvme/README.md) describes its layers.
 
 ## Compatibility

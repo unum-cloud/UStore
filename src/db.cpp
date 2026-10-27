@@ -2,7 +2,7 @@
  *  @file src/db.cpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief Implements `c/ustore/db.h`: databases, snapshots, transactions and collections, the views they read
+ *  @brief Implements <tt>c/ustore/db.h</tt>: databases, snapshots, transactions and collections, the views they read
  *      through, the spelling of their closed sets, and the refusing opens of the engines a build lacks.
  */
 

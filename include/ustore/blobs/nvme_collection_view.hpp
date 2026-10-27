@@ -91,6 +91,8 @@ class collection_view {
 
     /**
      *  @brief The newest version of @p stored_key stamped at or below @p at, which is what a reader at @p at sees.
+     *  @param[in] stored_key The key to look up.
+     *  @param[in] at The stamp the reader is pinned at.
      *  @param[out] found What that version does and its bytes, untouched when there is none.
      *  @return Whether any run carries such a version, a removal included.
      */

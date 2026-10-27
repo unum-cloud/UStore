@@ -858,8 +858,8 @@ class basic_extent_volume {
 
     /**
      *  @brief Mounts @p medium of @p disk, formatting it when it holds no volume and @p format allows.
-     *  @param[inout] disk The transport, borrowed and outliving the volume.
-     *  @param[inout] channel A channel to read the head and the slots through, borrowed for this call.
+     *  @param[in,out] disk The transport, borrowed and outliving the volume.
+     *  @param[in,out] channel A channel to read the head and the slots through, borrowed for this call.
      *  @param[in] medium The registered medium the volume occupies.
      *  @param[in] format The identity and geometry a format writes, and what to do with a bad catalog.
      *  @return The volume, or @c status_code_t::malformed_k for a medium @p format refuses to repair.
@@ -928,7 +928,7 @@ class basic_extent_volume {
 
     /**
      *  @brief Makes the bytes of @p blob durable and then records it, in that order and no other.
-     *  @param[inout] channel The channel the caller wrote the bytes on, which is the only one that can flush them.
+     *  @param[in,out] channel The channel the caller wrote the bytes on, which is the only one that can flush them.
      *  @param[in] blob The reservation @c create handed out, whose bytes the caller has already completed.
      *  @return Success, or @c status_code_t::not_found_k when no live reservation covers that range.
      */
@@ -1697,7 +1697,7 @@ inline status_t create_directories(char const* path) noexcept {
     return create_directory(components);
 }
 
-/** Writes @c <directory>/<name> into @p into, or refuses a path the buffer will not hold. */
+/** Writes the directory, a separator and the name into @p into, or refuses a path the buffer will not hold. */
 inline status_t join_path(char const* directory, char const* name, std::span<char> into) noexcept {
     std::size_t const directory_bytes = std::strlen(directory);
     std::size_t const name_bytes = std::strlen(name);
@@ -1808,7 +1808,7 @@ class basic_storage_mount {
     /**
      *  @brief Pins the arena, queue pairs the channels and opens one volume per data directory of @p config.
      *  @param[in] config The channel shape, the shared channels and the data directories, with their capacities.
-     *  @param[inout] constraint The host budget the arena is charged to, once, for the life of the mount.
+     *  @param[in,out] constraint The host budget the arena is charged to, once, for the life of the mount.
      *  @param[in] threads Executor threads, each of which gets a channel of its own.
      *  @param[in] database The database the volumes belong to, which a mount refuses to open under another.
      *  @return Success, or the first refusal, after which @c unmount gives back whatever was taken.
@@ -1890,7 +1890,7 @@ class basic_storage_mount {
      *  @brief Opens the volume of @p directory as medium @p index, and adopts it into the router.
      *  @param[in] directory The path the volume file sits in, and the bytes the volume spans.
      *  @param[in] index The medium slot this volume takes, which @c unmount gives back.
-     *  @param[inout] channel The channel the head and the catalog slots are read and written through.
+     *  @param[in,out] channel The channel the head and the catalog slots are read and written through.
      *  @param[in] database The database the volume belongs to, which a mount refuses to open under another.
      */
     status_t open_volume_(data_directory_config_t const& directory, std::size_t index, io_channel_t& channel,
@@ -1972,7 +1972,7 @@ class mounted_storage {
     /**
      *  @brief Probes the transport @p config asks for and mounts the whole storage stack on it.
      *  @param[in] config The transport, the channel shape and the data directories, with their capacities.
-     *  @param[inout] constraint The host budget the arena is charged to, once, for the life of the mount.
+     *  @param[in,out] constraint The host budget the arena is charged to, once, for the life of the mount.
      *  @param[in] threads Executor threads, each of which gets a channel of its own.
      *  @param[in] database The database the volumes belong to, or an invalid identifier to take any.
      */

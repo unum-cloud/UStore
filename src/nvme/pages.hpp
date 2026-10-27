@@ -2,16 +2,17 @@
  *  @file src/nvme/pages.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief The page edits of the C ABI over the pages stores of `include/ustore/pages/nvme_store.hpp`, for the NVMe
- *      engine's table.
+ *  @brief The page edits of the C ABI over the pages stores of
+ *      <tt>include/ustore/pages/nvme_store.hpp</tt>, for the NVMe engine's table.
  *
- *  These calls build on the writes and the collection lookups of `src/nvme/database.hpp`. An edit call addressing
- *  any collection but a pages one is refused. The `*_edits` calls of `src/blobs_layers/pages.hpp` read the pages
- *  unwatched through the engine's own reads, check and apply the edits, and answer the edits of every page as one
- *  chain, which @c commit_page_edits lands. A chain that imports or removes the page decides it whole, so the page it
- *  leaves is written, or removed, and any other chain is appended as one @c page_fold_t change delta, watching
- *  nothing, so two commits editing one page both land. Reads take `pages_read_over_blobs` over the engine's own reads
- *  of the pages store, which fold the deltas.
+ *  These calls build on the writes and the collection lookups of <tt>src/nvme/database.hpp</tt>. An
+ *  edit call addressing any collection but a pages one is refused. The @c *_edits calls of
+ *  <tt>src/blobs_layers/pages.hpp</tt> read the pages unwatched through the engine's own reads,
+ *  check and apply the edits, and answer the edits of every page as one chain, which
+ *  @c commit_page_edits lands. A chain that imports or removes the page decides it whole, so the
+ *  page it leaves is written, or removed, and any other chain is appended as one @c page_fold_t
+ *  change delta, watching nothing, so two commits editing one page both land. Reads take
+ *  @c pages_read_over_blobs over the engine's own reads of the pages store, which fold the deltas.
  */
 
 #pragma once
@@ -36,8 +37,9 @@ using ustore::pages::page_fold_t;
 /** The fold every change delta of a pages collection is written for. */
 inline constexpr page_fold_t pages_fold_k {};
 
-/** Refuses a page call of @p arguments addressing any collection but a pages one, then commits the chains @p edits
- *  answers, called as `edits()`, in one transaction, the caller's or one of their own flushed when the call asks. */
+/** Refuses a page call of @p arguments addressing any collection but a pages one, then commits the
+ *  chains @p edits answers, called as <tt>edits()</tt>, in one transaction, the caller's or one of
+ *  their own flushed when the call asks. */
 template <cpu_class_t cpu_class_, typename arguments_type_, typename edits_type_>
 status_t commit_page_edits(arguments_type_ const& arguments, view_t const& view, edits_type_&& edits) noexcept {
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);

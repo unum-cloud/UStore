@@ -268,10 +268,12 @@ class memory_run {
     /**
      *  @brief The run one merge makes of @p versions, which come in key order with the versions of a key newest first,
      *      for runs of one tier it replaces.
+     *  @param[in] versions The versions to merge, in key order with the versions of a key newest first.
      *  @param[in] oldest_stamp The oldest stamp of the runs it replaces, which the run keeps covering where that
      *      version did not survive, so neighbouring runs still never overlap and the durable stamp stays below every
      *      commit the run holds.
      *  @param[in] tier The tier of the runs it replaces, which the run is one above.
+     *  @param[in] allocator Where the merged run's columns are allocated.
      */
     static expected<memory_run> merged(std::span<stamped_delta<stored_key_t> const> versions,
                                        transaction_stamp_t oldest_stamp, std::uint32_t tier,

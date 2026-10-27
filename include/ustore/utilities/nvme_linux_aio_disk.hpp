@@ -259,7 +259,7 @@ class linux_aio_files_disk {
 
     /**
      *  @brief Takes @p queue_pair back once it has nothing outstanding, and empties the handle.
-     *  @param[inout] queue_pair The queue pair to return, surrendered on success only.
+     *  @param[in,out] queue_pair The queue pair to return, surrendered on success only.
      */
     status_t release_queue_pair(queue_pair_t& queue_pair) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
@@ -310,7 +310,7 @@ class linux_aio_files_disk {
 
     /**
      *  @brief Gives @p registered_memory back, refusing while the kernel may still write into it.
-     *  @param[inout] registered_memory The range to give back, surrendered on success.
+     *  @param[in,out] registered_memory The range to give back, surrendered on success.
      */
     status_t unregister_memory(registered_memory_t& registered_memory) noexcept {
         registered_memory_slot_t* const slot = slot_of_(registered_memory);
@@ -364,7 +364,7 @@ class linux_aio_files_disk {
 
     /**
      *  @brief Closes @p registered_medium, refusing while requests against it are still in flight.
-     *  @param[inout] registered_medium The medium to give back, surrendered on success.
+     *  @param[in,out] registered_medium The medium to give back, surrendered on success.
      */
     status_t unregister_medium(registered_medium_t& registered_medium) noexcept {
         registered_medium_slot_t* const slot = slot_of_(registered_medium);

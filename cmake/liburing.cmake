@@ -31,7 +31,7 @@ add_library(
     "${liburing_SOURCE_DIR}/src/syscall.c" "${liburing_SOURCE_DIR}/src/version.c"
 )
 add_library(uring::uring ALIAS uring)
-target_include_directories(uring PUBLIC $<BUILD_INTERFACE:${liburing_SOURCE_DIR}/src/include>)
+target_include_directories(uring SYSTEM PUBLIC $<BUILD_INTERFACE:${liburing_SOURCE_DIR}/src/include>)
 target_compile_definitions(uring PRIVATE _GNU_SOURCE _LARGEFILE_SOURCE _FILE_OFFSET_BITS=64 LIBURING_INTERNAL)
 target_compile_options(uring PRIVATE -include "${liburing_SOURCE_DIR}/config-host.h")
 set_target_properties(uring PROPERTIES POSITION_INDEPENDENT_CODE ON)
