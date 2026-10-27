@@ -7,7 +7,7 @@
  *
  *  Generated tweet-shaped documents sit back to back in one tape, as a read answers them. Each call takes the next
  *  batch of them and either parses every document with yyjson and looks each field up, or resolves every field with
- *  `resolve_fields` from `ustore/docs/json_paths.hpp`; both then fill the same columns, so the gap is the cost of
+ *  `extract_fields` from `ustore/docs/json_paths.hpp`; both then fill the same columns, so the gap is the cost of
  *  locating the fields. No engine is opened, so storage reads stay out of the timings.
  *
  *  Beside the flags of @c bench/harness.hpp, whose @c --seed also seeds the documents, it takes:
@@ -33,7 +33,7 @@
 #include <smashtable/basic_vector.hpp>
 #include <stringzilla/capabilities.h> // `sz_capabilities_enabled_cpu`
 
-#include "ustore/docs/json_paths.hpp"       // `resolve_fields`, `json_documents_t`
+#include "ustore/docs/json_paths.hpp"       // `extract_fields`, `json_documents_t`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `json_lookup`, `gather_scalar`, `json_to_string`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_rewind`, `arena_free`, `growing_strings`
 
@@ -172,8 +172,8 @@ constexpr std::array<column_t, 4> columns_k {{
 }};
 
 /** Converts @p value into cell @p index of a column of @p type, as the docs gather does. */
-conversion_t gather_cell(ustore_docs_field_type_t type, yyjson_val* value, ustore_byte_t* scalars, std::size_t index,
-                         growing_strings<arena_allocator<byte_t>>& strings) noexcept {
+conversion_t gather_cell(ustore_docs_field_type_t type, json_cell_t const& value, ustore_byte_t* scalars,
+                         std::size_t index, growing_strings<arena_allocator<byte_t>>& strings) noexcept {
     switch (type) {
     case ustore_docs_field_type_u64_k: return gather_scalar<std::uint64_t>(value, scalars, index);
     case ustore_docs_field_type_u32_k: return gather_scalar<std::uint32_t>(value, scalars, index);
@@ -188,7 +188,7 @@ conversion_t gather_cell(ustore_docs_field_type_t type, yyjson_val* value, ustor
 }
 
 /** Fills every column of @p columns from @p values, laid out field after field, counting the valid cells. */
-std::size_t fill_columns(std::span<column_t const> columns, std::span<yyjson_val* const> values, std::size_t count,
+std::size_t fill_columns(std::span<column_t const> columns, std::span<json_cell_t const> values, std::size_t count,
                          std::span<ustore_byte_t> scalars, ustore_arena_t scratch) noexcept {
     std::size_t valid = 0;
     for (std::size_t column = 0; column != columns.size(); ++column) {
@@ -204,27 +204,54 @@ std::size_t fill_columns(std::span<column_t const> columns, std::span<yyjson_val
 
 #pragma region Benchmarks
 
+/** The value yyjson parsed @p value into, as an extraction holds it, missing for @c nullptr. */
+json_cell_t cell_of_parsed(yyjson_val* value) noexcept {
+    json_cell_t cell;
+    if (!value) return cell;
+    switch (yyjson_get_type(value)) {
+    case YYJSON_TYPE_NULL: cell.token = json_token_t::null_k; break;
+    case YYJSON_TYPE_BOOL: cell.token = yyjson_get_bool(value) ? json_token_t::true_k : json_token_t::false_k; break;
+    case YYJSON_TYPE_STR:
+        cell.token = json_token_t::string_k, cell.bytes = {yyjson_get_str(value), yyjson_get_len(value)};
+        break;
+    case YYJSON_TYPE_OBJ: cell.token = json_token_t::object_k; break;
+    case YYJSON_TYPE_ARR: cell.token = json_token_t::array_k; break;
+    case YYJSON_TYPE_NUM:
+        cell.token = json_token_t::number_k;
+        if (yyjson_is_real(value)) cell.number = yyjson_get_real(value);
+        else if (yyjson_is_sint(value)) cell.number = yyjson_get_sint(value);
+        else cell.number = yyjson_get_uint(value);
+        break;
+    default: break;
+    }
+    return cell;
+}
+
 /** Locates every field of @p fields in @p documents by parsing each document with yyjson, field after field. */
 bool resolve_with_yyjson(json_documents_t const& documents, std::span<std::string_view const> fields,
-                         ustore_arena_t scratch, std::span<yyjson_val*> values) noexcept {
+                         ustore_arena_t scratch, std::span<json_cell_t> values) noexcept {
     for (std::size_t index = 0; index != documents.count; ++index) {
         std::string_view const document = documents[index];
         auto [parsed, status] = json_parse(document, scratch);
         if (status.failed()) return false;
         yyjson_val* const root = yyjson_doc_get_root(parsed.handle);
         for (std::size_t field = 0; field != fields.size(); ++field)
-            values[field * documents.count + index] = json_lookup(root, fields[field]);
+            values[field * documents.count + index] = cell_of_parsed(json_lookup(root, fields[field]));
     }
     return true;
 }
 
-/** Locates every field of @p fields in @p documents with one subdocuments pass. */
+/** Extracts every field of @p fields in @p documents with one subdocuments pass. */
 bool resolve_with_subdocuments(json_documents_t const& documents, std::span<std::string_view const> fields,
-                               bool containers_parsed, ustore_arena_t scratch, std::span<yyjson_val*> values) noexcept {
+                               ustore_arena_t scratch, std::span<json_cell_t> values) noexcept {
     std::size_t const count = documents.count;
     auto const cell_of = [count](std::size_t cell) noexcept { return field_cell_t {cell % count, cell / count}; };
-    return resolve_fields(documents, fields, count * fields.size(), cell_of, containers_parsed, scratch,
-                          stringzilla_capabilities(), values);
+    json_cells_t cells;
+    if (extract_fields(documents, fields, count * fields.size(), cell_of, stringzilla_capabilities(), scratch, cells)
+            .failed())
+        return false;
+    for (std::size_t cell = 0; cell != count * fields.size(); ++cell) values[cell] = cells[cell];
+    return true;
 }
 
 /** Runs one row: each call resolves the next batch of the corpus with @p subdocuments or yyjson, then fills
@@ -238,7 +265,7 @@ row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& 
 
     return run_threads(executor, settings, name, [&](loop_t& loop, std::size_t) noexcept {
         ustore_arena_t const scratch = new (std::nothrow) ustore_arena_handle_t {};
-        st::basic_vector<yyjson_val*> values;
+        st::basic_vector<json_cell_t> values;
         st::basic_vector<ustore_byte_t> scalars;
         if (!scratch || st::failed(values.resize(batch_size * columns.size())) ||
             st::failed(scalars.resize(batch_size * sizeof(std::uint64_t))))
@@ -248,9 +275,8 @@ row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& 
             std::size_t const first = (call % batches) * batch_size;
             json_documents_t const documents = corpus.batch(first, batch_size);
             arena_rewind(scratch);
-            bool const resolved = subdocuments
-                                      ? resolve_with_subdocuments(documents, used_fields, false, scratch, values)
-                                      : resolve_with_yyjson(documents, used_fields, scratch, values);
+            bool const resolved = subdocuments ? resolve_with_subdocuments(documents, used_fields, scratch, values)
+                                               : resolve_with_yyjson(documents, used_fields, scratch, values);
             if (!resolved) {
                 loop.fail();
                 continue;

@@ -237,7 +237,7 @@ class value_writer_t {
         return out;
     }
 
-    /** Text that is no JSON, or JSON only a lenient reader takes. */
+    /** Text that is no strict JSON, NaN and comments included, which every write refuses. */
     std::string odd() {
         static constexpr std::string_view odd_k[] = {"{", "", "[1,", "nul", "{\"a\":}", "NaN", "/* c */ {\"a\":1}"};
         return std::string(pick(odd_k));

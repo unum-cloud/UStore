@@ -2,8 +2,9 @@
  *  @file include/ustore/docs/json_values.hpp
  *  @author Ash Vardanian
  *  @date December 26, 2022
- *  @brief JSON documents parsed with yyjson into an arena, the conversions between their values and the fixed-width
- *      scalars, strings and UUIDs a column of a gather holds, and the keys documents name in an id field.
+ *  @brief JSON documents parsed with yyjson into an arena for writes, the conversions between the values a read
+ *      extracts and the fixed-width scalars, strings and UUIDs a column of a gather holds, and the keys documents
+ *      name in an id field.
  *
  *  Every document parses into the arena it is given, which owns all of its memory, so nothing is freed one allocation
  *  at a time. A conversion reports how faithfully a value fits its column: exactly, converted, colliding with the
@@ -25,9 +26,10 @@
 #include <system_error> // `std::errc`
 #include <type_traits>  // `std::is_same_v`
 #include <utility>      // `std::in_range`
+#include <variant>      // `std::variant`, `std::get_if`
 
 #include <fmt/format.h> // `fmt::format_to_n`
-#include <yyjson.h>     // `yyjson_read_opts`, `yyjson_mut_doc`
+#include <yyjson.h>     // `yyjson_read_opts`, `yyjson_mut_doc`, `yyjson_read_number`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`
 #include "ustore/utilities/types.hpp"       // `value_view_t`, `expected`, `status_t`
@@ -170,12 +172,13 @@ inline expected<std::string_view> field_pointer(std::string_view field, ustore_a
     return std::string_view {pointer.data(), static_cast<std::size_t>(end - pointer.data())};
 }
 
-/** Parses a JSON document, leaving the result empty for an empty or a missing value. */
+/** Parses a strict RFC 8259 document, refusing comments and non-finite literals as the reads do, and leaving the result
+ *  empty for an empty or a missing value. */
 inline expected<json_t> json_parse(value_view_t bytes, ustore_arena_t arena) noexcept {
     if (bytes.empty()) return json_t {};
 
     yyjson_alc const allocator = json_allocator(arena);
-    yyjson_read_flag const flags = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_INF_AND_NAN;
+    yyjson_read_flag const flags = YYJSON_READ_NOFLAG;
     // yyjson writes into its input only with `YYJSON_READ_INSITU`, which is never set.
     char* const text = const_cast<char*>(bytes.c_str());
     yyjson_doc* const handle = yyjson_read_opts(text, bytes.size(), flags, &allocator, nullptr);
@@ -201,11 +204,15 @@ inline expected<value_view_t> json_dump(json_value_t value, ustore_arena_t arena
     if (!value) return value_view_t {};
 
     yyjson_alc const allocator = json_allocator(arena);
-    yyjson_write_flag const flags = YYJSON_WRITE_ALLOW_INF_AND_NAN;
+    yyjson_write_flag const flags = YYJSON_WRITE_NOFLAG;
     std::size_t length = 0;
+    yyjson_write_err error {};
     char const* const text = value.mutable_handle
-                                 ? yyjson_mut_val_write_opts(value.mutable_handle, flags, &allocator, &length, nullptr)
-                                 : yyjson_val_write_opts(value.handle, flags, &allocator, &length, nullptr);
+                                 ? yyjson_mut_val_write_opts(value.mutable_handle, flags, &allocator, &length, &error)
+                                 : yyjson_val_write_opts(value.handle, flags, &allocator, &length, &error);
+    // A non-finite number has no strict JSON spelling, so a document holding one is refused like a lenient one
+    if (!text && error.code == YYJSON_WRITE_ERROR_NAN_OR_INF)
+        return status_t {status_code_t::malformed_k, "JSON spells no NaN or Infinity"};
     if (!text) return status_t {status_code_t::out_of_memory_k, "Failed to serialize the document"};
     return value_view_t {text, length};
 }
@@ -257,40 +264,123 @@ bool integer_fits(integer_ integer) noexcept {
     else return std::in_range<scalar_>(integer);
 }
 
+/** What one field of one document holds, told by the first byte of its JSON token. */
+enum class json_token_t : std::uint8_t {
+
+    /** No member of the document has the field, so the cell is null. */
+    missing_k = 0,
+
+    /** A JSON @c null. */
+    null_k = 1,
+
+    /** A JSON @c false. */
+    false_k = 2,
+
+    /** A JSON @c true. */
+    true_k = 3,
+
+    /** A JSON number. */
+    number_k = 4,
+
+    /** A JSON string. */
+    string_k = 5,
+
+    /** A JSON object, as its raw bytes. */
+    object_k = 6,
+
+    /** A JSON array, as its raw bytes. */
+    array_k = 7,
+
+    /** A token of a malformed document, or a string whose escapes do not decode, which is null. */
+    malformed_k = 8,
+};
+
+/** The number a JSON number spells, as yyjson reads it: unsigned, signed, or real. */
+using json_number_t = std::variant<std::uint64_t, std::int64_t, double>;
+
+/** One value a read extracted from a document: what it is, its bytes, a string's unquoted and unescaped, and the
+ *  number a number spells. */
+struct json_cell_t {
+
+    /** What the value is, @c json_token_t::missing_k where the field is missing. */
+    json_token_t token = json_token_t::missing_k;
+
+    /** The bytes of the value: a string's body unescaped, any other value as the document spells it. */
+    std::string_view bytes;
+
+    /** The number a @c json_token_t::number_k value spells. */
+    json_number_t number {};
+};
+
+/** Longest number token a read parses; longer spellings carry digits no 64-bit number keeps. */
+constexpr std::size_t json_number_length_limit_k = 64;
+
+/** Reads the number @p token spells exactly, as yyjson reads one inside a document, or a malformed cell. */
+inline json_cell_t json_read_number(std::string_view token) noexcept {
+    json_cell_t const malformed {json_token_t::malformed_k, token};
+    if (token.empty() || token.size() >= json_number_length_limit_k) return malformed;
+    // yyjson reads to a terminator, which a token at the very end of a document's bytes lacks
+    char terminated[json_number_length_limit_k] = {};
+    std::memcpy(terminated, token.data(), token.size());
+    yyjson_val value {};
+    char const* const end = yyjson_read_number(terminated, &value, YYJSON_READ_NOFLAG, nullptr, nullptr);
+    if (end != terminated + token.size()) return malformed;
+    json_cell_t cell {json_token_t::number_k, token};
+    switch (yyjson_get_subtype(&value)) {
+    case YYJSON_SUBTYPE_UINT: cell.number = yyjson_get_uint(&value); break;
+    case YYJSON_SUBTYPE_SINT: cell.number = yyjson_get_sint(&value); break;
+    default: cell.number = yyjson_get_real(&value); break;
+    }
+    return cell;
+}
+
+/** What @p token holds, told by its first byte; a string keeps its quotes for the caller to unescape. */
+inline json_cell_t json_classify(std::string_view token) noexcept {
+    if (token.empty()) return {json_token_t::malformed_k, token};
+    switch (token.front()) {
+    case '"': return {json_token_t::string_k, token};
+    case '{': return {json_token_t::object_k, token};
+    case '[': return {json_token_t::array_k, token};
+    case 't': return {json_token_t::true_k, token};
+    case 'f': return {json_token_t::false_k, token};
+    case 'n': return {json_token_t::null_k, token};
+    default: return json_read_number(token);
+    }
+}
+
 /** Converts @p value into @p scalar, where a value outside the range of the scalar collides. */
 template <typename scalar_>
-conversion_t json_to_scalar(yyjson_val* value, scalar_& scalar) noexcept {
-    if (!value) return conversion_t::missing_k;
+conversion_t json_to_scalar(json_cell_t const& value, scalar_& scalar) noexcept {
+    switch (value.token) {
+    case json_token_t::missing_k:
+    case json_token_t::null_k: return conversion_t::missing_k;
 
-    switch (yyjson_get_type(value)) {
-    case YYJSON_TYPE_NULL: return conversion_t::missing_k;
-
-    case YYJSON_TYPE_BOOL:
-        scalar = static_cast<scalar_>(yyjson_get_bool(value));
+    case json_token_t::false_k:
+    case json_token_t::true_k:
+        scalar = static_cast<scalar_>(value.token == json_token_t::true_k);
         return std::is_same_v<scalar_, bool> ? conversion_t::exact_k : conversion_t::converted_k;
 
-    case YYJSON_TYPE_STR: {
-        std::string_view const text {yyjson_get_str(value), yyjson_get_len(value)};
-        return parse_entire_number(text, scalar) ? conversion_t::converted_k : conversion_t::collides_k;
-    }
+    case json_token_t::string_k:
+        return parse_entire_number(value.bytes, scalar) ? conversion_t::converted_k : conversion_t::collides_k;
 
-    case YYJSON_TYPE_NUM:
-        switch (yyjson_get_subtype(value)) {
-        case YYJSON_SUBTYPE_REAL:
-            if (!real_fits<scalar_>(yyjson_get_real(value))) return conversion_t::collides_k;
-            scalar = static_cast<scalar_>(yyjson_get_real(value));
+    case json_token_t::number_k:
+        if (double const* const real = std::get_if<double>(&value.number)) {
+            if (!real_fits<scalar_>(*real)) return conversion_t::collides_k;
+            scalar = static_cast<scalar_>(*real);
             return std::is_floating_point_v<scalar_> ? conversion_t::exact_k : conversion_t::converted_k;
-        case YYJSON_SUBTYPE_SINT:
-            if (!integer_fits<scalar_>(yyjson_get_sint(value))) return conversion_t::collides_k;
-            scalar = static_cast<scalar_>(yyjson_get_sint(value));
+        }
+        if (std::int64_t const* const signed_integer = std::get_if<std::int64_t>(&value.number)) {
+            if (!integer_fits<scalar_>(*signed_integer)) return conversion_t::collides_k;
+            scalar = static_cast<scalar_>(*signed_integer);
             return std::is_integral_v<scalar_> && std::is_signed_v<scalar_> ? conversion_t::exact_k
                                                                             : conversion_t::converted_k;
-        case YYJSON_SUBTYPE_UINT:
-            if (!integer_fits<scalar_>(yyjson_get_uint(value))) return conversion_t::collides_k;
-            scalar = static_cast<scalar_>(yyjson_get_uint(value));
+        }
+        {
+            std::uint64_t const unsigned_integer = std::get<std::uint64_t>(value.number);
+            if (!integer_fits<scalar_>(unsigned_integer)) return conversion_t::collides_k;
+            scalar = static_cast<scalar_>(unsigned_integer);
             return std::is_unsigned_v<scalar_> && !std::is_same_v<scalar_, bool> ? conversion_t::exact_k
                                                                                  : conversion_t::converted_k;
-        default: return conversion_t::collides_k;
         }
 
     default: return conversion_t::collides_k;
@@ -298,25 +388,26 @@ conversion_t json_to_scalar(yyjson_val* value, scalar_& scalar) noexcept {
 }
 
 /** Converts @p value into @p text, printing numbers into @p print_buffer. */
-inline conversion_t json_to_string(yyjson_val* value, printed_number_buffer_t& print_buffer,
+inline conversion_t json_to_string(json_cell_t const& value, printed_number_buffer_t& print_buffer,
                                    std::string_view& text) noexcept {
-    if (!value) return conversion_t::missing_k;
-
     char* const buffer_end = print_buffer + printed_number_length_limit_k;
-    switch (yyjson_get_type(value)) {
-    case YYJSON_TYPE_NULL: return conversion_t::missing_k;
+    switch (value.token) {
+    case json_token_t::missing_k:
+    case json_token_t::null_k: return conversion_t::missing_k;
 
-    case YYJSON_TYPE_BOOL: text = yyjson_get_bool(value) ? true_k : false_k; return conversion_t::converted_k;
+    case json_token_t::false_k:
+    case json_token_t::true_k:
+        text = value.token == json_token_t::true_k ? true_k : false_k;
+        return conversion_t::converted_k;
 
-    case YYJSON_TYPE_STR: text = {yyjson_get_str(value), yyjson_get_len(value)}; return conversion_t::exact_k;
+    case json_token_t::string_k: text = value.bytes; return conversion_t::exact_k;
 
-    case YYJSON_TYPE_NUM:
-        switch (yyjson_get_subtype(value)) {
-        case YYJSON_SUBTYPE_REAL: text = print_number(print_buffer, buffer_end, yyjson_get_real(value)); break;
-        case YYJSON_SUBTYPE_SINT: text = print_number(print_buffer, buffer_end, yyjson_get_sint(value)); break;
-        case YYJSON_SUBTYPE_UINT: text = print_number(print_buffer, buffer_end, yyjson_get_uint(value)); break;
-        default: return conversion_t::collides_k;
-        }
+    case json_token_t::number_k:
+        if (double const* const real = std::get_if<double>(&value.number))
+            text = print_number(print_buffer, buffer_end, *real);
+        else if (std::int64_t const* const signed_integer = std::get_if<std::int64_t>(&value.number))
+            text = print_number(print_buffer, buffer_end, *signed_integer);
+        else text = print_number(print_buffer, buffer_end, std::get<std::uint64_t>(value.number));
         return text.empty() ? conversion_t::collides_k : conversion_t::converted_k;
 
     default: return conversion_t::collides_k;
@@ -396,7 +487,7 @@ inline std::size_t field_size_bytes(ustore_docs_field_type_t type) noexcept {
 
 /** Converts @p value into the scalar at @p index of @p column, zeroing a cell that holds no valid value. */
 template <typename scalar_>
-conversion_t gather_scalar(yyjson_val* value, ustore_byte_t* column, std::size_t index) noexcept {
+conversion_t gather_scalar(json_cell_t const& value, ustore_byte_t* column, std::size_t index) noexcept {
     scalar_ scalar {};
     conversion_t const conversion = json_to_scalar(value, scalar);
     if (!is_valid(conversion)) scalar = {};
@@ -430,7 +521,7 @@ inline std::uint16_t half_of(float single) noexcept {
 
 /** Converts @p value into the half-precision float at @p index of @p column, where a magnitude past its range
  *  collides. */
-inline conversion_t gather_half(yyjson_val* value, ustore_byte_t* column, std::size_t index) noexcept {
+inline conversion_t gather_half(json_cell_t const& value, ustore_byte_t* column, std::size_t index) noexcept {
     float single = 0;
     conversion_t conversion = json_to_scalar(value, single);
     if (is_valid(conversion) && std::isfinite(single) && std::abs(single) >= half_overflow_k)
@@ -442,15 +533,16 @@ inline conversion_t gather_half(yyjson_val* value, ustore_byte_t* column, std::s
 
 /** Parses canonical UUID text such as "123e4567-e89b-12d3-a456-426614174000" into the bytes at @p index of @p column,
  *  in the order they are written. */
-inline conversion_t gather_uuid(yyjson_val* value, ustore_byte_t* column, std::size_t index) noexcept {
+inline conversion_t gather_uuid(json_cell_t const& value, ustore_byte_t* column, std::size_t index) noexcept {
     std::uint8_t parsed[uuid_bytes_k] = {};
     ustore_byte_t* const cell = column + index * uuid_bytes_k;
     std::memset(cell, 0, uuid_bytes_k);
 
-    if (!value || yyjson_is_null(value)) return conversion_t::missing_k;
-    if (!yyjson_is_str(value) || yyjson_get_len(value) != uuid_text_length_k) return conversion_t::collides_k;
+    if (value.token == json_token_t::missing_k || value.token == json_token_t::null_k) return conversion_t::missing_k;
+    if (value.token != json_token_t::string_k || value.bytes.size() != uuid_text_length_k)
+        return conversion_t::collides_k;
 
-    char const* const text = yyjson_get_str(value);
+    char const* const text = value.bytes.data();
     std::size_t parsed_count = 0;
     for (std::size_t position = 0; position != uuid_text_length_k; position += 2) {
         if (position == 8 || position == 13 || position == 18 || position == 23) {

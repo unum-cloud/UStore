@@ -23,6 +23,7 @@
 
 #include <forkunion.h>
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <stringzilla/types.h>         // `sz_allocator_t`
 
 #include "ustore/utilities/ram_device.hpp" // `claim_t`, `residency_t`
 #include "ustore/utilities/types.hpp"      // `expected`, `status_t`, `round_up_to_multiple`, `u32_tape`, `u64_tape`
@@ -306,5 +307,30 @@ class growing_strings {
         return export_strings(arena, size(), bytes_.size(), strings, exported);
     }
 };
+
+/** Serves @p bytes from the arena behind @p handle, as a StringZilla allocator does. */
+inline void* stringzilla_allocate(sz_size_t bytes, void* handle, sz_stream_t) noexcept {
+    auto [block, status] = arena_allocate<byte_t>(static_cast<ustore_arena_t>(handle), bytes,
+                                                  alignof(std::max_align_t));
+    return status.failed() ? nullptr : block.data();
+}
+
+/** Grows the block at @p pointer in place where the arena allows, as a StringZilla allocator does. */
+inline void* stringzilla_reallocate(void* pointer, sz_size_t old_bytes, sz_size_t new_bytes, void* handle,
+                                    sz_stream_t) noexcept {
+    if (new_bytes <= old_bytes) return pointer;
+    std::span<byte_t> const old_block {static_cast<byte_t*>(pointer), old_bytes};
+    auto [block, status] = arena_grow(static_cast<ustore_arena_t>(handle), old_block, new_bytes - old_bytes,
+                                      alignof(std::max_align_t));
+    return status.failed() ? nullptr : block.data();
+}
+
+/** Arena memory is released with the arena, never one block at a time. */
+inline void stringzilla_free(void*, sz_size_t, void*, sz_stream_t) noexcept {}
+
+/** A StringZilla allocator serving every block from @p arena, which frees them all when it rewinds. */
+inline sz_allocator_t stringzilla_allocator(ustore_arena_t arena) noexcept {
+    return {stringzilla_allocate, stringzilla_reallocate, stringzilla_free, arena};
+}
 
 } // namespace unum::ustore::utilities

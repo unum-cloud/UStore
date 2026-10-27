@@ -28,6 +28,7 @@
 #include <fmt/format.h> // `fmt::println`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <stringzilla/capabilities.h>  // `sz_capabilities_enabled_cpu`
 
 #include "ustore/pages/element_tree.hpp" // `element_tree`, `page_view_t`
 #include "ustore/pages/markup.hpp"       // `import_xml`, `render_xml`, `find_xpath`
@@ -37,6 +38,15 @@ namespace unum::ustore::test {
 using namespace unum::ustore::pages;
 
 #pragma region Harness
+
+/** The StringZilla kernels this CPU allows, probed once as `src/` does before it parses markup. */
+inline sz_capability_t stringzilla_capabilities() noexcept {
+    static sz_capability_t const capabilities = []() noexcept {
+        sz_capability_t probed = 0;
+        return sz_capabilities_enabled_cpu(&probed) == sz_success_k ? probed : sz_capability_t {0};
+    }();
+    return capabilities;
+}
 
 /** Prints a failed check with its location and counts it. */
 static std::size_t check(bool condition, std::source_location location = std::source_location::current()) {
@@ -368,8 +378,9 @@ std::size_t xml_import_render() {
         tree_t tree(allocator);
         std::uint32_t ordinal = 0;
         auto mint = [&]() noexcept { return mint_key(5, 0, ++ordinal); };
-        failures += check_code(import_xml(sample.input, mint_key(5, 0, 0), {5, 0}, mint, tree),
-                               status_code_t::success_k);
+        failures += check_code(
+            import_xml(sample.input, mint_key(5, 0, 0), {5, 0}, mint, tree, stringzilla_capabilities()),
+            status_code_t::success_k);
         chars_t rendered {test_allocator<char>(&arena)}, text {test_allocator<char>(&arena)};
         failures += check_code(render_xml(tree, tree.root(), rendered), status_code_t::success_k);
         failures += check_code(render_text(tree, tree.root(), text), status_code_t::success_k);
@@ -384,8 +395,9 @@ std::size_t xml_import_render() {
     tree_t tree(allocator);
     std::uint32_t ordinal = 0;
     auto mint = [&]() noexcept { return mint_key(5, 0, ++ordinal); };
-    failures += check_code(import_xml("<p>a<b>c</b>d</p>", mint_key(5, 0, 0), {5, 0}, mint, tree),
-                           status_code_t::success_k);
+    failures += check_code(
+        import_xml("<p>a<b>c</b>d</p>", mint_key(5, 0, 0), {5, 0}, mint, tree, stringzilla_capabilities()),
+        status_code_t::success_k);
     element_index_t const paragraph = tree.find(mint_key(5, 0, 1));
     failures += check(paragraph != no_element_k && tree.text(paragraph) == "a");
     element_index_t const bold = tree.find(mint_key(5, 0, 2));
@@ -424,7 +436,8 @@ std::size_t xml_round_trip_random() {
         tree_t imported(allocator);
         std::uint32_t ordinal = 0;
         auto mint = [&]() noexcept { return mint_key(2, 0, ++ordinal); };
-        status_t const status = import_xml(view_of(first), mint_key(2, 0, 0), {2, 0}, mint, imported);
+        status_t const status = import_xml(view_of(first), mint_key(2, 0, 0), {2, 0}, mint, imported,
+                                           stringzilla_capabilities());
         failures += check_code(status, status_code_t::success_k);
         if (status.failed()) {
             fmt::println("      input: [{}]", view_of(first));
@@ -474,13 +487,17 @@ std::size_t markup_refusals() {
         "<a>x]]>y</a>",
     };
     for (std::string_view input : malformed)
-        failures += check_code(import_xml(input, root, {}, mint, tree), status_code_t::malformed_k);
-    failures += check_code(import_xml("<!DOCTYPE a [<!ENTITY e \"x\">]><a/>", root, {}, mint, tree),
-                           status_code_t::unsupported_k);
+        failures += check_code(import_xml(input, root, {}, mint, tree, stringzilla_capabilities()),
+                               status_code_t::malformed_k);
+    failures += check_code(
+        import_xml("<!DOCTYPE a [<!ENTITY e \"x\">]><a/>", root, {}, mint, tree, stringzilla_capabilities()),
+        status_code_t::unsupported_k);
     for (page_encoding_t encoding : {page_encoding_t::html_k, page_encoding_t::markdown_k, page_encoding_t::json_k}) {
-        failures += check_code(import_markup(encoding, "<a/>", root, {}, mint, tree), status_code_t::unsupported_k);
-        failures += check_code(import_markup(page_encoding_t::xml_k, "<a/>", root, {}, mint, tree),
-                               status_code_t::success_k);
+        failures += check_code(import_markup(encoding, "<a/>", root, {}, mint, tree, stringzilla_capabilities()),
+                               status_code_t::unsupported_k);
+        failures += check_code(
+            import_markup(page_encoding_t::xml_k, "<a/>", root, {}, mint, tree, stringzilla_capabilities()),
+            status_code_t::success_k);
         chars_t output {test_allocator<char>(&arena)};
         failures += check_code(render_markup(tree, tree.root(), encoding, output), status_code_t::unsupported_k);
     }
@@ -495,7 +512,8 @@ std::size_t text_import_render() {
     tree_t tree(allocator);
     std::uint32_t ordinal = 0;
     auto mint = [&]() noexcept { return mint_key(4, 0, ++ordinal); };
-    failures += check_code(import_markup(page_encoding_t::text_k, "a < b & c", mint_key(4, 0, 0), {}, mint, tree),
+    failures += check_code(import_markup(page_encoding_t::text_k, "a < b & c", mint_key(4, 0, 0), {}, mint, tree,
+                                         stringzilla_capabilities()),
                            status_code_t::success_k);
     chars_t text {test_allocator<char>(&arena)}, xml {test_allocator<char>(&arena)};
     failures += check_code(render_markup(tree, tree.root(), page_encoding_t::text_k, text), status_code_t::success_k);
@@ -503,8 +521,9 @@ std::size_t text_import_render() {
     failures += check_equal(view_of(text), "a < b & c");
     failures += check_equal(view_of(xml), "a &lt; b &amp; c");
     failures += check(tree.size() == 2);
-    failures += check_code(import_markup(page_encoding_t::text_k, "", mint_key(4, 0, 0), {}, mint, tree),
-                           status_code_t::success_k);
+    failures += check_code(
+        import_markup(page_encoding_t::text_k, "", mint_key(4, 0, 0), {}, mint, tree, stringzilla_capabilities()),
+        status_code_t::success_k);
     failures += check(tree.size() == 1);
     return failures;
 }
@@ -518,7 +537,7 @@ std::size_t xpath_spans() {
     std::uint32_t ordinal = 0;
     auto mint = [&]() noexcept { return mint_key(6, 0, ++ordinal); };
     failures += check_code(import_xml("<doc><b id=\"1\">x</b><c><b id=\"2\"/></c><b id=\"3\">y<i/></b></doc>",
-                                      mint_key(6, 0, 0), {}, mint, tree),
+                                      mint_key(6, 0, 0), {}, mint, tree, stringzilla_capabilities()),
                            status_code_t::success_k);
     chars_t rendered {test_allocator<char>(&arena)};
     st::basic_vector<element_span_t, test_allocator<element_span_t>> spans {test_allocator<element_span_t>(&arena)};
@@ -533,7 +552,8 @@ std::size_t xpath_spans() {
 
     std::string_view const paths[] = {"//b", "/doc/b[2]/i"};
     st::basic_vector<sz_match_t, test_allocator<sz_match_t>> matches {test_allocator<sz_match_t>(&arena)};
-    failures += check_code(find_xpath(view_of(rendered), paths, matches), status_code_t::success_k);
+    failures += check_code(find_xpath(view_of(rendered), paths, matches, stringzilla_capabilities()),
+                           status_code_t::success_k);
     std::vector<std::string> found;
     for (sz_match_t const& match : matches) {
         element_index_t const element = element_starting(std::span<element_span_t const>(spans.begin(), spans.end()),
@@ -548,7 +568,8 @@ std::size_t xpath_spans() {
     failures += check(found == wanted);
 
     std::string_view const broken[] = {"//b[last()]"};
-    failures += check_code(find_xpath(view_of(rendered), broken, matches), status_code_t::malformed_k);
+    failures += check_code(find_xpath(view_of(rendered), broken, matches, stringzilla_capabilities()),
+                           status_code_t::malformed_k);
     return failures;
 }
 
@@ -560,8 +581,9 @@ std::size_t heap_allocator() {
     element_tree<heap_t> tree(allocator);
     std::uint32_t ordinal = 0;
     auto mint = [&]() noexcept { return mint_key(8, 0, ++ordinal); };
-    failures += check_code(import_xml("<a x=\"&amp;\">b<c/>&lt;d</a>", mint_key(8, 0, 0), {}, mint, tree),
-                           status_code_t::success_k);
+    failures += check_code(
+        import_xml("<a x=\"&amp;\">b<c/>&lt;d</a>", mint_key(8, 0, 0), {}, mint, tree, stringzilla_capabilities()),
+        status_code_t::success_k);
     auto blob = tree.encode(allocator);
     failures += check(bool(blob));
     element_tree<heap_t> decoded(allocator);

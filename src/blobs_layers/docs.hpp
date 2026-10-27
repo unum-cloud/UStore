@@ -6,10 +6,9 @@
  *      read-modify-writes through the reads and writes of its documents.
  *
  *  Documents are stored as JSON text. Whole-document reads and upserts pass straight through to the engine's own
- *  reads and writes. Field reads and gathers locate their fields with one StringZilla subdocuments pass over the
- *  documents read, and parse with yyjson only a batch that pass cannot read as yyjson would. Gists and modifications
- *  parse every document with yyjson. All of it lives in the scratch of the call, so the arena of the request holds
- *  only its outputs.
+ *  reads and writes. Field reads and gathers extract their fields with one StringZilla subdocuments pass over the
+ *  documents read, with no other parser. Gists and modifications parse every document with yyjson. All of it lives in
+ *  the scratch of the call, so the arena of the request holds only its outputs.
  *
  *  Every call takes the documents of one engine as an object answering `read(places, view)`, the binary documents at
  *  @c places as a @c json_documents_t appended to the scratch, and `write(places, values, durability, view)`. The
@@ -36,7 +35,7 @@
 #include "ustore/ranges.hpp" // `place_batch_t`, `values_view_t`
 
 #include "ustore/docs/json_patch.hpp"       // `modify`, `modification_t`
-#include "ustore/docs/json_paths.hpp"       // `resolve_fields`, `json_documents_t`, `field_cell_t`
+#include "ustore/docs/json_paths.hpp"       // `extract_fields`, `json_documents_t`, `field_cell_t`, `json_text_of`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `gather_scalar`, `field_size_bytes`, `extract_keys`
 #include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
@@ -85,14 +84,6 @@ expected<values_view_t> read_documents(documents_type_ const& documents, place_b
     auto [read, status] = documents.read(places, view);
     if (status.failed()) return status;
     return values_view_t {places.count, read.presences, read.tape};
-}
-
-/** The value of @p document under @p field, parsed with yyjson into @p scratch, or @c nullptr where it is missing. */
-inline expected<yyjson_val*> parse_field(std::string_view document, std::string_view field,
-                                         ustore_arena_t scratch) noexcept {
-    auto [parsed, status] = json_parse(document, scratch);
-    if (status.failed()) return status;
-    return json_lookup(yyjson_doc_get_root(parsed.handle), field);
 }
 
 /**
@@ -357,14 +348,15 @@ status_t read_document_fields(documents_type_ const& source, ustore_docs_read_t 
     if (outputs_status.failed()) return outputs_status;
 
     // A value is present when its field is, and its text stays in scratch until the outputs copy it
-    auto export_one = [&](yyjson_val* value) noexcept -> status_t {
-        if (!value) {
+    auto export_one = [&](json_cell_t const& value) noexcept -> status_t {
+        if (value.token == json_token_t::missing_k) {
             outputs.append_missing();
             return {};
         }
-        if (arguments.outputs_type == ustore_docs_field_type_json_k || yyjson_is_ctn(value)) {
-            auto [text, dump_status] = json_dump({value, nullptr}, view.scratch);
-            if (dump_status.failed()) return dump_status;
+        bool const container = value.token == json_token_t::object_k || value.token == json_token_t::array_k;
+        if (arguments.outputs_type == ustore_docs_field_type_json_k || container) {
+            auto [text, text_status] = json_text_of(value, view.scratch);
+            if (text_status.failed()) return text_status;
             outputs.append(text);
             return {};
         }
@@ -386,25 +378,18 @@ status_t read_document_fields(documents_type_ const& source, ustore_docs_read_t 
     if (read_status.failed()) return read_status;
     auto [task_fields, fields_status] = distinct_fields(fields, arguments.count, view.scratch);
     if (fields_status.failed()) return fields_status;
-    auto [values, values_status] = arena_allocate<yyjson_val*>(view.scratch, arguments.count);
-    if (values_status.failed()) return values_status;
 
-    // One subdocuments pass resolves every task, and yyjson parses each task's document only when it cannot
+    // One subdocuments pass extracts every task's value
     auto const cell_of = [&](std::size_t task) noexcept {
         return field_cell_t {read.document_of(task), task_fields.fields_of_tasks[task]};
     };
-    bool const resolved = resolve_fields(read.documents, task_fields.distinct, arguments.count, cell_of, true,
-                                         view.scratch, stringzilla_capabilities(), values);
-    for (std::size_t task = 0; task != arguments.count; ++task) {
-        yyjson_val* value = values[task];
-        if (!resolved) {
-            auto [parsed, parsed_status] = parse_field(read.documents[read.document_of(task)], field_of(fields, task),
-                                                       view.scratch);
-            if (parsed_status.failed()) return parsed_status;
-            value = parsed;
-        }
-        if (status_t const status = export_one(value); status.failed()) return status;
-    }
+    json_cells_t values;
+    if (status_t const extracted = extract_fields(read.documents, task_fields.distinct, arguments.count, cell_of,
+                                                  stringzilla_capabilities(), view.scratch, values);
+        extracted.failed())
+        return extracted;
+    for (std::size_t task = 0; task != arguments.count; ++task)
+        if (status_t const status = export_one(values[task]); status.failed()) return status;
     return outputs.finish(arguments);
 }
 
@@ -454,32 +439,19 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
     auto [documents, documents_status] = source.read(places_of(arguments), view);
     if (documents_status.failed()) return documents_status;
 
-    // One subdocuments pass resolves every cell, field after field, where yyjson would parse every document once
+    // One subdocuments pass extracts every cell, field after field
     auto [field_names, names_status] = arena_allocate<std::string_view>(view.scratch, fields_count);
     if (names_status.failed()) return names_status;
     for (std::size_t field_index = 0; field_index != fields_count; ++field_index)
         field_names[field_index] = string_of(fields[field_index]);
-    auto [values, values_status] = arena_allocate<yyjson_val*>(view.scratch, docs_count * fields_count);
-    if (values_status.failed()) return values_status;
     auto const cell_of = [docs_count](std::size_t cell) noexcept {
         return field_cell_t {cell % docs_count, cell / docs_count};
     };
-    bool const resolved = resolve_fields(documents, field_names, docs_count * fields_count, cell_of, false,
-                                         view.scratch, stringzilla_capabilities(), values);
-
-    // Without it, every document parses once, then the columns fill one after another
-    std::span<yyjson_val*> roots;
-    if (!resolved) {
-        auto [parsed_roots, roots_status] = arena_allocate<yyjson_val*>(view.scratch, docs_count);
-        if (roots_status.failed()) return roots_status;
-        for (std::size_t document_index = 0; document_index != docs_count; ++document_index) {
-            std::string_view const document = documents[document_index];
-            auto [parsed, parsed_status] = json_parse(document, view.scratch);
-            if (parsed_status.failed()) return parsed_status;
-            parsed_roots[document_index] = yyjson_doc_get_root(parsed.handle);
-        }
-        roots = parsed_roots;
-    }
+    json_cells_t values;
+    if (status_t const extracted = extract_fields(documents, field_names, docs_count * fields_count, cell_of,
+                                                  stringzilla_capabilities(), view.scratch, values);
+        extracted.failed())
+        return extracted;
 
     auto [columns, columns_status] = arena_allocate<ustore_docs_column_view_t>(arguments.arena, fields_count);
     if (columns_status.failed()) return columns_status;
@@ -489,7 +461,6 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
     printed_number_buffer_t print_buffer;
     for (std::size_t field_index = 0; field_index != fields_count; ++field_index) {
         ustore_docs_field_type_t const type = arguments.outputs_types[field_index];
-        std::string_view const field = string_of(fields[field_index]);
         bool const holds_strings = type == ustore_docs_field_type_str_k || type == ustore_docs_field_type_bin_k;
         auto [bitmaps, bitmaps_status] = arena_allocate<ustore_octet_t>(arguments.arena, 3 * bitmap_stride);
         if (bitmaps_status.failed()) return bitmaps_status;
@@ -500,8 +471,7 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
         growing_strings<arena_allocator<byte_t>> strings {view.scratch};
 
         for (std::size_t document_index = 0; document_index != docs_count; ++document_index) {
-            yyjson_val* const value = resolved ? values[field_index * docs_count + document_index]
-                                               : json_lookup(roots[document_index], field);
+            json_cell_t const value = values[field_index * docs_count + document_index];
             ustore_byte_t* const scalar_column = scalars.data();
             conversion_t conversion = conversion_t::collides_k;
 
