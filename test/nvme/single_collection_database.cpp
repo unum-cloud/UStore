@@ -278,9 +278,8 @@ template <typename key_slot_type_, typename mount_type_>
 template <typename mount_type_>
 std::size_t every_layout_round_trips(mount_type_ const& mount) {
     std::size_t failures = 0;
-    failures += layout_round_trip<key_slot<stored_key_t, value_layout_t::inline_1_byte_k>>(mount, 0, 0);
-    failures += layout_round_trip<key_slot<stored_key_t, value_layout_t::inline_8_bytes_k>>(mount, 0, 0);
-    failures += layout_round_trip<key_slot<stored_key_t, value_layout_t::inline_64_bytes_k>>(mount, 0, 0);
+    failures += layout_round_trip<key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>>(mount, 0, 0);
+    failures += layout_round_trip<key_slot<stored_key_t, value_layout_t::inline_44_bytes_k>>(mount, 0, 0);
     failures += layout_round_trip<key_slot<stored_key_t, value_layout_t::fixed_width_k>>(mount, 512, 0);
     failures += layout_round_trip<key_slot<stored_key_t, value_layout_t::variable_width_k>>(mount, 0, value_max_size_k);
     return failures;
@@ -423,7 +422,7 @@ template <typename key_slot_type_, typename mount_type_>
 template <typename mount_type_>
 std::size_t every_layout_survives_reopen(mount_type_ const& mount) {
     std::size_t failures = 0;
-    failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::inline_8_bytes_k>>(mount, 0, 0);
+    failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>>(mount, 0, 0);
     failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::fixed_width_k>>(mount, 512, 0);
     failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::variable_width_k>>(mount, 0,
                                                                                                  value_max_size_k);

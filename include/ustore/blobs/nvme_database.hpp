@@ -1579,12 +1579,10 @@ concept nvme_store_concept = requires(
     store_type_& store, store_type_ const& viewed, typename store_type_::volume_t& volume,
     collection_config_t const& config, typename store_type_::constraint_t& constraint,
     typename store_type_::ledger_t& ledger, io_channel_t& channel, lsm_tree_publication_hook_t const& published,
-    std::span<int const> devices, std::span<lsm_tree_run_record_t const> runs,
+    compactor_ref_t const& compactor, std::span<lsm_tree_run_record_t const> runs,
     st::basic_vector<lsm_tree_run_record_t>& listed, typename store_type_::stored_key_t stored_key,
-    std::span<typename store_type_::stored_key_t const> stored_keys,
-    std::span<keyed_delta<typename store_type_::stored_key_t>> deltas, std::span<byte_t const> stored_values,
-    std::span<stored_value_size_t const> sizes, std::span<byte_t> into, stored_value_size_t& size,
-    typename store_type_::sealed_commit_t& sealed, transaction_stamp_t stamp, std::size_t thread_index) {
+    std::span<byte_t> into, stored_value_size_t& size, typename store_type_::sealed_commit_t& sealed,
+    transaction_stamp_t stamp, std::size_t thread_index) {
     typename store_type_::key_slot_t;
     typename store_type_::fold_t;
     { store_type_::mount(volume, config, constraint, ledger) } noexcept -> std::same_as<expected<store_type_>>;
@@ -1599,11 +1597,6 @@ concept nvme_store_concept = requires(
     { store.select(channel, stored_key, into, size, stamp, thread_index) } noexcept -> std::same_as<status_t>;
     { viewed.written_since(stored_key, stamp) } noexcept -> std::same_as<bool>;
     { viewed.range_written_since(stored_key, stored_key, stamp) } noexcept -> std::same_as<bool>;
-    { viewed.seal(deltas) } noexcept -> std::same_as<expected<typename store_type_::sealed_commit_t>>;
-    {
-        viewed.seal_writes(stored_keys, stored_values, sizes)
-    } noexcept -> std::same_as<expected<typename store_type_::sealed_commit_t>>;
-    { viewed.seal_removals(stored_keys) } noexcept -> std::same_as<expected<typename store_type_::sealed_commit_t>>;
     { viewed.memory_pressure(sealed) } noexcept -> std::same_as<memory_pressure_t>;
     { store.prepare(sealed) } noexcept -> std::same_as<status_t>;
     { store.publish(sealed, stamp) } noexcept;
@@ -1614,7 +1607,7 @@ concept nvme_store_concept = requires(
     { viewed.flush_due() } noexcept -> std::same_as<bool>;
     { store.flush(channel) } noexcept -> std::same_as<status_t>;
     { viewed.needs_compaction() } noexcept -> std::same_as<bool>;
-    { store.compact(channel, channel, devices, published) } noexcept -> std::same_as<expected<compaction_outcome_t>>;
+    { store.compact(channel, channel, compactor, published) } noexcept -> std::same_as<expected<compaction_outcome_t>>;
 };
 
 /**
@@ -1717,12 +1710,16 @@ class basic_database {
      *  @param[inout] router The volumes every run lands on, borrowed and outliving the database.
      *  @param[inout] channels The queue pairs every call borrows one of, borrowed and outliving the database.
      *  @param[in] config The delta bounds a transaction takes when its caller names none.
+     *  @param[in] compactor What every merge runs on: the calling thread, or a device lane the caller owns, which
+     *      outlives the database.
      */
-    status_t mount(router_t& router, channel_pool_t& channels, database_config_t const& config) noexcept {
+    status_t mount(router_t& router, channel_pool_t& channels, database_config_t const& config,
+                   compactor_ref_t compactor = {}) noexcept {
         if (router_ != nullptr) return {status_code_t::already_exists_k, "This database has already mounted"};
         router_ = &router;
         channels_ = &channels;
         config_ = config;
+        compactor_ = compactor;
         status_t const opened = open_schema_();
         if (opened.failed()) {
             // A schema this database could not open stays as it lies, never saved again without what it missed.
@@ -2133,6 +2130,51 @@ class basic_database {
         }
     }
 
+    /**
+     *  @brief Counts the runs of @p id a reader at @p stamp walks, for an unordered scan that walks each run on its
+     *      own: every level's runs, then the memory runs oldest first.
+     *  @note A transaction's own deltas are one more run, which @c database_transaction::for_each_uncommitted walks.
+     */
+    expected<counted_runs_t> runs_count(any_collection_id_t const& id, transaction_stamp_t stamp = head_stamp_k,
+                                        std::size_t thread_index = outside_executor_k) noexcept {
+        reader_t const inside = ledger_.epochs().enter(thread_index);
+        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        if (!found) return status_t {status_code_t::not_found_k, "The database names no such collection"};
+        return std::visit(
+            [&]<typename store_type_>(store_type_ const& collection) noexcept -> expected<counted_runs_t> {
+                if constexpr (keyed_by_database<store_type_>()) return collection.count_runs(stamp, thread_index);
+                else return keyed_otherwise_();
+            },
+            found->held);
+    }
+
+    /**
+     *  @brief Hands @p visitor the newest version at or below @p stamp of every key from @p from up in the run at
+     *      @p run_index of @p counted, as @c runs_count counted the runs of @p id, consulting no other run, so a key
+     *      another run removed or repeats is still handed out.
+     *  @param[in] visitor Called as @c visitor(stored_key, state, size) inside the epochs, answering whether the walk
+     *      carries on, so it must not block; a caller bounds one call's work by answering false and resuming past the
+     *      last key.
+     *  @param[in] stamp The stamp a reader is pinned at, which every run of one scan should share.
+     *  @retval contended_k A flush, a compaction or a merge rearranged the runs since they were counted, so the scan
+     *      counts them again or walks in order.
+     */
+    template <typename visitor_type_>
+    status_t scan_run(any_collection_id_t const& id, counted_runs_t const& counted, std::uint64_t run_index,
+                      stored_key_t from, visitor_type_&& visitor, transaction_stamp_t stamp = head_stamp_k,
+                      std::size_t thread_index = outside_executor_k) noexcept {
+        reader_t const inside = ledger_.epochs().enter(thread_index);
+        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+        return std::visit(
+            [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
+                if constexpr (keyed_by_database<store_type_>())
+                    return collection.scan_run(counted, run_index, from, visitor, stamp, thread_index);
+                else return keyed_otherwise_();
+            },
+            found->held);
+    }
+
 #pragma endregion Lookups
 
 #pragma region Writes
@@ -2219,7 +2261,7 @@ class basic_database {
         for (std::size_t index = 0; index != collections_.size(); ++index) {
             auto [merged, compact_status] = std::visit(
                 [&](auto& held) noexcept {
-                    return held.compact(reading->channel(), writing.channel(), resources_->gpu_devices, published);
+                    return held.compact(reading->channel(), writing.channel(), compactor_, published);
                 },
                 collections_[index]->held);
             if (compact_status.failed() && first.succeeded()) first = compact_status;
@@ -2730,8 +2772,8 @@ class basic_database {
         published.notify = &record_schema_;
         published.context = &recording;
         while (collection.needs_compaction()) {
-            auto [outcome, compact_status] = collection.compact(reading.channel(), writing.channel(),
-                                                                resources_->gpu_devices, published);
+            auto [outcome, compact_status] = collection.compact(reading.channel(), writing.channel(), compactor_,
+                                                                published);
             if (compact_status.failed()) return compact_status;
             if (outcome == compaction_outcome_t::nothing_to_compact_k) break;
         }
@@ -3077,6 +3119,9 @@ class basic_database {
 
     /** The stamps every commit of this database draws, a transaction's or a head write's, and the stamps pinned. */
     commit_ledger<atomic_reference_, waiter_type_> ledger_;
+
+    /** What every merge of this database runs on, picked at mount: the calling thread, or a lane the opener owns. */
+    compactor_ref_t compactor_;
 
     /** The transactions of this database, which names this store for as long as it lives. */
     registry_t transactions_;

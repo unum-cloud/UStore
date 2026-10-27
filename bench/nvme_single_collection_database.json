@@ -1,23 +1,5 @@
 {
-  "1_byte": {
-    "enabled": false,
-    "threads": 1,
-    "population_count": 100000,
-    "cache_limit": 10000,
-    "memory_runs_max_deltas": 10000,
-    "memory_runs_max_bytes": 410000,
-    "level_enlarge_factor": 4
-  },
-  "4_bytes": {
-    "enabled": false,
-    "threads": 1,
-    "population_count": 100000,
-    "cache_limit": 40000,
-    "memory_runs_max_deltas": 10000,
-    "memory_runs_max_bytes": 440000,
-    "level_enlarge_factor": 4
-  },
-  "8_bytes": {
+  "12_bytes": {
     "enabled": false,
     "threads": 1,
     "population_count": 100000,
@@ -26,25 +8,7 @@
     "memory_runs_max_bytes": 480000,
     "level_enlarge_factor": 4
   },
-  "16_bytes": {
-    "enabled": false,
-    "threads": 1,
-    "population_count": 100000,
-    "cache_limit": 160000,
-    "memory_runs_max_deltas": 10000,
-    "memory_runs_max_bytes": 560000,
-    "level_enlarge_factor": 4
-  },
-  "32_bytes": {
-    "enabled": false,
-    "threads": 1,
-    "population_count": 100000,
-    "cache_limit": 320000,
-    "memory_runs_max_deltas": 10000,
-    "memory_runs_max_bytes": 720000,
-    "level_enlarge_factor": 4
-  },
-  "64_bytes": {
+  "44_bytes": {
     "enabled": false,
     "threads": 1,
     "population_count": 100000,

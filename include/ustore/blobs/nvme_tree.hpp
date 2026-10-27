@@ -847,14 +847,12 @@ template <issue_sink_concept sink_>
         return report_issue(sink, issue_kind_t::error_k, "Exactly one of value_size and value_max_size must be set");
 
     if (is_inline(value_layout)) {
-        auto const smallest = static_cast<stored_value_size_t>(value_layout_t::inline_1_byte_k);
-        auto const largest = static_cast<stored_value_size_t>(value_layout_t::inline_64_bytes_k);
-        if (config.value_size < smallest || config.value_size > largest)
-            return report_issue(sink, issue_kind_t::error_k, "Inline value size must be within [{}, {}]", smallest,
-                                largest);
+        auto const largest = static_cast<stored_value_size_t>(value_layout_t::inline_44_bytes_k);
+        if (config.value_size < 1 || config.value_size > largest)
+            return report_issue(sink, issue_kind_t::error_k, "Inline value size must be within [1, {}]", largest);
         if (config.value_size > static_cast<stored_value_size_t>(value_layout))
             return report_issue(sink, issue_kind_t::error_k, "Value layout is too small for the value size");
-        if (config.value_size <= static_cast<stored_value_size_t>(value_layout) / 2)
+        if (resolve_value_layout(config.value_size) != value_layout)
             report_issue(sink, issue_kind_t::warning_k, "A smaller value layout fits the value size");
         if (config.cache_limit > 0)
             report_issue(sink, issue_kind_t::warning_k, "Value cache does not serve inline values");
@@ -864,7 +862,7 @@ template <issue_sink_concept sink_>
             config.value_size > storage_limits_t::fixed_value_max_size_k)
             return report_issue(sink, issue_kind_t::error_k, "Fixed value size must be within [{}, {}]",
                                 storage_limits_t::fixed_value_min_size_k, storage_limits_t::fixed_value_max_size_k);
-        if (config.value_size <= static_cast<stored_value_size_t>(value_layout_t::inline_64_bytes_k))
+        if (config.value_size <= static_cast<stored_value_size_t>(value_layout_t::inline_44_bytes_k))
             report_issue(sink, issue_kind_t::warning_k, "An inline value layout fits the value size");
     }
     else if (config.value_max_size < storage_limits_t::variable_value_min_size_k ||
@@ -1321,7 +1319,7 @@ enum class compactor_choice_t : std::uint8_t {
     /** @c host_compactor_t, on the calling thread. */
     host_k,
 
-    /** @c cuda_compactor_t, on the first device the executor named. */
+    /** @c cuda_compaction_lane_t, on the first device the executor named. */
     device_k,
 };
 
@@ -1490,8 +1488,8 @@ class lsm_level_merger {
         /** Where the compaction runs. */
         compaction_placement_t placement = compaction_placement_t::automatic_k;
 
-        /** The devices the executor named, the first of which a device compaction runs on, empty for the host alone. */
-        std::span<int const> devices;
+        /** The compactor the database picked at open: the calling thread, or its warm device lane. */
+        compactor_ref_t compactor;
 
         /** The word the merge reads between blocks, or null for a merge nobody stops. */
         cancellation_t const* cancellation = nullptr;
@@ -1532,10 +1530,10 @@ class lsm_level_merger {
         // A fold reads the values of the changes it folds, from their runs, one at a time.
         auto read_value = [&](located_key_slot<key_slot_t> const& record, utilities::arena_allocator<byte_t>& arena,
                               std::span<byte_t const>& bytes) noexcept {
-            std::size_t const size = record.key_slot.size;
+            std::size_t const size = sources[record.sorted_run]->value_window(record.position).bytes;
             byte_t* const into = size != 0 ? arena.allocate(size) : nullptr;
             if (size != 0 && into == nullptr) return st::status_t::out_of_memory_heap_k;
-            if (sources[record.sorted_run]->read_value(reading_channel, record.key_slot, {into, size}).failed())
+            if (sources[record.sorted_run]->read_value(reading_channel, record.position, {into, size}).failed())
                 return st::status_t::input_output_k;
             bytes = {into, size};
             return st::status_t::success_k;
@@ -1547,7 +1545,7 @@ class lsm_level_merger {
         if (status_t const compacted = run_compaction_(kind_of_(request.upper->order(), request.depth),
                                                        all.first(upper_runs), all.subspan(upper_runs),
                                                        bounds_of_(request), request.stamps, request.placement,
-                                                       request.devices, fold, device_fold, read_value, output);
+                                                       request.compactor, fold, device_fold, read_value, output);
             compacted.failed())
             return compacted;
 
@@ -1556,12 +1554,15 @@ class lsm_level_merger {
 
         std::uint64_t first_cell = 0;
         std::uint64_t first_key_slot = 0;
+        std::uint64_t first_copy_range = 0;
         for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
             planned_run_t planned;
             planned.key_slots_count = output.sorted_runs[index].key_slots_count;
             planned.stored_values_bytes = output.sorted_runs[index].stored_values_bytes;
             planned.first_cell = first_cell;
             planned.first_key_slot = first_key_slot;
+            planned.first_copy_range = first_copy_range;
+            planned.copy_ranges_count = output.sorted_runs[index].value_copy_ranges_count;
 
             auto [written, write_run_status] = write_run_(
                 volume, reading_channel, writing_channel, std::span<sorted_run_t const* const> {sources}, output,
@@ -1576,6 +1577,7 @@ class lsm_level_merger {
             }
             first_cell += round_up_to_multiple(planned.key_slots_count, sorted_run_layout_t::branching_k);
             first_key_slot += planned.key_slots_count;
+            first_copy_range += planned.copy_ranges_count;
         }
         return merged;
     }
@@ -1586,7 +1588,7 @@ class lsm_level_merger {
 
 #pragma region Private Types
 
-    /** One run of the compaction's plan, with where its cells and its migrations start in the output. */
+    /** One run of the compaction's plan, with where its cells, survivors and copy ranges start in the output. */
     struct planned_run_t {
 
         /** Key slots the run holds, padding cells excluded. */
@@ -1598,8 +1600,14 @@ class lsm_level_merger {
         /** Where this run's cells start in the compaction's cells. */
         std::uint64_t first_cell = 0;
 
-        /** Where this run's survivors start in the compaction's migrations. */
+        /** Where this run's survivors start in the compaction's stamps, kinds and offsets. */
         std::uint64_t first_key_slot = 0;
+
+        /** Where this run's value copy ranges start in the compaction's. */
+        std::uint64_t first_copy_range = 0;
+
+        /** Value copy ranges filling this run's stored values section. */
+        std::uint64_t copy_ranges_count = 0;
     };
 
     /** One block of one source value's read, kept until its completion carries the block back. */
@@ -1637,6 +1645,7 @@ class lsm_level_merger {
         bounds.header_bytes = sorted_run_layout_t::header_bytes();
         bounds.alignment_bytes = portable_alignment_k;
         bounds.branching = sorted_run_layout_t::branching_k;
+        bounds.value_stride = is_fixed(value_layout_k) ? request.value_max_size : 0;
         return bounds;
     }
 
@@ -1657,50 +1666,59 @@ class lsm_level_merger {
             if (run.layout().branching != sorted_run_layout_t::branching_k ||
                 cells.size() != run.layout().cells_count())
                 return {status_code_t::malformed_k, "A run's index is not laid out as a merge reads it"};
-            views[index] = sorted_run_index_view<key_slot_t> {cells.data(), run.population_count(), &run.stamps(),
-                                                              &run.kinds(), run.tails()};
+            views[index] = sorted_run_index_view<key_slot_t> {
+                cells.data(), run.population_count(), &run.stamps(), &run.kinds(), run.tails(), run.value_offsets()};
         }
         return {};
     }
 
+    /** Counts the key slots @p upper and @p lower merge, and tells whether any of their runs holds a change. */
+    [[nodiscard]] static std::uint64_t merged_count_(std::span<sorted_run_index_view<key_slot_t> const> upper,
+                                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
+                                                     bool& changes) noexcept {
+        std::uint64_t merged = 0;
+        changes = false;
+        for (std::size_t index = 0; index != upper.size(); ++index) {
+            merged += upper[index].key_slots_count;
+            changes |= holds_changes(upper[index].kinds);
+        }
+        for (std::size_t index = 0; index != lower.size(); ++index) {
+            merged += lower[index].key_slots_count;
+            changes |= holds_changes(lower[index].kinds);
+        }
+        return merged;
+    }
+
 #if USTORE_WITH_CUDA
 
-    /** Compacts on the first of @p devices when @p placement asks for one and no run holds a change, or one does and
-     *  @p device_fold composes changes, and on the calling thread otherwise, where runs carrying tails always merge. */
+    /** Compacts on the lane @p compactor names when @p placement asks for a device and no run holds a change, or one
+     *  does and @p device_fold composes changes, and on the calling thread otherwise, where runs carrying tails and
+     *  merges outgrowing the lane's scratch merge. */
     template <typename fold_type_, typename device_fold_type_, typename value_reader_type_>
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
                                     sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
-                                    compaction_placement_t placement, std::span<int const> devices,
+                                    compaction_placement_t placement, compactor_ref_t const& compactor,
                                     fold_type_ const& fold, [[maybe_unused]] device_fold_type_ const& device_fold,
                                     value_reader_type_&& read_value, compaction_output_t& output) noexcept {
-        // No device compaction is compiled for key slots carrying tails.
-        if constexpr (!tailed_key_slot_concept<key_slot_t>) {
-            std::uint64_t merged = 0;
-            bool changes = false;
-            for (std::size_t index = 0; index != upper.size(); ++index) {
-                merged += upper[index].key_slots_count;
-                changes |= holds_changes(upper[index].kinds);
-            }
-            for (std::size_t index = 0; index != lower.size(); ++index) {
-                merged += lower[index].key_slots_count;
-                changes |= holds_changes(lower[index].kinds);
-            }
-
-            constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
-            if ((!changes || device_folds_k) &&
-                choose_compactor(placement, devices.size(), merged) == compactor_choice_t::device_k) {
-                if (devices.empty()) return {status_code_t::device_k, "A device compaction names no device"};
-                st::expected<cuda_compactor_t> compactor = cuda_compactor_t::make(devices.front());
-                if (!compactor) return compaction_status(compactor.status());
+        bool changes = false;
+        std::uint64_t const merged = merged_count_(upper, lower, changes);
+        cuda_compaction_lane_t* const* const lane = std::get_if<cuda_compaction_lane_t*>(&compactor);
+        if (choose_compactor(placement, lane != nullptr ? 1 : 0, merged) == compactor_choice_t::device_k) {
+            if (lane == nullptr) return {status_code_t::unsupported_k, "No device lane serves this database"};
+            // No device compaction is compiled for key slots carrying tails.
+            if constexpr (!tailed_key_slot_concept<key_slot_t>) {
+                constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
+                st::status_t compacted = st::status_t::invalid_argument_k;
                 if constexpr (device_folds_k)
-                    return compaction_status(
-                        compactor->compact(kind, upper, lower, bounds, stamps, fold, device_fold, read_value, output));
+                    compacted = (*lane)->compact(kind, upper, lower, bounds, stamps, fold, device_fold, read_value,
+                                                 output);
                 // No run holds a change here, so the compaction built for the last write serves every fold
-                else
-                    return compaction_status(compactor->compact(kind, upper, lower, bounds, stamps,
-                                                                utilities::last_write_fold_t {}, no_device_fold_t {},
-                                                                located_value_reader<key_slot_t> {}, output));
+                else if (!changes)
+                    compacted = (*lane)->compact(kind, upper, lower, bounds, stamps, utilities::last_write_fold_t {},
+                                                 no_device_fold_t {}, located_value_reader<key_slot_t> {}, output);
+                if (compacted != st::status_t::invalid_argument_k && compacted != st::status_t::out_of_memory_heap_k)
+                    return compaction_status(compacted);
             }
         }
         return compaction_status(
@@ -1714,7 +1732,7 @@ class lsm_level_merger {
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
                                     sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
-                                    compaction_placement_t placement, std::span<int const>, fold_type_ const& fold,
+                                    compaction_placement_t placement, compactor_ref_t const&, fold_type_ const& fold,
                                     device_fold_type_ const&, value_reader_type_&& read_value,
                                     compaction_output_t& output) noexcept {
         if (choose_compactor(placement, 0, 0) == compactor_choice_t::device_k)
@@ -1783,6 +1801,17 @@ class lsm_level_merger {
         header.newest_stamp = newest;
         header.kinds_bytes = kinds.saved_bytes();
 
+        // The run's own value offsets from its first key slot on, none but for a variable width.
+        st::basic_vector<stored_value_offset_t> value_offsets;
+        if (!output.value_offsets.empty()) {
+            std::uint64_t const begin = output.value_offsets[planned.first_key_slot];
+            if (value_offsets.resize(static_cast<std::size_t>(planned.key_slots_count + 1)) != st::status_t::success_k)
+                return status_t {status_code_t::out_of_memory_k, "A merge could not lay out a run's value offsets"};
+            for (std::uint64_t index = 0; index != value_offsets.size(); ++index)
+                value_offsets[index] = static_cast<stored_value_offset_t>(
+                    output.value_offsets[planned.first_key_slot + index] - begin);
+        }
+
         // The run's own tails and their offsets from its first key slot on, none for a run of whole keys.
         st::basic_vector<std::uint32_t> tail_offsets;
         std::span<byte_t const> tails;
@@ -1812,8 +1841,9 @@ class lsm_level_merger {
         volume_blob_t const blob = reserved;
 
         key_tails_column_t const run_tails {std::span<std::uint32_t const> {tail_offsets}, tails};
-        if (status_t const written = write_sections_(volume, reading_channel, writing_channel, sources, output, planned,
-                                                     header, column, kinds, run_tails, blob, cancellation);
+        if (status_t const written = write_sections_(
+                volume, reading_channel, writing_channel, sources, output, planned, header, column, kinds,
+                std::span<stored_value_offset_t const> {value_offsets}, run_tails, blob, cancellation);
             written.failed()) {
             [[maybe_unused]] status_t const abandoned = volume.drop(writing_channel, sorted_run_t::name_of(content_id));
             return written;
@@ -1825,12 +1855,13 @@ class lsm_level_merger {
         return sorted_run_t::attach(volume, writing_channel, blob);
     }
 
-    /** Writes the header, the cells, the gathered values, the tails, the stamps, the kinds and the tail offsets of one
-     *  new run, and makes them all durable. */
+    /** Writes the header, the cells, the value offsets, the gathered values, the tail offsets, the tails, the stamps
+     *  and the kinds of one new run, and makes them all durable. */
     static status_t write_sections_(volume_t& volume, io_channel_t& reading_channel, io_channel_t& writing_channel,
                                     std::span<sorted_run_t const* const> sources, compaction_output_t const& output,
                                     planned_run_t const& planned, sorted_run_header_t const& header,
                                     stamps_column_t const& column, kinds_column_t const& kinds,
+                                    std::span<stored_value_offset_t const> value_offsets,
                                     key_tails_column_t const& tails, volume_blob_t const& blob,
                                     cancellation_t const* cancellation) noexcept {
         std::uint64_t const block_bytes = round_down_to_multiple(writing_channel.streams().buffer_bytes(),
@@ -1853,14 +1884,16 @@ class lsm_level_merger {
 
         if (status_t const cells = write_cells_(writer, output, planned, header, blob, block_bytes); cells.failed())
             return cells;
+        if (status_t const offsets = sorted_run_t::write_value_offsets(writer, blob, header, value_offsets);
+            offsets.failed())
+            return offsets;
         if (status_t const values = write_values_(volume, reading_channel, writer, sources, output, planned, header,
                                                   blob, block_bytes, cancellation);
             values.failed())
             return values;
-        if (status_t const written = sorted_run_t::write_tails(writer, blob, header, tails.bytes); written.failed())
+        if (status_t const written = sorted_run_t::write_tails(writer, blob, header, tails); written.failed())
             return written;
-        if (status_t const trailer = sorted_run_t::write_trailer(writer, blob, header, column, kinds, tails.offsets);
-            trailer.failed())
+        if (status_t const trailer = sorted_run_t::write_trailer(writer, blob, header, column, kinds); trailer.failed())
             return trailer;
         return writer.make_durable();
     }
@@ -1893,9 +1926,10 @@ class lsm_level_merger {
     }
 
     /**
-     *  @brief Gathers every survivor's value out of its old run and writes them back to back.
+     *  @brief Gathers the run's value copy ranges out of their source runs and the folded bytes, and writes them back
+     *      to back.
      *
-     *  @note Values are read into a scratch buffer a block deep plus one read block, so a value that
+     *  @note Ranges are read into a scratch buffer a block deep plus one read block, so a range that
      *      straddles the boundary between two written blocks is still read whole exactly once.
      */
     static status_t write_values_(volume_t& volume, io_channel_t& reading_channel, write_pipeline_t& writer,
@@ -1935,8 +1969,8 @@ class lsm_level_merger {
                 std::memcpy(scratch.data() + piece.destination, completed.bytes.data() + piece.skipped, piece.carried);
             };
 
-            std::uint64_t survivor = planned.first_key_slot;
-            std::uint64_t const survivors_end = planned.first_key_slot + planned.key_slots_count;
+            std::uint64_t range = planned.first_copy_range;
+            std::uint64_t const ranges_end = planned.first_copy_range + planned.copy_ranges_count;
             std::uint64_t chunk_offset = 0;
             std::uint64_t gathered = 0;
             std::uint64_t written = 0;
@@ -1947,42 +1981,39 @@ class lsm_level_merger {
                     return cancelled_status_();
                 }
 
-                while (gathered < block_bytes && survivor != survivors_end) {
-                    while (gathered < block_bytes && survivor != survivors_end && reader.can_enqueue()) {
-                        stored_value_migration_t const& migration = output.migrations[survivor];
-                        if (migration.size == 0) {
-                            ++survivor;
-                            chunk_offset = 0;
-                            continue;
-                        }
-                        // A value a fold wrote is copied out of the compaction's own bytes, a read block at a time.
-                        if (migration.old_sorted_run == sources.size()) {
+                while (gathered < block_bytes && range != ranges_end) {
+                    while (gathered < block_bytes && range != ranges_end && reader.can_enqueue()) {
+                        value_copy_range_t const& copied = output.value_copy_ranges[range];
+                        // Values a fold wrote are copied out of the compaction's own bytes, a read block at a time.
+                        if (copied.source_run == sources.size()) {
                             std::uint64_t const length = std::min<std::uint64_t>(read_block,
-                                                                                 migration.size - chunk_offset);
+                                                                                 copied.bytes - chunk_offset);
                             std::memcpy(scratch.data() + gathered,
-                                        output.folded.data() + migration.old_location + chunk_offset,
+                                        output.folded.data() + copied.source_begin + chunk_offset,
                                         static_cast<std::size_t>(length));
                             gathered += length;
                             chunk_offset += length;
-                            if (chunk_offset == migration.size) {
-                                ++survivor;
+                            if (chunk_offset == copied.bytes) {
+                                ++range;
                                 chunk_offset = 0;
                             }
                             continue;
                         }
-                        std::uint64_t const aligned = round_down_to_multiple(migration.old_location,
-                                                                             portable_alignment_k);
-                        std::uint64_t const skipped = migration.old_location - aligned;
-                        std::uint64_t const covered = round_up_to_multiple(skipped + migration.size,
+                        sorted_run_t const& source = *sources[copied.source_run];
+                        std::uint64_t const first = sorted_run_layout_t::values_offset(source.population_count()) +
+                                                    copied.source_begin;
+                        std::uint64_t const aligned = round_down_to_multiple(first, portable_alignment_k);
+                        std::uint64_t const skipped = first - aligned;
+                        std::uint64_t const covered = round_up_to_multiple(skipped + copied.bytes,
                                                                            portable_alignment_k);
-                        extent_t const window = sources[migration.old_sorted_run]->blob().slice(aligned, covered);
+                        extent_t const window = source.blob().slice(aligned, covered);
                         if (window.length != covered)
-                            return {status_code_t::malformed_k, "A source run is shorter than the value it locates"};
+                            return {status_code_t::malformed_k, "A source run is shorter than the values it copies"};
 
                         std::uint64_t const length = read_block < covered - chunk_offset ? read_block
                                                                                          : covered - chunk_offset;
                         std::uint64_t const from = chunk_offset > skipped ? chunk_offset : skipped;
-                        std::uint64_t const wanted_last = skipped + migration.size;
+                        std::uint64_t const wanted_last = skipped + copied.bytes;
                         std::uint64_t const to = chunk_offset + length < wanted_last ? chunk_offset + length
                                                                                      : wanted_last;
                         pending_piece_t piece;
@@ -1995,7 +2026,7 @@ class lsm_level_merger {
                         gathered += piece.carried;
                         chunk_offset += length;
                         if (chunk_offset == covered) {
-                            ++survivor;
+                            ++range;
                             chunk_offset = 0;
                         }
                     }
@@ -2363,18 +2394,22 @@ class lsm_tree {
      *  @param[in] stamps The stamp of every key slot, in the same order.
      *  @param[in] kinds The @c delta_kind_t of every key slot, in the same order.
      *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
-     *  @param[in] stored_values The values back to back, located from the run's own values offset.
+     *  @param[in] stored_values The values back to back in sorted order, one of @p value_max_size bytes per key slot
+     *      for a fixed width.
+     *  @param[in] value_offsets Where each value starts inside @p stored_values and one past the last, for a variable
+     *      width alone.
      *  @param[in] value_max_size The largest value the collection admits, kept in the run's header.
      *  @param[in] published What to call once the new set is current, which returns once no reader holds the old one.
      *  @param[in] tails The tails of the keys the key slots' heads cut short, in the same order, none for whole keys.
      */
     status_t flush(io_channel_t& channel, std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
                    std::span<std::uint8_t const> kinds, std::uint64_t floor, std::span<byte_t const> stored_values,
-                   stored_value_size_t value_max_size,
+                   std::span<stored_value_offset_t const> value_offsets, stored_value_size_t value_max_size,
                    lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
                    key_tails_column_t const& tails = {}) noexcept {
-        auto [written, write_sorted_run_status] = sorted_run_t::write(
-            *volume_, channel, uuid_generator(), key_slots, stamps, kinds, floor, stored_values, value_max_size, tails);
+        auto [written, write_sorted_run_status] = sorted_run_t::write(*volume_, channel, uuid_generator(), key_slots,
+                                                                      stamps, kinds, floor, stored_values,
+                                                                      value_offsets, value_max_size, tails);
         if (write_sorted_run_status.failed()) return write_sorted_run_status;
         uuid_t const content_id = written.content_id();
 
@@ -2442,7 +2477,7 @@ class lsm_tree {
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] placement Where the compaction runs, which a collection leaves automatic.
-     *  @param[in] devices The devices the executor named, the first of which a device compaction runs on.
+     *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device lane.
      *  @param[in] cancellation The word the merge reads between blocks, or null for a merge nobody stops.
      *  @param[in] fold How the collection's changes compose and apply.
      *  @param[in] device_fold How a device composes the collection's changes, or @c no_device_fold_t where none does,
@@ -2456,14 +2491,14 @@ class lsm_tree {
     template <utilities::fold_concept fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(
         io_channel_t& reading_channel, io_channel_t& writing_channel, compaction_placement_t placement,
-        std::span<int const> devices, cancellation_t const* cancellation, fold_type_ const& fold,
+        compactor_ref_t const& compactor, cancellation_t const* cancellation, fold_type_ const& fold,
         device_fold_type_ const& device_fold,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
         compaction_stamps_t const& stamps = compaction_stamps_t {}) noexcept {
         if (!claim_compaction_()) return compaction_outcome_t::nothing_to_compact_k;
 
         expected<compaction_outcome_t> const outcome = compact_once_(reading_channel, writing_channel, placement,
-                                                                     devices, cancellation, fold, device_fold,
+                                                                     compactor, cancellation, fold, device_fold,
                                                                      published, stamps, merge_choice_t::overfull_k);
         atomic_reference_<std::int32_t> {compacting_}.store(static_cast<std::int32_t>(compaction_state_t::idle_k),
                                                             std::memory_order_release);
@@ -2668,7 +2703,7 @@ class lsm_tree {
     /** Runs one merge of the level @p choice picks and publishes it, which the claim around it keeps to one thread. */
     template <typename fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact_once_(io_channel_t& reading_channel, io_channel_t& writing_channel,
-                                                 compaction_placement_t placement, std::span<int const> devices,
+                                                 compaction_placement_t placement, compactor_ref_t const& compactor,
                                                  cancellation_t const* cancellation, fold_type_ const& fold,
                                                  device_fold_type_ const& device_fold,
                                                  lsm_tree_publication_hook_t const& published,
@@ -2690,11 +2725,12 @@ class lsm_tree {
         request.lower = grows ? nullptr : &source.level(lower);
         request.number = static_cast<std::uint32_t>(lower);
         request.depth = lsm_level_depth_t::bottom_k;
-        request.value_max_size = static_cast<stored_value_size_t>(config_.lsm_level_0.sorted_run.value_max_size);
+        sorted_run_config_t const& values = config_.lsm_level_0.sorted_run;
+        request.value_max_size = is_fixed(value_layout_k) ? values.value_size : values.value_max_size;
         request.run_key_slots_capacity = storage_limits_t::memory_runs_max_deltas_k;
         request.run_bytes_limit = storage_limits_t::sorted_run_file_max_size_k;
         request.placement = placement;
-        request.devices = devices;
+        request.compactor = compactor;
         request.cancellation = cancellation;
         request.stamps = stamps;
         if (!grows && lower + 1 != source.size()) request.depth = lsm_level_depth_t::intermediate_k;

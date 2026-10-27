@@ -6,12 +6,12 @@
  *
  *  A compaction reads the sorted run indexes of an upper LSM level and of the lower sorted runs it overlaps, keeps the
  *  newest key slot of every stored key, drops removals when it writes the bottom LSM level, and lays the survivors
- *  into sorted runs that fit their bounds, planning where every stored value moves. Both compactors share the rules
- *  below. The device one composes chains of changes only through a device fold the caller passes, and folds on the
- *  host every chain reaching a write or a base, so without a device fold a merge of runs holding a change runs on the
- *  host. A build with @c USTORE_WITH_CUDA declares the device compactor for every compiler, its kernels in
- *  @c vram_nvidia_compaction.cuh compile under nvcc alone, and @c compaction.cu instantiates its compaction for the
- *  engine's key slots, so a host TU calls it.
+ *  into sorted runs that fit their bounds, planning the coalesced ranges every stored value moves in and the value
+ *  offsets of every new run. Both compactors share the rules below. The device one composes chains of changes only
+ *  through a device fold the caller passes, and folds on the host every chain reaching a write or a base, so without a
+ *  device fold a merge of runs holding a change runs on the host. A build with @c USTORE_WITH_CUDA declares the device
+ *  compactor for every compiler, its kernels in @c vram_nvidia_compaction.cuh compile under nvcc alone, and
+ *  @c compaction.cu instantiates its compaction for the engine's key slots, so a host TU calls it.
  */
 
 #pragma once
@@ -21,13 +21,15 @@
 #include <cstdint> // `std::int64_t`, `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
+#include <array>       // `std::array`
 #include <concepts>    // `std::convertible_to`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`, `std::type_identity_t`
-#include <utility>     // `std::move`, `std::swap`
+#include <utility>     // `std::index_sequence`, `std::move`, `std::swap`
+#include <variant>     // `std::variant`
 
 #include <smashtable/basic_vector.hpp>           // `st::basic_vector`
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
@@ -45,8 +47,8 @@ using utilities::delta_view_t;
 
 #pragma region Vocabulary
 
-/** A key slot shape compaction merges: trivially copyable, keyed by a stored key, and sized, with the kind of each
- *  delta in its run's kinds column. */
+/** A key slot shape compaction merges: trivially copyable and keyed by a stored key, with the kind of each delta in
+ *  its run's kinds column. */
 template <typename key_slot_type_>
 concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_type_> &&
                                        stored_key_concept<typename key_slot_type_::stored_key_t> &&
@@ -54,19 +56,18 @@ concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_typ
                                            {
                                                key_slot.stored_key
                                            } -> std::convertible_to<typename key_slot_type_::stored_key_t>;
-                                           { key_slot.size } -> std::convertible_to<std::uint64_t>;
                                        };
 
-/** A key slot shape recording the size of each stored value, which a shape holding one width for every value lacks. */
+/** A key slot shape recording the size of its inline value, which a shape holding one width for every value lacks. */
 template <typename key_slot_type_>
 concept sizes_stored_values_concept = requires(key_slot_type_& key_slot) {
     key_slot.size = static_cast<stored_value_size_t>(0);
 };
 
-/** A key slot shape whose stored values live in its sorted run's stored values section, found by location. */
+/** A key slot shape whose stored values live in its sorted run's stored values section, found by sorted position. */
 template <typename key_slot_type_>
-concept locates_stored_values_concept = requires(key_slot_type_ const& key_slot) {
-    { key_slot.location } -> std::convertible_to<std::uint64_t>;
+concept locates_stored_values_concept = requires {
+    requires is_fixed_or_variable_width(key_slot_type_::value_layout_k);
 };
 
 /** A key slot shape whose stored key is the head of a longer key, as a string's 16-byte head is, so its runs carry the
@@ -135,6 +136,10 @@ struct sorted_run_index_view {
 
     /** The tails of the keys the key slots' heads cut short, none for a run of whole keys. */
     key_tails_column_t tails;
+
+    /** Where each key slot's value starts inside the run's values section and one past the last, in sorted order,
+     *  for a variable-width run alone. */
+    std::span<stored_value_offset_t const> value_offsets;
 };
 
 /** Whether @p kinds may hold a change, which only a fold's merge reads; a column packs from its least kind to its
@@ -186,6 +191,9 @@ struct sorted_run_bounds_t {
 
     /** Cells in one sorted run index row, the same for the input and the output sorted runs. */
     std::uint64_t branching = 0;
+
+    /** Bytes every value of a fixed-width layout takes in its runs, removals included, and zero for any other. */
+    std::uint64_t value_stride = 0;
 };
 
 /** One sorted run a compaction produced. */
@@ -196,21 +204,30 @@ struct compacted_sorted_run_t {
 
     /** Bytes of the stored values its key slots locate, before alignment. */
     std::uint64_t stored_values_bytes = 0;
+
+    /** Value copy ranges filling its stored values section, which follow those of the sorted runs before it. */
+    std::uint64_t value_copy_ranges_count = 0;
 };
 
-/** Where one key slot's stored value comes from; a size of zero leaves nothing to copy. */
-struct stored_value_migration_t {
+/** One range of stored value bytes a new sorted run copies, coalesced from the values of neighbouring survivors that
+ *  sit back to back in one source. */
+struct value_copy_range_t {
 
-    /** Bytes of the stored value. */
-    std::uint32_t size = 0;
+    /** Index of the source run, counting the upper LSM level first and the lower LSM level after it, where the index
+     *  past every source run names the compaction's folded bytes. */
+    std::uint32_t source_run = 0;
 
-    /** Location of the stored value in its old sorted run, or in the compaction's folded bytes. */
-    std::uint32_t old_location = 0;
+    /** Where the range starts inside the source run's values section, or inside the folded bytes. */
+    std::uint32_t source_begin = 0;
 
-    /** Index of the old sorted run, counting the upper LSM level first and the lower LSM level after it, where the
-     *  index past every source run names the compaction's folded bytes. */
-    std::uint32_t old_sorted_run = 0;
+    /** Bytes the range copies, never zero. */
+    std::uint32_t bytes = 0;
+
+    /** Where the range lands inside the new sorted run's values section. */
+    std::uint32_t target_begin = 0;
 };
+
+static_assert(sizeof(value_copy_range_t) == 16, "A value copy range is four words");
 
 /** A SmashTable vector of @p element_type_ on the allocator @p allocator_type_ rebinds to it. */
 template <typename element_type_, typename allocator_type_>
@@ -228,8 +245,12 @@ struct compaction_output {
     /** The new sorted runs in ascending order of stored keys. */
     rebound_vector<compacted_sorted_run_t, allocator_type_> sorted_runs;
 
-    /** One migration per key slot in sorted order across the sorted runs, empty for stored values held inline. */
-    rebound_vector<stored_value_migration_t, allocator_type_> migrations;
+    /** The value copy ranges of every sorted run in turn, empty for stored values held inline. */
+    rebound_vector<value_copy_range_t, allocator_type_> value_copy_ranges;
+
+    /** One offset per key slot into the stored values across the sorted runs and one past the last, for a
+     *  variable-width layout alone, which every new run rebases from its first key slot. */
+    rebound_vector<std::uint64_t, allocator_type_> value_offsets;
 
     /** One stamp per key slot in sorted order across the sorted runs, each at or above the merge's floor. */
     rebound_vector<std::uint64_t, allocator_type_> stamps;
@@ -237,7 +258,8 @@ struct compaction_output {
     /** One @c delta_kind_t per key slot in sorted order across the sorted runs. */
     rebound_vector<std::uint8_t, allocator_type_> kinds;
 
-    /** The values a fold wrote, back to back, which a migration from the index past every source run locates. */
+    /** The values a fold wrote, back to back in survivor order, which copy ranges naming the index past every source
+     *  run read. */
     rebound_vector<byte_t, allocator_type_> folded;
 
     /** One offset per key slot into @c tails across the sorted runs and one past the last, none for whole keys. */
@@ -253,8 +275,10 @@ struct compaction_output {
         : cells(typename std::allocator_traits<allocator_type_>::template rebind_alloc<key_slot_type_>(allocator)),
           sorted_runs(typename std::allocator_traits<allocator_type_>::template rebind_alloc<compacted_sorted_run_t>(
               allocator)),
-          migrations(typename std::allocator_traits<allocator_type_>::template rebind_alloc<stored_value_migration_t>(
-              allocator)),
+          value_copy_ranges(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<value_copy_range_t>(allocator)),
+          value_offsets(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
           stamps(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
           kinds(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint8_t>(allocator)),
           folded(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)),
@@ -278,7 +302,16 @@ struct located_key_slot {
 
     /** The stamp of the commit that wrote it. */
     std::uint64_t stamp = 0;
+
+    /** Its sorted position in its sorted run, by which its value is read. */
+    std::uint32_t position = 0;
+
+    /** Bytes its value takes in its sorted run's values section, or in the folded bytes, zero for values inline. */
+    std::uint32_t size = 0;
 };
+
+static_assert(sizeof(located_key_slot<key_slot<st::key128_t, value_layout_t::variable_width_k>>) == 40,
+              "A compaction record of a 16-byte cell is 40 bytes");
 
 /** A located key slot of a tailed shape with the tail of its key, viewing its sorted run's tails, the unit a merge of
  *  such runs moves. */
@@ -428,20 +461,25 @@ constexpr bool survives(located_tailed_key_slot<key_slot_type_> const* previous,
     return survives(shares_key ? &previous->located : nullptr, current.located, kind, stamps);
 }
 
-/** Bytes of the stored value @p key_slot locates in a stored values section, zero for empty, removed and inline
- *  stored values. */
-template <typename key_slot_type_>
-constexpr std::uint64_t stored_value_bytes(key_slot_type_ const& key_slot) noexcept {
-    if constexpr (locates_stored_values_concept<key_slot_type_>) return key_slot.size;
-    else return 0;
+/** Bytes the value at sorted @p position takes in its run's values section: through @p value_offsets where the run
+ *  carries them, and @p value_stride otherwise, which is zero for values held inline. */
+constexpr std::uint32_t stored_value_bytes(stored_value_offset_t const* value_offsets, std::uint64_t value_stride,
+                                           std::uint64_t position) noexcept {
+    return value_offsets != nullptr ? value_offsets[position + 1] - value_offsets[position]
+                                    : static_cast<std::uint32_t>(value_stride);
 }
 
-/** Offset of the stored values section in a sorted run of @p key_slots_count key slots. */
+/** Offset of the stored values section in a sorted run of @p key_slots_count key slots, past its value offsets. */
 template <typename key_slot_type_>
 constexpr std::uint64_t stored_values_offset(sorted_run_bounds_t const& bounds,
                                              std::uint64_t key_slots_count) noexcept {
     std::uint64_t const cells_bytes = round_up_to_multiple(key_slots_count, bounds.branching) * sizeof(key_slot_type_);
-    return bounds.header_bytes + round_up_to_multiple(cells_bytes, bounds.alignment_bytes);
+    std::uint64_t offsets_bytes = 0;
+    if constexpr (locates_stored_values_concept<key_slot_type_>)
+        if (is_variable_width(key_slot_type_::value_layout_k))
+            offsets_bytes = round_up_to_multiple((key_slots_count + 1) * sizeof(stored_value_offset_t),
+                                                 bounds.alignment_bytes);
+    return bounds.header_bytes + round_up_to_multiple(cells_bytes, bounds.alignment_bytes) + offsets_bytes;
 }
 
 /** Bytes of a sorted run file of @p key_slots_count key slots locating @p stored_values_bytes bytes of stored
@@ -468,49 +506,141 @@ constexpr key_slot_type_ padding_key_slot() noexcept {
     return padding;
 }
 
-/** Copies @p cell of a sorted run, its stamp out of @p stamps, null reading as zero, and its kind out of @p kinds,
- *  null reading as a write, into its sorted position among @p records, skipping padding. */
+/** Copies @p cell of a sorted run, its stamp out of @p stamps, null reading as zero, its kind out of @p kinds, null
+ *  reading as a write, and its value's bytes as @c stored_value_bytes reads them, into its sorted position among
+ *  @p records, skipping padding. */
 template <typename key_slot_type_>
 constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout_t const& layout, std::uint64_t cell,
                             std::uint32_t sorted_run, std::uint64_t const* stamps, std::uint8_t const* kinds,
+                            stored_value_offset_t const* value_offsets, std::uint64_t value_stride,
                             located_key_slot<key_slot_type_>* records) noexcept {
     std::uint64_t const sorted = layout.cell_to_sorted(cell);
     if (sorted < layout.key_slots_count)
         records[sorted] = located_key_slot<key_slot_type_> {
-            cells[cell], sorted_run,
+            cells[cell],
+            sorted_run,
             kinds != nullptr ? static_cast<delta_kind_t>(kinds[sorted]) : delta_kind_t::write_k,
-            stamps != nullptr ? stamps[sorted] : std::uint64_t {0}};
+            stamps != nullptr ? stamps[sorted] : std::uint64_t {0},
+            static_cast<std::uint32_t>(sorted),
+            stored_value_bytes(value_offsets, value_stride, sorted)};
 }
 
 /**
- *  @brief Writes a surviving key slot into its cell of a new sorted run, and plans where its stored value comes from.
+ *  @brief Writes a surviving key slot into its cell of a new sorted run, with its stamp and its kind.
  *
  *  @param[in] source The survivor with the index of its old sorted run.
  *  @param[in] layout Layout of the new sorted run's sorted run index.
  *  @param[in] position Position of the survivor in the new sorted run's sorted order.
- *  @param[in] section_offset Offset of the new sorted run's stored values section.
- *  @param[in] preceding_bytes Stored value bytes the survivors before it in the new sorted run locate.
  *  @param[in] floor The stamp the survivor's stamp is raised to at least.
  *  @param[out] cells The new sorted run's cells.
- *  @param[out] migration The survivor's migration, written only for key slots that locate stored values.
  *  @param[out] stamp The survivor's stamp, raised to @p floor.
  *  @param[out] kind The survivor's kind.
  */
 template <typename key_slot_type_>
 constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, sorted_run_index_layout_t const& layout,
-                              std::uint64_t position, std::uint64_t section_offset, std::uint64_t preceding_bytes,
-                              std::uint64_t floor, key_slot_type_* cells, stored_value_migration_t* migration,
-                              std::uint64_t* stamp, std::uint8_t* kind) noexcept {
+                              std::uint64_t position, std::uint64_t floor, key_slot_type_* cells, std::uint64_t* stamp,
+                              std::uint8_t* kind) noexcept {
     *stamp = source.stamp > floor ? source.stamp : floor;
     *kind = static_cast<std::uint8_t>(source.kind);
-    key_slot_type_ key_slot = source.key_slot;
+    cells[layout.sorted_to_cell(position)] = source.key_slot;
+}
+
+/**
+ *  @brief Lays the value @p bytes a fold wrote for @p record into @p folded, the bytes of a merge's folded values, or
+ *      into its inline key slot, so the copy plan and the new run read it where @p record now names it.
+ *  @param[in] value_stride Bytes every value of a fixed-width layout takes, which a folded removal fills with zeros.
+ *  @param[in] folded_run The index past every source run, which names the folded bytes.
+ */
+template <typename key_slot_type_, typename folded_type_>
+st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t value_stride, std::uint32_t folded_run,
+                                located_key_slot<key_slot_type_>& record, folded_type_& folded) noexcept {
+    using st::status_t;
+    key_slot_type_& key_slot = record.key_slot;
     if constexpr (locates_stored_values_concept<key_slot_type_>) {
-        migration->size = static_cast<std::uint32_t>(stored_value_bytes(key_slot));
-        migration->old_location = static_cast<std::uint32_t>(key_slot.location);
-        migration->old_sorted_run = source.sorted_run;
-        key_slot.location = static_cast<decltype(key_slot.location)>(section_offset + preceding_bytes);
+        std::size_t size = bytes.size();
+        if constexpr (is_fixed(key_slot_type_::value_layout_k)) {
+            if (!bytes.empty() && bytes.size() != value_stride) return status_t::invalid_argument_k;
+            size = static_cast<std::size_t>(value_stride);
+        }
+        std::size_t const location = folded.size();
+        if (location + size > std::numeric_limits<std::uint32_t>::max()) return status_t::capacity_exhausted_k;
+        if (status_t const grown = folded.resize(location + size); grown != status_t::success_k) return grown;
+        if (!bytes.empty()) std::memcpy(folded.data() + location, bytes.data(), bytes.size());
+        if (bytes.size() != size) std::memset(folded.data() + location + bytes.size(), 0, size - bytes.size());
+        record.sorted_run = folded_run;
+        record.position = 0;
+        record.size = static_cast<std::uint32_t>(size);
     }
-    cells[layout.sorted_to_cell(position)] = key_slot;
+    else {
+        if (bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
+        if (!bytes.empty()) std::memcpy(key_slot.data, bytes.data(), bytes.size());
+        if constexpr (sizes_stored_values_concept<key_slot_type_>)
+            key_slot.size = static_cast<stored_value_size_t>(bytes.size());
+        else if (bytes.size() != key_slot_type_::size) return status_t::invalid_argument_k;
+    }
+    return status_t::success_k;
+}
+
+/**
+ *  @brief Coalesces where the values of @p survivors come from into the copy ranges of each of @p sorted_runs, and
+ *      counts each run's ranges into it.
+ *  @param[in] survivors The survivors in sorted order across the new runs; one naming the run past every source has
+ *      its value next in the folded bytes, which hold the folded values in survivor order.
+ *  @param[in] upper The upper LSM level's views, whose value offsets locate the values of a variable width.
+ *  @param[in] lower The lower LSM level's views.
+ *  @param[in] value_stride Bytes every value of a fixed-width layout takes, which locates its values by position.
+ *  @param[out] ranges The copy ranges of every run in turn, replacing what it held.
+ */
+template <typename key_slot_type_, typename record_type_, typename sorted_runs_type_, typename ranges_type_>
+st::status_t plan_value_copies(record_type_ const* survivors,
+                               std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                               std::span<sorted_run_index_view<key_slot_type_> const> lower, std::uint64_t value_stride,
+                               sorted_runs_type_& sorted_runs, ranges_type_& ranges) noexcept {
+    using st::status_t;
+    ranges.clear();
+    std::uint64_t const sources_count = upper.size() + lower.size();
+    std::uint64_t folded_begin = 0;
+    std::uint64_t first = 0;
+    for (std::size_t run = 0; run != sorted_runs.size(); ++run) {
+        std::size_t const first_range = ranges.size();
+        std::uint64_t const end = first + sorted_runs[run].key_slots_count;
+        std::uint64_t target = 0;
+        for (std::uint64_t index = first; index != end; ++index) {
+            located_key_slot<key_slot_type_> const& record = located_of(survivors[index]);
+            if (record.size == 0) continue;
+            std::uint64_t source_begin = folded_begin;
+            if (record.sorted_run == sources_count) folded_begin += record.size;
+            else {
+                sorted_run_index_view<key_slot_type_> const& view = record.sorted_run < upper.size()
+                                                                        ? upper[record.sorted_run]
+                                                                        : lower[record.sorted_run - upper.size()];
+                source_begin = !view.value_offsets.empty() ? view.value_offsets[record.position]
+                                                           : record.position * value_stride;
+            }
+            if (ranges.size() != first_range) {
+                value_copy_range_t& last = ranges[ranges.size() - 1];
+                std::uint64_t const extended = std::uint64_t {last.bytes} + record.size;
+                if (last.source_run == record.sorted_run &&
+                    last.source_begin + std::uint64_t {last.bytes} == source_begin &&
+                    extended <= std::numeric_limits<std::uint32_t>::max()) {
+                    last.bytes = static_cast<std::uint32_t>(extended);
+                    target += record.size;
+                    continue;
+                }
+            }
+            if (source_begin > std::numeric_limits<std::uint32_t>::max() ||
+                target > std::numeric_limits<std::uint32_t>::max())
+                return status_t::capacity_exhausted_k;
+            status_t const pushed = ranges.push_back(
+                value_copy_range_t {record.sorted_run, static_cast<std::uint32_t>(source_begin), record.size,
+                                    static_cast<std::uint32_t>(target)});
+            if (pushed != status_t::success_k) return pushed;
+            target += record.size;
+        }
+        sorted_runs[run].value_copy_ranges_count = ranges.size() - first_range;
+        first = end;
+    }
+    return status_t::success_k;
 }
 
 /**
@@ -592,6 +722,21 @@ st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t
         first_bytes = taken_bytes;
     }
     return status_t::success_k;
+}
+
+/** Whether every view of @p views can tell its values' bytes as @p bounds lay them: through value offsets for each run
+ *  holding key slots of a variable width, and by a stride the bounds name for a fixed width. */
+template <typename key_slot_type_>
+constexpr bool views_locate_values(std::span<sorted_run_index_view<key_slot_type_> const> views,
+                                   sorted_run_bounds_t const& bounds) noexcept {
+    if constexpr (!locates_stored_values_concept<key_slot_type_>) return bounds.value_stride == 0;
+    else if constexpr (is_fixed(key_slot_type_::value_layout_k)) return bounds.value_stride != 0;
+    else {
+        if (bounds.value_stride != 0) return false;
+        for (sorted_run_index_view<key_slot_type_> const& view : views)
+            if (view.key_slots_count != 0 && view.value_offsets.size() != view.key_slots_count + 1) return false;
+        return true;
+    }
 }
 
 #pragma endregion Rules
@@ -697,10 +842,10 @@ struct host_compactor_t {
      *  @param[in] fold How the collection's changes compose and apply.
      *  @param[in] read_value Called as @c read_value(record, arena, bytes) to view the bytes of a record a fold reads,
      *      answering an @c st::status_t, with any bytes it reads allocated from @c arena.
-     *  @param[out] output The new sorted runs, their cells, stamps and kinds, their stored values' migrations, and the
-     *      values a fold wrote.
-     *  @retval invalid_argument_k The bounds admit no sorted run, the LSM levels hold more than 2^32 sorted runs, or
-     *      the fold refused a chain.
+     *  @param[out] output The new sorted runs, their cells, stamps and kinds, their value offsets and value copy
+     *      ranges, and the values a fold wrote.
+     *  @retval invalid_argument_k The bounds admit no sorted run, the LSM levels hold more than 2^32 sorted runs, a
+     *      variable-width view lacks its value offsets, or the fold refused a chain.
      *  @retval capacity_exhausted_k A folded value outgrows its inline key slot or the 32-bit locations.
      *  @retval out_of_memory_heap_k A buffer could not grow.
      */
@@ -721,6 +866,8 @@ struct host_compactor_t {
         if (!admits_sorted_runs(bounds)) return status_t::invalid_argument_k;
         std::uint64_t const sorted_runs_count = upper.size() + lower.size();
         if (sorted_runs_count > std::numeric_limits<std::uint32_t>::max()) return status_t::invalid_argument_k;
+        if (!views_locate_values(upper, bounds) || !views_locate_values(lower, bounds))
+            return status_t::invalid_argument_k;
 
         std::uint64_t upper_key_slots = 0;
         for (std::size_t index = 0; index != upper.size(); ++index) upper_key_slots += upper[index].key_slots_count;
@@ -745,11 +892,18 @@ struct host_compactor_t {
                                                                     : lower[sorted_run - upper.size()];
             if (sorted_run <= upper.size()) run_starts[sorted_run] = run_offset;
             sorted_run_index_layout_t const layout(view.key_slots_count, bounds.branching);
+            stored_value_offset_t const* const offsets = !view.value_offsets.empty() ? view.value_offsets.data()
+                                                                                     : nullptr;
             for (std::uint64_t cell = 0; cell != layout.cells_count(); ++cell) {
                 std::uint64_t const sorted = layout.cell_to_sorted(cell);
                 if (sorted < layout.key_slots_count)
                     located_of(records[run_offset + sorted]) = located_key_slot<key_slot_type_> {
-                        view.cells[cell], static_cast<std::uint32_t>(sorted_run), delta_kind_t::write_k, 0};
+                        view.cells[cell],
+                        static_cast<std::uint32_t>(sorted_run),
+                        delta_kind_t::write_k,
+                        0,
+                        static_cast<std::uint32_t>(sorted),
+                        stored_value_bytes(offsets, bounds.value_stride, sorted)};
             }
             if (view.stamps != nullptr)
                 for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
@@ -832,25 +986,10 @@ struct host_compactor_t {
         // A folded value replaces its survivor's own: inline in the key slot, or in the compaction's folded bytes
         output.folded.clear();
         for (folded_t const& folded : folds) {
-            key_slot_type_& key_slot = located_of(records[folded.survivor]).key_slot;
-            if constexpr (locates_stored_values_concept<key_slot_type_>) {
-                std::size_t const location = output.folded.size();
-                if (location + folded.bytes.size() > std::numeric_limits<std::uint32_t>::max())
-                    return status_t::capacity_exhausted_k;
-                status = output.folded.resize(location + folded.bytes.size());
-                if (status != status_t::success_k) return status;
-                if (!folded.bytes.empty())
-                    std::memcpy(output.folded.data() + location, folded.bytes.data(), folded.bytes.size());
-                key_slot.location = static_cast<decltype(key_slot.location)>(location);
-                located_of(records[folded.survivor]).sorted_run = static_cast<std::uint32_t>(sorted_runs_count);
-            }
-            else {
-                if (folded.bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
-                if (!folded.bytes.empty()) std::memcpy(key_slot.data, folded.bytes.data(), folded.bytes.size());
-            }
-            if constexpr (sizes_stored_values_concept<key_slot_type_>)
-                key_slot.size = static_cast<stored_value_size_t>(folded.bytes.size());
-            else if (folded.bytes.size() != key_slot_type_::size) return status_t::invalid_argument_k;
+            status = place_folded_value(folded.bytes, bounds.value_stride,
+                                        static_cast<std::uint32_t>(sorted_runs_count),
+                                        located_of(records[folded.survivor]), output.folded);
+            if (status != status_t::success_k) return status;
         }
 
         basic_vector<std::uint64_t> prefix;
@@ -859,7 +998,7 @@ struct host_compactor_t {
             if (status != status_t::success_k) return status;
             prefix[0] = 0;
             for (std::uint64_t index = 0; index != survivors; ++index)
-                prefix[index + 1] = prefix[index] + stored_value_bytes(located_of(records[index]).key_slot);
+                prefix[index + 1] = prefix[index] + located_of(records[index]).size;
         }
         // Tails take room in a run file beside the values, so the plan bounds both together.
         basic_vector<std::uint64_t> planned;
@@ -902,8 +1041,6 @@ struct host_compactor_t {
         key_slot_type_ const padding = padding_key_slot<key_slot_type_>();
         for (std::uint64_t cell = 0; cell != cells_count; ++cell) output.cells[cell] = padding;
 
-        status = output.migrations.resize(locates_stored_values_concept<key_slot_type_> ? survivors : 0);
-        if (status != status_t::success_k) return status;
         status = output.stamps.resize(survivors);
         if (status != status_t::success_k) return status;
         status = output.kinds.resize(survivors);
@@ -914,20 +1051,27 @@ struct host_compactor_t {
         for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
             std::uint64_t const count = output.sorted_runs[index].key_slots_count;
             sorted_run_index_layout_t const layout(count, bounds.branching);
-            std::uint64_t const section_offset = stored_values_offset<key_slot_type_>(bounds, count);
             for (std::uint64_t position = 0; position != count; ++position) {
                 std::uint64_t const survivor = first + position;
-                std::uint64_t const preceding = prefix.size() != 0 ? prefix[survivor] - prefix[first] : 0;
-                stored_value_migration_t* const migration = output.migrations.size() != 0
-                                                                ? output.migrations.data() + survivor
-                                                                : nullptr;
-                place_key_slot(located_of(records[survivor]), layout, position, section_offset, preceding, stamps.floor,
-                               output.cells.data() + first_cell, migration, output.stamps.data() + survivor,
+                place_key_slot(located_of(records[survivor]), layout, position, stamps.floor,
+                               output.cells.data() + first_cell, output.stamps.data() + survivor,
                                output.kinds.data() + survivor);
             }
             first += count;
             first_cell += layout.cells_count();
         }
+
+        status = plan_value_copies<key_slot_type_>(records.data(), upper, lower, bounds.value_stride,
+                                                   output.sorted_runs, output.value_copy_ranges);
+        if (status != status_t::success_k) return status;
+        output.value_offsets.clear();
+        if constexpr (locates_stored_values_concept<key_slot_type_>)
+            if (is_variable_width(key_slot_type_::value_layout_k)) {
+                status = output.value_offsets.resize(prefix.size());
+                if (status != status_t::success_k) return status;
+                for (std::size_t index = 0; index != prefix.size(); ++index)
+                    output.value_offsets[index] = prefix[index];
+            }
 
         output.tail_offsets.clear();
         output.tails.clear();
@@ -958,6 +1102,9 @@ struct host_compactor_t {
 /** The device fold of a collection no device composes the changes of, so a merge of runs holding a change runs on the
  *  host. */
 struct no_device_fold_t {};
+
+/** The device compactor a database's merges may run on, defined for builds with @c USTORE_WITH_CUDA. */
+class cuda_compaction_lane_t;
 
 #if USTORE_WITH_CUDA
 
@@ -1006,12 +1153,14 @@ class located_value_reader {
     read_t read_ = &refuse_;
 };
 
-/** Compacts LSM levels on one CUDA device, queueing every transfer and kernel on a stream of its own. */
-class cuda_compactor_t {
+/** The one device compactor a database's merges run on, made once at open by whoever opens it: one stream, and device
+ *  scratch every compaction reuses, grown to the largest merge it served, so a warm lane allocates nothing. */
+class cuda_compaction_lane_t {
   public:
 
-    /** Binds a compactor to device @p ordinal with a new stream, failing when no such device exists. */
-    static st::expected<cuda_compactor_t> make(int ordinal) noexcept;
+    /** Binds a lane to device @p ordinal with a stream of its own, its scratch never growing past @p scratch_limit
+     *  bytes, zero for no limit, failing when no such device exists. */
+    static st::expected<cuda_compaction_lane_t> make(int ordinal, std::size_t scratch_limit) noexcept;
 
     /**
      *  @brief Does what @c host_compactor_t::compact does with identical output, composing the chains of changes alone
@@ -1031,17 +1180,96 @@ class cuda_compactor_t {
                          std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
                          compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
 
-    /** The ordinal of the device the compactor runs on. */
+    /** The ordinal of the device the lane runs on. */
     int device() const noexcept { return stream_.device(); }
 
-  private:
-    explicit cuda_compactor_t(cuda_stream_t&& stream) noexcept : stream_(std::move(stream)) {}
+    /** Device allocations the lane made, which stop once its scratch holds the largest merge it serves. */
+    std::uint64_t device_allocations() const noexcept { return device_allocations_; }
 
-    /** The stream every transfer and kernel of the compactor queues on. */
+  private:
+
+    /** One role of the lane's device scratch, which each compaction views as the elements it needs there. */
+    enum class scratch_role_t : std::uint8_t {
+        records_k,
+        merged_k,
+        run_cells_k,
+        run_stamps_k,
+        run_kinds_k,
+        run_offsets_k,
+        pinned_k,
+        temporary_k,
+        flags_k,
+        selected_k,
+        prefix_k,
+        placements_k,
+        cells_k,
+        stamps_k,
+        kinds_k,
+        fold_indices_k,
+        fold_records_k,
+        count_k,
+    };
+
+    /** The device bytes of one role. */
+    using scratch_t = utilities::cuda_device_buffer<std::byte>;
+
+    /** Roles the scratch holds. */
+    static constexpr std::size_t scratch_roles_k = static_cast<std::size_t>(scratch_role_t::count_k);
+
+    cuda_compaction_lane_t(cuda_stream_t&& stream, std::size_t scratch_limit) noexcept
+        : stream_(std::move(stream)), scratch_limit_(scratch_limit),
+          scratch_(scratch_of_(stream_.device(), std::make_index_sequence<scratch_roles_k> {})) {}
+
+    template <std::size_t... roles_>
+    static std::array<scratch_t, scratch_roles_k> scratch_of_(int device, std::index_sequence<roles_...>) noexcept {
+        return {((void)roles_, scratch_t {utilities::cuda_device_allocator<std::byte>(device)})...};
+    }
+
+    /**
+     *  @brief Points @p into at room for @p count elements in the scratch of @p role, growing it when it holds fewer
+     *      bytes, after the kernels queued so far finished with what it held.
+     *  @retval out_of_memory_heap_k The growth would take the scratch past its limit, so the merge runs on the host.
+     *  @note Device memory carries no type of its own, so a role's bytes are viewed as whatever elements a compaction
+     *      places there.
+     */
+    template <typename element_type_>
+    st::status_t room_(scratch_role_t role, std::size_t count, element_type_*& into) noexcept {
+        scratch_t& scratch = scratch_[static_cast<std::size_t>(role)];
+        std::size_t const bytes = count * sizeof(element_type_);
+        if (bytes > scratch.size()) {
+            std::size_t const others = scratch_bytes_ - scratch.size();
+            if (scratch_limit_ != 0 && others + bytes > scratch_limit_) return st::status_t::out_of_memory_heap_k;
+            if (st::status_t const drained = stream_.synchronize(); drained != st::status_t::success_k) return drained;
+            st::status_t const grown = scratch.reserve(bytes);
+            scratch_bytes_ = others + scratch.size();
+            if (grown != st::status_t::success_k) return grown;
+            ++device_allocations_;
+        }
+        into = static_cast<element_type_*>(static_cast<void*>(scratch.data()));
+        return st::status_t::success_k;
+    }
+
+    /** The stream every transfer and kernel of the lane queues on. */
     cuda_stream_t stream_;
+
+    /** Bytes the scratch may hold across every role, zero for no limit. */
+    std::size_t scratch_limit_ = 0;
+
+    /** Bytes the scratch holds across every role. */
+    std::size_t scratch_bytes_ = 0;
+
+    /** The device scratch every compaction reuses, one buffer per role. */
+    std::array<scratch_t, scratch_roles_k> scratch_;
+
+    /** Device allocations the scratch made since the lane was made. */
+    std::uint64_t device_allocations_ = 0;
 };
 
 #endif
+
+/** The compactor a database's merges run on, picked once at mount by whoever opens it: the calling thread, or a warm
+ *  device lane that opener owns. */
+using compactor_ref_t = std::variant<host_compactor_t, cuda_compaction_lane_t*>;
 
 #pragma endregion Device
 

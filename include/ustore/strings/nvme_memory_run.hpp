@@ -30,7 +30,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::max`, `std::min`, `std::sort`
+#include <algorithm>   // `std::max`, `std::min`
 #include <compare>     // `std::strong_ordering`
 #include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`, `std::as_bytes`
@@ -41,6 +41,7 @@
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
 #include <smashtable/row_layout.hpp>             // `st::key128_t`
 #include <smashtable/shared.hpp>                 // `st::default_allocator`, `st::expected`
+#include <stringzilla/sort.h>                    // `sz_kernel_sort_order_t`
 #include <stringzilla/stringzilla.hpp>           // `sz::string_view_t`
 
 #include "ustore/blobs/nvme_memory_run.hpp" // `keyed_delta`, `stamped_delta`, `kept_versions`
@@ -73,6 +74,76 @@ inline std::strong_ordering order_strings(st::key128_t const& first_head, std::s
     return sz::string_view_t {tail_of(first)} <=> sz::string_view_t {tail_of(second)};
 }
 
+/** The strings @p deltas write, as StringZilla's kernels read a collection, viewing them where they lie. */
+template <typename delta_type_>
+sz_strings_view_t strings_of(std::span<delta_type_ const> deltas) noexcept {
+    sz_strings_view_t strings;
+    strings.layout = sz_strings_accessor_k;
+    strings.count = deltas.size();
+    strings.data.accessor.handle = deltas.data();
+    strings.data.accessor.get = [](void const* handle, sz_size_t const* indices, sz_size_t count,
+                                   sz_string_view_t* views) {
+        delta_type_ const* const all = static_cast<delta_type_ const*>(handle);
+        for (sz_size_t index = 0; index != count; ++index) {
+            std::string_view const text = all[indices[index]].stored_key;
+            // A caller's empty string may view no bytes at all, which a kernel's compare must still read safely.
+            views[index] = sz_string_view_t {text.empty() ? "" : text.data(), text.size()};
+        }
+    };
+    return strings;
+}
+
+/** Which of several deltas to one string a deduplicating sort keeps. */
+enum class keep_t : std::uint8_t {
+
+    /** The one given first, as a seal of distinct strings expects. */
+    first_k = 0,
+
+    /** The one given last, as a batch naming a string twice means. */
+    last_k = 1,
+};
+
+/**
+ *  @brief Orders @p deltas by their strings through @p sort_order and keeps one delta of every string, the first or
+ *      the last given as @p keep says, packed at the front in string order.
+ *  @param[in] sort_order The StringZilla sort kernel src/ picked for the CPU, which orders bytes like @c memcmp.
+ *  @return How many deltas were kept, or the status a kernel or the room for the order refused.
+ */
+template <typename delta_type_, typename allocator_type_>
+expected<std::size_t> sort_unique_strings(std::span<delta_type_> deltas, sz_kernel_sort_order_t sort_order, keep_t keep,
+                                          allocator_type_ const& allocator) noexcept {
+    using order_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<sz_size_t>;
+    using deltas_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<delta_type_>;
+    if (sort_order == nullptr) return status_t {status_code_t::invalid_argument_k, "No kernel sorts the strings"};
+    st::basic_vector<sz_size_t, order_allocator_t> order {order_allocator_t {allocator}};
+    if (order.resize(deltas.size()) != st::status_t::success_k)
+        return status_t {status_code_t::out_of_memory_k, "No room to order the strings"};
+    sz_strings_view_t const strings = strings_of(std::span<delta_type_ const> {deltas});
+    sz_status_t const sorted = sort_order(&strings, 0, sz_false_k, nullptr, order.data(), nullptr);
+    if (sorted != sz_success_k)
+        return status_t {sorted == sz_bad_alloc_k ? status_code_t::out_of_memory_k : status_code_t::internal_k,
+                         sz_status_name(sorted)};
+
+    // Choosing among equal strings by their given positions keeps the answer whatever the sort's stability.
+    std::size_t kept = 0;
+    for (std::size_t index = 0; index != order.size(); ++index) {
+        sz_size_t const given = order[index];
+        if (kept == 0 ||
+            std::string_view {deltas[order[kept - 1]].stored_key} != std::string_view {deltas[given].stored_key}) {
+            order[kept++] = given;
+            continue;
+        }
+        sz_size_t& survivor = order[kept - 1];
+        survivor = keep == keep_t::first_k ? std::min(survivor, given) : std::max(survivor, given);
+    }
+    st::basic_vector<delta_type_, deltas_allocator_t> survivors {deltas_allocator_t {allocator}};
+    if (survivors.resize(kept) != st::status_t::success_k)
+        return status_t {status_code_t::out_of_memory_k, "No room to gather the kept deltas"};
+    for (std::size_t index = 0; index != kept; ++index) survivors[index] = deltas[order[index]];
+    for (std::size_t index = 0; index != kept; ++index) deltas[index] = survivors[index];
+    return kept;
+}
+
 /**
  *  @brief The deltas one transaction wrote to one strings collection, sorted by string and copied into columns, not
  *      yet stamped.
@@ -101,22 +172,22 @@ class sealed_deltas {
     sealed_deltas& operator=(sealed_deltas const&) = delete;
 
     /**
-     *  @brief Sorts @p deltas by string in place and copies them, strings and bytes alike, into columns on
-     *      @p allocator.
+     *  @brief Sorts @p deltas by string in place through @p sort_order and copies them, strings and bytes alike, into
+     *      columns on @p allocator.
+     *  @param[in] sort_order The StringZilla sort kernel src/ picked for the CPU.
      *  @retval invalid_argument_k No deltas, two deltas of one string, a removal carrying bytes, or a write carrying
      *      anything but one 16-byte value.
      *  @retval capacity_exhausted_k More string and value bytes than one sorted run file holds.
      *  @retval out_of_memory_k A column could not be allocated.
      */
-    static expected<sealed_deltas> seal(std::span<keyed_delta_t> deltas, allocator_t allocator = {}) noexcept {
+    static expected<sealed_deltas> seal(std::span<keyed_delta_t> deltas, sz_kernel_sort_order_t sort_order,
+                                        allocator_t allocator = {}) noexcept {
         if (deltas.empty()) return status_t {status_code_t::invalid_argument_k, "A seal takes at least one delta"};
-        // A caller's empty string may view no bytes at all, which only the standard views compare safely.
-        std::sort(deltas.begin(), deltas.end(), [](keyed_delta_t const& first, keyed_delta_t const& second) noexcept {
-            return first.stored_key < second.stored_key;
-        });
+        auto [kept, sort_status] = sort_unique_strings(deltas, sort_order, keep_t::first_k, allocator);
+        if (sort_status.failed()) return sort_status;
+        if (kept != deltas.size())
+            return status_t {status_code_t::invalid_argument_k, "A seal takes one delta per string"};
         for (std::size_t index = 0; index != deltas.size(); ++index) {
-            if (index != 0 && deltas[index - 1].stored_key == deltas[index].stored_key)
-                return status_t {status_code_t::invalid_argument_k, "A seal takes one delta per string"};
             std::size_t const carried = deltas[index].delta.kind == delta_kind_t::remove_k ? 0 : value_bytes_k;
             if (deltas[index].delta.bytes.size() != carried)
                 return status_t {status_code_t::invalid_argument_k, "A write carries one key and a removal none"};

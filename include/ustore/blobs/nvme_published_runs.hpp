@@ -663,6 +663,10 @@ class published_runs {
 
         /** Its room in the ledger's list of what the leader unpublished, once a publication replaces it. */
         unpublished_t unpublished;
+
+        /** How its runs are arranged, which a flush, a compaction or a merge of memory runs moves past and a commit,
+         *  only putting a newer run ahead, keeps. */
+        std::uint64_t layout_generation = 0;
     };
 
     /** The view a read walks and the stamp it reads at. */
@@ -843,7 +847,8 @@ class published_runs {
      */
     status_t prepare(memory_run_t const* run) noexcept {
         forget_prepared();
-        auto [view, view_status] = next_view_(run, current_->memory_runs.runs(), current_->oldest_readable);
+        auto [view, view_status] = next_view_(run, current_->memory_runs.runs(), current_->oldest_readable,
+                                              current_->layout_generation);
         if (view_status.failed() || memory_runs_.reserve(memory_runs_.size() + 1) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to prepare a commit"};
         view->levels = current_->levels;
@@ -973,7 +978,7 @@ class published_runs {
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
-     *  @param[in] devices The devices the executor named, the first of which a large merge runs on, empty for the host.
+     *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device lane.
      *  @param[in] fold What a change delta does, which composes the changes no reader tells apart.
      *  @param[in] device_fold What composes the changes of the merge on a device, or @c no_device_fold_t where nothing
      *      does, which keeps every merge holding a change on the host.
@@ -981,7 +986,7 @@ class published_runs {
      */
     template <utilities::fold_concept fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(io_channel_t& reading_channel, io_channel_t& writing_channel,
-                                           std::span<int const> devices, fold_type_ const& fold,
+                                           compactor_ref_t const& compactor, fold_type_ const& fold,
                                            device_fold_type_ const& device_fold,
                                            lsm_tree_publication_hook_t const& published) noexcept {
         // A pinned reader keeps the version it reads, and the durable horizon keeps the version a mount falls back to.
@@ -996,7 +1001,7 @@ class published_runs {
         publication.owner = this;
         publication.oldest_readable = stamps.horizon;
         publication.chained = &published;
-        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, devices, nullptr,
+        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, compactor, nullptr,
                              fold, device_fold, publication.hook(), stamps);
     }
 
@@ -1111,11 +1116,12 @@ class published_runs {
         return {};
     }
 
-    /** A view naming @p newest, when not null, ahead of @p older, below levels its caller fills in, which no reader
-     *  reaches until it is published. */
+    /** A view naming @p newest, when not null, ahead of @p older, below levels its caller fills in, arranged as
+     *  @p layout_generation says, which no reader reaches until it is published. */
     static expected<std::unique_ptr<view_t>> next_view_(memory_run_t const* newest,
                                                         std::span<memory_run_t const* const> older,
-                                                        transaction_stamp_t oldest_readable) noexcept {
+                                                        transaction_stamp_t oldest_readable,
+                                                        std::uint64_t layout_generation) noexcept {
         std::size_t const ahead = newest != nullptr ? 1 : 0;
         typename memory_view_t::runs_t runs;
         if (runs.resize(older.size() + ahead) != st::status_t::success_k)
@@ -1125,6 +1131,7 @@ class published_runs {
         std::unique_ptr<view_t> view {new (std::nothrow)
                                           view_t {memory_view_t::of(std::move(runs)), nullptr, oldest_readable}};
         if (!view) return status_t {status_code_t::out_of_memory_k, "No room to lay out a view"};
+        view->layout_generation = layout_generation;
         return view;
     }
 
@@ -1153,7 +1160,8 @@ class published_runs {
                (publication.flushed.empty() || runs[kept] == publication.flushed[0]) &&
                "A flush writes out the oldest memory runs");
         auto [next, next_status] = next_view_(nullptr, runs.first(kept),
-                                              std::max(owner.current_->oldest_readable, publication.oldest_readable));
+                                              std::max(owner.current_->oldest_readable, publication.oldest_readable),
+                                              owner.current_->layout_generation + 1);
         if (next_status.succeeded() && publication.freed.reserve(publication.flushed.size()) != st::status_t::success_k)
             next_status = status_t {status_code_t::out_of_memory_k, "A flush could not take its memory runs over"};
         if (next_status.failed()) {
@@ -1223,6 +1231,7 @@ class published_runs {
             ledger_->stop_leading();
             return {status_code_t::out_of_memory_k, "No room to lay out a merged view"};
         }
+        next->layout_generation = current_->layout_generation + 1;
         // The runs the store owns run oldest first, opposite to the view, so the group's oldest sits here.
         std::size_t const oldest = runs.size() - first - group.size();
         replace_view_(std::move(next));

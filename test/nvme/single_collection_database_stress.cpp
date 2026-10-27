@@ -304,10 +304,10 @@ template <typename key_slot_type_, typename mount_type_>
     return failures;
 }
 
-/** One-byte values kept inside the key slots. */
+/** Values of up to 12 bytes kept inside the key slots. */
 template <typename mount_type_>
-std::size_t inline_1_byte_keeps_its_values(mount_type_ const& mount) {
-    using slot_t = key_slot<stored_key_t, value_layout_t::inline_1_byte_k>;
+std::size_t inline_12_bytes_keeps_its_values(mount_type_ const& mount) {
+    using slot_t = key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>;
     return concurrent_operations_keep_their_values<slot_t>(mount, 0, 0);
 }
 
@@ -347,7 +347,7 @@ int main(int argc, char const* argv[]) {
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount, "inline_1_byte", inline_1_byte_keeps_its_values);
+        report(totals, mount, "inline_12_bytes", inline_12_bytes_keeps_its_values);
         report(totals, mount, "fixed_width", fixed_width_keeps_its_values);
         report(totals, mount, "variable_width", variable_width_keeps_its_values);
     };

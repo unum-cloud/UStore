@@ -2,7 +2,7 @@
  *  @file include/ustore/blobs/vram_nvidia_compaction.cuh
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief The kernels of the device compactor on CUB: extraction, survival, folding, value sizes, padding and
+ *  @brief The kernels of the device compactor on CUB: extraction, survival, folding, value offsets, padding and
  *      placement.
  *
  *  A merge holding changes copies its merged records back once survival is settled, walks them on the host as the host
@@ -23,15 +23,13 @@
 #include <cub/version.cuh>
 #endif
 
-#include "ustore/blobs/nvme_compaction.hpp"        // `cuda_compactor_t`, `compaction_kind_t`, `compaction_output`
+#include "ustore/blobs/nvme_compaction.hpp"        // `cuda_compaction_lane_t`, `compaction_kind_t`, `compaction_output`
 #include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_stream_t`, `cuda_status`
 
 #if defined(__CUDACC__)
 
 namespace unum::ustore::blobs {
 
-using utilities::cuda_device_allocator;
-using utilities::cuda_device_buffer;
 using utilities::cuda_device_scope_t;
 using utilities::cuda_status;
 
@@ -61,8 +59,15 @@ struct extract_kernel {
     /** The sorted run's kinds in sorted order on the device, or null when every record is a write. */
     std::uint8_t const* kinds;
 
+    /** The sorted run's value offsets on the device, or null for a run finding its values by stride. */
+    stored_value_offset_t const* value_offsets;
+
+    /** Bytes every value of a fixed-width layout takes, zero for any other. */
+    std::uint64_t value_stride;
+
     constexpr void operator()(std::int64_t cell) const noexcept {
-        extract_cell(cells, layout, static_cast<std::uint64_t>(cell), sorted_run, stamps, kinds, records);
+        extract_cell(cells, layout, static_cast<std::uint64_t>(cell), sorted_run, stamps, kinds, value_offsets,
+                     value_stride, records);
     }
 };
 
@@ -88,7 +93,7 @@ struct survivor_kernel {
     }
 };
 
-/** Writes each survivor's stored value bytes one slot ahead, so an inclusive sum leaves prefix sums behind. */
+/** Writes each survivor's stored value bytes one slot ahead, so an inclusive sum leaves the value offsets behind. */
 template <typename key_slot_type_>
 struct stored_value_bytes_kernel {
 
@@ -98,9 +103,7 @@ struct stored_value_bytes_kernel {
     /** Prefix sums, one slot longer than the survivors. */
     std::uint64_t* prefix;
 
-    constexpr void operator()(std::int64_t index) const noexcept {
-        prefix[index + 1] = stored_value_bytes(survivors[index].key_slot);
-    }
+    constexpr void operator()(std::int64_t index) const noexcept { prefix[index + 1] = survivors[index].size; }
 };
 
 /** Fills every output cell with padding. */
@@ -116,7 +119,7 @@ struct padding_kernel {
     constexpr void operator()(std::int64_t cell) const noexcept { cells[cell] = padding; }
 };
 
-/** Where one new sorted run starts among the survivors and the cells, and where its stored values section begins. */
+/** Where one new sorted run starts among the survivors and the cells. */
 struct sorted_run_placement_t {
 
     /** Index of the sorted run's first survivor. */
@@ -125,22 +128,16 @@ struct sorted_run_placement_t {
     /** Index of the sorted run's first cell. */
     std::uint64_t first_cell = 0;
 
-    /** Offset of the sorted run's stored values section. */
-    std::uint64_t section_offset = 0;
-
     /** Layout of the sorted run's sorted run index. */
     sorted_run_index_layout_t layout;
 };
 
-/** Places each survivor into its sorted run and plans its stored value. */
+/** Places each survivor into its sorted run, with its stamp and its kind. */
 template <typename key_slot_type_>
 struct place_kernel {
 
     /** The survivors in sorted order. */
     located_key_slot<key_slot_type_> const* survivors;
-
-    /** Prefix sums of stored value bytes, or null for stored values held inline. */
-    std::uint64_t const* prefix;
 
     /** Placements of the new sorted runs, ascending. */
     sorted_run_placement_t const* placements;
@@ -150,9 +147,6 @@ struct place_kernel {
 
     /** Cells of all new sorted runs. */
     key_slot_type_* cells;
-
-    /** One migration per survivor, or null for stored values held inline. */
-    stored_value_migration_t* migrations;
 
     /** The stamp every survivor's stamp is raised to at least. */
     std::uint64_t floor;
@@ -173,10 +167,8 @@ struct place_kernel {
             else high = middle;
         }
         sorted_run_placement_t const& placement = placements[low];
-        std::uint64_t const preceding = prefix != nullptr ? prefix[index] - prefix[placement.first_key_slot] : 0;
-        place_key_slot(survivors[index], placement.layout, index - placement.first_key_slot, placement.section_offset,
-                       preceding, floor, cells + placement.first_cell,
-                       migrations != nullptr ? migrations + index : nullptr, stamps + index, kinds + index);
+        place_key_slot(survivors[index], placement.layout, index - placement.first_key_slot, floor,
+                       cells + placement.first_cell, stamps + index, kinds + index);
     }
 };
 
@@ -196,9 +188,21 @@ struct folded_survivor_kernel {
     constexpr void operator()(std::int64_t index) const noexcept { survivors[indices[index]] = folded[index]; }
 };
 
+/** Copies @p count elements from @p source to @p target on @p stream and waits until it ran, as every upload and
+ *  download of a compaction does. */
+template <typename element_type_>
+st::status_t copy_waiting(element_type_* target, element_type_ const* source, std::size_t count,
+                          cudaStream_t stream) noexcept {
+    if (count == 0) return st::status_t::success_k;
+    st::status_t const status = cuda_status(
+        cudaMemcpyAsync(target, source, count * sizeof(element_type_), cudaMemcpyDefault, stream));
+    return status != st::status_t::success_k ? status : cuda_status(cudaStreamSynchronize(stream));
+}
+
 /**
  *  @brief Folds what the survivors of a merge fold, as @c host_compactor_t::compact does, writing their values into
- *      @p output's folded bytes and the folded survivors over @p survivors on the device.
+ *      @p output's folded bytes and listing each folded survivor's index and record in @p indices and
+ *      @p replacements, which the caller writes over the survivors on the device.
  *
  *  The merged records and their survival flags come back to the host, which finds the versions behind every surviving
  *  change through @c folded_versions, as the host compactor does. A surviving change whose older versions are all
@@ -207,11 +211,13 @@ struct folded_survivor_kernel {
  */
 template <typename key_slot_type_, typename fold_type_, typename device_fold_type_, typename allocator_type_>
 st::status_t fold_survivors(cuda_stream_t const& stream, compaction_kind_t kind, compaction_stamps_t const& stamps,
-                            std::uint64_t sorted_runs_count, located_key_slot<key_slot_type_> const* merged,
-                            std::uint8_t const* flags, std::uint64_t merged_count,
-                            located_key_slot<key_slot_type_>* survivors, fold_type_ const& fold,
-                            device_fold_type_ const& device_fold, located_value_reader<key_slot_type_> read_value,
-                            compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
+                            std::uint64_t sorted_runs_count, std::uint64_t value_stride,
+                            located_key_slot<key_slot_type_> const* merged, std::uint8_t const* flags,
+                            std::uint64_t merged_count, fold_type_ const& fold, device_fold_type_ const& device_fold,
+                            located_value_reader<key_slot_type_> read_value,
+                            compaction_output<key_slot_type_, allocator_type_>& output,
+                            st::basic_vector<std::uint64_t>& indices,
+                            st::basic_vector<located_key_slot<key_slot_type_>>& replacements) noexcept {
     using st::basic_vector;
     using st::status_t;
     using record_t = located_key_slot<key_slot_type_>;
@@ -293,8 +299,6 @@ st::status_t fold_survivors(cuda_stream_t const& stream, compaction_kind_t kind,
     }
 
     // A folded value replaces its survivor's own: inline in the key slot, or in the compaction's folded bytes
-    basic_vector<std::uint64_t> indices;
-    basic_vector<record_t> replacements;
     status = indices.resize(folds.size());
     if (status != status_t::success_k) return status;
     status = replacements.resize(folds.size());
@@ -308,51 +312,19 @@ st::status_t fold_survivors(cuda_stream_t const& stream, compaction_kind_t kind,
                                            composed_offsets[folded.chain + 1] - composed_offsets[folded.chain]};
         record_t record = records[folded.merged];
         record.kind = folded.kind;
-        key_slot_type_& key_slot = record.key_slot;
-        if constexpr (locates_stored_values_concept<key_slot_type_>) {
-            std::size_t const location = output.folded.size();
-            if (location + bytes.size() > std::numeric_limits<std::uint32_t>::max())
-                return status_t::capacity_exhausted_k;
-            status = output.folded.resize(location + bytes.size());
-            if (status != status_t::success_k) return status;
-            if (!bytes.empty()) std::memcpy(output.folded.data() + location, bytes.data(), bytes.size());
-            key_slot.location = static_cast<decltype(key_slot.location)>(location);
-            record.sorted_run = static_cast<std::uint32_t>(sorted_runs_count);
-        }
-        else {
-            if (bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
-            if (!bytes.empty()) std::memcpy(key_slot.data, bytes.data(), bytes.size());
-        }
-        if constexpr (sizes_stored_values_concept<key_slot_type_>)
-            key_slot.size = static_cast<stored_value_size_t>(bytes.size());
-        else if (bytes.size() != key_slot_type_::size) return status_t::invalid_argument_k;
+        status = place_folded_value(bytes, value_stride, static_cast<std::uint32_t>(sorted_runs_count), record,
+                                    output.folded);
+        if (status != status_t::success_k) return status;
         indices[index] = folded.survivor;
         replacements[index] = record;
     }
-    if (folds.empty()) return status_t::success_k;
-
-    int const device = stream.device();
-    cuda_device_buffer<std::uint64_t> device_indices {cuda_device_allocator<std::uint64_t>(device)};
-    cuda_device_buffer<record_t> device_replacements {cuda_device_allocator<record_t>(device)};
-    status = device_indices.reserve(folds.size());
-    if (status != status_t::success_k) return status;
-    status = device_replacements.reserve(folds.size());
-    if (status != status_t::success_k) return status;
-    status = device_indices.copy_in(indices.data(), indices.size(), 0, handle);
-    if (status != status_t::success_k) return status;
-    status = device_replacements.copy_in(replacements.data(), replacements.size(), 0, handle);
-    if (status != status_t::success_k) return status;
-    folded_survivor_kernel<key_slot_type_> const kernel {survivors, device_indices.data(), device_replacements.data()};
-    status = cuda_status(cub::DeviceFor::Bulk(static_cast<std::int64_t>(folds.size()), kernel, handle));
-    if (status != status_t::success_k) return status;
-    // The buffers above free on return, so the kernel reading them finishes first
-    return stream.synchronize();
+    return status_t::success_k;
 }
 
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
           typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t cuda_compactor_t::compact(
+st::status_t cuda_compaction_lane_t::compact(
     compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
     std::span<sorted_run_index_view<key_slot_type_> const> lower, sorted_run_bounds_t const& bounds,
     compaction_stamps_t const& stamps, [[maybe_unused]] fold_type_ const& fold,
@@ -367,6 +339,7 @@ st::status_t cuda_compactor_t::compact(
     if (!admits_sorted_runs(bounds)) return status_t::invalid_argument_k;
     std::uint64_t const sorted_runs_count = upper.size() + lower.size();
     if (sorted_runs_count > std::numeric_limits<std::uint32_t>::max()) return status_t::invalid_argument_k;
+    if (!views_locate_values(upper, bounds) || !views_locate_values(lower, bounds)) return status_t::invalid_argument_k;
     int const device = stream_.device();
     cudaStream_t const stream = stream_.handle();
     expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(device);
@@ -391,22 +364,24 @@ st::status_t cuda_compactor_t::compact(
         if (sorted_run < upper.size()) upper_key_slots += view.key_slots_count;
     }
 
-    cuda_device_buffer<record_t> records {cuda_device_allocator<record_t>(device)};
-    cuda_device_buffer<record_t> scratch {cuda_device_allocator<record_t>(device)};
-    cuda_device_buffer<key_slot_type_> sorted_run_cells {cuda_device_allocator<key_slot_type_>(device)};
-    cuda_device_buffer<std::uint64_t> sorted_run_stamps {cuda_device_allocator<std::uint64_t>(device)};
-    cuda_device_buffer<std::uint8_t> sorted_run_kinds {cuda_device_allocator<std::uint8_t>(device)};
-    cuda_device_buffer<std::uint64_t> pinned {cuda_device_allocator<std::uint64_t>(device)};
-    cuda_device_buffer<std::byte> temporary {cuda_device_allocator<std::byte>(device)};
-    status_t status = records.reserve(merged_count);
+    // Every buffer is the lane's own, grown to the largest merge so far, so a warm lane allocates nothing here.
+    record_t* records = nullptr;
+    record_t* scratch = nullptr;
+    key_slot_type_* sorted_run_cells = nullptr;
+    std::uint64_t* sorted_run_stamps = nullptr;
+    std::uint8_t* sorted_run_kinds = nullptr;
+    stored_value_offset_t* sorted_run_offsets = nullptr;
+    status_t status = room_(scratch_role_t::records_k, merged_count, records);
     if (status != status_t::success_k) return status;
-    status = scratch.reserve(merged_count);
+    status = room_(scratch_role_t::merged_k, merged_count, scratch);
     if (status != status_t::success_k) return status;
-    status = sorted_run_cells.reserve(largest_cells);
+    status = room_(scratch_role_t::run_cells_k, largest_cells, sorted_run_cells);
     if (status != status_t::success_k) return status;
-    status = sorted_run_stamps.reserve(largest_cells);
+    status = room_(scratch_role_t::run_stamps_k, largest_cells, sorted_run_stamps);
     if (status != status_t::success_k) return status;
-    status = sorted_run_kinds.reserve(largest_cells);
+    status = room_(scratch_role_t::run_kinds_k, largest_cells, sorted_run_kinds);
+    if (status != status_t::success_k) return status;
+    status = room_(scratch_role_t::run_offsets_k, largest_cells + 1, sorted_run_offsets);
     if (status != status_t::success_k) return status;
 
     // A run's stamps and kinds are packed, so they unpack on the host into blocks the size of the largest run.
@@ -420,18 +395,18 @@ st::status_t cuda_compactor_t::compact(
     // The pinned stamps are a few words, read by every survival check, so the device holds its own copy.
     compaction_stamps_t device_stamps = stamps;
     if (stamps.pinned_count != 0) {
-        status = pinned.reserve(stamps.pinned_count);
+        std::uint64_t* pinned = nullptr;
+        status = room_(scratch_role_t::pinned_k, stamps.pinned_count, pinned);
         if (status != status_t::success_k) return status;
-        status = pinned.copy_in(stamps.pinned, stamps.pinned_count, 0, stream);
+        status = copy_waiting(pinned, stamps.pinned, stamps.pinned_count, stream);
         if (status != status_t::success_k) return status;
-        device_stamps.pinned = pinned.data();
+        device_stamps.pinned = pinned;
     }
 
-    // Growing the scratch frees the old run, so the kernels still reading it finish first
+    // Growing the temporary frees what it held, which the lane does only once the kernels reading it finished.
+    std::byte* temporary = nullptr;
     auto const grow_temporary = [&temporary, this](std::size_t bytes) noexcept {
-        if (bytes <= temporary.size()) return status_t::success_k;
-        status_t const drained = stream_.synchronize();
-        return drained != status_t::success_k ? drained : temporary.reserve(bytes);
+        return room_(scratch_role_t::temporary_k, bytes, temporary);
     };
 
     // Every sorted run's cells upload and land at their sorted positions, in one run per sorted run
@@ -442,7 +417,7 @@ st::status_t cuda_compactor_t::compact(
                                                                 : lower[sorted_run - upper.size()];
         sorted_run_index_layout_t const layout(view.key_slots_count, bounds.branching);
         if (layout.cells_count() == 0) continue;
-        status = sorted_run_cells.copy_in(view.cells, layout.cells_count(), 0, stream);
+        status = copy_waiting(sorted_run_cells, view.cells, layout.cells_count(), stream);
         if (status != status_t::success_k) return status;
         std::uint64_t const* run_stamps = nullptr;
         std::uint8_t const* run_kinds = nullptr;
@@ -456,23 +431,27 @@ st::status_t cuda_compactor_t::compact(
         if (carries_stamps) {
             for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
                 unpacked[sorted] = (*view.stamps)[static_cast<std::size_t>(sorted)];
-            status = sorted_run_stamps.copy_in(unpacked.data(), view.key_slots_count, 0, stream);
+            status = copy_waiting(sorted_run_stamps, unpacked.data(), view.key_slots_count, stream);
             if (status != status_t::success_k) return status;
-            run_stamps = sorted_run_stamps.data();
+            run_stamps = sorted_run_stamps;
         }
         if (carries_kinds) {
             for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
                 unpacked_kinds[sorted] = (*view.kinds)[static_cast<std::size_t>(sorted)];
-            status = sorted_run_kinds.copy_in(unpacked_kinds.data(), view.key_slots_count, 0, stream);
+            status = copy_waiting(sorted_run_kinds, unpacked_kinds.data(), view.key_slots_count, stream);
             if (status != status_t::success_k) return status;
-            run_kinds = sorted_run_kinds.data();
+            run_kinds = sorted_run_kinds;
         }
-        extract_kernel<key_slot_type_> const kernel {sorted_run_cells.data(),
-                                                     records.data() + run_offset,
-                                                     layout,
-                                                     static_cast<std::uint32_t>(sorted_run),
-                                                     run_stamps,
-                                                     run_kinds};
+        stored_value_offset_t const* run_offsets = nullptr;
+        if (!view.value_offsets.empty()) {
+            status = copy_waiting(sorted_run_offsets, view.value_offsets.data(), view.value_offsets.size(), stream);
+            if (status != status_t::success_k) return status;
+            run_offsets = sorted_run_offsets;
+        }
+        extract_kernel<key_slot_type_> const kernel {sorted_run_cells, records + run_offset,
+                                                     layout,           static_cast<std::uint32_t>(sorted_run),
+                                                     run_stamps,       run_kinds,
+                                                     run_offsets,      bounds.value_stride};
         status = cuda_status(cub::DeviceFor::Bulk(static_cast<std::int64_t>(layout.cells_count()), kernel, stream));
         if (status != status_t::success_k) return status;
         run_offset += view.key_slots_count;
@@ -485,95 +464,109 @@ st::status_t cuda_compactor_t::compact(
     if (overlapping & (upper_key_slots > 1)) {
         std::size_t bytes = 0;
         std::int64_t const count = static_cast<std::int64_t>(upper_key_slots);
-        status = cuda_status(cub::DeviceMergeSort::SortKeys(nullptr, bytes, records.data(), count, order, stream));
+        status = cuda_status(cub::DeviceMergeSort::SortKeys(nullptr, bytes, records, count, order, stream));
         if (status != status_t::success_k) return status;
         status = grow_temporary(bytes);
         if (status != status_t::success_k) return status;
-        status = cuda_status(
-            cub::DeviceMergeSort::SortKeys(temporary.data(), bytes, records.data(), count, order, stream));
+        status = cuda_status(cub::DeviceMergeSort::SortKeys(temporary, bytes, records, count, order, stream));
         if (status != status_t::success_k) return status;
     }
 
     // One merge path joins the upper and lower runs
-    record_t* merged = records.data();
-    record_t* kept = scratch.data();
+    record_t* merged = records;
+    record_t* kept = scratch;
     if ((upper_key_slots != 0) & (merged_count != upper_key_slots)) {
         std::size_t bytes = 0;
         std::int64_t const upper_count = static_cast<std::int64_t>(upper_key_slots);
         std::int64_t const lower_count = static_cast<std::int64_t>(merged_count - upper_key_slots);
-        status = cuda_status(cub::DeviceMerge::MergeKeys(nullptr, bytes, records.data(), upper_count,
-                                                         records.data() + upper_count, lower_count, scratch.data(),
-                                                         order, stream));
+        status = cuda_status(cub::DeviceMerge::MergeKeys(nullptr, bytes, records, upper_count, records + upper_count,
+                                                         lower_count, scratch, order, stream));
         if (status != status_t::success_k) return status;
         status = grow_temporary(bytes);
         if (status != status_t::success_k) return status;
-        status = cuda_status(cub::DeviceMerge::MergeKeys(temporary.data(), bytes, records.data(), upper_count,
-                                                         records.data() + upper_count, lower_count, scratch.data(),
-                                                         order, stream));
+        status = cuda_status(cub::DeviceMerge::MergeKeys(temporary, bytes, records, upper_count, records + upper_count,
+                                                         lower_count, scratch, order, stream));
         if (status != status_t::success_k) return status;
-        merged = scratch.data();
-        kept = records.data();
+        merged = scratch;
+        kept = records;
     }
 
     // The first record of every stored key survives, unless it is a removal where removals drop
     std::uint64_t survivors = 0;
     if (merged_count != 0) {
-        cuda_device_buffer<std::uint8_t> flags {cuda_device_allocator<std::uint8_t>(device)};
-        cuda_device_buffer<std::int64_t> selected {cuda_device_allocator<std::int64_t>(device)};
-        status = flags.reserve(merged_count);
+        std::uint8_t* flags = nullptr;
+        std::int64_t* selected = nullptr;
+        status = room_(scratch_role_t::flags_k, merged_count, flags);
         if (status != status_t::success_k) return status;
-        status = selected.reserve(1);
+        status = room_(scratch_role_t::selected_k, 1, selected);
         if (status != status_t::success_k) return status;
         std::int64_t const count = static_cast<std::int64_t>(merged_count);
-        survivor_kernel<key_slot_type_> const kernel {merged, flags.data(), kind, device_stamps};
+        survivor_kernel<key_slot_type_> const kernel {merged, flags, kind, device_stamps};
         status = cuda_status(cub::DeviceFor::Bulk(count, kernel, stream));
         if (status != status_t::success_k) return status;
         std::size_t bytes = 0;
-        status = cuda_status(
-            cub::DeviceSelect::Flagged(nullptr, bytes, merged, flags.data(), kept, selected.data(), count, stream));
+        status = cuda_status(cub::DeviceSelect::Flagged(nullptr, bytes, merged, flags, kept, selected, count, stream));
         if (status != status_t::success_k) return status;
         status = grow_temporary(bytes);
         if (status != status_t::success_k) return status;
-        status = cuda_status(cub::DeviceSelect::Flagged(temporary.data(), bytes, merged, flags.data(), kept,
-                                                        selected.data(), count, stream));
+        status = cuda_status(
+            cub::DeviceSelect::Flagged(temporary, bytes, merged, flags, kept, selected, count, stream));
         if (status != status_t::success_k) return status;
         std::int64_t selected_count = 0;
-        status = selected.copy_out(&selected_count, 1, 0, stream);
+        status = copy_waiting(&selected_count, selected, 1, stream);
         if (status != status_t::success_k) return status;
         survivors = static_cast<std::uint64_t>(selected_count);
         if constexpr (device_folds_k)
             if (changes) {
-                status = fold_survivors(stream_, kind, stamps, sorted_runs_count, merged, flags.data(), merged_count,
-                                        kept, fold, device_fold, read_value, output);
+                basic_vector<std::uint64_t> indices;
+                basic_vector<record_t> replacements;
+                status = fold_survivors(stream_, kind, stamps, sorted_runs_count, bounds.value_stride, merged, flags,
+                                        merged_count, fold, device_fold, read_value, output, indices, replacements);
                 if (status != status_t::success_k) return status;
+                if (!indices.empty()) {
+                    std::uint64_t* device_indices = nullptr;
+                    record_t* device_replacements = nullptr;
+                    status = room_(scratch_role_t::fold_indices_k, indices.size(), device_indices);
+                    if (status != status_t::success_k) return status;
+                    status = room_(scratch_role_t::fold_records_k, replacements.size(), device_replacements);
+                    if (status != status_t::success_k) return status;
+                    status = copy_waiting(device_indices, indices.data(), indices.size(), stream);
+                    if (status != status_t::success_k) return status;
+                    status = copy_waiting(device_replacements, replacements.data(), replacements.size(), stream);
+                    if (status != status_t::success_k) return status;
+                    folded_survivor_kernel<key_slot_type_> const kernel {kept, device_indices, device_replacements};
+                    status = cuda_status(
+                        cub::DeviceFor::Bulk(static_cast<std::int64_t>(indices.size()), kernel, stream));
+                    if (status != status_t::success_k) return status;
+                    // The host lists above free on return, which the copies already read.
+                }
             }
     }
 
-    cuda_device_buffer<std::uint64_t> prefix {cuda_device_allocator<std::uint64_t>(device)};
+    std::uint64_t* prefix = nullptr;
     if constexpr (locates_stored_values_concept<key_slot_type_>) {
-        status = prefix.reserve(survivors + 1);
+        status = room_(scratch_role_t::prefix_k, survivors + 1, prefix);
         if (status != status_t::success_k) return status;
         std::uint64_t const zero = 0;
-        status = prefix.copy_in(&zero, 1, 0, stream);
+        status = copy_waiting(prefix, &zero, 1, stream);
         if (status != status_t::success_k) return status;
         if (survivors != 0) {
             std::int64_t const count = static_cast<std::int64_t>(survivors);
-            stored_value_bytes_kernel<key_slot_type_> const kernel {kept, prefix.data()};
+            stored_value_bytes_kernel<key_slot_type_> const kernel {kept, prefix};
             status = cuda_status(cub::DeviceFor::Bulk(count, kernel, stream));
             if (status != status_t::success_k) return status;
             std::size_t bytes = 0;
-            status = cuda_status(cub::DeviceScan::InclusiveSum(nullptr, bytes, prefix.data() + 1, count, stream));
+            status = cuda_status(cub::DeviceScan::InclusiveSum(nullptr, bytes, prefix + 1, count, stream));
             if (status != status_t::success_k) return status;
             status = grow_temporary(bytes);
             if (status != status_t::success_k) return status;
-            status = cuda_status(
-                cub::DeviceScan::InclusiveSum(temporary.data(), bytes, prefix.data() + 1, count, stream));
+            status = cuda_status(cub::DeviceScan::InclusiveSum(temporary, bytes, prefix + 1, count, stream));
             if (status != status_t::success_k) return status;
         }
     }
-    auto const read_prefix = [&prefix, stream](std::uint64_t index, std::uint64_t& bytes) noexcept {
+    auto const read_prefix = [prefix, stream](std::uint64_t index, std::uint64_t& bytes) noexcept {
         bytes = 0;
-        return prefix.size() != 0 ? prefix.copy_out(&bytes, 1, index, stream) : status_t::success_k;
+        return prefix != nullptr ? copy_waiting(&bytes, prefix + index, 1, stream) : status_t::success_k;
     };
     auto const shares_key = [kept, stream](std::uint64_t index, bool& shared) noexcept {
         record_t neighbours[2] {};
@@ -595,67 +588,72 @@ st::status_t cuda_compactor_t::compact(
     for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
         std::uint64_t const count = output.sorted_runs[index].key_slots_count;
         placements[index] = sorted_run_placement_t {first, cells_count,
-                                                    stored_values_offset<key_slot_type_>(bounds, count),
                                                     sorted_run_index_layout_t(count, bounds.branching)};
         first += count;
         cells_count += round_up_to_multiple(count, bounds.branching);
     }
 
-    std::uint64_t const migrations_count = locates_stored_values_concept<key_slot_type_> ? survivors : 0;
-    cuda_device_buffer<sorted_run_placement_t> device_placements {
-        cuda_device_allocator<sorted_run_placement_t>(device)};
-    cuda_device_buffer<key_slot_type_> cells {cuda_device_allocator<key_slot_type_>(device)};
-    cuda_device_buffer<stored_value_migration_t> migrations {cuda_device_allocator<stored_value_migration_t>(device)};
-    cuda_device_buffer<std::uint64_t> survivor_stamps {cuda_device_allocator<std::uint64_t>(device)};
-    cuda_device_buffer<std::uint8_t> survivor_kinds {cuda_device_allocator<std::uint8_t>(device)};
-    status = device_placements.reserve(placements.size());
+    sorted_run_placement_t* device_placements = nullptr;
+    key_slot_type_* cells = nullptr;
+    std::uint64_t* survivor_stamps = nullptr;
+    std::uint8_t* survivor_kinds = nullptr;
+    status = room_(scratch_role_t::placements_k, placements.size(), device_placements);
     if (status != status_t::success_k) return status;
-    status = device_placements.copy_in(placements.data(), placements.size(), 0, stream);
+    status = copy_waiting(device_placements, placements.data(), placements.size(), stream);
     if (status != status_t::success_k) return status;
-    status = cells.reserve(cells_count);
+    status = room_(scratch_role_t::cells_k, cells_count, cells);
     if (status != status_t::success_k) return status;
-    status = migrations.reserve(migrations_count);
+    status = room_(scratch_role_t::stamps_k, survivors, survivor_stamps);
     if (status != status_t::success_k) return status;
-    status = survivor_stamps.reserve(survivors);
-    if (status != status_t::success_k) return status;
-    status = survivor_kinds.reserve(survivors);
+    status = room_(scratch_role_t::kinds_k, survivors, survivor_kinds);
     if (status != status_t::success_k) return status;
 
     if (cells_count != 0) {
-        padding_kernel<key_slot_type_> const kernel {cells.data(), padding_key_slot<key_slot_type_>()};
+        padding_kernel<key_slot_type_> const kernel {cells, padding_key_slot<key_slot_type_>()};
         status = cuda_status(cub::DeviceFor::Bulk(static_cast<std::int64_t>(cells_count), kernel, stream));
         if (status != status_t::success_k) return status;
     }
     if (survivors != 0) {
-        place_kernel<key_slot_type_> const kernel {kept,
-                                                   prefix.size() != 0 ? prefix.data() : nullptr,
-                                                   device_placements.data(),
-                                                   placements.size(),
-                                                   cells.data(),
-                                                   migrations_count != 0 ? migrations.data() : nullptr,
-                                                   stamps.floor,
-                                                   survivor_stamps.data(),
-                                                   survivor_kinds.data()};
+        place_kernel<key_slot_type_> const kernel {kept,         device_placements, placements.size(), cells,
+                                                   stamps.floor, survivor_stamps,   survivor_kinds};
         status = cuda_status(cub::DeviceFor::Bulk(static_cast<std::int64_t>(survivors), kernel, stream));
         if (status != status_t::success_k) return status;
     }
 
     status = output.cells.resize(cells_count);
     if (status != status_t::success_k) return status;
-    status = cells.copy_out(output.cells.data(), cells_count, 0, stream);
-    if (status != status_t::success_k) return status;
-    status = output.migrations.resize(migrations_count);
-    if (status != status_t::success_k) return status;
-    status = migrations.copy_out(output.migrations.data(), migrations_count, 0, stream);
+    status = copy_waiting(output.cells.data(), cells, cells_count, stream);
     if (status != status_t::success_k) return status;
     status = output.stamps.resize(survivors);
     if (status != status_t::success_k) return status;
-    status = survivor_stamps.copy_out(output.stamps.data(), survivors, 0, stream);
+    status = copy_waiting(output.stamps.data(), survivor_stamps, survivors, stream);
     if (status != status_t::success_k) return status;
     status = output.kinds.resize(survivors);
     if (status != status_t::success_k) return status;
-    status = survivor_kinds.copy_out(output.kinds.data(), survivors, 0, stream);
+    status = copy_waiting(output.kinds.data(), survivor_kinds, survivors, stream);
     if (status != status_t::success_k) return status;
+
+    // The prefix is the new runs' value offsets, and the copy plan coalesces the survivors' sources on the host.
+    output.value_offsets.clear();
+    output.value_copy_ranges.clear();
+    if constexpr (locates_stored_values_concept<key_slot_type_>) {
+        if (is_variable_width(key_slot_type_::value_layout_k)) {
+            status = output.value_offsets.resize(survivors + 1);
+            if (status != status_t::success_k) return status;
+            status = copy_waiting(output.value_offsets.data(), prefix, survivors + 1, stream);
+            if (status != status_t::success_k) return status;
+        }
+        basic_vector<record_t> placed;
+        status = placed.resize(survivors);
+        if (status != status_t::success_k) return status;
+        status = cuda_status(
+            cudaMemcpyAsync(placed.data(), kept, survivors * sizeof(record_t), cudaMemcpyDeviceToHost, stream));
+        if (status != status_t::success_k) return status;
+        status = stream_.synchronize();
+        if (status != status_t::success_k) return status;
+        return plan_value_copies<key_slot_type_>(placed.data(), upper, lower, bounds.value_stride, output.sorted_runs,
+                                                 output.value_copy_ranges);
+    }
     return stream_.synchronize();
 }
 

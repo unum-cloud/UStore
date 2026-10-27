@@ -56,22 +56,14 @@ struct single_collection_database_initial_config_t {
 
 struct bench_config_t {
     bench_config_t() {
-        single_collection_database_1_byte.name = "Armenia";
-        single_collection_database_4_bytes.name = "Georgia";
-        single_collection_database_8_bytes.name = "Italy";
-        single_collection_database_16_bytes.name = "Ukraine";
-        single_collection_database_32_bytes.name = "Iran";
-        single_collection_database_64_bytes.name = "US";
+        single_collection_database_12_bytes.name = "Italy";
+        single_collection_database_44_bytes.name = "US";
         single_collection_database_fixed_width.name = "Germany";
         single_collection_database_variable_width.name = "Russia";
     }
 
-    single_collection_database_initial_config_t single_collection_database_1_byte;
-    single_collection_database_initial_config_t single_collection_database_4_bytes;
-    single_collection_database_initial_config_t single_collection_database_8_bytes;
-    single_collection_database_initial_config_t single_collection_database_16_bytes;
-    single_collection_database_initial_config_t single_collection_database_32_bytes;
-    single_collection_database_initial_config_t single_collection_database_64_bytes;
+    single_collection_database_initial_config_t single_collection_database_12_bytes;
+    single_collection_database_initial_config_t single_collection_database_44_bytes;
     single_collection_database_initial_config_t single_collection_database_fixed_width;
     single_collection_database_initial_config_t single_collection_database_variable_width;
     string_t folder;
@@ -104,49 +96,27 @@ std::shared_ptr<single_collection_database<stored_key_t, value_layout_>> open_si
 
 struct single_collection_databases_t {
 
-    using single_collection_database_1_byte_t =
-        single_collection_database<stored_key_t, value_layout_t::inline_1_byte_k>;
-    using single_collection_database_4_bytes_t =
-        single_collection_database<stored_key_t, value_layout_t::inline_4_bytes_k>;
-    using single_collection_database_8_bytes_t =
-        single_collection_database<stored_key_t, value_layout_t::inline_8_bytes_k>;
-    using single_collection_database_16_bytes_t =
-        single_collection_database<stored_key_t, value_layout_t::inline_16_bytes_k>;
-    using single_collection_database_32_bytes_t =
-        single_collection_database<stored_key_t, value_layout_t::inline_32_bytes_k>;
-    using single_collection_database_64_bytes_t =
-        single_collection_database<stored_key_t, value_layout_t::inline_64_bytes_k>;
+    using single_collection_database_12_bytes_t =
+        single_collection_database<stored_key_t, value_layout_t::inline_12_bytes_k>;
+    using single_collection_database_44_bytes_t =
+        single_collection_database<stored_key_t, value_layout_t::inline_44_bytes_k>;
     using single_collection_database_fixed_width_t =
         single_collection_database<stored_key_t, value_layout_t::fixed_width_k>;
     using single_collection_database_variable_width_t =
         single_collection_database<stored_key_t, value_layout_t::variable_width_k>;
 
     inline single_collection_databases_t(bench_config_t const& config, resources_shared_ptr_t resources)
-        : config(config), resources(resources), single_collection_database_1_byte(nullptr),
-          single_collection_database_4_bytes(nullptr), single_collection_database_8_bytes(nullptr),
-          single_collection_database_16_bytes(nullptr), single_collection_database_32_bytes(nullptr),
-          single_collection_database_64_bytes(nullptr), single_collection_database_fixed_width(nullptr),
+        : config(config), resources(resources), single_collection_database_12_bytes(nullptr),
+          single_collection_database_44_bytes(nullptr), single_collection_database_fixed_width(nullptr),
           single_collection_database_variable_width(nullptr) {}
 
     void open() {
-        if (config.single_collection_database_1_byte.enabled)
-            single_collection_database_1_byte = open_single_collection_database<value_layout_t::inline_1_byte_k>(
-                config.folder, config.single_collection_database_1_byte, resources);
-        if (config.single_collection_database_4_bytes.enabled)
-            single_collection_database_4_bytes = open_single_collection_database<value_layout_t::inline_4_bytes_k>(
-                config.folder, config.single_collection_database_4_bytes, resources);
-        if (config.single_collection_database_8_bytes.enabled)
-            single_collection_database_8_bytes = open_single_collection_database<value_layout_t::inline_8_bytes_k>(
-                config.folder, config.single_collection_database_8_bytes, resources);
-        if (config.single_collection_database_16_bytes.enabled)
-            single_collection_database_16_bytes = open_single_collection_database<value_layout_t::inline_16_bytes_k>(
-                config.folder, config.single_collection_database_16_bytes, resources);
-        if (config.single_collection_database_32_bytes.enabled)
-            single_collection_database_32_bytes = open_single_collection_database<value_layout_t::inline_32_bytes_k>(
-                config.folder, config.single_collection_database_32_bytes, resources);
-        if (config.single_collection_database_64_bytes.enabled)
-            single_collection_database_64_bytes = open_single_collection_database<value_layout_t::inline_64_bytes_k>(
-                config.folder, config.single_collection_database_64_bytes, resources);
+        if (config.single_collection_database_12_bytes.enabled)
+            single_collection_database_12_bytes = open_single_collection_database<value_layout_t::inline_12_bytes_k>(
+                config.folder, config.single_collection_database_12_bytes, resources);
+        if (config.single_collection_database_44_bytes.enabled)
+            single_collection_database_44_bytes = open_single_collection_database<value_layout_t::inline_44_bytes_k>(
+                config.folder, config.single_collection_database_44_bytes, resources);
         if (config.single_collection_database_fixed_width.enabled)
             single_collection_database_fixed_width = open_single_collection_database<value_layout_t::fixed_width_k>(
                 config.folder, config.single_collection_database_fixed_width, resources);
@@ -157,23 +127,15 @@ struct single_collection_databases_t {
     }
 
     void close() {
-        single_collection_database_1_byte.reset();
-        single_collection_database_4_bytes.reset();
-        single_collection_database_8_bytes.reset();
-        single_collection_database_16_bytes.reset();
-        single_collection_database_32_bytes.reset();
-        single_collection_database_64_bytes.reset();
+        single_collection_database_12_bytes.reset();
+        single_collection_database_44_bytes.reset();
         single_collection_database_fixed_width.reset();
         single_collection_database_variable_width.reset();
     }
 
     void destroy() {
-        single_collection_database_1_byte->destroy();
-        single_collection_database_4_bytes->destroy();
-        single_collection_database_8_bytes->destroy();
-        single_collection_database_16_bytes->destroy();
-        single_collection_database_32_bytes->destroy();
-        single_collection_database_64_bytes->destroy();
+        single_collection_database_12_bytes->destroy();
+        single_collection_database_44_bytes->destroy();
         single_collection_database_fixed_width->destroy();
         single_collection_database_variable_width->destroy();
     }
@@ -181,12 +143,8 @@ struct single_collection_databases_t {
     bench_config_t config;
     resources_shared_ptr_t resources;
 
-    std::shared_ptr<single_collection_database_1_byte_t> single_collection_database_1_byte;
-    std::shared_ptr<single_collection_database_4_bytes_t> single_collection_database_4_bytes;
-    std::shared_ptr<single_collection_database_8_bytes_t> single_collection_database_8_bytes;
-    std::shared_ptr<single_collection_database_16_bytes_t> single_collection_database_16_bytes;
-    std::shared_ptr<single_collection_database_32_bytes_t> single_collection_database_32_bytes;
-    std::shared_ptr<single_collection_database_64_bytes_t> single_collection_database_64_bytes;
+    std::shared_ptr<single_collection_database_12_bytes_t> single_collection_database_12_bytes;
+    std::shared_ptr<single_collection_database_44_bytes_t> single_collection_database_44_bytes;
     std::shared_ptr<single_collection_database_fixed_width_t> single_collection_database_fixed_width;
     std::shared_ptr<single_collection_database_variable_width_t> single_collection_database_variable_width;
 };
@@ -449,88 +407,32 @@ void register_insertion_benchmarks(bench_config_t const& bench_config,
         bench_config.single_collection_database_variable_width.value_max_size);
 
     register_section("<<<Insertion: pulling>>>");
-    if (bench_config.single_collection_database_1_byte.enabled) {
-        auto threads_count = bench_config.single_collection_database_1_byte.threads_count;
-        auto population_count = bench_config.single_collection_database_1_byte.population_count / threads_count;
-        register_benchmark("1_byte_single_collection_database",
+    if (bench_config.single_collection_database_12_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_12_bytes.threads_count;
+        auto population_count = bench_config.single_collection_database_12_bytes.population_count / threads_count;
+        register_benchmark("12_bytes_single_collection_database",
                            {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_pulling_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               insert(state, bench_config.single_collection_database_1_byte,
-                                      *single_collection_databases.single_collection_database_1_byte);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_4_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_4_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_4_bytes.population_count / threads_count;
-        register_benchmark("4_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_pulling_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               insert(state, bench_config.single_collection_database_4_bytes,
-                                      *single_collection_databases.single_collection_database_4_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_8_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_8_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_8_bytes.population_count / threads_count;
-        register_benchmark("8_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_pulling_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               insert(state, bench_config.single_collection_database_8_bytes,
-                                      *single_collection_databases.single_collection_database_8_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_16_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_16_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_16_bytes.population_count / threads_count;
-        register_benchmark("16_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_pulling_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               insert(state, bench_config.single_collection_database_16_bytes,
-                                      *single_collection_databases.single_collection_database_16_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_32_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_32_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_32_bytes.population_count / threads_count;
-        register_benchmark("32_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_pulling_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               insert(state, bench_config.single_collection_database_32_bytes,
-                                      *single_collection_databases.single_collection_database_32_bytes);
+                               insert(state, bench_config.single_collection_database_12_bytes,
+                                      *single_collection_databases.single_collection_database_12_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
 
-    if (bench_config.single_collection_database_64_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_64_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_64_bytes.population_count / threads_count;
-        register_benchmark("64_bytes_single_collection_database",
+    if (bench_config.single_collection_database_44_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_44_bytes.threads_count;
+        auto population_count = bench_config.single_collection_database_44_bytes.population_count / threads_count;
+        register_benchmark("44_bytes_single_collection_database",
                            {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_pulling_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               insert(state, bench_config.single_collection_database_64_bytes,
-                                      *single_collection_databases.single_collection_database_64_bytes);
+                               insert(state, bench_config.single_collection_database_44_bytes,
+                                      *single_collection_databases.single_collection_database_44_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
@@ -574,87 +476,31 @@ void register_single_find_benchmarks(bench_config_t const& bench_config,
         bench_config.single_collection_database_variable_width.value_max_size);
 
     register_section("<<<Single find: mmap>>>");
-    if (bench_config.single_collection_database_1_byte.enabled) {
-        auto threads_count = bench_config.single_collection_database_1_byte.threads_count;
-        auto population_count = bench_config.single_collection_database_1_byte.population_count / threads_count;
-        register_benchmark("1_byte_single_collection_database",
+    if (bench_config.single_collection_database_12_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_12_bytes.threads_count;
+        auto population_count = bench_config.single_collection_database_12_bytes.population_count / threads_count;
+        register_benchmark("12_bytes_single_collection_database",
                            {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_posix_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               find_only(state, bench_config.single_collection_database_1_byte,
-                                         *single_collection_databases.single_collection_database_1_byte);
+                               find_only(state, bench_config.single_collection_database_12_bytes,
+                                         *single_collection_databases.single_collection_database_12_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
-    if (bench_config.single_collection_database_4_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_4_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_4_bytes.population_count / threads_count;
-        register_benchmark("4_bytes_single_collection_database",
+    if (bench_config.single_collection_database_44_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_44_bytes.threads_count;
+        auto population_count = bench_config.single_collection_database_44_bytes.population_count / threads_count;
+        register_benchmark("44_bytes_single_collection_database",
                            {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_posix_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               find_only(state, bench_config.single_collection_database_4_bytes,
-                                         *single_collection_databases.single_collection_database_4_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_8_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_8_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_8_bytes.population_count / threads_count;
-        register_benchmark("8_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               find_only(state, bench_config.single_collection_database_8_bytes,
-                                         *single_collection_databases.single_collection_database_8_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_16_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_16_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_16_bytes.population_count / threads_count;
-        register_benchmark("16_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               find_only(state, bench_config.single_collection_database_16_bytes,
-                                         *single_collection_databases.single_collection_database_16_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_32_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_32_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_32_bytes.population_count / threads_count;
-        register_benchmark("32_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               find_only(state, bench_config.single_collection_database_32_bytes,
-                                         *single_collection_databases.single_collection_database_32_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_64_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_64_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_64_bytes.population_count / threads_count;
-        register_benchmark("64_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               find_only(state, bench_config.single_collection_database_64_bytes,
-                                         *single_collection_databases.single_collection_database_64_bytes);
+                               find_only(state, bench_config.single_collection_database_44_bytes,
+                                         *single_collection_databases.single_collection_database_44_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
@@ -693,87 +539,31 @@ void register_single_selection_inline_benchmarks(bench_config_t const& bench_con
                                                  single_collection_databases_t& single_collection_databases) {
 
     register_section("<<<Single selection: mmap>>>");
-    if (bench_config.single_collection_database_1_byte.enabled) {
-        auto threads_count = bench_config.single_collection_database_1_byte.threads_count;
-        auto population_count = bench_config.single_collection_database_1_byte.population_count / threads_count;
-        register_benchmark("1_byte_single_collection_database",
+    if (bench_config.single_collection_database_12_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_12_bytes.threads_count;
+        auto population_count = bench_config.single_collection_database_12_bytes.population_count / threads_count;
+        register_benchmark("12_bytes_single_collection_database",
                            {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_posix_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               select(state, bench_config.single_collection_database_1_byte,
-                                      *single_collection_databases.single_collection_database_1_byte);
+                               select(state, bench_config.single_collection_database_12_bytes,
+                                      *single_collection_databases.single_collection_database_12_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
-    if (bench_config.single_collection_database_4_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_4_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_4_bytes.population_count / threads_count;
-        register_benchmark("4_bytes_single_collection_database",
+    if (bench_config.single_collection_database_44_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_44_bytes.threads_count;
+        auto population_count = bench_config.single_collection_database_44_bytes.population_count / threads_count;
+        register_benchmark("44_bytes_single_collection_database",
                            {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_posix_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               select(state, bench_config.single_collection_database_4_bytes,
-                                      *single_collection_databases.single_collection_database_4_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_8_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_8_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_8_bytes.population_count / threads_count;
-        register_benchmark("8_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               select(state, bench_config.single_collection_database_8_bytes,
-                                      *single_collection_databases.single_collection_database_8_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_16_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_16_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_16_bytes.population_count / threads_count;
-        register_benchmark("16_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               select(state, bench_config.single_collection_database_16_bytes,
-                                      *single_collection_databases.single_collection_database_16_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_32_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_32_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_32_bytes.population_count / threads_count;
-        register_benchmark("32_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               select(state, bench_config.single_collection_database_32_bytes,
-                                      *single_collection_databases.single_collection_database_32_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_64_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_64_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_64_bytes.population_count / threads_count;
-        register_benchmark("64_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               select(state, bench_config.single_collection_database_64_bytes,
-                                      *single_collection_databases.single_collection_database_64_bytes);
+                               select(state, bench_config.single_collection_database_44_bytes,
+                                      *single_collection_databases.single_collection_database_44_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
@@ -868,76 +658,27 @@ void register_scan_inline_benchmarks(bench_config_t const& bench_config,
                                      single_collection_databases_t& single_collection_databases) {
 
     register_section("<<<Scan: mmap>>>");
-    if (bench_config.single_collection_database_1_byte.enabled) {
-        auto threads_count = bench_config.single_collection_database_1_byte.threads_count;
-        register_benchmark("1_byte_single_collection_database", {0, 1, time_unit_t::microsecond_k, threads_count},
+    if (bench_config.single_collection_database_12_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_12_bytes.threads_count;
+        register_benchmark("12_bytes_single_collection_database", {0, 1, time_unit_t::microsecond_k, threads_count},
                            [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_posix_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               scan(state, *single_collection_databases.single_collection_database_1_byte);
+                               scan(state, *single_collection_databases.single_collection_database_12_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
-    if (bench_config.single_collection_database_4_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_4_bytes.threads_count;
-        register_benchmark("4_bytes_single_collection_database", {0, 1, time_unit_t::microsecond_k, threads_count},
-                           [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               scan(state, *single_collection_databases.single_collection_database_4_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_8_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_8_bytes.threads_count;
-        register_benchmark("8_bytes_single_collection_database", {0, 1, time_unit_t::microsecond_k, threads_count},
+    if (bench_config.single_collection_database_44_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_44_bytes.threads_count;
+        register_benchmark("44_bytes_single_collection_database", {0, 1, time_unit_t::microsecond_k, threads_count},
                            [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_posix_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               scan(state, *single_collection_databases.single_collection_database_8_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_16_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_16_bytes.threads_count;
-        register_benchmark("16_bytes_single_collection_database", {0, 1, time_unit_t::microsecond_k, threads_count},
-                           [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               scan(state, *single_collection_databases.single_collection_database_16_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_32_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_32_bytes.threads_count;
-        register_benchmark("32_bytes_single_collection_database", {0, 1, time_unit_t::microsecond_k, threads_count},
-                           [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               scan(state, *single_collection_databases.single_collection_database_32_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_64_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_64_bytes.threads_count;
-        register_benchmark("64_bytes_single_collection_database", {0, 1, time_unit_t::microsecond_k, threads_count},
-                           [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_posix_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               scan(state, *single_collection_databases.single_collection_database_64_bytes);
+                               scan(state, *single_collection_databases.single_collection_database_44_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
@@ -989,87 +730,31 @@ void register_deletion_benchmarks(bench_config_t const& bench_config,
         bench_config.single_collection_database_variable_width.value_max_size);
 
     register_section("<<<Deletion: pulling>>>");
-    if (bench_config.single_collection_database_1_byte.enabled) {
-        auto threads_count = bench_config.single_collection_database_1_byte.threads_count;
-        auto population_count = bench_config.single_collection_database_1_byte.population_count / threads_count;
-        register_benchmark("1_byte_single_collection_database",
+    if (bench_config.single_collection_database_12_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_12_bytes.threads_count;
+        auto population_count = bench_config.single_collection_database_12_bytes.population_count / threads_count;
+        register_benchmark("12_bytes_single_collection_database",
                            {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_pulling_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               remove(state, bench_config.single_collection_database_1_byte,
-                                      *single_collection_databases.single_collection_database_1_byte);
+                               remove(state, bench_config.single_collection_database_12_bytes,
+                                      *single_collection_databases.single_collection_database_12_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
-    if (bench_config.single_collection_database_4_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_4_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_4_bytes.population_count / threads_count;
-        register_benchmark("4_bytes_single_collection_database",
+    if (bench_config.single_collection_database_44_bytes.enabled) {
+        auto threads_count = bench_config.single_collection_database_44_bytes.threads_count;
+        auto population_count = bench_config.single_collection_database_44_bytes.population_count / threads_count;
+        register_benchmark("44_bytes_single_collection_database",
                            {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
                                if (state.thread_index() == 0) {
                                    initialize_pulling_disk_router(bench_config.folder);
                                    single_collection_databases.open();
                                }
-                               remove(state, bench_config.single_collection_database_4_bytes,
-                                      *single_collection_databases.single_collection_database_4_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_8_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_8_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_8_bytes.population_count / threads_count;
-        register_benchmark("8_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_pulling_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               remove(state, bench_config.single_collection_database_8_bytes,
-                                      *single_collection_databases.single_collection_database_8_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_16_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_16_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_16_bytes.population_count / threads_count;
-        register_benchmark("16_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_pulling_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               remove(state, bench_config.single_collection_database_16_bytes,
-                                      *single_collection_databases.single_collection_database_16_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_32_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_32_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_32_bytes.population_count / threads_count;
-        register_benchmark("32_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_pulling_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               remove(state, bench_config.single_collection_database_32_bytes,
-                                      *single_collection_databases.single_collection_database_32_bytes);
-                               if (state.thread_index() == 0) single_collection_databases.close();
-                           });
-    }
-    if (bench_config.single_collection_database_64_bytes.enabled) {
-        auto threads_count = bench_config.single_collection_database_64_bytes.threads_count;
-        auto population_count = bench_config.single_collection_database_64_bytes.population_count / threads_count;
-        register_benchmark("64_bytes_single_collection_database",
-                           {0, population_count, time_unit_t::microsecond_k, threads_count}, [&](bm::State& state) {
-                               if (state.thread_index() == 0) {
-                                   initialize_pulling_disk_router(bench_config.folder);
-                                   single_collection_databases.open();
-                               }
-                               remove(state, bench_config.single_collection_database_64_bytes,
-                                      *single_collection_databases.single_collection_database_64_bytes);
+                               remove(state, bench_config.single_collection_database_44_bytes,
+                                      *single_collection_databases.single_collection_database_44_bytes);
                                if (state.thread_index() == 0) single_collection_databases.close();
                            });
     }
@@ -1132,105 +817,38 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
     };
 
     workload_t workload("");
-    bench_config.single_collection_database_1_byte.enabled = find_workload("1_byte", workload);
-    if (bench_config.single_collection_database_1_byte.enabled) {
-        bench_config.single_collection_database_1_byte.threads_count = workload.get_value<std::size_t>("threads");
-        bench_config.single_collection_database_1_byte.enabled = workload.get_value<bool>("enabled");
-        bench_config.single_collection_database_1_byte.population_count = workload.get_value<std::size_t>(
+
+    bench_config.single_collection_database_12_bytes.enabled = find_workload("12_bytes", workload);
+    if (bench_config.single_collection_database_12_bytes.enabled) {
+        bench_config.single_collection_database_12_bytes.threads_count = workload.get_value<std::size_t>("threads");
+        bench_config.single_collection_database_12_bytes.enabled = workload.get_value<bool>("enabled");
+        bench_config.single_collection_database_12_bytes.population_count = workload.get_value<std::size_t>(
             "population_count");
-        bench_config.single_collection_database_1_byte.value_size = 1;
-        bench_config.single_collection_database_1_byte.value_max_size = 0;
-        bench_config.single_collection_database_1_byte.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_1_byte.memory_runs_max_bytes = workload.get_value<std::size_t>(
+        bench_config.single_collection_database_12_bytes.value_size = 8;
+        bench_config.single_collection_database_12_bytes.value_max_size = 0;
+        bench_config.single_collection_database_12_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
+        bench_config.single_collection_database_12_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
             "memory_runs_max_bytes");
-        bench_config.single_collection_database_1_byte.memory_runs_max_deltas = workload.get_value<std::size_t>(
+        bench_config.single_collection_database_12_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
             "memory_runs_max_deltas");
-        bench_config.single_collection_database_1_byte.level_enlarge_factor = workload.get_value<std::size_t>(
+        bench_config.single_collection_database_12_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
 
-    bench_config.single_collection_database_4_bytes.enabled = find_workload("4_bytes", workload);
-    if (bench_config.single_collection_database_4_bytes.enabled) {
-        bench_config.single_collection_database_4_bytes.threads_count = workload.get_value<std::size_t>("threads");
-        bench_config.single_collection_database_4_bytes.enabled = workload.get_value<bool>("enabled");
-        bench_config.single_collection_database_4_bytes.population_count = workload.get_value<std::size_t>(
+    bench_config.single_collection_database_44_bytes.enabled = find_workload("44_bytes", workload);
+    if (bench_config.single_collection_database_44_bytes.enabled) {
+        bench_config.single_collection_database_44_bytes.threads_count = workload.get_value<std::size_t>("threads");
+        bench_config.single_collection_database_44_bytes.enabled = workload.get_value<bool>("enabled");
+        bench_config.single_collection_database_44_bytes.population_count = workload.get_value<std::size_t>(
             "population_count");
-        bench_config.single_collection_database_4_bytes.value_size = 4;
-        bench_config.single_collection_database_4_bytes.value_max_size = 0;
-        bench_config.single_collection_database_4_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_4_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
+        bench_config.single_collection_database_44_bytes.value_size = 64;
+        bench_config.single_collection_database_44_bytes.value_max_size = 0;
+        bench_config.single_collection_database_44_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
+        bench_config.single_collection_database_44_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
             "memory_runs_max_bytes");
-        bench_config.single_collection_database_4_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
+        bench_config.single_collection_database_44_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
             "memory_runs_max_deltas");
-        bench_config.single_collection_database_4_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
-            "level_enlarge_factor");
-    }
-
-    bench_config.single_collection_database_8_bytes.enabled = find_workload("8_bytes", workload);
-    if (bench_config.single_collection_database_8_bytes.enabled) {
-        bench_config.single_collection_database_8_bytes.threads_count = workload.get_value<std::size_t>("threads");
-        bench_config.single_collection_database_8_bytes.enabled = workload.get_value<bool>("enabled");
-        bench_config.single_collection_database_8_bytes.population_count = workload.get_value<std::size_t>(
-            "population_count");
-        bench_config.single_collection_database_8_bytes.value_size = 8;
-        bench_config.single_collection_database_8_bytes.value_max_size = 0;
-        bench_config.single_collection_database_8_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_8_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
-            "memory_runs_max_bytes");
-        bench_config.single_collection_database_8_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
-            "memory_runs_max_deltas");
-        bench_config.single_collection_database_8_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
-            "level_enlarge_factor");
-    }
-
-    bench_config.single_collection_database_16_bytes.enabled = find_workload("16_bytes", workload);
-    if (bench_config.single_collection_database_16_bytes.enabled) {
-        bench_config.single_collection_database_16_bytes.threads_count = workload.get_value<std::size_t>("threads");
-        bench_config.single_collection_database_16_bytes.enabled = workload.get_value<bool>("enabled");
-        bench_config.single_collection_database_16_bytes.population_count = workload.get_value<std::size_t>(
-            "population_count");
-        bench_config.single_collection_database_16_bytes.value_size = 16;
-        bench_config.single_collection_database_16_bytes.value_max_size = 0;
-        bench_config.single_collection_database_16_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_16_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
-            "memory_runs_max_bytes");
-        bench_config.single_collection_database_16_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
-            "memory_runs_max_deltas");
-        bench_config.single_collection_database_16_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
-            "level_enlarge_factor");
-    }
-
-    bench_config.single_collection_database_32_bytes.enabled = find_workload("32_bytes", workload);
-    if (bench_config.single_collection_database_32_bytes.enabled) {
-        bench_config.single_collection_database_32_bytes.threads_count = workload.get_value<std::size_t>("threads");
-        bench_config.single_collection_database_32_bytes.enabled = workload.get_value<bool>("enabled");
-        bench_config.single_collection_database_32_bytes.population_count = workload.get_value<std::size_t>(
-            "population_count");
-        bench_config.single_collection_database_32_bytes.value_size = 32;
-        bench_config.single_collection_database_32_bytes.value_max_size = 0;
-        bench_config.single_collection_database_32_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_32_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
-            "memory_runs_max_bytes");
-        bench_config.single_collection_database_32_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
-            "memory_runs_max_deltas");
-        bench_config.single_collection_database_32_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
-            "level_enlarge_factor");
-    }
-
-    bench_config.single_collection_database_64_bytes.enabled = find_workload("64_bytes", workload);
-    if (bench_config.single_collection_database_64_bytes.enabled) {
-        bench_config.single_collection_database_64_bytes.threads_count = workload.get_value<std::size_t>("threads");
-        bench_config.single_collection_database_64_bytes.enabled = workload.get_value<bool>("enabled");
-        bench_config.single_collection_database_64_bytes.population_count = workload.get_value<std::size_t>(
-            "population_count");
-        bench_config.single_collection_database_64_bytes.value_size = 64;
-        bench_config.single_collection_database_64_bytes.value_max_size = 0;
-        bench_config.single_collection_database_64_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_64_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
-            "memory_runs_max_bytes");
-        bench_config.single_collection_database_64_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
-            "memory_runs_max_deltas");
-        bench_config.single_collection_database_64_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
+        bench_config.single_collection_database_44_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
 

@@ -20,8 +20,8 @@ A type is named after what it holds and what it does, from the whole database do
 | `nvme_store`                 | The store of one collection: memory runs and a value cache in front of an LSM tree |
 | `lsm_tree`                   | One LSM tree of levels, with the compaction that republishes them                  |
 | `lsm_level`                  | One level of sorted runs                                                           |
-| `lsm_sorted_run`             | One immutable file: a header, the sorted run index, then the stored values         |
-| `key_slot`                   | A stored key with the size and location of its stored value                        |
+| `lsm_sorted_run`             | One immutable file: a header, the sorted run index, value offsets, then values     |
+| `key_slot`                   | A stored key, beside its value only where the value sits inline                    |
 | `stored_value`               | One value                                                                          |
 
 The types are templates of `include/ustore/`, which `variants.hpp` instantiates once per CPU class, in `unum::ustore::blobs` for the LSM layers and `unum::ustore::utilities` for the I/O kits beneath them:
@@ -57,9 +57,12 @@ The engine compacts after every write that leaves a collection due, on the threa
 
 `value_layout_t` fixes a collection's sorted run layout at compile time, and `resolve_value_layout` picks the narrowest one for a value width:
 
-- `inline_1_byte_k` through `inline_64_bytes_k` keep values of up to 64 bytes inside the key slot, so the sorted run has no stored values section.
-- `fixed_width_k` stores wider values of one width in the stored values section.
-- `variable_width_k` stores values of any width up to the collection's maximum, and is what a width of zero resolves to.
+- `inline_12_bytes_k` and `inline_44_bytes_k` keep values of up to 12 or 44 bytes inside a 32 or 64-byte key slot, so the sorted run has no stored values section.
+- `fixed_width_k` stores wider values of one width in the stored values section, found by stride from the key slot's sorted position.
+- `variable_width_k` stores values of any width up to the collection's maximum, found through a `u32` value offsets column right before the values, and is what a width of zero resolves to.
+
+Every section of a sorted run starts on a 4,096-byte page, and a cell holds the 16-byte key alone for both layouts that store values apart, so a row of 16 cells is 256 bytes.
+The value offsets stay in memory like the tails do, so a point read still costs one I/O, and the values of any range of positions read as one tape of offsets and bytes, which is an Arrow strings column and a StringZilla tape as it lands.
 
 A `database` mixes collections of different value layouts, and its collection scanner scans any of them.
 
@@ -67,7 +70,7 @@ A `database` mixes collections of different value layouts, and its collection sc
 
 Every commit draws one stamp from the database's `commit_ledger_t`, over SmashTable's `commit_order_t`, and a graph's two databases share one ledger.
 A memory run carries the stamp of the commit that wrote each of its deltas, and every sorted run carries a column of its key slots' stamps as an `immutable_packed_array` trailer, frame-of-reference coded from a floor no reader can tell apart, so a cold run spends no bit on them.
-The trailer's second column holds every key slot's `delta_kind_t`, which tells a write, a removal and a fold's change apart, so no size or location of a key slot is a sentinel, and a run of writes alone spends no bit on it.
+The trailer's second column holds every key slot's `delta_kind_t`, which tells a write, a removal and a fold's change apart, so no value offset or width is a sentinel, and a run of writes alone spends no bit on it.
 A run may hold several versions of one key, newest first, and the run cutter never splits them.
 
 A reader pins a stamp in the ledger and reads the newest version at or below it.

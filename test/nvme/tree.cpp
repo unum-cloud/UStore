@@ -18,7 +18,7 @@
 #include <cstring> // `std::memcmp`
 
 #include <array>   // `std::array`
-#include <memory>  // `std::align`, `std::unique_ptr`
+#include <memory>  // `std::addressof`, `std::align`, `std::unique_ptr`
 #include <new>     // `std::bad_alloc`, `std::align_val_t`, `std::nothrow_t`
 #include <span>    // `std::span`
 #include <thread>  // `std::thread`
@@ -145,7 +145,6 @@ constexpr stored_value_size_t value_max_size_k = 128ull * 1024ull;
 /** The keys and the key slots every case of this suite drives. */
 using stored_key_t = std::uint64_t;
 using variable_slot_t = key_slot<stored_key_t, value_layout_t::variable_width_k>;
-using layout_t = sorted_run_layout<variable_slot_t>;
 
 /** The runs, the levels and the trees every case drives over the volume of @p fixture_type_. */
 template <typename fixture_type_>
@@ -186,8 +185,11 @@ struct batch_t {
     /** Key slots in ascending order of their keys. */
     st::basic_vector<variable_slot_t> key_slots;
 
-    /** The values back to back, in the order their key slots locate them. */
+    /** The values back to back, in the order of their key slots. */
     st::basic_vector<byte_t> values;
+
+    /** Where each value starts inside @c values and one past the last. */
+    st::basic_vector<stored_value_offset_t> offsets;
 
     /** The @c delta_kind_t of every key slot. */
     st::basic_vector<std::uint8_t> kinds;
@@ -198,6 +200,7 @@ struct batch_t {
     std::size_t failures = 0;
     failures += expect(into.key_slots.resize(wanted.size()) == st::status_t::success_k);
     failures += expect(into.kinds.resize(wanted.size()) == st::status_t::success_k);
+    failures += expect(into.offsets.resize(wanted.size() + 1) == st::status_t::success_k);
     if (failures != 0) return failures;
 
     std::uint64_t total = 0;
@@ -206,24 +209,22 @@ struct batch_t {
     failures += expect(into.values.resize(static_cast<std::size_t>(total)) == st::status_t::success_k);
     if (failures != 0) return failures;
 
-    std::uint64_t location = layout_t::values_offset(wanted.size());
     std::uint64_t written = 0;
     for (std::size_t index = 0; index != wanted.size(); ++index) {
         expectation_t const& entry = wanted[index];
         bool const removed = entry.state == lookup_result_t::removed_k;
         variable_slot_t slot;
         slot.stored_key = entry.stored_key;
-        slot.location = static_cast<stored_value_offset_t>(location);
+        into.offsets[index] = static_cast<stored_value_offset_t>(written);
         into.kinds[index] = static_cast<std::uint8_t>(removed ? delta_kind_t::remove_k : delta_kind_t::write_k);
         if (!removed) {
-            slot.size = static_cast<stored_value_size_t>(entry.bytes);
             for (std::uint64_t byte = 0; byte != entry.bytes; ++byte)
                 into.values[static_cast<std::size_t>(written + byte)] = painted(entry.seed, byte);
-            location += entry.bytes;
             written += entry.bytes;
         }
         into.key_slots[index] = slot;
     }
+    into.offsets[wanted.size()] = static_cast<stored_value_offset_t>(written);
     return failures;
 }
 
@@ -237,7 +238,8 @@ template <typename tree_type_>
     failures += expect(tree.flush(channel, std::span<variable_slot_t const> {batch.key_slots},
                                   std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())},
                                   std::span<std::uint8_t const> {batch.kinds}, 0,
-                                  std::span<byte_t const> {batch.values}, value_max_size_k)
+                                  std::span<byte_t const> {batch.values},
+                                  std::span<stored_value_offset_t const> {batch.offsets}, value_max_size_k)
                            .succeeded());
     return failures;
 }
@@ -307,7 +309,7 @@ template <typename level_type_>
         for (std::size_t at = 0; at != count; ++at) {
             positions[at] = at;
             starts[at] = base + total;
-            total += source.key_slot(at).size;
+            total += source.value_window(at).bytes;
         }
         failures += expect(into.resize(base + total) == st::status_t::success_k);
         if (failures != 0) return failures;
@@ -333,7 +335,8 @@ template <typename level_type_, typename volume_type_>
     expected<sorted_run_t> written = sorted_run_t::write(
         volume, channel, uuid_generator(), std::span<variable_slot_t const> {batch.key_slots},
         std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())},
-        std::span<std::uint8_t const> {batch.kinds}, 0, std::span<byte_t const> {batch.values}, value_max_size_k);
+        std::span<std::uint8_t const> {batch.kinds}, 0, std::span<byte_t const> {batch.values},
+        std::span<stored_value_offset_t const> {batch.offsets}, value_max_size_k);
     failures += expect(written.has_value());
     if (!written) return failures;
     failures += expect(level.bind_queue_pair(std::move(*written)).succeeded());
@@ -923,9 +926,12 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     failures += expect(host.has_value());
     if (!host) return failures;
 
-    int const first_device[] = {0};
+    // The device side runs on a lane made once, as an engine makes its own at open, and a build without one refuses.
     request.placement = compaction_placement_t::device_k;
-    request.devices = first_device;
+#if USTORE_WITH_CUDA
+    st::expected<cuda_compaction_lane_t> lane = cuda_compaction_lane_t::make(0, 0);
+    if (lane) request.compactor = std::addressof(*lane);
+#endif
     expected<level_t> device = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
                                                last_write_fold_t {}, no_device_fold_t {});
     if (!device) {
@@ -946,11 +952,12 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
             ++differing;
             continue;
         }
-        for (std::uint64_t at = 0; at != left.population_count(); ++at) {
-            variable_slot_t const& one = left.key_slot(at);
-            variable_slot_t const& two = right.key_slot(at);
-            if (one.stored_key != two.stored_key || one.size != two.size || one.location != two.location) ++differing;
-        }
+        for (std::uint64_t at = 0; at != left.population_count(); ++at)
+            differing += left.key_slot(at).stored_key != right.key_slot(at).stored_key ||
+                         left.kind(at) != right.kind(at);
+        // Equal populations carry equally many value offsets, which must match one for one.
+        differing += std::memcmp(left.value_offsets().data(), right.value_offsets().data(),
+                                 left.value_offsets().size_bytes()) != 0;
     }
     failures += expect_eq(differing, std::size_t {0});
 

@@ -35,12 +35,13 @@
 #include <cassert> // `assert`
 #include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
-#include <cstring> // `std::memcpy`
+#include <cstring> // `std::memcpy`, `std::memset`
 
 #include <algorithm> // `std::max`, `std::min`, `std::stable_sort`
 #include <array>     // `std::array`
 #include <atomic>    // `std::memory_order_acquire`
 #include <bit>       // `std::bit_floor`
+#include <limits>    // `std::numeric_limits`
 #include <memory>    // `std::unique_ptr`
 #include <new>       // `std::nothrow`
 #include <span>      // `std::span`
@@ -330,6 +331,17 @@ template <typename stored_key_type_>
 constexpr std::size_t scan_page_keys() noexcept {
     return utilities::arena_page_bytes_k / sizeof(scan_entry<stored_key_type_>);
 }
+
+/** The runs an unordered scan of one store walks one at a time: every level's runs in order, then the memory runs
+ *  oldest first, so the run a later commit adds lands past every run counted. */
+struct counted_runs_t {
+
+    /** Runs counted. */
+    std::uint64_t count = 0;
+
+    /** The arrangement the count holds for, which a flush, a compaction or a merge of memory runs moves past. */
+    std::uint64_t layout_generation = 0;
+};
 
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_>
@@ -723,6 +735,69 @@ class nvme_store {
                               sink);
     }
 
+    /** The runs a reader at @p stamp walks, counted for an unordered scan that walks them one at a time. */
+    [[nodiscard]] counted_runs_t count_runs(transaction_stamp_t stamp = head_stamp_k,
+                                            std::size_t thread_index = outside_executor_k) const noexcept {
+        reader_t const inside = runs_.enter(thread_index);
+        reading_t const read = runs_.reading(stamp);
+        return counted_runs_t {level_runs_(*read.view->levels) + read.view->memory_runs.runs().size(),
+                               read.view->layout_generation};
+    }
+
+    /**
+     *  @brief Hands @p visitor the newest version at or below @p stamp of every key from @p from up that the run at
+     *      @p run_index of @p counted carries, in that run's order, with no other run consulted.
+     *  @param[in] counted The runs as @c count_runs counted them, which the index names one of.
+     *  @param[in] visitor Called as @c visitor(stored_key, state, size) inside the epochs, answering whether the walk
+     *      carries on, so it must not block; a change answers @c changed_k with its own bytes.
+     *  @param[in] stamp The stamp a reader is pinned at, which every run of one scan should share.
+     *  @retval contended_k A flush, a compaction or a merge of memory runs rearranged the runs since they were counted.
+     *  @retval invalid_argument_k The index names no run counted.
+     */
+    template <typename visitor_type_>
+    status_t scan_run(counted_runs_t const& counted, std::uint64_t run_index, stored_key_t from,
+                      visitor_type_&& visitor, transaction_stamp_t stamp = head_stamp_k,
+                      std::size_t thread_index = outside_executor_k) const noexcept {
+        if (run_index >= counted.count) return {status_code_t::invalid_argument_k, "No run counted at that index"};
+        reader_t const inside = runs_.enter(thread_index);
+        reading_t const read = runs_.reading(stamp);
+        if (read.view->layout_generation != counted.layout_generation)
+            return {status_code_t::contended_k, "The runs were rearranged since they were counted"};
+        level_set_t const& levels = *read.view->levels;
+        std::uint64_t index = run_index;
+        for (std::size_t number = 0; number != levels.size(); ++number) {
+            auto const& level = levels.level(number);
+            if (index >= level.size()) {
+                index -= level.size();
+                continue;
+            }
+            auto const& run = level.run(static_cast<std::size_t>(index));
+            walk_versions_(
+                run.lower_bound(from), run.population_count(), read.stamp,
+                [&](std::uint64_t position) noexcept { return run.key_slot(position).stored_key; },
+                [&](std::uint64_t position) noexcept { return run.stamp(position); },
+                [&](std::uint64_t position) noexcept {
+                    return visitor(run.key_slot(position).stored_key, run_result_(run.kind(position)),
+                                   static_cast<stored_value_size_t>(run.value_window(position).bytes));
+                });
+            return {};
+        }
+        // Commits only put newer runs ahead in the view, so the oldest-first index counts from its end.
+        std::span<memory_run_t const* const> const memory = read.view->memory_runs.runs();
+        if (index >= memory.size()) return {status_code_t::invalid_argument_k, "No run counted at that index"};
+        memory_run_t const& run = *memory[memory.size() - 1 - static_cast<std::size_t>(index)];
+        walk_versions_(
+            run.lower_bound(from), run.size(), read.stamp,
+            [&](std::uint64_t position) noexcept { return run.stored_key(static_cast<std::size_t>(position)); },
+            [&](std::uint64_t position) noexcept { return run.stamp(static_cast<std::size_t>(position)); },
+            [&](std::uint64_t position) noexcept {
+                delta_view_t const delta = run.delta(static_cast<std::size_t>(position));
+                return visitor(run.stored_key(static_cast<std::size_t>(position)), run_result_(delta.kind),
+                               static_cast<stored_value_size_t>(delta.bytes.size()));
+            });
+        return {};
+    }
+
 #pragma endregion Lookups
 
 #pragma region Writes
@@ -966,15 +1041,18 @@ class nvme_store {
             drained_stamps_t stamps {constrained_allocator<std::uint64_t, atomic_reference_> {constraint}};
             drained_kinds_t kinds {constrained_allocator<std::uint8_t, atomic_reference_> {constraint}};
             drained_values_t stored_values {constrained_allocator<byte_t, atomic_reference_> {constraint}};
+            drained_offsets_t value_offsets {
+                constrained_allocator<stored_value_offset_t, atomic_reference_> {constraint}};
             utilities::local_arena_t folded;
             utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
             if (status_t const drained = drain_(flushed, survival, folded_bytes, key_slots, stamps, kinds,
-                                                stored_values);
+                                                stored_values, value_offsets);
                 drained.failed())
                 return drained;
             return tree.flush(channel, std::span<key_slot_t const> {key_slots}, std::span<std::uint64_t const> {stamps},
                               std::span<std::uint8_t const> {kinds}, survival.floor,
-                              std::span<byte_t const> {stored_values}, value_max_size_, published);
+                              std::span<byte_t const> {stored_values},
+                              std::span<stored_value_offset_t const> {value_offsets}, value_max_size_, published);
         });
     }
 
@@ -985,13 +1063,13 @@ class nvme_store {
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
-     *  @param[in] devices The devices the executor named, the first of which a large merge runs on, empty for the host.
+     *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device lane.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
      */
     expected<compaction_outcome_t> compact(
-        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<int const> devices,
+        io_channel_t& reading_channel, io_channel_t& writing_channel, compactor_ref_t const& compactor,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        return runs_.compact(reading_channel, writing_channel, devices, fold_, device_fold_, published);
+        return runs_.compact(reading_channel, writing_channel, compactor, fold_, device_fold_, published);
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a collection holding no memory run
@@ -1028,8 +1106,12 @@ class nvme_store {
     /** The key slots one flush writes, in ascending order of their keys. */
     using drained_slots_t = st::basic_vector<key_slot_t, constrained_allocator<key_slot_t, atomic_reference_>>;
 
-    /** The values one flush writes, back to back in the order the key slots locate them. */
+    /** The values one flush writes, back to back in the order of the key slots. */
     using drained_values_t = st::basic_vector<byte_t, constrained_allocator<byte_t, atomic_reference_>>;
+
+    /** Where each value one flush writes starts and one past the last, for a variable width alone. */
+    using drained_offsets_t =
+        st::basic_vector<stored_value_offset_t, constrained_allocator<stored_value_offset_t, atomic_reference_>>;
 
     /** The stamps of the key slots one flush writes, in the same order. */
     using drained_stamps_t = st::basic_vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>>;
@@ -1062,17 +1144,48 @@ class nvme_store {
 
 #pragma region Private Methods
 
+    /** Runs every level of @p levels holds together. */
+    [[nodiscard]] static std::uint64_t level_runs_(level_set_t const& levels) noexcept {
+        std::uint64_t runs = 0;
+        for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
+        return runs;
+    }
+
+    /** What a lookup answers for a run's delta of @p kind, taken alone. */
+    [[nodiscard]] static lookup_result_t run_result_(delta_kind_t kind) noexcept {
+        if (kind == delta_kind_t::remove_k) return lookup_result_t::removed_k;
+        if (kind == delta_kind_t::change_k) return lookup_result_t::changed_k;
+        return lookup_result_t::written_k;
+    }
+
+    /** Visits through @p visit the newest position at or below @p stamp of every key of one run's sorted positions
+     *  @b [begin,end), whose versions of one key sit newest first, until @p visit answers false. */
+    template <typename key_of_type_, typename stamp_of_type_, typename visit_type_>
+    static void walk_versions_(std::uint64_t begin, std::uint64_t end, transaction_stamp_t stamp, key_of_type_&& key_of,
+                               stamp_of_type_&& stamp_of, visit_type_&& visit) noexcept {
+        std::uint64_t visited = end;
+        for (std::uint64_t position = begin; position != end; ++position) {
+            if (stamp_of(position) > stamp) continue;
+            if (visited != end && key_of(visited) == key_of(position)) continue;
+            visited = position;
+            if (!visit(position)) return;
+        }
+    }
+
     /** Whether a written value of @p size bytes is one this collection's layout can hold. */
     [[nodiscard]] bool admits_(std::size_t size) const noexcept {
         if constexpr (is_fixed(value_layout_k)) return size == value_size_;
         else return size <= value_max_size_;
     }
 
-    /** Whether this collection's layout can hold @p delta: a write of an admitted width, or a removal or a change
-     *  that fits the key slot where values sit inline, the written-value bounds binding writes alone. */
+    /** Whether this collection's layout can hold @p delta: a write of an admitted width, a removal, or a change that
+     *  fits the key slot where values sit inline and the stride where they sit at a fixed width, the written-value
+     *  bounds binding writes alone otherwise. */
     [[nodiscard]] bool admits_(delta_view_t const& delta) const noexcept {
         if (delta.kind == delta_kind_t::write_k) return admits_(delta.bytes.size());
         if constexpr (holds_values_inline_k) return delta.bytes.size() <= value_max_size_;
+        else if constexpr (is_fixed(value_layout_k))
+            return delta.kind == delta_kind_t::remove_k || delta.bytes.size() == value_size_;
         else return true;
     }
 
@@ -1101,8 +1214,8 @@ class nvme_store {
     /**
      *  @brief Folds the versions of @p stored_key at or below @p read's stamp, collected newest first down to the first
      *      that closes the chain, into the value a reader at that stamp sees.
-     *  @param[in] bytes_of Called as @c bytes_of(run, slot, bytes) for a version a level holds, viewing its bytes in
-     *      the key slot or in @p arena, answering a status.
+     *  @param[in] bytes_of Called as @c bytes_of(run, position, bytes) for a version a level holds at a sorted
+     *      position, viewing its bytes in the key slot or in @p arena, answering a status.
      *  @param[out] value The folded value, viewing a memory run, a key slot, or @p arena.
      *  @return What the key carries, or the status a read or the fold refused it with.
      */
@@ -1127,9 +1240,8 @@ class nvme_store {
                 std::uint64_t const sorted = position.level_position.key_slot_position;
                 stamp = run.stamp(sorted);
                 version.kind = run.kind(sorted);
-                key_slot_t const& slot = run.key_slot(sorted);
-                if (slot.size != 0)
-                    if (status_t const read_bytes = bytes_of(run, slot, version.bytes); read_bytes.failed())
+                if (run.value_window(sorted).bytes != 0)
+                    if (status_t const read_bytes = bytes_of(run, sorted, version.bytes); read_bytes.failed())
                         return read_bytes;
             }
             if (version.kind != delta_kind_t::change_k || fold_.closes(version)) {
@@ -1172,8 +1284,10 @@ class nvme_store {
         utilities::local_arena_t scratch;
         utilities::arena_allocator<byte_t> arena = scratch.allocator();
         std::span<byte_t const> value;
-        auto bytes_of = [](auto const&, key_slot_t const& slot, std::span<byte_t const>& bytes) noexcept -> status_t {
+        auto bytes_of = [](auto const& run, std::uint64_t position,
+                           std::span<byte_t const>& bytes) noexcept -> status_t {
             if constexpr (holds_values_inline_k) {
+                key_slot_t const& slot = run.key_slot(position);
                 bytes = std::span<byte_t const> {slot.data, slot.size};
                 return {};
             }
@@ -1185,22 +1299,24 @@ class nvme_store {
         return *folded;
     }
 
-    /** The bytes of the version @p slot of @p run locates, read on @p channel into @p arena where they sit apart from
-     *  the key slot. */
+    /** The bytes of the version at sorted @p position of @p run, read on @p channel into @p arena where they sit apart
+     *  from the key slot. */
     template <typename run_type_>
-    static status_t read_bytes_(io_channel_t& channel, run_type_ const& run, key_slot_t const& slot,
+    static status_t read_bytes_(io_channel_t& channel, run_type_ const& run, std::uint64_t position,
                                 utilities::arena_allocator<byte_t>& arena, std::span<byte_t const>& bytes) noexcept {
         if constexpr (holds_values_inline_k) {
+            key_slot_t const& slot = run.key_slot(position);
             bytes = std::span<byte_t const> {slot.data, slot.size};
             return {};
         }
         else {
-            byte_t* const into = slot.size != 0 ? arena.allocate(slot.size) : nullptr;
-            if (slot.size != 0 && into == nullptr)
+            std::size_t const size = run.value_window(position).bytes;
+            byte_t* const into = size != 0 ? arena.allocate(size) : nullptr;
+            if (size != 0 && into == nullptr)
                 return {status_code_t::out_of_memory_k, "No room to read a change's value"};
-            if (status_t const read = run.read_value(channel, slot, std::span<byte_t> {into, slot.size}); read.failed())
+            if (status_t const read = run.read_value(channel, position, std::span<byte_t> {into, size}); read.failed())
                 return read;
-            bytes = std::span<byte_t const> {into, slot.size};
+            bytes = std::span<byte_t const> {into, size};
             return {};
         }
     }
@@ -1211,8 +1327,8 @@ class nvme_store {
         utilities::local_arena_t scratch;
         utilities::arena_allocator<byte_t> arena = scratch.allocator();
         std::span<byte_t const> value;
-        auto bytes_of = [&](auto const& run, key_slot_t const& slot, std::span<byte_t const>& bytes) noexcept {
-            return read_bytes_(channel, run, slot, arena, bytes);
+        auto bytes_of = [&](auto const& run, std::uint64_t position, std::span<byte_t const>& bytes) noexcept {
+            return read_bytes_(channel, run, position, arena, bytes);
         };
         auto [folded, fold_status] = fold_versions_(read, stored_key, bytes_of, arena, value);
         if (fold_status.failed()) return fold_status;
@@ -1233,8 +1349,8 @@ class nvme_store {
             utilities::local_arena_t scratch;
             utilities::arena_allocator<byte_t> arena = scratch.allocator();
             std::span<byte_t const> value;
-            auto bytes_of = [&](auto const& run, key_slot_t const& slot, std::span<byte_t const>& bytes) noexcept {
-                return read_bytes_(channel, run, slot, arena, bytes);
+            auto bytes_of = [&](auto const& run, std::uint64_t position, std::span<byte_t const>& bytes) noexcept {
+                return read_bytes_(channel, run, position, arena, bytes);
             };
             auto [folded, fold_status] = fold_versions_(read, stored_keys[request], bytes_of, arena, value);
             if (fold_status.failed()) return fold_status;
@@ -1293,11 +1409,15 @@ class nvme_store {
      *  @param[out] key_slots The key slots in ascending order of their keys, as a run takes them.
      *  @param[out] stamps The stamp of every key slot, the versions of one key newest first.
      *  @param[out] kinds The @c delta_kind_t of every key slot, in the same order.
-     *  @param[out] stored_values The values back to back, empty for a layout holding them inline.
+     *  @param[out] stored_values The values back to back, empty for a layout holding them inline, and one stride per
+     *      key slot at a fixed width, a removal's zeroed.
+     *  @param[out] value_offsets Where each value starts inside @p stored_values and one past the last, for a variable
+     *      width alone.
      */
     status_t drain_(std::span<memory_run_t const* const> flushed, compaction_stamps_t const& survival,
                     utilities::arena_allocator<byte_t>& arena, drained_slots_t& key_slots, drained_stamps_t& stamps,
-                    drained_kinds_t& kinds, drained_values_t& stored_values) const noexcept {
+                    drained_kinds_t& kinds, drained_values_t& stored_values,
+                    drained_offsets_t& value_offsets) const noexcept {
         stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {runs_.constraint()}};
         if (status_t const kept = kept_versions(flushed, survival, fold_, versions, arena); kept.failed()) return kept;
         if (key_slots.reserve(versions.size()) != st::status_t::success_k ||
@@ -1306,33 +1426,49 @@ class nvme_store {
             return {status_code_t::out_of_memory_k, "A flush could not hold its key slots"};
         std::uint64_t total = 0;
         for (stamped_delta_t const& version : versions) total += version.delta.bytes.size();
+        if constexpr (is_fixed(value_layout_k)) total = std::uint64_t {versions.size()} * value_size_;
+        if constexpr (sorted_run_layout_t::carries_value_offsets_k) {
+            if (total > std::numeric_limits<stored_value_offset_t>::max())
+                return {status_code_t::capacity_exhausted_k, "A flush's values outgrow a run's value offsets"};
+            if (value_offsets.resize(versions.size() + 1) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A flush could not hold its value offsets"};
+        }
 
         if constexpr (!holds_values_inline_k)
             if (stored_values.resize(static_cast<std::size_t>(total)) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A flush could not hold its values"};
-        std::uint64_t location = sorted_run_layout_t::values_offset(versions.size());
         std::uint64_t written = 0;
-        for (stamped_delta_t const& version : versions) {
+        for (std::size_t index = 0; index != versions.size(); ++index) {
+            stamped_delta_t const& version = versions[index];
             std::span<byte_t const> const bytes = version.delta.bytes;
             key_slot_t built {};
             built.stored_key = version.stored_key;
-            built.size = static_cast<stored_value_size_t>(bytes.size());
             if constexpr (holds_values_inline_k) {
                 // A merge may compose changes wider than any one of them, which a key slot cannot hold.
                 if (bytes.size() > sizeof(built.data))
                     return {status_code_t::capacity_exhausted_k, "A folded change outgrows its key slot"};
                 if (!bytes.empty()) std::memcpy(built.data, bytes.data(), bytes.size());
+                built.size = static_cast<stored_value_size_t>(bytes.size());
             }
             else {
-                built.location = static_cast<stored_value_offset_t>(location);
+                // A fixed width spends its stride on every key slot, so a removal's stride stays zeroed.
+                std::uint64_t const stride = is_fixed(value_layout_k) ? value_size_ : bytes.size();
+                if (bytes.size() > stride)
+                    return {status_code_t::capacity_exhausted_k, "A value outgrows its fixed width"};
+                if constexpr (sorted_run_layout_t::carries_value_offsets_k)
+                    value_offsets[index] = static_cast<stored_value_offset_t>(written);
                 if (!bytes.empty()) std::memcpy(stored_values.data() + written, bytes.data(), bytes.size());
-                location += bytes.size();
-                written += bytes.size();
+                if (bytes.size() != stride)
+                    std::memset(stored_values.data() + written + bytes.size(), 0,
+                                static_cast<std::size_t>(stride - bytes.size()));
+                written += stride;
             }
             [[maybe_unused]] st::status_t const placed = key_slots.push_back(std::move(built));
             [[maybe_unused]] st::status_t const stamped = stamps.push_back(std::uint64_t {version.stamp});
             [[maybe_unused]] st::status_t const kinded = kinds.push_back(static_cast<std::uint8_t>(version.delta.kind));
         }
+        if constexpr (sorted_run_layout_t::carries_value_offsets_k)
+            value_offsets[versions.size()] = static_cast<stored_value_offset_t>(written);
         return {};
     }
 
@@ -1657,7 +1793,7 @@ class nvme_store_cursor {
         if (chosen == cursors_.size()) return false;
         run_cursor_t const& cursor = cursors_[chosen];
         auto const& run = view_->levels->level(cursor.level_number).run(cursor.run_index);
-        take_(run.kind(chosen_position), run.key_slot(chosen_position).size, entry);
+        take_(run.kind(chosen_position), run.value_window(chosen_position).bytes, entry);
         return true;
     }
 

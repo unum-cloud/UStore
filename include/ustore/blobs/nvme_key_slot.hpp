@@ -5,8 +5,9 @@
  *  @brief The vocabulary of UStoreNVMe's LSM trees: identifiers and value layouts, the keys key slots are ordered
  *      by, stored values and their locations, key slots, and the sorted run index laid over them.
  *
- *  A key slot is a stored key with the size and location of its stored value, specialized per value layout, and the
- *  kind of its delta sits in its run's kinds column beside the stamps, so a remove delta needs no size or location.
+ *  A key slot is a stored key, with an inline value beside it for the layouts holding values inline, and the kind of
+ *  its delta sits in its run's kinds column beside the stamps. A value held apart is found by the key slot's sorted
+ *  position: by stride for fixed-width values, and through the run's value offsets column for variable-width ones.
  *  Keys carry their bounds through @c limit, and the 16-byte key is ordered like @c memcmp. The sorted run index is
  *  the B-tree whose cells hold a sorted run's key slots, which both compactors lay out the same way.
  */
@@ -180,18 +181,20 @@ enum class transfer_mode_t : bool {
 enum class value_layout_t : std::uint16_t {
     unknown_k = 0,
 
-    inline_1_byte_k = 1,
-    inline_4_bytes_k = 4,
-    inline_8_bytes_k = 8,
-    inline_16_bytes_k = 16,
-    inline_32_bytes_k = 32,
-    inline_64_bytes_k = 64,
+    /** Values of up to 12 bytes inside a 32-byte key slot, after its 16-byte key and 4-byte size. */
+    inline_12_bytes_k = 12,
 
-    fixed_width_k,
-    variable_width_k,
+    /** Values of up to 44 bytes inside a 64-byte key slot, after its 16-byte key and 4-byte size. */
+    inline_44_bytes_k = 44,
+
+    /** Values of one width outside a 16-byte key slot; the numbers below are persisted in store tags. */
+    fixed_width_k = 65,
+
+    /** Values of differing widths outside a 16-byte key slot. */
+    variable_width_k = 66,
 
     /** Every value is one 16-byte key, held in the key slot: the strings modality's layout. */
-    uuid_k,
+    uuid_k = 67,
 };
 
 /** Bit fields describing a sequence of values: completeness, ordering, sorting and tree shape. */
@@ -217,9 +220,7 @@ enum class data_structure_info_t : std::uint16_t {
 
 /** Whether @p value_layout stores values inside the key slot itself, of its width or as one 16-byte key. */
 constexpr bool is_inline(value_layout_t value_layout) noexcept {
-    return value_layout == value_layout_t::inline_1_byte_k || value_layout == value_layout_t::inline_4_bytes_k ||
-           value_layout == value_layout_t::inline_8_bytes_k || value_layout == value_layout_t::inline_16_bytes_k ||
-           value_layout == value_layout_t::inline_32_bytes_k || value_layout == value_layout_t::inline_64_bytes_k ||
+    return value_layout == value_layout_t::inline_12_bytes_k || value_layout == value_layout_t::inline_44_bytes_k ||
            value_layout == value_layout_t::uuid_k;
 }
 
@@ -239,12 +240,8 @@ constexpr bool is_fixed_or_variable_width(value_layout_t value_layout) noexcept 
 /** The narrowest value layout holding values of @p value_size bytes, where zero means variable-size values. */
 constexpr value_layout_t resolve_value_layout(std::size_t value_size) noexcept {
     if (value_size == 0) return value_layout_t::variable_width_k;
-    if (value_size == 1) return value_layout_t::inline_1_byte_k;
-    if (value_size <= 4) return value_layout_t::inline_4_bytes_k;
-    if (value_size <= 8) return value_layout_t::inline_8_bytes_k;
-    if (value_size <= 16) return value_layout_t::inline_16_bytes_k;
-    if (value_size <= 32) return value_layout_t::inline_32_bytes_k;
-    if (value_size <= 64) return value_layout_t::inline_64_bytes_k;
+    if (value_size <= 12) return value_layout_t::inline_12_bytes_k;
+    if (value_size <= 44) return value_layout_t::inline_44_bytes_k;
     return value_layout_t::fixed_width_k;
 }
 
@@ -321,7 +318,7 @@ concept stored_key_concept = std::is_trivially_copyable_v<stored_key_type_> &&
 
 #pragma region Stored Value
 
-/** Where one stored value starts inside its sorted run file. */
+/** Where one stored value starts inside the bytes holding it, such as a sorted run's values section. */
 using stored_value_offset_t = u32_t;
 
 /** How many bytes one stored value occupies. */
@@ -657,12 +654,8 @@ template <locations_mutability_t mutability_ = locations_mutability_t::mutable_k
 class any_stored_value_locations_span {
   public:
     using variant_t = std::variant<stored_value_locations_span<value_layout_t::unknown_k, mutability_>,
-                                   stored_value_locations_span<value_layout_t::inline_1_byte_k, mutability_>,
-                                   stored_value_locations_span<value_layout_t::inline_4_bytes_k, mutability_>,
-                                   stored_value_locations_span<value_layout_t::inline_8_bytes_k, mutability_>,
-                                   stored_value_locations_span<value_layout_t::inline_16_bytes_k, mutability_>,
-                                   stored_value_locations_span<value_layout_t::inline_32_bytes_k, mutability_>,
-                                   stored_value_locations_span<value_layout_t::inline_64_bytes_k, mutability_>,
+                                   stored_value_locations_span<value_layout_t::inline_12_bytes_k, mutability_>,
+                                   stored_value_locations_span<value_layout_t::inline_44_bytes_k, mutability_>,
                                    stored_value_locations_span<value_layout_t::fixed_width_k, mutability_>,
                                    stored_value_locations_span<value_layout_t::variable_width_k, mutability_>>;
 
@@ -716,12 +709,8 @@ template <template <typename> typename allocator_ = heap_allocator>
 class any_stored_value_locations {
   public:
     using variant_t = std::variant<stored_value_locations<value_layout_t::unknown_k, allocator_>,
-                                   stored_value_locations<value_layout_t::inline_1_byte_k, allocator_>,
-                                   stored_value_locations<value_layout_t::inline_4_bytes_k, allocator_>,
-                                   stored_value_locations<value_layout_t::inline_8_bytes_k, allocator_>,
-                                   stored_value_locations<value_layout_t::inline_16_bytes_k, allocator_>,
-                                   stored_value_locations<value_layout_t::inline_32_bytes_k, allocator_>,
-                                   stored_value_locations<value_layout_t::inline_64_bytes_k, allocator_>,
+                                   stored_value_locations<value_layout_t::inline_12_bytes_k, allocator_>,
+                                   stored_value_locations<value_layout_t::inline_44_bytes_k, allocator_>,
                                    stored_value_locations<value_layout_t::fixed_width_k, allocator_>,
                                    stored_value_locations<value_layout_t::variable_width_k, allocator_>>;
 
@@ -847,23 +836,13 @@ struct key_slot {
     constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
 };
 
+/** A key slot of a fixed-width value, which its run finds by stride from the key slot's sorted position. */
 template <typename stored_key_>
 struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
     using stored_key_t = stored_key_;
     static constexpr value_layout_t value_layout_k = value_layout_t::fixed_width_k;
 
     stored_key_t stored_key = limit<stored_key_t>::max();
-    stored_value_size_t size = 0;
-    stored_value_offset_t location = 0;
-
-    stored_value_size_t aligned_buffer_size() const noexcept {
-        auto padded_size = stored_value_offset_t(size != 0) * (buffer_padding() + size);
-        return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
-    }
-    stored_value_offset_t aligned_offset_in_file() const noexcept {
-        return round_down_to_multiple<stored_value_offset_t>(location, buffer_alignment_k);
-    }
-    stored_value_size_t buffer_padding() const noexcept { return location - aligned_offset_in_file(); }
 
     constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
     constexpr bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
@@ -871,6 +850,7 @@ struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
     constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
 };
 
+/** A key slot of a variable-width value, which its run finds through the value offsets column by sorted position. */
 template <typename stored_key_, key_tails_t key_tails_>
 struct key_slot<stored_key_, value_layout_t::variable_width_k, key_tails_> {
     using stored_key_t = stored_key_;
@@ -878,17 +858,6 @@ struct key_slot<stored_key_, value_layout_t::variable_width_k, key_tails_> {
     static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
 
     stored_key_t stored_key = limit<stored_key_t>::max();
-    stored_value_size_t size = 0;
-    stored_value_offset_t location = 0;
-
-    stored_value_size_t aligned_buffer_size() const noexcept {
-        auto padded_size = stored_value_offset_t(size != 0) * (buffer_padding() + size);
-        return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
-    }
-    stored_value_offset_t aligned_offset_in_file() const noexcept {
-        return round_down_to_multiple<stored_value_offset_t>(location, buffer_alignment_k);
-    }
-    stored_value_size_t buffer_padding() const noexcept { return location - aligned_offset_in_file(); }
 
     constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
     constexpr bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
@@ -913,8 +882,18 @@ struct key_slot<stored_key_, value_layout_t::uuid_k, key_tails_> {
     constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
 };
 
+static_assert(sizeof(key_slot<st::key128_t, value_layout_t::inline_12_bytes_k>) == 32,
+              "A small inline cell is its 16-byte key, its 4-byte size and 12 bytes of value");
+static_assert(sizeof(key_slot<st::key128_t, value_layout_t::inline_44_bytes_k>) == 64,
+              "A wide inline cell is its 16-byte key, its 4-byte size and 44 bytes of value");
 static_assert(sizeof(key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>) == 32,
               "A strings cell is a 16-byte head and its 16-byte value");
+static_assert(sizeof(key_slot<st::key128_t, value_layout_t::fixed_width_k>) == 16,
+              "A fixed-width cell is its 16-byte key alone, so a row of 16 cells is 256 bytes");
+static_assert(sizeof(key_slot<st::key128_t, value_layout_t::variable_width_k>) == 16,
+              "A variable-width cell is its 16-byte key alone, so a row of 16 cells is 256 bytes");
+static_assert(sizeof(key_slot<st::key128_t, value_layout_t::variable_width_k, key_tails_t::carried_k>) == 16,
+              "A tailed variable-width cell is its 16-byte head alone");
 
 #pragma endregion Key Slot
 

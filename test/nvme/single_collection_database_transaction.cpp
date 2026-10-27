@@ -63,8 +63,8 @@ struct layout {
     static constexpr stored_value_size_t value_max_size_k = value_max_size_;
 };
 
-using inline_1_byte_layout_t = layout<key_slot<stored_key_t, value_layout_t::inline_1_byte_k>, 0, 0>;
-using inline_64_bytes_layout_t = layout<key_slot<stored_key_t, value_layout_t::inline_64_bytes_k>, 0, 0>;
+using inline_12_bytes_layout_t = layout<key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>, 0, 0>;
+using inline_44_bytes_layout_t = layout<key_slot<stored_key_t, value_layout_t::inline_44_bytes_k>, 0, 0>;
 using fixed_width_layout_t = layout<key_slot<stored_key_t, value_layout_t::fixed_width_k>, 4097, 0>;
 using variable_width_layout_t = layout<key_slot<stored_key_t, value_layout_t::variable_width_k>, 0, 4096>;
 
@@ -806,8 +806,8 @@ int main(int argc, char const* argv[]) {
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        run_layout<inline_1_byte_layout_t>(totals, mount, "inline_1_byte");
-        run_layout<inline_64_bytes_layout_t>(totals, mount, "inline_64_bytes");
+        run_layout<inline_12_bytes_layout_t>(totals, mount, "inline_12_bytes");
+        run_layout<inline_44_bytes_layout_t>(totals, mount, "inline_44_bytes");
         run_layout<fixed_width_layout_t>(totals, mount, "fixed_width");
         run_layout<variable_width_layout_t>(totals, mount, "variable_width");
     };

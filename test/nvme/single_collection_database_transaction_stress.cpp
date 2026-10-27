@@ -51,7 +51,7 @@ constexpr std::size_t value_bytes_k = 8;
 
 /** The keys, and the key slots of eight inline bytes, every case of this suite drives. */
 using stored_key_t = std::uint64_t;
-using inline_slot_t = key_slot<stored_key_t, value_layout_t::inline_8_bytes_k>;
+using inline_slot_t = key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>;
 
 /** A fixture, the channels a database needs, and the volume over them. */
 template <typename fixture_type_>

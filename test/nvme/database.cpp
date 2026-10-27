@@ -70,11 +70,8 @@ struct database_types {
     using database_of =
         basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, layout_store_tags<stores_...>, stores_...>;
     using database_t =
-        database_of<strings_store_t, blobs_store_of<value_layout_t::inline_1_byte_k>,
-                    blobs_store_of<value_layout_t::inline_4_bytes_k>, blobs_store_of<value_layout_t::inline_8_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_16_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_32_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_64_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
+        database_of<strings_store_t, blobs_store_of<value_layout_t::inline_12_bytes_k>,
+                    blobs_store_of<value_layout_t::inline_44_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
                     blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
 
@@ -554,7 +551,7 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     failures += expect_eq(restored.lsm_tree.lsm_level_0.sorted_run.value_max_size, value_max_size_k);
     failures += expect_eq(restored.memory_runs_max_deltas, std::size_t {4096});
     failures += expect_eq(store.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
-                          stored_value_size_t {8});
+                          stored_value_size_t {12});
     std::uint16_t store_tag = 0;
     failures += expect(store.collection_store_tag(*blobs, store_tag).succeeded());
     failures += expect_eq(store_tag, static_cast<std::uint16_t>(value_layout_t::variable_width_k));
@@ -572,7 +569,7 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
 
     // A database of fewer stores refuses a catalog naming a store it lacks, and leaves it whole for one that has.
     using numbers_only_t = typename types_t::template database_of<
-        typename types_t::template blobs_store_of<value_layout_t::inline_8_bytes_k>>;
+        typename types_t::template blobs_store_of<value_layout_t::inline_12_bytes_k>>;
     {
         numbers_only_t narrow {(*stack)->fixture->resources};
         failures += expect_status(narrow.mount((*stack)->router, (*stack)->fixture->channels, test_database_config()),
@@ -583,14 +580,14 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     using reordered_t = typename types_t::template database_of<
         typename types_t::template blobs_store_of<value_layout_t::variable_width_k>,
         typename types_t::template blobs_store_of<value_layout_t::fixed_width_k>,
-        typename types_t::template blobs_store_of<value_layout_t::inline_8_bytes_k>>;
+        typename types_t::template blobs_store_of<value_layout_t::inline_12_bytes_k>>;
     {
         reordered_t reordered {(*stack)->fixture->resources};
         failures += expect(
             reordered.mount((*stack)->router, (*stack)->fixture->channels, test_database_config()).succeeded());
         failures += expect_eq(reordered.size(), std::size_t {3});
         failures += expect_eq(reordered.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
-                              stored_value_size_t {8});
+                              stored_value_size_t {12});
         for (std::uint64_t key = 0; key != 4; ++key) failures += check_painted(reordered, named, key, 3);
         failures += expect(reordered.unmount().succeeded());
     }
@@ -635,7 +632,7 @@ std::size_t strings_survive_reopen(mount_type_ const& mount) {
             keys[index][position] = painted(index, position);
     }
     {
-        strings::nvme_transaction<database_t, strings_store_t> written {*(*stack)->store};
+        strings::nvme_transaction<database_t, strings_store_t> written {*(*stack)->store, &sz_sort_order_serial};
         auto [held, begin_status] = (*stack)->store->create_transaction(test_database_config().default_transaction);
         failures += expect(begin_status.succeeded());
         if (failures != 0) return failures;
@@ -1293,6 +1290,62 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     return failures;
 }
 
+/** An unordered scan walks every run on its own: a key two runs carry comes out twice, a removal comes out as one, a
+ *  commit leaves the counted runs where they were, and a flush rearranges them, which the next run's walk reports. */
+template <typename mount_type_>
+std::size_t runs_scan_one_at_a_time(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+    expected<collection_id_t> const created = create_named(store, "runs", test_config(0, value_max_size_k));
+    failures += expect(created.has_value());
+    if (!created) return failures;
+    any_collection_id_t const runs {*created};
+
+    std::array<byte_t, 8> const value = counted(7);
+    for (std::uint64_t key = 1; key <= 4; ++key)
+        failures += expect(store.insert(runs, stored_key_t {key}, stored_value_view_t {value}).succeeded());
+    failures += expect(store.flush().succeeded());
+    // Two memory runs above the flushed one, fewer than a merge of memory runs by tier takes.
+    failures += expect(store.insert(runs, stored_key_t {2}, stored_value_view_t {value}).succeeded());
+    failures += expect(store.remove(runs, stored_key_t {3}).succeeded());
+
+    expected<counted_runs_t> const counted_runs = store.runs_count(runs);
+    failures += expect(counted_runs.has_value());
+    if (!counted_runs) return failures;
+    failures += expect(counted_runs->count >= 3);
+    std::array<std::size_t, 5> written {};
+    std::array<std::size_t, 5> removed {};
+    auto const tally = [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
+        std::size_t const index = static_cast<std::size_t>(key) < written.size() ? static_cast<std::size_t>(key) : 0;
+        if (state == lookup_result_t::written_k && size == value.size()) ++written[index];
+        if (state == lookup_result_t::removed_k) ++removed[index];
+        return true;
+    };
+    for (std::uint64_t run = 0; run != counted_runs->count; ++run)
+        failures += expect(store.scan_run(runs, *counted_runs, run, stored_key_t {1}, tally).succeeded());
+    failures += expect_eq(written[1], std::size_t {1});
+    failures += expect_eq(written[2], std::size_t {2});
+    failures += expect_eq(written[3], std::size_t {1});
+    failures += expect_eq(written[4], std::size_t {1});
+    failures += expect_eq(removed[3], std::size_t {1});
+    failures += expect_eq(written[0], std::size_t {0});
+
+    // A commit only puts a newer run ahead, while a flush rearranges the runs the count named.
+    failures += expect(store.insert(runs, stored_key_t {5}, stored_value_view_t {value}).succeeded());
+    failures += expect(store.scan_run(runs, *counted_runs, 0, stored_key_t {1}, tally).succeeded());
+    failures += expect(store.flush().succeeded());
+    failures += expect(store.scan_run(runs, *counted_runs, 0, stored_key_t {1}, tally) == status_code_t::contended_k);
+    failures += expect(store.scan_run(runs, *counted_runs, counted_runs->count, stored_key_t {1}, tally) ==
+                       status_code_t::invalid_argument_k);
+    return failures;
+}
+
 /**
  *  @brief Dropping a collection waits for no snapshot, since a snapshot is a pinned stamp that holds no level set,
  *      and the snapshot finds the collection gone afterwards.
@@ -1713,6 +1766,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "conflict_spares_the_other", conflict_leaves_the_other_collection_untouched);
         report(totals, mount, "rollback_and_renew", rollback_and_renew_behave);
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
+        report(totals, mount, "runs_scan_one_at_a_time", runs_scan_one_at_a_time);
         report(totals, mount, "drop_proceeds_beside_the_snapshot", drop_proceeds_beside_the_snapshot);
         report(totals, mount, "threads_commit_serializably", threads_commit_serializably);
         report(totals, mount, "readers_beside_committers_and_flushes", readers_beside_committers_and_flushes);

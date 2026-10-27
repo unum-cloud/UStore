@@ -8,7 +8,7 @@
 
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
-#include "ustore/blobs/nvme_key_slot.hpp" // `limit`
+#include "ustore/blobs/nvme_key_slot.hpp" // `limit`, `value_layout_t`
 
 namespace unum::ustore::test {
 
@@ -24,24 +24,24 @@ struct inline_key_slot {
     std::uint8_t data[8] = {};
 };
 
-/** Stored values of one width in the stored values section, laid out as UStoreNVMe's fixed-size key slots are. */
+/** Stored values of one width in the stored values section, found by stride, as UStoreNVMe's fixed-width key slots
+ *  find theirs. */
 template <typename stored_key_type_>
 struct fixed_width_key_slot {
     using stored_key_t = stored_key_type_;
+    static constexpr blobs::value_layout_t value_layout_k = blobs::value_layout_t::fixed_width_k;
 
     stored_key_t stored_key = limit<stored_key_t>::max();
-    std::uint32_t size = 0;
-    std::uint32_t location = 0;
 };
 
-/** Stored values of any width in the stored values section, laid out as UStoreNVMe's variable-size key slots are. */
+/** Stored values of any width in the stored values section, found through value offsets, as UStoreNVMe's
+ *  variable-width key slots find theirs. */
 template <typename stored_key_type_>
 struct variable_width_key_slot {
     using stored_key_t = stored_key_type_;
+    static constexpr blobs::value_layout_t value_layout_k = blobs::value_layout_t::variable_width_k;
 
     stored_key_t stored_key = limit<stored_key_t>::max();
-    std::uint32_t size = 0;
-    std::uint32_t location = 0;
 };
 
 } // namespace unum::ustore::test

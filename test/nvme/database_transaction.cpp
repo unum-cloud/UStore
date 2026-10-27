@@ -70,10 +70,8 @@ struct database_types {
     using database_of =
         basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, layout_store_tags<stores_...>, stores_...>;
     using database_t =
-        database_of<blobs_store_of<value_layout_t::inline_1_byte_k>, blobs_store_of<value_layout_t::inline_4_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_8_bytes_k>, blobs_store_of<value_layout_t::inline_16_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_32_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_64_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
+        database_of<blobs_store_of<value_layout_t::inline_12_bytes_k>,
+                    blobs_store_of<value_layout_t::inline_44_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
                     blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
     using transaction_unique_ptr_t = typename database_t::transaction_unique_ptr_t;

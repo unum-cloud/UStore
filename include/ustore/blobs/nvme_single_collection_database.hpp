@@ -1061,18 +1061,22 @@ class basic_single_collection_database {
      *      writing_channel.
      *  @param[in] config The collection's bounds and the transaction defaults.
      *  @param[in] resources The budget the conflict record, the roster and every transaction's writes are charged to.
+     *  @param[in] compactor What every merge runs on: the calling thread, or a device lane the caller owns, which
+     *      outlives the database.
      *  @return The database, or @c malformed_k for a volume whose schema names another value layout.
      */
-    static expected<database_unique_ptr_t> open(
-        volume_t& volume, io_channel_t& writing_channel, io_channel_t& merging_channel,
-        single_collection_database_config_t const& config,
-        resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept {
+    static expected<database_unique_ptr_t> open(volume_t& volume, io_channel_t& writing_channel,
+                                                io_channel_t& merging_channel,
+                                                single_collection_database_config_t const& config,
+                                                resources_shared_ptr<atomic_reference_, waiter_type_> resources,
+                                                compactor_ref_t compactor = {}) noexcept {
         if (!resources) return status_t {status_code_t::invalid_argument_k, "A database is charged to some budget"};
         std::unique_ptr<commit_ledger<atomic_reference_, waiter_type_>> owned {
             new (std::nothrow) commit_ledger<atomic_reference_, waiter_type_> {}};
         if (!owned) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
         commit_ledger<atomic_reference_, waiter_type_>& ledger = *owned;
-        return open_(volume, writing_channel, merging_channel, config, std::move(resources), ledger, std::move(owned));
+        return open_(volume, writing_channel, merging_channel, config, std::move(resources), compactor, ledger,
+                     std::move(owned));
     }
 
     /** Drops both blobs and every run, which destroys the data and leaves the volume empty of it. */
@@ -1215,7 +1219,7 @@ class basic_single_collection_database {
         lsm_tree_publication_hook_t published;
         published.notify = &record_schema_;
         published.context = this;
-        return collection_.compact(writing_channel_, merging_channel_, gpu_devices_, published);
+        return collection_.compact(writing_channel_, merging_channel_, compactor_, published);
     }
 
     /** How many memory runs the collection holds, and how many commits they hold. */
@@ -1411,17 +1415,18 @@ class basic_single_collection_database {
     basic_single_collection_database(volume_t& volume, io_channel_t& writing_channel, io_channel_t& merging_channel,
                                      single_collection_database_config_t const& config,
                                      resources_shared_ptr<atomic_reference_, waiter_type_> resources,
-                                     collection_t&& mounted, commit_ledger<atomic_reference_, waiter_type_>& ledger,
+                                     compactor_ref_t compactor, collection_t&& mounted,
+                                     commit_ledger<atomic_reference_, waiter_type_>& ledger,
                                      std::unique_ptr<commit_ledger<atomic_reference_, waiter_type_>> owned) noexcept
         : volume_(volume), writing_channel_(writing_channel), merging_channel_(merging_channel), config_(config),
-          owned_ledger_(std::move(owned)), ledger_(ledger), collection_(std::move(mounted)),
-          gpu_devices_(resources->gpu_devices), registry_(*this, std::move(resources)) {}
+          owned_ledger_(std::move(owned)), ledger_(ledger), collection_(std::move(mounted)), compactor_(compactor),
+          registry_(*this, std::move(resources)) {}
 
     /** Mounts the collection and the database around it, drawing stamps from @p ledger. */
     static expected<database_unique_ptr_t> open_(
         volume_t& volume, io_channel_t& writing_channel, io_channel_t& merging_channel,
         single_collection_database_config_t const& config,
-        resources_shared_ptr<atomic_reference_, waiter_type_> resources,
+        resources_shared_ptr<atomic_reference_, waiter_type_> resources, compactor_ref_t compactor,
         commit_ledger<atomic_reference_, waiter_type_>& ledger,
         std::unique_ptr<commit_ledger<atomic_reference_, waiter_type_>> owned) noexcept {
         if (&writing_channel == &merging_channel)
@@ -1431,8 +1436,8 @@ class basic_single_collection_database {
         if (mount_collection_status.failed()) return mount_collection_status;
 
         database_unique_ptr_t opened {new (std::nothrow) basic_single_collection_database {
-            volume, writing_channel, merging_channel, config, std::move(resources), std::move(mounted), ledger,
-            std::move(owned)}};
+            volume, writing_channel, merging_channel, config, std::move(resources), compactor, std::move(mounted),
+            ledger, std::move(owned)}};
         if (!opened) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
         if (status_t const restored = opened->mount_(); restored.failed()) {
             // The schema the mount read stays as it lies, never saved again without the runs it failed to take back.
@@ -1516,7 +1521,7 @@ class basic_single_collection_database {
         published.notify = &record_schema_;
         published.context = this;
         while (collection_.needs_compaction()) {
-            auto [outcome, compact_status] = collection_.compact(writing_channel_, merging_channel_, gpu_devices_,
+            auto [outcome, compact_status] = collection_.compact(writing_channel_, merging_channel_, compactor_,
                                                                  published);
             if (compact_status.failed()) return compact_status;
             if (outcome == compaction_outcome_t::nothing_to_compact_k) break;
@@ -1771,8 +1776,8 @@ class basic_single_collection_database {
     /** The durable stamp of the schema copy the open read, above which a mount drops every version. */
     transaction_stamp_t loaded_durable_ = unwritten_stamp_k;
 
-    /** The devices the executor named, which a compaction runs on, owned by the budget @c registry_ holds. */
-    std::span<int const> gpu_devices_;
+    /** What every merge runs on, picked at open: the calling thread, or a lane the opener owns. */
+    compactor_ref_t compactor_;
 
     /** The order every transaction is placed in, and the last commit to write each key. */
     registry_t registry_;

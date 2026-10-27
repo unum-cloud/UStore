@@ -24,7 +24,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::max`, `std::min`, `std::stable_sort`
+#include <algorithm>   // `std::max`, `std::min`
 #include <compare>     // `std::strong_ordering`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
@@ -444,8 +444,9 @@ class nvme_store {
      *  @brief Sorts and copies @p deltas into one commit's sealed deltas for this store, on the committer's thread and
      *      off every shared path, and allocates the run they become; no deltas seal into no run.
      *  @param[in] deltas One delta per string, which this sorts in place: writes of one 16-byte key and removals.
+     *  @param[in] sort_order The StringZilla sort kernel src/ picked for the CPU.
      */
-    expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas) const noexcept {
+    expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas, sz_kernel_sort_order_t sort_order) const noexcept {
         for (keyed_delta_t const& each : deltas) {
             if (each.delta.kind == delta_kind_t::change_k)
                 return status_t {status_code_t::invalid_argument_k, "A string takes whole values and removals"};
@@ -454,7 +455,7 @@ class nvme_store {
         }
         sealed_commit_t sealed;
         if (deltas.empty()) return sealed;
-        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, allocator_t {runs_.constraint()});
+        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, sort_order, allocator_t {runs_.constraint()});
         if (seal_status.failed()) return seal_status;
         sealed.deltas = std::move(sealed_deltas);
         sealed.run.reset(new (std::nothrow) memory_run_t {});
@@ -463,9 +464,10 @@ class nvme_store {
     }
 
     /** Seals one value per string of @p texts, a repeated string taking its last value, out of @p values cut by
-     *  @p sizes, each of which names 16 bytes. */
+     *  @p sizes, each of which names 16 bytes, sorting through the kernel @p sort_order src/ picked. */
     expected<sealed_commit_t> seal_writes(std::span<std::string_view const> texts, std::span<byte_t const> values,
-                                          std::span<stored_value_size_t const> sizes) const noexcept {
+                                          std::span<stored_value_size_t const> sizes,
+                                          sz_kernel_sort_order_t sort_order) const noexcept {
         if (sizes.size() != texts.size())
             return status_t {status_code_t::invalid_argument_k, "A batched insert names the size of every value"};
         std::uint64_t total = 0;
@@ -480,16 +482,17 @@ class nvme_store {
                                            delta_view_t {delta_kind_t::write_k, values.subspan(offset, sizes[index])}};
             offset += sizes[index];
         }
-        return seal(last_of_each_string_(deltas));
+        return seal_last_of_each_(deltas, sort_order);
     }
 
-    /** Seals a removal of every string of @p texts. */
-    expected<sealed_commit_t> seal_removals(std::span<std::string_view const> texts) const noexcept {
+    /** Seals a removal of every string of @p texts, sorting through the kernel @p sort_order src/ picked. */
+    expected<sealed_commit_t> seal_removals(std::span<std::string_view const> texts,
+                                            sz_kernel_sort_order_t sort_order) const noexcept {
         auto [deltas, deltas_status] = deltas_of_(texts.size());
         if (deltas_status.failed()) return deltas_status;
         for (std::size_t index = 0; index != texts.size(); ++index)
             deltas[index] = keyed_delta_t {texts[index], delta_view_t {delta_kind_t::remove_k, {}}};
-        return seal(last_of_each_string_(deltas));
+        return seal_last_of_each_(deltas, sort_order);
     }
 
     /** How full the memory runs of the published view would be with @p sealed beside them. */
@@ -629,7 +632,7 @@ class nvme_store {
                                                        std::span<byte_t const> {drained.tails}};
             return tree.flush(channel, std::span<key_slot_t const> {drained.key_slots},
                               std::span<std::uint64_t const> {drained.stamps},
-                              std::span<std::uint8_t const> {drained.kinds}, survival.floor, {}, key_slot_t::size,
+                              std::span<std::uint8_t const> {drained.kinds}, survival.floor, {}, {}, key_slot_t::size,
                               published, tails);
         });
     }
@@ -641,14 +644,14 @@ class nvme_store {
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
-     *  @param[in] devices The devices the executor named, which the tree passes over for runs carrying tails, as no
-     *      device compaction is compiled for them.
+     *  @param[in] compactor The compactor the database picked at open, which the tree passes over for runs carrying
+     *      tails, as no device compaction is compiled for them.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
      */
     expected<compaction_outcome_t> compact(
-        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<int const> devices,
+        io_channel_t& reading_channel, io_channel_t& writing_channel, blobs::compactor_ref_t const& compactor,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        return runs_.compact(reading_channel, writing_channel, devices, fold_, blobs::no_device_fold_t {}, published);
+        return runs_.compact(reading_channel, writing_channel, compactor, fold_, blobs::no_device_fold_t {}, published);
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a store holding no memory run takes. */
@@ -897,18 +900,12 @@ class nvme_store {
         return deltas;
     }
 
-    /** Keeps the last delta of every string of @p deltas, which a batch naming a string twice takes. */
-    [[nodiscard]] static std::span<keyed_delta_t> last_of_each_string_(deltas_t& deltas) noexcept {
-        std::stable_sort(deltas.begin(), deltas.end(), [](keyed_delta_t const& first, keyed_delta_t const& second) {
-            return first.stored_key < second.stored_key;
-        });
-        std::size_t kept = 0;
-        for (std::size_t index = 0; index != deltas.size(); ++index) {
-            bool const repeated = index + 1 != deltas.size() &&
-                                  deltas[index + 1].stored_key == deltas[index].stored_key;
-            if (!repeated) deltas[kept++] = deltas[index];
-        }
-        return std::span<keyed_delta_t> {deltas.data(), kept};
+    /** Seals the last delta of every string of @p deltas, which a batch naming a string twice takes. */
+    expected<sealed_commit_t> seal_last_of_each_(deltas_t& deltas, sz_kernel_sort_order_t sort_order) const noexcept {
+        auto [kept, sort_status] = sort_unique_strings(std::span<keyed_delta_t> {deltas}, sort_order, keep_t::last_k,
+                                                       deltas.get_allocator());
+        if (sort_status.failed()) return sort_status;
+        return seal(std::span<keyed_delta_t> {deltas.data(), kept}, sort_order);
     }
 
 #pragma endregion Private Methods
@@ -956,9 +953,10 @@ class nvme_transaction {
     /** One delta a commit hands a store over. */
     using keyed_delta_t = keyed_delta<std::string_view>;
 
-    /** A transaction of @p database writing and watching nothing yet, joined to none. */
-    explicit nvme_transaction(database_t& database) noexcept
-        : database_(&database), writes_(place_hash_t {&tape_}, place_equals_t {&tape_}) {
+    /** A transaction of @p database writing and watching nothing yet, joined to none, which seals its strings in
+     *  order through the StringZilla sort kernel @p sort_order src/ picked for the CPU. */
+    nvme_transaction(database_t& database, sz_kernel_sort_order_t sort_order) noexcept
+        : database_(&database), sort_order_(sort_order), writes_(place_hash_t {&tape_}, place_equals_t {&tape_}) {
         share_.context = this;
         share_.prepare = &prepare_share_;
         share_.publish = &publish_share_;
@@ -1228,7 +1226,7 @@ class nvme_transaction {
             if (status_t const made = with_store_(collection,
                                                   [&](store_t& store) noexcept -> status_t {
                                                       auto [commit, seal_status] = store.seal(
-                                                          std::span<keyed_delta_t> {deltas});
+                                                          std::span<keyed_delta_t> {deltas}, sort_order_);
                                                       if (seal_status.failed()) return seal_status;
                                                       sealed.commit = std::move(commit);
                                                       return {};
@@ -1315,6 +1313,9 @@ class nvme_transaction {
 
     /** The database every collection lives in, which outlives this. */
     database_t* database_ = nullptr;
+
+    /** The StringZilla kernel the strings of every seal are sorted by, which src/ picked for the CPU. */
+    sz_kernel_sort_order_t sort_order_ = nullptr;
 
     /** Every string this transaction wrote or watched, back to back. */
     st::basic_vector<char> tape_;

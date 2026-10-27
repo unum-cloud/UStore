@@ -208,7 +208,7 @@ static void draw_commit(std::vector<std::string> const& pool, std::mt19937_64& g
 /** Seals and stamps @p deltas into a run that @p runs owns, answering it, or null on a failure it counts. */
 static run_t const* commit(std::vector<keyed_delta_t>& deltas, transaction_stamp_t stamp,
                            std::vector<std::unique_ptr<run_t>>& runs, std::size_t& failures) {
-    expected<sealed_t> sealed = sealed_t::seal(deltas);
+    expected<sealed_t> sealed = sealed_t::seal(deltas, &sz_sort_order_serial);
     if ((failures += check(sealed.has_value()))) return nullptr;
     expected<run_t> stamped = run_t::stamped(std::move(*sealed), stamp);
     if ((failures += check(stamped.has_value()))) return nullptr;
@@ -265,24 +265,37 @@ static std::size_t refusals() {
     std::size_t failures = 0;
     bytes_t const payload(sizeof(ustore_key_t), byte_t {7});
     std::vector<keyed_delta_t> none;
-    failures += check(sealed_t::seal(none).code() == status_code_t::invalid_argument_k);
+    failures += check(sealed_t::seal(none, &sz_sort_order_serial).code() == status_code_t::invalid_argument_k);
 
     std::string const repeated_text(20, 'x');
     std::vector<keyed_delta_t> repeated {{repeated_text, {delta_kind_t::write_k, payload}},
                                          {repeated_text, {delta_kind_t::remove_k, {}}}};
-    failures += check(sealed_t::seal(repeated).code() == status_code_t::invalid_argument_k);
+    failures += check(sealed_t::seal(repeated, &sz_sort_order_serial).code() == status_code_t::invalid_argument_k);
+
+    // A batch naming a string twice keeps its last delta, in byte order, the empty string first.
+    std::vector<keyed_delta_t> batch {{"b", {delta_kind_t::write_k, payload}},
+                                      {"", {delta_kind_t::remove_k, {}}},
+                                      {"ab", {delta_kind_t::write_k, payload}},
+                                      {"b", {delta_kind_t::remove_k, {}}}};
+    expected<std::size_t> const kept = strings::sort_unique_strings(std::span<keyed_delta_t> {batch},
+                                                                    &sz_sort_order_serial, strings::keep_t::last_k,
+                                                                    st::default_allocator<byte_t> {});
+    failures += check(kept.has_value() && *kept == 3);
+    failures += check(batch[0].stored_key.empty() && batch[1].stored_key == "ab" && batch[2].stored_key == "b");
+    failures += check(batch[2].delta.kind == delta_kind_t::remove_k);
 
     std::vector<keyed_delta_t> loaded_removal {{"key", {delta_kind_t::remove_k, payload}}};
-    failures += check(sealed_t::seal(loaded_removal).code() == status_code_t::invalid_argument_k);
+    failures += check(sealed_t::seal(loaded_removal, &sz_sort_order_serial).code() ==
+                      status_code_t::invalid_argument_k);
 
     bytes_t const short_payload(4, byte_t {7});
     std::vector<keyed_delta_t> short_write {{"key", {delta_kind_t::write_k, short_payload}}};
-    failures += check(sealed_t::seal(short_write).code() == status_code_t::invalid_argument_k);
+    failures += check(sealed_t::seal(short_write, &sz_sort_order_serial).code() == status_code_t::invalid_argument_k);
     std::vector<keyed_delta_t> empty_write {{"key", {delta_kind_t::write_k, {}}}};
-    failures += check(sealed_t::seal(empty_write).code() == status_code_t::invalid_argument_k);
+    failures += check(sealed_t::seal(empty_write, &sz_sort_order_serial).code() == status_code_t::invalid_argument_k);
 
     std::vector<keyed_delta_t> one {{"key", {delta_kind_t::write_k, payload}}};
-    expected<sealed_t> sealed = sealed_t::seal(one);
+    expected<sealed_t> sealed = sealed_t::seal(one, &sz_sort_order_serial);
     if (check(sealed.has_value())) return failures + 1;
     failures += check(run_t::stamped(std::move(*sealed), unwritten_stamp_k).code() ==
                       status_code_t::invalid_argument_k);
@@ -292,7 +305,7 @@ static std::size_t refusals() {
     std::vector<keyed_delta_t> deltas {{"gone", {delta_kind_t::remove_k, {}}},
                                        {"blank", {delta_kind_t::write_k, other_payload}},
                                        {empty_string, {delta_kind_t::write_k, payload}}};
-    expected<run_t> stamped = run_t::stamped(*sealed_t::seal(deltas), 5);
+    expected<run_t> stamped = run_t::stamped(*sealed_t::seal(deltas, &sz_sort_order_serial), 5);
     if (check(stamped.has_value())) return failures + 1;
     view_t const empty;
     expected<view_t> view = view_t::extended(empty, *stamped);
@@ -311,7 +324,7 @@ static std::size_t refusals() {
                       !view->range_written_since("b", "a", 4));
 
     std::vector<keyed_delta_t> older {{"older", {delta_kind_t::write_k, payload}}};
-    expected<run_t> older_run = run_t::stamped(*sealed_t::seal(older), 5);
+    expected<run_t> older_run = run_t::stamped(*sealed_t::seal(older, &sz_sort_order_serial), 5);
     if (check(older_run.has_value())) return failures + 1;
     failures += check(view_t::extended(*view, *older_run).code() == status_code_t::invalid_argument_k);
     return failures;
