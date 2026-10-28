@@ -97,86 +97,9 @@ if (WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif ()
 
-# Warnings apply to UStore's own targets only, so fetched dependencies build with their own flags.
-add_library(ustore_warnings INTERFACE)
-if (MSVC)
-    target_compile_options(ustore_warnings INTERFACE /W4 /permissive- /Zc:__cplusplus)
-    if (USTORE_WERROR)
-        target_compile_options(ustore_warnings INTERFACE /WX)
-    endif ()
-else ()
-    # The C ABI takes named arguments as partially designated structs, leaving the rest zeroed. CUDA sources take the
-    # compactor's own flags instead, since nvcc's host pass reads line markers that pedantic mode rejects.
-    target_compile_options(
-        ustore_warnings
-        INTERFACE
-            "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Wpedantic;-Wno-unknown-pragmas;-Wno-missing-field-initializers>"
-            "$<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<CXX_COMPILER_ID:Clang,AppleClang>>:-Wdocumentation>"
-    )
-    if (USTORE_WERROR)
-        target_compile_options(ustore_warnings INTERFACE -Werror)
-    endif ()
-endif ()
+include(cmake/ustore_flags.cmake)
 
-# USTORE_TARGET_ARCH tunes UStore's own units, which all link `ustore_warnings`, for one CPU: `native` for this host, or
-# a CPU name like `graniterapids`, also when cross-compiling. A WebAssembly module takes its one SIMD capability
-# instead: serial, v128 or v128relaxed. Fetched dependencies keep their own flags.
-if (USTORE_TARGET_ARCH STREQUAL "native" AND CMAKE_CROSSCOMPILING)
-    message(FATAL_ERROR "USTORE_TARGET_ARCH=native needs the host as the target; name a CPU instead")
-elseif (EMSCRIPTEN OR CMAKE_SYSTEM_PROCESSOR MATCHES "wasm")
-    if (USTORE_TARGET_ARCH STREQUAL "v128relaxed")
-        target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-msimd128;-mrelaxed-simd>")
-    elseif (USTORE_TARGET_ARCH STREQUAL "v128")
-        target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-msimd128>")
-    elseif (USTORE_TARGET_ARCH AND NOT USTORE_TARGET_ARCH STREQUAL "serial")
-        message(
-            FATAL_ERROR "USTORE_TARGET_ARCH on WebAssembly: serial, v128 or v128relaxed, not `${USTORE_TARGET_ARCH}`"
-        )
-    endif ()
-elseif (
-    USTORE_TARGET_ARCH
-    AND MSVC
-    AND NOT USTORE_TARGET_ARCH STREQUAL "native"
-)
-    message(FATAL_ERROR "MSVC takes USTORE_TARGET_ARCH=native only; pass an /arch: value such as AVX2 or AVX512 "
-                        "through CMAKE_CXX_FLAGS instead of `${USTORE_TARGET_ARCH}`"
-    )
-elseif (USTORE_TARGET_ARCH AND MSVC)
-    # MSVC has no `/arch:native`, and no UStore unit needs instruction-set flags, so the toolchain default stays.
-elseif (USTORE_TARGET_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64")
-    # AArch64 names CPUs through `-mcpu`, like `neoverse-v2`, as `-march` takes only architecture versions.
-    target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${USTORE_TARGET_ARCH}>")
-elseif (USTORE_TARGET_ARCH)
-    target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-march=${USTORE_TARGET_ARCH}>")
-endif ()
-
-# Sanitizers instrument UStore's own targets and the sibling headers they compile, while RocksDB, LevelDB, liburing,
-# fmt, yyjson and the sibling archives keep their release flags. -O1 keeps the instrumented suites tolerable outside
-# Debug.
-add_library(ustore_sanitizers INTERFACE)
-if (USTORE_BUILD_SANITIZERS STREQUAL "address")
-    if (MSVC)
-        set(ustore_sanitizer_flags_ /fsanitize=address)
-    else ()
-        set(ustore_sanitizer_flags_ -fsanitize=address,undefined)
-    endif ()
-elseif (USTORE_BUILD_SANITIZERS STREQUAL "thread")
-    if (MSVC)
-        message(FATAL_ERROR "MSVC has no ThreadSanitizer, so USTORE_BUILD_SANITIZERS=thread needs Clang or GCC")
-    endif ()
-    set(ustore_sanitizer_flags_ -fsanitize=thread)
-elseif (NOT USTORE_BUILD_SANITIZERS STREQUAL "off")
-    message(FATAL_ERROR "USTORE_BUILD_SANITIZERS is off, address or thread, not '${USTORE_BUILD_SANITIZERS}'")
-endif ()
-if (ustore_sanitizer_flags_ AND NOT MSVC)
-    target_compile_options(
-        ustore_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ustore_sanitizer_flags_};-fno-omit-frame-pointer>"
-                                    "$<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<NOT:$<CONFIG:Debug>>>:-O1>"
-    )
-    target_link_options(ustore_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ustore_sanitizer_flags_}>")
-elseif (ustore_sanitizer_flags_)
-    target_compile_options(ustore_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ustore_sanitizer_flags_}>")
-endif ()
+include(cmake/ustore_platform.cmake)
 
 find_package(Threads REQUIRED)
 include(GNUInstallDirs)
@@ -213,57 +136,7 @@ include(cmake/fmt.cmake)
 set(YYJSON_INSTALL OFF)
 include(cmake/yyjson.cmake)
 
-# A sibling builds from its nested checkout, or else from the commit its submodule pins, fetched unless
-# `FETCHCONTENT_SOURCE_DIR_<NAME>` names a local checkout, as in a workspace that keeps the siblings side by side. The
-# caller passes that override variable, so nothing derives its name.
-function (ustore_sibling name_ override_ repository_ tag_)
-    if (TARGET ${name_}::header)
-        return()
-    endif ()
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED ${override_})
-        add_subdirectory(${name_} EXCLUDE_FROM_ALL SYSTEM)
-    else ()
-        message(STATUS "ustore: ${name_} submodule absent or overridden, fetching ${tag_}")
-        FetchContent_Declare(
-            ${name_}
-            GIT_REPOSITORY ${repository_}
-            GIT_TAG ${tag_}
-            EXCLUDE_FROM_ALL SYSTEM
-        )
-        FetchContent_MakeAvailable(${name_})
-    endif ()
-endfunction ()
-
-# The siblings tune their own units for the same CPU, and probe what this host runs under `native`.
-if (USTORE_TARGET_ARCH)
-    set(FORKUNION_TARGET_ARCH ${USTORE_TARGET_ARCH})
-    set(STRINGZILLA_TARGET_ARCH ${USTORE_TARGET_ARCH})
-endif ()
-
-# ForkUnion's C ABI, linked statically into every engine and suite
-ustore_sibling(
-    forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
-    12a0a2706534452830868b7e33a4697549c898d5
-)
-# Every UStore thread runs inside ForkUnion's compiled pool, whose barriers ThreadSanitizer sees only once that archive
-# is instrumented as well
-if (USTORE_BUILD_SANITIZERS STREQUAL "thread")
-    target_link_libraries(forkunion_static PRIVATE ustore_sanitizers)
-endif ()
-
-# SmashTable's containers, header-only
-ustore_sibling(
-    smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable.git
-    e0db741da4e7b9cf6bc13aa493eff264aff3cfb8
-)
-
-# StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
-# the running CPU supports. NumKong is unused today; wiring it in later is the same add_subdirectory plus a
-# numkong::header link, once something includes its headers.
-ustore_sibling(
-    stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla.git
-    a4e9f5b0ac91481a5c30957e05d2310f3928c1d8
-)
+include(cmake/ustore_siblings.cmake)
 
 # The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
 # headers they reach into. The package installs UStore's own headers alone, so a consumer brings each sibling's.
@@ -285,63 +158,7 @@ target_link_libraries(
                             $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:ustore_sanitizers>
 )
 
-# NVMe's compaction on the device, the CUDA runtime library every engine and suite links once the build carries it. The
-# GPU half is opt-in, so a build without it leaves the toolkit alone.
-if (USTORE_BUILD_CUDA)
-    include(CheckLanguage)
-
-    # A toolkit installed outside the PATH, which is where the distribution packages put it
-    if (NOT DEFINED CMAKE_CUDA_COMPILER)
-        find_program(USTORE_NVCC nvcc HINTS /usr/local/cuda/bin /opt/cuda/bin)
-        if (USTORE_NVCC)
-            set(CMAKE_CUDA_COMPILER "${USTORE_NVCC}")
-        endif ()
-    endif ()
-    check_language(CUDA)
-    if (NOT CMAKE_CUDA_COMPILER)
-        message(
-            WARNING
-                "UStore: no CUDA compiler found, so only the host compaction suite builds - install CUDA 13 or newer"
-        )
-    endif ()
-endif ()
-if (USTORE_BUILD_CUDA AND CMAKE_CUDA_COMPILER)
-    if (CMAKE_VERSION VERSION_LESS 3.31 AND USTORE_CUDA_ARCHITECTURES MATCHES "1[0-9][0-9][af]")
-        message(FATAL_ERROR "Three-digit \"a\" and \"f\" CUDA codes need CMake 3.31, found ${CMAKE_VERSION}")
-    endif ()
-    # The same codes on every machine, rather than whatever GPU the building one carries
-    set(CMAKE_CUDA_ARCHITECTURES ${USTORE_CUDA_ARCHITECTURES})
-    enable_language(CUDA)
-    if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13)
-        message(FATAL_ERROR "UStore needs CUDA 13 or newer, found ${CMAKE_CUDA_COMPILER_VERSION}")
-    endif ()
-    find_package(CUDAToolkit REQUIRED)
-    # NVCC's default leaves Turing and Ampere cubins uncompressed, ten times their compressed size.
-    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>)
-    include(cmake/cccl.cmake)
-
-    add_library(ustore_nvme_compaction STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cu")
-    target_link_libraries(
-        ustore_nvme_compaction
-        PUBLIC CCCL::CUB CUDA::cudart ustore_header smashtable::header forkunion::header
-        PRIVATE stringzilla::static
-    )
-    set_target_properties(ustore_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-    target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
-    # The host pass reads nvcc's preprocessed output, where every header is the main file and every macro is expanded,
-    # so constant operands from capability macros and unused statics of the C headers would warn there and nowhere else
-    target_compile_options(
-        ustore_nvme_compaction
-        PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-constant-logical-operand,-Wno-unneeded-internal-declaration>
-    )
-    # A constexpr function is callable from a kernel, so the shared headers carry no host-device qualifier
-    target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-    # StringZilla's serial kernels, reached through the engine's key slots, carry GCC pragmas nvcc's front end does not
-    # know
-    target_compile_options(ustore_nvme_compaction PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=1675>)
-    # Every target linking the library merges on the device, and every other one takes the host branch of the merger
-    target_compile_definitions(ustore_nvme_compaction PUBLIC USTORE_WITH_CUDA=1)
-endif ()
+include(cmake/ustore_gpu.cmake)
 
 # The RAM and NVMe engines compile one variant per CPU class, in `src/<engine>/variants_<class>.cpp`, and their opens
 # pick the newest one the running CPU admits. A class is its parent plus the ForkUnion capabilities its waiter and
@@ -536,42 +353,6 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
 endforeach ()
-
-# Both libraries install with a CMake package, `find_package(ustore)` naming them `ustore::static` and `ustore::shared`;
-# the engine archives install beside them as `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`, which
-# `ustore::static` links
-if (USTORE_INSTALL)
-    include(CMakePackageConfigHelpers)
-    set(ustore_config_install_dir_ "${CMAKE_INSTALL_LIBDIR}/cmake/ustore")
-    install(
-        TARGETS ustore_header ustore_static ustore_shared ${ustore_engine_archives_}
-        EXPORT ustoreTargets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
-    install(
-        EXPORT ustoreTargets
-        NAMESPACE ustore::
-        DESTINATION ${ustore_config_install_dir_}
-    )
-    file(
-        WRITE "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfig.cmake"
-        [[include(CMakeFindDependencyMacro)
-find_dependency(Threads)
-include("${CMAKE_CURRENT_LIST_DIR}/ustoreTargets.cmake")
-]]
-    )
-    write_basic_package_version_file(
-        "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfigVersion.cmake"
-        VERSION ${PROJECT_VERSION}
-        COMPATIBILITY SameMajorVersion
-    )
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfig.cmake"
-                  "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfigVersion.cmake" DESTINATION ${ustore_config_install_dir_}
-    )
-    install(DIRECTORY c/ustore cpp/ustore include/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-endif ()
 
 if (${USTORE_BUILD_TOOLS})
     add_executable(ustore_cli tools/cli.cpp tools/dataset.cpp)
@@ -880,3 +661,5 @@ endif ()
 if (${USTORE_BUILD_PYTHON})
     add_subdirectory(python)
 endif ()
+
+include(cmake/ustore_install.cmake)
