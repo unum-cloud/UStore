@@ -92,6 +92,7 @@ constexpr enumerator_spelling<ustore_cpu_class_t> cpu_class_names_k[] {
     {ustore_cpu_class_aws_g2_k, "aws-g2"},
     {ustore_cpu_class_apple_m2_k, "apple-m2"},
     {ustore_cpu_class_aws_g5_k, "aws-g5"},
+    {ustore_cpu_class_monoversioned_k, "monoversioned"},
 };
 
 /** The canonical spelling of every transport. */

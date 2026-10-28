@@ -21,16 +21,17 @@ function (ustore_sibling name_ override_ repository_ tag_)
     endif ()
 endfunction ()
 
-# The siblings tune their own units for the same CPU, and probe what this host runs under `native`.
-if (USTORE_TARGET_ARCH)
-    set(FORKUNION_TARGET_ARCH ${USTORE_TARGET_ARCH})
-    set(STRINGZILLA_TARGET_ARCH ${USTORE_TARGET_ARCH})
-endif ()
+# The siblings build for the floor and the build kind UStore builds for. StringZilla's GPU backends stay off, as the
+# compaction calls none and their toolkit headers would shadow the pinned CCCL in every unit linking StringZilla.
+foreach (sibling_ IN ITEMS FORKUNION STRINGZILLA SMASHTABLE)
+    set(${sibling_}_MARCH "${USTORE_MARCH}")
+    set(${sibling_}_MULTIVERSIONED "${USTORE_MULTIVERSIONED}")
+endforeach ()
 
 # ForkUnion's C ABI, linked statically into every engine and suite
 ustore_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
-    0b9296ebe0dc3886f4f850f0dc97d6ce382ac909
+    5fac4b88fcd2f611db41055da2b20e1e765449a2
 )
 # Every UStore thread runs inside ForkUnion's compiled pool, whose barriers ThreadSanitizer sees only once that archive
 # is instrumented as well
@@ -41,7 +42,7 @@ endif ()
 # SmashTable's containers, header-only
 ustore_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable.git
-    e45080c7ea61a5a9c7fc90ac8b9595b49b341574
+    fe3d32edb4685b925e62a427ef6ebdf74b311af9
 )
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
@@ -49,5 +50,5 @@ ustore_sibling(
 # numkong::header link, once something includes its headers.
 ustore_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla.git
-    53fb6a67b188561ffcab506ee3d03901716b1b49
+    a43a398cecd159f6c383843756540b898a45bee7
 )

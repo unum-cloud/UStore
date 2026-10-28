@@ -38,7 +38,10 @@ option(USTORE_BUILD_BENCH "Compile the C++ benchmarks in bench/" OFF)
 option(USTORE_BUILD_TOOLS "Compile the CLI and the dataset tools in tools/" OFF)
 option(USTORE_BUILD_SHARED "Compile the static and shared C libraries in the default build" OFF)
 option(USTORE_BUILD_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
-option(USTORE_BUILD_CUDA "Compile NVMe's GPU compaction" OFF)
+set(USTORE_CUDA_ARCH
+    ""
+    CACHE STRING "NVIDIA code NVMe's GPU compaction builds for: empty, all, native or one like 100f"
+)
 option(USTORE_WERROR "Treat compiler warnings as errors" OFF)
 option(USTORE_BUNDLE_SIBLINGS "Copy the ForkUnion and StringZilla objects into ustore_static; Cargo links their own" ON)
 set(USTORE_BUILD_SANITIZERS
@@ -46,26 +49,19 @@ set(USTORE_BUILD_SANITIZERS
     CACHE STRING "Sanitizers for UStore's own targets: off, address (with undefined) or thread"
 )
 set_property(CACHE USTORE_BUILD_SANITIZERS PROPERTY STRINGS off address thread)
-# Seeded from the environment at the first configure, so `cargo` and `scikit-build-core` honour
-# `USTORE_TARGET_ARCH=native`.
-set(USTORE_TARGET_ARCH
-    "$ENV{USTORE_TARGET_ARCH}"
+# Seeded from the environment at the first configure, so `cargo` and `scikit-build-core` honour `USTORE_MARCH=native`
+# and `USTORE_MULTIVERSIONED=OFF`.
+set(USTORE_MARCH
+    "$ENV{USTORE_MARCH}"
     CACHE STRING
-          "CPU the own units and the siblings are tuned for: empty for the toolchain default, native, or a CPU name"
+          "The `-march` floor: empty for the toolchain default, an ISA level, native, or a CPU like graniterapids"
 )
-set(USTORE_TARGET_CLASSES
-    ""
-    CACHE STRING "CPU classes compiled beside serial: empty for every class, a list like apple_m2, or native"
-)
-if (USTORE_TARGET_CLASSES STREQUAL "native" AND NOT USTORE_TARGET_ARCH STREQUAL "native")
-    message(FATAL_ERROR "USTORE_TARGET_CLASSES=native reads what this host runs, which the siblings probe only under "
-                        "USTORE_TARGET_ARCH=native"
-    )
+set(ustore_multiversioned_ ON)
+if (DEFINED ENV{USTORE_MULTIVERSIONED})
+    set(ustore_multiversioned_ "$ENV{USTORE_MULTIVERSIONED}")
 endif ()
-# CUB is all the compaction kernels call, so one plain code per generation covers Ampere through Blackwell.
-set(USTORE_CUDA_ARCHITECTURES
-    "80;90;100;120"
-    CACHE STRING "GPU architectures NVMe's compaction compiles for"
+option(USTORE_MULTIVERSIONED "Compile every CPU class above the floor, or one monoversioned class for USTORE_MARCH"
+       ${ustore_multiversioned_}
 )
 
 # C++20 is a floor each UStore target declares through `cxx_std_20`, so fetched dependencies build at the standard they
@@ -164,59 +160,90 @@ include(cmake/ustore_gpu.cmake)
 # pick the newest one the running CPU admits. A class is its parent plus the ForkUnion capabilities its waiter and
 # atomic reference add beyond the spin hint every core of an architecture carries, restated here row for row from
 # `parent_class_of`, `waiter_for_cpu_class` and `atomic_ref_for_cpu_class` of `src/lib.hpp`. It exists when its parent
-# does and every one of those capabilities is enabled, and compiles when it also passes `USTORE_TARGET_CLASSES`, which
-# every UStore unit reads as `USTORE_TARGET_<CLASS>` set to 0 or 1, collected in `ustore_cpu_gates_`. ForkUnion spells
-# each instruction in the assembly itself, so a class needs no flags of its own, and the `serial` class is the floor
-# every CPU runs.
+# does and every one of those capabilities is enabled. A multiversioned build keeps every class that exists. A
+# monoversioned build keeps none, the `serial` floor included, and compiles the one `monoversioned` class instead, with
+# the waiter and atomic reference ForkUnion picks for `USTORE_MARCH` and what a preset vouches for. Every UStore unit
+# reads the kept classes as `USTORE_TARGET_<CLASS>` set to 0 or 1, collected in `ustore_cpu_gates_`. ForkUnion spells
+# each instruction in the assembly itself, so a class needs no flags of its own.
 set(ustore_class_serial_exists_ TRUE)
-set(ustore_cpu_classes_ serial)
-set(ustore_cpu_gates_)
+set(ustore_class_serial_kept_ ${USTORE_MULTIVERSIONED})
+set(ustore_class_serial_macro_ SERIAL)
+set(ustore_cpu_rows_ serial)
 
 # Declares the CPU class @p class_, gated as `USTORE_TARGET_<target_macro_>`, over the class named after `OVER` and the
-# ForkUnion capabilities after it. A targeted build keeps serial and the named classes, or under `native` the classes
-# this host runs in full.
+# ForkUnion capabilities after it.
 function (ustore_cpu_class class_ target_macro_)
     cmake_parse_arguments(PARSE_ARGV 2 arg "" "OVER" "")
     set(exists_ ${ustore_class_${arg_OVER}_exists_})
-    set(kept_ ${exists_})
     foreach (capability_ IN LISTS arg_UNPARSED_ARGUMENTS)
         if (NOT forkunion_target_${capability_}_enabled)
             set(exists_ FALSE)
-            set(kept_ FALSE)
-        elseif (USTORE_TARGET_CLASSES STREQUAL "native" AND NOT forkunion_target_${capability_}_runs)
-            set(kept_ FALSE)
         endif ()
     endforeach ()
-    if (USTORE_TARGET_CLASSES
-        AND NOT USTORE_TARGET_CLASSES STREQUAL "native"
-        AND NOT class_ IN_LIST USTORE_TARGET_CLASSES
-    )
-        set(kept_ FALSE)
+    set(kept_ FALSE)
+    if (USTORE_MULTIVERSIONED)
+        set(kept_ ${exists_})
     endif ()
     set(ustore_class_${class_}_exists_
         ${exists_}
         PARENT_SCOPE
     )
-    if (kept_)
-        set(ustore_cpu_classes_
-            ${ustore_cpu_classes_} ${class_}
-            PARENT_SCOPE
-        )
-        set(ustore_cpu_gates_
-            ${ustore_cpu_gates_} "USTORE_TARGET_${target_macro_}=1"
-            PARENT_SCOPE
-        )
-    else ()
-        set(ustore_cpu_gates_
-            ${ustore_cpu_gates_} "USTORE_TARGET_${target_macro_}=0"
-            PARENT_SCOPE
-        )
-    endif ()
+    set(ustore_class_${class_}_kept_
+        ${kept_}
+        PARENT_SCOPE
+    )
+    set(ustore_class_${class_}_macro_
+        ${target_macro_}
+        PARENT_SCOPE
+    )
+    set(ustore_cpu_rows_
+        ${ustore_cpu_rows_} ${class_}
+        PARENT_SCOPE
+    )
 endfunction ()
 
 ustore_cpu_class(intel_sierra INTEL_SIERRA OVER serial x86_tpause x86_cmpccxadd)
 ustore_cpu_class(apple_m2 APPLE_M2 OVER serial arm64_lse arm64_rcpc)
-ustore_cpu_class(aws_g5 AWS_G5 OVER apple_m2 arm64_wfet)
+
+# A monoversioned build compiles one class: every capability StringZilla and ForkUnion enabled, which is what
+# `USTORE_MARCH` implies plus what a preset vouches for.
+set(ustore_class_monoversioned_macro_ MONOVERSIONED)
+set(ustore_monoversioned_capabilities_)
+if (NOT USTORE_MULTIVERSIONED)
+    foreach (library_ IN ITEMS stringzilla forkunion)
+        get_property(enabled_ GLOBAL PROPERTY ${library_}_capabilities_enabled)
+        foreach (capability_ IN LISTS enabled_)
+            if (NOT DEFINED ${library_}_target_${capability_}_architectures
+                AND NOT "${ustore_monoversioned_capabilities_} " MATCHES " ${capability_} "
+            )
+                string(APPEND ustore_monoversioned_capabilities_ " ${capability_}")
+            endif ()
+        endforeach ()
+    endforeach ()
+    set(ustore_class_monoversioned_kept_ TRUE)
+endif ()
+list(APPEND ustore_cpu_rows_ monoversioned)
+
+set(ustore_cpu_classes_)
+set(ustore_cpu_gates_)
+foreach (class_ IN LISTS ustore_cpu_rows_)
+    if (ustore_class_${class_}_kept_)
+        list(APPEND ustore_cpu_classes_ ${class_})
+        list(APPEND ustore_cpu_gates_ "USTORE_TARGET_${ustore_class_${class_}_macro_}=1")
+    else ()
+        list(APPEND ustore_cpu_gates_ "USTORE_TARGET_${ustore_class_${class_}_macro_}=0")
+    endif ()
+endforeach ()
+if (USTORE_MARCH)
+    set(ustore_floor_ "${USTORE_MARCH}")
+else ()
+    set(ustore_floor_ "the portable floor")
+endif ()
+if (USTORE_MULTIVERSIONED)
+    message(STATUS "UStore: multiversioned above ${ustore_floor_}")
+else ()
+    message(STATUS "UStore: monoversioned for ${ustore_floor_}:${ustore_monoversioned_capabilities_}")
+endif ()
 
 # Without `USTORE_BUILD_SHARED`, the libraries build only for the targets that link them
 if (NOT USTORE_BUILD_SHARED AND NOT USTORE_INSTALL)

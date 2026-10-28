@@ -19,13 +19,15 @@ namespace unum::ustore::nvme {
 #if USTORE_TARGET_INTEL_SIERRA
 extern template struct nvme_variant<cpu_class_t::intel_sierra_k>;
 #endif // USTORE_TARGET_INTEL_SIERRA
-#if USTORE_TARGET_AWS_G5
-extern template struct nvme_variant<cpu_class_t::aws_g5_k>;
-#endif // USTORE_TARGET_AWS_G5
 #if USTORE_TARGET_APPLE_M2
 extern template struct nvme_variant<cpu_class_t::apple_m2_k>;
 #endif // USTORE_TARGET_APPLE_M2
+#if USTORE_TARGET_SERIAL
 extern template struct nvme_variant<cpu_class_t::serial_k>;
+#endif // USTORE_TARGET_SERIAL
+#if USTORE_TARGET_MONOVERSIONED
+extern template struct nvme_variant<cpu_class_t::monoversioned_k>;
+#endif // USTORE_TARGET_MONOVERSIONED
 
 /** Implements @c ustore_database_open_nvme with the newest class @p ceiling fits, each lineage newest first. */
 status_t open(ustore_database_open_nvme_t const& arguments, cpu_ceiling_t ceiling, view_t const& view) noexcept {

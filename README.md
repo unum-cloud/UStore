@@ -240,7 +240,7 @@ An engine reports itself through `ustore_database_describe`: its name, what it s
 The C++ `database_t` exposes the capability bits as `supports_transactions`, `supports_snapshots` and `supports_collections`.
 `ustore_database_clear` empties every collection at once, and `ustore_database_compact` reclaims the space overwritten and removed data still takes.
 NVMe's sources are not yet ported to the current C ABI, so `USTORE_WITH_NVME` stays off until they build.
-Once ported, NVMe runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_BUILD_CUDA`; [`src/nvme/README.md`](src/nvme/README.md) describes its layers.
+Once ported, NVMe runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_CUDA_ARCH`; [`src/nvme/README.md`](src/nvme/README.md) describes its layers.
 
 ## Compatibility
 

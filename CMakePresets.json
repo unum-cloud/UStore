@@ -69,7 +69,7 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
-        "CMAKE_CUDA_FLAGS_RELWITHDEBINFO": "-O0 -Xptxas -O0 -DNDEBUG",
+        "CMAKE_CUDA_FLAGS_RELWITHDEBINFO": "-O0 -Xcicc -O0 -Xptxas -O0 -DNDEBUG",
         "USTORE_BUILD_TEST": "ON",
         "USTORE_BUILD_BENCH": "ON",
         "USTORE_BUILD_TOOLS": "ON",
@@ -152,8 +152,7 @@
         "CMAKE_CUDA_FLAGS_RELWITHDEBINFO": "-O2 -lineinfo -DNDEBUG",
         "USTORE_WITH_NVME": "ON",
         "CMAKE_CUDA_HOST_COMPILER": "clang++",
-        "USTORE_BUILD_CUDA": "ON",
-        "USTORE_CUDA_ARCHITECTURES": "native"
+        "USTORE_CUDA_ARCH": "native"
       }
     },
     {
@@ -203,7 +202,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "EMSCRIPTEN_SYSTEM_PROCESSOR": "wasm32",
-        "USTORE_TARGET_ARCH": "v128",
+        "USTORE_MARCH": "v128",
         "USTORE_BUILD_SHARED": "ON"
       }
     },
@@ -214,7 +213,7 @@
       "description": "The extended module over the RAM engine: Memory64, threads and Relaxed SIMD, the flags Emscripten's toolchain reads as it loads.",
       "cacheVariables": {
         "EMSCRIPTEN_SYSTEM_PROCESSOR": "wasm64",
-        "USTORE_TARGET_ARCH": "v128relaxed",
+        "USTORE_MARCH": "v128relaxed",
         "CMAKE_C_FLAGS": "--target=wasm64 -pthread",
         "CMAKE_CXX_FLAGS": "--target=wasm64 -pthread"
       }
@@ -223,57 +222,114 @@
       "name": "machine",
       "hidden": true,
       "inherits": ["llvm", "linux"],
-      "description": "The libraries for one machine: its CPU, serial plus the one CPU class it runs in full, and its one GPU code for the NVMe engine's compaction.",
+      "description": "One machine: its CPU floor, every kernel-library capability spelled as 1 or 0, and its one GPU code.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "USTORE_BUILD_SHARED": "ON",
         "USTORE_WITH_NVME": "ON",
         "CMAKE_CUDA_HOST_COMPILER": "clang++",
-        "USTORE_BUILD_CUDA": "ON",
-        "STRINGZILLA_PROFILE_CAPABILITIES": "ON"
+        "USTORE_MULTIVERSIONED": "OFF"
       }
     },
     {
       "name": "xeon4_hopper",
       "inherits": "machine",
       "displayName": "Xeon 4 with Hopper - compile only",
-      "description": "Sapphire Rapids runs no class above serial in full, as it lacks CMPCCXADD.",
       "cacheVariables": {
-        "USTORE_TARGET_ARCH": "sapphirerapids",
-        "USTORE_TARGET_CLASSES": "serial",
-        "USTORE_CUDA_ARCHITECTURES": "90a-real"
+        "USTORE_MARCH": "sapphirerapids",
+        "USTORE_CUDA_ARCH": "90a",
+        "STRINGZILLA_TARGET_WESTMERE": "1",
+        "STRINGZILLA_TARGET_GOLDMONT": "1",
+        "STRINGZILLA_TARGET_HASWELL": "1",
+        "STRINGZILLA_TARGET_SKYLAKE": "1",
+        "STRINGZILLA_TARGET_ICELAKE": "1",
+        "FORKUNION_TARGET_X86_PAUSE": "1",
+        "FORKUNION_TARGET_X86_TPAUSE": "1",
+        "FORKUNION_TARGET_X86_CLDEMOTE": "1",
+        "FORKUNION_TARGET_X86_CMPCCXADD": "0",
+        "FORKUNION_TARGET_X86_RAOINT": "0"
       }
     },
     {
       "name": "xeon6_blackwell",
       "inherits": "machine",
       "displayName": "Xeon 6 with Blackwell - compile only",
-      "description": "Granite Rapids runs no class above serial in full, as it lacks CMPCCXADD.",
       "cacheVariables": {
-        "USTORE_TARGET_ARCH": "graniterapids",
-        "USTORE_TARGET_CLASSES": "serial",
-        "USTORE_CUDA_ARCHITECTURES": "100f-real"
+        "USTORE_MARCH": "graniterapids",
+        "USTORE_CUDA_ARCH": "100f",
+        "STRINGZILLA_TARGET_WESTMERE": "1",
+        "STRINGZILLA_TARGET_GOLDMONT": "1",
+        "STRINGZILLA_TARGET_HASWELL": "1",
+        "STRINGZILLA_TARGET_SKYLAKE": "1",
+        "STRINGZILLA_TARGET_ICELAKE": "1",
+        "FORKUNION_TARGET_X86_PAUSE": "1",
+        "FORKUNION_TARGET_X86_TPAUSE": "1",
+        "FORKUNION_TARGET_X86_CLDEMOTE": "1",
+        "FORKUNION_TARGET_X86_CMPCCXADD": "0",
+        "FORKUNION_TARGET_X86_RAOINT": "0"
       }
     },
     {
       "name": "grace_hopper",
       "inherits": "machine",
       "displayName": "Grace with Hopper - compile only",
+      "description": "Grace's 128-bit SVE gains nothing over NEON, so every SVE capability is off.",
       "cacheVariables": {
-        "USTORE_TARGET_ARCH": "neoverse-v2",
-        "USTORE_TARGET_CLASSES": "apple_m2",
-        "USTORE_CUDA_ARCHITECTURES": "90a-real"
+        "USTORE_MARCH": "grace",
+        "USTORE_CUDA_ARCH": "90a",
+        "STRINGZILLA_TARGET_NEON": "1",
+        "STRINGZILLA_TARGET_NEONAES": "1",
+        "STRINGZILLA_TARGET_NEONSHA": "1",
+        "STRINGZILLA_TARGET_SVE": "0",
+        "STRINGZILLA_TARGET_SVE2": "0",
+        "STRINGZILLA_TARGET_SVE2AES": "0",
+        "FORKUNION_TARGET_ARM64_YIELD": "1",
+        "FORKUNION_TARGET_ARM64_WFET": "0",
+        "FORKUNION_TARGET_ARM64_DC_CVAC": "1",
+        "FORKUNION_TARGET_ARM64_PRFM": "1",
+        "FORKUNION_TARGET_ARM64_LSE": "1",
+        "FORKUNION_TARGET_ARM64_RCPC": "1"
       }
     },
     {
       "name": "vera_rubin",
       "inherits": "machine",
       "displayName": "Vera with Rubin - compile only",
-      "description": "Olympus cores need Clang 22 or GCC 15, and CUDA 13.4 names no Rubin code, so it compiles 100f.",
+      "description": "Olympus cores need Clang 22 or GCC 15 and CUDA 13.4 names no Rubin code, so it compiles 100f; WFET is on, as no compiler macro reports it, and SVE off, as on Grace.",
       "cacheVariables": {
-        "USTORE_TARGET_ARCH": "olympus",
-        "USTORE_TARGET_CLASSES": "aws_g5",
-        "USTORE_CUDA_ARCHITECTURES": "100f-real"
+        "USTORE_MARCH": "olympus",
+        "USTORE_CUDA_ARCH": "100f",
+        "STRINGZILLA_TARGET_NEON": "1",
+        "STRINGZILLA_TARGET_NEONAES": "1",
+        "STRINGZILLA_TARGET_NEONSHA": "1",
+        "STRINGZILLA_TARGET_SVE": "0",
+        "STRINGZILLA_TARGET_SVE2": "0",
+        "STRINGZILLA_TARGET_SVE2AES": "0",
+        "FORKUNION_TARGET_ARM64_YIELD": "1",
+        "FORKUNION_TARGET_ARM64_WFET": "1",
+        "FORKUNION_TARGET_ARM64_DC_CVAC": "1",
+        "FORKUNION_TARGET_ARM64_PRFM": "1",
+        "FORKUNION_TARGET_ARM64_LSE": "1",
+        "FORKUNION_TARGET_ARM64_RCPC": "1"
+      }
+    },
+    {
+      "name": "venice_mi450",
+      "inherits": "machine",
+      "displayName": "EPYC Venice with MI450 - compile only",
+      "description": "Clang 22 names no Zen 6 core, so it compiles at znver5 and spells the rows GCC 16's znver6 implies; gfx1250 covers MI450X and MI455X.",
+      "cacheVariables": {
+        "USTORE_MARCH": "znver5",
+        "STRINGZILLA_TARGET_WESTMERE": "1",
+        "STRINGZILLA_TARGET_GOLDMONT": "1",
+        "STRINGZILLA_TARGET_HASWELL": "1",
+        "STRINGZILLA_TARGET_SKYLAKE": "1",
+        "STRINGZILLA_TARGET_ICELAKE": "1",
+        "FORKUNION_TARGET_X86_PAUSE": "1",
+        "FORKUNION_TARGET_X86_TPAUSE": "0",
+        "FORKUNION_TARGET_X86_CLDEMOTE": "1",
+        "FORKUNION_TARGET_X86_CMPCCXADD": "0",
+        "FORKUNION_TARGET_X86_RAOINT": "0"
       }
     }
   ],

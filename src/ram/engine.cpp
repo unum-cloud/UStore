@@ -36,16 +36,18 @@ namespace unum::ustore::ram {
 extern template struct ram_variant<cpu_class_t::intel_sierra_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::intel_sierra_k, isolation_t::strict_serializable_k>;
 #endif // USTORE_TARGET_INTEL_SIERRA
-#if USTORE_TARGET_AWS_G5
-extern template struct ram_variant<cpu_class_t::aws_g5_k, isolation_t::snapshot_k>;
-extern template struct ram_variant<cpu_class_t::aws_g5_k, isolation_t::strict_serializable_k>;
-#endif // USTORE_TARGET_AWS_G5
 #if USTORE_TARGET_APPLE_M2
 extern template struct ram_variant<cpu_class_t::apple_m2_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::apple_m2_k, isolation_t::strict_serializable_k>;
 #endif // USTORE_TARGET_APPLE_M2
+#if USTORE_TARGET_SERIAL
 extern template struct ram_variant<cpu_class_t::serial_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::serial_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_SERIAL
+#if USTORE_TARGET_MONOVERSIONED
+extern template struct ram_variant<cpu_class_t::monoversioned_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::monoversioned_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_MONOVERSIONED
 
 /** Opens a database of @p cpu_class_ at @p isolation into @p database. */
 template <cpu_class_t cpu_class_>

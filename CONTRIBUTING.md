@@ -37,9 +37,12 @@ Only `release` and the Windows presets add RocksDB and LevelDB; every other pres
 `msvc2026_x64` and `msvc2022_arm64` build `release` with Visual Studio, while `android_arm64`, `wasm32_emscripten` and `wasm64_emscripten` compile the libraries over the RAM engine and run nothing.
 `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` and `CMAKE_CUDA_COMPILER_LAUNCHER` come from the environment, so exporting `ccache` there caches objects in every tree.
 
-`USTORE_TARGET_ARCH` tunes UStore's own units for one CPU, `native` or a name like `graniterapids`, and hands the same value to ForkUnion and StringZilla.
-`USTORE_TARGET_CLASSES` compiles `serial` plus the CPU classes it lists, or under `native` the classes this host runs in full, which needs `USTORE_TARGET_ARCH=native`; empty compiles every class.
-The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set both, with the one CUDA code of their GPU, and CI compiles each of them.
+`USTORE_MARCH` sets the floor of UStore's own units, an ISA level like `x86-64-v3`, `native` or a CPU name like `graniterapids`, and hands the same value and build kind to ForkUnion, StringZilla and SmashTable.
+`USTORE_MULTIVERSIONED` is the build kind: `ON` by default, a multiversioned build of every CPU class the toolchain compiles, picked at runtime, or with `OFF` a monoversioned build of one `monoversioned` class and no named class, `serial` included.
+That class takes the waiter, atomic reference and string kernels StringZilla and ForkUnion enabled: what the floor implies, plus what `-D <LIB>_TARGET_<CAP>=1` vouches for where no compiler macro reports it, like `FORKUNION_TARGET_ARM64_WFET=1` on Vera.
+A handle pinned below it, or opened on a CPU lacking it, gets `ustore_status_unsupported_k`, and both switches are seeded from the environment variables of the same name.
+`USTORE_CUDA_ARCH` adds NVMe's GPU compaction, whose CUB kernels need only plain codes: `all` compiles a cubin per generation from Ampere through Blackwell and the Ampere PTX for every later GPU, `native` the code of each visible GPU, and one code like `100f` its cubin alone.
+The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set `USTORE_MARCH` with `USTORE_MULTIVERSIONED=OFF` and the one CUDA code of their GPU, and CI compiles each of them.
 
 ## Layout and Namespaces
 

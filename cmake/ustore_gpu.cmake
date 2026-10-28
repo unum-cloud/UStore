@@ -1,8 +1,8 @@
-# The CUDA compiler, its architectures and toolkit, and NVMe's compaction library on the device.
+# The CUDA compiler, its codes and toolkit, and NVMe's compaction library on the device.
 
 # NVMe's compaction on the device, the CUDA runtime library every engine and suite links once the build carries it. The
 # GPU half is opt-in, so a build without it leaves the toolkit alone.
-if (USTORE_BUILD_CUDA)
+if (USTORE_CUDA_ARCH)
     include(CheckLanguage)
 
     # A toolkit installed outside the PATH, which is where the distribution packages put it
@@ -20,12 +20,22 @@ if (USTORE_BUILD_CUDA)
         )
     endif ()
 endif ()
-if (USTORE_BUILD_CUDA AND CMAKE_CUDA_COMPILER)
-    if (CMAKE_VERSION VERSION_LESS 3.31 AND USTORE_CUDA_ARCHITECTURES MATCHES "1[0-9][0-9][af]")
+if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
+    # CUB is all the compaction kernels call, so plain codes cover Ampere through Blackwell: `all` carries a cubin per
+    # generation and the floor's PTX for every later GPU, `native` the code of each visible GPU, and a named code its
+    # cubin alone.
+    if (USTORE_CUDA_ARCH STREQUAL "all")
+        set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real 100-real 120-real 80-virtual)
+    elseif (USTORE_CUDA_ARCH STREQUAL "native")
+        set(CMAKE_CUDA_ARCHITECTURES native)
+    elseif (USTORE_CUDA_ARCH MATCHES "^[0-9]+[af]?$")
+        set(CMAKE_CUDA_ARCHITECTURES ${USTORE_CUDA_ARCH}-real)
+    else ()
+        message(FATAL_ERROR "USTORE_CUDA_ARCH takes all, native or one code like 100f, not `${USTORE_CUDA_ARCH}`")
+    endif ()
+    if (CMAKE_VERSION VERSION_LESS 3.31 AND CMAKE_CUDA_ARCHITECTURES MATCHES "1[0-9][0-9][af]")
         message(FATAL_ERROR "Three-digit \"a\" and \"f\" CUDA codes need CMake 3.31, found ${CMAKE_VERSION}")
     endif ()
-    # The same codes on every machine, rather than whatever GPU the building one carries
-    set(CMAKE_CUDA_ARCHITECTURES ${USTORE_CUDA_ARCHITECTURES})
     enable_language(CUDA)
     if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13)
         message(FATAL_ERROR "UStore needs CUDA 13 or newer, found ${CMAKE_CUDA_COMPILER_VERSION}")

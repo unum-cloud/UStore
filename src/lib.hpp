@@ -176,8 +176,12 @@ enum class cpu_class_t : std::uint32_t {
     /** Armv8.3+ Arm, named for Apple M2: single-instruction LSE read-modify-writes under RCpc acquiring loads. */
     apple_m2_k,
 
-    /** Graviton5-class Arm - Neoverse V3: the @c apple_m2_k atomics with @c WFET waits. */
+    /** Graviton5-class Arm - Neoverse V3: the @c apple_m2_k atomics with @c WFE waits; no build compiles it yet. */
     aws_g5_k,
+
+    /** The one class of a monoversioned build: the waiter, atomic reference and string kernels @c USTORE_MARCH
+     *  implies or a preset vouches for, as the libraries compiled them. */
+    monoversioned_k,
 };
 
 /** The class a refused rung degrades to - the next one down its own lineage, which is the class a
@@ -191,9 +195,10 @@ constexpr cpu_class_t parent_class_of(cpu_class_t cpu_class) noexcept {
     }
 }
 
-/** The wait instruction one CPU class pairs: the serial floor spins @c PAUSE on x86 and @c YIELD on
- *  Arm, the WAITPKG Xeons arm @c TPAUSE, the Armv8.7 classes arm @c WFET, everything else yields - as does any
- *  class whose @c FORKUNION_TARGET_<BIT> is off in the probe list. */
+/** The wait instruction one CPU class pairs: the serial floor spins @c PAUSE on x86 and @c YIELD on Arm, the WAITPKG
+ *  Xeons arm @c TPAUSE, the Graviton5 class sleeps in @c WFE on uncapped waits, everything else yields - as does any
+ *  class whose @c FORKUNION_TARGET_<BIT> is off in the probe list. The timed @c WFET only a monoversioned build
+ *  reaches, where a preset vouches for it. */
 template <cpu_class_t cpu_class_>
 struct waiter_for_cpu_class {
     using type = fu::standard_yield_t;
@@ -220,10 +225,16 @@ struct waiter_for_cpu_class<cpu_class_t::apple_m2_k> {
     using type = fu::arm64_yield_t;
 };
 #endif
-#if FORKUNION_TARGET_ARM64_WFET
+#if FORKUNION_TARGET_ARM64_WFE
 template <>
 struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
-    using type = fu::arm64_wfet_t;
+    using type = fu::arm64_wfe_t;
+};
+#endif
+#if USTORE_TARGET_MONOVERSIONED
+template <>
+struct waiter_for_cpu_class<cpu_class_t::monoversioned_k> {
+    using type = fu::preferred_yield_t;
 };
 #endif
 
@@ -270,6 +281,13 @@ struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
     using type = fu::arm64_lse_atomic_ref<value_type_>;
 };
 #endif
+#if USTORE_TARGET_MONOVERSIONED
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::monoversioned_k> {
+    template <typename value_type_>
+    using type = fu::preferred_atomic_ref<value_type_>;
+};
+#endif
 
 /** The reference a CPU class owns one word of @p value_type_ through, spelled short for the engines' own words. */
 template <cpu_class_t cpu_class_, typename value_type_>
@@ -293,7 +311,9 @@ constexpr fu::capabilities_t forkunion_capabilities_of() noexcept {
  *  through @c USTORE_TARGET_<CLASS>; a ladder never picks a class without one. */
 constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
     switch (cpu_class) {
+#if USTORE_TARGET_SERIAL
     case cpu_class_t::serial_k: return true;
+#endif
 #if USTORE_TARGET_INTEL_SIERRA
     case cpu_class_t::intel_sierra_k: return true;
 #endif
@@ -302,6 +322,9 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
 #endif
 #if USTORE_TARGET_AWS_G5
     case cpu_class_t::aws_g5_k: return true;
+#endif
+#if USTORE_TARGET_MONOVERSIONED
+    case cpu_class_t::monoversioned_k: return true;
 #endif
     default: return false;
     }
@@ -328,6 +351,7 @@ constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu_class) no
     case cpu_class_t::aws_g2_k: return forkunion_capabilities_of<cpu_class_t::aws_g2_k>();
     case cpu_class_t::apple_m2_k: return forkunion_capabilities_of<cpu_class_t::apple_m2_k>();
     case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
+    case cpu_class_t::monoversioned_k: return forkunion_capabilities_of<cpu_class_t::monoversioned_k>();
     default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
     }
 }
@@ -343,9 +367,9 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu_class) noe
     case cpu_class_t::intel_sierra_k:
         return stringzilla_capabilities_of(cpu_class_t::intel_haswell_k) | sz_cap_goldmont_k;
     case cpu_class_t::aws_g2_k:
-    case cpu_class_t::apple_m2_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
-    case cpu_class_t::aws_g5_k:
-        return stringzilla_capabilities_of(cpu_class_t::apple_m2_k) | sz_cap_sve_k | sz_cap_sve2_k | sz_cap_sve2aes_k;
+    case cpu_class_t::apple_m2_k:
+    case cpu_class_t::aws_g5_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
+    case cpu_class_t::monoversioned_k: return sz_capabilities_compiled_cpu_mask();
     default: return sz_cap_serial_k;
     }
 }
@@ -353,32 +377,17 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu_class) noe
 /** The C enum's class as the engines name it; @c ustore_cpu_class_unknown_k derives nothing, so it names the serial
  *  floor. */
 constexpr cpu_class_t cpu_class_of(ustore_cpu_class_t cpu_class) noexcept {
-    if (cpu_class == ustore_cpu_class_unknown_k || cpu_class > ustore_cpu_class_aws_g5_k) return cpu_class_t::serial_k;
+    if (cpu_class == ustore_cpu_class_unknown_k || cpu_class > ustore_cpu_class_monoversioned_k)
+        return cpu_class_t::serial_k;
     return static_cast<cpu_class_t>(cpu_class);
 }
 
-static_assert(static_cast<std::uint32_t>(cpu_class_t::aws_g5_k) == ustore_cpu_class_aws_g5_k);
+static_assert(static_cast<std::uint32_t>(cpu_class_t::monoversioned_k) == ustore_cpu_class_monoversioned_k);
 
-/** What a handle may use: the masks this machine runs when nothing is pinned, the pinned class's masks when it runs
- *  them, refusing an unknown class or one this machine does not run. The one caller of StringZilla's and ForkUnion's
- *  detection. */
-inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t pinned) noexcept {
-    cpu_ceiling_t detected;
-    if (sz_capabilities_detected_cpu(&detected.compute) != sz_success_k) detected.compute = sz_cap_serial_k;
-    detected.sync = fu::cpu_capabilities();
-    if (pinned == ustore_cpu_class_unknown_k) return detected;
-    if (pinned > ustore_cpu_class_aws_g5_k) return status_t {status_code_t::invalid_argument_k, "Unknown CPU class"};
-    cpu_class_t const pinned_class = cpu_class_of(pinned);
-    cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
-    if ((detected.compute & wanted.compute) != wanted.compute || (detected.sync & wanted.sync) != wanted.sync)
-        return status_t {status_code_t::unsupported_k, "The CPU does not run the pinned class"};
-    return wanted;
-}
-
-/** Whether @p rung fits under @p ceiling: its waiter and atomics need nothing the ceiling lacks, as its variant
- *  inlines no StringZilla kernel. */
+/** Whether @p rung fits under @p ceiling: its waiter, atomics and string kernels need nothing the ceiling lacks. */
 constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
-    return (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
+    return (stringzilla_capabilities_of(rung) & ~ceiling.compute) == 0 &&
+           (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
 }
 
 /** The mask a pool of an executor under @p ceiling is allowed: every placement bit, and the instructions the ceiling
@@ -392,10 +401,38 @@ constexpr fu_capabilities_t forkunion_allowed_of(cpu_ceiling_t ceiling) noexcept
 template <cpu_class_t... classes_>
 struct cpu_ladder {};
 
-/** The classes carrying variants, each lineage newest first and the serial floor last; a rung the build left out is
- *  skipped by the walk, never by the list. */
+/** The classes carrying variants, each lineage newest first and the serial floor last, or the one class of a
+ *  monoversioned build; a rung the build left out is skipped by the walk, never by the list. */
+#if USTORE_TARGET_MONOVERSIONED
+using cpu_ladder_t = cpu_ladder<cpu_class_t::monoversioned_k>;
+#else
 using cpu_ladder_t =
     cpu_ladder<cpu_class_t::intel_sierra_k, cpu_class_t::aws_g5_k, cpu_class_t::apple_m2_k, cpu_class_t::serial_k>;
+#endif
+
+/** What a handle may use: the masks this machine runs when nothing is pinned, the pinned class's masks when it runs
+ *  them, refusing an unknown class, one this machine does not run, or a ceiling the build compiled no class under, as
+ *  a monoversioned build on an older CPU or under a pin below its one class. The one caller of StringZilla's and
+ *  ForkUnion's detection. */
+inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t pinned) noexcept {
+    cpu_ceiling_t ceiling;
+    if (sz_capabilities_detected_cpu(&ceiling.compute) != sz_success_k) ceiling.compute = sz_cap_serial_k;
+    ceiling.sync = fu::cpu_capabilities();
+    if (pinned > ustore_cpu_class_monoversioned_k)
+        return status_t {status_code_t::invalid_argument_k, "Unknown CPU class"};
+    if (pinned != ustore_cpu_class_unknown_k) {
+        cpu_class_t const pinned_class = cpu_class_of(pinned);
+        cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
+        if ((ceiling.compute & wanted.compute) != wanted.compute || (ceiling.sync & wanted.sync) != wanted.sync)
+            return status_t {status_code_t::unsupported_k, "The CPU does not run the pinned class"};
+        ceiling = wanted;
+    }
+    bool const compiled = []<cpu_class_t... classes_>(cpu_ladder<classes_...>, cpu_ceiling_t under) noexcept {
+        return ((cpu_class_compiled(classes_) && cpu_rung_fits(classes_, under)) || ...);
+    }(cpu_ladder_t {}, ceiling);
+    if (!compiled) return status_t {status_code_t::unsupported_k, "The build compiled no class the CPU runs"};
+    return ceiling;
+}
 
 /** Opens through @p open on the newest rung of @p ladder the build compiled and @p ceiling fits, the serial floor
  *  last, calling it as <tt>open.template operator()<class>()</tt>; a class picking its parent's waiter and atomics is
@@ -405,7 +442,8 @@ status_t open_fitting_rung(cpu_ladder<classes_...>, cpu_ceiling_t ceiling, open_
     status_t opened;
     bool picked = false;
     auto rung = [&]<cpu_class_t class_>() noexcept {
-        if constexpr (class_ == cpu_class_t::serial_k || rung_advances<class_>()) {
+        constexpr bool floor_k = class_ == cpu_class_t::serial_k || class_ == cpu_class_t::monoversioned_k;
+        if constexpr ((floor_k && cpu_class_compiled(class_)) || rung_advances<class_>()) {
             if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, opened = open.template operator()<class_>();
         }
         else static_assert(!cpu_class_compiled(class_), "A compiled class no longer advances past the one below");

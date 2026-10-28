@@ -548,6 +548,9 @@ typedef enum ustore_cpu_class_t {
     /** Arm server cores from AWS Graviton 5 on. */
     ustore_cpu_class_aws_g5_k,
 
+    /** The one class of a monoversioned build, whatever its floor implies or its preset vouches for. */
+    ustore_cpu_class_monoversioned_k,
+
 } ustore_cpu_class_t;
 
 /** The canonical spelling of a CPU class, as @c ustore_cpu_class_intel_haswell_k spells "intel-haswell" and

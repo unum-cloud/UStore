@@ -134,6 +134,7 @@ class CPUClass(IntEnum):
     AWS_G2 = 6
     APPLE_M2 = 7
     AWS_G5 = 8
+    MONOVERSIONED = 9
 
 class Transport(IntEnum):
     """How the NVMe engine moves bytes between its files and memory, valued as `ustore_transport_t`."""
