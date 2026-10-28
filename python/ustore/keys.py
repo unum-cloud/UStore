@@ -5,8 +5,6 @@ Author: Ash Vardanian
 Date: September 18, 2026
 """
 
-from __future__ import annotations
-
 from collections.abc import Iterable, Iterator
 from operator import index
 from uuid import UUID

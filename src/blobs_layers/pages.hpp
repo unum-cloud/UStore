@@ -54,7 +54,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`
 
 #include "engine.hpp"             // `blobs_verbs<home_t::host_k>`, `view_t`
-#include "lib.hpp"                // `stringzilla_capabilities`
+#include "lib.hpp"                // `ustore_database_handle_t`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `places_of`, `validate_remove`
 #include "utilities/outputs.hpp"  // `read_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
@@ -409,7 +409,7 @@ status_t serve_import(ustore_pages_import_t const& arguments, strings_arg_t cons
             pages::element_key_t const root = element_key_of(page.place.key);
             page_tree_t tree {allocator};
             if (status_t const status = pages::import_markup(encoding, markup, root, placement, mint, tree,
-                                                             stringzilla_capabilities());
+                                                             arguments.database->ceiling.compute);
                 status.failed())
                 return status;
             auto [dense, dense_status] = tree.encode(allocator);
@@ -446,7 +446,8 @@ status_t serve_insert(ustore_pages_insert_t const& arguments, strings_arg_t cons
             };
             page_tree_t fragment {allocator};
             if (status_t const parsed = pages::import_markup(encoding, string_of(values[task]), pages::nil_key_k,
-                                                             placement, mint, fragment, stringzilla_capabilities());
+                                                             placement, mint, fragment,
+                                                             arguments.database->ceiling.compute);
                 parsed.failed())
                 return parsed;
             auto [dense, dense_status] = fragment.encode(allocator);

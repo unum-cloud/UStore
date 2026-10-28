@@ -215,11 +215,11 @@ extern crate stringzilla as _;
 pub use blobs::{Cursor, Entry, Measurement, Page, Scanned, Values};
 pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{
-    key_unknown, version, Admission, Arena, Blocking, CaseSensitivity, CollectionID, Collections, CommitStamp,
-    DataDirectory, Database, Deferred, DeferredView, Deferring, Description, DropMode, Durability, Engine, Error,
-    Executor, Gds, IOOptions, Isolation, Key, LevelDBOptions, Matching, Modality, Mood, NVMEOptions, PatternKind,
-    PredicateCallback, PredicateCost, ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions, Snapshot,
-    Status, Tape, Transaction, Transport, View, Wait, Watch, UUID,
+    key_unknown, version, Admission, Arena, Blocking, CPUClass, CaseSensitivity, CollectionID, Collections,
+    CommitStamp, DataDirectory, Database, Deferred, DeferredView, Deferring, Description, DropMode, Durability, Engine,
+    Error, Executor, Gds, IOOptions, Isolation, Key, LevelDBOptions, Matching, Modality, Mood, NVMEOptions,
+    PatternKind, PredicateCallback, PredicateCost, ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions,
+    Snapshot, Status, Tape, Transaction, Transport, View, Wait, Watch, UUID,
 };
 pub use docs::{
     Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, Document, DocumentEntry, FieldAddress, FieldEntry,

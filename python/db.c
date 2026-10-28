@@ -208,8 +208,8 @@ static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNU
 }
 
 static char const doc_Database_open_ram[] =                                                  //
-    "open_ram(directory=None, *, isolation=Isolation.STRICT_SERIALIZABLE, executor=None)\n"  //
-    "answers a database in memory.\n"                                                        //
+    "open_ram(directory=None, *, isolation=Isolation.STRICT_SERIALIZABLE, executor=None,\n"  //
+    "cpu_class=CPUClass.AUTOMATIC) answers a database in memory.\n"                          //
     "\n"                                                                                     //
     "Calls `ustore_database_open_ram` with a directory and `ustore_database_init_ram`\n"     //
     "without one.\n"                                                                         //
@@ -220,13 +220,18 @@ static char const doc_Database_open_ram[] =                                     
     "  isolation (Isolation): How transactions see each other.\n"                            //
     "  executor (Executor, optional): The executor the open blocks on, or None to open on\n" //
     "    the calling thread.\n"                                                              //
+    "  cpu_class (CPUClass): The CPU class the database confines its waits, atomics and\n"   //
+    "    string kernels to; AUTOMATIC takes what the CPU offers.\n"                          //
     "Returns:\n"                                                                             //
-    "  Database: The opened database.";
+    "  Database: The opened database.\n"                                                     //
+    "Raises:\n"                                                                              //
+    "  UnsupportedError: The CPU does not run the `cpu_class`.";
 
 static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* args, Py_ssize_t positional_args_count,
                                    PyObject* args_names_tuple) {
     opening_t opening = {0};
     int isolation = ustore_isolation_strict_serializable_k;
+    int cpu_class = ustore_cpu_class_unknown_k;
     Py_ssize_t const args_names_count = opening_positional(&opening, "open_ram", args, positional_args_count,
                                                            args_names_tuple);
     if (args_names_count < 0) goto failed;
@@ -238,6 +243,8 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         else if (PyUnicode_CompareWithASCIIString(name, "isolation") == 0)
             read = ustore_py_enum_from_object(value, "isolation", ustore_py_enum_isolation_k, &isolation);
         else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "cpu_class") == 0)
+            read = ustore_py_enum_from_object(value, "cpu_class", ustore_py_enum_cpu_class_k, &cpu_class);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
     }
@@ -249,6 +256,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         .executor = opening.executor,
         .outcome = &outcome,
         .isolation = (ustore_isolation_t)isolation,
+        .cpu_class = (ustore_cpu_class_t)cpu_class,
     };
     ustore_database_open_ram_t open_ram = {
         .database = &handle,
@@ -256,6 +264,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         .outcome = &outcome,
         .directory = path_bytes(opening.directory),
         .isolation = (ustore_isolation_t)isolation,
+        .cpu_class = (ustore_cpu_class_t)cpu_class,
     };
     Py_BEGIN_ALLOW_THREADS;
     if (opening.directory) ustore_database_open_ram(&open_ram);
@@ -419,7 +428,8 @@ failed:
 }
 
 static char const doc_Database_open_nvme[] =                                                    //
-    "open_nvme(directory, *, executor=None, **sizes) answers a database on NVMe.\n"             //
+    "open_nvme(directory, *, executor=None, cpu_class=CPUClass.AUTOMATIC, **sizes) answers a\n" //
+    "database on NVMe.\n"                                                                       //
     "\n"                                                                                        //
     "Every size keyword names a field of ustore_database_open_nvme_t, like memory_limit,\n"     //
     "transaction_max_bytes or collection_cache_limit, where zero keeps the engine's default.\n" //
@@ -434,10 +444,13 @@ static char const doc_Database_open_nvme[] =                                    
     "    (path, max_bytes) pair; none keeps one volume inside the directory.\n"                 //
     "  compactions (Executor, optional): An executor of Executor.for_vram() whose device and\n" //
     "    scratch limit every merge takes, read once here; None merges on host threads.\n"       //
+    "  cpu_class (CPUClass): The CPU class the database confines its waits, atomics and\n"      //
+    "    string kernels to; AUTOMATIC takes what the CPU offers.\n"                             //
     "Returns:\n"                                                                                //
     "  Database: The opened database.\n"                                                        //
     "Raises:\n"                                                                                 //
-    "  UnsupportedError: This build carries no NVMe engine.\n"                                  //
+    "  UnsupportedError: This build carries no NVMe engine, or the CPU does not run the\n"      //
+    "    `cpu_class`.\n"                                                                        //
     "  DeviceError: The `compactions` executor was not made by Executor.for_vram().";
 
 static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* args, Py_ssize_t positional_args_count,
@@ -464,6 +477,11 @@ static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* 
             read = opening_data_directories(&opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "compactions") == 0)
             read = executor_option(value, "compactions", &open_nvme.compactions);
+        else if (PyUnicode_CompareWithASCIIString(name, "cpu_class") == 0) {
+            int cpu_class = ustore_cpu_class_unknown_k;
+            read = ustore_py_enum_from_object(value, "cpu_class", ustore_py_enum_cpu_class_k, &cpu_class);
+            open_nvme.cpu_class = (ustore_cpu_class_t)cpu_class;
+        }
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
     }

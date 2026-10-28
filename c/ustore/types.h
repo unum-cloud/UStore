@@ -518,6 +518,45 @@ USTORE_EXPORT char const* ustore_mood_name(ustore_mood_t mood);
 /** Reads a mood back from its canonical spelling; @c ustore_mood_parked_k when unrecognized. */
 USTORE_EXPORT ustore_mood_t ustore_mood_from_name(ustore_bytes_view_t name);
 
+/** The CPU generation a database or an executor confines itself to, named as the sibling libraries name it. */
+typedef enum ustore_cpu_class_t {
+
+    /** Whatever the running CPU offers. */
+    ustore_cpu_class_unknown_k = 0,
+
+    /** The portable floor every CPU runs. */
+    ustore_cpu_class_serial_k,
+
+    /** x86 cores from Intel Haswell on. */
+    ustore_cpu_class_intel_haswell_k,
+
+    /** x86 efficiency cores from Intel Sierra Forest on. */
+    ustore_cpu_class_intel_sierra_k,
+
+    /** x86 server cores from Intel Skylake on. */
+    ustore_cpu_class_intel_skylake_k,
+
+    /** x86 server cores from Intel Ice Lake on. */
+    ustore_cpu_class_intel_icelake_k,
+
+    /** Arm cores from AWS Graviton 2 on. */
+    ustore_cpu_class_aws_g2_k,
+
+    /** Arm cores from Apple M2 on. */
+    ustore_cpu_class_apple_m2_k,
+
+    /** Arm server cores from AWS Graviton 5 on. */
+    ustore_cpu_class_aws_g5_k,
+
+} ustore_cpu_class_t;
+
+/** The canonical spelling of a CPU class, as @c ustore_cpu_class_intel_haswell_k spells "intel-haswell" and
+ *  @c ustore_cpu_class_unknown_k spells "automatic", or "unrecognized". */
+USTORE_EXPORT char const* ustore_cpu_class_name(ustore_cpu_class_t cpu_class);
+
+/** Reads a CPU class back from its canonical spelling; @c ustore_cpu_class_unknown_k when unrecognized. */
+USTORE_EXPORT ustore_cpu_class_t ustore_cpu_class_from_name(ustore_bytes_view_t name);
+
 /**
  *  @brief The host memory domains a RAM executor serves, NUMA nodes as the operating system numbers them.
  *
@@ -555,6 +594,9 @@ typedef struct ustore_executor_for_ram_t {
     /** Deferred calls the executor holds at once, sizing its deferred table, where zero takes a default. */
     ustore_size_t deferred_limit;
 
+    /** The CPU class the threads confine their waits and atomics to, where zero takes what the CPU offers. */
+    ustore_cpu_class_t cpu_class;
+
 } ustore_executor_for_ram_t;
 
 /**
@@ -568,9 +610,10 @@ typedef struct ustore_executor_for_ram_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, a memory domain
- *    identifier names no domain, or ForkUnion refuses an argument.
+ *    identifier names no domain, the CPU class is unknown, or ForkUnion refuses an argument.
  *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
- *    are asked of a build without them, or the operating system denies ForkUnion an operation.
+ *    are asked of a build without them, the CPU does not run the @c cpu_class, or the operating
+ *    system denies ForkUnion an operation.
  *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments);
@@ -690,6 +733,9 @@ typedef struct ustore_executor_for_nvme_t {
     /** Deferred calls the executor holds at once, sizing its deferred table, where zero takes a default. */
     ustore_size_t deferred_limit;
 
+    /** The CPU class the threads confine their waits and atomics to, where zero takes what the CPU offers. */
+    ustore_cpu_class_t cpu_class;
+
 } ustore_executor_for_nvme_t;
 
 /**
@@ -700,10 +746,11 @@ typedef struct ustore_executor_for_nvme_t {
  *  executor may be freed before the databases it opened. Where its merges run is the open's own @c compactions.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the transport is
- *    unknown, or ForkUnion refuses an argument.
+ *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the transport or the
+ *    CPU class is unknown, or ForkUnion refuses an argument.
  *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
- *    are asked of a build without them, or the operating system denies ForkUnion an operation.
+ *    are asked of a build without them, the CPU does not run the @c cpu_class, or the operating
+ *    system denies ForkUnion an operation.
  *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments);

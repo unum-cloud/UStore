@@ -23,9 +23,10 @@ CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=OFF -DUSTORE_WITH_LEVELDB=OFF" pip install .
 pip install . --config-settings=cmake.define.USTORE_WITH_LEVELDB=OFF
 ```
 
-`cibuildwheel` builds wheels for CPython 3.12, 3.13 and 3.14, and for the free-threaded 3.14t, where importing `ustore` keeps the GIL disabled.
+`cibuildwheel` builds wheels for CPython 3.12, 3.13, 3.14 and 3.15, and for the free-threaded 3.14t and 3.15t, where importing `ustore` keeps the GIL disabled.
 `engines_compiled()` names the engines a build carries, each opened through its own class method: `Database.open_ram()`, `open_rocksdb()`, `open_leveldb()` or `open_nvme()`, and `view_rocksdb()` for a read-only RocksDB database.
 `open_ram(directory)` persists the database as one image in that directory, while `open_ram()` keeps it in memory alone.
+`open_ram` and `open_nvme` take a `cpu_class=` keyword, a `CPUClass` that confines the database's waits, atomics and string kernels, and raise `UnsupportedError` where the CPU does not run it.
 
 ## Quickstart
 
@@ -312,7 +313,7 @@ An edge is a source, a target and an optional identifier, so distinct identifier
 
 ## Collections, Modes & Stamps
 
-Every C enum a caller meets is an `enum.IntEnum` of `ustore`: `Status`, `Mood`, `Watch`, `Durability`, `DropMode`, `ScanMode`, `Modality`, `Isolation`, `Transport`, `Engine`, `Role`, `FieldType` and `Modification`.
+Every C enum a caller meets is an `enum.IntEnum` of `ustore`: `Status`, `Mood`, `CPUClass`, `Watch`, `Durability`, `DropMode`, `ScanMode`, `Modality`, `Isolation`, `Transport`, `Engine`, `Role`, `FieldType` and `Modification`.
 The module builds each one at import through the C `_name` functions, valued as the enumerators and named by their canonical spellings in upper case, dashes as underscores, so "strict-serializable" is `Isolation.STRICT_SERIALIZABLE` and "read-only" is `Status.READ_ONLY`.
 A verb takes any `int` that is an enumerator, refusing a bool, which would read as zero or one, and text.
 `Error.status` and `Deferred.status` are `Status` members, `measure()` answers a `Measurement` struct sequence, `database.capabilities` a `Capabilities` one of `transactions` and `snapshots`, and `Columns.types` holds `FieldType` members.

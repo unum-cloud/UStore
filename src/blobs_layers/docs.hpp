@@ -42,7 +42,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
 
 #include "engine.hpp"            // `blobs_verbs<home_t::host_k>`, `view_t`
-#include "lib.hpp"               // `stringzilla_capabilities`
+#include "lib.hpp"               // `ustore_database_handle_t`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
 #include "utilities/outputs.hpp" // `read_outputs_t`
 
@@ -386,7 +386,7 @@ status_t read_document_fields(documents_type_ const& source, ustore_docs_read_t 
     };
     json_cells_t values;
     if (status_t const extracted = extract_fields(read.documents, task_fields.distinct, arguments.count, cell_of,
-                                                  stringzilla_capabilities(), view.scratch, values);
+                                                  arguments.database->ceiling.compute, view.scratch, values);
         extracted.failed())
         return extracted;
     for (std::size_t task = 0; task != arguments.count; ++task)
@@ -450,7 +450,7 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
     };
     json_cells_t values;
     if (status_t const extracted = extract_fields(documents, field_names, docs_count * fields_count, cell_of,
-                                                  stringzilla_capabilities(), view.scratch, values);
+                                                  arguments.database->ceiling.compute, view.scratch, values);
         extracted.failed())
         return extracted;
 

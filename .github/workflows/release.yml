@@ -116,13 +116,10 @@ jobs:
           path: build_release/_deps
           key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
 
-      # Ninja takes the first compiler on the path, which on Windows runners can be MinGW's
+      # The preset names Clang, which Windows packages replace with MSVC
       - name: Build
-        env:
-          CC: ${{ runner.os == 'Windows' && 'cl' || '' }}
-          CXX: ${{ runner.os == 'Windows' && 'cl' || '' }}
         run: |
-          cmake --preset release \
+          cmake --preset release ${{ runner.os == 'Windows' && '-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl' || '' }} \
             -DUSTORE_INSTALL=ON \
             -DUSTORE_BUILD_TEST=OFF \
             -DUSTORE_BUILD_BENCH=OFF \
@@ -152,7 +149,7 @@ jobs:
       fail-fast: false
       matrix:
         # One entry per interpreter variant: a `cp314-*` glob stops before the `t`.
-        python-version: ["312", "313", "314", "314t"]
+        python-version: ["312", "313", "314", "314t", "315", "315t"]
         os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, windows-2025, windows-11-arm]
     steps:
       - name: Checkout
@@ -162,7 +159,7 @@ jobs:
       - name: Pull Git Submodules
         run: git submodule update --init --recursive
       - name: Build Wheels
-        uses: pypa/cibuildwheel@v4.2.1
+        uses: pypa/cibuildwheel@v4.3.5
         env:
           CIBW_BUILD: cp${{ matrix.python-version }}-*
           CIBW_ARCHS: native

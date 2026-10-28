@@ -343,7 +343,7 @@ status_t seek_each(database_t& database, place_batch_t const& places, ::leveldb:
 
 #pragma region Lifetime
 
-status_t database_open(ustore_database_open_leveldb_t const& arguments, view_t const&) {
+status_t database_open(ustore_database_open_leveldb_t const& arguments, cpu_ceiling_t, view_t const&) {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
 

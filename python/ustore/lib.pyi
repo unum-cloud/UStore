@@ -121,6 +121,20 @@ class Isolation(IntEnum):
     STRICT_SERIALIZABLE = 0
     SNAPSHOT = 1
 
+class CPUClass(IntEnum):
+    """The CPU generation a database confines its waits, atomics and string kernels to, valued as
+    `ustore_cpu_class_t`."""
+
+    AUTOMATIC = 0
+    SERIAL = 1
+    INTEL_HASWELL = 2
+    INTEL_SIERRA = 3
+    INTEL_SKYLAKE = 4
+    INTEL_ICELAKE = 5
+    AWS_G2 = 6
+    APPLE_M2 = 7
+    AWS_G5 = 8
+
 class Transport(IntEnum):
     """How the NVMe engine moves bytes between its files and memory, valued as `ustore_transport_t`."""
 
@@ -836,8 +850,10 @@ class Database(_Writes, _Receivers):
         *,
         isolation: Isolation = Isolation.STRICT_SERIALIZABLE,
         executor: Executor | None = None,
+        cpu_class: CPUClass = CPUClass.AUTOMATIC,
     ) -> Self:
-        """An in-memory database, persisted as one image when it names a directory, opened blocking on `executor`."""
+        """An in-memory database, persisted as one image when it names a directory, opened blocking on `executor`
+        and confined to `cpu_class`."""
 
     @classmethod
     def open_rocksdb(
@@ -872,6 +888,7 @@ class Database(_Writes, _Receivers):
         executor: Executor | None = None,
         data_directories: Sequence[DataDirectory] = (),
         compactions: Executor | None = None,
+        cpu_class: CPUClass = CPUClass.AUTOMATIC,
         memory_limit: int = 0,
         transaction_max_bytes: int = 0,
         transaction_max_deltas: int = 0,

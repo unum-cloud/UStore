@@ -46,6 +46,22 @@ set(USTORE_BUILD_SANITIZERS
     CACHE STRING "Sanitizers for UStore's own targets: off, address (with undefined) or thread"
 )
 set_property(CACHE USTORE_BUILD_SANITIZERS PROPERTY STRINGS off address thread)
+# Seeded from the environment at the first configure, so `cargo` and `scikit-build-core` honour
+# `USTORE_TARGET_ARCH=native`.
+set(USTORE_TARGET_ARCH
+    "$ENV{USTORE_TARGET_ARCH}"
+    CACHE STRING
+          "CPU the own units and the siblings are tuned for: empty for the toolchain default, native, or a CPU name"
+)
+set(USTORE_TARGET_CLASSES
+    ""
+    CACHE STRING "CPU classes compiled beside serial: empty for every class, a list like apple_m2, or native"
+)
+if (USTORE_TARGET_CLASSES STREQUAL "native" AND NOT USTORE_TARGET_ARCH STREQUAL "native")
+    message(FATAL_ERROR "USTORE_TARGET_CLASSES=native reads what this host runs, which the siblings probe only under "
+                        "USTORE_TARGET_ARCH=native"
+    )
+endif ()
 # CUB is all the compaction kernels call, so one plain code per generation covers Ampere through Blackwell.
 set(USTORE_CUDA_ARCHITECTURES
     "80;90;100;120"
@@ -58,8 +74,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # No target uses C++20 modules, and Homebrew's clang-scan-deps cannot find the macOS SDK on its own.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
-set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
-set(CMAKE_CACHEFILE_DIR "${CMAKE_SOURCE_DIR}/build")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/bin")
@@ -102,6 +116,38 @@ else ()
     if (USTORE_WERROR)
         target_compile_options(ustore_warnings INTERFACE -Werror)
     endif ()
+endif ()
+
+# USTORE_TARGET_ARCH tunes UStore's own units, which all link `ustore_warnings`, for one CPU: `native` for this host, or
+# a CPU name like `graniterapids`, also when cross-compiling. A WebAssembly module takes its one SIMD capability
+# instead: serial, v128 or v128relaxed. Fetched dependencies keep their own flags.
+if (USTORE_TARGET_ARCH STREQUAL "native" AND CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR "USTORE_TARGET_ARCH=native needs the host as the target; name a CPU instead")
+elseif (EMSCRIPTEN OR CMAKE_SYSTEM_PROCESSOR MATCHES "wasm")
+    if (USTORE_TARGET_ARCH STREQUAL "v128relaxed")
+        target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-msimd128;-mrelaxed-simd>")
+    elseif (USTORE_TARGET_ARCH STREQUAL "v128")
+        target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-msimd128>")
+    elseif (USTORE_TARGET_ARCH AND NOT USTORE_TARGET_ARCH STREQUAL "serial")
+        message(
+            FATAL_ERROR "USTORE_TARGET_ARCH on WebAssembly: serial, v128 or v128relaxed, not `${USTORE_TARGET_ARCH}`"
+        )
+    endif ()
+elseif (
+    USTORE_TARGET_ARCH
+    AND MSVC
+    AND NOT USTORE_TARGET_ARCH STREQUAL "native"
+)
+    message(FATAL_ERROR "MSVC takes USTORE_TARGET_ARCH=native only; pass an /arch: value such as AVX2 or AVX512 "
+                        "through CMAKE_CXX_FLAGS instead of `${USTORE_TARGET_ARCH}`"
+    )
+elseif (USTORE_TARGET_ARCH AND MSVC)
+    # MSVC has no `/arch:native`, and no UStore unit needs instruction-set flags, so the toolchain default stays.
+elseif (USTORE_TARGET_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64")
+    # AArch64 names CPUs through `-mcpu`, like `neoverse-v2`, as `-march` takes only architecture versions.
+    target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${USTORE_TARGET_ARCH}>")
+elseif (USTORE_TARGET_ARCH)
+    target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-march=${USTORE_TARGET_ARCH}>")
 endif ()
 
 # Sanitizers instrument UStore's own targets and the sibling headers they compile, while RocksDB, LevelDB, liburing,
@@ -149,41 +195,56 @@ endif ()
 
 # Engines:
 if (${USTORE_WITH_LEVELDB})
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/leveldb.cmake")
+    include(cmake/leveldb.cmake)
 endif ()
 
 if (${USTORE_WITH_ROCKSDB})
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocksdb.cmake")
+    include(cmake/rocksdb.cmake)
 endif ()
 
 # The user-space NVMe transport, an `ustore_spdk` interface target over the archives of an SPDK build
 if (${USTORE_WITH_SPDK})
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/spdk.cmake")
+    include(cmake/spdk.cmake)
 endif ()
 
 # Modalities:
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/fmt.cmake")
+include(cmake/fmt.cmake)
 # Its objects go inside the UStore libraries, so an install publishes no yyjson header, archive or config of its own
 set(YYJSON_INSTALL OFF)
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/yyjson.cmake")
+include(cmake/yyjson.cmake)
 
-# A sibling builds from its nested checkout, or from the directory `FETCHCONTENT_SOURCE_DIR_<NAME>` names when the
-# submodule is not initialized, as in a workspace that keeps the siblings side by side
-function (ustore_sibling name_)
-    string(TOUPPER ${name_} name_upper_)
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt")
+# A sibling builds from its nested checkout, or else from the commit its submodule pins, fetched unless
+# `FETCHCONTENT_SOURCE_DIR_<NAME>` names a local checkout, as in a workspace that keeps the siblings side by side. The
+# caller passes that override variable, so nothing derives its name.
+function (ustore_sibling name_ override_ repository_ tag_)
+    if (TARGET ${name_}::header)
+        return()
+    endif ()
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED ${override_})
         add_subdirectory(${name_} EXCLUDE_FROM_ALL SYSTEM)
-    elseif (DEFINED FETCHCONTENT_SOURCE_DIR_${name_upper_})
-        add_subdirectory(
-            "${FETCHCONTENT_SOURCE_DIR_${name_upper_}}" "${CMAKE_CURRENT_BINARY_DIR}/${name_}" EXCLUDE_FROM_ALL SYSTEM
-        )
     else ()
-        message(FATAL_ERROR "ustore: initialize the ${name_} submodule or set FETCHCONTENT_SOURCE_DIR_${name_upper_}")
+        message(STATUS "ustore: ${name_} submodule absent or overridden, fetching ${tag_}")
+        FetchContent_Declare(
+            ${name_}
+            GIT_REPOSITORY ${repository_}
+            GIT_TAG ${tag_}
+            EXCLUDE_FROM_ALL SYSTEM
+        )
+        FetchContent_MakeAvailable(${name_})
     endif ()
 endfunction ()
 
+# The siblings tune their own units for the same CPU, and probe what this host runs under `native`.
+if (USTORE_TARGET_ARCH)
+    set(FORKUNION_TARGET_ARCH ${USTORE_TARGET_ARCH})
+    set(STRINGZILLA_TARGET_ARCH ${USTORE_TARGET_ARCH})
+endif ()
+
 # ForkUnion's C ABI, linked statically into every engine and suite
-ustore_sibling(forkunion)
+ustore_sibling(
+    forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
+    12a0a2706534452830868b7e33a4697549c898d5
+)
 # Every UStore thread runs inside ForkUnion's compiled pool, whose barriers ThreadSanitizer sees only once that archive
 # is instrumented as well
 if (USTORE_BUILD_SANITIZERS STREQUAL "thread")
@@ -191,12 +252,18 @@ if (USTORE_BUILD_SANITIZERS STREQUAL "thread")
 endif ()
 
 # SmashTable's containers, header-only
-ustore_sibling(smashtable)
+ustore_sibling(
+    smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable.git
+    e0db741da4e7b9cf6bc13aa493eff264aff3cfb8
+)
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
 # the running CPU supports. NumKong is unused today; wiring it in later is the same add_subdirectory plus a
 # numkong::header link, once something includes its headers.
-ustore_sibling(stringzilla)
+ustore_sibling(
+    stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla.git
+    a4e9f5b0ac91481a5c30957e05d2310f3928c1d8
+)
 
 # The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
 # headers they reach into. The package installs UStore's own headers alone, so a consumer brings each sibling's.
@@ -239,11 +306,19 @@ if (USTORE_BUILD_CUDA)
     endif ()
 endif ()
 if (USTORE_BUILD_CUDA AND CMAKE_CUDA_COMPILER)
+    if (CMAKE_VERSION VERSION_LESS 3.31 AND USTORE_CUDA_ARCHITECTURES MATCHES "1[0-9][0-9][af]")
+        message(FATAL_ERROR "Three-digit \"a\" and \"f\" CUDA codes need CMake 3.31, found ${CMAKE_VERSION}")
+    endif ()
     # The same codes on every machine, rather than whatever GPU the building one carries
     set(CMAKE_CUDA_ARCHITECTURES ${USTORE_CUDA_ARCHITECTURES})
     enable_language(CUDA)
+    if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13)
+        message(FATAL_ERROR "UStore needs CUDA 13 or newer, found ${CMAKE_CUDA_COMPILER_VERSION}")
+    endif ()
     find_package(CUDAToolkit REQUIRED)
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/cccl.cmake")
+    # NVCC's default leaves Turing and Ampere cubins uncompressed, ten times their compressed size.
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>)
+    include(cmake/cccl.cmake)
 
     add_library(ustore_nvme_compaction STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cu")
     target_link_libraries(
@@ -270,49 +345,60 @@ endif ()
 
 # The RAM and NVMe engines compile one variant per CPU class, in `src/<engine>/variants_<class>.cpp`, and their opens
 # pick the newest one the running CPU admits. A class is its parent plus the ForkUnion capabilities its waiter and
-# atomic reference add, restated here row for row from `parent_class_of`, `waiter_for_cpu_class` and
-# `atomic_ref_for_cpu_class` of `src/lib.hpp`. It exists only when its parent does and the toolchain compiles one of
-# those capabilities, which every UStore unit reads as `USTORE_TARGET_<CLASS>`, collected in `ustore_cpu_gates_`.
-# ForkUnion spells each instruction in the assembly itself, so a class needs no flags of its own, and the `serial` class
-# is the floor every CPU runs.
+# atomic reference add beyond the spin hint every core of an architecture carries, restated here row for row from
+# `parent_class_of`, `waiter_for_cpu_class` and `atomic_ref_for_cpu_class` of `src/lib.hpp`. It exists when its parent
+# does and every one of those capabilities is enabled, and compiles when it also passes `USTORE_TARGET_CLASSES`, which
+# every UStore unit reads as `USTORE_TARGET_<CLASS>` set to 0 or 1, collected in `ustore_cpu_gates_`. ForkUnion spells
+# each instruction in the assembly itself, so a class needs no flags of its own, and the `serial` class is the floor
+# every CPU runs.
 set(ustore_class_serial_exists_ TRUE)
 set(ustore_cpu_classes_ serial)
 set(ustore_cpu_gates_)
 
 # Declares the CPU class @p class_, gated as `USTORE_TARGET_<target_macro_>`, over the class named after `OVER` and the
-# ForkUnion capabilities after it.
+# ForkUnion capabilities after it. A targeted build keeps serial and the named classes, or under `native` the classes
+# this host runs in full.
 function (ustore_cpu_class class_ target_macro_)
     cmake_parse_arguments(PARSE_ARGV 2 arg "" "OVER" "")
-    if (NOT ustore_class_${arg_OVER}_exists_)
-        return()
-    endif ()
-    set(advances_ FALSE)
+    set(exists_ ${ustore_class_${arg_OVER}_exists_})
+    set(kept_ ${exists_})
     foreach (capability_ IN LISTS arg_UNPARSED_ARGUMENTS)
-        if (forkunion_target_${capability_}_compiles)
-            set(advances_ TRUE)
+        if (NOT forkunion_target_${capability_}_enabled)
+            set(exists_ FALSE)
+            set(kept_ FALSE)
+        elseif (USTORE_TARGET_CLASSES STREQUAL "native" AND NOT forkunion_target_${capability_}_runs)
+            set(kept_ FALSE)
         endif ()
     endforeach ()
-    set(ustore_class_${class_}_exists_
-        ${advances_}
-        PARENT_SCOPE
+    if (USTORE_TARGET_CLASSES
+        AND NOT USTORE_TARGET_CLASSES STREQUAL "native"
+        AND NOT class_ IN_LIST USTORE_TARGET_CLASSES
     )
-    if (NOT advances_)
-        return()
+        set(kept_ FALSE)
     endif ()
-    set(ustore_cpu_classes_
-        ${ustore_cpu_classes_} ${class_}
+    set(ustore_class_${class_}_exists_
+        ${exists_}
         PARENT_SCOPE
     )
-    set(ustore_cpu_gates_
-        ${ustore_cpu_gates_} "USTORE_TARGET_${target_macro_}=1"
-        PARENT_SCOPE
-    )
+    if (kept_)
+        set(ustore_cpu_classes_
+            ${ustore_cpu_classes_} ${class_}
+            PARENT_SCOPE
+        )
+        set(ustore_cpu_gates_
+            ${ustore_cpu_gates_} "USTORE_TARGET_${target_macro_}=1"
+            PARENT_SCOPE
+        )
+    else ()
+        set(ustore_cpu_gates_
+            ${ustore_cpu_gates_} "USTORE_TARGET_${target_macro_}=0"
+            PARENT_SCOPE
+        )
+    endif ()
 endfunction ()
 
-ustore_cpu_class(intel_haswell INTEL_HASWELL OVER serial x86_pause)
-ustore_cpu_class(intel_sierra INTEL_SIERRA OVER intel_haswell x86_tpause x86_cmpccxadd)
-ustore_cpu_class(aws_g2 AWS_G2 OVER serial arm64_yield)
-ustore_cpu_class(apple_m2 APPLE_M2 OVER aws_g2 arm64_lse arm64_rcpc)
+ustore_cpu_class(intel_sierra INTEL_SIERRA OVER serial x86_tpause x86_cmpccxadd)
+ustore_cpu_class(apple_m2 APPLE_M2 OVER serial arm64_lse arm64_rcpc)
 ustore_cpu_class(aws_g5 AWS_G5 OVER apple_m2 arm64_wfet)
 
 # Without `USTORE_BUILD_SHARED`, the libraries build only for the targets that link them
@@ -420,7 +506,7 @@ target_link_libraries(
 )
 # The archives linked inside keep their exports to themselves, so the shared library exports the C ABI alone
 target_link_options(
-    ustore_shared PRIVATE $<$<PLATFORM_ID:Linux>:LINKER:--exclude-libs,ALL>
+    ustore_shared PRIVATE $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--exclude-libs,ALL>
     $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_ustore_*>
 )
 

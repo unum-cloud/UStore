@@ -33,6 +33,13 @@ The `release` and `relwithdebinfo` presets build with whatever toolchain the env
 `dev` is the everyday tree `.clangd` reads: every CPU target at `-O2` with line tables.
 `trace` is `dev` plus `-ftime-trace`, writing a `.json` beside every object to show where compile time goes.
 `check` turns warnings into errors through `USTORE_WERROR`, and suites, benchmarks and tools are off unless a preset or `-D` asks for them.
+Only `release` and the Windows presets add RocksDB and LevelDB; every other preset builds the RAM engine and whatever `-D USTORE_WITH_*` adds.
+`msvc2026_x64` and `msvc2022_arm64` build `release` with Visual Studio, while `android_arm64`, `wasm32_emscripten` and `wasm64_emscripten` compile the libraries over the RAM engine and run nothing.
+`CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` and `CMAKE_CUDA_COMPILER_LAUNCHER` come from the environment, so exporting `ccache` there caches objects in every tree.
+
+`USTORE_TARGET_ARCH` tunes UStore's own units for one CPU, `native` or a name like `graniterapids`, and hands the same value to ForkUnion and StringZilla.
+`USTORE_TARGET_CLASSES` compiles `serial` plus the CPU classes it lists, or under `native` the classes this host runs in full, which needs `USTORE_TARGET_ARCH=native`; empty compiles every class.
+The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set both, with the one CUDA code of their GPU, and CI compiles each of them.
 
 ## Layout and Namespaces
 
@@ -195,7 +202,7 @@ A namespace-scope `_k` constant names an invariant — a format, an alignment, a
 `CMakeLists.txt` builds two libraries from the same sources, every engine adding its own:
 
 - __`ustore_static`__, aliased `ustore::static` and `ustore::ustore`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. The suites, benchmarks and tools inside the tree link it as `ustore::static` and reach the siblings through it.
-- __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, `--exclude-libs,ALL` on Linux and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
+- __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, `--exclude-libs,ALL` on Linux, Android and FreeBSD and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
 
 `c/test.c` builds against both, as `ustore_test_c` and `ustore_test_c_shared`, and CTest runs both.
 `USTORE_INSTALL` installs the two libraries, the headers, and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::static` and `ustore::shared`.

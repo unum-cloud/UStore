@@ -139,5 +139,5 @@ using namespace unum::ustore;
 using namespace unum::ustore::oracles::leveldb;
 
 void ustore_database_open_leveldb(ustore_database_open_leveldb_t* arguments) {
-    route_init<&guarded<&database_open, ustore_database_open_leveldb_t, view_t>>(arguments);
+    route_init<&guarded<&database_open, ustore_database_open_leveldb_t, cpu_ceiling_t, view_t>>(arguments);
 }

@@ -80,13 +80,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The release preset builds with each platform's own toolchain, while the sanitizer presets assume Clang and lld.
+        # The release preset builds with Clang, AppleClang on macOS, while the sanitizer presets also assume lld.
         include:
           - { name: "Linux x86-64", os: ubuntu-26.04, preset: release }
           - { name: "Linux AArch64", os: ubuntu-26.04-arm, preset: release }
           - { name: "macOS ARM64", os: macos-26, preset: release }
-          - { name: "Windows x86-64", os: windows-2025, preset: release }
-          - { name: "Windows ARM64", os: windows-11-arm, preset: release }
+          - { name: "Windows x86-64 with Visual Studio 2026", os: windows-2025-vs2026, preset: msvc2026_x64 }
+          - { name: "Windows ARM64 with Visual Studio 2022", os: windows-11-arm, preset: msvc2022_arm64 }
           - { name: "Linux x86-64 with ASan and UBSan", os: ubuntu-26.04, preset: debug }
           - { name: "Linux x86-64 with TSan", os: ubuntu-26.04, preset: tsan }
     steps:
@@ -112,7 +112,7 @@ jobs:
 
       # Sanitizer runtimes crash under the runner kernel's 32-bit mmap randomization.
       - name: Lower ASLR Entropy
-        if: matrix.preset != 'release'
+        if: matrix.preset == 'debug' || matrix.preset == 'tsan'
         run: sudo sysctl vm.mmap_rnd_bits=28
 
       - name: Restore Fetched Dependencies
@@ -121,11 +121,7 @@ jobs:
           path: build_${{ matrix.preset }}/_deps
           key: deps-${{ runner.os }}-${{ runner.arch }}-${{ matrix.preset }}-${{ hashFiles('cmake/*.cmake') }}
 
-      # Ninja takes the first compiler on the path, which on Windows runners can be MinGW's
       - name: Configure
-        env:
-          CC: ${{ runner.os == 'Windows' && 'cl' || '' }}
-          CXX: ${{ runner.os == 'Windows' && 'cl' || '' }}
         run: cmake --preset ${{ matrix.preset }}
       # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
       - name: Build the C Tests with MSVC
@@ -139,6 +135,82 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+  # Each machine profile builds the libraries for one CPU and one GPU code; the Arm ones build natively on Arm runners,
+  # where the CUDA image also exists. Clang 22 compiles the host units, as Ubuntu 24.04's GCC predates Olympus, and the
+  # family codes like `100f` need CMake 3.31, where Ubuntu 24.04 ships 3.28. The siblings come from their pins.
+  build_machine_profile:
+    name: Build Machine Profile ${{ matrix.preset }}
+    runs-on: ${{ contains(fromJSON('["grace_hopper", "vera_rubin"]'), matrix.preset) && 'ubuntu-24.04-arm' || 'ubuntu-26.04' }}
+    container: nvidia/cuda:13.4.3-devel-ubuntu26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [xeon4_hopper, xeon6_blackwell, grace_hopper, vera_rubin]
+    env:
+      CC: clang-22
+      CXX: clang++-22
+    steps:
+      - name: Install Dependencies
+        run: |
+          apt-get update && apt-get install -y ninja-build g++ git python3-pip curl gnupg
+          pip install --break-system-packages "cmake>=3.31"
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/resolute/ llvm-toolchain-resolute-22 main" \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update && apt-get install -y clang-22 lld-22
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.preset }} -D CMAKE_C_COMPILER="$CC" -D CMAKE_CXX_COMPILER="$CXX" -D CMAKE_CUDA_HOST_COMPILER="$CXX"
+          cmake --build --preset ${{ matrix.preset }}
+
+  # The NDK's own toolchain builds the libraries over the RAM engine; nothing runs them.
+  build_android:
+    name: Build Android ARM64
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build
+        run: |
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME}"
+          cmake --preset android_arm64
+          cmake --build --preset android_arm64
+
+  # The minimal and the extended module over the RAM engine; nothing runs them.
+  build_wasm:
+    name: Build WebAssembly with ${{ matrix.preset }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [wasm32_emscripten, wasm64_emscripten]
+    env:
+      EMSCRIPTEN_VERSION: "6.0.9"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Install Ninja and Emscripten
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+          (cd ~/emsdk && ./emsdk install "$EMSCRIPTEN_VERSION" && ./emsdk activate "$EMSCRIPTEN_VERSION")
+      - name: Build
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }}
 
   verify_models:
     name: Check Promela Models and GenMC Clients
@@ -184,7 +256,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, windows-2025, windows-11-arm]
-        python-version: ["3.12", "3.14t"]
+        python-version: ["3.12", "3.15t"]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -243,14 +315,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-26.04, macos-26]
-        python-version: ["312", "314t"]
+        python-version: ["312", "315t"]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Pull Git Submodules
         run: git submodule update --init --recursive
       - name: Build Wheels
-        uses: pypa/cibuildwheel@v4.2.1
+        uses: pypa/cibuildwheel@v4.3.5
         env:
           CIBW_BUILD: cp${{ matrix.python-version }}-*
           CIBW_ARCHS: native

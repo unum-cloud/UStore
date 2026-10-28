@@ -194,6 +194,7 @@ int ustore_py_types_import(void);
 typedef enum ustore_py_enum_t {
     ustore_py_enum_status_k = 0,
     ustore_py_enum_mood_k,
+    ustore_py_enum_cpu_class_k,
     ustore_py_enum_watch_k,
     ustore_py_enum_durability_k,
     ustore_py_enum_drop_mode_k,

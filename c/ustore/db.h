@@ -285,6 +285,10 @@ typedef struct ustore_database_init_ram_t {
     /** How transactions see each other. */
     ustore_isolation_t isolation;
 
+    /** The CPU class the database confines its waits, atomics and string kernels to, where zero takes what the CPU
+     *  offers. */
+    ustore_cpu_class_t cpu_class;
+
 } ustore_database_init_ram_t;
 
 /**
@@ -295,8 +299,9 @@ typedef struct ustore_database_init_ram_t {
  *  - @c ustore_status_device_k The executor computes on a device.
  *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
  *    executor running it.
- *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, or the isolation is
- *    unknown.
+ *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, or the isolation or the
+ *    CPU class is unknown.
+ *  - @c ustore_status_unsupported_k The CPU does not run the @c cpu_class.
  */
 USTORE_EXPORT void ustore_database_init_ram(ustore_database_init_ram_t* arguments);
 
@@ -321,6 +326,10 @@ typedef struct ustore_database_open_ram_t {
     /** How transactions see each other. */
     ustore_isolation_t isolation;
 
+    /** The CPU class the database confines its waits, atomics and string kernels to, where zero takes what the CPU
+     *  offers. */
+    ustore_cpu_class_t cpu_class;
+
 } ustore_database_open_ram_t;
 
 /**
@@ -333,7 +342,8 @@ typedef struct ustore_database_open_ram_t {
  *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
  *    executor running it.
  *  - @c ustore_status_invalid_argument_k The @c directory is empty, the @c database output is
- *    @c NULL, or the isolation is unknown.
+ *    @c NULL, or the isolation or the CPU class is unknown.
+ *  - @c ustore_status_unsupported_k The CPU does not run the @c cpu_class.
  *  - @c ustore_status_not_found_k The directory does not exist.
  *  - @c ustore_status_malformed_k The image has an unknown format, is truncated or names an unknown
  *    modality.
@@ -523,6 +533,10 @@ typedef struct ustore_database_open_nvme_t {
     /** Bytes of the largest value of a collection whose values vary in size. */
     ustore_size_t collection_value_max_size;
 
+    /** The CPU class the database confines its waits, atomics and string kernels to, where zero takes what the CPU
+     *  offers. */
+    ustore_cpu_class_t cpu_class;
+
 } ustore_database_open_nvme_t;
 
 /**
@@ -530,15 +544,15 @@ typedef struct ustore_database_open_nvme_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_unsupported_k The library was built without the engine, SPDK is asked for,
- *    the volumes or the schema have another format version, or the @c compactions executor is given
- *    to a library built without CUDA.
+ *    the volumes or the schema have another format version, the @c compactions executor is given
+ *    to a library built without CUDA, or the CPU does not run the @c cpu_class.
  *  - @c ustore_status_device_k The executor computes on a device, or the @c compactions executor is
  *    no VRAM one.
  *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
  *    executor running it.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
  *    empty, the counted @c data_directories are @c NULL, one has an empty path or a path past the
- *    platform's limit, the transport is unknown, or a size or count is out of range.
+ *    platform's limit, the transport or the CPU class is unknown, or a size or count is out of range.
  *  - @c ustore_status_out_of_memory_k The @c memory_limit refuses the arena or the channels.
  *  - @c ustore_status_not_found_k The directory does not exist.
  *  - @c ustore_status_capacity_exhausted_k The drives need more queue pairs or targets than a volume

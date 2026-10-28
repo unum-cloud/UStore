@@ -142,9 +142,9 @@ extern "C" bool RocksDbIOUringEnable() { return true; }
 #endif
 
 void ustore_database_open_rocksdb(ustore_database_open_rocksdb_t* arguments) {
-    route_init<&guarded<&database_open, ustore_database_open_rocksdb_t, view_t>>(arguments);
+    route_init<&guarded<&database_open, ustore_database_open_rocksdb_t, cpu_ceiling_t, view_t>>(arguments);
 }
 
 void ustore_database_view_rocksdb(ustore_database_view_rocksdb_t* arguments) {
-    route_init<&guarded<&database_view, ustore_database_view_rocksdb_t, view_t>>(arguments);
+    route_init<&guarded<&database_view, ustore_database_view_rocksdb_t, cpu_ceiling_t, view_t>>(arguments);
 }

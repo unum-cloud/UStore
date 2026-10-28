@@ -33,6 +33,13 @@ target_include_directories(ustore_python PRIVATE ${PROJECT_SOURCE_DIR}/c ${CMAKE
 # The one library carries every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads,
 # and documents convert to and from Python objects through the yyjson it already carries.
 target_link_libraries(ustore_python PRIVATE ustore::static yyjson::yyjson ustore_warnings)
+# The module's one export is its init function; the archives linked inside, UStore's own and its siblings', fmt and
+# yyjson among them, keep their symbols to themselves.
+set_target_properties(ustore_python PROPERTIES C_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+target_link_options(
+    ustore_python PRIVATE $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--exclude-libs,ALL>
+    $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_PyInit_lib>
+)
 
 # Named, or every dependency's own install rules land in the wheel beside the extension.
 install(TARGETS ustore_python LIBRARY DESTINATION ustore COMPONENT ustore_python)

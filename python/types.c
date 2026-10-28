@@ -1431,6 +1431,7 @@ int ustore_py_context_blocking(ustore_py_context_t const* context, char const* o
 static char const* const enum_names[ustore_py_enums_count_k] = {
     [ustore_py_enum_status_k] = "Status",
     [ustore_py_enum_mood_k] = "Mood",
+    [ustore_py_enum_cpu_class_k] = "CPUClass",
     [ustore_py_enum_watch_k] = "Watch",
     [ustore_py_enum_durability_k] = "Durability",
     [ustore_py_enum_drop_mode_k] = "DropMode",
@@ -1459,6 +1460,7 @@ static char const* enum_spelling(ustore_py_enum_t kind, int value) {
     switch (kind) {
     case ustore_py_enum_status_k: return ustore_status_name((ustore_status_t)value);
     case ustore_py_enum_mood_k: return ustore_mood_name((ustore_mood_t)value);
+    case ustore_py_enum_cpu_class_k: return ustore_cpu_class_name((ustore_cpu_class_t)value);
     case ustore_py_enum_watch_k: return ustore_watch_name((ustore_watch_t)value);
     case ustore_py_enum_durability_k: return ustore_durability_name((ustore_durability_t)value);
     case ustore_py_enum_drop_mode_k: return ustore_drop_mode_name((ustore_drop_mode_t)value);

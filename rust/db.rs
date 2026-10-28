@@ -373,6 +373,7 @@ pub(crate) mod ffi {
         pub ram: ustore_ram_options_t,
         pub threads: ustore_size_t,
         pub deferred_limit: ustore_size_t,
+        pub cpu_class: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -402,6 +403,7 @@ pub(crate) mod ffi {
         pub nvme: ustore_nvme_options_t,
         pub threads: ustore_size_t,
         pub deferred_limit: ustore_size_t,
+        pub cpu_class: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -443,6 +445,7 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub completion: ustore_completion_t,
         pub isolation: ustore_enum_t,
+        pub cpu_class: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -453,6 +456,7 @@ pub(crate) mod ffi {
         pub completion: ustore_completion_t,
         pub directory: ustore_bytes_view_t,
         pub isolation: ustore_enum_t,
+        pub cpu_class: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -498,6 +502,7 @@ pub(crate) mod ffi {
         pub collection_level_enlarge_factor: ustore_size_t,
         pub collection_value_size: ustore_size_t,
         pub collection_value_max_size: ustore_size_t,
+        pub cpu_class: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -658,6 +663,8 @@ pub(crate) mod ffi {
 
         pub fn ustore_mood_name(mood: ustore_enum_t) -> *const c_char;
         pub fn ustore_mood_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_cpu_class_name(cpu_class: ustore_enum_t) -> *const c_char;
+        pub fn ustore_cpu_class_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_durability_name(durability: ustore_enum_t) -> *const c_char;
         pub fn ustore_durability_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_watch_name(watch: ustore_enum_t) -> *const c_char;
@@ -1691,6 +1698,70 @@ impl FromStr for Gds {
     }
 }
 
+/// The CPU generation a database confines its waits, atomics and string kernels to, where `None` takes what the CPU
+/// offers. Prints and parses its stable name, like "intel-icelake".
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum CPUClass {
+    /// Portable kernels that run on any CPU.
+    Serial = 1,
+    /// x86 cores from Intel Haswell on.
+    IntelHaswell = 2,
+    /// x86 efficiency cores from Intel Sierra Forest on.
+    IntelSierra = 3,
+    /// x86 server cores from Intel Skylake on.
+    IntelSkylake = 4,
+    /// x86 server cores from Intel Ice Lake on.
+    IntelIcelake = 5,
+    /// Arm cores from AWS Graviton 2 on.
+    AWSG2 = 6,
+    /// Arm cores from Apple M2 on.
+    AppleM2 = 7,
+    /// Arm server cores from AWS Graviton 5 on.
+    AWSG5 = 8,
+}
+
+impl CPUClass {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            1 => Some(CPUClass::Serial),
+            2 => Some(CPUClass::IntelHaswell),
+            3 => Some(CPUClass::IntelSierra),
+            4 => Some(CPUClass::IntelSkylake),
+            5 => Some(CPUClass::IntelIcelake),
+            6 => Some(CPUClass::AWSG2),
+            7 => Some(CPUClass::AppleM2),
+            8 => Some(CPUClass::AWSG5),
+            _ => None,
+        }
+    }
+
+    /// The `ustore_cpu_class_t` of `cpu_class`, zero for `None`.
+    fn to_raw(cpu_class: Option<CPUClass>) -> ffi::ustore_enum_t {
+        cpu_class.map_or(0, |cpu_class| cpu_class as ffi::ustore_enum_t)
+    }
+}
+
+impl fmt::Display for CPUClass {
+    /// Calls `ustore_cpu_class_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_cpu_class_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for CPUClass {
+    type Err = Error;
+
+    /// Calls `ustore_cpu_class_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_cpu_class_from_name,
+            ffi::ustore_cpu_class_name,
+            CPUClass::from_raw,
+        )
+    }
+}
+
 /// How the NVMe engine moves bytes between its files and memory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Transport {
@@ -1803,6 +1874,9 @@ pub struct RAMOptions<'options> {
     pub isolation: Isolation,
     /// The executor the open runs on, after the calls submitted there before it; `None` opens on the calling thread.
     pub executor: Option<&'options Executor>,
+    /// The CPU class the database confines itself to, failing with [`Status::Unsupported`] where the CPU does not run
+    /// it; `None` takes what the CPU offers.
+    pub cpu_class: Option<CPUClass>,
 }
 
 /// What [`Database::open_rocksdb`] and [`Database::view_rocksdb`] open.
@@ -1879,6 +1953,9 @@ pub struct NVMEOptions<'path> {
     pub collection_value_size: u64,
     /// Bytes of the largest value of a collection whose values vary in size.
     pub collection_value_max_size: u64,
+    /// The CPU class the database confines itself to, failing with [`Status::Unsupported`] where the CPU does not run
+    /// it; `None` takes what the CPU offers.
+    pub cpu_class: Option<CPUClass>,
 }
 
 impl<'path> NVMEOptions<'path> {
@@ -2013,6 +2090,7 @@ impl Database {
             outcome: &mut outcome,
             completion: ffi::ustore_completion_t::Blocking,
             isolation: options.isolation as ffi::ustore_enum_t,
+            cpu_class: CPUClass::to_raw(options.cpu_class),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_init_ram(&mut arguments) };
@@ -2036,6 +2114,7 @@ impl Database {
             completion: ffi::ustore_completion_t::Blocking,
             directory: directory.as_bytes().into(),
             isolation: options.isolation as ffi::ustore_enum_t,
+            cpu_class: CPUClass::to_raw(options.cpu_class),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_open_ram(&mut arguments) };
@@ -2139,6 +2218,7 @@ impl Database {
             collection_level_enlarge_factor: options.collection_level_enlarge_factor as ffi::ustore_size_t,
             collection_value_size: options.collection_value_size,
             collection_value_max_size: options.collection_value_max_size,
+            cpu_class: CPUClass::to_raw(options.cpu_class),
         };
         // SAFETY: every pointer in `arguments` outlives the call, the paths included.
         unsafe { ffi::ustore_database_open_nvme(&mut arguments) };
@@ -3292,6 +3372,7 @@ impl Executor {
             ram: ram_options(memory_domains),
             threads: threads as ffi::ustore_size_t,
             deferred_limit: deferred_limit as ffi::ustore_size_t,
+            cpu_class: CPUClass::to_raw(None),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return and copies the domains.
         unsafe { ffi::ustore_executor_for_ram(&mut arguments) };
@@ -3338,6 +3419,7 @@ impl Executor {
             nvme: nvme_options(io),
             threads: threads as ffi::ustore_size_t,
             deferred_limit: deferred_limit as ffi::ustore_size_t,
+            cpu_class: CPUClass::to_raw(None),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_executor_for_nvme(&mut arguments) };

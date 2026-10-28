@@ -9,24 +9,40 @@
     {
       "name": "base",
       "hidden": true,
-      "description": "Ninja, a build tree named after the preset, and a compilation database for the language server, on whatever toolchain the environment provides: MSVC, AppleClang, GCC or Clang. Export CMAKE_CXX_COMPILER_LAUNCHER=ccache to cache objects. No preset adds instruction-set flags, so every tree runs on any CPU of its architecture.",
+      "description": "Ninja, a build tree named after the preset, and a compilation database for the language server, on whatever toolchain the environment provides: MSVC, AppleClang, GCC or Clang. The compiler launchers come from the environment, so exporting CMAKE_CXX_COMPILER_LAUNCHER=ccache caches objects. Only the machine profiles add instruction-set flags, so every other tree runs on any CPU of its architecture.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build_${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_OPTIMIZE_DEPENDENCIES": "ON",
-        "USTORE_WITH_ROCKSDB": "ON",
-        "USTORE_WITH_LEVELDB": "ON"
+        "CMAKE_C_COMPILER_LAUNCHER": "$env{CMAKE_C_COMPILER_LAUNCHER}",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "$env{CMAKE_CXX_COMPILER_LAUNCHER}",
+        "CMAKE_CUDA_COMPILER_LAUNCHER": "$env{CMAKE_CUDA_COMPILER_LAUNCHER}"
       }
+    },
+    {
+      "name": "linux",
+      "hidden": true,
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
+    {
+      "name": "windows",
+      "hidden": true,
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "clang",
+      "hidden": true,
+      "inherits": "base",
+      "description": "Clang, which compiles faster and lighter than GCC, and is AppleClang on macOS.",
+      "cacheVariables": { "CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++" }
     },
     {
       "name": "llvm",
       "hidden": true,
-      "inherits": "base",
+      "inherits": "clang",
       "description": "Clang and lld, which the sanitizer, tracing and line-table flags of the development presets assume. `lld` links several times faster than `bfd` and `ld64`.",
       "cacheVariables": {
-        "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
         "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld"
       }
@@ -63,7 +79,7 @@
     },
     {
       "name": "relwithdebinfo",
-      "inherits": "base",
+      "inherits": "llvm",
       "displayName": "RelWithDebInfo - optimized suites with symbols",
       "description": "Optimized, with full DWARF for stepping through the suites.",
       "cacheVariables": {
@@ -75,11 +91,13 @@
     },
     {
       "name": "release",
-      "inherits": "base",
+      "inherits": "clang",
       "displayName": "Release - every CPU target",
-      "description": "Libraries, suites, benchmarks and the CLI on every engine.",
+      "description": "Libraries, suites, benchmarks and the CLI on every engine, RocksDB and LevelDB included.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "USTORE_WITH_ROCKSDB": "ON",
+        "USTORE_WITH_LEVELDB": "ON",
         "USTORE_BUILD_TEST": "ON",
         "USTORE_BUILD_BENCH": "ON",
         "USTORE_BUILD_TOOLS": "ON",
@@ -146,6 +164,117 @@
       "cacheVariables": {
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -gline-tables-only -DNDEBUG -ftime-trace"
       }
+    },
+    {
+      "name": "msvc2026_x64",
+      "inherits": ["release", "windows"],
+      "displayName": "Windows x64 - Visual Studio 2026",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "cacheVariables": { "CMAKE_C_COMPILER": "cl", "CMAKE_CXX_COMPILER": "cl" }
+    },
+    {
+      "name": "msvc2022_arm64",
+      "inherits": ["release", "windows"],
+      "displayName": "Windows ARM64 - Visual Studio 2022",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "ARM64",
+      "cacheVariables": { "CMAKE_C_COMPILER": "cl", "CMAKE_CXX_COMPILER": "cl" }
+    },
+    {
+      "name": "android_arm64",
+      "inherits": "base",
+      "displayName": "Android ARM64 - compile only",
+      "description": "The libraries over the RAM engine, through the NDK's own toolchain from ANDROID_NDK_ROOT.",
+      "toolchainFile": "$env{ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-28",
+        "USTORE_BUILD_SHARED": "ON"
+      }
+    },
+    {
+      "name": "wasm32_emscripten",
+      "inherits": "base",
+      "displayName": "WebAssembly 32-bit under Emscripten - compile only",
+      "description": "The minimal module over the RAM engine: one thread, SIMD128. Emscripten's own toolchain reads the processor from EMSCRIPTEN_SYSTEM_PROCESSOR.",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EMSCRIPTEN_SYSTEM_PROCESSOR": "wasm32",
+        "USTORE_TARGET_ARCH": "v128",
+        "USTORE_BUILD_SHARED": "ON"
+      }
+    },
+    {
+      "name": "wasm64_emscripten",
+      "inherits": "wasm32_emscripten",
+      "displayName": "WebAssembly 64-bit under Emscripten - compile only",
+      "description": "The extended module over the RAM engine: Memory64, threads and Relaxed SIMD, the flags Emscripten's toolchain reads as it loads.",
+      "cacheVariables": {
+        "EMSCRIPTEN_SYSTEM_PROCESSOR": "wasm64",
+        "USTORE_TARGET_ARCH": "v128relaxed",
+        "CMAKE_C_FLAGS": "--target=wasm64 -pthread",
+        "CMAKE_CXX_FLAGS": "--target=wasm64 -pthread"
+      }
+    },
+    {
+      "name": "machine",
+      "hidden": true,
+      "inherits": ["llvm", "linux"],
+      "description": "The libraries for one machine: its CPU, serial plus the one CPU class it runs in full, and its one GPU code for the NVMe engine's compaction.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "USTORE_BUILD_SHARED": "ON",
+        "USTORE_WITH_NVME": "ON",
+        "CMAKE_CUDA_HOST_COMPILER": "clang++",
+        "USTORE_BUILD_CUDA": "ON",
+        "STRINGZILLA_PROFILE_CAPABILITIES": "ON"
+      }
+    },
+    {
+      "name": "xeon4_hopper",
+      "inherits": "machine",
+      "displayName": "Xeon 4 with Hopper - compile only",
+      "description": "Sapphire Rapids runs no class above serial in full, as it lacks CMPCCXADD.",
+      "cacheVariables": {
+        "USTORE_TARGET_ARCH": "sapphirerapids",
+        "USTORE_TARGET_CLASSES": "serial",
+        "USTORE_CUDA_ARCHITECTURES": "90a-real"
+      }
+    },
+    {
+      "name": "xeon6_blackwell",
+      "inherits": "machine",
+      "displayName": "Xeon 6 with Blackwell - compile only",
+      "description": "Granite Rapids runs no class above serial in full, as it lacks CMPCCXADD.",
+      "cacheVariables": {
+        "USTORE_TARGET_ARCH": "graniterapids",
+        "USTORE_TARGET_CLASSES": "serial",
+        "USTORE_CUDA_ARCHITECTURES": "100f-real"
+      }
+    },
+    {
+      "name": "grace_hopper",
+      "inherits": "machine",
+      "displayName": "Grace with Hopper - compile only",
+      "cacheVariables": {
+        "USTORE_TARGET_ARCH": "neoverse-v2",
+        "USTORE_TARGET_CLASSES": "apple_m2",
+        "USTORE_CUDA_ARCHITECTURES": "90a-real"
+      }
+    },
+    {
+      "name": "vera_rubin",
+      "inherits": "machine",
+      "displayName": "Vera with Rubin - compile only",
+      "description": "Olympus cores need Clang 22 or GCC 15, and CUDA 13.4 names no Rubin code, so it compiles 100f.",
+      "cacheVariables": {
+        "USTORE_TARGET_ARCH": "olympus",
+        "USTORE_TARGET_CLASSES": "aws_g5",
+        "USTORE_CUDA_ARCHITECTURES": "100f-real"
+      }
     }
   ],
   "buildPresets": [
@@ -193,7 +322,16 @@
       "name": "trace",
       "configurePreset": "trace",
       "jobs": 0
-    }
+    },
+    { "name": "msvc2026_x64", "configurePreset": "msvc2026_x64", "configuration": "Release" },
+    { "name": "msvc2022_arm64", "configurePreset": "msvc2022_arm64", "configuration": "Release" },
+    { "name": "android_arm64", "configurePreset": "android_arm64", "jobs": 0 },
+    { "name": "wasm32_emscripten", "configurePreset": "wasm32_emscripten", "jobs": 0 },
+    { "name": "wasm64_emscripten", "configurePreset": "wasm64_emscripten", "jobs": 0 },
+    { "name": "xeon4_hopper", "configurePreset": "xeon4_hopper", "jobs": 0 },
+    { "name": "xeon6_blackwell", "configurePreset": "xeon6_blackwell", "jobs": 0 },
+    { "name": "grace_hopper", "configurePreset": "grace_hopper", "jobs": 0 },
+    { "name": "vera_rubin", "configurePreset": "vera_rubin", "jobs": 0 }
   ],
   "testPresets": [
     {
@@ -243,7 +381,9 @@
       "name": "cuda",
       "inherits": "base",
       "configurePreset": "cuda"
-    }
+    },
+    { "name": "msvc2026_x64", "inherits": "base", "configurePreset": "msvc2026_x64", "configuration": "Release" },
+    { "name": "msvc2022_arm64", "inherits": "base", "configurePreset": "msvc2022_arm64", "configuration": "Release" }
   ],
   "workflowPresets": [
     {

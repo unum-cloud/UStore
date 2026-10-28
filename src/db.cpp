@@ -6,6 +6,7 @@
  *      through, the spelling of their closed sets, and the refusing opens of the engines a build lacks.
  */
 
+#include <cstddef> // `size_t`, which Emscripten's <sys/random.h> needs
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 
 #if defined(_WIN32)

@@ -81,6 +81,19 @@ constexpr enumerator_spelling<ustore_predicate_cost_t> predicate_cost_names_k[] 
     {ustore_predicate_expensive_k, "expensive"},
 };
 
+/** The canonical spelling of every CPU class, as UCall spells its classes. */
+constexpr enumerator_spelling<ustore_cpu_class_t> cpu_class_names_k[] {
+    {ustore_cpu_class_unknown_k, "automatic"},
+    {ustore_cpu_class_serial_k, "serial"},
+    {ustore_cpu_class_intel_haswell_k, "intel-haswell"},
+    {ustore_cpu_class_intel_sierra_k, "intel-sierra"},
+    {ustore_cpu_class_intel_skylake_k, "intel-skylake"},
+    {ustore_cpu_class_intel_icelake_k, "intel-icelake"},
+    {ustore_cpu_class_aws_g2_k, "aws-g2"},
+    {ustore_cpu_class_apple_m2_k, "apple-m2"},
+    {ustore_cpu_class_aws_g5_k, "aws-g5"},
+};
+
 /** The canonical spelling of every transport. */
 constexpr enumerator_spelling<ustore_transport_t> transport_names_k[] {
     {ustore_transport_automatic_k, "automatic"},     {ustore_transport_blocking_k, "blocking"},
@@ -234,16 +247,16 @@ nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept {
 
 } // namespace unum::ustore
 
-/** Makes in @p made the executor running calls on @p pool, with its driver and a table of @p deferred_limit calls,
- *  keeping the scratch of every thread of the pool on the memory domain of @p topology local to it when @p domains
- *  hold it, and every other scratch and arena on the first of them. */
+/** Makes in @p made the executor running calls on @p pool, with its driver allowed the ForkUnion capabilities in
+ *  @p allowed and a table of @p deferred_limit calls, keeping the scratch of every pool thread on the memory domain
+ *  of @p topology local to it when @p domains hold it, and every other scratch and arena on the first of them. */
 static status_t make_executor(std::variant<executor_t, lent_pool_t> pool, topology_t const& topology,
                               std::span<fu_memory_domain_id_t const> domains, std::size_t deferred_limit,
-                              ustore_executor_t& made) noexcept {
+                              fu_capabilities_t allowed, ustore_executor_t& made) noexcept {
     std::size_t const limit = deferred_limit ? deferred_limit : deferred_limit_default_k;
     if (limit > deferred_limit_max_k)
         return {status_code_t::capacity_exhausted_k, "An executor holds at most 2^30 deferred calls"};
-    st::expected<executor_t> driver = executor_t::make_unpinned(1, spawned_exclusivity());
+    st::expected<executor_t> driver = executor_t::make_unpinned(1, spawned_exclusivity(), allowed);
     if (!driver) return pool_failure(driver.status());
     std::size_t const threads = view_of(pool).threads_count();
     ustore_executor_handle_t* const executor = new (std::nothrow)
@@ -293,7 +306,7 @@ ustore_status_t ustore_outcome_status(ustore_outcome_t* outcome) {
 char const* ustore_status_name(ustore_status_t status) { return name_in(status_names_k, status); }
 
 ustore_status_t ustore_status_from_name(ustore_bytes_view_t name) {
-    std::string_view const text {reinterpret_cast<char const*>(name.data), name.length};
+    std::string_view const text = string_of(name);
     for (enumerator_spelling<ustore_status_t> const& spelling : status_names_k)
         if (spelling.name == text) return spelling.value;
     return ustore_status_invalid_argument_k;
@@ -301,6 +314,8 @@ ustore_status_t ustore_status_from_name(ustore_bytes_view_t name) {
 
 char const* ustore_mood_name(ustore_mood_t mood) { return name_in(mood_names_k, mood); }
 ustore_mood_t ustore_mood_from_name(ustore_bytes_view_t name) { return value_in(mood_names_k, name); }
+char const* ustore_cpu_class_name(ustore_cpu_class_t cpu_class) { return name_in(cpu_class_names_k, cpu_class); }
+ustore_cpu_class_t ustore_cpu_class_from_name(ustore_bytes_view_t name) { return value_in(cpu_class_names_k, name); }
 char const* ustore_pattern_kind_name(ustore_pattern_kind_t kind) { return name_in(pattern_kind_names_k, kind); }
 ustore_pattern_kind_t ustore_pattern_kind_from_name(ustore_bytes_view_t name) {
     return value_in(pattern_kind_names_k, name);
@@ -333,6 +348,9 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
     if (!arguments->executor)
         return finish(outcome, {status_code_t::invalid_argument_k, "The call needs an output for the executor"});
     *arguments->executor = nullptr;
+    auto const [ceiling, pick_status] = pick_cpu_ceiling(arguments->cpu_class);
+    if (pick_status.failed()) return finish(outcome, pick_status);
+    fu_capabilities_t const allowed = forkunion_allowed_of(ceiling);
     st::expected<topology_t> topology = topology_t::make();
     if (!topology) return finish(outcome, pool_failure(topology.status()));
     st::basic_vector<fu_memory_domain_id_t> domains;
@@ -346,12 +364,12 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
     else if (!threads) threads = std::max<std::size_t>(cores_near(*topology, domains) * 7 / 8, 1);
     // ForkUnion spawns near one memory domain or across every one, so naming several but not all takes the machine
     bool const near_one = domains.size() == 1 && topology->memory_domains_count() > 1;
-    st::expected<executor_t> pool = near_one
-                                        ? executor_t::make_near(*topology, domains[0], threads, spawned_exclusivity())
-                                        : executor_t::make(*topology, threads, spawned_exclusivity());
+    st::expected<executor_t> pool = near_one ? executor_t::make_near(*topology, domains[0], threads,
+                                                                     spawned_exclusivity(), allowed)
+                                             : executor_t::make(*topology, threads, spawned_exclusivity(), allowed);
     if (!pool) return finish(outcome, pool_failure(pool.status()));
-    finish(outcome,
-           make_executor(std::move(*pool), *topology, domains, arguments->deferred_limit, *arguments->executor));
+    finish(outcome, make_executor(std::move(*pool), *topology, domains, arguments->deferred_limit, allowed,
+                                  *arguments->executor));
 }
 
 void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
@@ -366,12 +384,13 @@ void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
     st::basic_vector<fu_memory_domain_id_t> domains;
     if (status_t const status = read_memory_domains(arguments->ram, *topology, domains); status.failed())
         return finish(outcome, status);
-    finish(outcome, make_executor(*pool, *topology, domains, arguments->deferred_limit, *arguments->executor));
+    finish(outcome, make_executor(*pool, *topology, domains, arguments->deferred_limit, fu_capabilities_all_k,
+                                  *arguments->executor));
 }
 
 /** Makes in @p made an executor of @p threads host threads spread over the whole machine, as the NVMe and VRAM
- *  executors take, whose scratch lives near each thread. */
-static status_t spawn_across_machine(std::size_t threads, std::size_t deferred_limit,
+ *  executors take, allowed the ForkUnion capabilities in @p allowed, whose scratch lives near each thread. */
+static status_t spawn_across_machine(std::size_t threads, std::size_t deferred_limit, fu_capabilities_t allowed,
                                      ustore_executor_t& made) noexcept {
     st::expected<topology_t> topology = topology_t::make();
     if (!topology) return pool_failure(topology.status());
@@ -381,9 +400,9 @@ static status_t spawn_across_machine(std::size_t threads, std::size_t deferred_l
         if (threads > 1) return {status_code_t::unsupported_k, "This build spawns no threads"};
         threads = 1;
     }
-    st::expected<executor_t> pool = executor_t::make(*topology, threads, spawned_exclusivity());
+    st::expected<executor_t> pool = executor_t::make(*topology, threads, spawned_exclusivity(), allowed);
     if (!pool) return pool_failure(pool.status());
-    return make_executor(std::move(*pool), *topology, domains, deferred_limit, made);
+    return make_executor(std::move(*pool), *topology, domains, deferred_limit, allowed, made);
 }
 
 void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
@@ -393,6 +412,8 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
     *arguments->executor = nullptr;
     if (arguments->nvme.transport > ustore_transport_linux_spdk_k)
         return finish(outcome, {status_code_t::invalid_argument_k, "Unknown transport"});
+    auto const [ceiling, pick_status] = pick_cpu_ceiling(arguments->cpu_class);
+    if (pick_status.failed()) return finish(outcome, pick_status);
     std::size_t threads = arguments->threads;
     // Every thread pins a channel of 12 MB by default, so the derived count stays as low as the NVMe mount keeps its
     // own
@@ -401,7 +422,7 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
             threads = std::clamp<std::size_t>(*cores / 2, 1, 8);
     ustore_executor_t made = nullptr;
     if (status_t const status = spawn_across_machine(std::max<std::size_t>(threads, 1), arguments->deferred_limit,
-                                                     made);
+                                                     forkunion_allowed_of(ceiling), made);
         status.failed())
         return finish(outcome, status);
     made->device = arguments->nvme;
@@ -422,7 +443,8 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     if (!spawned) return finish(outcome, spawned.status());
     // One host thread keeps the device fed, as every call only queues work on its stream
     ustore_executor_t made = nullptr;
-    if (status_t const status = spawn_across_machine(1, arguments->deferred_limit, made); status.failed())
+    if (status_t const status = spawn_across_machine(1, arguments->deferred_limit, fu_capabilities_all_k, made);
+        status.failed())
         return finish(outcome, status);
     made->device = std::move(*spawned);
     *arguments->executor = made;

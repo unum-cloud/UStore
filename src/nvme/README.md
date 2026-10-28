@@ -4,7 +4,7 @@ UStoreNVMe is UStore's NVMe-focused LSM engine, with `io_uring`, Linux AIO, SPDK
 Every collection is a log-structured merge tree of immutable sorted runs, each opening with a memory-mapped B-tree of its keys.
 Keys are fixed-width stored keys, `ustore_key_t` at the C ABI, and values are opaque bytes whose width a collection fixes at compile time.
 The C ABI in `variants.hpp` backs each UStore database with one `database` and each collection with one `nvme_store` under the same UUID.
-Every call is a template on the CPU class, whose atomic reference and waiter instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class the running CPU admits, ending on the serial floor, and every handle it hands out carries that class's table.
+Every call is a template on the CPU class, whose atomic reference and waiter instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class its ceiling fits, ending on the serial floor, and every handle it hands out carries that class's table.
 It mounts on files through whichever file transport its executor names, reserves the `_collections` and `_names` system collections, and creates every other collection with a variable-width value layout so an empty value keeps its key.
 Every write of a caller commits through a transaction of the registry, while both system collections change straight in the store under a claim of their own, as no caller's transaction reaches them.
 A stage checks a transaction and hands the database's claim back at once, so the commit checks it again; a held claim would stall every other call.

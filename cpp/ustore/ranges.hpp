@@ -253,7 +253,7 @@ class strided_span {
 
   public:
     strided_span() = default;
-    strided_span(iterator_t begin, std::size_t count) noexcept : begin_(begin), count_(count) {}
+    strided_span(iterator_t begin, ustore_size_t count) noexcept : begin_(begin), count_(count) {}
 
     element_* data() const noexcept { return begin_.get(); }
     iterator_t begin() const noexcept { return begin_; }
@@ -709,7 +709,7 @@ class lengths_view_t {
     }
 
     sz::indexed_container_iterator<lengths_view_t> begin() const noexcept { return {*this, 0}; }
-    sz::indexed_container_iterator<lengths_view_t> end() const noexcept { return {*this, count_}; }
+    sz::indexed_container_iterator<lengths_view_t> end() const noexcept { return {*this, size()}; }
 
     bits_view_t presences() const noexcept { return {presences_}; }
     ustore_length_t const* lengths() const noexcept { return lengths_; }

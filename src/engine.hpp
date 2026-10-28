@@ -16,7 +16,9 @@
 #include <thread>  // `std::thread::id`
 #include <variant> // `std::variant`, `std::monostate`
 
+#include <forkunion/capabilities.hpp>  // `fu::capabilities_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <stringzilla/capabilities.h>  // `sz_capability_t`, `sz_cap_serial_k`
 
 #include "ustore/blobs.h"   // `ustore_blobs_read_t`, `ustore_blobs_write_t` and the other binary calls
 #include "ustore/db.h"      // `ustore_database_t`, `ustore_transaction_t`, `ustore_view_t` and the calls on them
@@ -559,6 +561,13 @@ enum class driver_state_t : std::uint32_t {
     absent_k,
 };
 
+/** What one handle may use: the masks this machine runs when nothing is pinned, the pinned class's masks when it runs
+ *  them, as @c pick_cpu_ceiling picks them once at open. */
+struct cpu_ceiling_t {
+    sz_capability_t compute = sz_cap_serial_k;
+    fu::capabilities_t sync = fu::capabilities_unknown_k;
+};
+
 /** Where an executor runs calls: one pool thread, or the calling thread of a blocking call. */
 struct runner_t {
 
@@ -583,6 +592,9 @@ struct ustore_database_handle_t {
 
     /** Whether calls may change the database, as an open or a view set it. */
     access_t access = access_t::read_write_k;
+
+    /** The kernels and waits every call on the database may use, picked once at open. */
+    cpu_ceiling_t ceiling;
 
     /** Deferred calls naming the database that have not finished, through @c std::atomic_ref. */
     std::uint32_t deferred_calls = 0;

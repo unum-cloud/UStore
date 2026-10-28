@@ -286,8 +286,9 @@ struct nvme_variant {
     /** The table every handle the open of this class hands out is stamped with. */
     static engine_t const engine_k;
 
-    /** Implements @c ustore_database_open_nvme over a store of this class. */
-    static status_t open(ustore_database_open_nvme_t const& arguments, view_t const& view) noexcept;
+    /** Implements @c ustore_database_open_nvme over a store of this class, sorting strings as @p ceiling allows. */
+    static status_t open(ustore_database_open_nvme_t const& arguments, cpu_ceiling_t ceiling,
+                         view_t const& view) noexcept;
 };
 
 /** Everything one open database holds, behind its database handle of the C ABI. */
@@ -311,6 +312,9 @@ struct database_state {
 
     /** The buffer every caller's transaction takes. */
     transaction_config_t transaction_shape;
+
+    /** The StringZilla kernel every strings commit sorts through, resolved once under the handle's ceiling. */
+    sz_kernel_sort_order_t sort_order = nullptr;
 
     /** The executor that opened the database, whose threads read on a channel and an epoch slot of their own, or
      *  null; compared by address alone, as one made where a freed one was has threads as exclusive, and any index
@@ -357,7 +361,7 @@ struct transaction_state {
 
     transaction_state(database_state<cpu_class_>& owner,
                       typename database_of<cpu_class_>::transaction_unique_ptr_t&& opened) noexcept
-        : state(owner), strings(*owner.store, stringzilla_sort_order()), held(std::move(opened)) {
+        : state(owner), strings(*owner.store, owner.sort_order), held(std::move(opened)) {
         strings.join(*held);
     }
 };
@@ -764,7 +768,7 @@ status_t commit_alone(database_state<cpu_class_>& state, ustore_arena_t scratch,
     shape.max_bytes = std::max<std::size_t>(bytes, 1);
     for (std::size_t attempt = 0; attempt != commit_attempts_k; ++attempt) {
         // Declared first, so the transaction it joins dies before it does.
-        strings_transaction_of<cpu_class_> strings {*state.store, stringzilla_sort_order()};
+        strings_transaction_of<cpu_class_> strings {*state.store, state.sort_order};
         auto [held, begin_status] = begin_transaction(state, shape);
         if (begin_status.failed()) return begin_status;
         strings.join(*held);
@@ -1665,18 +1669,17 @@ status_t mount_store(database_state<cpu_class_>& state, database_config_t const&
     });
 }
 
-/** Opens the store @p resources place, every collection of it shaped as @p shape and merged on @p compactions,
- *  reserving both system collections on the first open. */
+/** Opens the store @p resources place, every collection of it shaped as @p shape, merged on @p compactions and its
+ *  strings sorted through @p sort_order, reserving both system collections on the first open. */
 template <cpu_class_t cpu_class_>
-expected<std::unique_ptr<database_state<cpu_class_>>> open_state(resources_config_t const& resources,
-                                                                 database_config_t const& transactions,
-                                                                 collection_config_t const& shape,
-                                                                 ustore_arena_t scratch,
-                                                                 cuda_executor_t const* compactions) noexcept {
+expected<std::unique_ptr<database_state<cpu_class_>>> open_state(
+    resources_config_t const& resources, database_config_t const& transactions, collection_config_t const& shape,
+    sz_kernel_sort_order_t sort_order, ustore_arena_t scratch, cuda_executor_t const* compactions) noexcept {
     std::unique_ptr<database_state<cpu_class_>> state {new (std::nothrow) database_state<cpu_class_>};
     if (!state) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the database"};
     state->collection_shape = shape;
     state->transaction_shape = transactions.default_transaction;
+    state->sort_order = sort_order;
     auto [opened, open_status] =
         open_resources<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>(resources,
                                                                                                    uuid_t {});
@@ -1709,7 +1712,8 @@ expected<std::unique_ptr<database_state<cpu_class_>>> open_state(resources_confi
 
 /** Implements @c ustore_database_open_nvme, reserving both system collections on the first open. */
 template <cpu_class_t cpu_class_>
-status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& arguments, view_t const& view) noexcept {
+status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& arguments, cpu_ceiling_t ceiling,
+                                        view_t const& view) noexcept {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
 
@@ -1724,9 +1728,14 @@ status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& argum
     cuda_executor_t const* compactions = nullptr;
     if (status_t const read = read_options(arguments, resources, transactions, collections, compactions); read.failed())
         return read;
+    sz_kernel_punned_t sort_order = nullptr;
+    sz_capability_t sort_capability = 0;
+    if (sz_sort_find_kernel(sz_kernel_sort_order_k, ceiling.compute, &sort_order, &sort_capability) != sz_success_k)
+        return {status_code_t::unsupported_k, "No StringZilla kernel sorts the strings"};
     std::unique_ptr<ustore_database_handle_t> handle {new (std::nothrow) ustore_database_handle_t {}};
     if (!handle) return {status_code_t::out_of_memory_k, "Failed to allocate the database"};
     auto [state, open_status] = open_state<cpu_class_>(resources, transactions, create_collection_config(collections),
+                                                       reinterpret_cast<sz_kernel_sort_order_t>(sort_order),
                                                        view.scratch, compactions);
     if (open_status.failed()) return open_status;
     state->executor = nvme_placement_of(arguments.executor).executor;
@@ -1917,7 +1926,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     status_t saved;
     {
         auto [target, open_status] = open_state<cpu_class_>(resources, transactions, source.collection_shape,
-                                                            view.scratch, host_merges);
+                                                            source.sort_order, view.scratch, host_merges);
         saved = open_status;
         for (collection_ids_t const& collection : held)
             if (saved.succeeded()) saved = save_collection(access, collection, *target, progress);

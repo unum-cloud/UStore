@@ -63,8 +63,8 @@
 #include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref` & kin - the classes' atomic references
 #include <forkunion/capabilities.hpp>  // `fu::x86_pause_t`, `fu::arm64_wfet_t` & waiter kin, `fu::cpu_capabilities`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <stringzilla/capabilities.h>  // `sz_capabilities_enabled_cpu`, `sz_kernel_sort_order_t`
-#include <stringzilla/sort.h>          // `sz_sort_order_serial` and its tiers
+#include <stringzilla/capabilities.h>  // `sz_capabilities_detected_cpu`, `sz_kernel_sort_order_t`
+#include <stringzilla/sort.h>          // `sz_sort_find_kernel`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include "ustore/types.hpp"                 // `key_after`, `largest_key_k`
@@ -135,7 +135,7 @@ char const* name_in(enumerator_spelling<enum_type_> const (&names)[count_], enum
 /** The enumerator of @p names spelled @p name, or the zero enumerator for a name none carries. */
 template <typename enum_type_, std::size_t count_>
 enum_type_ value_in(enumerator_spelling<enum_type_> const (&names)[count_], ustore_bytes_view_t name) noexcept {
-    std::string_view const text {reinterpret_cast<char const*>(name.data), name.length};
+    std::string_view const text = string_of(name);
     for (enumerator_spelling<enum_type_> const& spelling : names)
         if (spelling.name == text) return spelling.value;
     return enum_type_ {};
@@ -146,23 +146,31 @@ enum_type_ value_in(enumerator_spelling<enum_type_> const (&names)[count_], usto
 #pragma region CPU Classes
 
 /** The CPU families UStore ships variants for, named as USearch names them. Each class bundles the
- *  wait instruction and the atomics its silicon generation guarantees; the engines inline no
- *  compute kit, so only a class whose waiter or atomic reference differs from its parent's carries
- *  a variant. */
+ *  wait instruction and the atomics its silicon generation guarantees, and the StringZilla kernels
+ *  its calls dispatch to; the engines inline no compute kit, so only a class whose waiter or atomic
+ *  reference differs from its parent's carries a variant, and Haswell, Skylake, Ice Lake and
+ *  Graviton2 only cap the StringZilla kernels. */
 enum class cpu_class_t : std::uint32_t {
     unknown_k = 0,
 
-    /** The portable floor: standard atomics, and yields to the scheduler. */
+    /** The portable floor: standard atomics, spinning on the hint every core of its architecture carries, @c PAUSE or
+     *  @c YIELD, and yielding to the scheduler elsewhere. */
     serial_k,
 
-    /** Haswell-class x86, and every x86-64 core this engine runs on: @c PAUSE between attempts. */
+    /** Haswell-class x86: the @c serial_k waits and atomics, and AVX2 string kernels. */
     intel_haswell_k,
 
     /** Sierra Forest-class x86 - the E-core Xeons, and Diamond Rapids after them: @c TPAUSE waits
      *  and @c CMPCCXADD conditional adds. */
     intel_sierra_k,
 
-    /** Graviton2-class Arm - Neoverse N1: @c YIELD between attempts. */
+    /** Skylake-class x86 servers: AVX-512 string kernels over the @c intel_haswell_k waits and atomics. */
+    intel_skylake_k,
+
+    /** Ice Lake-class x86 servers: the @c intel_skylake_k kernels widened by VBMI2 and SHA-NI. */
+    intel_icelake_k,
+
+    /** Graviton2-class Arm - Neoverse N1: the @c serial_k waits and atomics, and NEON string kernels. */
     aws_g2_k,
 
     /** Armv8.3+ Arm, named for Apple M2: single-instruction LSE read-modify-writes under RCpc acquiring loads. */
@@ -176,15 +184,15 @@ enum class cpu_class_t : std::uint32_t {
  *  variant must be distinct from to earn instantiation. */
 constexpr cpu_class_t parent_class_of(cpu_class_t cpu_class) noexcept {
     switch (cpu_class) {
-    case cpu_class_t::intel_sierra_k: return cpu_class_t::intel_haswell_k;
+    case cpu_class_t::intel_icelake_k: return cpu_class_t::intel_skylake_k;
+    case cpu_class_t::intel_skylake_k: return cpu_class_t::intel_haswell_k;
     case cpu_class_t::aws_g5_k: return cpu_class_t::apple_m2_k;
-    case cpu_class_t::apple_m2_k: return cpu_class_t::aws_g2_k;
     default: return cpu_class_t::serial_k;
     }
 }
 
-/** The wait instruction one CPU class pairs: x86 spins @c PAUSE, the WAITPKG Xeons arm @c TPAUSE,
- *  Arm spins @c YIELD and the Armv8.7 classes arm @c WFET, everything else yields - as does any
+/** The wait instruction one CPU class pairs: the serial floor spins @c PAUSE on x86 and @c YIELD on
+ *  Arm, the WAITPKG Xeons arm @c TPAUSE, the Armv8.7 classes arm @c WFET, everything else yields - as does any
  *  class whose @c FORKUNION_TARGET_<BIT> is off in the probe list. */
 template <cpu_class_t cpu_class_>
 struct waiter_for_cpu_class {
@@ -192,7 +200,7 @@ struct waiter_for_cpu_class {
 };
 #if FORKUNION_TARGET_X86_PAUSE
 template <>
-struct waiter_for_cpu_class<cpu_class_t::intel_haswell_k> {
+struct waiter_for_cpu_class<cpu_class_t::serial_k> {
     using type = fu::x86_pause_t;
 };
 #endif
@@ -204,7 +212,7 @@ struct waiter_for_cpu_class<cpu_class_t::intel_sierra_k> {
 #endif
 #if FORKUNION_TARGET_ARM64_YIELD
 template <>
-struct waiter_for_cpu_class<cpu_class_t::aws_g2_k> {
+struct waiter_for_cpu_class<cpu_class_t::serial_k> {
     using type = fu::arm64_yield_t;
 };
 template <>
@@ -270,7 +278,7 @@ using atomic_ref_of = typename atomic_ref_for_cpu_class<cpu_class_>::template ty
 /** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause: the runtime
  *  confirms nothing about them. */
 inline constexpr fu::capabilities_t baseline_hints_k = fu::capability_x86_pause_k | fu::capability_arm64_yield_k |
-                                                       fu::capability_risc5_pause_k;
+                                                       fu::capability_riscv64_pause_k;
 
 /** Lowers one CPU class onto ForkUnion's mask - the bits the runtime must confirm before the
  *  class's waiter and atomic reference are trusted, read off the two types themselves. */
@@ -286,14 +294,8 @@ constexpr fu::capabilities_t forkunion_capabilities_of() noexcept {
 constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
     switch (cpu_class) {
     case cpu_class_t::serial_k: return true;
-#if USTORE_TARGET_INTEL_HASWELL
-    case cpu_class_t::intel_haswell_k: return true;
-#endif
 #if USTORE_TARGET_INTEL_SIERRA
     case cpu_class_t::intel_sierra_k: return true;
-#endif
-#if USTORE_TARGET_AWS_G2
-    case cpu_class_t::aws_g2_k: return true;
 #endif
 #if USTORE_TARGET_APPLE_M2
     case cpu_class_t::apple_m2_k: return true;
@@ -315,41 +317,101 @@ consteval bool rung_advances() noexcept {
             !std::is_same_v<atomic_ref_of<cpu_class_, std::uint32_t>, atomic_ref_of<parent_k, std::uint32_t>>);
 }
 
-/** Whether the running CPU confirms every ForkUnion bit one CPU class needs. */
-template <cpu_class_t cpu_class_>
-bool forkunion_admits() noexcept {
-    constexpr fu::capabilities_t wanted = forkunion_capabilities_of<cpu_class_>();
-    return (fu::cpu_capabilities() & wanted) == wanted;
+/** ForkUnion's mask for a class named at run time; Haswell, Skylake, Ice Lake and Graviton2 carry no variant and wait
+ *  and synchronize as the serial floor does. */
+constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+    case cpu_class_t::intel_haswell_k:
+    case cpu_class_t::intel_skylake_k:
+    case cpu_class_t::intel_icelake_k: return forkunion_capabilities_of<cpu_class_t::intel_haswell_k>();
+    case cpu_class_t::intel_sierra_k: return forkunion_capabilities_of<cpu_class_t::intel_sierra_k>();
+    case cpu_class_t::aws_g2_k: return forkunion_capabilities_of<cpu_class_t::aws_g2_k>();
+    case cpu_class_t::apple_m2_k: return forkunion_capabilities_of<cpu_class_t::apple_m2_k>();
+    case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
+    default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
+    }
 }
 
-/** The capabilities of this CPU that StringZilla dispatches on, probed once per process. */
-inline sz_capability_t stringzilla_capabilities() noexcept {
-    static sz_capability_t const capabilities = []() noexcept {
-        sz_capability_t probed = 0;
-        return sz_capabilities_enabled_cpu(&probed) == sz_success_k ? probed : sz_capability_t {0};
-    }();
-    return capabilities;
+/** The StringZilla capabilities one CPU class dispatches its string kernels on, as UCall's classes name them. */
+constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+    case cpu_class_t::intel_haswell_k: return sz_cap_serial_k | sz_cap_haswell_k | sz_cap_westmere_k;
+    case cpu_class_t::intel_skylake_k:
+        return stringzilla_capabilities_of(cpu_class_t::intel_haswell_k) | sz_cap_skylake_k;
+    case cpu_class_t::intel_icelake_k:
+        return stringzilla_capabilities_of(cpu_class_t::intel_skylake_k) | sz_cap_icelake_k | sz_cap_goldmont_k;
+    case cpu_class_t::intel_sierra_k:
+        return stringzilla_capabilities_of(cpu_class_t::intel_haswell_k) | sz_cap_goldmont_k;
+    case cpu_class_t::aws_g2_k:
+    case cpu_class_t::apple_m2_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
+    case cpu_class_t::aws_g5_k:
+        return stringzilla_capabilities_of(cpu_class_t::apple_m2_k) | sz_cap_sve_k | sz_cap_sve2_k | sz_cap_sve2aes_k;
+    default: return sz_cap_serial_k;
+    }
 }
 
-/** The StringZilla sort kernel the running CPU admits, newest tier first, which the strings stores seal through. */
-inline sz_kernel_sort_order_t stringzilla_sort_order() noexcept {
-    [[maybe_unused]] sz_capability_t const capabilities = stringzilla_capabilities();
-#if STRINGZILLA_TARGET_SKYLAKE
-    if (capabilities & sz_cap_skylake_k) return &sz_sort_order_skylake;
-#endif
-#if STRINGZILLA_TARGET_HASWELL
-    if (capabilities & sz_cap_haswell_k) return &sz_sort_order_haswell;
-#endif
-#if STRINGZILLA_TARGET_SVE
-    if (capabilities & sz_cap_sve_k) return &sz_sort_order_sve;
-#endif
-#if STRINGZILLA_TARGET_NEON
-    if (capabilities & sz_cap_neon_k) return &sz_sort_order_neon;
-#endif
-#if STRINGZILLA_TARGET_RVV
-    if (capabilities & sz_cap_rvv_k) return &sz_sort_order_rvv;
-#endif
-    return &sz_sort_order_serial;
+/** The C enum's class as the engines name it; @c ustore_cpu_class_unknown_k derives nothing, so it names the serial
+ *  floor. */
+constexpr cpu_class_t cpu_class_of(ustore_cpu_class_t cpu_class) noexcept {
+    if (cpu_class == ustore_cpu_class_unknown_k || cpu_class > ustore_cpu_class_aws_g5_k) return cpu_class_t::serial_k;
+    return static_cast<cpu_class_t>(cpu_class);
+}
+
+static_assert(static_cast<std::uint32_t>(cpu_class_t::aws_g5_k) == ustore_cpu_class_aws_g5_k);
+
+/** What a handle may use: the masks this machine runs when nothing is pinned, the pinned class's masks when it runs
+ *  them, refusing an unknown class or one this machine does not run. The one caller of StringZilla's and ForkUnion's
+ *  detection. */
+inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t pinned) noexcept {
+    cpu_ceiling_t detected;
+    if (sz_capabilities_detected_cpu(&detected.compute) != sz_success_k) detected.compute = sz_cap_serial_k;
+    detected.sync = fu::cpu_capabilities();
+    if (pinned == ustore_cpu_class_unknown_k) return detected;
+    if (pinned > ustore_cpu_class_aws_g5_k) return status_t {status_code_t::invalid_argument_k, "Unknown CPU class"};
+    cpu_class_t const pinned_class = cpu_class_of(pinned);
+    cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
+    if ((detected.compute & wanted.compute) != wanted.compute || (detected.sync & wanted.sync) != wanted.sync)
+        return status_t {status_code_t::unsupported_k, "The CPU does not run the pinned class"};
+    return wanted;
+}
+
+/** Whether @p rung fits under @p ceiling: its waiter and atomics need nothing the ceiling lacks, as its variant
+ *  inlines no StringZilla kernel. */
+constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
+    return (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
+}
+
+/** The mask a pool of an executor under @p ceiling is allowed: every placement bit, and the instructions the ceiling
+ *  keeps. */
+constexpr fu_capabilities_t forkunion_allowed_of(cpu_ceiling_t ceiling) noexcept {
+    return static_cast<fu_capabilities_t>((fu_capabilities_all_k & ~fu_capability_any_instruction_k) | ceiling.sync |
+                                          baseline_hints_k);
+}
+
+/** CPU classes newest first, the order a ladder tries them in. */
+template <cpu_class_t... classes_>
+struct cpu_ladder {};
+
+/** The classes carrying variants, each lineage newest first and the serial floor last; a rung the build left out is
+ *  skipped by the walk, never by the list. */
+using cpu_ladder_t =
+    cpu_ladder<cpu_class_t::intel_sierra_k, cpu_class_t::aws_g5_k, cpu_class_t::apple_m2_k, cpu_class_t::serial_k>;
+
+/** Opens through @p open on the newest rung of @p ladder the build compiled and @p ceiling fits, the serial floor
+ *  last, calling it as <tt>open.template operator()<class>()</tt>; a class picking its parent's waiter and atomics is
+ *  skipped without instantiating its variant. */
+template <cpu_class_t... classes_, typename open_type_>
+status_t open_fitting_rung(cpu_ladder<classes_...>, cpu_ceiling_t ceiling, open_type_&& open) noexcept {
+    status_t opened;
+    bool picked = false;
+    auto rung = [&]<cpu_class_t class_>() noexcept {
+        if constexpr (class_ == cpu_class_t::serial_k || rung_advances<class_>()) {
+            if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, opened = open.template operator()<class_>();
+        }
+        else static_assert(!cpu_class_compiled(class_), "A compiled class no longer advances past the one below");
+    };
+    (rung.template operator()<classes_>(), ...);
+    return opened;
 }
 
 #pragma endregion CPU Classes
@@ -587,6 +649,9 @@ inline void clear_outputs(ustore_graph_vertices_cursor_next_t const& arguments) 
 struct ragged_input_t {
     ustore_strings_view_t view;
     std::size_t count;
+
+    ragged_input_t(ustore_strings_view_t view, ustore_size_t count) noexcept
+        : view(view), count(static_cast<std::size_t>(count)) {}
 };
 
 /** The ragged inputs of every call that takes them, in the order its engine slot reads them. */
@@ -1302,7 +1367,7 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
             if (!verb) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
             if constexpr (carries_match<arguments_type_>) {
                 auto [match, match_status] = compile_match<home_k>(arguments, runner.scratch,
-                                                                   stringzilla_capabilities());
+                                                                   database->ceiling.compute);
                 if (match_status.failed()) return match_status;
                 if constexpr (home_k == home_t::host_k) {
                     if (!match.matches_everything())
@@ -1393,10 +1458,17 @@ status_t serve_and_release(arguments_type_& arguments, view_t const& runner) noe
     return status;
 }
 
-/** Opens the database @p call names through @p open_, its engine's open, which claims nothing. */
+/** Opens the database @p call names through @p open_, its engine's open, which claims nothing, under the ceiling its
+ *  pinned class sets, which the opened handle keeps for every later call. */
 template <typename arguments_type_, auto open_>
 status_t serve_open(arguments_type_& call, view_t const& runner) noexcept {
-    return open_(call, runner);
+    ustore_cpu_class_t pinned = ustore_cpu_class_unknown_k;
+    if constexpr (requires { call.cpu_class; }) pinned = call.cpu_class;
+    auto const [ceiling, pick_status] = pick_cpu_ceiling(pinned);
+    if (pick_status.failed()) return pick_status;
+    if (status_t const opened = open_(call, ceiling, runner); opened.failed()) return opened;
+    (*call.database)->ceiling = ceiling;
+    return {};
 }
 
 /** Serves @p call with @p serve_ in the scratch and on the thread @p runner names, then finishes its outcome. */
@@ -1521,7 +1593,7 @@ expected<cursor_engines<verbs_type_>> open_cursor_home(engine_t const& engine, a
                                             verb_slot<scan_type_>::template table<home_>;
     if (!verbs || !(verbs->*verb_slot<scan_type_>::template verb<home_>))
         return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
-    auto [match, match_status] = compile_match<home_>(arguments, compiled, stringzilla_capabilities());
+    auto [match, match_status] = compile_match<home_>(arguments, compiled, arguments.database->ceiling.compute);
     if (match_status.failed()) return match_status;
     return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, home_> {verbs, match}};
 }

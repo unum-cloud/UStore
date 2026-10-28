@@ -76,7 +76,7 @@ A save copies the snapshot into a new database a memtable-sized batch at a time,
 
 `src/nvme/` is the hyper-converged engine, and the one UStore's hardware paths serve.
 A `database` holds collections, each in an `nvme_store` over an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions.
-`src/nvme/variants.hpp` serves every slot of `engine_t` the RAM engine serves, its snapshots as stamps pinned in the database's commit ledger, once per CPU class of `src/lib.hpp`, and `src/nvme/engine.cpp` opens a database with the newest class the running CPU admits.
+`src/nvme/variants.hpp` serves every slot of `engine_t` the RAM engine serves, its snapshots as stamps pinned in the database's commit ledger, once per CPU class of `src/lib.hpp`, and `src/nvme/engine.cpp` opens a database with the newest class its ceiling fits, the running CPU's or the pinned `cpu_class`'s.
 Every collection of the C ABI is one collection of the database under its UUID, keyed by the 16 bytes of `ustore_key_t`.
 Its `_collections` system collection maps every collection onto its name, the database's own schema recording its modality, and a strings collection and the names live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole strings, whose writes and watches join a transaction as a share of it.
 A graph collection lives in the graph store of `include/ustore/graph/nvme_store.hpp`, one key per vertex folded from half-edge change deltas, and `src/nvme/graph.hpp` serves the graph calls of the table over it.
