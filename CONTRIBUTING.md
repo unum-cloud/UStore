@@ -132,7 +132,7 @@ Per-thread scratch belongs to the executor that owns the threads.
 
 ### Threads and Placement
 
-Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion.h`, wrapped once by the C++ executor of `include/ustore/utilities/ram_device.hpp` and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
+Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, wrapped once by the C++ executor of `include/ustore/utilities/ram_device.hpp` and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
 The executor owns a `fu_topology_t` and a `fu_pool_t` created through `fu_topology_new`, `fu_pool_new` and `fu_pool_spawn`, returns `expected` from its factory, deletes the pool in its destructor, and forwards C++ callables to the pool through a C callback.
 A pool another library lends through `ustore_executor_on_pool` is wrapped by `lent_pool_t` instead, which dispatches on it but never deletes or parks it.
 The arenas place their blocks with `fu_allocate_on_domain_id` and release them with `fu_free_on_domain_id`.
@@ -205,10 +205,12 @@ A namespace-scope `_k` constant names an invariant — a format, an alignment, a
 `CMakeLists.txt` builds two libraries from the same sources, every engine adding its own:
 
 - __`ustore_static`__, aliased `ustore::static` and `ustore::ustore`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. The suites, benchmarks and tools inside the tree link it as `ustore::static` and reach the siblings through it.
-- __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, `--exclude-libs,ALL` on Linux, Android and FreeBSD and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
+- __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, a `ustore_*` version script on Linux, Android and FreeBSD and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
 
 `c/test.c` builds against both, as `ustore_test_c` and `ustore_test_c_shared`, and CTest runs both.
-`USTORE_INSTALL` installs the two libraries, the headers, and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::static` and `ustore::shared`.
+`USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::static` and `ustore::shared`.
+The install splits into components: `sdk` holds the shared library, `c/ustore/`, `cpp/ustore/`, the package and the license, `static` the archive with the engines' archives, and `core` the header-only `include/ustore/`.
+`cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, stripped, as the preview SDK `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows.
 A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration carries it.
 
 ## Python Builds
@@ -233,6 +235,7 @@ An engine is left out through `CMAKE_ARGS` or `--config-settings=cmake.define.US
 `Cargo.toml` and `build.rs` at the root build the crate from `rust/lib.rs`, and `build.rs` compiles no C or C++ itself.
 The crate's own usage is described in [`rust/README.md`](rust/README.md).
 It configures CMake with `USTORE_BUILD_SHARED=ON` and `USTORE_INSTALL=ON`, installs into `OUT_DIR`, and links the `ustore_static` archive with the archives of the engines its features enable, and the target's C++ standard library.
+`USTORE_LIBRARY_DIR` names a directory already holding those archives, such as the `lib/` of a prefix installed with `USTORE_BUNDLE_SIBLINGS=OFF`, and skips the CMake build.
 
 - __RAM__ always builds, in the `ustore_static` archive the crate links.
 - __rocksdb and leveldb__ are default features, each adding its engine to that library; without one, its `Database::open_*` fails with `Status::Unsupported`.

@@ -16,7 +16,7 @@
 #include <type_traits> // `std::is_nothrow_invocable_v`, `std::remove_reference_t`
 #include <utility>     // `std::exchange`, `std::forward`, `std::swap`
 
-#include <forkunion.h>
+#include <forkunion/forkunion.h>
 
 #include <smashtable/shared.hpp>
 

@@ -71,6 +71,8 @@ if (NOT rocksdb_POPULATED)
         OFF
         CACHE INTERNAL ""
     )
+    # RocksDB moves a default install prefix to `/usr` on Linux, which every install rule of this project would follow
+    set(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT OFF)
     FetchContent_Populate(rocksdb)
     add_subdirectory(${rocksdb_SOURCE_DIR} ${rocksdb_BINARY_DIR} EXCLUDE_FROM_ALL SYSTEM)
     add_library(rocksdb::rocksdb ALIAS rocksdb)

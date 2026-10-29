@@ -22,7 +22,7 @@
 #include <utility>     // `std::exchange`
 #include <variant>     // `std::variant`, `std::get_if`
 
-#include <forkunion.h>
+#include <forkunion/forkunion.h>
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <stringzilla/types.h>         // `sz_allocator_t`
 

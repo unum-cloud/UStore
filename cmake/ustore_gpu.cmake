@@ -48,8 +48,9 @@ if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
     add_library(ustore_nvme_compaction STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cu")
     target_link_libraries(
         ustore_nvme_compaction
-        PUBLIC CCCL::CUB CUDA::cudart ustore_header smashtable::header forkunion::header
-        PRIVATE stringzilla::static
+        PUBLIC $<BUILD_INTERFACE:CCCL::CUB> CUDA::cudart ustore_header $<BUILD_INTERFACE:smashtable::header>
+               $<BUILD_INTERFACE:forkunion::header>
+        PRIVATE $<BUILD_INTERFACE:stringzilla::static>
     )
     set_target_properties(ustore_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)

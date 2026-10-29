@@ -12,7 +12,7 @@
 
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Every CMake option a Cargo feature turns on, paired with that feature.
 const KNOWN_OPTIONS: &[(&str, &str)] = &[
@@ -52,31 +52,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-
-    let mut build = cmake::Config::new(&manifest);
-    build
-        .define("USTORE_BUILD_SHARED", "ON")
-        .define("USTORE_INSTALL", "ON")
-        .define("CMAKE_INSTALL_LIBDIR", "lib")
-        .define("USTORE_BUNDLE_SIBLINGS", "OFF")
-        .always_configure(false);
-    for (option, feature) in KNOWN_OPTIONS {
-        build.define(*option, if feature_enabled(feature) { "ON" } else { "OFF" });
-    }
-    for (variable, links) in [
-        ("FETCHCONTENT_SOURCE_DIR_FORKUNION", "forkunion"),
-        ("FETCHCONTENT_SOURCE_DIR_SMASHTABLE", "smashtable"),
-        ("FETCHCONTENT_SOURCE_DIR_STRINGZILLA", "stringzilla"),
-    ] {
-        build.define(variable, sibling_source(links)?);
-    }
-
-    let prefix = build.build();
-    println!(
-        "cargo:rustc-link-search=native={}",
-        prefix.join("lib").display()
-    );
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
+    let target_env = env::var("CARGO_CFG_TARGET_ENV")?;
+
+    // A directory holding `ustore_static` and the engine archives beside it, like the `lib/` of a
+    // prefix CMake installed with `USTORE_BUNDLE_SIBLINGS=OFF`, skips the build here.
+    println!("cargo:rerun-if-env-changed=USTORE_LIBRARY_DIR");
+    let library = match env::var_os("USTORE_LIBRARY_DIR") {
+        Some(directory) => {
+            let directory = PathBuf::from(directory);
+            let archive = match target_env.as_str() {
+                "msvc" => "ustore_static.lib",
+                _ => "libustore_static.a",
+            };
+            println!(
+                "cargo:rerun-if-changed={}",
+                directory.join(archive).display()
+            );
+            directory
+        }
+        None => build_library(&manifest)?.join("lib"),
+    };
+    println!("cargo:rustc-link-search=native={}", library.display());
     println!("cargo:rustc-link-lib=static=ustore_static");
     if feature_enabled("rocksdb") {
         println!("cargo:rustc-link-lib=static=rocksdb");
@@ -94,16 +91,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // The archives are C++, so the standard library they were compiled against comes along.
-    let target_env = env::var("CARGO_CFG_TARGET_ENV")?;
     match (target_os.as_str(), target_env.as_str()) {
         (_, "msvc") => {}
         ("macos" | "ios" | "freebsd", _) => println!("cargo:rustc-link-lib=dylib=c++"),
         _ => println!("cargo:rustc-link-lib=dylib=stdc++"),
+    }
+    Ok(())
+}
+
+/// Installs the libraries through CMake into `OUT_DIR`, answering the prefix.
+fn build_library(manifest: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let mut build = cmake::Config::new(manifest);
+    build
+        .define("USTORE_BUILD_SHARED", "ON")
+        .define("USTORE_INSTALL", "ON")
+        .define("CMAKE_INSTALL_LIBDIR", "lib")
+        .define("USTORE_BUNDLE_SIBLINGS", "OFF")
+        .always_configure(false);
+    for (option, feature) in KNOWN_OPTIONS {
+        build.define(*option, if feature_enabled(feature) { "ON" } else { "OFF" });
+    }
+    for (variable, links) in [
+        ("FETCHCONTENT_SOURCE_DIR_FORKUNION", "forkunion"),
+        ("FETCHCONTENT_SOURCE_DIR_SMASHTABLE", "smashtable"),
+        ("FETCHCONTENT_SOURCE_DIR_STRINGZILLA", "stringzilla"),
+    ] {
+        build.define(variable, sibling_source(links)?);
     }
 
     // Cargo scans a watched directory recursively.
     for source in SOURCES {
         println!("cargo:rerun-if-changed={}", manifest.join(source).display());
     }
-    Ok(())
+    Ok(build.build())
 }

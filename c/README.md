@@ -51,6 +51,10 @@ find_package(ustore 1.0 REQUIRED)
 target_link_libraries(your_target PRIVATE ustore::shared)
 ```
 
+The preview SDK is the `sdk` component alone: the stripped shared library, the C headers, the C++ wrappers, the package, a `.pc` file and the license.
+`cpack --config build_release/CPackConfig.cmake` archives it as `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows, and a consumer without CMake links it through `pkg-config --cflags --libs ustore`.
+`cmake --install build_release --component static` adds `ustore::static` with the engines' archives, and `--component core` the header-only templates.
+
 `c/` and `cpp/` are both include roots, so every header is spelled `<ustore/...>` in the tree and once installed, where the headers of both land side by side in one `ustore/` folder.
 
 ## Conventions

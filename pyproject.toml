@@ -71,13 +71,17 @@ sdist.include = [
   "/cmake/**",
   "/tools/**",
   "/python/**",
+  "/numkong/c/**",
   "/numkong/include/**",
+  "/numkong/cpp/**",
   "/stringzilla/CMakeLists.txt",
   "/stringzilla/VERSION",
   "/stringzilla/cmake/**",
   "/stringzilla/c/**",
   "/stringzilla/probes/**",
   "/stringzilla/include/**",
+  "/stringzilla/cpp/**",
+  "/stringzilla/src/**",
   "/smashtable/CMakeLists.txt",
   "/smashtable/VERSION",
   "/smashtable/cmake/**",
@@ -88,6 +92,7 @@ sdist.include = [
   "/forkunion/c/**",
   "/forkunion/probes/**",
   "/forkunion/include/**",
+  "/forkunion/src/**",
 ]
 wheel.packages = ["python/ustore"]
 

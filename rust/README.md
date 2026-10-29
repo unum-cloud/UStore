@@ -8,6 +8,7 @@ cargo add ustore
 
 The crate links the engine library CMake builds and consumes it through the C ABI in `c/ustore/`.
 `build.rs` compiles no C or C++ of its own: it configures CMake, installs the libraries into `OUT_DIR` and links `ustore_static`, the archive that carries the objects of the small libraries it builds on, with the archives of the engines its features enable.
+`USTORE_LIBRARY_DIR` names a directory already holding those archives, such as the `lib/` of a prefix CMake installed with `USTORE_BUNDLE_SIBLINGS=OFF`, and skips the CMake build.
 
 The in-memory `ram` engine always builds, the default `rocksdb` and `leveldb` features add theirs to the one library, and the `nvme` feature adds the NVMe engine when asked for.
 Without a feature, its engine's `Database::open_*` fails with `Status::Unsupported`.

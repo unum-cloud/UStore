@@ -5,7 +5,7 @@ string(STRIP ${ustore_version_} ustore_version_)
 # CMake versions are numeric, so the pre-release suffix of VERSION stays in ustore_version_ only.
 string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" ustore_version_number_ ${ustore_version_})
 project(
-    UStore
+    ustore
     LANGUAGES C CXX
     VERSION ${ustore_version_number_}
     HOMEPAGE_URL "https://github.com/unum-cloud/UStore"
@@ -336,6 +336,8 @@ add_library(ustore_shared SHARED ${ustore_library_exclusion_} ${ustore_sources_}
 add_library(ustore::shared ALIAS ustore_shared)
 set_target_properties(ustore_static PROPERTIES EXPORT_NAME static)
 set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
+# `SOVERSION` carries the major alone, the only break the C ABI admits
+set_target_properties(ustore_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 target_compile_definitions(
     ustore_shared
     PRIVATE USTORE_EXPORTING
@@ -348,9 +350,13 @@ target_link_libraries(
 target_link_libraries(
     ustore_shared PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_} ${ustore_engine_archives_}
 )
-# The archives linked inside keep their exports to themselves, so the shared library exports the C ABI alone
+# The shared library exports the C ABI alone. On ELF a version script does it, since the standard library's inline
+# definitions, like `std::bad_variant_access`, keep default visibility under any preset, as do the archives linked
+# inside
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ustore_shared.map" "{ global: ustore_*; local: *; };\n")
 target_link_options(
-    ustore_shared PRIVATE $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--exclude-libs,ALL>
+    ustore_shared PRIVATE
+    $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/ustore_shared.map>
     $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_ustore_*>
 )
 
@@ -368,7 +374,10 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
     target_compile_definitions(${library_} PRIVATE ${ustore_cpu_gates_})
     target_link_libraries(${library_} PRIVATE $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>)
     target_link_libraries(${library_} PUBLIC $<BUILD_INTERFACE:ustore_sanitizers>)
-    if (TARGET ustore_nvme_compaction)
+    # The shared library holds the device merger inside, and the archive hands it to its consumers' links.
+    if (TARGET ustore_nvme_compaction AND library_ STREQUAL "ustore_shared")
+        target_link_libraries(${library_} PRIVATE ustore_nvme_compaction)
+    elseif (TARGET ustore_nvme_compaction)
         target_link_libraries(${library_} PUBLIC ustore_nvme_compaction)
     endif ()
     # The `include_directories` above reach this project's targets only, so a consumer linking a library inherits the

@@ -96,6 +96,8 @@
       "description": "Libraries, suites, benchmarks and the CLI on every engine, RocksDB and LevelDB included.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-ffile-prefix-map=${sourceDir}=.",
+        "CMAKE_CXX_FLAGS": "-ffile-prefix-map=${sourceDir}=.",
         "USTORE_WITH_ROCKSDB": "ON",
         "USTORE_WITH_LEVELDB": "ON",
         "USTORE_BUILD_TEST": "ON",
@@ -170,7 +172,12 @@
       "displayName": "Windows x64 - Visual Studio 2026",
       "generator": "Visual Studio 18 2026",
       "architecture": "x64",
-      "cacheVariables": { "CMAKE_C_COMPILER": "cl", "CMAKE_CXX_COMPILER": "cl" }
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_C_FLAGS": "/DWIN32 /D_WINDOWS /pathmap:${sourceDir}=.",
+        "CMAKE_CXX_FLAGS": "/DWIN32 /D_WINDOWS /EHsc /pathmap:${sourceDir}=."
+      }
     },
     {
       "name": "msvc2022_arm64",
@@ -178,7 +185,12 @@
       "displayName": "Windows ARM64 - Visual Studio 2022",
       "generator": "Visual Studio 17 2022",
       "architecture": "ARM64",
-      "cacheVariables": { "CMAKE_C_COMPILER": "cl", "CMAKE_CXX_COMPILER": "cl" }
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_C_FLAGS": "/DWIN32 /D_WINDOWS /pathmap:${sourceDir}=.",
+        "CMAKE_CXX_FLAGS": "/DWIN32 /D_WINDOWS /EHsc /pathmap:${sourceDir}=."
+      }
     },
     {
       "name": "android_arm64",
