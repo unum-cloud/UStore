@@ -42,6 +42,10 @@ set(USTORE_CUDA_ARCH
     ""
     CACHE STRING "NVIDIA code NVMe's GPU compaction builds for: empty, all, native or one like 100f"
 )
+set(USTORE_ROCM_ARCH
+    ""
+    CACHE STRING "AMD processors the device bundles embed code objects for: empty, all, native or a list like gfx942"
+)
 option(USTORE_WERROR "Treat compiler warnings as errors" OFF)
 option(USTORE_BUNDLE_SIBLINGS "Copy the ForkUnion and StringZilla objects into ustore_static; Cargo links their own" ON)
 set(USTORE_BUILD_SANITIZERS
@@ -204,6 +208,7 @@ endfunction ()
 
 ustore_cpu_class(intel_sierra INTEL_SIERRA OVER serial x86_tpause x86_cmpccxadd)
 ustore_cpu_class(apple_m2 APPLE_M2 OVER serial arm64_lse arm64_rcpc)
+ustore_cpu_class(alibaba_c930 ALIBABA_C930 OVER serial riscv64_wrs riscv64_zacas)
 
 # A monoversioned build compiles one class: every capability StringZilla and ForkUnion enabled, which is what
 # `USTORE_MARCH` implies plus what a preset vouches for.
@@ -263,6 +268,7 @@ set(ustore_sources_
     src/docs.cpp
     src/graph.cpp
     src/pages.cpp
+    src/arrow.cpp
     src/ram/engine.cpp
 )
 set(ustore_sibling_archives_ forkunion_static stringzilla_static)
@@ -283,6 +289,7 @@ list(APPEND ustore_compiled_objects_ ustore_ram_variants)
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
+set(ustore_device_compaction_ OFF)
 if (${USTORE_WITH_NVME})
     list(APPEND ustore_sources_ src/nvme/engine.cpp)
     foreach (class_ IN LISTS ustore_cpu_classes_)
@@ -296,6 +303,51 @@ if (${USTORE_WITH_NVME})
     list(APPEND ustore_compiled_objects_ ustore_nvme_variants)
     list(APPEND ustore_engine_definitions_ USTORE_WITH_NVME=1)
     list(APPEND ustore_engine_names_ "nvme")
+
+    # The engine's compaction on the device, whose objects both libraries take, with the CUDA runtime it calls linked
+    # statically and hidden from the shared library's exports, while a build without CUDA codes takes
+    # `compaction_absent.cpp`, which makes no lane
+    if (ustore_cuda_codes_)
+        add_library(ustore_nvme_compaction OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cu")
+        target_link_libraries(
+            ustore_nvme_compaction
+            PUBLIC $<BUILD_INTERFACE:smashtable::header> $<BUILD_INTERFACE:forkunion::header>
+            # Private, since its StringZilla half defines `STRINGZILLA_HEADER_ONLY` for every unit it reaches
+            PRIVATE $<BUILD_INTERFACE:ustore_header> $<BUILD_INTERFACE:CCCL::CUB> CUDA::cudart_static
+                    $<BUILD_INTERFACE:stringzilla::static>
+        )
+        set_target_properties(
+            ustore_nvme_compaction
+            PROPERTIES CUDA_RUNTIME_LIBRARY Static
+                       CUDA_STANDARD 20
+                       CUDA_STANDARD_REQUIRED ON
+                       POSITION_INDEPENDENT_CODE ON
+        )
+        target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+        # The host pass reads nvcc's preprocessed output, where every header is the main file and every macro is
+        # expanded, so constant operands from capability macros and unused statics of the C headers would warn there and
+        # nowhere else
+        target_compile_options(
+            ustore_nvme_compaction
+            PUBLIC
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-constant-logical-operand,-Wno-unneeded-internal-declaration>
+        )
+        # A constexpr function is callable from a kernel, so the shared headers carry no host-device qualifier
+        target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+        # StringZilla's serial kernels, reached through the engine's key slots, carry GCC pragmas nvcc's front end does
+        # not know
+        target_compile_options(ustore_nvme_compaction PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=1675>)
+        set(ustore_device_compaction_ ON)
+    else ()
+        add_library(ustore_nvme_compaction OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction_absent.cpp")
+        target_link_libraries(
+            ustore_nvme_compaction
+            PUBLIC $<BUILD_INTERFACE:smashtable::header> $<BUILD_INTERFACE:forkunion::header>
+            PRIVATE $<BUILD_INTERFACE:ustore_header>
+        )
+        set_target_properties(ustore_nvme_compaction PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif ()
+    list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_nvme_compaction>)
 endif ()
 
 if (${USTORE_WITH_ROCKSDB})
@@ -329,6 +381,25 @@ foreach (dependency_ IN LISTS ustore_dependencies_)
     endif ()
     list(APPEND ustore_dependency_links_ $<BUILD_INTERFACE:${dependency_}>)
 endforeach ()
+# The kernels an executor loads at spawn, embedded in both libraries as one device-only bundle per vendor the build
+# names codes for, so neither links a GPU runtime. Each vendor's bundle is a target of its own, since a device pass
+# reads its includes from its target and only the NVIDIA one may see the CUDA toolkit's headers
+if (ustore_cuda_codes_)
+    add_library(ustore_vram_nvidia_tapes OBJECT ${ustore_library_exclusion_})
+    ustore_gpu_bundle(
+        ustore_vram_nvidia_tapes nvidia vram_nvidia_tapes
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/vram/vram_kernels_nvidia_tapes.cu" ${ustore_cuda_codes_}
+    )
+    list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_vram_nvidia_tapes>)
+endif ()
+if (ustore_rocm_codes_)
+    add_library(ustore_vram_amd_tapes OBJECT ${ustore_library_exclusion_})
+    ustore_gpu_bundle(
+        ustore_vram_amd_tapes amd vram_amd_tapes "${CMAKE_CURRENT_SOURCE_DIR}/src/vram/vram_kernels_amd_tapes.hip"
+        ${ustore_rocm_codes_}
+    )
+    list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_vram_amd_tapes>)
+endif ()
 add_library(ustore_static STATIC ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_dependency_objects_})
 add_library(ustore::static ALIAS ustore_static)
 add_library(ustore::ustore ALIAS ustore_static)
@@ -350,13 +421,25 @@ target_link_libraries(
 target_link_libraries(
     ustore_shared PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_} ${ustore_engine_archives_}
 )
+# Every GPU runtime and cuFile open through `dlopen` at first use, which glibc before 2.34 keeps in `libdl`
+target_link_libraries(ustore_static PUBLIC ${CMAKE_DL_LIBS})
+target_link_libraries(ustore_shared PRIVATE ${CMAKE_DL_LIBS})
+# Both libraries hold the device merger's objects, and the archive hands the static CUDA runtime they call to its
+# consumers' links
+if (ustore_device_compaction_)
+    target_link_libraries(ustore_static PUBLIC CUDA::cudart_static)
+    target_link_libraries(ustore_shared PRIVATE CUDA::cudart_static)
+endif ()
 # The shared library exports the C ABI alone. On ELF a version script does it, since the standard library's inline
 # definitions, like `std::bad_variant_access`, keep default visibility under any preset, as do the archives linked
 # inside
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ustore_shared.map" "{ global: ustore_*; local: *; };\n")
+# The static CUDA runtime the device merger calls stays inside, exporting nothing, so the library links no GPU runtime
 target_link_options(
-    ustore_shared PRIVATE
+    ustore_shared
+    PRIVATE
     $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/ustore_shared.map>
+    $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--exclude-libs,libcudart_static.a>
     $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_ustore_*>
 )
 
@@ -374,12 +457,6 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
     target_compile_definitions(${library_} PRIVATE ${ustore_cpu_gates_})
     target_link_libraries(${library_} PRIVATE $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>)
     target_link_libraries(${library_} PUBLIC $<BUILD_INTERFACE:ustore_sanitizers>)
-    # The shared library holds the device merger inside, and the archive hands it to its consumers' links.
-    if (TARGET ustore_nvme_compaction AND library_ STREQUAL "ustore_shared")
-        target_link_libraries(${library_} PRIVATE ustore_nvme_compaction)
-    elseif (TARGET ustore_nvme_compaction)
-        target_link_libraries(${library_} PUBLIC ustore_nvme_compaction)
-    endif ()
     # The `include_directories` above reach this project's targets only, so a consumer linking a library inherits the
     # public headers from the target instead.
     target_include_directories(
@@ -397,7 +474,9 @@ endif ()
 
 if (${USTORE_BUILD_TEST})
     enable_testing()
-    set(ustore_test_names_ "api" "compilation" "units" "strings" "strings_collection")
+    set(ustore_test_names_ "api" "compilation" "units" "strings" "strings_collection" "arrow")
+    # Every suite reaching the one GPU the machine shares, which CTest runs one at a time
+    set(ustore_gpu_tests_)
 
     # The storage suites build with the NVMe engine they test. The storage ring stands outside the per-engine loop: it
     # links no engine, only the siblings it is written against.
@@ -412,13 +491,16 @@ if (${USTORE_BUILD_TEST})
             "collection"
             "transaction_registry"
             "database"
+            "ingest"
             "single_collection_database"
         )
 
-        # The io_uring, Linux AIO and SPDK transports are Linux-only and take no option of their own; each suite skips
-        # itself where the kernel or the build refuses its transport.
+        # The io_uring, Linux AIO, SPDK and cuFile transports are Linux-only and take no option of their own; each suite
+        # skips itself where the kernel or the build refuses its transport.
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-            list(APPEND ustore_storage_test_names_ "linux_uring_disk" "linux_aio_disk" "linux_spdk_disk")
+            list(APPEND ustore_storage_test_names_ "linux_uring_disk" "linux_aio_disk" "linux_spdk_disk"
+                 "linux_cufile_disk"
+            )
         endif ()
 
         # The SPDK suite starts and stops its own target through the rig script, so the script's path is compiled in and
@@ -440,10 +522,11 @@ if (${USTORE_BUILD_TEST})
                         ustore_warnings
             )
             set(storage_arguments_ --directory ${CMAKE_BINARY_DIR}/test_data)
+            # Every suite reaching the tree's merger links the compactor, which makes no lane without a CUDA compiler
+            target_link_libraries(${storage_exe_} PRIVATE ustore_nvme_compaction)
             # The LSM suite merges on the device where the build carries one, so on the transports that need no hardware
             # option its device case may no longer skip
-            if (storage_name_ STREQUAL "tree" AND TARGET ustore_nvme_compaction)
-                target_link_libraries(${storage_exe_} PRIVATE ustore_nvme_compaction)
+            if (storage_name_ STREQUAL "tree" AND ustore_device_compaction_)
                 list(APPEND storage_arguments_ --no-skips --transports memory,blocking,linux-uring)
             endif ()
             if (storage_name_ STREQUAL "linux_spdk_disk")
@@ -456,6 +539,9 @@ if (${USTORE_BUILD_TEST})
                 endif ()
             endif ()
             add_test(NAME ${storage_exe_} COMMAND ${storage_exe_} ${storage_arguments_})
+            if (storage_name_ MATCHES "^(tree|database|linux_cufile_disk)$")
+                list(APPEND ustore_gpu_tests_ ${storage_exe_})
+            endif ()
         endforeach ()
 
         # The database suites run as plain C++ everywhere, and merge on the device through the compactor once the build
@@ -478,9 +564,7 @@ if (${USTORE_BUILD_TEST})
                         $<$<PLATFORM_ID:Windows>:bcrypt>
                         ustore_warnings
             )
-            if (TARGET ustore_nvme_compaction)
-                target_link_libraries(ustore_test_nvme_${suite_name_} PRIVATE ustore_nvme_compaction)
-            endif ()
+            target_link_libraries(ustore_test_nvme_${suite_name_} PRIVATE ustore_nvme_compaction)
             add_test(NAME ustore_test_nvme_${suite_name_} COMMAND ustore_test_nvme_${suite_name_} --directory
                                                                   ${CMAKE_BINARY_DIR}/test_data
             )
@@ -500,10 +584,13 @@ if (${USTORE_BUILD_TEST})
     endif ()
 
     # The compaction suite as plain C++ checks the comparator, the survival rule, the sorted-run split and the placement
-    # without a device, so it builds without a CUDA compiler
+    # without a device, over a compactor that makes no lane, so it builds without a CUDA compiler
     set(ustore_compaction_host_source_ "${CMAKE_CURRENT_BINARY_DIR}/test/nvme/compaction_host.cpp")
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/test/nvme/compaction.cu" "${ustore_compaction_host_source_}" COPYONLY)
-    add_executable(ustore_test_nvme_compaction_host "${ustore_compaction_host_source_}")
+    add_executable(
+        ustore_test_nvme_compaction_host "${ustore_compaction_host_source_}"
+                                         "${CMAKE_CURRENT_SOURCE_DIR}/test/nvme/compaction_absent.cpp"
+    )
     target_include_directories(ustore_test_nvme_compaction_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
     target_compile_features(ustore_test_nvme_compaction_host PRIVATE cxx_std_20)
     # A fold's scratch arena allocates on ForkUnion's memory domains, which the host compactor reaches
@@ -515,19 +602,72 @@ if (${USTORE_BUILD_TEST})
 
     # The device half of the suite is the same source as host C++ over the compiled compactor, since nvcc's front end
     # crashes instantiating StringZilla's string, which the harness reaches; one CUDA TU instantiates its key slots
-    if (TARGET ustore_nvme_compaction)
+    if (ustore_device_compaction_)
         add_executable(
             ustore_test_nvme_compaction "${ustore_compaction_host_source_}"
                                         "${CMAKE_CURRENT_SOURCE_DIR}/test/nvme/compaction_device.cu"
         )
         target_include_directories(ustore_test_nvme_compaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_compile_features(ustore_test_nvme_compaction PRIVATE cxx_std_20)
-        set_target_properties(ustore_test_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+        set_target_properties(
+            ustore_test_nvme_compaction
+            PROPERTIES CUDA_RUNTIME_LIBRARY Static
+                       CUDA_STANDARD 20
+                       CUDA_STANDARD_REQUIRED ON
+        )
         target_link_libraries(
-            ustore_test_nvme_compaction PRIVATE ustore_nvme_compaction forkunion::static fmt::fmt ustore_warnings
+            ustore_test_nvme_compaction
+            PRIVATE ustore_nvme_compaction
+                    ustore_header
+                    CCCL::CUB
+                    CUDA::cudart_static
+                    smashtable::header
+                    forkunion::static
+                    stringzilla::header
+                    fmt::fmt
+                    ustore_warnings
         )
         add_test(NAME ustore_test_nvme_compaction COMMAND ustore_test_nvme_compaction)
+        list(APPEND ustore_gpu_tests_ ustore_test_nvme_compaction)
     endif ()
+
+    # The shared library opens every GPU runtime at first use, so it names none as needed. It builds by default only
+    # with `USTORE_BUILD_SHARED` and CTest builds nothing, so the test requires its file, failing on a missing one
+    # instead of passing the `grep`
+    if (USTORE_BUILD_SHARED AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME ustore_test_links_no_gpu_runtime
+                 COMMAND sh -c "! readelf -d \"$0\" | grep -E 'NEEDED.*(libcudart|libcuda\\.|libamdhip64|libcufile)'"
+                         $<TARGET_FILE:ustore_shared>
+        )
+        set_tests_properties(ustore_test_links_no_gpu_runtime PROPERTIES REQUIRED_FILES $<TARGET_FILE:ustore_shared>)
+    endif ()
+
+    # Every read verb on each listed GPU against the host, once per engine on the one GPU the device suites share
+    add_executable(ustore_test_vram test/vram/towers.cpp)
+    target_include_directories(ustore_test_vram PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_link_libraries(ustore_test_vram PRIVATE ustore::static fmt::fmt ustore_warnings)
+    foreach (engine_name_ IN ITEMS ${ustore_engine_names_})
+        add_test(NAME ustore_test_vram_${engine_name_} COMMAND ustore_test_vram --engine ${engine_name_} --directory
+                                                               ${CMAKE_BINARY_DIR}/test_data
+        )
+        list(APPEND ustore_gpu_tests_ ustore_test_vram_${engine_name_})
+    endforeach ()
+
+    # A stand-in HIP runtime reporting one gfx942 device drives the AMD routing on machines without AMD hardware
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_library(ustore_fake_amdhip64 SHARED test/vram/fake_amdhip64.cpp)
+        set_target_properties(
+            ustore_fake_amdhip64 PROPERTIES OUTPUT_NAME amdhip64 LIBRARY_OUTPUT_DIRECTORY
+                                                                 ${CMAKE_BINARY_DIR}/fake_amdhip64
+        )
+        add_dependencies(ustore_test_vram ustore_fake_amdhip64)
+        add_test(NAME ustore_test_vram_fake_amd COMMAND ustore_test_vram --engine ram --no-skips --filter "^vram\\.amd")
+        set_tests_properties(
+            ustore_test_vram_fake_amd PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/fake_amdhip64"
+        )
+        list(APPEND ustore_gpu_tests_ ustore_test_vram_fake_amd)
+    endif ()
+    set_tests_properties(${ustore_gpu_tests_} PROPERTIES RESOURCE_LOCK gpu0)
 
     set(ustore_stress_names_ "atomicity" "linearizability")
 
@@ -640,8 +780,14 @@ if (${USTORE_BUILD_TEST})
         endforeach ()
     endforeach ()
 
-    # The tools suite drives the CLI on the same engine
+    # The tools suite drives the CLI on the same engine, and the codec of the tools builds against the headers alone
     if (${USTORE_BUILD_TOOLS})
+        add_executable(ustore_test_tools_arrow_ipc test/tools/arrow_ipc.cpp)
+        target_include_directories(ustore_test_tools_arrow_ipc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_link_libraries(
+            ustore_test_tools_arrow_ipc PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
+        )
+        add_test(NAME ustore_test_tools_arrow_ipc COMMAND ustore_test_tools_arrow_ipc)
         add_executable(ustore_test_tools test/tools.cpp tools/dataset.cpp)
         target_link_libraries(ustore_test_tools PRIVATE ustore::static fmt::fmt ustore_warnings)
         add_dependencies(ustore_test_tools ustore_cli)
@@ -651,6 +797,21 @@ if (${USTORE_BUILD_TEST})
                              $<TARGET_FILE:ustore_cli>
             )
         endforeach ()
+    endif ()
+
+    # The CUDA driver and cuFile keep what they allocate at first use, which LeakSanitizer would charge to every suite
+    # probing the GPU tables
+    if (USTORE_BUILD_SANITIZERS STREQUAL "address")
+        get_property(
+            ustore_registered_tests_
+            DIRECTORY
+            PROPERTY TESTS
+        )
+        set_tests_properties(
+            ${ustore_registered_tests_}
+            PROPERTIES ENVIRONMENT_MODIFICATION
+                       "LSAN_OPTIONS=string_prepend:suppressions=${CMAKE_CURRENT_SOURCE_DIR}/test/leak_sanitizer.supp:"
+        )
     endif ()
 
     # RocksDB builds uninstrumented, so ThreadSanitizer cannot see the barriers of its own threads

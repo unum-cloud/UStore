@@ -2,7 +2,8 @@
  *  @file tools/dataset.h
  *  @author Ash Vardanian
  *  @date April 16, 2023
- *  @brief Imports and exports documents and graph edges as NDJSON or CSV files.
+ *  @brief Imports and exports documents and graph edges as NDJSON or CSV files, and whole collections of every modality
+ *      as Apache Arrow IPC streams and files.
  */
 
 #pragma once
@@ -12,6 +13,117 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** How the bytes of a dataset are spelled. */
+typedef enum ustore_dataset_format_t {
+
+    /** Named by the extension of the path, where the standard input of @c - is sniffed on import and streamed on
+     *  export. */
+    ustore_dataset_format_automatic_k = 0,
+
+    /** One JSON document per line, @c .ndjson. */
+    ustore_dataset_format_ndjson_k = 1,
+
+    /** Comma-separated records under a header, @c .csv. */
+    ustore_dataset_format_csv_k = 2,
+
+    /** An Apache Arrow IPC stream, @c .arrows. */
+    ustore_dataset_format_arrow_stream_k = 3,
+
+    /** An Apache Arrow IPC file, @c .arrow or @c .feather, read sequentially so a pipe carries it too. */
+    ustore_dataset_format_arrow_file_k = 4,
+
+} ustore_dataset_format_t;
+
+/** The format @p path spells through its extension, or @p asked when it names one, staying automatic for a path that
+ *  spells none. */
+ustore_dataset_format_t ustore_dataset_format_of(ustore_bytes_view_t path, ustore_dataset_format_t asked);
+
+/** How an Arrow import lands its rows. */
+typedef enum ustore_dataset_ingestion_t {
+
+    /** Through the writes of the modality, a batch at a time. */
+    ustore_dataset_ingestion_batched_k = 0,
+
+    /** As one commit of strictly ascending keys, through an ingest of @c ustore_ingest_sorted_k. */
+    ustore_dataset_ingestion_sorted_k = 1,
+
+    /** As one commit of keys in any order, the last repeat winning, through an @c ustore_ingest_unsorted_k ingest. */
+    ustore_dataset_ingestion_unsorted_k = 2,
+
+} ustore_dataset_ingestion_t;
+
+/** Imports an Apache Arrow stream or file of any modality into a named collection, created when missing. */
+typedef struct ustore_dataset_import_t {
+
+    /** Already open database instance. */
+    ustore_database_t database;
+
+    /** Receives the outcome of the import. */
+    ustore_outcome_t* outcome;
+
+    /** How durable the import is once final. */
+    ustore_durability_t durability;
+
+    /** Name of the collection to write, created when missing, where empty takes the schema's @c ustore.collection. */
+    ustore_bytes_view_t collection_name;
+
+    /** What the collection holds, where zero takes the schema's @c ustore.modality, else what its columns spell. A
+     *  collection that already exists must hold what is named here. */
+    ustore_modality_t modality;
+
+    /** The file to import, mapped whole, or @c - for standard input, read in the byte counts each message names. */
+    ustore_bytes_view_t path;
+
+    /** How the input is spelled, where @c ustore_dataset_format_automatic_k reads the extension. */
+    ustore_dataset_format_t format;
+
+    /** How the rows land, where a bulk ingest that fails drops the collection it created. */
+    ustore_dataset_ingestion_t ingestion;
+
+    /** Optional output for the rows written. */
+    ustore_size_t* written;
+} ustore_dataset_import_t;
+
+void ustore_dataset_import(ustore_dataset_import_t*);
+
+/** Exports a collection of any modality as an Apache Arrow stream or file, its buffers gathered without copies. */
+typedef struct ustore_dataset_export_t {
+
+    /** Already open database instance. */
+    ustore_database_t database;
+
+    /** Receives the outcome of the export. */
+    ustore_outcome_t* outcome;
+
+    /** What the export sees, where @c NULL takes a snapshot of the head. */
+    ustore_view_t view;
+
+    /** Collection to export. */
+    ustore_collection_id_t collection;
+
+    /** Name written as the schema's @c ustore.collection, so an import recreates the collection under it, or empty for
+     *  none. */
+    ustore_bytes_view_t collection_name;
+
+    /** The file to create, or @c - for standard output. */
+    ustore_bytes_view_t path;
+
+    /** How the output is spelled, where @c ustore_dataset_format_automatic_k reads the extension and @c - streams. */
+    ustore_dataset_format_t format;
+
+    /** Where every body and buffer starts at its absolute position: 64, the default for zero, or 4096 for readers
+     *  through @c O_DIRECT and cuFile. */
+    ustore_size_t alignment;
+
+    /** Most rows per batch, where zero takes the export's default. */
+    ustore_size_t batch_rows;
+
+    /** Optional output for the rows written. */
+    ustore_size_t* written;
+} ustore_dataset_export_t;
+
+void ustore_dataset_export(ustore_dataset_export_t*);
 
 /** Imports every row of one NDJSON or CSV file as a document, keyed by its @c id_field. */
 typedef struct ustore_docs_import_t {

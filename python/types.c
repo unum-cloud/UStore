@@ -574,46 +574,6 @@ void ustore_py_keys_release(ustore_py_keys_t* batch) {
 
 #pragma endregion Keys
 
-#pragma region Arrow Arrays
-
-#ifndef ARROW_C_DATA_INTERFACE
-#define ARROW_C_DATA_INTERFACE
-
-#define ARROW_FLAG_DICTIONARY_ORDERED 1
-#define ARROW_FLAG_NULLABLE           2
-#define ARROW_FLAG_MAP_KEYS_SORTED    4
-
-/** The type of an exported array, laid out as the Arrow C data interface fixes it. */
-struct ArrowSchema {
-    char const* format;
-    char const* name;
-    char const* metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema** children;
-    struct ArrowSchema* dictionary;
-    void (*release)(struct ArrowSchema*);
-    void* private_data;
-};
-
-/** The buffers of an exported array, laid out as the Arrow C data interface fixes it. */
-struct ArrowArray {
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    void const** buffers;
-    struct ArrowArray** children;
-    struct ArrowArray* dictionary;
-    void (*release)(struct ArrowArray*);
-    void* private_data;
-};
-
-#endif // ARROW_C_DATA_INTERFACE
-
-#pragma endregion Arrow Arrays
-
 #pragma region Strings Views
 
 /** Writes the view of every requested string out of the views the call pinned when it was gathered. */
@@ -844,6 +804,56 @@ void ustore_py_contents_release(ustore_py_contents_t* batch) {
     batch->block = NULL;
     batch->count = 0;
     Py_CLEAR(batch->held);
+}
+
+/** Borrows one text into the next view of @p texts: a string as the UTF-8 bytes it caches, a bytes-like object as it
+ *  is, None refused, and any other item through @p serializer where there is one. */
+static int text_borrow(PyObject* object, ustore_py_text_serializer_t serializer, void* state,
+                       ustore_py_texts_t* texts) {
+    ustore_py_contents_t* const batch = &texts->contents;
+    if (!PyUnicode_Check(object)) {
+        if (!serializer || object == Py_None || PyObject_CheckBuffer(object))
+            return ustore_py_contents_borrow(object, batch);
+        return serializer(object, state);
+    }
+    Py_ssize_t length = 0;
+    char const* const text = PyUnicode_AsUTF8AndSize(object, &length);
+    if (!text) return -1;
+    batch->views[batch->count].data = (uint8_t const*)text;
+    batch->views[batch->count].length = (ustore_size_t)length;
+    ++batch->count;
+    return 0;
+}
+
+int ustore_py_texts_from_object(PyObject* object, char const* argument, ustore_py_text_serializer_t serializer,
+                                void* state, ustore_py_texts_t* texts) {
+    memset(texts, 0, sizeof(*texts));
+    int const tape = ustore_py_contents_from_tape(object, &texts->contents);
+    if (tape != 0) return tape < 0 ? -1 : 0;
+
+    int const one = PyUnicode_Check(object) || PyObject_CheckBuffer(object) || PyDict_Check(object);
+    texts->held = one ? Py_NewRef(object) : PySequence_Tuple(object);
+    if (!texts->held)
+        return ustore_py_raise_from_cause(PyExc_TypeError, "The %s are a tape, a sequence of them or one, not %S",
+                                          argument, Py_TYPE(object));
+    size_t const count = one ? 1 : (size_t)PyTuple_GET_SIZE(texts->held);
+    if (ustore_py_contents_reserve(&texts->contents, count,
+                                   one ? ustore_py_contents_broadcast_k : ustore_py_contents_per_task_k) != 0) {
+        Py_CLEAR(texts->held);
+        return -1;
+    }
+    for (size_t task_index = 0; task_index != count; ++task_index)
+        if (text_borrow(one ? object : PyTuple_GET_ITEM(texts->held, (Py_ssize_t)task_index), serializer, state,
+                        texts) != 0) {
+            ustore_py_texts_release(texts);
+            return -1;
+        }
+    return 0;
+}
+
+void ustore_py_texts_release(ustore_py_texts_t* texts) {
+    ustore_py_contents_release(&texts->contents);
+    Py_CLEAR(texts->held);
 }
 
 #pragma endregion Contents
@@ -1440,6 +1450,8 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
     [ustore_py_enum_isolation_k] = "Isolation",
     [ustore_py_enum_transport_k] = "Transport",
     [ustore_py_enum_gds_k] = "Gds",
+    [ustore_py_enum_gpu_vendor_k] = "GPUVendor",
+    [ustore_py_enum_gpu_class_k] = "GPUClass",
     [ustore_py_enum_pattern_kind_k] = "PatternKind",
     [ustore_py_enum_case_sensitivity_k] = "CaseSensitivity",
     [ustore_py_enum_predicate_cost_k] = "PredicateCost",
@@ -1447,6 +1459,7 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
     [ustore_py_enum_role_k] = "Role",
     [ustore_py_enum_field_type_k] = "FieldType",
     [ustore_py_enum_modification_k] = "Modification",
+    [ustore_py_enum_page_encoding_k] = "PageEncoding",
 };
 
 /** Every enumerator of every closed set lies below this, as the C suite checks, so a walk up to it finds them all. */
@@ -1469,6 +1482,8 @@ static char const* enum_spelling(ustore_py_enum_t kind, int value) {
     case ustore_py_enum_isolation_k: return ustore_isolation_name((ustore_isolation_t)value);
     case ustore_py_enum_transport_k: return ustore_transport_name((ustore_transport_t)value);
     case ustore_py_enum_gds_k: return ustore_gds_name((ustore_gds_t)value);
+    case ustore_py_enum_gpu_vendor_k: return ustore_gpu_vendor_name((ustore_gpu_vendor_t)value);
+    case ustore_py_enum_gpu_class_k: return ustore_gpu_class_name((ustore_gpu_class_t)value);
     case ustore_py_enum_pattern_kind_k: return ustore_pattern_kind_name((ustore_pattern_kind_t)value);
     case ustore_py_enum_case_sensitivity_k: return ustore_case_sensitivity_name((ustore_case_sensitivity_t)value);
     case ustore_py_enum_predicate_cost_k: return ustore_predicate_cost_name((ustore_predicate_cost_t)value);
@@ -1476,6 +1491,7 @@ static char const* enum_spelling(ustore_py_enum_t kind, int value) {
     case ustore_py_enum_role_k: return ustore_vertex_role_name((ustore_vertex_role_t)value);
     case ustore_py_enum_field_type_k: return ustore_docs_field_type_name((ustore_docs_field_type_t)value);
     case ustore_py_enum_modification_k: return ustore_docs_modification_name((ustore_docs_modification_t)value);
+    case ustore_py_enum_page_encoding_k: return ustore_page_encoding_name((ustore_page_encoding_t)value);
     case ustore_py_enums_count_k: break;
     }
     return enum_unrecognized_k;
@@ -2244,14 +2260,15 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* args, Py_ssi
 
 static char const doc_Executor_for_vram[] =                                                    //
     "for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC, deferred_limit=0) answers an\n"   //
-    "executor of one CUDA device.\n"                                                           //
+    "executor of one GPU, NVIDIA or AMD.\n"                                                    //
     "\n"                                                                                       //
     "Every call queues on one stream of the device, so one host thread keeps it fed, and\n"    //
     "every arena it makes lives there; a multi-GPU caller makes one per device.\n"             //
-    "Database.open_nvme() takes one as its `compactions`. Calls `ustore_executor_for_vram`.\n" //
+    "Database.open_nvme() takes one of an NVIDIA device as its `compactions`. Calls\n"         //
+    "`ustore_executor_for_vram`.\n"                                                            //
     "\n"                                                                                       //
     "Args:\n"                                                                                  //
-    "  device (int): The CUDA ordinal of the device.\n"                                        //
+    "  device (int): The ordinal of the device, its position in `gpu_devices()`.\n"            //
     "  scratch_limit (int, optional): Bytes of device scratch a call or a merge takes; zero\n" //
     "    lets scratch grow as calls ask.\n"                                                    //
     "  gds (Gds, optional): How bytes move between the drives and the device.\n"               //
@@ -2260,8 +2277,7 @@ static char const doc_Executor_for_vram[] =                                     
     "Returns:\n"                                                                               //
     "  Executor: The new executor.\n"                                                          //
     "Raises:\n"                                                                                //
-    "  UnsupportedError: This build carries no CUDA devices.\n"                                //
-    "  DeviceError: No device carries the ordinal.";
+    "  DeviceError: No device carries the ordinal, or its driver refuses a stream.";
 
 static PyObject* Executor_for_vram(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
                                    PyObject* args_names_tuple) {
@@ -2276,7 +2292,7 @@ static PyObject* Executor_for_vram(PyObject* type, PyObject* const* args, Py_ssi
         (values[3] && ustore_py_size_from_object(values[3], "deferred_limit", &deferred_limit) != 0))
         return NULL;
     if (!values[0]) {
-        PyErr_SetString(PyExc_TypeError, "for_vram() needs the CUDA ordinal of its device");
+        PyErr_SetString(PyExc_TypeError, "for_vram() needs the ordinal of its device");
         return NULL;
     }
     device = PyLong_AsLong(values[0]);
@@ -2467,11 +2483,81 @@ static PyStructSequence_Desc description_description = {
     6,
 };
 
+PyTypeObject* GPUDeviceType = NULL;
+
+static PyStructSequence_Field gpu_device_fields[] = {
+    {"ordinal", "The ordinal `Executor.for_vram()` names the device by, its position in `gpu_devices()`."},
+    {"vendor", "The vendor whose runtime drives the device, a GPUVendor."},
+    {"vendor_ordinal", "The device's ordinal in its vendor's runtime, as `nvidia-smi` or `rocm-smi` list it."},
+    {"gpu_class", "The class of the device, a GPUClass."},
+    {"compute_units", "Streaming multiprocessors or compute units."},
+    {"memory_bytes", "Device memory in bytes."},
+    {"name", "The vendor's own name for the device."},
+    {NULL, NULL},
+};
+
+static PyStructSequence_Desc gpu_device_description = {
+    "ustore.GPUDevice",
+    "One GPU this process can drive, as `gpu_devices()` lists it.",
+    gpu_device_fields,
+    7,
+};
+
+char const ustore_py_gpu_devices_doc[] =                                                      //
+    "gpu_devices() answers a tuple of GPUDevice.\n"                                           //
+    "\n"                                                                                      //
+    "Every GPU this process can drive, NVIDIA devices first, then AMD, each at the ordinal\n" //
+    "`Executor.for_vram()` names it by. A vendor whose runtime is absent lists none, so a\n"  //
+    "machine without GPUs answers an empty tuple. Calls `ustore_gpu_devices`.";
+
+PyObject* ustore_py_gpu_devices(PyObject* Py_UNUSED(module), PyObject* Py_UNUSED(arguments)) {
+    ustore_gpu_device_t devices[128];
+    ustore_size_t count = 0;
+    ustore_outcome_t outcome = {0};
+    ustore_gpu_devices_t listing = {
+        .outcome = &outcome,
+        .devices = devices,
+        .devices_capacity = sizeof(devices) / sizeof(devices[0]),
+        .devices_count = &count,
+    };
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_gpu_devices(&listing);
+    Py_END_ALLOW_THREADS;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
+    if (count > listing.devices_capacity) count = listing.devices_capacity;
+    PyObject* const listed = PyTuple_New((Py_ssize_t)count);
+    for (ustore_size_t index = 0; listed && index != count; ++index) {
+        ustore_gpu_device_t const* const device = &devices[index];
+        PyObject* fields[7];
+        fields[0] = PyLong_FromUnsignedLongLong(index);
+        fields[1] = ustore_py_enum_to_object(ustore_py_enum_gpu_vendor_k, (int)device->vendor);
+        fields[2] = PyLong_FromUnsignedLong(device->vendor_ordinal);
+        fields[3] = ustore_py_enum_to_object(ustore_py_enum_gpu_class_k, (int)device->gpu_class);
+        fields[4] = PyLong_FromUnsignedLong(device->compute_units);
+        fields[5] = PyLong_FromUnsignedLongLong(device->memory_bytes);
+        fields[6] = PyUnicode_DecodeUTF8(device->name, (Py_ssize_t)strnlen(device->name, sizeof(device->name)),
+                                         "replace");
+        PyObject* const entry = PyStructSequence_New(GPUDeviceType);
+        int complete = entry != NULL;
+        for (size_t field = 0; field != 7; ++field) complete &= fields[field] != NULL;
+        if (!complete) {
+            for (size_t field = 0; field != 7; ++field) Py_XDECREF(fields[field]);
+            Py_XDECREF(entry);
+            Py_DECREF(listed);
+            return NULL;
+        }
+        for (size_t field = 0; field != 7; ++field) PyStructSequence_SetItem(entry, (Py_ssize_t)field, fields[field]);
+        PyTuple_SET_ITEM(listed, (Py_ssize_t)index, entry);
+    }
+    return listed;
+}
+
 int ustore_py_types_import(void) {
     if (!CapabilitiesType) CapabilitiesType = PyStructSequence_NewType(&capabilities_description);
     if (!MeasurementType) MeasurementType = PyStructSequence_NewType(&measurement_description);
     if (!DescriptionType) DescriptionType = PyStructSequence_NewType(&description_description);
-    return CapabilitiesType && MeasurementType && DescriptionType ? 0 : -1;
+    if (!GPUDeviceType) GPUDeviceType = PyStructSequence_NewType(&gpu_device_description);
+    return CapabilitiesType && MeasurementType && DescriptionType && GPUDeviceType ? 0 : -1;
 }
 
 #pragma endregion Module Types

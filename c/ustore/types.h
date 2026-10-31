@@ -548,6 +548,9 @@ typedef enum ustore_cpu_class_t {
     /** Arm server cores from AWS Graviton 5 on. */
     ustore_cpu_class_aws_g5_k,
 
+    /** RISC-V cores with RVV, Zawrs and Zacas, from Alibaba's C930 on. */
+    ustore_cpu_class_alibaba_c930_k,
+
     /** The one class of a monoversioned build, whatever its floor implies or its preset vouches for. */
     ustore_cpu_class_monoversioned_k,
 
@@ -779,6 +782,117 @@ USTORE_EXPORT char const* ustore_gds_name(ustore_gds_t gds);
 /** Reads a GPUDirect Storage mode back from its canonical spelling; @c ustore_gds_automatic_k when unrecognized. */
 USTORE_EXPORT ustore_gds_t ustore_gds_from_name(ustore_bytes_view_t name);
 
+/** The GPU vendors one binary drives at once, each through a runtime opened on first use. */
+typedef enum ustore_gpu_vendor_t {
+
+    /** No vendor, as an unrecognized spelling reads back. */
+    ustore_gpu_vendor_unknown_k = 0,
+
+    /** NVIDIA, through the CUDA driver when one is installed. */
+    ustore_gpu_vendor_nvidia_k = 1,
+
+    /** AMD, through the HIP runtime when one is installed. */
+    ustore_gpu_vendor_amd_k = 2,
+
+} ustore_gpu_vendor_t;
+
+/** The canonical spelling of a GPU vendor, as @c ustore_gpu_vendor_amd_k spells "amd", or "unrecognized". */
+USTORE_EXPORT char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t vendor);
+
+/** Reads a GPU vendor back from its canonical spelling; @c ustore_gpu_vendor_unknown_k when unrecognized. */
+USTORE_EXPORT ustore_gpu_vendor_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name);
+
+/** The GPU generations UStore tells apart, the device twin of @c ustore_cpu_class_t: a class implies its vendor, and
+ *  within a vendor a newer device takes the newest class it satisfies. */
+typedef enum ustore_gpu_class_t {
+
+    /** No class, which no listed device carries. */
+    ustore_gpu_class_unknown_k = 0,
+
+    /** Ampere-class NVIDIA and every NVIDIA GPU without a class of its own - A100, A10 & RTX 30. */
+    ustore_gpu_class_nvidia_ampere_k = 1,
+
+    /** Ada-class NVIDIA - L4, L40S & RTX 40. */
+    ustore_gpu_class_nvidia_ada_k = 2,
+
+    /** Hopper-class NVIDIA - H100 & H200. */
+    ustore_gpu_class_nvidia_hopper_k = 3,
+
+    /** Blackwell-class NVIDIA - B200, B300 & GB300. */
+    ustore_gpu_class_nvidia_blackwell_k = 4,
+
+    /** Consumer Blackwell NVIDIA - RTX 50, RTX PRO 6000 & DGX Spark. */
+    ustore_gpu_class_nvidia_blackwellrtx_k = 5,
+
+    /** CDNA3 AMD - MI300X & MI325X, gfx942. */
+    ustore_gpu_class_amd_cdna3_k = 6,
+
+    /** CDNA4 AMD - MI350X & MI355X, gfx950. */
+    ustore_gpu_class_amd_cdna4_k = 7,
+
+    /** CDNA5 AMD - MI400, gfx1250. */
+    ustore_gpu_class_amd_cdna5_k = 8,
+
+} ustore_gpu_class_t;
+
+/** The canonical spelling of a GPU class, as @c ustore_gpu_class_amd_cdna3_k spells "amd-cdna3", or "unrecognized". */
+USTORE_EXPORT char const* ustore_gpu_class_name(ustore_gpu_class_t gpu_class);
+
+/** Reads a GPU class back from its canonical spelling; @c ustore_gpu_class_unknown_k when unrecognized. */
+USTORE_EXPORT ustore_gpu_class_t ustore_gpu_class_from_name(ustore_bytes_view_t name);
+
+/** One GPU as UStore numbers it: its position in the listing of @c ustore_gpu_devices is the ordinal
+ *  @c ustore_executor_for_vram_t::device names it by. */
+typedef struct ustore_gpu_device_t {
+
+    /** The vendor whose runtime drives the device. */
+    ustore_gpu_vendor_t vendor;
+
+    /** The device's ordinal in its vendor's runtime, as @c nvidia-smi or @c rocm-smi list it. */
+    uint32_t vendor_ordinal;
+
+    /** The class of the device. */
+    ustore_gpu_class_t gpu_class;
+
+    /** Streaming multiprocessors or compute units. */
+    uint32_t compute_units;
+
+    /** Device memory in bytes. */
+    uint64_t memory_bytes;
+
+    /** The vendor's own name for the device, null-terminated and truncated to fit. */
+    char name[64];
+
+} ustore_gpu_device_t;
+
+/** The arguments of @c ustore_gpu_devices. */
+typedef struct ustore_gpu_devices_t {
+
+    /** Output for the outcome, final on return. */
+    ustore_outcome_t* outcome;
+
+    /** Output for up to @c devices_capacity devices, in UStore ordinal order; may be @c NULL. */
+    ustore_gpu_device_t* devices;
+
+    /** Entries @c devices holds. */
+    ustore_size_t devices_capacity;
+
+    /** The @b optional output for every device this process can drive, which may exceed @c devices_capacity. */
+    ustore_size_t* devices_count;
+
+} ustore_gpu_devices_t;
+
+/**
+ *  @brief Lists every GPU this process can drive, NVIDIA devices first, then AMD, so the position of a device is the
+ *      ordinal @c ustore_executor_for_vram_t::device names it by.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  Each vendor's runtime opens on the first call, and a vendor whose runtime is absent lists no devices, so the call
+ *  succeeds with a zero count on a machine without GPUs. Devices of no class UStore knows are left out. The listing is
+ *  taken once per process and never changes after.
+ */
+USTORE_EXPORT void ustore_gpu_devices(ustore_gpu_devices_t* arguments);
+
 /** The arguments of @c ustore_executor_for_vram. */
 typedef struct ustore_executor_for_vram_t {
 
@@ -788,12 +902,12 @@ typedef struct ustore_executor_for_vram_t {
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
 
-    /** The CUDA ordinal every call and arena of this executor uses; an ordinal no device carries is refused with
-     *  @c ustore_status_device_k. */
+    /** The UStore ordinal of the device every call and arena of this executor uses, its position in the listing of
+     *  @c ustore_gpu_devices; an ordinal no device carries is refused with @c ustore_status_device_k. */
     int32_t device;
 
-    /** The @b optional borrowed @c cudaStream_t on @c device, which must outlive the executor; @c NULL creates one.
-     *  One stream per device is the whole design. */
+    /** The @b optional borrowed stream on @c device, a @c cudaStream_t on NVIDIA and a @c hipStream_t on AMD, which
+     *  must outlive the executor; @c NULL creates one. One stream per device is the whole design. */
     void* stream;
 
     /** The @b optional ceiling on the device scratch a call or a merge takes; zero lets scratch grow as calls ask. */
@@ -814,15 +928,17 @@ typedef struct ustore_executor_for_vram_t {
  *  Every call queues on that stream in order, so one host thread keeps the device fed, and a multi-GPU caller makes
  *  one executor per device. Its calls read through an engine's device verbs, which refuse changes and the control
  *  plane, and every call no device tower serves yet, with @c ustore_status_unsupported_k, and arenas it makes live on
- *  its device. @c ustore_database_open_nvme takes one as its @c compactions, reading its device and scratch limit
- *  once.
+ *  its device. @c ustore_database_open_nvme takes one of an NVIDIA device as its @c compactions, reading its device
+ *  and scratch limit once. Every build spawns one, as the vendor's runtime opens at the first call and the library
+ *  links none.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the @c gds mode is
  *    unknown, or ForkUnion refuses an argument.
- *  - @c ustore_status_unsupported_k The library was built without CUDA, the process may allocate on
- *    no memory domain, or the operating system denies ForkUnion an operation.
- *  - @c ustore_status_device_k No device carries the ordinal.
+ *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, or the operating
+ *    system denies ForkUnion an operation.
+ *  - @c ustore_status_device_k No device carries the ordinal, its driver refuses a stream or an
+ *    event, or @c ustore_gds_direct_k names a device other than NVIDIA.
  *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments);

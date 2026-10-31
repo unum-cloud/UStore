@@ -56,6 +56,7 @@ struct candidates_t {
 /** Translates a StringZilla refusal, carrying its static message. */
 inline status_t stringzilla_refusal(sz_status_t status) noexcept {
     if (status == sz_bad_alloc_k) return {status_code_t::out_of_memory_k, sz_status_name(status)};
+    if (status == sz_missing_kernel_k) return {status_code_t::unsupported_k, sz_status_name(status)};
     return {status_code_t::invalid_argument_k, sz_status_name(status)};
 }
 
@@ -94,6 +95,12 @@ struct compiled_match<home_t::host_k> {
 
     /** Whether the match scores the values it keeps. */
     bool scores() const noexcept { return scorer != nullptr; }
+
+    /** Whether the match asks the predicate about the keys it lists. */
+    bool asks() const noexcept { return predicate.callback != nullptr; }
+
+    /** Rewinds @p page, which a listing lays every page out in. */
+    void rewind_page(ustore_arena_t page) const noexcept { arena_rewind(page); }
 
     /** Keeps among @p candidates of the page listing @p keys those the predicate admits, when its cost places it at
      *  @p phase, gathering the asked keys and their admissions into @p work. */
@@ -143,6 +150,13 @@ struct compiled_match<home_t::host_k> {
         else if (sz_subdocuments_engine_t* const* const paths = std::get_if<sz_subdocuments_engine_t*>(&matcher))
             status = sz_subdocuments_contains(*paths, &strings, contained.data(), &malformed_index, nullptr);
         if (status != sz_success_k) return stringzilla_refusal(status);
+        return narrow(views, contained.data(), candidates);
+    }
+
+    /** Keeps among @p candidates those @p contained marks, compacting the @p views of their values beside them, and
+     *  scores the kept when the match scores. */
+    status_t narrow(std::span<sz_string_view_t> views, sz_u1x8_t const* contained,
+                    candidates_t& candidates) const noexcept {
         std::size_t kept = 0;
         for (std::size_t index = 0; index != candidates.count; ++index) {
             if (!((contained[index / 8] >> (index % 8)) & 1u)) continue;
@@ -165,15 +179,23 @@ struct compiled_match<home_t::host_k> {
     }
 };
 
-/** A device match, which has no predicate member: a host verdict cannot narrow a device scan. */
-template <>
-struct compiled_match<home_t::vram_nvidia_k> {
+/** A device match: the engine compiled for the executor's device, and the host half asking the predicate and scoring
+ *  what the device kept, as the listing runs on the host either way. */
+template <home_t home_>
+    requires(home_ != home_t::host_k)
+struct compiled_match<home_> {
 
     /** The compiled engine on the executor's device, if the match reads values. */
     value_matcher_t matcher;
 
+    /** The caller's predicate and the BM25 scorer, whose own matcher reads no values. */
+    compiled_match<home_t::host_k> host;
+
     /** Whether the match reads the values of the keys it narrows. */
     bool reads_values() const noexcept { return !std::holds_alternative<match_everything_t>(matcher); }
+
+    /** Whether the match narrows nothing, so the plain scan serves. */
+    bool matches_everything() const noexcept { return !reads_values() && host.matches_everything(); }
 };
 
 /** Whether @p arguments_type_ is a scan or cursor init carrying a match. */
@@ -183,6 +205,14 @@ concept carries_match = requires(arguments_type_ const& arguments) { arguments.p
 /** Whether the patterns of a call match everything. */
 inline bool matches_everything(ustore_patterns_t const& patterns) noexcept {
     return !patterns.count && !patterns.patterns.data.u32_tape.offsets && !patterns.weights;
+}
+
+/** Whether the patterns or the filter of @p arguments read the values of the keys they narrow. */
+template <typename arguments_type_>
+bool reads_values(arguments_type_ const& arguments) noexcept {
+    if constexpr (requires { arguments.patterns; }) return !matches_everything(arguments.patterns);
+    else if constexpr (requires { arguments.filter; }) return arguments.filter.length != 0;
+    else return false;
 }
 
 /** The strings @p view holds, @p count of them, as StringZilla reads them, viewing @p view's own memory. */
@@ -220,10 +250,11 @@ inline sz_strings_view_t stringzilla_strings(ustore_strings_view_t const& view, 
     return strings;
 }
 
-/** Compiles @p patterns, which the scans of blobs and strings take, into an engine laid out in @p into for the kernels
- *  @p capabilities allow. */
+/** Compiles @p patterns, which the scans of blobs and strings take, into @p matcher: an engine for the kernels
+ *  @p capabilities allow, whose handle is laid out in @p into and whose state @p engine_memory holds. */
 inline status_t compile_patterns(ustore_patterns_t const& patterns, ustore_arena_t into, sz_capability_t capabilities,
-                                 compiled_match<home_t::host_k>& match) noexcept {
+                                 sz_allocator_t engine_memory, value_matcher_t& matcher) noexcept {
+    matcher = match_everything_t {};
     if (matches_everything(patterns)) return {};
     if (patterns.kind != ustore_pattern_regex_k && patterns.kind != ustore_pattern_substrings_k)
         return {status_code_t::invalid_argument_k, "Unknown pattern kind"};
@@ -235,33 +266,32 @@ inline status_t compile_patterns(ustore_patterns_t const& patterns, ustore_arena
     status_t gathered;
     sz_strings_view_t const strings = stringzilla_strings(patterns.patterns, patterns.count, into, gathered);
     if (gathered.failed()) return gathered;
-    sz_allocator_t allocator = stringzilla_allocator(into);
     sz_case_sensitivity_t const sensitivity = patterns.sensitivity == ustore_uncased_k ? sz_uncased_k : sz_cased_k;
     if (patterns.kind == ustore_pattern_regex_k) {
         auto [compiled, compiled_status] = arena_allocate<sz_regex_engine_t>(into, 1);
         if (compiled_status.failed()) return compiled_status;
         sz_size_t malformed_index = 0;
         sz_status_t const status = sz_regex_engine_init(compiled.data(), &strings, sensitivity, &malformed_index,
-                                                        capabilities, &allocator, nullptr);
+                                                        capabilities, &engine_memory, nullptr);
         if (status != sz_success_k) return stringzilla_refusal(status);
-        match.matcher = compiled.data();
+        matcher = compiled.data();
         return {};
     }
     auto [compiled, compiled_status] = arena_allocate<sz_substrings_engine_t>(into, 1);
     if (compiled_status.failed()) return compiled_status;
     sz_status_t const status = sz_substrings_engine_init(
         compiled.data(), &strings, sensitivity, sz_substrings_leftmost_longest_k,
-        STRINGZILLA_SUBSTRINGS_HOT_STATES_AUTO, 0, 0, capabilities, &allocator, nullptr);
+        STRINGZILLA_SUBSTRINGS_HOT_STATES_AUTO, 0, 0, capabilities, &engine_memory, nullptr);
     if (status != sz_success_k) return stringzilla_refusal(status);
-    match.matcher = compiled.data();
-    if (patterns.weights) match.scorer = compiled.data(), match.weights = patterns.weights;
+    matcher = compiled.data();
     return {};
 }
 
-/** Compiles @p filter, a JSONPath or root filter of documents or an XPath of pages as @p format names, into an engine
- *  laid out in @p into for the kernels @p capabilities allow. */
+/** Compiles @p filter, a JSONPath or root filter of documents or an XPath of pages as @p format names, into
+ *  @p matcher, as @c compile_patterns compiles patterns. */
 inline status_t compile_filter(ustore_bytes_view_t filter, sz_subdocuments_format_t format, ustore_arena_t into,
-                               sz_capability_t capabilities, value_matcher_t& matcher) noexcept {
+                               sz_capability_t capabilities, sz_allocator_t engine_memory,
+                               value_matcher_t& matcher) noexcept {
     matcher = match_everything_t {};
     if (!filter.length) return {};
     if (!filter.data) return {status_code_t::invalid_argument_k, "A filter of some length needs its bytes"};
@@ -272,53 +302,46 @@ inline status_t compile_filter(ustore_bytes_view_t filter, sz_subdocuments_forma
     sz_strings_from_string_views(&path, 1, &paths);
     auto [compiled, compiled_status] = arena_allocate<sz_subdocuments_engine_t>(into, 1);
     if (compiled_status.failed()) return compiled_status;
-    sz_allocator_t allocator = stringzilla_allocator(into);
     sz_size_t malformed_index = 0;
     sz_status_t const status = sz_subdocuments_engine_init(compiled.data(), &paths, format,
                                                            sz_subdocuments_options_none_k, &malformed_index,
-                                                           capabilities, &allocator, nullptr);
+                                                           capabilities, &engine_memory, nullptr);
     if (status != sz_success_k) return stringzilla_refusal(status);
     matcher = compiled.data();
     return {};
 }
 
-/** Compiles what @p arguments match at @p home_, laying the engine out in @p into, which must
- *  outlive the match, for the kernels @p capabilities allow. */
-template <home_t home_, typename arguments_type_>
-expected<compiled_match<home_>> compile_match(arguments_type_ const& arguments, ustore_arena_t into,
-                                              sz_capability_t capabilities) noexcept {
-    compiled_match<home_> match;
-    if constexpr (home_ == home_t::vram_nvidia_k) {
-        bool const reads_values = [&]() noexcept {
-            if constexpr (requires { arguments.patterns; }) return !matches_everything(arguments.patterns);
-            else if constexpr (requires { arguments.filter; }) return arguments.filter.length != 0;
-            else return false;
-        }();
-        if (reads_values) return status_t {status_code_t::unsupported_k, "Device scans match nothing yet"};
-    }
-    else if constexpr (requires { arguments.patterns; }) {
-        if (status_t const status = compile_patterns(arguments.patterns, into, capabilities, match); status.failed())
-            return status;
-    }
+/** Compiles the patterns or the filter of @p arguments into @p matcher, as @c compile_patterns does. */
+template <typename arguments_type_>
+status_t compile_values(arguments_type_ const& arguments, ustore_arena_t into, sz_capability_t capabilities,
+                        sz_allocator_t engine_memory, value_matcher_t& matcher) noexcept {
+    if constexpr (requires { arguments.patterns; })
+        return compile_patterns(arguments.patterns, into, capabilities, engine_memory, matcher);
     else if constexpr (std::is_same_v<arguments_type_, ustore_docs_scan_t> ||
-                       std::is_same_v<arguments_type_, ustore_docs_cursor_init_t>) {
-        if (status_t const status = compile_filter(arguments.filter, sz_subdocuments_json_k, into, capabilities,
-                                                   match.matcher);
-            status.failed())
-            return status;
-    }
-    else if constexpr (requires { arguments.filter; }) {
-        if (status_t const status = compile_filter(arguments.filter, sz_subdocuments_xml_k, into, capabilities,
-                                                   match.matcher);
-            status.failed())
-            return status;
-    }
+                       std::is_same_v<arguments_type_, ustore_docs_cursor_init_t>)
+        return compile_filter(arguments.filter, sz_subdocuments_json_k, into, capabilities, engine_memory, matcher);
+    else if constexpr (requires { arguments.filter; })
+        return compile_filter(arguments.filter, sz_subdocuments_xml_k, into, capabilities, engine_memory, matcher);
+    else return {};
+}
+
+/** Compiles what @p arguments match on the host, laying the engine handles and their state out in @p into, which must
+ *  outlive the match, for the kernels @p capabilities allow. */
+template <typename arguments_type_>
+expected<compiled_match<home_t::host_k>> compile_match(arguments_type_ const& arguments, ustore_arena_t into,
+                                                       sz_capability_t capabilities) noexcept {
+    compiled_match<home_t::host_k> match;
+    if (status_t const status = compile_values(arguments, into, capabilities, stringzilla_allocator(into),
+                                               match.matcher);
+        status.failed())
+        return status;
+    if constexpr (requires { arguments.patterns; })
+        if (arguments.patterns.weights)
+            match.scorer = std::get<sz_substrings_engine_t*>(match.matcher), match.weights = arguments.patterns.weights;
     if (arguments.predicate.cost != ustore_predicate_cheap_k &&
         arguments.predicate.cost != ustore_predicate_expensive_k)
         return status_t {status_code_t::invalid_argument_k, "Unknown predicate cost"};
-    if constexpr (home_ == home_t::host_k) match.predicate = arguments.predicate;
-    else if (arguments.predicate.callback)
-        return status_t {status_code_t::device_k, "A host predicate cannot narrow a device scan"};
+    match.predicate = arguments.predicate;
     return match;
 }
 
@@ -407,10 +430,10 @@ using keyed_survivors_t = st::basic_vector<ustore_key_t, arena_allocator<ustore_
  *  The pages are ordered, whatever the scan's mode, as each resumes past the last key of the one before. Answers the
  *  key the next listing resumes at, or nothing once the collection ends.
  */
-template <typename scan_type_>
+template <typename scan_type_, typename match_type_>
 status_t list_matched_keys(home_tables<home_t::host_k> const& engine, ustore_database_t database,
                            ustore_collection_id_t const& collection, ustore_key_t start, std::size_t wanted,
-                           compiled_match<home_t::host_k> const& match, ustore_arena_t page, view_t const& view,
+                           match_type_ const& match, ustore_arena_t page, view_t const& view,
                            keyed_survivors_t& survivors, std::variant<ustore_key_t, exhausted_t>& resume,
                            scores_sink_t* scores = nullptr) noexcept {
     auto const* const verbs = engine.*verb_slot<scan_type_>::template table<home_t::host_k>;
@@ -420,7 +443,7 @@ status_t list_matched_keys(home_tables<home_t::host_k> const& engine, ustore_dat
     std::size_t const first = survivors.size();
     resume = start;
     while (survivors.size() - first < wanted) {
-        arena_rewind(page);
+        match.rewind_page(page);
         ustore_length_t const* offsets = nullptr;
         ustore_key_t const* listed = nullptr;
         scan_type_ const scan {.database = database,
@@ -487,12 +510,12 @@ status_t list_matched_keys(home_tables<home_t::host_k> const& engine, ustore_dat
 
 /** A filtered scan of keys as a plan of one phase, one step per task, each listing its task's survivors after those of
  *  the tasks before it. */
-template <typename scan_type_>
+template <typename scan_type_, typename match_type_>
 struct keyed_scan_plan {
     using step_t = std::size_t;
 
     home_tables<home_t::host_k> const& engine;
-    compiled_match<home_t::host_k> const& match;
+    match_type_ const& match;
     scan_type_ const& arguments;
     std::span<ustore_length_t> offsets;
     keyed_survivors_t& survivors;
@@ -516,9 +539,9 @@ struct keyed_scan_plan {
 
 /** Serves the scan @p arguments with @p match through the host verbs of @p engine as a plan of one step per task, the
  *  call's arena holding one page at a time until the survivors are copied into it. */
-template <typename scan_type_>
-status_t scan_matched(home_tables<home_t::host_k> const& engine, compiled_match<home_t::host_k> const& match,
-                      scan_type_ const& arguments, view_t const& view) noexcept {
+template <typename scan_type_, typename match_type_>
+status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ const& match, scan_type_ const& arguments,
+                      view_t const& view) noexcept {
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
     auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(view.scratch, arguments.count + 1);
     if (offsets_status.failed()) return offsets_status;
@@ -529,11 +552,12 @@ status_t scan_matched(home_tables<home_t::host_k> const& engine, compiled_match<
         else return false;
     }();
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
-    keyed_scan_plan<scan_type_> plan {engine, match, arguments, offsets, survivors, scored ? &scores : nullptr};
+    scores_sink_t* const kept_scores = scored ? &scores : nullptr;
+    keyed_scan_plan<scan_type_, match_type_> plan {engine, match, arguments, offsets, survivors, kept_scores};
     if (status_t const status = run_steps(plan, view, progress); status.failed()) return status;
     offsets[arguments.count] = static_cast<ustore_length_t>(survivors.size());
 
-    arena_rewind(arguments.arena);
+    match.rewind_page(arguments.arena);
     auto [copied_offsets, copied_offsets_status] = arena_copy<ustore_length_t>(arguments.arena, offsets);
     if (copied_offsets_status.failed()) return copied_offsets_status;
     auto [keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, survivors);
@@ -560,13 +584,12 @@ status_t scan_matched(home_tables<home_t::host_k> const& engine, compiled_match<
  *  The predicate sees the keys the strings map onto, which a read of every page's strings finds. Answers the string
  *  the next listing resumes at in @p resume, kept in @p resume_bytes, or nothing once the prefix ends.
  */
-template <typename survivors_type_, typename resume_bytes_type_>
+template <typename match_type_, typename survivors_type_, typename resume_bytes_type_>
 status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_database_t database,
                               ustore_collection_id_t const& collection, ustore_bytes_view_t prefix,
-                              ustore_bytes_view_t start, std::size_t wanted,
-                              compiled_match<home_t::host_k> const& match, ustore_arena_t page, view_t const& view,
-                              survivors_type_& survivors, resume_bytes_type_& resume_bytes,
-                              std::variant<ustore_bytes_view_t, exhausted_t>& resume,
+                              ustore_bytes_view_t start, std::size_t wanted, match_type_ const& match,
+                              ustore_arena_t page, view_t const& view, survivors_type_& survivors,
+                              resume_bytes_type_& resume_bytes, std::variant<ustore_bytes_view_t, exhausted_t>& resume,
                               scores_sink_t* scores = nullptr) noexcept {
     strings_verbs<home_t::host_k> const& verbs = *engine.strings;
     view_t page_view = view;
@@ -574,7 +597,7 @@ status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_
     std::size_t const first = survivors.size();
     resume = start;
     while (survivors.size() - first < wanted) {
-        arena_rewind(page);
+        match.rewind_page(page);
         ustore_length_t const* offsets = nullptr;
         ustore_strings_view_t listed_view {};
         ustore_strings_scan_t const scan {.database = database,
@@ -592,7 +615,7 @@ status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_
         strings_arg_t const listed {listed_view};
 
         ustore_key_t const* keys = nullptr;
-        if (match.predicate.callback && listed_count) {
+        if (match.asks() && listed_count) {
             ustore_strings_read_t const read {.database = database,
                                               .count = listed_count,
                                               .collections = {&collection, 0},
@@ -653,9 +676,10 @@ status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_
 
 /** Serves the strings scan @p arguments with @p match through the host verbs of @p engine, one filtered listing per
  *  task, as @c scan_matched serves the keyed scans. */
-inline status_t scan_matched(home_tables<home_t::host_k> const& engine, compiled_match<home_t::host_k> const& match,
-                             ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
-                             strings_arg_t const& starts, view_t const& view) noexcept {
+template <typename match_type_>
+status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ const& match,
+                      ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
+                      strings_arg_t const& starts, view_t const& view) noexcept {
     if (arguments.mode != ustore_scan_ordered_k && arguments.mode != ustore_scan_unordered_k)
         return {status_code_t::invalid_argument_k, "Unknown scan mode"};
     if (!arguments.offsets || !arguments.strings)
@@ -684,7 +708,7 @@ inline status_t scan_matched(home_tables<home_t::host_k> const& engine, compiled
     }
     offsets[arguments.count] = static_cast<ustore_length_t>(survivors.size());
 
-    arena_rewind(arguments.arena);
+    match.rewind_page(arguments.arena);
     auto [copied_offsets, copied_offsets_status] = arena_copy<ustore_length_t>(arguments.arena, offsets);
     if (copied_offsets_status.failed()) return copied_offsets_status;
     if (status_t const status = survivors.export_into(arguments.arena, *arguments.strings); status.failed())

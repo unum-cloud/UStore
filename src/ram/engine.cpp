@@ -40,6 +40,10 @@ extern template struct ram_variant<cpu_class_t::intel_sierra_k, isolation_t::str
 extern template struct ram_variant<cpu_class_t::apple_m2_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::apple_m2_k, isolation_t::strict_serializable_k>;
 #endif // USTORE_TARGET_APPLE_M2
+#if USTORE_TARGET_ALIBABA_C930
+extern template struct ram_variant<cpu_class_t::alibaba_c930_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::alibaba_c930_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_ALIBABA_C930
 #if USTORE_TARGET_SERIAL
 extern template struct ram_variant<cpu_class_t::serial_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::serial_k, isolation_t::strict_serializable_k>;
@@ -70,11 +74,13 @@ status_t open_in(arguments_type_ const& arguments, cpu_ceiling_t ceiling, std::s
     });
 }
 
-status_t init(ustore_database_init_ram_t const& arguments, cpu_ceiling_t ceiling, view_t const&) noexcept {
+status_t init(ustore_database_init_ram_t const& arguments, cpu_ceiling_t ceiling, stringzilla_kernels_t const&,
+              view_t const&) noexcept {
     return open_in(arguments, ceiling, {});
 }
 
-status_t open(ustore_database_open_ram_t const& arguments, cpu_ceiling_t ceiling, view_t const&) noexcept {
+status_t open(ustore_database_open_ram_t const& arguments, cpu_ceiling_t ceiling, stringzilla_kernels_t const&,
+              view_t const&) noexcept {
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
     return open_in(arguments, ceiling, string_of(arguments.directory));
 }

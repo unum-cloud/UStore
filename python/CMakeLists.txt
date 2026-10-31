@@ -13,8 +13,10 @@ python_add_library(
     blobs.c
     docs.c
     graph.c
+    pages.c
     strings.c
     collection.c
+    arrow.c
 )
 
 # `ustore/__init__.py` imports it as `ustore.lib`, so the file name is part of the interface. The engines are C++, so

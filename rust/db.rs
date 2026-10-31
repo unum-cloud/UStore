@@ -407,6 +407,24 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
+    pub struct ustore_gpu_device_t {
+        pub vendor: ustore_enum_t,
+        pub vendor_ordinal: u32,
+        pub gpu_class: ustore_enum_t,
+        pub compute_units: u32,
+        pub memory_bytes: u64,
+        pub name: [c_char; 64],
+    }
+
+    #[repr(C)]
+    pub struct ustore_gpu_devices_t {
+        pub outcome: *mut ustore_outcome_t,
+        pub devices: *mut ustore_gpu_device_t,
+        pub devices_capacity: ustore_size_t,
+        pub devices_count: *mut ustore_size_t,
+    }
+
+    #[repr(C)]
     pub struct ustore_executor_for_vram_t {
         pub executor: *mut ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
@@ -681,6 +699,10 @@ pub(crate) mod ffi {
         pub fn ustore_predicate_cost_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_gds_name(gds: ustore_enum_t) -> *const c_char;
         pub fn ustore_gds_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_gpu_vendor_name(vendor: ustore_enum_t) -> *const c_char;
+        pub fn ustore_gpu_vendor_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_gpu_class_name(gpu_class: ustore_enum_t) -> *const c_char;
+        pub fn ustore_gpu_class_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_transport_name(transport: ustore_enum_t) -> *const c_char;
         pub fn ustore_transport_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_engine_name(engine: ustore_enum_t) -> *const c_char;
@@ -692,6 +714,7 @@ pub(crate) mod ffi {
         pub fn ustore_executor_on_pool(arguments: *mut ustore_executor_on_pool_t);
         pub fn ustore_executor_for_nvme(arguments: *mut ustore_executor_for_nvme_t);
         pub fn ustore_executor_for_vram(arguments: *mut ustore_executor_for_vram_t);
+        pub fn ustore_gpu_devices(arguments: *mut ustore_gpu_devices_t);
         pub fn ustore_executor_drain(arguments: *mut ustore_executor_drain_t);
         pub fn ustore_executor_free(executor: ustore_executor_t);
 
@@ -1698,6 +1721,172 @@ impl FromStr for Gds {
     }
 }
 
+/// The vendor whose runtime drives a GPU, as `ustore_gpu_vendor_t` spells it, like "amd".
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum GPUVendor {
+    /// NVIDIA, through the CUDA driver.
+    Nvidia = 1,
+    /// AMD, through the HIP runtime.
+    Amd = 2,
+}
+
+impl GPUVendor {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            1 => Some(GPUVendor::Nvidia),
+            2 => Some(GPUVendor::Amd),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for GPUVendor {
+    /// Calls `ustore_gpu_vendor_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_gpu_vendor_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for GPUVendor {
+    type Err = Error;
+
+    /// Calls `ustore_gpu_vendor_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_gpu_vendor_from_name,
+            ffi::ustore_gpu_vendor_name,
+            GPUVendor::from_raw,
+        )
+    }
+}
+
+/// The generation of a GPU, as `ustore_gpu_class_t` spells it, like "nvidia-hopper".
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum GPUClass {
+    /// Ampere-class NVIDIA and every NVIDIA GPU without a class of its own - A100, A10 & RTX 30.
+    NvidiaAmpere = 1,
+    /// Ada-class NVIDIA - L4, L40S & RTX 40.
+    NvidiaAda = 2,
+    /// Hopper-class NVIDIA - H100 & H200.
+    NvidiaHopper = 3,
+    /// Blackwell-class NVIDIA - B200, B300 & GB300.
+    NvidiaBlackwell = 4,
+    /// Consumer Blackwell NVIDIA - RTX 50, RTX PRO 6000 & DGX Spark.
+    NvidiaBlackwellRTX = 5,
+    /// CDNA3 AMD - MI300X & MI325X.
+    AmdCDNA3 = 6,
+    /// CDNA4 AMD - MI350X & MI355X.
+    AmdCDNA4 = 7,
+    /// CDNA5 AMD - MI400.
+    AmdCDNA5 = 8,
+}
+
+impl GPUClass {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            1 => Some(GPUClass::NvidiaAmpere),
+            2 => Some(GPUClass::NvidiaAda),
+            3 => Some(GPUClass::NvidiaHopper),
+            4 => Some(GPUClass::NvidiaBlackwell),
+            5 => Some(GPUClass::NvidiaBlackwellRTX),
+            6 => Some(GPUClass::AmdCDNA3),
+            7 => Some(GPUClass::AmdCDNA4),
+            8 => Some(GPUClass::AmdCDNA5),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for GPUClass {
+    /// Calls `ustore_gpu_class_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_gpu_class_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for GPUClass {
+    type Err = Error;
+
+    /// Calls `ustore_gpu_class_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_gpu_class_from_name,
+            ffi::ustore_gpu_class_name,
+            GPUClass::from_raw,
+        )
+    }
+}
+
+/// One GPU this process can drive, as [`gpu_devices`] lists it.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct GPUDevice {
+    /// The ordinal [`Executor::for_vram`] names the device by, its position in [`gpu_devices`].
+    pub ordinal: usize,
+    /// The vendor whose runtime drives the device.
+    pub vendor: GPUVendor,
+    /// The device's ordinal in its vendor's runtime, as `nvidia-smi` or `rocm-smi` list it.
+    pub vendor_ordinal: u32,
+    /// The class of the device.
+    pub gpu_class: GPUClass,
+    /// Streaming multiprocessors or compute units.
+    pub compute_units: u32,
+    /// Device memory in bytes.
+    pub memory_bytes: u64,
+    /// The vendor's own name for the device.
+    pub name: String,
+}
+
+/// Every GPU this process can drive, NVIDIA devices first, then AMD, each at the ordinal [`Executor::for_vram`] names
+/// it by; empty on a machine without GPUs or their runtimes.
+///
+/// Calls `ustore_gpu_devices`.
+pub fn gpu_devices() -> Result<Vec<GPUDevice>> {
+    let mut count: ffi::ustore_size_t = 0;
+    let mut outcome = ffi::ustore_outcome_t::default();
+    let mut counting = ffi::ustore_gpu_devices_t {
+        outcome: &mut outcome,
+        devices: ptr::null_mut(),
+        devices_capacity: 0,
+        devices_count: &mut count,
+    };
+    // SAFETY: every pointer in `counting` outlives the call, which is final on return.
+    unsafe { ffi::ustore_gpu_devices(&mut counting) };
+    check(outcome)?;
+    let mut listed: Vec<ffi::ustore_gpu_device_t> = Vec::with_capacity(count as usize);
+    let mut outcome = ffi::ustore_outcome_t::default();
+    let mut listing = ffi::ustore_gpu_devices_t {
+        outcome: &mut outcome,
+        devices: listed.as_mut_ptr(),
+        devices_capacity: count,
+        devices_count: ptr::null_mut(),
+    };
+    // SAFETY: `devices` has room for `count` entries, which the call writes all of, since the listing never changes.
+    unsafe {
+        ffi::ustore_gpu_devices(&mut listing);
+        listed.set_len(count as usize);
+    }
+    check(outcome)?;
+    Ok(listed
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, device)| {
+            // SAFETY: the library null-terminates the name within its 64 bytes.
+            let name = unsafe { CStr::from_ptr(device.name.as_ptr()) };
+            Some(GPUDevice {
+                ordinal,
+                vendor: GPUVendor::from_raw(device.vendor)?,
+                vendor_ordinal: device.vendor_ordinal,
+                gpu_class: GPUClass::from_raw(device.gpu_class)?,
+                compute_units: device.compute_units,
+                memory_bytes: device.memory_bytes,
+                name: name.to_string_lossy().into_owned(),
+            })
+        })
+        .collect())
+}
+
 /// The CPU generation a database confines its waits, atomics and string kernels to, where `None` takes what the CPU
 /// offers. Prints and parses its stable name, like "intel-icelake".
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -1718,8 +1907,10 @@ pub enum CPUClass {
     AppleM2 = 7,
     /// Arm server cores from AWS Graviton 5 on.
     AWSG5 = 8,
+    /// RISC-V cores with RVV, Zawrs and Zacas, from Alibaba's C930 on.
+    AlibabaC930 = 9,
     /// The one class of a monoversioned build.
-    Monoversioned = 9,
+    Monoversioned = 10,
 }
 
 impl CPUClass {
@@ -1733,7 +1924,8 @@ impl CPUClass {
             6 => Some(CPUClass::AWSG2),
             7 => Some(CPUClass::AppleM2),
             8 => Some(CPUClass::AWSG5),
-            9 => Some(CPUClass::Monoversioned),
+            9 => Some(CPUClass::AlibabaC930),
+            10 => Some(CPUClass::Monoversioned),
             _ => None,
         }
     }
@@ -3429,16 +3621,16 @@ impl Executor {
         Executor::created(handle, outcome)
     }
 
-    /// Opens one submission stream on the CUDA device `device`, or borrows the caller's `stream`, all of it driven by
-    /// one host thread - which is why this takes no thread count - moving bytes as `gds` says. Zero `scratch_limit`
-    /// lets scratch grow as calls ask. It fails with [`Status::Unsupported`] in a build without CUDA and with
-    /// [`Status::Device`] for an ordinal no device carries. [`NVMEOptions::compactions`] places the merges of an NVMe
-    /// database on it.
+    /// Opens one submission stream on `device`, a [`GPUDevice::ordinal`] of either vendor, or borrows the caller's
+    /// `stream`, all of it driven by one host thread - which is why this takes no thread count - moving bytes as `gds`
+    /// says. Zero `scratch_limit` lets scratch grow as calls ask. It fails with [`Status::Device`] for an ordinal no
+    /// device carries. [`NVMEOptions::compactions`] places the merges of an NVMe database on one of an NVIDIA device.
     ///
     /// Calls `ustore_executor_for_vram`.
     ///
     /// # Safety
-    /// `stream` must be null or a live CUDA stream on `device` that outlives the executor.
+    /// `stream` must be null or a live stream on `device` that outlives the executor: a `cudaStream_t` on NVIDIA and a
+    /// `hipStream_t` on AMD.
     pub unsafe fn for_vram(
         device: i32,
         stream: *mut c_void,

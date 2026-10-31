@@ -37,7 +37,7 @@
 #include <cstdint> // `std::uint8_t`, `std::int32_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm>   // `std::copy`, `std::min`
+#include <algorithm>   // `std::copy`, `std::min`, `std::sort`, `std::binary_search`
 #include <array>       // `std::array`
 #include <atomic>      // `std::atomic_thread_fence`, `std::memory_order`
 #include <concepts>    // `std::same_as`
@@ -1401,8 +1401,8 @@ class database_transaction {
 
 #pragma region Schema
 
-/** The layout the schema blob follows, which a database of another version refuses to open. */
-inline constexpr std::uint64_t database_schema_version_k = 2;
+/** The layout the schema blob follows: collections and stamps, then the stamps ingests assigned their runs. */
+inline constexpr std::uint64_t database_schema_version_k = 1;
 
 /** @p text as the bytes a volume names a blob by, without its terminator. */
 template <std::size_t length_>
@@ -1580,16 +1580,18 @@ concept nvme_store_concept = requires(
     collection_config_t const& config, typename store_type_::constraint_t& constraint,
     typename store_type_::ledger_t& ledger, io_channel_t& channel, lsm_tree_publication_hook_t const& published,
     compactor_ref_t const& compactor, std::span<lsm_tree_run_record_t const> runs,
-    st::basic_vector<lsm_tree_run_record_t>& listed, typename store_type_::stored_key_t stored_key,
-    std::span<byte_t> into, stored_value_size_t& size, typename store_type_::sealed_commit_t& sealed,
-    transaction_stamp_t stamp, std::size_t thread_index) {
+    std::span<lsm_tree_run_stamp_t const> stamps, st::basic_vector<lsm_tree_run_record_t>& listed,
+    st::basic_vector<lsm_tree_run_stamp_t>& listed_stamps, typename store_type_::ingest_runs_t& ingest_runs,
+    typename store_type_::stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size,
+    typename store_type_::sealed_commit_t& sealed, transaction_stamp_t stamp, std::size_t thread_index) {
     typename store_type_::key_slot_t;
     typename store_type_::fold_t;
     { store_type_::mount(volume, config, constraint, ledger) } noexcept -> std::same_as<expected<store_type_>>;
-    { store.restore(channel, runs) } noexcept -> std::same_as<status_t>;
+    { store.restore(channel, runs, stamps) } noexcept -> std::same_as<status_t>;
     { store.truncate_above(channel, channel, stamp, published) } noexcept -> std::same_as<status_t>;
     { store.destroy(channel) } noexcept -> std::same_as<status_t>;
     { record_lsm_tree_runs(viewed.tree(), listed) } noexcept -> std::same_as<status_t>;
+    { record_lsm_tree_run_stamps(viewed.tree(), listed_stamps) } noexcept -> std::same_as<status_t>;
     { viewed.population_count() } noexcept -> std::same_as<std::uint64_t>;
     { viewed.size_bytes() } noexcept -> std::same_as<std::uint64_t>;
     { viewed.value_max_size() } noexcept -> std::same_as<stored_value_size_t>;
@@ -1608,6 +1610,9 @@ concept nvme_store_concept = requires(
     { store.flush(channel) } noexcept -> std::same_as<status_t>;
     { viewed.needs_compaction() } noexcept -> std::same_as<bool>;
     { store.compact(channel, channel, compactor, published) } noexcept -> std::same_as<expected<compaction_outcome_t>>;
+    { store.begin_ingest() } noexcept -> std::same_as<typename store_type_::ingest_runs_t>;
+    { store.publish_ingest(channel, ingest_runs) } noexcept -> std::same_as<expected<transaction_stamp_t>>;
+    { store.drop_ingest(channel, ingest_runs) } noexcept;
 };
 
 /**
@@ -1710,7 +1715,7 @@ class basic_database {
      *  @param[in,out] router The volumes every run lands on, borrowed and outliving the database.
      *  @param[in,out] channels The queue pairs every call borrows one of, borrowed and outliving the database.
      *  @param[in] config The delta bounds a transaction takes when its caller names none.
-     *  @param[in] compactor What every merge runs on: the calling thread, or a device lane the caller owns, which
+     *  @param[in] compactor What every merge runs on: the calling thread, or a device compactor the caller owns, which
      *      outlives the database.
      */
     status_t mount(router_t& router, channel_pool_t& channels, database_config_t const& config,
@@ -2230,15 +2235,91 @@ class basic_database {
     status_t flush() noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        status_t first;
-        for (std::size_t index = 0; index != collections_.size(); ++index)
-            if (status_t const flushed = std::visit([&](auto& held) noexcept { return held.flush(claimed->channel()); },
-                                                    collections_[index]->held);
-                flushed.failed() && first.succeeded())
-                first = flushed;
-        // Every run the flushes wrote is sealed by now, so the schema may name them.
-        if (status_t const saved = save_schema_(claimed->channel()); saved.failed() && first.succeeded()) first = saved;
-        return first;
+        return flush_holding_(claimed->channel());
+    }
+
+    /** An ingest under way into one collection: the claim it holds until destroyed, and the rows and runs so far. */
+    class ingest_t;
+
+    /**
+     *  @brief Opens @p ingest into @p id, taking the claim it holds until it is destroyed, which keeps the collection
+     *      from being dropped beneath its runs.
+     *  @return @c not_found_k for no such collection, or success.
+     */
+    status_t begin_ingest(any_collection_id_t const& id, ingest_t& ingest) noexcept {
+        claim_guard_t claim {*this};
+        std::size_t const position = position_at_(id);
+        if (position == collections_.size())
+            return {status_code_t::not_found_k, "The database names no such collection"};
+        ingest.claim_ = std::move(claim);
+        ingest.position_ = position;
+        auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
+            any_collection_t& held = collections_[position]->held;
+            if (held.index() == index_) ingest.runs_.template emplace<index_>(std::get<index_>(held).begin_ingest());
+        };
+        [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
+            (rung(std::integral_constant<std::size_t, indices_> {}), ...);
+        }(std::index_sequence_for<stores_...> {});
+        return {};
+    }
+
+    /**
+     *  @brief Lays @p rows out behind the rows @p ingest laid out before, outside the memory runs, writing a run each
+     *      time one fills, so appends of any size land in runs of a flush's size.
+     *  @param[in] rows Rows ascending past every row before them, readable until the call returns.
+     *  @return @c unsupported_k for a store writing no such rows, or the status that stopped it with @p ingest as it
+     *      was.
+     */
+    template <typename row_type_>
+    status_t write_ingest(ingest_t& ingest, std::span<row_type_ const> rows) noexcept {
+        auto [guard, acquire_status] = channels_->acquire();
+        if (acquire_status.failed()) return acquire_status;
+        io_channel_t& channel = guard.channel();
+        return with_ingest_<status_t>(
+            ingest, [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
+                if constexpr (requires { held.write_ingest(channel, rows, ingested); })
+                    return held.write_ingest(channel, rows, ingested);
+                else return status_t {status_code_t::unsupported_k, "This collection's store ingests no such rows"};
+            });
+    }
+
+    /**
+     *  @brief Publishes every run of @p ingest as one commit of its own above every level holding their keys, and
+     *      answers its stamp.
+     *  @param[in] durability Flushed for an ingest durable on return, flushing every collection and saving the schema,
+     *      or buffered for one the next save names and a crash before it drops whole.
+     *  @return The stamp, or the status that stopped it with every run dropped, either way with the claim given back.
+     */
+    expected<transaction_stamp_t> publish_ingest(ingest_t& ingest, ustore_durability_t durability) noexcept {
+        // The channel goes back before the claim, as every claimed call gives them back
+        expected<transaction_stamp_t> const landed = [&]() noexcept -> expected<transaction_stamp_t> {
+            auto [guard, acquire_status] = channels_->acquire();
+            if (acquire_status.failed()) return acquire_status;
+            io_channel_t& channel = guard.channel();
+            expected<transaction_stamp_t> const published = with_ingest_<expected<transaction_stamp_t>>(
+                ingest,
+                [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
+                    return held.publish_ingest(channel, ingested);
+                });
+            if (!published || durability != ustore_durability_flushed_k) return published;
+            if (status_t const durable = flush_holding_(channel); durable.failed()) return durable;
+            return published;
+        }();
+        ingest.claim_ = claim_guard_t {};
+        return landed;
+    }
+
+    /** Drops every run @p ingest wrote and never published, under the claim, which it takes again once given back. */
+    void drop_ingest(ingest_t& ingest) noexcept {
+        if (std::visit([](auto const& ingested) noexcept { return ingested.runs.empty(); }, ingest.runs_)) return;
+        if (!ingest.claim_.holding()) ingest.claim_ = claim_guard_t {*this};
+        auto [guard, acquire_status] = channels_->acquire();
+        if (acquire_status.failed()) return;
+        [[maybe_unused]] status_t const dropped = with_ingest_<status_t>(
+            ingest, [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
+                held.drop_ingest(guard.channel(), ingested);
+                return status_t {};
+            });
     }
 
     /** Whether any collection has a level over its bounds, which @c compact then merges. */
@@ -2573,6 +2654,27 @@ class basic_database {
         channel_guard_t channel_;
     };
 
+  public:
+    class ingest_t {
+      public:
+        ingest_t() noexcept = default;
+        ingest_t(ingest_t const&) = delete;
+        ingest_t& operator=(ingest_t const&) = delete;
+
+      private:
+        friend class basic_database;
+
+        /** The database's claim, held from @c begin_ingest until this is destroyed. */
+        claim_guard_t claim_;
+
+        /** Where the collection sits in the schema, which no create or drop moves while the claim is held. */
+        std::size_t position_ = 0;
+
+        /** The rows laid out and the runs written so far, of the store the collection is held in. */
+        std::variant<typename stores_::ingest_runs_t...> runs_;
+    };
+
+  private:
 #pragma endregion Private Types
 
 #pragma region Private Methods
@@ -2831,6 +2933,20 @@ class basic_database {
         claim_.release();
     }
 
+    /** Flushes every collection and saves the schema naming the runs, holding the claim; answers the first failure,
+     *  after trying every collection. */
+    status_t flush_holding_(io_channel_t& channel) noexcept {
+        status_t first;
+        for (std::size_t index = 0; index != collections_.size(); ++index)
+            if (status_t const flushed = std::visit([&](auto& held) noexcept { return held.flush(channel); },
+                                                    collections_[index]->held);
+                flushed.failed() && first.succeeded())
+                first = flushed;
+        // Every run the flushes wrote is sealed by now, so the schema may name them.
+        if (status_t const saved = save_schema_(channel); saved.failed() && first.succeeded()) first = saved;
+        return first;
+    }
+
     /** Takes the claim and then a shared channel, which every call that moves bytes runs under. */
     expected<claimed_channel_t> claim_channel_() noexcept {
         claim_guard_t claim {*this};
@@ -2850,6 +2966,20 @@ class basic_database {
         for (std::size_t index = 0; index != collections_.size(); ++index)
             if (collections_[index]->name == named) return index;
         return collections_.size();
+    }
+
+    /** Answers @p action on the store @p ingest writes into and the runs it wrote so far. */
+    template <typename result_type_, typename action_type_>
+    result_type_ with_ingest_(ingest_t& ingest, action_type_&& action) noexcept {
+        any_collection_t& held = collections_[ingest.position_]->held;
+        result_type_ result = status_t {status_code_t::internal_k, "The ingest lost its store"};
+        auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
+            if (held.index() == index_) result = action(std::get<index_>(held), std::get<index_>(ingest.runs_));
+        };
+        [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
+            (rung(std::integral_constant<std::size_t, indices_> {}), ...);
+        }(std::index_sequence_for<stores_...> {});
+        return result;
     }
 
     /** Mounts @p entry's collection on its volume in the one of @c stores_ its tag names, which the caller checked. */
@@ -2940,6 +3070,7 @@ class basic_database {
         stamps.generation = generation_ + 1;
         st::basic_vector<collection_record_t> records;
         st::basic_vector<lsm_tree_run_record_t> runs;
+        st::basic_vector<lsm_tree_run_stamp_t> ingested;
         if (records.reserve(collections_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
         for (std::size_t index = 0; index != collections_.size(); ++index) {
@@ -2948,7 +3079,11 @@ class basic_database {
             record.id = entry.id;
             std::size_t const named_before = runs.size();
             if (status_t const named = std::visit(
-                    [&](auto const& held) noexcept { return record_lsm_tree_runs(held.tree(), runs); }, entry.held);
+                    [&](auto const& held) noexcept {
+                        status_t const listed = record_lsm_tree_runs(held.tree(), runs);
+                        return listed.failed() ? listed : record_lsm_tree_run_stamps(held.tree(), ingested);
+                    },
+                    entry.held);
                 named.failed())
                 return named;
             record.run_count = runs.size() - named_before;
@@ -2970,9 +3105,11 @@ class basic_database {
 
         std::uint64_t const version = database_schema_version_k;
         st::basic_vector<byte_t> image;
-        if (image.resize(fields_storage_requirements(version, stamps, records, runs)) != st::status_t::success_k)
+        if (image.resize(fields_storage_requirements(version, stamps, records, runs, ingested)) !=
+            st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
-        if (status_t const laid = save_fields(bytes_span_t {image}, version, stamps, records, runs); laid.failed())
+        if (status_t const laid = save_fields(bytes_span_t {image}, version, stamps, records, runs, ingested);
+            laid.failed())
             return laid;
         if (status_t const written = write_blob_(channel, database_schema_name(schema_copy_of(stamps.generation)),
                                                  blob_kind_t::schema_k, std::span<byte_t const> {image});
@@ -2982,10 +3119,12 @@ class basic_database {
         return {};
     }
 
-    /** Reads copy @p copy of the schema into its fields, or leaves @p stamps at generation zero when it is absent. */
+    /** Reads copy @p copy of the schema into its fields, or leaves @p stamps at generation zero when it is absent; a
+     *  copy of version 2 carries no ingested runs. */
     status_t read_schema_copy_(io_channel_t& channel, std::size_t copy, schema_stamps_t& stamps,
                                st::basic_vector<collection_record_t>& records,
-                               st::basic_vector<lsm_tree_run_record_t>& runs) const noexcept {
+                               st::basic_vector<lsm_tree_run_record_t>& runs,
+                               st::basic_vector<lsm_tree_run_stamp_t>& ingested) const noexcept {
         auto [found, find_status] = router_->find(database_schema_name(copy));
         if (find_status.failed()) return find_status == status_code_t::not_found_k ? status_t {} : find_status;
 
@@ -3001,6 +3140,10 @@ class basic_database {
             return parsed;
         if (version != database_schema_version_k)
             return {status_code_t::unsupported_k, "The schema follows another version"};
+        if (status_t const parsed = load_fields(
+                bytes_view_t {image}.subspan(fields_storage_requirements(version, stamps, records, runs)), ingested);
+            parsed.failed())
+            return parsed;
         if (stamps.generation == 0) return {status_code_t::malformed_k, "A saved schema counts at least one save"};
         return {};
     }
@@ -3015,6 +3158,7 @@ class basic_database {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         if (status_t const loaded = load_schema_(claimed->channel()); loaded.failed()) return loaded;
+        if (status_t const swept = sweep_unnamed_runs_(claimed->channel()); swept.failed()) return swept;
 
         // The stamps continue above the durable stamp, and every version above it is a commit a crash tore, which
         // is dropped before anything draws a stamp; resuming first is what lets the truncation's schema promise it.
@@ -3042,20 +3186,60 @@ class basic_database {
         std::array<schema_stamps_t, 2> stamps {};
         std::array<st::basic_vector<collection_record_t>, 2> records;
         std::array<st::basic_vector<lsm_tree_run_record_t>, 2> runs_of;
+        std::array<st::basic_vector<lsm_tree_run_stamp_t>, 2> ingested_of;
         for (std::size_t copy = 0; copy != 2; ++copy)
-            if (status_t const read = read_schema_copy_(channel, copy, stamps[copy], records[copy], runs_of[copy]);
+            if (status_t const read = read_schema_copy_(channel, copy, stamps[copy], records[copy], runs_of[copy],
+                                                        ingested_of[copy]);
                 read.failed())
                 return read;
         std::size_t const newer = stamps[1].generation > stamps[0].generation ? 1 : 0;
         if (stamps[newer].generation == 0) return {};
         generation_ = stamps[newer].generation;
         loaded_durable_ = stamps[newer].durable;
-        return adopt_all_(channel, records[newer], runs_of[newer]);
+        return adopt_all_(channel, records[newer], runs_of[newer], ingested_of[newer]);
     }
 
-    /** Opens every collection @p records names over the runs @p runs carries for them, in order. */
+    /** Drops every sorted run the volumes hold that no collection names, which a crash between a flush's seal and the
+     *  schema save naming its run leaves behind, before anything else of the mount writes. */
+    status_t sweep_unnamed_runs_(io_channel_t& channel) noexcept {
+        st::basic_vector<lsm_tree_run_record_t> runs;
+        for (std::size_t index = 0; index != collections_.size(); ++index)
+            if (status_t const listed = std::visit(
+                    [&](auto const& held) noexcept { return record_lsm_tree_runs(held.tree(), runs); },
+                    collections_[index]->held);
+                listed.failed())
+                return listed;
+        st::basic_vector<uuid_t> named;
+        if (named.resize(runs.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to list the runs the schema names"};
+        for (std::size_t index = 0; index != runs.size(); ++index) named[index] = runs[index].content_id;
+        std::sort(named.begin(), named.end());
+
+        st::basic_vector<uuid_t> unnamed;
+        status_t listed;
+        router_->for_each(blob_kind_t::sorted_run_k, [&](blob_name_t name, volume_blob_t const&) noexcept {
+            if (listed.failed() || name.size() != uuid_t::size_bytes_k) return;
+            uuid_t content_id;
+            std::memcpy(content_id.bytes, name.data(), uuid_t::size_bytes_k);
+            if (std::binary_search(named.begin(), named.end(), content_id)) return;
+            if (unnamed.push_back(std::move(content_id)) != st::status_t::success_k)
+                listed = {status_code_t::out_of_memory_k, "No room to list the runs the schema leaves unnamed"};
+        });
+        if (listed.failed()) return listed;
+        // The catalog cannot change while it is walked, so the drops follow the walk.
+        for (uuid_t const& content_id : unnamed)
+            if (status_t const dropped = router_->drop(
+                    channel, blob_name_t {reinterpret_cast<byte_t const*>(content_id.bytes), uuid_t::size_bytes_k});
+                dropped.failed())
+                return dropped;
+        return {};
+    }
+
+    /** Opens every collection @p records names over the runs @p runs carries for them, in order, with the
+     *  @p stamps ingests assigned. */
     status_t adopt_all_(io_channel_t& channel, st::basic_vector<collection_record_t> const& records,
-                        st::basic_vector<lsm_tree_run_record_t> const& runs) noexcept {
+                        st::basic_vector<lsm_tree_run_record_t> const& runs,
+                        st::basic_vector<lsm_tree_run_stamp_t> const& stamps) noexcept {
         if (collections_.reserve(records.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room for the collections the schema names"};
         std::size_t named = 0;
@@ -3064,7 +3248,8 @@ class basic_database {
                 return {status_code_t::malformed_k, "The schema names more runs than it carries"};
             std::size_t const count = static_cast<std::size_t>(records[index].run_count);
             if (status_t const opened = adopt_(channel, records[index],
-                                               std::span<lsm_tree_run_record_t const> {runs.data() + named, count});
+                                               std::span<lsm_tree_run_record_t const> {runs.data() + named, count},
+                                               std::span<lsm_tree_run_stamp_t const> {stamps});
                 opened.failed())
                 return opened;
             named += count;
@@ -3073,9 +3258,11 @@ class basic_database {
         return {};
     }
 
-    /** Opens the collection @p record describes over the runs @p runs names, and takes it into the schema. */
+    /** Opens the collection @p record describes over the runs @p runs names, with the @p stamps ingests
+     *  assigned, and takes it into the schema. */
     status_t adopt_(io_channel_t& channel, collection_record_t const& record,
-                    std::span<lsm_tree_run_record_t const> runs) noexcept {
+                    std::span<lsm_tree_run_record_t const> runs,
+                    std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
         if (static_cast<std::size_t>(record.volume) >= router_->size())
             return {status_code_t::malformed_k, "The schema names a volume this mount did not open"};
         if (store_tags_::index_of(record.store_tag) >= sizeof...(stores_))
@@ -3090,8 +3277,8 @@ class basic_database {
         entry->config = record.config();
         entry->volume = static_cast<volume_id_t>(record.volume);
         if (status_t const mounted = mount_collection_(*entry); mounted.failed()) return mounted;
-        if (status_t const restored = std::visit([&](auto& held) noexcept { return held.restore(channel, runs); },
-                                                 entry->held);
+        if (status_t const restored = std::visit(
+                [&](auto& held) noexcept { return held.restore(channel, runs, stamps); }, entry->held);
             restored.failed())
             return restored;
         if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
@@ -3125,7 +3312,8 @@ class basic_database {
     /** The stamps every commit of this database draws, a transaction's or a head write's, and the stamps pinned. */
     commit_ledger<atomic_reference_, waiter_type_> ledger_;
 
-    /** What every merge of this database runs on, picked at mount: the calling thread, or a lane the opener owns. */
+    /** What every merge of this database runs on, picked at mount: the calling thread, or a device compactor the
+     *  opener owns. */
     compactor_ref_t compactor_;
 
     /** The transactions of this database, which names this store for as long as it lives. */

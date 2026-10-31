@@ -135,9 +135,9 @@ inline bool names_directory(char const* path) noexcept {
 #pragma region Handles
 
 /** The RAM engine of one CPU class and isolation level, whose stores own their words through the
- *  class's atomic reference and wait through its waiter. Each table is defined beside the calls it
- *  names, so the explicit instantiation in <tt>src/ram/variants_&lt;class&gt;.cpp</tt> compiles
- *  every call of the class there. */
+ *  class's atomic reference and wait through its waiter. Each modality's table is defined beside the
+ *  calls it names, and the database and engine tables in <tt>src/ram/variants.hpp</tt>, so the
+ *  explicit instantiation in <tt>src/ram/variants_&lt;class&gt;.cpp</tt> compiles every call there. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct ram_variant {
 
@@ -2066,36 +2066,6 @@ void database_free(ustore_database_t database) noexcept {
     [[maybe_unused]] status_t const persisted = persist(*state);
     delete state;
 }
-
-template <cpu_class_t cpu_class_, isolation_t isolation_>
-database_verbs_t const ram_variant<cpu_class_, isolation_>::database_verbs_k {
-    .describe = &serve_database<cpu_class_, isolation_, ustore_database_describe_t>,
-    .clear = &serve_database<cpu_class_, isolation_, ustore_database_clear_t>,
-    .compact = &serve_database<cpu_class_, isolation_, ustore_database_compact_t>,
-    .snapshot_init = &serve_database<cpu_class_, isolation_, ustore_snapshot_init_t>,
-    .snapshot_save = &serve_database<cpu_class_, isolation_, ustore_snapshot_save_t>,
-    .collection_list = &serve_database<cpu_class_, isolation_, ustore_collection_list_t>,
-    .collection_create = &serve_database<cpu_class_, isolation_, ustore_collection_create_t>,
-    .collection_find = &serve_database<cpu_class_, isolation_, ustore_collection_find_t, strings_arg_t>,
-    .collection_drop = &serve_database<cpu_class_, isolation_, ustore_collection_drop_t>,
-    .transaction_init = &serve_database<cpu_class_, isolation_, ustore_transaction_init_t>,
-    .transaction_stage = &serve_database<cpu_class_, isolation_, ustore_transaction_stage_t>,
-    .transaction_commit = &serve_database<cpu_class_, isolation_, ustore_transaction_commit_t>,
-    .transaction_rollback = &serve_database<cpu_class_, isolation_, ustore_transaction_rollback_t>,
-    .transaction_free = &transaction_free<cpu_class_, isolation_>,
-    .snapshot_free = &snapshot_free<cpu_class_, isolation_>,
-    .database_free = &database_free<cpu_class_, isolation_>,
-};
-
-template <cpu_class_t cpu_class_, isolation_t isolation_>
-engine_t const ram_variant<cpu_class_, isolation_>::engine_k {
-    .database = &database_verbs_k,
-    .host = {.blobs = &blobs_verbs_k,
-             .strings = &strings_verbs_k,
-             .docs = &docs_verbs_k,
-             .graph = &graph_verbs_k,
-             .pages = &pages_verbs_k},
-};
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t ram_variant<cpu_class_, isolation_>::open(ustore_database_t* database, std::string_view directory) noexcept {

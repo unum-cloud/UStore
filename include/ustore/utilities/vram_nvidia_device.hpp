@@ -2,691 +2,347 @@
  *  @file include/ustore/utilities/vram_nvidia_device.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
- *  @brief CUDA devices from the host: specifications, memory, NUMA placement, streams, events, buffers and the
+ *  @brief NVIDIA devices from the host: the driver opened at first use, the device listing, modules, events and the
  *      executor calls on one device queue through.
  *
- *  Host code over the CUDA runtime API with no kernels, so it compiles under a host compiler whenever the
- *  toolkit's headers are on the include path, and to nothing without them but an executor type a build without
- *  CUDA never spawns. Nothing here throws or keeps global state: devices enumerate into a table the caller owns.
+ *  The library never links @c libcuda or the CUDA runtime: @c cuda_api_t::load opens the driver and resolves the entry
+ *  points UStore calls into one table, which stays empty where the driver is absent, so NVIDIA then lists no devices
+ *  and the binary still loads. The few driver types, constants and prototypes UStore calls are spelled here, copied
+ *  from the driver's stable ABI, so any host compiler builds it. Kernels reach a device as fatbins compiled ahead of
+ *  time and embedded in the library, loaded by @c cuda_module_t and launched by name. The runtime helpers the graph's
+ *  device fold still calls live apart, in @c vram_nvidia_runtime.cuh.
  */
 
 #pragma once
 
-#include <cstddef> // `std::byte`, `std::size_t`
-#include <cstdint> // `std::uint8_t`
-#include <cstdio>  // `std::fopen`, `std::fgets`, `std::fclose`
-#include <cstdlib> // `std::strtol`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 
-#include <limits>      // `std::numeric_limits`
-#include <optional>    // `std::optional`
-#include <type_traits> // `std::true_type`
-#include <utility>     // `std::exchange`, `std::move`
+#include <span>    // `std::span`
+#include <utility> // `std::exchange`, `std::swap`
 
-#if __has_include(<cuda_runtime.h>)
-#include <cuda_runtime.h>
+#include <stringzilla/capabilities.h> // `sz_capability_t`
 
-#include <smashtable/basic_vector.hpp>
-#include <smashtable/shared.hpp>
-
-#include "ustore/utilities/ram_device.hpp"
-#endif
+#include "ustore/utilities/blocking_files.hpp" // `shared_library_t`
+#include "ustore/utilities/ram_buffers.hpp"    // `pinned_bounce`, `managed_blocks_t`, `free_blocks`
+#include "ustore/utilities/types.hpp"          // `gpu_device_t`, `gpu_class_t`, `expected`, `status_t`
 
 namespace unum::ustore::utilities {
 
-#if __has_include(<cuda_runtime.h>)
+#pragma region Driver ABI
 
-#pragma region Devices
-
-/** The status a CUDA runtime result maps to, keeping exhausted memory and absent devices apart from other failures. */
-inline st::status_t cuda_status(cudaError_t error) noexcept {
-    using st::status_t;
-    switch (error) {
-    case cudaSuccess: return status_t::success_k;
-    case cudaErrorMemoryAllocation: return status_t::out_of_memory_heap_k;
-    case cudaErrorInvalidValue:
-    case cudaErrorInvalidDevice:
-    case cudaErrorNoDevice: return status_t::invalid_argument_k;
-    default: return status_t::unknown_k;
-    }
-}
-
-/** GPU generations by compute capability. */
-enum class cuda_generation_t : std::uint8_t {
-
-    /** A compute capability this table does not name. */
-    unknown_k,
-
-    /** Compute capability 8.0 through 8.7. */
-    ampere_k,
-
-    /** Compute capability 8.9. */
-    ada_k,
-
-    /** Compute capability 9.0. */
-    hopper_k,
-
-    /** Compute capability 10.0 in data centers, 11.0 in Thor and 12.0 in workstations. */
-    blackwell_k,
+/** The driver's status word, @c CUresult, naming the values UStore tells apart; any other is a failure. */
+enum cuda_result_t : int {
+    cuda_success_k = 0,
+    cuda_error_not_initialized_k = 3,
 };
 
-/** The generation of compute capability @p major and @p minor. */
-constexpr cuda_generation_t cuda_generation(int major, int minor) noexcept {
-    if (major == 8) return minor >= 9 ? cuda_generation_t::ada_k : cuda_generation_t::ampere_k;
-    if (major == 9) return cuda_generation_t::hopper_k;
-    if ((major >= 10) & (major <= 12)) return cuda_generation_t::blackwell_k;
-    return cuda_generation_t::unknown_k;
+/** A device address, @c CUdeviceptr, which unified addressing shares with the host. */
+using cuda_device_address_t = unsigned long long;
+
+/** The driver's opaque handles: @c CUcontext, @c CUstream, @c CUevent, @c CUmodule and @c CUfunction. */
+using cuda_context_handle_t = struct cuda_context_opaque_t*;
+using cuda_stream_handle_t = struct cuda_stream_opaque_t*;
+using cuda_event_handle_t = struct cuda_event_opaque_t*;
+using cuda_module_handle_t = struct cuda_module_opaque_t*;
+using cuda_function_handle_t = struct cuda_function_opaque_t*;
+
+/** The @c CUdevice_attribute values UStore queries. */
+enum cuda_device_attribute_t : int {
+    cuda_attribute_multiprocessor_count_k = 16,
+    cuda_attribute_compute_capability_major_k = 75,
+    cuda_attribute_compute_capability_minor_k = 76,
+    cuda_attribute_host_numa_id_k = 134,
+};
+
+/** The flags UStore passes, @c CU_STREAM_NON_BLOCKING, @c CU_EVENT_BLOCKING_SYNC and @c CU_EVENT_DISABLE_TIMING, and
+ *  the @c CUpointer_attribute values it reads. */
+inline constexpr unsigned cuda_stream_non_blocking_k = 1;
+inline constexpr unsigned cuda_event_blocking_sync_k = 1;
+inline constexpr unsigned cuda_event_disable_timing_k = 2;
+inline constexpr int cuda_pointer_memory_type_k = 2;
+inline constexpr int cuda_pointer_is_managed_k = 8;
+inline constexpr int cuda_pointer_device_ordinal_k = 9;
+inline constexpr unsigned cuda_memory_type_device_k = 2;
+
+/** The @c CU_MEM_ATTACH_GLOBAL flag of managed allocations, which any stream on any device reaches. */
+inline constexpr unsigned cuda_attach_global_k = 1;
+
+#pragma endregion Driver ABI
+
+/**
+ *  @brief The driver entry points UStore calls, resolved from @c libcuda by @c load.
+ *
+ *  Every entry is null when the driver is absent or lacks any of them, which leaves NVIDIA with no devices; each
+ *  spells the prototype of the exported symbol it is resolved by, the @c _v2 one where @c <cuda.h> maps the name onto
+ *  it.
+ */
+struct cuda_api_t {
+    cuda_result_t (*init)(unsigned) = nullptr;
+    cuda_result_t (*get_device_count)(int*) = nullptr;
+    cuda_result_t (*get_device)(int*, int) = nullptr;
+    cuda_result_t (*get_device_attribute)(int*, cuda_device_attribute_t, int) = nullptr;
+    cuda_result_t (*get_device_name)(char*, int, int) = nullptr;
+    cuda_result_t (*get_device_memory)(std::size_t*, int) = nullptr;
+    cuda_result_t (*retain_primary_context)(cuda_context_handle_t*, int) = nullptr;
+    cuda_result_t (*set_current_context)(cuda_context_handle_t) = nullptr;
+    cuda_result_t (*stream_create)(cuda_stream_handle_t*, unsigned) = nullptr;
+    cuda_result_t (*stream_destroy)(cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*stream_synchronize)(cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*event_create)(cuda_event_handle_t*, unsigned) = nullptr;
+    cuda_result_t (*event_record)(cuda_event_handle_t, cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*event_synchronize)(cuda_event_handle_t) = nullptr;
+    cuda_result_t (*event_destroy)(cuda_event_handle_t) = nullptr;
+    cuda_result_t (*pointer_attribute)(void*, int, cuda_device_address_t) = nullptr;
+    cuda_result_t (*allocate_async)(cuda_device_address_t*, std::size_t, cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*free_async)(cuda_device_address_t, cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*allocate_managed)(cuda_device_address_t*, std::size_t, unsigned) = nullptr;
+    cuda_result_t (*free_blocking)(cuda_device_address_t) = nullptr;
+    cuda_result_t (*fill_async)(cuda_device_address_t, unsigned char, std::size_t, cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*upload_async)(cuda_device_address_t, void const*, std::size_t, cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*download_async)(void*, cuda_device_address_t, std::size_t, cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*copy_async)(cuda_device_address_t, cuda_device_address_t, std::size_t,
+                                cuda_stream_handle_t) = nullptr;
+    cuda_result_t (*register_host)(void*, std::size_t, unsigned) = nullptr;
+    cuda_result_t (*unregister_host)(void*) = nullptr;
+    cuda_result_t (*module_load_data)(cuda_module_handle_t*, void const*) = nullptr;
+    cuda_result_t (*module_unload)(cuda_module_handle_t) = nullptr;
+    cuda_result_t (*module_get_function)(cuda_function_handle_t*, cuda_module_handle_t, char const*) = nullptr;
+    cuda_result_t (*launch_kernel)(cuda_function_handle_t, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+                                   unsigned, cuda_stream_handle_t, void**, void**) = nullptr;
+
+    /** Whether the driver loaded and initialized with every entry resolved. */
+    explicit operator bool() const noexcept { return launch_kernel != nullptr; }
+
+    /** Opens the driver, resolves every entry and initializes it, or answers the empty table. The library stays open
+     *  for the life of the process, as the table points into it. */
+    static cuda_api_t load() noexcept {
+        // Each system names the driver its own way, and opening another's name merely fails
+        shared_library_t library;
+        for (char const* name : {"libcuda.so.1", "nvcuda.dll"})
+            if ((library = shared_library_t::open(name))) break;
+        if (!library) return {};
+        cuda_api_t api;
+        bool const resolved = //
+            library.resolve("cuInit", api.init) && library.resolve("cuDeviceGetCount", api.get_device_count) &&
+            library.resolve("cuDeviceGet", api.get_device) &&
+            library.resolve("cuDeviceGetAttribute", api.get_device_attribute) &&
+            library.resolve("cuDeviceGetName", api.get_device_name) &&
+            library.resolve("cuDeviceTotalMem_v2", api.get_device_memory) &&
+            library.resolve("cuDevicePrimaryCtxRetain", api.retain_primary_context) &&
+            library.resolve("cuCtxSetCurrent", api.set_current_context) &&
+            library.resolve("cuStreamCreate", api.stream_create) &&
+            library.resolve("cuStreamDestroy_v2", api.stream_destroy) &&
+            library.resolve("cuStreamSynchronize", api.stream_synchronize) &&
+            library.resolve("cuEventCreate", api.event_create) && library.resolve("cuEventRecord", api.event_record) &&
+            library.resolve("cuEventSynchronize", api.event_synchronize) &&
+            library.resolve("cuEventDestroy_v2", api.event_destroy) &&
+            library.resolve("cuPointerGetAttribute", api.pointer_attribute) &&
+            library.resolve("cuMemAllocAsync", api.allocate_async) &&
+            library.resolve("cuMemFreeAsync", api.free_async) &&
+            library.resolve("cuMemAllocManaged", api.allocate_managed) &&
+            library.resolve("cuMemFree_v2", api.free_blocking) && library.resolve("cuMemsetD8Async", api.fill_async) &&
+            library.resolve("cuMemcpyHtoDAsync_v2", api.upload_async) &&
+            library.resolve("cuMemcpyDtoHAsync_v2", api.download_async) &&
+            library.resolve("cuMemcpyDtoDAsync_v2", api.copy_async) &&
+            library.resolve("cuMemHostRegister_v2", api.register_host) &&
+            library.resolve("cuMemHostUnregister", api.unregister_host) &&
+            library.resolve("cuModuleLoadData", api.module_load_data) &&
+            library.resolve("cuModuleUnload", api.module_unload) &&
+            library.resolve("cuModuleGetFunction", api.module_get_function) &&
+            library.resolve("cuLaunchKernel", api.launch_kernel);
+        // A driver without a usable GPU fails its initialization, which lists no devices either
+        if (resolved && api.init(0) == cuda_success_k) return api;
+        return {};
+    }
+};
+
+/** The ordinal of the NVIDIA device whose memory holds @p pointer, or -1 for host memory, pinned, managed or neither,
+ *  which unified addressing tells apart through the driver. */
+inline int cuda_device_of(cuda_api_t const& api, void const* pointer) noexcept {
+    unsigned memory_type = 0;
+    int managed = 0, ordinal = -1;
+    cuda_device_address_t const address = static_cast<cuda_device_address_t>(reinterpret_cast<std::uintptr_t>(pointer));
+    if (!api || !pointer ||
+        api.pointer_attribute(&memory_type, cuda_pointer_memory_type_k, address) != cuda_success_k ||
+        memory_type != cuda_memory_type_device_k ||
+        api.pointer_attribute(&managed, cuda_pointer_is_managed_k, address) != cuda_success_k || managed ||
+        api.pointer_attribute(&ordinal, cuda_pointer_device_ordinal_k, address) != cuda_success_k)
+        return -1;
+    return ordinal;
 }
 
-/** The number of CUDA devices the runtime sees, which is zero on a machine without one. */
-inline st::expected<std::size_t> cuda_count_devices() noexcept {
-    using st::status_t;
-    int count = 0;
-    cudaError_t const error = cudaGetDeviceCount(&count);
-    if (error == cudaErrorNoDevice) return std::size_t {0};
-    status_t const status = cuda_status(error);
-    if (status != status_t::success_k) return status;
-    return static_cast<std::size_t>(count);
+/** Frees every run of @p blocks through @p context, the retained primary context of the device they live on, waiting
+ *  for the device, as an arena outliving its executor is freed. */
+inline void free_cuda_blocks(cuda_api_t const& api, cuda_context_handle_t context, device_blocks_t& blocks) noexcept {
+    if (!api || api.set_current_context(context) != cuda_success_k) return;
+    free_blocks(blocks, [&](std::uintptr_t address) noexcept { api.free_blocking(address); });
 }
 
-/** Makes one device current for its lifetime, and the device current before it afterwards. */
-class cuda_device_scope_t {
+/** Writes every NVIDIA device @p api reaches into @p into, in CUDA ordinal order, as the driver reports it, and
+ *  answers how many it wrote; none without a driver. */
+inline std::size_t list_nvidia_gpu_devices(cuda_api_t const& api, std::span<gpu_device_t> into) noexcept {
+    std::size_t count = 0;
+    int devices_count = 0;
+    if (!api || api.get_device_count(&devices_count) != cuda_success_k) return count;
+    for (int ordinal = 0; ordinal != devices_count && count != into.size(); ++ordinal) {
+        int handle = 0, major = 0, minor = 0, compute_units = 0;
+        std::size_t memory_bytes = 0;
+        if (api.get_device(&handle, ordinal) != cuda_success_k ||
+            api.get_device_attribute(&major, cuda_attribute_compute_capability_major_k, handle) != cuda_success_k ||
+            api.get_device_attribute(&minor, cuda_attribute_compute_capability_minor_k, handle) != cuda_success_k ||
+            api.get_device_attribute(&compute_units, cuda_attribute_multiprocessor_count_k, handle) != cuda_success_k ||
+            api.get_device_memory(&memory_bytes, handle) != cuda_success_k)
+            continue;
+        gpu_device_t& device = into[count++];
+        device = {gpu_vendor_t::nvidia_k,
+                  static_cast<std::uint32_t>(ordinal),
+                  static_cast<std::uint32_t>(major),
+                  static_cast<std::uint32_t>(minor),
+                  static_cast<std::uint32_t>(compute_units),
+                  static_cast<std::uint64_t>(memory_bytes)};
+        api.get_device_name(device.name, static_cast<int>(sizeof(device.name)), handle);
+    }
+    return count;
+}
+
+/** An owned event in the context current at its creation, which blocks on sync, so a wait sleeps instead of spinning
+ *  a core; destruction never waits. */
+class cuda_event_t {
   public:
-
-    /** Makes device @p ordinal current, remembering the device current before. */
-    static st::expected<cuda_device_scope_t> make(int ordinal) noexcept {
-        using st::status_t;
-        int previous = 0;
-        status_t status = cuda_status(cudaGetDevice(&previous));
-        if (status != status_t::success_k) return status;
-        if (previous != ordinal) {
-            status = cuda_status(cudaSetDevice(ordinal));
-            if (status != status_t::success_k) return status;
-        }
-        return cuda_device_scope_t(previous, ordinal);
+    cuda_event_t() noexcept = default;
+    explicit cuda_event_t(cuda_api_t const& api) noexcept : api_(&api) {
+        api.event_create(&handle_, cuda_event_blocking_sync_k | cuda_event_disable_timing_k);
     }
-
-    cuda_device_scope_t(cuda_device_scope_t&& other) noexcept
-        : previous_(std::exchange(other.previous_, other.current_)), current_(other.current_) {}
-    cuda_device_scope_t(cuda_device_scope_t const&) = delete;
-    cuda_device_scope_t& operator=(cuda_device_scope_t&&) = delete;
-    cuda_device_scope_t& operator=(cuda_device_scope_t const&) = delete;
-
-    ~cuda_device_scope_t() noexcept {
-        if (previous_ != current_) { [[maybe_unused]] cudaError_t const error = cudaSetDevice(previous_); }
-    }
-
-  private:
-    cuda_device_scope_t(int previous, int current) noexcept : previous_(previous), current_(current) {}
-
-    /** The device to make current again, equal to @c current_ when there is nothing to restore. */
-    int previous_ = 0;
-
-    /** The device the scope made current. */
-    int current_ = 0;
-};
-
-/** One CUDA device's hardware as the runtime reports it. */
-struct cuda_device_specs_t {
-
-    /** The ordinal every runtime call addresses the device by. */
-    int ordinal = 0;
-
-    /** The device's name, null-terminated. */
-    char name[256] = {};
-
-    /** Major compute capability. */
-    int compute_major = 0;
-
-    /** Minor compute capability. */
-    int compute_minor = 0;
-
-    /** Streaming multiprocessors, the cores kernels launch across. */
-    int multiprocessor_count = 0;
-
-    /** Memory on the device in bytes. */
-    std::size_t total_bytes = 0;
-
-    /** PCI domain of the device. */
-    int pci_domain = 0;
-
-    /** PCI bus of the device. */
-    int pci_bus = 0;
-
-    /** PCI device number of the device. */
-    int pci_device = 0;
-
-    /** The generation of the device's compute capability. */
-    constexpr cuda_generation_t generation() const noexcept { return cuda_generation(compute_major, compute_minor); }
-
-    /** Queries device @p ordinal. */
-    static st::expected<cuda_device_specs_t> query(int ordinal) noexcept {
-        using st::status_t;
-        cudaDeviceProp properties {};
-        status_t const status = cuda_status(cudaGetDeviceProperties(&properties, ordinal));
-        if (status != status_t::success_k) return status;
-        cuda_device_specs_t specs;
-        specs.ordinal = ordinal;
-        std::size_t const name_capacity = sizeof(specs.name) < sizeof(properties.name) ? sizeof(specs.name)
-                                                                                       : sizeof(properties.name);
-        for (std::size_t index = 0; index + 1 < name_capacity && properties.name[index] != '\0'; ++index)
-            specs.name[index] = properties.name[index];
-        specs.compute_major = properties.major;
-        specs.compute_minor = properties.minor;
-        specs.multiprocessor_count = properties.multiProcessorCount;
-        specs.total_bytes = properties.totalGlobalMem;
-        specs.pci_domain = properties.pciDomainID;
-        specs.pci_bus = properties.pciBusID;
-        specs.pci_device = properties.pciDeviceID;
-        return specs;
-    }
-};
-
-/** Free and total memory of one device at the moment of the query. */
-struct cuda_memory_usage_t {
-
-    /** Bytes no allocation holds. */
-    std::size_t free_bytes = 0;
-
-    /** Bytes on the device. */
-    std::size_t total_bytes = 0;
-
-    /** Queries device @p ordinal, which creates its context when none exists yet. */
-    static st::expected<cuda_memory_usage_t> query(int ordinal) noexcept {
-        using st::status_t;
-        st::expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(ordinal);
-        if (!scope) return scope.status();
-        cuda_memory_usage_t usage;
-        status_t const status = cuda_status(cudaMemGetInfo(&usage.free_bytes, &usage.total_bytes));
-        if (status != status_t::success_k) return status;
-        return usage;
-    }
-};
-
-/** The memory domain of a device whose nearest NUMA node the system does not say. */
-inline constexpr fu_memory_domain_id_t no_memory_domain_k = -1;
-
-/** The host NUMA node nearest the device @p specs describe, from Linux sysfs, or @c no_memory_domain_k when unsaid. */
-inline fu_memory_domain_id_t cuda_numa_node(cuda_device_specs_t const& specs) noexcept {
-    char path[] = "/sys/bus/pci/devices/0000:00:00.0/numa_node";
-    auto const write_hex = [&path](std::size_t end, unsigned value, std::size_t width) noexcept {
-        for (std::size_t index = 0; index != width; ++index, value >>= 4) {
-            unsigned const digit = value & 0xF;
-            path[end - index - 1] = static_cast<char>(digit < 10 ? '0' + digit : 'a' + digit - 10);
-        }
-    };
-    write_hex(25, static_cast<unsigned>(specs.pci_domain), 4);
-    write_hex(28, static_cast<unsigned>(specs.pci_bus), 2);
-    write_hex(31, static_cast<unsigned>(specs.pci_device), 2);
-
-    std::FILE* const file = std::fopen(path, "r");
-    if (file == nullptr) return no_memory_domain_k;
-    char text[16] = {};
-    char const* const read = std::fgets(text, sizeof(text), file);
-    [[maybe_unused]] int const closed = std::fclose(file);
-    if (read == nullptr) return no_memory_domain_k;
-    long const node = std::strtol(text, nullptr, 10);
-    return node < 0 ? no_memory_domain_k : static_cast<fu_memory_domain_id_t>(node);
-}
-
-/** One device with its hardware, its memory when enumerated, and its nearest NUMA node. */
-struct cuda_device_t {
-
-    /** The device's hardware. */
-    cuda_device_specs_t specs;
-
-    /** Free and total memory when the table was enumerated. */
-    cuda_memory_usage_t memory;
-
-    /** The host NUMA node nearest the device, or @c no_memory_domain_k. */
-    fu_memory_domain_id_t numa_node = no_memory_domain_k;
-};
-
-/** Every CUDA device the runtime sees, enumerated once into a table its caller owns. */
-class cuda_devices_t {
-  public:
-
-    /** Enumerates every device, which yields an empty table on a machine without one. */
-    static st::expected<cuda_devices_t> make() noexcept {
-        using st::status_t;
-        auto [count, cuda_count_devices_status] = cuda_count_devices();
-        if (st::failed(cuda_count_devices_status)) return cuda_count_devices_status;
-        cuda_devices_t table;
-        status_t const status = table.devices_.resize(count);
-        if (status != status_t::success_k) return status;
-        for (std::size_t index = 0; index != count; ++index) {
-            int const ordinal = static_cast<int>(index);
-            auto [specs, query_cuda_device_specs_status] = cuda_device_specs_t::query(ordinal);
-            if (st::failed(query_cuda_device_specs_status)) return query_cuda_device_specs_status;
-            auto [memory, query_cuda_memory_usage_status] = cuda_memory_usage_t::query(ordinal);
-            if (st::failed(query_cuda_memory_usage_status)) return query_cuda_memory_usage_status;
-            table.devices_[index] = cuda_device_t {specs, memory, cuda_numa_node(specs)};
-        }
-        return table;
-    }
-
-    /** Devices in the table. */
-    std::size_t size() const noexcept { return devices_.size(); }
-
-    /** The device of ordinal @p index. */
-    cuda_device_t const& operator[](std::size_t index) const noexcept { return devices_[index]; }
-
-  private:
-    cuda_devices_t() noexcept = default;
-
-    /** One entry per device, by ordinal. */
-    st::basic_vector<cuda_device_t> devices_;
-};
-
-#pragma endregion Devices
-
-#pragma region Streams
-
-/** An owned stream on one device, drained and destroyed with its owner. */
-class cuda_stream_t {
-  public:
-
-    /** Creates a stream on device @p ordinal. */
-    static st::expected<cuda_stream_t> make(int ordinal) noexcept {
-        using st::status_t;
-        st::expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(ordinal);
-        if (!scope) return scope.status();
-        cudaStream_t handle = nullptr;
-        status_t const status = cuda_status(cudaStreamCreate(&handle));
-        if (status != status_t::success_k) return status;
-        return cuda_stream_t(handle, ordinal);
-    }
-
-    cuda_stream_t(cuda_stream_t&& other) noexcept
-        : handle_(std::exchange(other.handle_, nullptr)), device_(other.device_) {}
-    cuda_stream_t& operator=(cuda_stream_t&& other) noexcept {
-        std::swap(handle_, other.handle_);
-        std::swap(device_, other.device_);
+    cuda_event_t(cuda_event_t&& other) noexcept : api_(other.api_), handle_(std::exchange(other.handle_, nullptr)) {}
+    cuda_event_t& operator=(cuda_event_t&& other) noexcept {
+        std::swap(api_, other.api_), std::swap(handle_, other.handle_);
         return *this;
     }
-    cuda_stream_t(cuda_stream_t const&) = delete;
-    cuda_stream_t& operator=(cuda_stream_t const&) = delete;
-
-    ~cuda_stream_t() noexcept {
-        if (handle_ == nullptr) return;
-        st::expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(device_);
-        [[maybe_unused]] cudaError_t const drained = cudaStreamSynchronize(handle_);
-        [[maybe_unused]] cudaError_t const destroyed = cudaStreamDestroy(handle_);
+    cuda_event_t(cuda_event_t const&) = delete;
+    cuda_event_t& operator=(cuda_event_t const&) = delete;
+    ~cuda_event_t() noexcept {
+        if (handle_) api_->event_destroy(handle_);
     }
 
-    /** Blocks until everything queued on the stream ran, reporting the first failure among it. */
-    st::status_t synchronize() const noexcept { return cuda_status(cudaStreamSynchronize(handle_)); }
+    /** Whether the driver made the event. */
+    explicit operator bool() const noexcept { return handle_ != nullptr; }
 
-    /** The runtime handle kernels and transfers queue on. */
-    cudaStream_t handle() const noexcept { return handle_; }
-
-    /** The ordinal of the device the stream lives on. */
-    int device() const noexcept { return device_; }
+    /** Marks everything queued on @p stream so far, and sleeps until the device ran it, answering whether it did. */
+    bool record_and_wait(cuda_stream_handle_t stream) noexcept {
+        return handle_ && api_->event_record(handle_, stream) == cuda_success_k &&
+               api_->event_synchronize(handle_) == cuda_success_k;
+    }
 
   private:
-    cuda_stream_t(cudaStream_t handle, int device) noexcept : handle_(handle), device_(device) {}
-
-    /** The owned stream, null once moved from. */
-    cudaStream_t handle_ = nullptr;
-
-    /** The ordinal of the device the stream lives on. */
-    int device_ = 0;
+    cuda_api_t const* api_ = nullptr;
+    cuda_event_handle_t handle_ = nullptr;
 };
 
-/** Times the work queued on a stream between two marks, without blocking the host until the time is read. */
-class cuda_stopwatch_t {
+/** One fatbin loaded into one device's primary context and unloaded with this owner; kernels are found by name. */
+class cuda_module_t {
   public:
-
-    /** A stopwatch with no events, which a @c make or a move fills. */
-    cuda_stopwatch_t() noexcept = default;
-
-    /** Creates the two events of a stopwatch on device @p ordinal. */
-    static st::expected<cuda_stopwatch_t> make(int ordinal) noexcept {
-        using st::status_t;
-        st::expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(ordinal);
-        if (!scope) return scope.status();
-        cuda_stopwatch_t stopwatch;
-        stopwatch.device_ = ordinal;
-        status_t status = cuda_status(cudaEventCreate(&stopwatch.start_));
-        if (status != status_t::success_k) return status;
-        status = cuda_status(cudaEventCreate(&stopwatch.stop_));
-        if (status != status_t::success_k) return status;
-        return stopwatch;
-    }
-
-    cuda_stopwatch_t(cuda_stopwatch_t&& other) noexcept
-        : start_(std::exchange(other.start_, nullptr)), stop_(std::exchange(other.stop_, nullptr)),
-          device_(other.device_) {}
-    cuda_stopwatch_t& operator=(cuda_stopwatch_t&& other) noexcept {
-        std::swap(start_, other.start_);
-        std::swap(stop_, other.stop_);
-        std::swap(device_, other.device_);
+    cuda_module_t() noexcept = default;
+    cuda_module_t(cuda_module_t&& other) noexcept
+        : api_(other.api_), context_(other.context_), handle_(std::exchange(other.handle_, nullptr)) {}
+    cuda_module_t& operator=(cuda_module_t&& other) noexcept {
+        std::swap(api_, other.api_), std::swap(context_, other.context_), std::swap(handle_, other.handle_);
         return *this;
     }
-    cuda_stopwatch_t(cuda_stopwatch_t const&) = delete;
-    cuda_stopwatch_t& operator=(cuda_stopwatch_t const&) = delete;
-
-    ~cuda_stopwatch_t() noexcept {
-        if ((start_ == nullptr) & (stop_ == nullptr)) return;
-        st::expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(device_);
-        if (start_ != nullptr) { [[maybe_unused]] cudaError_t const error = cudaEventDestroy(start_); }
-        if (stop_ != nullptr) { [[maybe_unused]] cudaError_t const error = cudaEventDestroy(stop_); }
+    cuda_module_t(cuda_module_t const&) = delete;
+    cuda_module_t& operator=(cuda_module_t const&) = delete;
+    ~cuda_module_t() noexcept {
+        if (handle_ && api_->set_current_context(context_) == cuda_success_k) api_->module_unload(handle_);
     }
 
-    /** Marks the start where @p stream's queue stands now. */
-    st::status_t start(cuda_stream_t const& stream) noexcept {
-        return cuda_status(cudaEventRecord(start_, stream.handle()));
+    /** Loads @p fatbin into @p context, whose cubin matching the device the driver picks, or JIT-compiles its PTX,
+     *  refusing an empty one with @c device_k. */
+    static expected<cuda_module_t> load(cuda_api_t const& api, cuda_context_handle_t context,
+                                        std::span<byte_t const> fatbin) noexcept {
+        cuda_module_t loaded_module;
+        loaded_module.api_ = &api;
+        loaded_module.context_ = context;
+        if (fatbin.empty() || !api || api.set_current_context(context) != cuda_success_k ||
+            api.module_load_data(&loaded_module.handle_, fatbin.data()) != cuda_success_k)
+            return status_t {status_code_t::device_k, "The device refused the fatbin"};
+        return loaded_module;
     }
 
-    /** Marks the stop where @p stream's queue stands now. */
-    st::status_t stop(cuda_stream_t const& stream) noexcept {
-        return cuda_status(cudaEventRecord(stop_, stream.handle()));
-    }
-
-    /** Waits for the stop mark to pass, and answers the milliseconds between the marks. */
-    st::expected<double> milliseconds() const noexcept {
-        using st::status_t;
-        status_t status = cuda_status(cudaEventSynchronize(stop_));
-        if (status != status_t::success_k) return status;
-        float elapsed = 0;
-        status = cuda_status(cudaEventElapsedTime(&elapsed, start_, stop_));
-        if (status != status_t::success_k) return status;
-        return static_cast<double>(elapsed);
+    /** The kernel exported as @p name, or null when the fatbin has none. */
+    cuda_function_handle_t function(char const* name) const noexcept {
+        cuda_function_handle_t function = nullptr;
+        return handle_ && api_->module_get_function(&function, handle_, name) == cuda_success_k ? function : nullptr;
     }
 
   private:
-
-    /** The event marking the start. */
-    cudaEvent_t start_ = nullptr;
-
-    /** The event marking the stop. */
-    cudaEvent_t stop_ = nullptr;
-
-    /** The ordinal of the device the events live on. */
-    int device_ = 0;
+    cuda_api_t const* api_ = nullptr;
+    cuda_context_handle_t context_ = nullptr;
+    cuda_module_handle_t handle_ = nullptr;
 };
-
-/** Consecutive named phases of a GPU pipeline, timed on one borrowed stream, up to @c capacity_k of them. */
-class cuda_phases_t {
-  public:
-
-    /** Most phases one tracer times. */
-    static constexpr std::size_t capacity_k = 16;
-
-    /** Creates the stopwatches of every phase on the device of @p stream, which must outlive the tracer. */
-    static st::expected<cuda_phases_t> make(cuda_stream_t const& stream) noexcept {
-        cuda_phases_t phases;
-        phases.stream_ = &stream;
-        for (std::size_t index = 0; index != capacity_k; ++index) {
-            st::expected<cuda_stopwatch_t> stopwatch = cuda_stopwatch_t::make(stream.device());
-            if (!stopwatch) return stopwatch.status();
-            phases.stopwatches_[index] = std::move(*stopwatch);
-        }
-        return phases;
-    }
-
-    cuda_phases_t(cuda_phases_t&&) noexcept = default;
-    cuda_phases_t& operator=(cuda_phases_t&&) noexcept = default;
-    cuda_phases_t(cuda_phases_t const&) = delete;
-    cuda_phases_t& operator=(cuda_phases_t const&) = delete;
-
-    /** Ends the running phase, if any, and starts the phase @p name, a string that outlives the tracer. */
-    st::status_t begin(char const* name) noexcept {
-        using st::status_t;
-        status_t const status = end();
-        if (status != status_t::success_k) return status;
-        if (size_ == capacity_k) return status_t::capacity_exhausted_k;
-        names_[size_] = name;
-        running_ = size_ + 1;
-        return stopwatches_[size_++].start(*stream_);
-    }
-
-    /** Ends the running phase, doing nothing when none runs. */
-    st::status_t end() noexcept {
-        if (running_ == 0) return st::status_t::success_k;
-        std::size_t const index = std::exchange(running_, 0) - 1;
-        return stopwatches_[index].stop(*stream_);
-    }
-
-    /** Phases begun so far. */
-    std::size_t size() const noexcept { return size_; }
-
-    /** The name of phase @p index. */
-    char const* name(std::size_t index) const noexcept { return names_[index]; }
-
-    /** Waits for phase @p index to end on the device, and answers its milliseconds. */
-    st::expected<double> milliseconds(std::size_t index) const noexcept { return stopwatches_[index].milliseconds(); }
-
-  private:
-    cuda_phases_t() noexcept = default;
-
-    /** The stream every phase is marked on. */
-    cuda_stream_t const* stream_ = nullptr;
-
-    /** One stopwatch per phase. */
-    cuda_stopwatch_t stopwatches_[capacity_k];
-
-    /** One name per phase begun. */
-    char const* names_[capacity_k] = {};
-
-    /** Phases begun. */
-    std::size_t size_ = 0;
-
-    /** One past the index of the running phase, zero when none runs. */
-    std::size_t running_ = 0;
-};
-
-#pragma endregion Streams
-
-#pragma region Memory
-
-/** Page-locked host memory devices copy to and from directly, as a container allocator that answers null on failure. */
-template <typename value_type_>
-class cuda_pinned_allocator {
-  public:
-    using value_type = value_type_;
-    using propagate_on_container_move_assignment = std::true_type;
-    using is_always_equal = std::true_type;
-
-    constexpr cuda_pinned_allocator() noexcept = default;
-
-    /** The rebinding conversion @c std::allocator_traits performs. */
-    template <typename other_type_>
-    constexpr cuda_pinned_allocator(cuda_pinned_allocator<other_type_> const&) noexcept {}
-
-    /** Pins room for @p count values, or answers null. */
-    value_type_* allocate(std::size_t count) noexcept {
-        if ((count == 0) | (count > std::numeric_limits<std::size_t>::max() / sizeof(value_type_))) return nullptr;
-        void* pointer = nullptr;
-        if (cudaHostAlloc(&pointer, count * sizeof(value_type_), cudaHostAllocPortable) != cudaSuccess) return nullptr;
-        return static_cast<value_type_*>(pointer);
-    }
-
-    /** Unpins and releases @p pointer, ignoring null. */
-    void deallocate(value_type_* pointer, std::size_t) noexcept {
-        if (pointer == nullptr) return;
-        [[maybe_unused]] cudaError_t const error = cudaFreeHost(pointer);
-    }
-
-    template <typename other_type_>
-    constexpr bool operator==(cuda_pinned_allocator<other_type_> const&) const noexcept {
-        return true;
-    }
-};
-
-/** Memory on one device for buffers kernels read, as an allocator that answers null on failure and never touches the
- *  bytes. */
-template <typename value_type_>
-class cuda_device_allocator {
-  public:
-    using value_type = value_type_;
-    using propagate_on_container_move_assignment = std::true_type;
-
-    /** Allocates on device @p ordinal. */
-    explicit constexpr cuda_device_allocator(int ordinal) noexcept : device_(ordinal) {}
-
-    /** The rebinding conversion @c std::allocator_traits performs; the device travels with it. */
-    template <typename other_type_>
-    constexpr cuda_device_allocator(cuda_device_allocator<other_type_> const& other) noexcept
-        : device_(other.device()) {}
-
-    /** Allocates room for @p count values on the device, or answers null. */
-    value_type_* allocate(std::size_t count) noexcept {
-        if ((count == 0) | (count > std::numeric_limits<std::size_t>::max() / sizeof(value_type_))) return nullptr;
-        st::expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(device_);
-        if (!scope) return nullptr;
-        void* pointer = nullptr;
-        if (cudaMalloc(&pointer, count * sizeof(value_type_)) != cudaSuccess) return nullptr;
-        return static_cast<value_type_*>(pointer);
-    }
-
-    /** Releases @p pointer, ignoring null. */
-    void deallocate(value_type_* pointer, std::size_t) noexcept {
-        if (pointer == nullptr) return;
-        st::expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(device_);
-        [[maybe_unused]] cudaError_t const error = cudaFree(pointer);
-    }
-
-    /** The ordinal of the device memory lands on. */
-    constexpr int device() const noexcept { return device_; }
-
-    template <typename other_type_>
-    constexpr bool operator==(cuda_device_allocator<other_type_> const& other) const noexcept {
-        return device_ == other.device();
-    }
-
-  private:
-
-    /** The ordinal of the device memory lands on. */
-    int device_ = 0;
-};
-
-/** Elements in memory a CUDA allocator provides, released on destruction, whose contents a growth discards. */
-template <typename element_type_, typename allocator_type_>
-class cuda_buffer {
-  public:
-
-    /** An empty buffer that allocates through @p allocator. */
-    explicit cuda_buffer(allocator_type_ allocator) noexcept : allocator_(std::move(allocator)) {}
-
-    /** A buffer of @p size elements from @p allocator. */
-    static st::expected<cuda_buffer> make(std::size_t size, allocator_type_ allocator) noexcept {
-        using st::status_t;
-        cuda_buffer buffer(std::move(allocator));
-        status_t const status = buffer.reserve(size);
-        if (status != status_t::success_k) return status;
-        return buffer;
-    }
-
-    cuda_buffer(cuda_buffer&& other) noexcept
-        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)),
-          allocator_(other.allocator_) {}
-    cuda_buffer& operator=(cuda_buffer&& other) noexcept {
-        std::swap(data_, other.data_);
-        std::swap(size_, other.size_);
-        std::swap(allocator_, other.allocator_);
-        return *this;
-    }
-    cuda_buffer(cuda_buffer const&) = delete;
-    cuda_buffer& operator=(cuda_buffer const&) = delete;
-
-    ~cuda_buffer() noexcept { release_(); }
-
-    /** Makes room for at least @p size elements, keeping an allocation that is large enough already. */
-    st::status_t reserve(std::size_t size) noexcept {
-        using st::status_t;
-        if (size <= size_) return status_t::success_k;
-        release_();
-        data_ = allocator_.allocate(size);
-        if (data_ == nullptr) return status_t::out_of_memory_heap_k;
-        size_ = size;
-        return status_t::success_k;
-    }
-
-    /** Copies @p count elements from @p source into the buffer at element @p offset, waiting until @p stream ran it. */
-    st::status_t copy_in(element_type_ const* source, std::size_t count, std::size_t offset,
-                         cudaStream_t stream) noexcept {
-        using st::status_t;
-        if (count == 0) return status_t::success_k;
-        status_t const status = cuda_status(
-            cudaMemcpyAsync(data_ + offset, source, count * sizeof(element_type_), cudaMemcpyDefault, stream));
-        return status != status_t::success_k ? status : cuda_status(cudaStreamSynchronize(stream));
-    }
-
-    /** Copies @p count elements at element @p offset into @p target, waiting until @p stream ran it. */
-    st::status_t copy_out(element_type_* target, std::size_t count, std::size_t offset,
-                          cudaStream_t stream) const noexcept {
-        using st::status_t;
-        if (count == 0) return status_t::success_k;
-        status_t const status = cuda_status(
-            cudaMemcpyAsync(target, data_ + offset, count * sizeof(element_type_), cudaMemcpyDefault, stream));
-        return status != status_t::success_k ? status : cuda_status(cudaStreamSynchronize(stream));
-    }
-
-    /** The first element, or null before the first reservation. */
-    element_type_* data() const noexcept { return data_; }
-
-    /** Elements the allocation holds. */
-    std::size_t size() const noexcept { return size_; }
-
-  private:
-    void release_() noexcept {
-        if (data_ != nullptr) allocator_.deallocate(data_, size_);
-        data_ = nullptr;
-        size_ = 0;
-    }
-
-    /** The allocation, or null before the first reservation. */
-    element_type_* data_ = nullptr;
-
-    /** Elements the allocation holds. */
-    std::size_t size_ = 0;
-
-    /** The allocator the buffer grows through. */
-    allocator_type_ allocator_;
-};
-
-/** Device memory for kernels on one device. */
-template <typename element_type_>
-using cuda_device_buffer = cuda_buffer<element_type_, cuda_device_allocator<element_type_>>;
-
-/** Page-locked host memory devices copy to and from directly. */
-template <typename element_type_>
-using cuda_pinned_buffer = cuda_buffer<element_type_, cuda_pinned_allocator<element_type_>>;
-
-#pragma endregion Memory
-
-#endif
 
 #pragma region Executors
 
-#if USTORE_WITH_CUDA
-
-/** The stream every call on one device queues on, and the ceiling on the scratch those calls walk with. Work is
- *  queued, never waited on, so one host thread keeps the device fed. */
+/** The stream every call on one NVIDIA device queues on, the event it waits on, the device's class, and the ceiling
+ *  on the scratch those calls walk with. Work is queued, never waited on but by @c wait, so one host thread keeps the
+ *  device fed. */
 class cuda_executor_t {
   public:
+    static constexpr gpu_vendor_t vendor_k = gpu_vendor_t::nvidia_k;
 
-    /** Binds device @p ordinal, queueing on @p borrowed, a stream of the caller's on that device which outlives the
-     *  executor, or on one of its own for null; its scratch never grows past @p scratch_limit bytes, zero for no
-     *  limit. */
-    static expected<cuda_executor_t> spawn(int ordinal, cudaStream_t borrowed, std::size_t scratch_limit) noexcept {
-        st::expected<std::size_t> const visible = cuda_count_devices();
-        if (!visible) return status_t {status_code_t::device_k, "The CUDA runtime counts no devices"};
-        if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= *visible)
-            return status_t {status_code_t::device_k, "No CUDA device carries the ordinal"};
-        cuda_executor_t executor {ordinal, scratch_limit};
-        executor.stream_ = borrowed;
-        if (borrowed) return executor;
-        st::expected<cuda_stream_t> created = cuda_stream_t::make(ordinal);
-        if (!created) return status_t {status_code_t::device_k, "Failed to create a stream on the device"};
-        executor.stream_ = created->handle();
-        executor.owned_stream_.emplace(std::move(*created));
+    /** The memory of the arenas made over this executor. */
+    using arena_blocks_t = cuda_blocks_t;
+
+    /** Binds CUDA ordinal @p ordinal through @p context, its retained primary context, as of class @p gpu_class, and
+     *  queues on @p borrowed, a @c cudaStream_t of the caller's on that device which outlives the executor, or on one
+     *  of its own for null; its scratch never grows past @p scratch_limit bytes, zero for no limit, and bytes move
+     *  between the drives and the device as @p gds asks. */
+    static expected<cuda_executor_t> spawn(cuda_api_t const& api, cuda_context_handle_t context, int ordinal,
+                                           gpu_class_t gpu_class, void* borrowed, std::size_t scratch_limit,
+                                           ustore_gds_t gds) noexcept {
+        if (!api || !context || api.set_current_context(context) != cuda_success_k)
+            return status_t {status_code_t::device_k, "The CUDA driver refused the device"};
+        cuda_executor_t executor;
+        executor.api_ = &api;
+        executor.context_ = context;
+        executor.device_ = ordinal;
+        executor.gpu_class_ = gpu_class;
+        executor.scratch_limit_ = scratch_limit;
+        executor.gds_ = gds;
+        executor.stream_ = static_cast<cuda_stream_handle_t>(borrowed);
+        if (!borrowed) {
+            if (api.stream_create(&executor.owned_stream_, cuda_stream_non_blocking_k) != cuda_success_k)
+                return status_t {status_code_t::device_k, "Failed to create a stream on the device"};
+            executor.stream_ = executor.owned_stream_;
+        }
+        executor.event_ = cuda_event_t {api};
+        if (!executor.event_) return status_t {status_code_t::device_k, "Failed to create an event on the device"};
+        // The bounce stays on node zero where the driver places the device on no NUMA node
+        int handle = 0, numa_node = -1;
+        if (api.get_device(&handle, ordinal) != cuda_success_k ||
+            api.get_device_attribute(&numa_node, cuda_attribute_host_numa_id_k, handle) != cuda_success_k ||
+            numa_node < 0)
+            numa_node = 0;
+        executor.bounce_ = pinned_bounce<cuda_api_t> {api, numa_node};
         return executor;
+    }
+
+    cuda_executor_t(cuda_executor_t&& other) noexcept { swap(other); }
+    cuda_executor_t& operator=(cuda_executor_t&& other) noexcept {
+        swap(other);
+        return *this;
+    }
+    cuda_executor_t(cuda_executor_t const&) = delete;
+    cuda_executor_t& operator=(cuda_executor_t const&) = delete;
+    ~cuda_executor_t() noexcept {
+        if (!api_ || api_->set_current_context(context_) != cuda_success_k) return;
+        api_->stream_synchronize(stream_);
+        free_blocks(managed_.blocks, [this](std::uintptr_t address) noexcept { free_managed(address); });
+        if (owned_stream_) api_->stream_destroy(owned_stream_);
     }
 
     /** Waits until everything queued on the stream ran, reporting a failure among it as @c device_k. */
     status_t wait() noexcept {
-        if (cudaStreamSynchronize(stream_) != cudaSuccess)
+        if (api_->set_current_context(context_) != cuda_success_k || !event_.record_and_wait(stream_))
             return {status_code_t::device_k, "The device failed a call queued on the executor"};
         return {};
     }
@@ -694,36 +350,131 @@ class cuda_executor_t {
     /** The CUDA ordinal every call and arena of the executor uses. */
     int device() const noexcept { return device_; }
 
+    /** The class of the device. */
+    gpu_class_t gpu_class() const noexcept { return gpu_class_; }
+
+    /** The StringZilla capabilities the device's class runs: its tiers start at compute capability 9.0 for
+     *  @c hopper and 10.0 for @c blackwell, consumer Blackwell included. */
+    sz_capability_t capabilities() const noexcept {
+        switch (gpu_class_) {
+        case gpu_class_t::nvidia_ampere_k:
+        case gpu_class_t::nvidia_ada_k: return sz_cap_cuda_k;
+        case gpu_class_t::nvidia_hopper_k: return sz_cap_cuda_k | sz_cap_hopper_k;
+        case gpu_class_t::nvidia_blackwell_k:
+        case gpu_class_t::nvidia_blackwellrtx_k: return sz_cap_cuda_k | sz_cap_hopper_k | sz_cap_blackwell_k;
+        default: return 0;
+        }
+    }
+
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
 
-  private:
-    cuda_executor_t(int device, std::size_t scratch_limit) noexcept : device_(device), scratch_limit_(scratch_limit) {}
-
-    /** The stream made here and destroyed with the executor, absent when the caller lent @c stream_. */
-    std::optional<cuda_stream_t> owned_stream_;
+    /** How bytes move between the drives and the device, which the compactions on the executor read sections by. */
+    ustore_gds_t gds() const noexcept { return gds_; }
 
     /** The stream every call queues on, owned or borrowed. */
-    cudaStream_t stream_ = nullptr;
+    cuda_stream_handle_t stream() const noexcept { return stream_; }
 
-    /** The CUDA ordinal of the device. */
+    /** Makes the device's context current on the calling thread, once per call, before any other entry below. */
+    status_t bind() noexcept {
+        if (api_->set_current_context(context_) != cuda_success_k)
+            return {status_code_t::device_k, "The CUDA driver refused the device's context"};
+        return {};
+    }
+
+    /** The ordinal of the NVIDIA device holding @p pointer, or -1 for memory the host reads in place. */
+    int device_of(void const* pointer) const noexcept { return cuda_device_of(*api_, pointer); }
+
+    /** Queues an allocation of @p bytes on the stream, answering its device address. */
+    expected<std::uintptr_t> allocate_async(std::size_t bytes) noexcept {
+        cuda_device_address_t address = 0;
+        if (api_->allocate_async(&address, bytes, stream_) != cuda_success_k)
+            return status_t {status_code_t::out_of_memory_k, "The device refused an allocation"};
+        return static_cast<std::uintptr_t>(address);
+    }
+
+    /** Queues freeing @p address, which @c allocate_async answered, behind everything queued before it. */
+    void free_async(std::uintptr_t address) noexcept { api_->free_async(address, stream_); }
+
+    /** Allocates @p bytes of managed memory, which the host and the device both reach. */
+    expected<std::uintptr_t> allocate_managed(std::size_t bytes) noexcept {
+        cuda_device_address_t address = 0;
+        if (api_->allocate_managed(&address, bytes, cuda_attach_global_k) != cuda_success_k)
+            return status_t {status_code_t::out_of_memory_k, "The device refused a managed allocation"};
+        return static_cast<std::uintptr_t>(address);
+    }
+
+    /** Frees @p address, which @c allocate_managed answered, once the device is done with it. */
+    void free_managed(std::uintptr_t address) noexcept { api_->free_blocking(address); }
+
+    /** Queues setting @p bytes at device @p address to @p value. */
+    status_t fill_async(std::uintptr_t address, byte_t value, std::size_t bytes) noexcept {
+        if (api_->fill_async(address, static_cast<unsigned char>(value), bytes, stream_) != cuda_success_k)
+            return {status_code_t::device_k, "The device refused a fill"};
+        return {};
+    }
+
+    /** Queues copying @p source from the host to device @p address. */
+    status_t upload_async(std::uintptr_t address, std::span<byte_t const> source) noexcept {
+        if (api_->upload_async(address, source.data(), source.size(), stream_) != cuda_success_k)
+            return {status_code_t::device_k, "The device refused a copy from the host"};
+        return {};
+    }
+
+    /** Queues copying device @p address into @p target on the host. */
+    status_t download_async(std::span<byte_t> target, std::uintptr_t address) noexcept {
+        if (api_->download_async(target.data(), address, target.size(), stream_) != cuda_success_k)
+            return {status_code_t::device_k, "The device refused a copy to the host"};
+        return {};
+    }
+
+    /** Queues copying @p bytes from device @p source to device @p target. */
+    status_t copy_async(std::uintptr_t target, std::uintptr_t source, std::size_t bytes) noexcept {
+        if (api_->copy_async(target, source, bytes, stream_) != cuda_success_k)
+            return {status_code_t::device_k, "The device refused a copy on the device"};
+        return {};
+    }
+
+    /** The host arena on the device's NUMA node that host verbs write into and copies leave from. */
+    ustore_arena_t bounce() noexcept { return bounce_.arena(); }
+
+    /** Rewinds the bounce to its newest block, unpinning every older one before it is freed. */
+    void rewind_bounce() noexcept { bounce_.rewind(); }
+
+    /** Pins every block of the bounce grown since the last pin, so copies from and into it run asynchronously. */
+    status_t pin_bounce() noexcept { return bounce_.pin(); }
+
+    /** The managed runs StringZilla's device engines lay their state out in. */
+    managed_blocks_t& managed() noexcept { return managed_; }
+
+  private:
+    cuda_executor_t() noexcept = default;
+
+    void swap(cuda_executor_t& other) noexcept {
+        std::swap(api_, other.api_), std::swap(context_, other.context_);
+        std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);
+        std::swap(event_, other.event_), std::swap(device_, other.device_), std::swap(gpu_class_, other.gpu_class_);
+        std::swap(scratch_limit_, other.scratch_limit_), std::swap(gds_, other.gds_);
+        std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
+    }
+
+    cuda_api_t const* api_ = nullptr;
+
+    /** The device's primary context, which the process's GPU runtime retained and never releases. */
+    cuda_context_handle_t context_ = nullptr;
+
+    /** The stream made here and destroyed with the executor, null when the caller lent @c stream_. */
+    cuda_stream_handle_t owned_stream_ = nullptr;
+
+    cuda_stream_handle_t stream_ = nullptr;
+    cuda_event_t event_;
     int device_ = 0;
-
-    /** Bytes of scratch a call may take, zero for no limit. */
+    gpu_class_t gpu_class_ = gpu_class_t::unknown_k;
     std::size_t scratch_limit_ = 0;
+    ustore_gds_t gds_ = ustore_gds_automatic_k;
+    pinned_bounce<cuda_api_t> bounce_;
+    managed_blocks_t managed_ {};
 };
-
-#else
-
-/** What a VRAM executor holds in a build without CUDA, which never spawns one. */
-class cuda_executor_t {
-  public:
-
-    /** The CUDA ordinal every arena of the executor would use. */
-    int device() const noexcept { return 0; }
-};
-
-#endif
 
 #pragma endregion Executors
 

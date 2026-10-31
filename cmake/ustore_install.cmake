@@ -8,11 +8,10 @@
 if (USTORE_INSTALL)
     include(CMakePackageConfigHelpers)
     set(ustore_config_install_dir_ "${CMAKE_INSTALL_LIBDIR}/cmake/ustore")
-    # The archive's consumers also link the device merger and the CUDA runtime it calls.
+    # The archive holds the device merger, whose consumers also link the static CUDA runtime it calls where it has one.
     set(ustore_static_archives_ ustore_static ${ustore_engine_archives_})
     set(ustore_static_dependencies_)
-    if (TARGET ustore_nvme_compaction)
-        list(APPEND ustore_static_archives_ ustore_nvme_compaction)
+    if (ustore_device_compaction_)
         set(ustore_static_dependencies_ "find_dependency(CUDAToolkit)")
     endif ()
     install(

@@ -31,13 +31,12 @@
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
-#include <stringzilla/find.h>              // `sz_find_byteset_best`
-#include <stringzilla/strings.h>           // `sz_strings_unescape_best`
+#include <stringzilla/find.h>              // `sz_byteset_init`, `sz_byteset_add_u8`
+#include <stringzilla/strings.h>           // `sz_strings_span_t`, `sz_strings_from_string_views`
 #include <stringzilla/subdocuments.h>      // `sz_subdocuments_engine_init`, `sz_subdocuments_find`
-#include <stringzilla/utf8_runes.h>        // `sz_utf8_count_strings_best`
 
 #include "ustore/docs/json_values.hpp"      // `json_cell_t`, `print_number`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `stringzilla_kernels_t`
 #include "ustore/utilities/types.hpp"       // `value_view_t`, `byte_t`
 
 namespace unum::ustore::docs {
@@ -45,6 +44,7 @@ namespace unum::ustore::docs {
 using utilities::arena_allocator;
 using utilities::growth_status;
 using utilities::stringzilla_allocator;
+using utilities::stringzilla_kernels_t;
 
 #pragma region StringZilla Bridges
 
@@ -261,14 +261,14 @@ inline std::string_view tape_string(sz_strings_span_t const& tape, std::size_t i
  *  @param[in] fields The fields the cells address, each a JSON Pointer, a top-level key, or empty for the document.
  *  @param[in] cells_count How many cells there are.
  *  @param[in] cell_of Called as <tt>cell_of(index)</tt>, answering the @c field_cell_t of cell @p index.
- *  @param[in] capabilities The StringZilla kernels the running CPU allows, which @c src/ probes once.
+ *  @param[in] kernels The StringZilla kernels the handle looked up once at open.
  *  @param[in] scratch Holds the engine, the columns and every value, until it rewinds.
  *  @param[out] cells The value of every cell, missing where a document or its field is.
  *  @retval malformed_k A document a cell reads breaks RFC 8259, or a string's escapes do not decode.
  */
 template <typename cell_of_type_>
 status_t extract_fields(json_documents_t const& documents, std::span<std::string_view const> fields,
-                        std::size_t cells_count, cell_of_type_ const& cell_of, sz_capability_t capabilities,
+                        std::size_t cells_count, cell_of_type_ const& cell_of, stringzilla_kernels_t const& kernels,
                         ustore_arena_t scratch, json_cells_t& cells) noexcept {
     auto [tokens, tokens_status] = arena_allocate<json_token_t>(scratch, cells_count);
     if (tokens_status.failed()) return tokens_status;
@@ -334,7 +334,8 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     subdocuments_engine_t engine;
     sz_strings_view_t paths_view {};
     sz_strings_from_string_views(paths.data(), paths.size(), &paths_view);
-    if (sz_status_t const compiled = engine.compile(paths_view, allocator, capabilities); compiled != sz_success_k)
+    if (sz_status_t const compiled = engine.compile(paths_view, allocator, kernels.capabilities);
+        compiled != sz_success_k)
         return stringzilla_failure(compiled, "The fields compile into no path the engine takes");
 
     // With first members only, a field path selects at most one node of a document
@@ -388,8 +389,8 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     sz_strings_from_string_views(escaped.data(), escaped.size(), &escaped_view);
     sz_size_t malformed_index = 0;
     // RFC 8259 strings hold well-formed UTF-8 and no raw control byte, which writes refuse and reads check alike
-    if (sz_status_t const status = sz_utf8_count_strings_best(&escaped_view, nullptr, escaped.size(), nullptr,
-                                                              &malformed_index, capabilities, nullptr);
+    if (sz_status_t const status = kernels.utf8_count_strings(&escaped_view, nullptr, escaped.size(), nullptr,
+                                                              &malformed_index, nullptr);
         status != sz_success_k)
         return stringzilla_failure(status, "The strings of the fields are not UTF-8");
     sz_byteset_t controls;
@@ -397,16 +398,14 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     for (unsigned control = 0; control != 0x20; ++control) sz_byteset_add_u8(&controls, static_cast<sz_u8_t>(control));
     for (sz_string_view_t const& body : escaped) {
         sz_cptr_t control = nullptr;
-        if (sz_status_t const status = sz_find_byteset_best(body.start, body.length, &controls, &control, capabilities,
-                                                            nullptr);
+        if (sz_status_t const status = kernels.find_byteset(body.start, body.length, &controls, &control, nullptr);
             status != sz_success_k)
             return stringzilla_failure(status, "The strings of the fields could not be checked");
         if (control) return {status_code_t::malformed_k, "Failed to parse the document"};
     }
     sz_strings_span_t unescaped {};
-    if (sz_status_t const status = sz_strings_unescape_best(&escaped_view, nullptr, escaped.size(), sz_escape_json_k,
-                                                            &allocator, &unescaped, &malformed_index, capabilities,
-                                                            nullptr);
+    if (sz_status_t const status = kernels.strings_unescape(&escaped_view, nullptr, escaped.size(), sz_escape_json_k,
+                                                            &allocator, &unescaped, &malformed_index, nullptr);
         status != sz_success_k)
         return stringzilla_failure(status, "The strings of the fields did not unescape");
     for (std::size_t string_index = 0; string_index != string_cells.size(); ++string_index)

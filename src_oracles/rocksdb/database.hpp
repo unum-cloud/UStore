@@ -746,11 +746,13 @@ status_t open_database(arguments_type_ const& arguments, access_t access) {
     return {};
 }
 
-status_t database_open(ustore_database_open_rocksdb_t const& arguments, cpu_ceiling_t, view_t const&) {
+status_t database_open(ustore_database_open_rocksdb_t const& arguments, cpu_ceiling_t, stringzilla_kernels_t const&,
+                       view_t const&) {
     return open_database(arguments, access_t::read_write_k);
 }
 
-status_t database_view(ustore_database_view_rocksdb_t const& arguments, cpu_ceiling_t, view_t const&) {
+status_t database_view(ustore_database_view_rocksdb_t const& arguments, cpu_ceiling_t, stringzilla_kernels_t const&,
+                       view_t const&) {
     return open_database(arguments, access_t::read_only_k);
 }
 

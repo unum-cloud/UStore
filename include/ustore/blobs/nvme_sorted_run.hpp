@@ -184,6 +184,23 @@ static_assert(sizeof(value_tape_window_t) == 48 && offsetof(value_tape_window_t,
                   offsetof(value_tape_window_t, first_offset) == 40,
               "A value tape window is two extents and four words");
 
+/** A run's blob reserved, with the header and the columns it will carry laid out: what @c reserve hands
+ *  @c write_sections and then @c seal_and_attach, so only the first and the last need the maintenance claim. */
+struct sorted_run_reservation_t {
+
+    /** The header the run will carry, from which every offset of its sections follows. */
+    sorted_run_header_t header {};
+
+    /** The blob reserved for the run, which no lookup answers for until it is sealed. */
+    volume_blob_t blob;
+
+    /** The stamps the trailer saves, packed from the header's floor. */
+    stamps_column_t stamps;
+
+    /** The kinds the trailer saves right after the stamps. */
+    kinds_column_t kinds;
+};
+
 #pragma endregion Vocabulary
 
 #pragma region Layout
@@ -400,7 +417,8 @@ class lsm_sorted_run {
         : volume_(std::exchange(other.volume_, nullptr)), blob_(other.blob_), header_(other.header_),
           layout_(other.layout_), cells_(std::move(other.cells_)), value_offsets_(std::move(other.value_offsets_)),
           stamps_(std::move(other.stamps_)), kinds_(std::move(other.kinds_)),
-          tail_offsets_(std::move(other.tail_offsets_)), tails_(std::move(other.tails_)) {
+          tail_offsets_(std::move(other.tail_offsets_)), tails_(std::move(other.tails_)),
+          assigned_stamp_(std::exchange(other.assigned_stamp_, 0)) {
         other.blob_ = volume_blob_t {};
         other.header_ = sorted_run_header_t {};
     }
@@ -417,6 +435,7 @@ class lsm_sorted_run {
         kinds_ = std::move(other.kinds_);
         tail_offsets_ = std::move(other.tail_offsets_);
         tails_ = std::move(other.tails_);
+        assigned_stamp_ = std::exchange(other.assigned_stamp_, 0);
         other.blob_ = volume_blob_t {};
         other.header_ = sorted_run_header_t {};
         return *this;
@@ -442,7 +461,8 @@ class lsm_sorted_run {
 #pragma region Setup and Teardown
 
     /**
-     *  @brief Writes a whole run into a fresh reservation of @p volume and records it under @p content_id.
+     *  @brief Writes a whole run into a fresh reservation of @p volume and records it under @p content_id, which is
+     *      @c reserve, @c write_sections and @c seal_and_attach in a row.
      *  @param[in,out] volume The volume the blob is reserved on, borrowed and outliving the run.
      *  @param[in,out] channel The channel the sections are queued on, held by the calling thread.
      *  @param[in] content_id The identifier the run is named by, which must name no blob yet.
@@ -468,6 +488,28 @@ class lsm_sorted_run {
                                           std::span<stored_value_offset_t const> value_offsets,
                                           stored_value_size_t value_max_size,
                                           key_tails_column_t const& tails = {}) noexcept {
+        auto [reservation, reserve_status] = reserve(volume, channel, content_id, key_slots, stamps, kinds, floor,
+                                                     stored_values, value_offsets, value_max_size, tails);
+        if (reserve_status.failed()) return reserve_status;
+        if (status_t const written = write_sections(volume, channel, reservation, key_slots, stored_values,
+                                                    value_offsets, tails);
+            written.failed()) {
+            [[maybe_unused]] status_t const abandoned = volume.drop(channel, name_of(content_id));
+            return written;
+        }
+        return seal_and_attach(volume, channel, reservation);
+    }
+
+    /**
+     *  @brief Checks a run, lays out its header and columns and reserves its blob on @p volume, which changes the
+     *      volume's catalog and so runs under the maintenance claim; takes what @c write takes.
+     *  @return The reservation @c write_sections fills, or the status that refused the run with nothing reserved.
+     */
+    static expected<sorted_run_reservation_t> reserve(
+        volume_type_& volume, io_channel_t& channel, uuid_t const& content_id, std::span<key_slot_t const> key_slots,
+        std::span<std::uint64_t const> stamps, std::span<std::uint8_t const> kinds, std::uint64_t floor,
+        std::span<byte_t const> stored_values, std::span<stored_value_offset_t const> value_offsets,
+        stored_value_size_t value_max_size, key_tails_column_t const& tails = {}) noexcept {
         if (!content_id.is_valid())
             return status_t {status_code_t::invalid_argument_k, "A run is named by a valid identifier"};
         if (status_t const checked = check_values_(stored_values, value_offsets, key_slots.size(), value_max_size);
@@ -484,18 +526,18 @@ class lsm_sorted_run {
                 return status_t {status_code_t::invalid_argument_k, "A run takes the versions of a key newest first"};
         }
 
+        sorted_run_reservation_t reservation;
         std::uint64_t newest = floor;
         auto [column, pack_status] = pack_stamps(stamps, floor, newest);
         if (pack_status.failed()) return pack_status;
+        reservation.stamps = std::move(column);
         auto [kinds_column, pack_kinds_status] = pack_kinds(kinds);
         if (pack_kinds_status.failed()) return pack_kinds_status;
-
-        std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(),
-                                                                 portable_alignment_k);
-        if (block_bytes < sorted_run_layout_t::header_bytes())
+        reservation.kinds = std::move(kinds_column);
+        if (block_bytes_of_(channel) < sorted_run_layout_t::header_bytes())
             return status_t {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
 
-        sorted_run_header_t header {};
+        sorted_run_header_t& header = reservation.header;
         header.magic = sorted_run_magic_k;
         header.format_version = sorted_run_format_version_k;
         header.key_slot_bytes = static_cast<std::uint32_t>(sizeof(key_slot_t));
@@ -505,10 +547,10 @@ class lsm_sorted_run {
         header.branching = static_cast<std::uint16_t>(sorted_run_layout_t::branching_k);
         header.value_layout = value_layout_k;
         header.content_id = content_id;
-        header.stamps_bytes = column.saved_bytes();
+        header.stamps_bytes = reservation.stamps.saved_bytes();
         header.stamps_floor = floor;
         header.newest_stamp = newest;
-        header.kinds_bytes = kinds_column.saved_bytes();
+        header.kinds_bytes = reservation.kinds.saved_bytes();
         header.key_tails_bytes = tails.bytes.size();
 
         std::uint64_t const reserved_bytes = sorted_run_layout_t::blob_bytes(
@@ -516,19 +558,84 @@ class lsm_sorted_run {
             header.key_tails_bytes);
         auto [reserved, create_status] = volume.create(name_of(content_id), blob_kind_t::sorted_run_k, reserved_bytes);
         if (create_status.failed()) return create_status;
-        volume_blob_t const blob = reserved;
+        reservation.blob = reserved;
+        return reservation;
+    }
 
-        if (status_t const written = write_sections_(volume, channel, blob, header, key_slots, column, kinds_column,
-                                                     stored_values, value_offsets, tails, block_bytes);
-            written.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume.drop(channel, name_of(content_id));
-            return written;
+    /**
+     *  @brief Stages the header, the cells, the value offsets, the values, the tail offsets, the tails, the stamps and
+     *      the kinds into the blob @p reservation holds, and makes them all durable at once, which touches no catalog
+     *      and so needs no claim.
+     *  @param[in,out] channel The channel the sections are queued on, which @c seal_and_attach must flush on too.
+     *  @param[in] reservation What @c reserve answered for the same key slots, values and tails.
+     *  @return Success, or the status that stopped the write, after which the caller drops the reservation.
+     */
+    static status_t write_sections(volume_type_& volume, io_channel_t& channel,
+                                   sorted_run_reservation_t const& reservation, std::span<key_slot_t const> key_slots,
+                                   std::span<byte_t const> stored_values,
+                                   std::span<stored_value_offset_t const> value_offsets,
+                                   key_tails_column_t const& tails = {}) noexcept {
+        std::uint64_t const block_bytes = block_bytes_of_(channel);
+        if (block_bytes < sorted_run_layout_t::header_bytes())
+            return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
+        volume_blob_t const& blob = reservation.blob;
+        sorted_run_header_t const& header = reservation.header;
+        write_pipeline_t writer {volume.disk(), channel, blob.medium};
+        sorted_run_index_layout_t const layout {header.key_slots_count, header.branching};
+
+        std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
+        auto [head, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
+        if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+        std::memset(head.bytes().data(), 0, static_cast<std::size_t>(head_bytes));
+        std::memcpy(head.bytes().data(), &header, sizeof(header));
+        if (status_t const queued = writer.enqueue_write(std::move(head), blob.slice(0, head_bytes)); queued.failed())
+            return queued;
+        if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
+
+        std::uint64_t const index_section = sorted_run_layout_t::index_section_bytes(header.key_slots_count);
+        for (std::uint64_t written = 0; written != index_section;) {
+            std::uint64_t const room = index_section - written;
+            std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
+            auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
+            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+            std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
+            std::memset(bytes.data(), 0, bytes.size());
+            paint_cells_(key_slots, layout, written, bytes);
+            if (status_t const queued = writer.enqueue_write(
+                    std::move(block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
+                queued.failed())
+                return queued;
+            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
+            written += chunk;
         }
-        if (status_t const sealed = volume.seal(channel, blob); sealed.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume.drop(channel, name_of(content_id));
+
+        if (status_t const offsets = write_value_offsets(writer, blob, header, value_offsets); offsets.failed())
+            return offsets;
+        if (status_t const values = write_bytes_(
+                writer, blob, sorted_run_layout_t::values_offset(header.key_slots_count),
+                sorted_run_layout_t::values_section_bytes(header.stored_values_bytes), stored_values);
+            values.failed())
+            return values;
+        if (status_t const written = write_tails(writer, blob, header, tails); written.failed()) return written;
+        if (status_t const trailer = write_trailer(writer, blob, header, reservation.stamps, reservation.kinds);
+            trailer.failed())
+            return trailer;
+        return writer.make_durable();
+    }
+
+    /**
+     *  @brief Records the blob @p reservation holds in the catalog of @p volume, dropping it if that fails, and opens
+     *      the run from the volume again; changes the catalog and so runs under the maintenance claim.
+     *  @param[in,out] channel The channel @c write_sections queued the sections on, the only one that flushes them.
+     *  @return The run, or the status that stopped the seal with the reservation dropped.
+     */
+    static expected<lsm_sorted_run> seal_and_attach(volume_type_& volume, io_channel_t& channel,
+                                                    sorted_run_reservation_t const& reservation) noexcept {
+        if (status_t const sealed = volume.seal(channel, reservation.blob); sealed.failed()) {
+            [[maybe_unused]] status_t const abandoned = volume.drop(channel, name_of(reservation.header.content_id));
             return sealed;
         }
-        return attach(volume, channel, blob);
+        return attach(volume, channel, reservation.blob);
     }
 
     /** Opens the run @p content_id names on @p volume, or answers @c not_found_k when it names none. */
@@ -622,6 +729,10 @@ class lsm_sorted_run {
 
     /** The stamp every stamp of the run was raised to at least. */
     [[nodiscard]] std::uint64_t stamps_floor() const noexcept { return header_.stamps_floor; }
+
+    /** The stamp @c assign_stamp gave every version of a run its blob stamps zero, or zero for a run that carries its
+     *  own stamps, which a schema records beside the run. */
+    [[nodiscard]] std::uint64_t assigned_stamp() const noexcept { return assigned_stamp_; }
 
     /** Bytes the stamps column takes in memory, which is all a run spends on its stamps. */
     [[nodiscard]] std::uint64_t stamps_bytes() const noexcept { return stamps_.size_bytes(); }
@@ -749,6 +860,29 @@ class lsm_sorted_run {
     }
 
 #pragma endregion Lookups
+
+#pragma region Stamps
+
+    /**
+     *  @brief Gives every version of a run written at stamp zero the stamp @p stamp, in memory alone, which an ingest
+     *      does once its commit draws the stamp and a mount does again from the schema, as the blob keeps its zeros.
+     *  @return Success, @c invalid_argument_k for a zero @p stamp or a run carrying stamps of its own, or
+     *      @c out_of_memory_k with the run unchanged.
+     */
+    status_t assign_stamp(std::uint64_t stamp) noexcept {
+        if (stamp == 0) return {status_code_t::invalid_argument_k, "A run is assigned a stamp above zero"};
+        if (header_.newest_stamp != 0 || assigned_stamp_ != 0)
+            return {status_code_t::invalid_argument_k, "Only a run written at stamp zero is assigned a stamp"};
+        st::expected<stamps_column_t> column = stamps_column_t::make(stamps_.size(), stamp);
+        if (!column) return {status_code_t::out_of_memory_k, "A run could not hold its assigned stamps"};
+        stamps_ = std::move(*column);
+        header_.stamps_floor = stamp;
+        header_.newest_stamp = stamp;
+        assigned_stamp_ = stamp;
+        return {};
+    }
+
+#pragma endregion Stamps
 
 #pragma region Batched Reads
 
@@ -1020,54 +1154,9 @@ class lsm_sorted_run {
         return {};
     }
 
-    /** Stages the header, the cells, the value offsets, the values, the tail offsets, the tails, the stamps and the
-     *  kinds into @p blob, and makes them all durable at once. */
-    static status_t write_sections_(volume_type_& volume, io_channel_t& channel, volume_blob_t const& blob,
-                                    sorted_run_header_t const& header, std::span<key_slot_t const> key_slots,
-                                    stamps_column_t const& column, kinds_column_t const& kinds,
-                                    std::span<byte_t const> stored_values,
-                                    std::span<stored_value_offset_t const> value_offsets,
-                                    key_tails_column_t const& tails, std::uint64_t block_bytes) noexcept {
-        write_pipeline_t writer {volume.disk(), channel, blob.medium};
-        sorted_run_index_layout_t const layout {header.key_slots_count, header.branching};
-
-        std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
-        auto [head, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
-        if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
-        std::memset(head.bytes().data(), 0, static_cast<std::size_t>(head_bytes));
-        std::memcpy(head.bytes().data(), &header, sizeof(header));
-        if (status_t const queued = writer.enqueue_write(std::move(head), blob.slice(0, head_bytes)); queued.failed())
-            return queued;
-        if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
-
-        std::uint64_t const index_section = sorted_run_layout_t::index_section_bytes(header.key_slots_count);
-        for (std::uint64_t written = 0; written != index_section;) {
-            std::uint64_t const room = index_section - written;
-            std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
-            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
-            std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
-            std::memset(bytes.data(), 0, bytes.size());
-            paint_cells_(key_slots, layout, written, bytes);
-            if (status_t const queued = writer.enqueue_write(
-                    std::move(block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
-                queued.failed())
-                return queued;
-            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
-            written += chunk;
-        }
-
-        if (status_t const offsets = write_value_offsets(writer, blob, header, value_offsets); offsets.failed())
-            return offsets;
-        if (status_t const values = write_bytes_(
-                writer, blob, sorted_run_layout_t::values_offset(header.key_slots_count),
-                sorted_run_layout_t::values_section_bytes(header.stored_values_bytes), stored_values);
-            values.failed())
-            return values;
-        if (status_t const written = write_tails(writer, blob, header, tails); written.failed()) return written;
-        if (status_t const trailer = write_trailer(writer, blob, header, column, kinds); trailer.failed())
-            return trailer;
-        return writer.make_durable();
+    /** Bytes of one block of @p channel that a section is staged in, a whole number of pages. */
+    [[nodiscard]] static std::uint64_t block_bytes_of_(io_channel_t& channel) noexcept {
+        return round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
     }
 
   public:
@@ -1402,6 +1491,9 @@ class lsm_sorted_run {
 
     /** The tails of every key back to back in sorted order, read whole at open, none for whole keys. */
     st::basic_vector<byte_t> tails_;
+
+    /** The stamp @c assign_stamp gave the run, zero while its stamps are the ones its blob carries. */
+    std::uint64_t assigned_stamp_ = 0;
 
 #pragma endregion Private Members
 };

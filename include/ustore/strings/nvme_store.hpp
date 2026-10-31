@@ -26,6 +26,7 @@
 
 #include <algorithm>   // `std::max`, `std::min`
 #include <compare>     // `std::strong_ordering`
+#include <concepts>    // `std::same_as`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`, `std::as_bytes`
@@ -63,6 +64,7 @@ using blobs::lookup_result_t;
 using blobs::lsm_level_order_t;
 using blobs::lsm_tree_publication_hook_t;
 using blobs::lsm_tree_run_record_t;
+using blobs::lsm_tree_run_stamp_t;
 using blobs::memory_pressure_t;
 using blobs::memory_shape_t;
 using blobs::published_runs;
@@ -594,9 +596,11 @@ class nvme_store {
         });
     }
 
-    /** Opens the runs @p runs names as this store's tree, which a mount does before anything reads. */
-    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs) noexcept {
-        return runs_.restore(channel, runs);
+    /** Opens the runs @p runs names as this store's tree, with the @p stamps ingests assigned, which a mount does
+     *  before anything reads. */
+    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
+                     std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
+        return runs_.restore(channel, runs, stamps);
     }
 
 #pragma endregion Writes
@@ -644,6 +648,86 @@ class nvme_store {
                               std::span<std::uint8_t const> {drained.kinds}, survival.floor, {}, {}, key_slot_t::size,
                               published, tails);
         });
+    }
+
+    /** What an ingest keeps between its writes: the cells and tails laid out for the run it fills, and the runs. */
+    struct ingest_runs_t;
+
+    /** What an ingest into this collection starts from. */
+    [[nodiscard]] ingest_runs_t begin_ingest() noexcept { return {}; }
+
+    /**
+     *  @brief Lays @p rows out behind the strings @p ingested laid out before, at stamp zero, heads in their cells and
+     *      tails in their tails, as a flush lays them, writing a run each time one fills.
+     *  @param[in] rows Strings in ascending order, each one 16-byte value under its string, readable until the call
+     *      returns.
+     *  @return Success, or the status that stopped it with @p ingested as it was, but where the strings laid out before
+     *      share their last head with the first of @p rows and both overflow a run together.
+     *
+     *  A run is cut once it holds as many cells as a flush writes, or tails nearing what its 32-bit offsets reach, but
+     *  only where the head changes, so no level splits one head between two runs.
+     */
+    status_t write_ingest(io_channel_t& channel, std::span<keyed_delta_t const> rows,
+                          ingest_runs_t& ingested) noexcept {
+        if (rows.empty()) return {};
+        drained_t& drained = ingested.drained;
+        bool const continues = !ingested.runs.empty() || !drained.key_slots.empty();
+        std::uint64_t tails = 0;
+        for (std::size_t index = 0; index != rows.size(); ++index) {
+            std::string_view const text = rows[index].stored_key;
+            std::string_view const previous = index ? rows[index - 1].stored_key
+                                                    : std::string_view {ingested.last.begin(), ingested.last.end()};
+            if ((index || continues) && !(previous < text))
+                return {status_code_t::invalid_argument_k, "An ingest takes its strings strictly ascending"};
+            delta_view_t const& delta = rows[index].delta;
+            if (delta.kind != delta_kind_t::write_k || !admits(delta.bytes.size()))
+                return {status_code_t::malformed_k, "A string maps onto one 16-byte key"};
+            tails += tail_of(text).size();
+        }
+        // The strings laid out before take a run of their own when these overflow it, unless one head spans both
+        bool const overflows = drained.key_slots.size() + rows.size() >
+                                   blobs::storage_limits_t::memory_runs_max_deltas_k ||
+                               drained.tails.size() + tails > ingested_tails_max_bytes_k;
+        if (overflows && !drained.key_slots.empty() &&
+            drained.key_slots.back().stored_key != head_of(rows.front().stored_key))
+            if (status_t const cut = write_ingested_run_(channel, drained, ingested.runs); cut.failed()) return cut;
+        std::size_t const runs_before = ingested.runs.size();
+        std::size_t const cells_before = drained.key_slots.size();
+        std::size_t const tails_before = drained.tails.size();
+        if (status_t const laid = lay_out_ingested_(channel, rows, ingested); laid.failed()) {
+            while (ingested.runs.size() != runs_before) {
+                [[maybe_unused]] status_t const dropped = sorted_run_t::drop(runs_.tree().volume(), channel,
+                                                                             ingested.runs.back().content_id());
+                ingested.runs.pop_back();
+            }
+            drained.resize(cells_before, tails_before);
+            return laid;
+        }
+        std::string_view const kept = rows.back().stored_key;
+        if (ingested.last.resize(kept.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "An ingest could not hold its last string"};
+        if (!kept.empty()) std::memcpy(ingested.last.data(), kept.data(), kept.size());
+        return {};
+    }
+
+    /** Writes the strings @p ingested laid out last as its final run, and publishes every run as one commit placed
+     *  above every level holding their keys, flushing the memory runs first, as the blobs store does. */
+    expected<transaction_stamp_t> publish_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
+        if (!ingested.drained.key_slots.empty())
+            if (status_t const cut = write_ingested_run_(channel, ingested.drained, ingested.runs); cut.failed()) {
+                drop_ingest(channel, ingested);
+                return cut;
+            }
+        return runs_.publish_ingest(channel, ingested.runs, [&]() noexcept { return flush(channel); });
+    }
+
+    /** Drops every run @p ingested wrote and every string it laid out, which an ingest that never published leaves. */
+    void drop_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
+        for (sorted_run_t const& run : ingested.runs)
+            if (run.attached()) [[maybe_unused]]
+                status_t const dropped = sorted_run_t::drop(runs_.tree().volume(), channel, run.content_id());
+        ingested.runs.clear();
+        ingested.drained.clear();
     }
 
     /** Whether any level of the tree is over the bytes its number admits. */
@@ -724,7 +808,34 @@ class nvme_store {
         st::basic_vector<std::uint8_t> kinds;
         st::basic_vector<std::uint32_t> tail_offsets;
         st::basic_vector<byte_t> tails;
+
+        /** Empties every column for the next run, keeping what they hold room for. */
+        void clear() noexcept { key_slots.clear(), stamps.clear(), kinds.clear(), tail_offsets.clear(), tails.clear(); }
+
+        /** Trims the columns back to @p cells cells and @p tail_bytes bytes of tails, as they stood before a layout. */
+        void resize(std::size_t cells, std::size_t tail_bytes) noexcept {
+            [[maybe_unused]] st::status_t trimmed = key_slots.resize(cells);
+            trimmed = stamps.resize(cells);
+            trimmed = kinds.resize(cells);
+            trimmed = tail_offsets.resize(cells);
+            trimmed = tails.resize(tail_bytes);
+        }
     };
+
+  public:
+    struct ingest_runs_t {
+
+        /** The cells, stamps, kinds and tails laid out for the run being filled. */
+        drained_t drained;
+
+        /** The runs written so far, in ascending order of their strings. */
+        st::basic_vector<sorted_run_t> runs;
+
+        /** The last string laid out, which the next one must ascend past. */
+        st::basic_vector<char> last;
+    };
+
+  private:
 
 #pragma endregion Private Types
 
@@ -898,6 +1009,61 @@ class nvme_store {
             written_tails += tail.size();
         }
         if (tails_bytes != 0) drained.tail_offsets[versions.size()] = static_cast<std::uint32_t>(written_tails);
+        return {};
+    }
+
+    /** Tails one ingested run carries at most, well inside what its 32-bit tail offsets and its file reach. */
+    static constexpr std::uint64_t ingested_tails_max_bytes_k = std::uint64_t {1} << 31;
+
+    /** Writes the cells, stamps, kinds and tails laid out so far as one run of stamp zero into @p runs, and empties
+     *  them for the next. */
+    status_t write_ingested_run_(io_channel_t& channel, drained_t& drained,
+                                 st::basic_vector<sorted_run_t>& runs) noexcept {
+        if (runs.reserve(runs.size() + 1) != st::status_t::success_k ||
+            drained.tail_offsets.push_back(static_cast<std::uint32_t>(drained.tails.size())) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "An ingest could not hold another run"};
+        key_tails_column_t const tails = drained.tails.empty()
+                                             ? key_tails_column_t {}
+                                             : key_tails_column_t {
+                                                   std::span<std::uint32_t const> {drained.tail_offsets},
+                                                   std::span<byte_t const> {drained.tails}};
+        auto [written, write_status] = sorted_run_t::write(
+            runs_.tree().volume(), channel, utilities::uuid_generator(),
+            std::span<key_slot_t const> {drained.key_slots}, std::span<std::uint64_t const> {drained.stamps},
+            std::span<std::uint8_t const> {drained.kinds}, 0, {}, {}, key_slot_t::size, tails);
+        if (write_status.failed()) {
+            drained.tail_offsets.pop_back();
+            return write_status;
+        }
+        [[maybe_unused]] st::status_t const placed = runs.push_back(st::assume_reserved, std::move(written));
+        drained.clear();
+        return {};
+    }
+
+    /** Lays @p rows out behind what @p ingested laid out, writing a run each time one fills where the head changes. */
+    status_t lay_out_ingested_(io_channel_t& channel, std::span<keyed_delta_t const> rows,
+                               ingest_runs_t& ingested) noexcept {
+        drained_t& drained = ingested.drained;
+        for (keyed_delta_t const& row : rows) {
+            st::key128_t const head = head_of(row.stored_key);
+            std::string_view const tail = tail_of(row.stored_key);
+            bool const full = drained.key_slots.size() >= blobs::storage_limits_t::memory_runs_max_deltas_k ||
+                              drained.tails.size() + tail.size() > ingested_tails_max_bytes_k;
+            if (full && !drained.key_slots.empty() && drained.key_slots.back().stored_key != head)
+                if (status_t const cut = write_ingested_run_(channel, drained, ingested.runs); cut.failed()) return cut;
+
+            key_slot_t built {};
+            built.stored_key = head;
+            std::memcpy(built.data, row.delta.bytes.data(), key_slot_t::size);
+            std::size_t const tails_before = drained.tails.size();
+            if (drained.key_slots.push_back(std::move(built)) != st::status_t::success_k ||
+                drained.stamps.push_back(std::uint64_t {0}) != st::status_t::success_k ||
+                drained.kinds.push_back(static_cast<std::uint8_t>(delta_kind_t::write_k)) != st::status_t::success_k ||
+                drained.tail_offsets.push_back(static_cast<std::uint32_t>(tails_before)) != st::status_t::success_k ||
+                drained.tails.resize(tails_before + tail.size()) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "An ingest could not hold its strings"};
+            if (!tail.empty()) std::memcpy(drained.tails.data() + tails_before, tail.data(), tail.size());
+        }
         return {};
     }
 

@@ -111,6 +111,7 @@ static PyObject* api_engines_compiled(PyObject* Py_UNUSED(module), PyObject* Py_
 static PyMethodDef module_methods[] = {
     {"version", api_version, METH_NOARGS, doc_version},
     {"engines_compiled", api_engines_compiled, METH_NOARGS, doc_engines_compiled},
+    {"gpu_devices", ustore_py_gpu_devices, METH_NOARGS, ustore_py_gpu_devices_doc},
     {NULL, NULL, 0, NULL},
 };
 
@@ -142,6 +143,7 @@ PyMODINIT_FUNC PyInit_lib(void) {
     if (PyModule_AddObjectRef(module, "Capabilities", (PyObject*)CapabilitiesType) < 0) goto failed;
     if (PyModule_AddObjectRef(module, "Measurement", (PyObject*)MeasurementType) < 0) goto failed;
     if (PyModule_AddObjectRef(module, "Description", (PyObject*)DescriptionType) < 0) goto failed;
+    if (PyModule_AddObjectRef(module, "GPUDevice", (PyObject*)GPUDeviceType) < 0) goto failed;
     PyObject* const edge_id_default = ustore_py_uuid_to_object(&ustore_edge_id_default_k.uuid);
     int const edge_id_added = edge_id_default ? PyModule_AddObjectRef(module, "edge_id_default", edge_id_default) : -1;
     Py_XDECREF(edge_id_default);

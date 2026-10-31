@@ -41,6 +41,7 @@
 #include <array>     // `std::array`
 #include <atomic>    // `std::memory_order_acquire`
 #include <bit>       // `std::bit_floor`
+#include <concepts>  // `std::same_as`
 #include <limits>    // `std::numeric_limits`
 #include <memory>    // `std::unique_ptr`
 #include <new>       // `std::nothrow`
@@ -429,6 +430,9 @@ class nvme_store {
 
     /** The tree the flushed writes of this collection live in. */
     using tree_t = typename published_runs_t::tree_t;
+
+    /** One immutable run of that tree, which an ingest writes before it publishes. */
+    using sorted_run_t = typename tree_t::sorted_run_t;
 
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
@@ -932,9 +936,11 @@ class nvme_store {
         return false;
     }
 
-    /** Opens the runs @p runs names as this collection's tree, which a mount does before anything reads. */
-    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs) noexcept {
-        return runs_.restore(channel, runs);
+    /** Opens the runs @p runs names as this collection's tree, with the @p stamps ingests assigned, which a mount does
+     *  before anything reads. */
+    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
+                     std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
+        return runs_.restore(channel, runs, stamps);
     }
 
     /** Writes @p stored_value under @p stored_key as a commit of its own, flushing first when the memory runs are past
@@ -1042,24 +1048,91 @@ class nvme_store {
         return runs_.flush([&](tree_t& tree, std::span<memory_run_t const* const> flushed,
                                compaction_stamps_t const& survival,
                                lsm_tree_publication_hook_t const& published) noexcept -> status_t {
-            constraint_t& constraint = runs_.constraint();
-            drained_slots_t key_slots {constrained_allocator<key_slot_t, atomic_reference_> {constraint}};
-            drained_stamps_t stamps {constrained_allocator<std::uint64_t, atomic_reference_> {constraint}};
-            drained_kinds_t kinds {constrained_allocator<std::uint8_t, atomic_reference_> {constraint}};
-            drained_values_t stored_values {constrained_allocator<byte_t, atomic_reference_> {constraint}};
-            drained_offsets_t value_offsets {
-                constrained_allocator<stored_value_offset_t, atomic_reference_> {constraint}};
+            drained_t drained {runs_.constraint()};
             utilities::local_arena_t folded;
             utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
-            if (status_t const drained = drain_(flushed, survival, folded_bytes, key_slots, stamps, kinds,
-                                                stored_values, value_offsets);
-                drained.failed())
-                return drained;
-            return tree.flush(channel, std::span<key_slot_t const> {key_slots}, std::span<std::uint64_t const> {stamps},
-                              std::span<std::uint8_t const> {kinds}, survival.floor,
-                              std::span<byte_t const> {stored_values},
-                              std::span<stored_value_offset_t const> {value_offsets}, value_max_size_, published);
+            if (status_t const laid = drain_(flushed, survival, folded_bytes, drained); laid.failed()) return laid;
+            return tree.flush(
+                channel, std::span<key_slot_t const> {drained.key_slots},
+                std::span<std::uint64_t const> {drained.stamps}, std::span<std::uint8_t const> {drained.kinds},
+                survival.floor, std::span<byte_t const> {drained.stored_values},
+                std::span<stored_value_offset_t const> {drained.value_offsets}, value_max_size_, published);
         });
+    }
+
+    /** What an ingest keeps between its writes: the rows laid out for the run it fills, and the runs it wrote. */
+    struct ingest_runs_t;
+
+    /** What an ingest into this collection starts from, charging the store's budget. */
+    [[nodiscard]] ingest_runs_t begin_ingest() noexcept { return ingest_runs_t {drained_t {runs_.constraint()}}; }
+
+    /**
+     *  @brief Lays @p rows out behind the rows @p ingested laid out before, at stamp zero, writing a run each time one
+     *      fills the deltas one flush holds or the bytes one run file takes.
+     *  @param[in,out] channel The channel the runs are written on, held by the calling thread.
+     *  @param[in] rows Rows in ascending order of their keys, readable until the call returns.
+     *  @return Success, or the status that stopped it with @p ingested as it was: @c invalid_argument_k for keys that
+     *      do not strictly ascend past every key before them, @c malformed_k for a row this collection admits no value
+     *      of.
+     *  @note Changes the volume's catalog, so the caller holds what serializes those changes.
+     */
+    status_t write_ingest(io_channel_t& channel, std::span<keyed_delta_t const> rows,
+                          ingest_runs_t& ingested) noexcept {
+        if (rows.empty()) return {};
+        drained_t& drained = ingested.drained;
+        bool const continues = !ingested.runs.empty() || !drained.key_slots.empty();
+        std::uint64_t bytes = 0;
+        for (std::size_t index = 0; index != rows.size(); ++index) {
+            stored_key_t const& previous = index ? rows[index - 1].stored_key : ingested.last;
+            if ((index || continues) && !(previous < rows[index].stored_key))
+                return {status_code_t::invalid_argument_k, "An ingest takes its keys strictly ascending"};
+            if (!admits_(rows[index].delta))
+                return {status_code_t::malformed_k, "This collection admits no value of that size"};
+            bytes += is_fixed(value_layout_k) ? value_size_ : rows[index].delta.bytes.size();
+        }
+        // The rows laid out before take a run of their own when these overflow it, so no run below holds one of them
+        if (!drained.key_slots.empty() &&
+            ingested_run_overflows_(drained.key_slots.size() + rows.size(), drained.stored_values.size() + bytes))
+            if (status_t const cut = write_ingested_run_(channel, ingested); cut.failed()) return cut;
+        std::size_t const runs_before = ingested.runs.size();
+        std::size_t const slots_before = drained.key_slots.size();
+        std::size_t const values_before = drained.stored_values.size();
+        if (status_t const laid = lay_out_ingested_(channel, rows, ingested); laid.failed()) {
+            while (ingested.runs.size() != runs_before) {
+                [[maybe_unused]] status_t const dropped = sorted_run_t::drop(runs_.tree().volume(), channel,
+                                                                             ingested.runs.back().content_id());
+                ingested.runs.pop_back();
+            }
+            drained.resize(slots_before, values_before);
+            return laid;
+        }
+        ingested.last = rows.back().stored_key;
+        return {};
+    }
+
+    /**
+     *  @brief Writes the rows @p ingested laid out last as its final run, and publishes every run as one commit placed
+     *      above every level holding their keys, flushing the memory runs first and retrying while commits refill them.
+     *  @return The stamp every ingested version carries, or the status that stopped it with every run dropped.
+     *  @note The owner serializes it with flushes, compactions and truncations, and the calling thread is inside no
+     *      epoch.
+     */
+    expected<transaction_stamp_t> publish_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
+        if (!ingested.drained.key_slots.empty())
+            if (status_t const cut = write_ingested_run_(channel, ingested); cut.failed()) {
+                drop_ingest(channel, ingested);
+                return cut;
+            }
+        return runs_.publish_ingest(channel, ingested.runs, [&]() noexcept { return flush(channel); });
+    }
+
+    /** Drops every run @p ingested wrote and every row it laid out, which an ingest that never published leaves. */
+    void drop_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
+        for (sorted_run_t const& run : ingested.runs)
+            if (run.attached()) [[maybe_unused]]
+                status_t const dropped = sorted_run_t::drop(runs_.tree().volume(), channel, run.content_id());
+        ingested.runs.clear();
+        ingested.drained.clear();
     }
 
     /** Whether any level of the tree is over the bytes its number admits. */
@@ -1069,7 +1142,8 @@ class nvme_store {
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
-     *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device lane.
+     *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device
+     *      compactor.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
      */
     expected<compaction_outcome_t> compact(
@@ -1109,21 +1183,50 @@ class nvme_store {
         sealed_commit_t* sealed = nullptr;
     };
 
-    /** The key slots one flush writes, in ascending order of their keys. */
-    using drained_slots_t = st::basic_vector<key_slot_t, constrained_allocator<key_slot_t, atomic_reference_>>;
+    /** A column one flush writes, charging the store's budget. */
+    template <typename element_type_>
+    using drained_column = st::basic_vector<element_type_, constrained_allocator<element_type_, atomic_reference_>>;
 
-    /** The values one flush writes, back to back in the order of the key slots. */
-    using drained_values_t = st::basic_vector<byte_t, constrained_allocator<byte_t, atomic_reference_>>;
+    /** The columns one flush or one ingested run writes, every one charging the store's budget. */
+    struct drained_t {
+        drained_t() noexcept = default;
+        explicit drained_t(constraint_t& constraint) noexcept
+            : key_slots {constrained_allocator<key_slot_t, atomic_reference_> {constraint}},
+              stamps {constrained_allocator<std::uint64_t, atomic_reference_> {constraint}},
+              kinds {constrained_allocator<std::uint8_t, atomic_reference_> {constraint}},
+              stored_values {constrained_allocator<byte_t, atomic_reference_> {constraint}},
+              value_offsets {constrained_allocator<stored_value_offset_t, atomic_reference_> {constraint}} {}
 
-    /** Where each value one flush writes starts and one past the last, for a variable width alone. */
-    using drained_offsets_t =
-        st::basic_vector<stored_value_offset_t, constrained_allocator<stored_value_offset_t, atomic_reference_>>;
+        /** The key slots, in ascending order of their keys. */
+        drained_column<key_slot_t> key_slots;
 
-    /** The stamps of the key slots one flush writes, in the same order. */
-    using drained_stamps_t = st::basic_vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>>;
+        /** The stamps of the key slots, in the same order. */
+        drained_column<std::uint64_t> stamps;
 
-    /** The @c delta_kind_t of the key slots one flush writes, in the same order. */
-    using drained_kinds_t = st::basic_vector<std::uint8_t, constrained_allocator<std::uint8_t, atomic_reference_>>;
+        /** The @c delta_kind_t of the key slots, in the same order. */
+        drained_column<std::uint8_t> kinds;
+
+        /** The values, back to back in the order of the key slots. */
+        drained_column<byte_t> stored_values;
+
+        /** Where each value starts and one past the last, for a variable width alone. */
+        drained_column<stored_value_offset_t> value_offsets;
+
+        /** Empties every column for the next run, keeping what they hold room for. */
+        void clear() noexcept {
+            key_slots.clear(), stamps.clear(), kinds.clear(), stored_values.clear(), value_offsets.clear();
+        }
+
+        /** Trims the columns back to @p slots key slots and @p values bytes of values, as they stood before a layout,
+         *  the value offsets to one past the slots, or none for none. */
+        void resize(std::size_t slots, std::size_t values) noexcept {
+            [[maybe_unused]] st::status_t trimmed = key_slots.resize(slots);
+            trimmed = stamps.resize(slots);
+            trimmed = kinds.resize(slots);
+            trimmed = stored_values.resize(values);
+            trimmed = value_offsets.resize(value_offsets.empty() || slots == 0 ? 0 : slots + 1);
+        }
+    };
 
     /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
     using stamped_deltas_t =
@@ -1134,6 +1237,21 @@ class nvme_store {
 
     /** The keys of a batch that neither a memory run nor the cache answered. */
     using deferred_keys_t = st::basic_vector<stored_key_t, constrained_allocator<stored_key_t, atomic_reference_>>;
+
+  public:
+    struct ingest_runs_t {
+
+        /** The key slots, stamps, kinds, values and value offsets laid out for the run being filled. */
+        drained_t drained;
+
+        /** The runs written so far, in ascending order of their keys. */
+        st::basic_vector<sorted_run_t> runs;
+
+        /** The last key laid out, which the next row must ascend past. */
+        stored_key_t last {};
+    };
+
+  private:
 
     /** The caller's request every deferred key came from. */
     using deferred_requests_t = st::basic_vector<std::size_t, constrained_allocator<std::size_t, atomic_reference_>>;
@@ -1415,38 +1533,94 @@ class nvme_store {
      *  @param[in] flushed The memory runs, newest first.
      *  @param[in] survival Which older versions a reader or a mount still needs, as a merge would decide.
      *  @param[in,out] arena Where the values of folded changes sit until the run is written.
-     *  @param[out] key_slots The key slots in ascending order of their keys, as a run takes them.
-     *  @param[out] stamps The stamp of every key slot, the versions of one key newest first.
-     *  @param[out] kinds The @c delta_kind_t of every key slot, in the same order.
-     *  @param[out] stored_values The values back to back, empty for a layout holding them inline, and one stride per
-     *      key slot at a fixed width, a removal's zeroed.
-     *  @param[out] value_offsets Where each value starts inside @p stored_values and one past the last, for a variable
-     *      width alone.
+     *  @param[out] drained The columns, the versions of one key newest first, as @c lay_out_versions_ lays them.
      */
     status_t drain_(std::span<memory_run_t const* const> flushed, compaction_stamps_t const& survival,
-                    utilities::arena_allocator<byte_t>& arena, drained_slots_t& key_slots, drained_stamps_t& stamps,
-                    drained_kinds_t& kinds, drained_values_t& stored_values,
-                    drained_offsets_t& value_offsets) const noexcept {
+                    utilities::arena_allocator<byte_t>& arena, drained_t& drained) const noexcept {
         stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {runs_.constraint()}};
         if (status_t const kept = kept_versions(flushed, survival, fold_, versions, arena); kept.failed()) return kept;
-        if (key_slots.reserve(versions.size()) != st::status_t::success_k ||
-            stamps.reserve(versions.size()) != st::status_t::success_k ||
-            kinds.reserve(versions.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A flush could not hold its key slots"};
-        std::uint64_t total = 0;
-        for (stamped_delta_t const& version : versions) total += version.delta.bytes.size();
-        if constexpr (is_fixed(value_layout_k)) total = std::uint64_t {versions.size()} * value_size_;
+        return lay_out_versions_(std::span<stamped_delta_t const> {versions}, drained);
+    }
+
+    /** Bytes the run laid out of @p key_slots key slots and @p values bytes of values takes at most, its trailer of
+     *  zero-width stamps and its kinds counted at a byte each. */
+    [[nodiscard]] static std::uint64_t ingested_run_bytes_(std::uint64_t key_slots, std::uint64_t values) noexcept {
+        return sorted_run_layout_t::blob_bytes(key_slots, values, portable_alignment_k,
+                                               key_slots + portable_alignment_k);
+    }
+
+    /** Whether a run of @p key_slots key slots and @p values bytes outgrows what one flush or one file holds. */
+    [[nodiscard]] static bool ingested_run_overflows_(std::uint64_t key_slots, std::uint64_t values) noexcept {
+        return key_slots > storage_limits_t::memory_runs_max_deltas_k ||
+               ingested_run_bytes_(key_slots, values) > storage_limits_t::sorted_run_file_max_size_k;
+    }
+
+    /** Writes the rows @p ingested laid out as one run of stamp zero, and empties the layout for the next. */
+    status_t write_ingested_run_(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
+        if (ingested.runs.reserve(ingested.runs.size() + 1) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "An ingest could not hold another run"};
+        auto [written, write_status] = sorted_run_t::write(
+            runs_.tree().volume(), channel, uuid_generator(), std::span<key_slot_t const> {ingested.drained.key_slots},
+            std::span<std::uint64_t const> {ingested.drained.stamps},
+            std::span<std::uint8_t const> {ingested.drained.kinds}, 0,
+            std::span<byte_t const> {ingested.drained.stored_values},
+            std::span<stored_value_offset_t const> {ingested.drained.value_offsets}, value_max_size_);
+        if (write_status.failed()) return write_status;
+        [[maybe_unused]] st::status_t const placed = ingested.runs.push_back(st::assume_reserved, std::move(written));
+        ingested.drained.clear();
+        return {};
+    }
+
+    /** Lays @p rows out behind what @p ingested laid out, writing a run each time one fills. */
+    status_t lay_out_ingested_(io_channel_t& channel, std::span<keyed_delta_t const> rows,
+                               ingest_runs_t& ingested) noexcept {
+        stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {runs_.constraint()}};
+        for (std::size_t first = 0; first != rows.size();) {
+            versions.clear();
+            std::uint64_t values = ingested.drained.stored_values.size();
+            std::size_t end = first;
+            for (; end != rows.size(); ++end) {
+                keyed_delta_t const& row = rows[end];
+                std::uint64_t const slots = ingested.drained.key_slots.size() + versions.size() + 1;
+                std::uint64_t const bytes = values + (is_fixed(value_layout_k) ? value_size_ : row.delta.bytes.size());
+                if (ingested_run_overflows_(slots, bytes) && slots != 1) break;
+                if (versions.push_back(stamped_delta_t {row.stored_key, 0, row.delta}) != st::status_t::success_k)
+                    return {status_code_t::out_of_memory_k, "An ingest could not hold its rows"};
+                values = bytes;
+            }
+            if (status_t const laid = lay_out_versions_(std::span<stamped_delta_t const> {versions}, ingested.drained);
+                laid.failed())
+                return laid;
+            first = end;
+            if (first != rows.size())
+                if (status_t const cut = write_ingested_run_(channel, ingested); cut.failed()) return cut;
+        }
+        return {};
+    }
+
+    /** Appends @p versions, in a run's order, to the columns @p drained a run is laid out from, as a flush and an
+     *  ingest both lay them: values back to back, none for a layout holding them inline and one stride per key slot
+     *  at a fixed width, a removal's zeroed, with value offsets for a variable width alone. */
+    status_t lay_out_versions_(std::span<stamped_delta_t const> versions, drained_t& drained) const noexcept {
+        std::size_t const first = drained.key_slots.size();
+        if (drained.key_slots.reserve(first + versions.size()) != st::status_t::success_k ||
+            drained.stamps.reserve(first + versions.size()) != st::status_t::success_k ||
+            drained.kinds.reserve(first + versions.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A run could not hold its key slots"};
+        std::uint64_t added = 0;
+        for (stamped_delta_t const& version : versions) added += version.delta.bytes.size();
+        if constexpr (is_fixed(value_layout_k)) added = std::uint64_t {versions.size()} * value_size_;
+        std::uint64_t written = holds_values_inline_k ? 0 : drained.stored_values.size();
         if constexpr (sorted_run_layout_t::carries_value_offsets_k) {
-            if (total > std::numeric_limits<stored_value_offset_t>::max())
-                return {status_code_t::capacity_exhausted_k, "A flush's values outgrow a run's value offsets"};
-            if (value_offsets.resize(versions.size() + 1) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A flush could not hold its value offsets"};
+            if (written + added > std::numeric_limits<stored_value_offset_t>::max())
+                return {status_code_t::capacity_exhausted_k, "A run's values outgrow its value offsets"};
+            if (drained.value_offsets.resize(first + versions.size() + 1) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A run could not hold its value offsets"};
         }
 
         if constexpr (!holds_values_inline_k)
-            if (stored_values.resize(static_cast<std::size_t>(total)) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A flush could not hold its values"};
-        std::uint64_t written = 0;
+            if (drained.stored_values.resize(static_cast<std::size_t>(written + added)) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A run could not hold its values"};
         for (std::size_t index = 0; index != versions.size(); ++index) {
             stamped_delta_t const& version = versions[index];
             std::span<byte_t const> const bytes = version.delta.bytes;
@@ -1465,19 +1639,20 @@ class nvme_store {
                 if (bytes.size() > stride)
                     return {status_code_t::capacity_exhausted_k, "A value outgrows its fixed width"};
                 if constexpr (sorted_run_layout_t::carries_value_offsets_k)
-                    value_offsets[index] = static_cast<stored_value_offset_t>(written);
-                if (!bytes.empty()) std::memcpy(stored_values.data() + written, bytes.data(), bytes.size());
+                    drained.value_offsets[first + index] = static_cast<stored_value_offset_t>(written);
+                if (!bytes.empty()) std::memcpy(drained.stored_values.data() + written, bytes.data(), bytes.size());
                 if (bytes.size() != stride)
-                    std::memset(stored_values.data() + written + bytes.size(), 0,
+                    std::memset(drained.stored_values.data() + written + bytes.size(), 0,
                                 static_cast<std::size_t>(stride - bytes.size()));
                 written += stride;
             }
-            [[maybe_unused]] st::status_t const placed = key_slots.push_back(std::move(built));
-            [[maybe_unused]] st::status_t const stamped = stamps.push_back(std::uint64_t {version.stamp});
-            [[maybe_unused]] st::status_t const kinded = kinds.push_back(static_cast<std::uint8_t>(version.delta.kind));
+            [[maybe_unused]] st::status_t const placed = drained.key_slots.push_back(std::move(built));
+            [[maybe_unused]] st::status_t const stamped = drained.stamps.push_back(std::uint64_t {version.stamp});
+            [[maybe_unused]] st::status_t const kinded = drained.kinds.push_back(
+                static_cast<std::uint8_t>(version.delta.kind));
         }
         if constexpr (sorted_run_layout_t::carries_value_offsets_k)
-            value_offsets[versions.size()] = static_cast<stored_value_offset_t>(written);
+            drained.value_offsets[first + versions.size()] = static_cast<stored_value_offset_t>(written);
         return {};
     }
 

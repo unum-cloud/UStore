@@ -2,7 +2,7 @@
  *  @file include/ustore/utilities/blocking_files.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
- *  @brief Whole-file mappings and directory queries, that block the calling thread.
+ *  @brief Whole-file mappings, directory queries and shared libraries opened by name, that block the calling thread.
  */
 
 #pragma once
@@ -13,6 +13,7 @@
 #if defined(_WIN32)
 #include <windows.h> // `CreateFileW`, `MapViewOfFile`, `GetFileAttributesW`
 #else
+#include <dlfcn.h>    // `dlopen`, `dlsym`
 #include <fcntl.h>    // `open`
 #include <sys/mman.h> // `mmap`, `madvise`, `munmap`
 #include <sys/stat.h> // `stat`, `fstat`, `S_ISDIR`
@@ -147,6 +148,35 @@ inline status_t seekable_file_t::close() noexcept {
 
 #endif
 
+/** A shared library opened by name and kept open for the process's life, as the entry points resolved from it are never
+ *  unloaded; empty where the system has no such library. */
+struct shared_library_t {
+    void* handle = nullptr;
+
+    /** Opens the library named @p path, or answers the empty one. */
+    static shared_library_t open(char const* path) noexcept {
+#if defined(_WIN32)
+        return {reinterpret_cast<void*>(::LoadLibraryA(path))};
+#else
+        return {::dlopen(path, RTLD_NOW | RTLD_LOCAL)};
+#endif
+    }
+
+    /** Points @p entry at the symbol exported as @p name, answering whether there is one. */
+    template <typename function_type_>
+    bool resolve(char const* name, function_type_& entry) const noexcept {
+        if (!handle) return false;
+#if defined(_WIN32)
+        entry = reinterpret_cast<function_type_>(::GetProcAddress(static_cast<HMODULE>(handle), name));
+#else
+        entry = reinterpret_cast<function_type_>(::dlsym(handle, name));
+#endif
+        return entry != nullptr;
+    }
+
+    explicit operator bool() const noexcept { return handle != nullptr; }
+};
+
 #pragma endregion Files
 
 #pragma region Mappings
@@ -210,18 +240,19 @@ inline mapped_file_t::~mapped_file_t() noexcept {
 }
 
 inline expected<mapped_file_t> mapped_file_t::map(char const* path) noexcept {
-    auto [file, open_status] = seekable_file_t::open(path);
-    if (open_status.failed()) return open_status;
-    auto [length, measure_status] = file.length();
-    if (measure_status.failed()) return measure_status;
+    // nvcc 13 crashes on structured bindings of a move-only file here, which GPU compaction's units include
+    expected<seekable_file_t> file = seekable_file_t::open(path);
+    if (!file) return file.status();
+    expected<std::size_t> length = file->length();
+    if (!length) return length.status();
     mapped_file_t mapped;
-    if (length == 0) return mapped;
+    if (*length == 0) return mapped;
     // A mapping outlives the descriptor it came from, which closes on return
-    void* const begin = ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, file.descriptor_, 0);
+    void* const begin = ::mmap(nullptr, *length, PROT_READ, MAP_PRIVATE, file->descriptor_, 0);
     if (begin == MAP_FAILED) return status_t {status_code_t::io_k, "Failed to map the file"};
-    [[maybe_unused]] int const advised = ::madvise(begin, length, MADV_SEQUENTIAL);
+    [[maybe_unused]] int const advised = ::madvise(begin, *length, MADV_SEQUENTIAL);
     mapped.data_ = static_cast<char const*>(begin);
-    mapped.size_ = length;
+    mapped.size_ = *length;
     return mapped;
 }
 

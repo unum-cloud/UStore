@@ -69,6 +69,7 @@
 //! Author: Ash Vardanian
 //! Date: October 7, 2026
 
+use crate::arrow::{self, ArrowArrayStream, IngestOrder};
 use crate::blobs::{Entry, Values};
 use crate::db::sealed::Writable;
 use crate::db::{
@@ -181,6 +182,49 @@ impl<'view, Parent: Writable> Collection<'view, Parent> {
             Err(failure) if failure.status == Status::AlreadyExists => self.existing(modality),
             Err(failure) => Err(failure),
         }
+    }
+}
+
+impl<Parent: Writable> Collection<'_, Parent> {
+    /// The collection the name addresses and what it holds, refusing a missing one.
+    fn found(&mut self) -> Result<(CollectionID, Modality)> {
+        self.find()?
+            .ok_or(fail(Status::NotFound, "no collection answers to that name"))
+    }
+
+    /// The whole collection as one Arrow stream through the view, whose batches outlive the stream; a head view
+    /// reads a snapshot the stream holds until dropped.
+    ///
+    /// Every pull runs the cursor of the collection's modality into an arena of its own, which the exporters of
+    /// `c/ustore/arrow.h` hand out as the batch's columns, and which the batch frees once released.
+    pub fn export_arrow(&mut self) -> Result<ArrowArrayStream> {
+        let (collection, modality) = self.found()?;
+        arrow::export(&self.view, collection, modality)
+    }
+
+    /// Writes every batch of `stream` through the writes of the collection's modality, answering the rows written.
+    ///
+    /// The converters of `c/ustore/arrow.h` read every batch's columns in place, and the last write pays
+    /// `durability`. The call takes the stream over and releases it, even on failure.
+    pub fn import_arrow(&mut self, stream: ArrowArrayStream, durability: Durability) -> Result<usize> {
+        let (collection, modality) = self.found()?;
+        arrow::import(&self.view, collection, modality, stream, durability)
+    }
+}
+
+impl Collection<'_, Database> {
+    /// Lands every batch of `stream` as one commit of its own at the head, answering the rows landed.
+    ///
+    /// Appends every batch to one ingest of `ustore_ingest_init`, which `ustore_ingest_finish` lands. The call takes
+    /// the stream over and releases it, even on failure.
+    pub fn ingest_arrow(
+        &mut self,
+        stream: ArrowArrayStream,
+        order: IngestOrder,
+        durability: Durability,
+    ) -> Result<usize> {
+        let (collection, modality) = self.found()?;
+        arrow::ingest(self.view.database(), collection, modality, stream, order, durability)
     }
 }
 

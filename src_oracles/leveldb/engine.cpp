@@ -40,6 +40,7 @@
 #include "blobs_layers/pages.hpp" // `pages_import_over_blobs`, `pages_read_over_blobs`
 #include "engine.hpp"             // `engine_t`, `guarded`, `remove_over_blobs`, `scan_over_blobs`
 #include "lib.hpp"                // `route_init`
+#include "vram/uploads.hpp"       // `uploading_vram_tables`
 
 #include "database.hpp" // `database_open`, `database_describe`, `collection_create`, `snapshot_init`
 #include "blobs.hpp"    // `blobs_write`, `blobs_remove`, `blobs_read`, `blobs_scan`, `blobs_sample`
@@ -131,6 +132,8 @@ engine_t const engine_k {
              .docs = &docs_verbs_k,
              .graph = &graph_verbs_k,
              .pages = &pages_verbs_k},
+    .vram_nvidia = uploading_vram_tables<home_t::vram_nvidia_k>,
+    .vram_amd = uploading_vram_tables<home_t::vram_amd_k>,
 };
 
 } // namespace unum::ustore::oracles::leveldb
@@ -139,5 +142,6 @@ using namespace unum::ustore;
 using namespace unum::ustore::oracles::leveldb;
 
 void ustore_database_open_leveldb(ustore_database_open_leveldb_t* arguments) {
-    route_init<&guarded<&database_open, ustore_database_open_leveldb_t, cpu_ceiling_t, view_t>>(arguments);
+    route_init<&guarded<&database_open, ustore_database_open_leveldb_t, cpu_ceiling_t, stringzilla_kernels_t, view_t>>(
+        arguments);
 }

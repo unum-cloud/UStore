@@ -37,8 +37,8 @@ pub enum PageEncoding {
 
 // region: Raw Declarations
 
-/// One-to-one mirror of the cursors of `c/ustore/pages.h`.
-mod ffi {
+/// One-to-one mirror of the cursors and the import of `c/ustore/pages.h`.
+pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 
     use std::ffi::c_void;
@@ -47,6 +47,9 @@ mod ffi {
         ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_completion_t, ustore_database_t,
         ustore_enum_t, ustore_executor_t, ustore_key_t, ustore_outcome_t, ustore_predicate_t,
         ustore_progress_callback_t, ustore_size_t, ustore_strings_view_t, ustore_view_t,
+    };
+    use crate::db::ffi::{
+        ustore_collections_view_t, ustore_durability_t, ustore_keys_view_t, ustore_transaction_t, ustore_watch_t,
     };
 
     #[repr(C)]
@@ -86,10 +89,29 @@ mod ffi {
         pub progress_state: *mut c_void,
     }
 
+    #[repr(C)]
+    pub struct ustore_pages_import_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub transaction: ustore_transaction_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub keys: ustore_keys_view_t,
+        pub values: ustore_strings_view_t,
+        pub encoding: ustore_enum_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
+        pub progress: ustore_progress_callback_t,
+        pub progress_state: *mut c_void,
+    }
+
     extern "C" {
         pub fn ustore_pages_cursor_init(arguments: *mut ustore_pages_cursor_init_t);
         pub fn ustore_pages_cursor_next(arguments: *mut ustore_pages_cursor_next_t);
         pub fn ustore_pages_cursor_free(cursor: ustore_pages_cursor_t);
+        pub fn ustore_pages_import(arguments: *mut ustore_pages_import_t);
     }
 }
 

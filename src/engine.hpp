@@ -29,9 +29,9 @@
 
 #include "ustore/status.hpp" // `expected`, `status_t`
 
-#include "ustore/utilities/ram_buffers.hpp"        // `host_blocks_t`, `cuda_blocks_t`
-#include "ustore/utilities/ram_device.hpp"         // `claim_t`
-#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_executor_t`
+#include "ustore/utilities/ram_buffers.hpp" // `host_blocks_t`, `cuda_blocks_t`, `hip_blocks_t`
+#include "ustore/utilities/ram_device.hpp"  // `claim_t`
+#include "ustore/utilities/vram_device.hpp" // `cuda_executor_t`, `hip_executor_t`
 
 #include "utilities/batches.hpp" // `strings_arg_t`
 
@@ -40,9 +40,12 @@ namespace unum::ustore {
 using utilities::cuda_blocks_t;
 using utilities::cuda_executor_t;
 using utilities::executor_t;
+using utilities::hip_blocks_t;
+using utilities::hip_executor_t;
 using utilities::host_blocks_t;
 using utilities::lent_pool_t;
 using utilities::strings_arg_t;
+using utilities::stringzilla_kernels_t;
 
 /** What a call reads through, decoded once by the router from its view, or from the transaction a write carries, and
  *  the scratch and the executor thread it works on. */
@@ -77,7 +80,38 @@ enum class home_t : std::uint8_t {
 
     /** One NVIDIA device, fed by the host thread of a VRAM executor. */
     vram_nvidia_k,
+
+    /** One AMD device, fed by the host thread of a VRAM executor. */
+    vram_amd_k,
 };
+
+/** The executor the verbs of one device home take. */
+template <home_t>
+struct executor_for_home;
+
+template <>
+struct executor_for_home<home_t::vram_nvidia_k> {
+    using type = cuda_executor_t;
+};
+
+template <>
+struct executor_for_home<home_t::vram_amd_k> {
+    using type = hip_executor_t;
+};
+
+/** The executor the verbs of device home @p home_ take as their last argument. */
+template <home_t home_>
+using home_executor = typename executor_for_home<home_>::type;
+
+/** The home whose verbs take @p executors_types_ as their last argument, host threads for none. */
+template <typename... executors_types_>
+inline constexpr home_t home_of_executors = home_t::host_k;
+
+template <>
+inline constexpr home_t home_of_executors<cuda_executor_t> = home_t::vram_nvidia_k;
+
+template <>
+inline constexpr home_t home_of_executors<hip_executor_t> = home_t::vram_amd_k;
 
 /** The database, snapshot, collection and transaction verbs every engine serves, on host threads alone. */
 struct database_verbs_t {
@@ -90,6 +124,10 @@ struct database_verbs_t {
     status_t (*collection_create)(ustore_collection_create_t const&, view_t const&) noexcept;
     status_t (*collection_find)(ustore_collection_find_t const&, strings_arg_t const& names, view_t const&) noexcept;
     status_t (*collection_drop)(ustore_collection_drop_t const&, view_t const&) noexcept;
+    status_t (*ingest_init)(ustore_ingest_init_t const&, view_t const&) noexcept;
+    status_t (*ingest_append)(ustore_ingest_append_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    status_t (*ingest_finish)(ustore_ingest_finish_t const&, view_t const&) noexcept;
+    void (*ingest_free)(ustore_ingest_t) noexcept;
     status_t (*transaction_init)(ustore_transaction_init_t const&, view_t const&) noexcept;
     status_t (*transaction_stage)(ustore_transaction_stage_t const&, view_t const&) noexcept;
     status_t (*transaction_commit)(ustore_transaction_commit_t const&, view_t const&) noexcept;
@@ -115,11 +153,12 @@ struct blobs_verbs<home_t::host_k> {
 };
 
 /** The verbs of blobs collections on a device, which has no slot for a change. */
-template <>
-struct blobs_verbs<home_t::vram_nvidia_k> {
-    status_t (*read)(ustore_blobs_read_t const&, view_t const&, cuda_executor_t&) noexcept;
-    status_t (*scan)(ustore_blobs_scan_t const&, view_t const&, cuda_executor_t&) noexcept;
-    status_t (*sample)(ustore_blobs_sample_t const&, view_t const&, cuda_executor_t&) noexcept;
+template <home_t home_>
+    requires(home_ != home_t::host_k)
+struct blobs_verbs<home_> {
+    status_t (*read)(ustore_blobs_read_t const&, view_t const&, home_executor<home_>&) noexcept;
+    status_t (*scan)(ustore_blobs_scan_t const&, view_t const&, home_executor<home_>&) noexcept;
+    status_t (*sample)(ustore_blobs_sample_t const&, view_t const&, home_executor<home_>&) noexcept;
 };
 
 /** The verbs of strings collections served at one home. */
@@ -137,12 +176,13 @@ struct strings_verbs<home_t::host_k> {
 };
 
 /** The verbs of strings collections on a device, whose strings a host index resolves. */
-template <>
-struct strings_verbs<home_t::vram_nvidia_k> {
+template <home_t home_>
+    requires(home_ != home_t::host_k)
+struct strings_verbs<home_> {
     status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&,
-                     cuda_executor_t&) noexcept;
+                     home_executor<home_>&) noexcept;
     status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes, strings_arg_t const& start_strings,
-                     view_t const&, cuda_executor_t&) noexcept;
+                     view_t const&, home_executor<home_>&) noexcept;
 };
 
 /** The verbs of documents collections served at one home. */
@@ -163,13 +203,15 @@ struct docs_verbs<home_t::host_k> {
 };
 
 /** The verbs of documents collections on a device, whose field paths the host compiles. */
-template <>
-struct docs_verbs<home_t::vram_nvidia_k> {
-    status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&, cuda_executor_t&) noexcept;
+template <home_t home_>
+    requires(home_ != home_t::host_k)
+struct docs_verbs<home_> {
+    status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&,
+                     home_executor<home_>&) noexcept;
     status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&,
-                       cuda_executor_t&) noexcept;
-    status_t (*scan)(ustore_docs_scan_t const&, view_t const&, cuda_executor_t&) noexcept;
-    status_t (*sample)(ustore_docs_sample_t const&, view_t const&, cuda_executor_t&) noexcept;
+                       home_executor<home_>&) noexcept;
+    status_t (*scan)(ustore_docs_scan_t const&, view_t const&, home_executor<home_>&) noexcept;
+    status_t (*sample)(ustore_docs_sample_t const&, view_t const&, home_executor<home_>&) noexcept;
 };
 
 /** The verbs of graph collections served at one home. */
@@ -188,10 +230,11 @@ struct graph_verbs<home_t::host_k> {
 };
 
 /** The verbs of graph collections on a device. */
-template <>
-struct graph_verbs<home_t::vram_nvidia_k> {
-    status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&, cuda_executor_t&) noexcept;
-    status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&, cuda_executor_t&) noexcept;
+template <home_t home_>
+    requires(home_ != home_t::host_k)
+struct graph_verbs<home_> {
+    status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&, home_executor<home_>&) noexcept;
+    status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&, home_executor<home_>&) noexcept;
 };
 
 /** The verbs of pages collections served at one home. */
@@ -215,10 +258,11 @@ struct pages_verbs<home_t::host_k> {
 };
 
 /** The verbs of pages collections on a device. */
-template <>
-struct pages_verbs<home_t::vram_nvidia_k> {
-    status_t (*read)(ustore_pages_read_t const&, view_t const&, cuda_executor_t&) noexcept;
-    status_t (*scan)(ustore_pages_scan_t const&, view_t const&, cuda_executor_t&) noexcept;
+template <home_t home_>
+    requires(home_ != home_t::host_k)
+struct pages_verbs<home_> {
+    status_t (*read)(ustore_pages_read_t const&, view_t const&, home_executor<home_>&) noexcept;
+    status_t (*scan)(ustore_pages_scan_t const&, view_t const&, home_executor<home_>&) noexcept;
 };
 
 /** The verbs of every modality an engine serves at one home; a null host table or verb answers
@@ -238,41 +282,48 @@ status_t unsupported_on_vram(parameters_types_...) noexcept {
     return {status_code_t::unsupported_k, "No engine serves this call on devices yet"};
 }
 
-inline constexpr blobs_verbs<home_t::vram_nvidia_k> unsupported_vram_blobs_k {
+template <home_t home_>
+inline constexpr blobs_verbs<home_> unsupported_vram_blobs {
     .read = &unsupported_on_vram,
     .scan = &unsupported_on_vram,
     .sample = &unsupported_on_vram,
 };
 
-inline constexpr strings_verbs<home_t::vram_nvidia_k> unsupported_vram_strings_k {
+template <home_t home_>
+inline constexpr strings_verbs<home_> unsupported_vram_strings {
     .read = &unsupported_on_vram,
     .scan = &unsupported_on_vram,
 };
 
-inline constexpr docs_verbs<home_t::vram_nvidia_k> unsupported_vram_docs_k {
+template <home_t home_>
+inline constexpr docs_verbs<home_> unsupported_vram_docs {
     .read = &unsupported_on_vram,
     .gather = &unsupported_on_vram,
     .scan = &unsupported_on_vram,
     .sample = &unsupported_on_vram,
 };
 
-inline constexpr graph_verbs<home_t::vram_nvidia_k> unsupported_vram_graph_k {
+template <home_t home_>
+inline constexpr graph_verbs<home_> unsupported_vram_graph {
     .read_edges = &unsupported_on_vram,
     .scan_vertices = &unsupported_on_vram,
 };
 
-inline constexpr pages_verbs<home_t::vram_nvidia_k> unsupported_vram_pages_k {
+template <home_t home_>
+inline constexpr pages_verbs<home_> unsupported_vram_pages {
     .read = &unsupported_on_vram,
     .scan = &unsupported_on_vram,
 };
 
-/** The device tables of an engine with no device tower yet, every entry answering @c unsupported_on_vram. */
-inline constexpr home_tables<home_t::vram_nvidia_k> unsupported_vram_tables_k {
-    .blobs = &unsupported_vram_blobs_k,
-    .strings = &unsupported_vram_strings_k,
-    .docs = &unsupported_vram_docs_k,
-    .graph = &unsupported_vram_graph_k,
-    .pages = &unsupported_vram_pages_k,
+/** The device tables of an engine with no device tower yet at @p home_, every entry answering
+ *  @c unsupported_on_vram. */
+template <home_t home_>
+inline constexpr home_tables<home_> unsupported_vram_tables {
+    .blobs = &unsupported_vram_blobs<home_>,
+    .strings = &unsupported_vram_strings<home_>,
+    .docs = &unsupported_vram_docs<home_>,
+    .graph = &unsupported_vram_graph<home_>,
+    .pages = &unsupported_vram_pages<home_>,
 };
 
 /**
@@ -292,13 +343,17 @@ struct engine_t {
     home_tables<home_t::host_k> host;
 
     /** The modality verbs on one NVIDIA device. */
-    home_tables<home_t::vram_nvidia_k> vram_nvidia = unsupported_vram_tables_k;
+    home_tables<home_t::vram_nvidia_k> vram_nvidia = unsupported_vram_tables<home_t::vram_nvidia_k>;
+
+    /** The modality verbs on one AMD device, which no engine serves yet. */
+    home_tables<home_t::vram_amd_k> vram_amd = unsupported_vram_tables<home_t::vram_amd_k>;
 
     /** The tables of the verbs served at @p home_. */
     template <home_t home_>
     home_tables<home_> const& tables() const noexcept {
         if constexpr (home_ == home_t::host_k) return host;
-        else return vram_nvidia;
+        else if constexpr (home_ == home_t::vram_nvidia_k) return vram_nvidia;
+        else return vram_amd;
     }
 };
 
@@ -596,6 +651,9 @@ struct ustore_database_handle_t {
     /** The kernels and waits every call on the database may use, picked once at open. */
     cpu_ceiling_t ceiling;
 
+    /** The StringZilla kernels calls on the database run directly, looked up under @c ceiling at open. */
+    stringzilla_kernels_t kernels;
+
     /** Deferred calls naming the database that have not finished, through @c std::atomic_ref. */
     std::uint32_t deferred_calls = 0;
 
@@ -617,6 +675,15 @@ struct ustore_transaction_handle_t {
 
     /** The caller's hold plus one per cursor reading through the transaction, through @c std::atomic_ref. */
     std::uint32_t holds = 1;
+};
+
+/** What @c ustore_ingest_t points to: its engine and state, null once finished, the database it keeps open, and the
+ *  scratch every call on it runs in, as the @c view_t the router hands its engine names it. */
+struct ustore_ingest_handle_t {
+    engine_t const* engine = nullptr;
+    void* state = nullptr;
+    ustore_database_t database = nullptr;
+    ustore_arena_handle_t scratch {};
 };
 
 /** What @c ustore_snapshot_t points to: its engine and state, and the database it keeps open. */
@@ -678,7 +745,7 @@ struct ustore_executor_handle_t {
     /** The memory domain every host arena the executor makes lives on, the first one it serves. */
     fu_memory_domain_id_t memory_domain = 0;
 
-    /** Nothing beyond the pool on RAM, the rings' options on NVMe, the device's stream on VRAM; the variant is the
-     *  kind tag, so no second word can disagree. */
-    std::variant<std::monostate, ustore_nvme_options_t, cuda_executor_t> device;
+    /** Nothing beyond the pool on RAM, the rings' options on NVMe, the device's stream on VRAM of either vendor; the
+     *  variant is the kind tag, so no second word can disagree. */
+    std::variant<std::monostate, ustore_nvme_options_t, cuda_executor_t, hip_executor_t> device;
 };

@@ -2,124 +2,52 @@
  *  @file src/nvme/compaction.cu
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief The compiled part of GPU compaction: binding a compactor to a device, and its compaction of every key slot
- *      the engine stores, with the graph's device fold for the graph's key slot, instantiated here so the host TUs of
- *      the engine call it.
+ *  @brief The compiled part of GPU compaction: binding a compactor to an executor, growing its scratch through it, and
+ *      its compaction of every key slot the engine stores, with the graph's device fold for the graph's key slot,
+ *      instantiated here so the host TUs of the engine call it.
  */
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::int64_t`, `std::uint64_t`
+#include <cstdint> // `std::uintptr_t`
 
-#include <span>    // `std::span`
-#include <utility> // `std::move`
-
-#include <smashtable/shared.hpp> // `st::status_t`, `st::expected`
-
-#include "ustore/blobs/vram_nvidia_compaction.cuh" // `compaction_kind_t`, `compaction_output`, `cuda_compaction_lane_t`
-#include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`, `value_layout_t`
-#include "ustore/graph/vram_nvidia_adjacency_fold.cuh" // `adjacency_fold_t`, `vram_nvidia_adjacency_fold_t`
-#include "ustore/utilities/folds.hpp"                  // `last_write_fold_t`
-#include "ustore/utilities/vram_nvidia_device.hpp"     // `cuda_count_devices`, `cuda_stream_t`
+#include "ustore/blobs/vram_nvidia_compaction.cuh"     // `cuda_compactor_t::compact`
+#include "ustore/graph/vram_nvidia_adjacency_fold.cuh" // `vram_nvidia_adjacency_fold_t::compose`
 
 namespace unum::ustore::blobs {
 
-using utilities::last_write_fold_t;
-
-st::expected<cuda_compaction_lane_t> cuda_compaction_lane_t::make(int ordinal, std::size_t scratch_limit) noexcept {
-    using st::expected;
-    using st::status_t;
-    expected<std::size_t> const devices = utilities::cuda_count_devices();
-    if (!devices) return devices.status();
-    if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= *devices) return status_t::invalid_argument_k;
-    expected<cuda_stream_t> stream = cuda_stream_t::make(ordinal);
-    if (!stream) return stream.status();
-    return cuda_compaction_lane_t(std::move(*stream), scratch_limit);
+expected<cuda_compactor_t> cuda_compactor_t::make(utilities::cuda_executor_t& executor,
+                                                  device_sections_reader_t sections) noexcept {
+    return cuda_compactor_t(executor, sections);
 }
 
-#pragma region Instantiations
+cuda_compactor_t::~cuda_compactor_t() noexcept {
+    if (!scratch_) return;
+    sections_.release();
+    if (executor_->bind().succeeded()) executor_->free_async(reinterpret_cast<std::uintptr_t>(scratch_));
+}
 
-/** The sorted run indexes of one LSM level, as a compaction takes both of its levels. */
-template <typename key_slot_type_>
-using views_of = std::span<sorted_run_index_view<key_slot_type_> const>;
-
-/** The key the engine stores: the sixteen bytes of the C ABI's key, read as two big-endian words. */
-using stored_key_t = st::key128_t;
-
-/** The key slots of the engine's collections, one per value layout a collection is created with. */
-using inline_12_bytes_slot_t = key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>;
-using inline_44_bytes_slot_t = key_slot<stored_key_t, value_layout_t::inline_44_bytes_k>;
-using fixed_width_slot_t = key_slot<stored_key_t, value_layout_t::fixed_width_k>;
-using variable_width_slot_t = key_slot<stored_key_t, value_layout_t::variable_width_k>;
-
-/** The key slots the storage suites model their runs with, one per value layout, since a database of them holds a
- *  collection of any layout. */
-using suite_inline_12_bytes_slot_t = key_slot<std::uint64_t, value_layout_t::inline_12_bytes_k>;
-using suite_inline_44_bytes_slot_t = key_slot<std::uint64_t, value_layout_t::inline_44_bytes_k>;
-using suite_fixed_width_slot_t = key_slot<std::uint64_t, value_layout_t::fixed_width_k>;
-using suite_variable_width_slot_t = key_slot<std::uint64_t, value_layout_t::variable_width_k>;
-
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<inline_12_bytes_slot_t>,
-                                                      views_of<inline_12_bytes_slot_t>, sorted_run_bounds_t const&,
-                                                      compaction_stamps_t const&, last_write_fold_t const&,
-                                                      no_device_fold_t const&,
-                                                      located_value_reader<inline_12_bytes_slot_t>,
-                                                      compaction_output<inline_12_bytes_slot_t>&);
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<inline_44_bytes_slot_t>,
-                                                      views_of<inline_44_bytes_slot_t>, sorted_run_bounds_t const&,
-                                                      compaction_stamps_t const&, last_write_fold_t const&,
-                                                      no_device_fold_t const&,
-                                                      located_value_reader<inline_44_bytes_slot_t>,
-                                                      compaction_output<inline_44_bytes_slot_t>&);
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<fixed_width_slot_t>,
-                                                      views_of<fixed_width_slot_t>, sorted_run_bounds_t const&,
-                                                      compaction_stamps_t const&, last_write_fold_t const&,
-                                                      no_device_fold_t const&, located_value_reader<fixed_width_slot_t>,
-                                                      compaction_output<fixed_width_slot_t>&);
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<variable_width_slot_t>,
-                                                      views_of<variable_width_slot_t>, sorted_run_bounds_t const&,
-                                                      compaction_stamps_t const&, last_write_fold_t const&,
-                                                      no_device_fold_t const&,
-                                                      located_value_reader<variable_width_slot_t>,
-                                                      compaction_output<variable_width_slot_t>&);
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<suite_inline_12_bytes_slot_t>,
-                                                      views_of<suite_inline_12_bytes_slot_t>,
-                                                      sorted_run_bounds_t const&, compaction_stamps_t const&,
-                                                      last_write_fold_t const&, no_device_fold_t const&,
-                                                      located_value_reader<suite_inline_12_bytes_slot_t>,
-                                                      compaction_output<suite_inline_12_bytes_slot_t>&);
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<suite_inline_44_bytes_slot_t>,
-                                                      views_of<suite_inline_44_bytes_slot_t>,
-                                                      sorted_run_bounds_t const&, compaction_stamps_t const&,
-                                                      last_write_fold_t const&, no_device_fold_t const&,
-                                                      located_value_reader<suite_inline_44_bytes_slot_t>,
-                                                      compaction_output<suite_inline_44_bytes_slot_t>&);
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<suite_fixed_width_slot_t>,
-                                                      views_of<suite_fixed_width_slot_t>, sorted_run_bounds_t const&,
-                                                      compaction_stamps_t const&, last_write_fold_t const&,
-                                                      no_device_fold_t const&,
-                                                      located_value_reader<suite_fixed_width_slot_t>,
-                                                      compaction_output<suite_fixed_width_slot_t>&);
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<suite_variable_width_slot_t>,
-                                                      views_of<suite_variable_width_slot_t>, sorted_run_bounds_t const&,
-                                                      compaction_stamps_t const&, last_write_fold_t const&,
-                                                      no_device_fold_t const&,
-                                                      located_value_reader<suite_variable_width_slot_t>,
-                                                      compaction_output<suite_variable_width_slot_t>&);
-
-/** The graph store's key slot, whose changes its device fold composes. */
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<variable_width_slot_t>,
-                                                      views_of<variable_width_slot_t>, sorted_run_bounds_t const&,
-                                                      compaction_stamps_t const&, graph::adjacency_fold_t const&,
-                                                      graph::vram_nvidia_adjacency_fold_t const&,
-                                                      located_value_reader<variable_width_slot_t>,
-                                                      compaction_output<variable_width_slot_t>&);
-template st::status_t cuda_compaction_lane_t::compact(compaction_kind_t, views_of<suite_variable_width_slot_t>,
-                                                      views_of<suite_variable_width_slot_t>, sorted_run_bounds_t const&,
-                                                      compaction_stamps_t const&, graph::adjacency_fold_t const&,
-                                                      graph::vram_nvidia_adjacency_fold_t const&,
-                                                      located_value_reader<suite_variable_width_slot_t>,
-                                                      compaction_output<suite_variable_width_slot_t>&);
-
-#pragma endregion Instantiations
+st::status_t cuda_compactor_t::reserve_(std::size_t bytes, std::size_t kept_bytes) noexcept {
+    if (bytes <= scratch_bytes_) return st::status_t::success_k;
+    expected<std::uintptr_t> grown = executor_->allocate_async(bytes);
+    if (!grown) return st::status_t::out_of_memory_heap_k;
+    ++device_allocations_;
+    if (scratch_) {
+        std::uintptr_t const page = utilities::portable_alignment_k;
+        std::uintptr_t const into = round_up_to_multiple<std::uintptr_t>(*grown, page);
+        std::uintptr_t const from = round_up_to_multiple<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(scratch_),
+                                                                         page);
+        if (kept_bytes != 0 && executor_->copy_async(into, from, kept_bytes).failed()) {
+            executor_->free_async(*grown);
+            return st::status_t::unknown_k;
+        }
+        sections_.release();
+        executor_->free_async(reinterpret_cast<std::uintptr_t>(scratch_));
+    }
+    scratch_ = reinterpret_cast<byte_t*>(*grown);
+    scratch_bytes_ = bytes;
+    return st::status_t::success_k;
+}
 
 } // namespace unum::ustore::blobs
+
+#include "nvme/compaction_variants.hpp" // `views_of`, `variable_width_slot_t`

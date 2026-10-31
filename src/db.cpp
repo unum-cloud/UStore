@@ -17,8 +17,9 @@
 #endif
 
 #include <chrono> // `std::chrono::system_clock`
+#include <new>    // `std::nothrow`
 
-#include "ustore/db.h" // `ustore_database_describe_t`, `ustore_transaction_init_t`, `ustore_collection_create_t`
+#include "ustore/db.h" // `ustore_database_describe_t`, `ustore_transaction_init_t`, `ustore_ingest_init_t`
 
 #include "lib.hpp" // `route`, `tagged_view`, `release_parent`, `enumerator_spelling`
 
@@ -40,6 +41,12 @@ constexpr enumerator_spelling<ustore_watch_t> watch_names_k[] {
 constexpr enumerator_spelling<ustore_scan_mode_t> scan_mode_names_k[] {
     {ustore_scan_ordered_k, "ordered"},
     {ustore_scan_unordered_k, "unordered"},
+};
+
+/** The canonical spelling of every ingest order. */
+constexpr enumerator_spelling<ustore_ingest_order_t> ingest_order_names_k[] {
+    {ustore_ingest_sorted_k, "sorted"},
+    {ustore_ingest_unsorted_k, "unsorted"},
 };
 
 /** The canonical spelling of every drop mode. */
@@ -93,6 +100,55 @@ expected<ustore_collection_id_t> mint_collection_id() noexcept {
 
 } // namespace unum::ustore
 
+status_t open_ingest(ustore_ingest_init_t const& arguments) noexcept {
+    if (!arguments.ingest) return {status_code_t::invalid_argument_k, "Need an output for the ingest"};
+    *arguments.ingest = nullptr;
+    ustore_database_t const database = arguments.database;
+    if (!database) return {status_code_t::uninitialized_k, "The database is uninitialized"};
+    if (arguments.order != ustore_ingest_sorted_k && arguments.order != ustore_ingest_unsorted_k)
+        return {status_code_t::invalid_argument_k, "Unknown ingest order"};
+    if (database->access == access_t::read_only_k)
+        return {status_code_t::read_only_k, "The database was opened read-only"};
+    engine_t const& engine = engine_of(database);
+    if (!engine.database->ingest_init) return {status_code_t::unsupported_k, "The engine ingests nothing"};
+    auto* const ingest = new (std::nothrow) ustore_ingest_handle_t {.engine = &engine, .database = database};
+    if (!ingest) return {status_code_t::out_of_memory_k, "Failed to allocate the ingest"};
+    *arguments.ingest = ingest;
+    if (status_t const opened = engine.database->ingest_init(arguments, view_t {.scratch = &ingest->scratch});
+        opened.failed()) {
+        *arguments.ingest = nullptr;
+        arena_free_blocks(ingest->scratch);
+        delete ingest;
+        return opened;
+    }
+    take_hold(database);
+    return {};
+}
+
+status_t append_ingest(ustore_ingest_append_t const& arguments) noexcept {
+    ustore_ingest_t const ingest = arguments.ingest;
+    if (!ingest || !ingest->state) return {status_code_t::invalid_argument_k, "The ingest is missing or finished"};
+    arena_rewind(&ingest->scratch);
+    strings_arg_t values;
+    if (status_t const gathered = gather_strings({arguments.values, arguments.count}, &ingest->scratch, values);
+        gathered.failed())
+        return gathered;
+    return ingest->engine->database->ingest_append(arguments, values, view_t {.scratch = &ingest->scratch});
+}
+
+status_t finish_ingest(ustore_ingest_finish_t const& arguments) noexcept {
+    if (arguments.commit_stamp) *arguments.commit_stamp = 0;
+    ustore_ingest_t const ingest = arguments.ingest;
+    if (!ingest || !ingest->state) return {status_code_t::invalid_argument_k, "The ingest is missing or finished"};
+    status_t landed {status_code_t::invalid_argument_k, "Unknown durability"};
+    arena_rewind(&ingest->scratch);
+    if (arguments.durability == ustore_durability_buffered_k || arguments.durability == ustore_durability_flushed_k)
+        landed = ingest->engine->database->ingest_finish(arguments, view_t {.scratch = &ingest->scratch});
+    ingest->engine->database->ingest_free(ingest);
+    ingest->state = nullptr;
+    return landed;
+}
+
 void ustore_database_describe(ustore_database_describe_t* arguments) { route(arguments); }
 void ustore_database_clear(ustore_database_clear_t* arguments) { route(arguments); }
 void ustore_database_compact(ustore_database_compact_t* arguments) { route(arguments); }
@@ -106,6 +162,9 @@ void ustore_transaction_init(ustore_transaction_init_t* arguments) { route(argum
 void ustore_transaction_stage(ustore_transaction_stage_t* arguments) { route(arguments); }
 void ustore_transaction_commit(ustore_transaction_commit_t* arguments) { route(arguments); }
 void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments) { route(arguments); }
+void ustore_ingest_init(ustore_ingest_init_t* arguments) { finish(*arguments->outcome, open_ingest(*arguments)); }
+void ustore_ingest_append(ustore_ingest_append_t* arguments) { finish(*arguments->outcome, append_ingest(*arguments)); }
+void ustore_ingest_finish(ustore_ingest_finish_t* arguments) { finish(*arguments->outcome, finish_ingest(*arguments)); }
 
 ustore_view_t ustore_transaction_view(ustore_transaction_t transaction, ustore_watch_t watch) {
     return tagged_view(transaction, watch == ustore_watch_none_k ? view_tag_t::blind_k : view_tag_t::watching_k);
@@ -127,11 +186,25 @@ char const* ustore_engine_name(ustore_engine_t engine) { return name_in(engine_n
 ustore_engine_t ustore_engine_from_name(ustore_bytes_view_t name) { return value_in(engine_names_k, name); }
 char const* ustore_modality_name(ustore_modality_t modality) { return name_in(modality_names_k, modality); }
 ustore_modality_t ustore_modality_from_name(ustore_bytes_view_t name) { return value_in(modality_names_k, name); }
+char const* ustore_ingest_order_name(ustore_ingest_order_t order) { return name_in(ingest_order_names_k, order); }
+
+ustore_ingest_order_t ustore_ingest_order_from_name(ustore_bytes_view_t name) {
+    return value_in(ingest_order_names_k, name);
+}
 
 void ustore_transaction_free(ustore_transaction_t transaction) {
     if (!transaction) return;
     wait_deferred_calls(transaction->deferred_calls);
     release_parent(transaction);
+}
+
+void ustore_ingest_free(ustore_ingest_t ingest) {
+    if (!ingest) return;
+    if (ingest->state) ingest->engine->database->ingest_free(ingest);
+    ustore_database_t const database = ingest->database;
+    arena_free_blocks(ingest->scratch);
+    delete ingest;
+    release_hold(database);
 }
 
 void ustore_snapshot_free(ustore_snapshot_t snapshot) {

@@ -133,6 +133,22 @@ inline std::uint64_t clock_stamp() noexcept {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(since_epoch).count());
 }
 
+/** Parses @p markup in @p encoding as the whole page under @p root, its elements placed at @p placement and minted
+ *  from it, unescaping through @p kernels, into its dense tree in @p allocator, as imports and ingests lay pages. */
+inline expected<std::span<byte_t const>> import_page_tree(pages::page_encoding_t encoding, std::string_view markup,
+                                                          pages::element_key_t const& root,
+                                                          pages::placement_t placement,
+                                                          stringzilla_kernels_t const& kernels,
+                                                          page_allocator_t allocator) noexcept {
+    std::uint32_t ordinal = 0;
+    auto mint = [&]() noexcept { return pages::mint_key(placement.stamp, placement.sequence, ordinal++); };
+    page_tree_t tree {allocator};
+    if (status_t const status = pages::import_markup(encoding, markup, root, placement, mint, tree, kernels);
+        status.failed())
+        return status;
+    return tree.encode(allocator);
+}
+
 /** The newest placement stamp of any element of @p tree, zero for an empty tree. */
 inline std::uint64_t newest_placement(page_tree_t const& tree) noexcept {
     std::uint64_t newest = 0;
@@ -403,16 +419,10 @@ status_t serve_import(ustore_pages_import_t const& arguments, strings_arg_t cons
     return edit_pages(
         arguments, view,
         [&](std::size_t task, pages::placement_t placement, touched_page_t& page) noexcept -> expected<pages::edit_t> {
-            std::uint32_t ordinal = 0;
-            auto mint = [&]() noexcept { return pages::mint_key(placement.stamp, placement.sequence, ordinal++); };
             std::string_view const markup = string_of(values[task]);
             pages::element_key_t const root = element_key_of(page.place.key);
-            page_tree_t tree {allocator};
-            if (status_t const status = pages::import_markup(encoding, markup, root, placement, mint, tree,
-                                                             arguments.database->ceiling.compute);
-                status.failed())
-                return status;
-            auto [dense, dense_status] = tree.encode(allocator);
+            auto [dense, dense_status] = import_page_tree(encoding, markup, root, placement,
+                                                          arguments.database->kernels, allocator);
             if (dense_status.failed()) return dense_status;
             if (!progress.advance(markup.size())) return progress_cancelled_k;
             return pages::import_edit(placement, root, dense);
@@ -446,8 +456,7 @@ status_t serve_insert(ustore_pages_insert_t const& arguments, strings_arg_t cons
             };
             page_tree_t fragment {allocator};
             if (status_t const parsed = pages::import_markup(encoding, string_of(values[task]), pages::nil_key_k,
-                                                             placement, mint, fragment,
-                                                             arguments.database->ceiling.compute);
+                                                             placement, mint, fragment, arguments.database->kernels);
                 parsed.failed())
                 return parsed;
             auto [dense, dense_status] = fragment.encode(allocator);

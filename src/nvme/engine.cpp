@@ -22,6 +22,9 @@ extern template struct nvme_variant<cpu_class_t::intel_sierra_k>;
 #if USTORE_TARGET_APPLE_M2
 extern template struct nvme_variant<cpu_class_t::apple_m2_k>;
 #endif // USTORE_TARGET_APPLE_M2
+#if USTORE_TARGET_ALIBABA_C930
+extern template struct nvme_variant<cpu_class_t::alibaba_c930_k>;
+#endif // USTORE_TARGET_ALIBABA_C930
 #if USTORE_TARGET_SERIAL
 extern template struct nvme_variant<cpu_class_t::serial_k>;
 #endif // USTORE_TARGET_SERIAL
@@ -30,9 +33,10 @@ extern template struct nvme_variant<cpu_class_t::monoversioned_k>;
 #endif // USTORE_TARGET_MONOVERSIONED
 
 /** Implements @c ustore_database_open_nvme with the newest class @p ceiling fits, each lineage newest first. */
-status_t open(ustore_database_open_nvme_t const& arguments, cpu_ceiling_t ceiling, view_t const& view) noexcept {
+status_t open(ustore_database_open_nvme_t const& arguments, cpu_ceiling_t ceiling, stringzilla_kernels_t const& kernels,
+              view_t const& view) noexcept {
     return open_fitting_rung(cpu_ladder_t {}, ceiling, [&]<cpu_class_t cpu_class_>() noexcept {
-        return nvme_variant<cpu_class_>::open(arguments, ceiling, view);
+        return nvme_variant<cpu_class_>::open(arguments, kernels, view);
     });
 }
 

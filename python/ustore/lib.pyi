@@ -8,7 +8,7 @@ from collections.abc import Callable, Generator, Iterator, Sequence
 from enum import IntEnum
 from os import PathLike
 from types import GenericAlias, TracebackType
-from typing import Any, Protocol, Self, final, overload, type_check_only
+from typing import Any, Literal, Protocol, Self, final, overload, type_check_only
 from uuid import UUID
 
 from _typeshed import structseq
@@ -22,6 +22,16 @@ class _ArrowArray(Protocol):
 
     def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]: ...
 
+@type_check_only
+class _ArrowStream(Protocol):
+    """Anything exporting an Arrow stream through the C stream interface, such as a `pyarrow.Table`."""
+
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object: ...
+
+type ArrowSource = _ArrowStream | _ArrowArray
+"""An Arrow stream whose batches a call takes over, or one array, read as a stream of one batch."""
+type IngestOrder = Literal["sorted", "unsorted"]
+"""Whether an ingest's keys strictly ascend across its stream, or arrive in any order with the last repeat winning."""
 type Buffer = memoryview | bytes | bytearray
 type CollectionLike = UUID | str
 type KeyLike = UUID | int | str | bytes
@@ -32,6 +42,9 @@ type TapeLike = _ArrowArray | tuple[Buffer, Buffer]
 offsets are unsigned 32-bit or 64-bit integers, one more than the values, which a write passes without a copy."""
 type JSONValue = dict[str, JSONValue] | list[JSONValue] | tuple[JSONValue, ...] | str | int | float | bool | None
 type DocumentLike = str | Buffer | dict[str, JSONValue] | list[JSONValue] | int | float | bool
+type TextsLike = Sequence[str | Buffer] | str | Buffer | TapeLike
+"""One `str` or bytes-like text per task, a tape of them, or one for every task, as markup and names reach pages."""
+type LengthsLike = Sequence[int] | int
 type PathLikeOrStr = str | bytes | PathLike[str]
 type DataDirectory = PathLikeOrStr | tuple[PathLikeOrStr, int]
 type Progress = Callable[[int, int], bool | None]
@@ -49,6 +62,10 @@ def version() -> str:
 
 def engines_compiled() -> tuple[str, ...]:
     """The engines this build carries: some of "ram", "rocksdb", "leveldb" and "nvme", in that order."""
+
+def gpu_devices() -> tuple[GPUDevice, ...]:
+    """Every GPU this process can drive, NVIDIA devices first, then AMD, each at the ordinal `Executor.for_vram` names
+    it by; empty on a machine without GPUs or their runtimes. Calls `ustore_gpu_devices`."""
 
 # region: Statuses and Modes
 
@@ -134,7 +151,8 @@ class CPUClass(IntEnum):
     AWS_G2 = 6
     APPLE_M2 = 7
     AWS_G5 = 8
-    MONOVERSIONED = 9
+    ALIBABA_C930 = 9
+    MONOVERSIONED = 10
 
 class Transport(IntEnum):
     """How the NVMe engine moves bytes between its files and memory, valued as `ustore_transport_t`."""
@@ -172,6 +190,24 @@ class Gds(IntEnum):
     AUTOMATIC = 0
     DIRECT = 1
     COMPAT = 2
+
+class GPUVendor(IntEnum):
+    """The vendor whose runtime drives a GPU, valued as `ustore_gpu_vendor_t`."""
+
+    NVIDIA = 1
+    AMD = 2
+
+class GPUClass(IntEnum):
+    """The generation of a GPU, valued as `ustore_gpu_class_t`."""
+
+    NVIDIA_AMPERE = 1
+    NVIDIA_ADA = 2
+    NVIDIA_HOPPER = 3
+    NVIDIA_BLACKWELL = 4
+    NVIDIA_BLACKWELLRTX = 5
+    AMD_CDNA3 = 6
+    AMD_CDNA4 = 7
+    AMD_CDNA5 = 8
 
 class Engine(IntEnum):
     """The engine serving a database, as `describe()` reports it, valued as `ustore_engine_t`."""
@@ -218,6 +254,15 @@ class Modification(IntEnum):
     INSERT = 2
     PATCH = 3
     MERGE = 4
+
+class PageEncoding(IntEnum):
+    """How a page or a fragment is spelled on import or rendered on read, valued as `ustore_page_encoding_t`."""
+
+    HTML = 0
+    XML = 1
+    MARKDOWN = 2
+    TEXT = 3
+    JSON = 4
 
 # endregion: Statuses and Modes
 
@@ -417,6 +462,10 @@ class Collection:
     def scan(self, start: KeyLike, wanted: int, arena: Arena, /) -> Keys:
         """Up to `wanted` keys from `start` upwards."""
 
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
+        """The whole collection as one Arrow stream through the receiver's view, keys as `arrow.uuid` and values as
+        binary, so `pyarrow.table(db['posters'])` reads it in place."""
+
 class BlobsView:
     """The binary values of a collection: one key reads a copy as bytes, a batch a list of them, through one-off
     arenas."""
@@ -495,9 +544,10 @@ class Executor:
         gds: Gds = Gds.AUTOMATIC,
         deferred_limit: int = 0,
     ) -> Self:
-        """One stream on the CUDA `device` every call queues on, fed by one host thread, which `Database.open_nvme`
-        takes as its `compactions`, refused with `UnsupportedError` in a build without CUDA; zero `scratch_limit` lets
-        scratch grow as calls ask. Calls `ustore_executor_for_vram`."""
+        """One stream on `device`, a `GPUDevice.ordinal` of either vendor, every call queues on, fed by one host thread,
+        which `Database.open_nvme` takes as its `compactions` on an NVIDIA device, refused with `DeviceError` for an
+        ordinal no device carries; zero `scratch_limit` lets scratch grow as calls ask. Calls
+        `ustore_executor_for_vram`."""
 
     def drain(self, mood: Mood = Mood.PARKED) -> None:
         """Waits for every call submitted before the drain began, setting what the threads do once idle."""
@@ -574,6 +624,38 @@ class Measurement(structseq[int], tuple[int, int, int, int, int, int]):
         """The most bytes the range may take on disk."""
 
 @final
+class GPUDevice(structseq[Any], tuple[int, GPUVendor, int, GPUClass, int, int, str]):
+    """One GPU this process can drive, as `gpu_devices()` lists it."""
+
+    @property
+    def ordinal(self) -> int:
+        """The ordinal `Executor.for_vram` names the device by, its position in `gpu_devices()`."""
+
+    @property
+    def vendor(self) -> GPUVendor:
+        """The vendor whose runtime drives the device."""
+
+    @property
+    def vendor_ordinal(self) -> int:
+        """The device's ordinal in its vendor's runtime, as `nvidia-smi` or `rocm-smi` list it."""
+
+    @property
+    def gpu_class(self) -> GPUClass:
+        """The class of the device."""
+
+    @property
+    def compute_units(self) -> int:
+        """Streaming multiprocessors or compute units."""
+
+    @property
+    def memory_bytes(self) -> int:
+        """Device memory in bytes."""
+
+    @property
+    def name(self) -> str:
+        """The vendor's own name for the device."""
+
+@final
 class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, int, int, int]):
     """What an open database reports about itself, as `describe()` answers it, every size the engine's estimate."""
 
@@ -641,6 +723,20 @@ class _Reads:
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Cursor:
         """A walk over documents, keeping those `filter` matches. Calls `ustore_docs_cursor_init`."""
+
+    def pages_cursor(
+        self,
+        start: KeyLike = 0,
+        /,
+        *,
+        collection: CollectionLike,
+        filter: str | bytes | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
+        outputs_encoding: PageEncoding = PageEncoding.XML,
+    ) -> Cursor:
+        """A walk over pages, keeping those holding a node of the XPath `filter`, whose pulls render whole pages into
+        `outputs_encoding` when asked. Calls `ustore_pages_cursor_init`."""
 
     def graph_vertices_cursor(
         self,
@@ -729,6 +825,33 @@ class _Reads:
     ) -> Keys: ...
     def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
         """Up to `wanted` document keys drawn at random, which a `docs_read` or a `docs_gather` follows."""
+    def pages_read(
+        self,
+        keys: KeyLike | KeysLike,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        elements: KeyLike | KeysLike | None = None,
+        outputs_encoding: PageEncoding = PageEncoding.XML,
+    ) -> Values:
+        """Renders whole pages, or the subtrees of `elements`, one per task, None where a page or an element is
+        absent."""
+    def pages_scan(
+        self,
+        start: KeyLike,
+        wanted: int,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        mode: ScanMode = ScanMode.ORDERED,
+        progress: Progress | None = None,
+        filter: str | bytes | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
+    ) -> Keys:
+        """Up to `wanted` page keys from `start`, keeping those holding a node of the XPath `filter`."""
     def graph_read_edges(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Neighborhoods: ...
@@ -809,6 +932,89 @@ class _Writes(_Reads):
         durability: Durability = Durability.BUFFERED,
     ) -> None:
         """Removes whole documents."""
+    def pages_import(
+        self,
+        keys: KeyLike | KeysLike,
+        markup: TextsLike,
+        *,
+        collection: CollectionLike,
+        encoding: PageEncoding = PageEncoding.XML,
+        durability: Durability = Durability.BUFFERED,
+        progress: Progress | None = None,
+    ) -> None:
+        """Replaces whole pages with parsed markup, minting a key for every element."""
+    def import_arrow(
+        self, source: ArrowSource, *, collection: CollectionLike, durability: Durability | None = None
+    ) -> int:
+        """Writes every batch of an Arrow stream through the writes of the collection's modality, answering the rows
+        written."""
+    def pages_insert(
+        self,
+        keys: KeyLike | KeysLike,
+        fragments: TextsLike,
+        *,
+        collection: CollectionLike,
+        elements: KeyLike | KeysLike | None = None,
+        parents: KeyLike | KeysLike | None = None,
+        anchors: KeyLike | KeysLike | None = None,
+        encoding: PageEncoding = PageEncoding.XML,
+        durability: Durability = Durability.BUFFERED,
+    ) -> tuple[UUID, ...]:
+        """Parses fragments into elements under `parents` after `anchors`, the root and the front where None, answering
+        the key every element ended up with, given in `elements` or minted."""
+    def pages_remove(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> None:
+        """Removes elements with their subtrees, where the page key removes the whole page."""
+    def pages_move(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        *,
+        collection: CollectionLike,
+        parents: KeyLike | KeysLike | None = None,
+        anchors: KeyLike | KeysLike | None = None,
+        durability: Durability = Durability.BUFFERED,
+    ) -> None:
+        """Moves elements with their subtrees under `parents` after `anchors`, keeping their keys."""
+    def pages_splice(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        starts: LengthsLike,
+        lengths: LengthsLike,
+        texts: TextsLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> None:
+        """Replaces `lengths` bytes of the text of every element from `starts` on with `texts`."""
+    def pages_set_attributes(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        fields: TextsLike,
+        values: TextsLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> None:
+        """Sets one attribute of an element per task, adding the ones it lacks."""
+    def pages_remove_attributes(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        fields: TextsLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> None:
+        """Removes one attribute of an element per task."""
     def graph_write_edges(
         self,
         sources: KeysLike,
@@ -843,6 +1049,16 @@ class Database(_Writes, _Receivers):
     """An embedded database, opened through one class method per engine."""
 
     capabilities: Capabilities
+
+    def ingest_arrow(
+        self,
+        source: ArrowSource,
+        *,
+        collection: CollectionLike,
+        order: IngestOrder = "sorted",
+        durability: Durability | None = None,
+    ) -> int:
+        """Lands every batch of an Arrow stream as one commit of its own at the head, answering the rows landed."""
 
     @classmethod
     def open_ram(
@@ -1023,6 +1239,16 @@ class View(_Writes, _Receivers):
 
     def unwatched(self) -> View:
         """A view of the same transaction whose calls record nothing."""
+
+    def ingest_arrow(
+        self,
+        source: ArrowSource,
+        *,
+        collection: CollectionLike,
+        order: IngestOrder = "sorted",
+        durability: Durability | None = None,
+    ) -> int:
+        """Lands every batch of an Arrow stream as one commit of its own at the head, answering the rows landed; a view of a transaction raises TypeError."""
 
     def commit(self, durability: Durability = Durability.BUFFERED) -> int:
         """Commits the transaction on the executor, answering the commit stamp."""
@@ -1334,6 +1560,35 @@ class DeferredView:
           Keys: One run of keys, in no particular order.
         """
 
+    def pages_read(
+        self,
+        keys: KeyLike | KeysLike,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        elements: KeyLike | KeysLike | None = None,
+        outputs_encoding: PageEncoding = PageEncoding.XML,
+    ) -> Deferred[Values]:
+        """Renders whole pages, or the subtrees of `elements`, one per task, None where a page or an element is
+        absent."""
+
+    def pages_scan(
+        self,
+        start: KeyLike,
+        wanted: int,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        mode: ScanMode = ScanMode.ORDERED,
+        progress: Progress | None = None,
+        filter: str | bytes | None = None,
+        predicate: Predicate | None = None,
+        predicate_cost: PredicateCost = PredicateCost.CHEAP,
+    ) -> Deferred[Keys]:
+        """Up to `wanted` page keys from `start`, keeping those holding a node of the XPath `filter`."""
+
     def graph_read_edges(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Deferred[Neighborhoods]:
@@ -1644,6 +1899,98 @@ class DeferredView:
           durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
             returning.
         """
+
+    def pages_import(
+        self,
+        keys: KeyLike | KeysLike,
+        markup: TextsLike,
+        *,
+        collection: CollectionLike,
+        encoding: PageEncoding = PageEncoding.XML,
+        durability: Durability = Durability.BUFFERED,
+        progress: Progress | None = None,
+    ) -> Deferred[None]:
+        """Replaces whole pages with parsed markup, minting a key for every element."""
+    def import_arrow(
+        self, source: ArrowSource, *, collection: CollectionLike, durability: Durability | None = None
+    ) -> Deferred[int]:
+        """Writes every batch of an Arrow stream through the writes of the collection's modality."""
+    def ingest_arrow(
+        self,
+        source: ArrowSource,
+        *,
+        collection: CollectionLike,
+        order: IngestOrder = "sorted",
+        durability: Durability | None = None,
+    ) -> Deferred[int]:
+        """Lands every batch of an Arrow stream as one commit of its own at the head, refused through a transaction."""
+    def pages_insert(
+        self,
+        keys: KeyLike | KeysLike,
+        fragments: TextsLike,
+        *,
+        collection: CollectionLike,
+        elements: KeyLike | KeysLike | None = None,
+        parents: KeyLike | KeysLike | None = None,
+        anchors: KeyLike | KeysLike | None = None,
+        encoding: PageEncoding = PageEncoding.XML,
+        durability: Durability = Durability.BUFFERED,
+    ) -> Deferred[tuple[UUID, ...]]:
+        """Parses fragments into elements under `parents` after `anchors`, the root and the front where None, answering
+        the key every element ended up with, given in `elements` or minted."""
+    def pages_remove(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> Deferred[None]:
+        """Removes elements with their subtrees, where the page key removes the whole page."""
+    def pages_move(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        *,
+        collection: CollectionLike,
+        parents: KeyLike | KeysLike | None = None,
+        anchors: KeyLike | KeysLike | None = None,
+        durability: Durability = Durability.BUFFERED,
+    ) -> Deferred[None]:
+        """Moves elements with their subtrees under `parents` after `anchors`, keeping their keys."""
+    def pages_splice(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        starts: LengthsLike,
+        lengths: LengthsLike,
+        texts: TextsLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> Deferred[None]:
+        """Replaces `lengths` bytes of the text of every element from `starts` on with `texts`."""
+    def pages_set_attributes(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        fields: TextsLike,
+        values: TextsLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> Deferred[None]:
+        """Sets one attribute of an element per task, adding the ones it lacks."""
+    def pages_remove_attributes(
+        self,
+        keys: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike,
+        fields: TextsLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> Deferred[None]:
+        """Removes one attribute of an element per task."""
 
     def graph_write_edges(
         self,

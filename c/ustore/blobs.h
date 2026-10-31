@@ -245,7 +245,7 @@ typedef struct ustore_blobs_scan_t {
     /** Optional patterns the value of every listed key matches, shared by every scan; zeroed lists every key. */
     ustore_patterns_t patterns;
 
-    /** Optional verdict on the listed keys, asked once per page as its @c cost says; host executors only. */
+    /** Optional verdict on the listed keys, asked on the host once per page as its @c cost says. */
     ustore_predicate_t predicate;
 
     /** Output for @c count plus one offsets into @c keys, the last one closing the final scan, inside @c arena. */
@@ -284,14 +284,13 @@ typedef struct ustore_blobs_scan_t {
  *    @c mode, a pattern kind, a case sensitivity or a predicate cost is unknown, the @c patterns do
  *    not compile, the @c view was made by neither view constructor or belongs to another engine, a
  *    watching scan goes through a staged transaction, or a collection holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes, or a device
- *    executor is given a predicate.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet.
+ *    call yet, or on one matching no values, as AMD devices do, given @c patterns.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
@@ -351,7 +350,6 @@ typedef struct ustore_blobs_cursor_init_t {
  *    predicate cost is unknown, or the @c patterns do not compile.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k A device @c executor is given @c patterns.
- *  - @c ustore_status_device_k A device @c executor is given a predicate.
  */
 USTORE_EXPORT void ustore_blobs_cursor_init(ustore_blobs_cursor_init_t* arguments);
 

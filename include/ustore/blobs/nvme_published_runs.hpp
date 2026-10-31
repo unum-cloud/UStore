@@ -228,6 +228,10 @@ class commit_ledger {
         return static_cast<transaction_stamp_t>(order_.published_stamp());
     }
 
+    /** The stamp the next commit draws, which only the holder of the leader word may ask, since only it draws and it
+     *  lands every stamp before drawing the next. */
+    [[nodiscard]] transaction_stamp_t next_stamp_leading() const noexcept { return published() + 1; }
+
     /** The epochs every reader of every collection on this ledger announces, which a view's replacer waits out. */
     [[nodiscard]] epochs_t& epochs() noexcept { return epochs_; }
 
@@ -406,9 +410,11 @@ class commit_ledger {
 
     /** Draws @p request's stamp, publishes its views, lands the stamp, and hands the request back. */
     void land_(commit_request_t& request) noexcept {
+        [[maybe_unused]] transaction_stamp_t const foreseen = next_stamp_leading();
         commit_in_flight_t in_flight;
         order_.begin_commit(in_flight);
         transaction_stamp_t const stamp = static_cast<transaction_stamp_t>(in_flight.stamp());
+        assert(stamp == foreseen && "The leader draws the stamp after the one last published");
         request.publish(request.context, stamp);
         // The leader draws every stamp and lands it before the next, so the order never waits here.
         order_.end_commit(in_flight);
@@ -630,6 +636,9 @@ class published_runs {
 
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
+
+    /** One immutable run of that tree. */
+    using sorted_run_t = typename tree_t::sorted_run_t;
 
     /** The stamps the store's writes carry and its readers pin. */
     using ledger_t = commit_ledger<atomic_reference_, waiter_type_>;
@@ -869,11 +878,13 @@ class published_runs {
     /** Drops the view @c prepare laid out, which the leader does for a commit it then refuses. */
     void forget_prepared() noexcept { prepared_view_.reset(); }
 
-    /** Opens the runs @p runs names as the tree, which a mount does before anything reads. */
-    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs) noexcept {
+    /** Opens the runs @p runs names as the tree, each run an ingest stamped taking its stamp from @p stamps again,
+     *  which a mount does before anything reads. */
+    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
+                     std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
         publication_t publication;
         publication.owner = this;
-        return tree_.restore(channel, runs, publication.hook());
+        return tree_.restore(channel, runs, stamps, publication.hook());
     }
 
 #pragma endregion Commits
@@ -978,7 +989,8 @@ class published_runs {
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
-     *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device lane.
+     *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device
+     *      compactor.
      *  @param[in] fold What a change delta does, which composes the changes no reader tells apart.
      *  @param[in] device_fold What composes the changes of the merge on a device, or @c no_device_fold_t where nothing
      *      does, which keeps every merge holding a change on the host.
@@ -1003,6 +1015,46 @@ class published_runs {
         publication.chained = &published;
         return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, compactor, nullptr,
                              fold, device_fold, publication.hook(), stamps);
+    }
+
+    /**
+     *  @brief Publishes @p runs, written at stamp zero, as one commit of their own, stamped with the stamp the commit
+     *      draws and placed so no shallower level holds a key of theirs, once the store holds no memory run.
+     *  @param[in,out] channel The channel a refused set's runs are dropped on, held by the calling thread.
+     *  @param[in,out] runs The runs in ascending order of their keys, emptied: moved into the tree, or dropped.
+     *  @param[in] flush Called as @c flush() before every attempt, writing the memory runs out as the store does.
+     *  @return The stamp every version of @p runs carries, the stamp published for no runs, or the status that stopped
+     *      it, @c contended_k once memory runs kept reappearing.
+     *  @note The owner serializes it with flushes, compactions and truncations of the store, and the calling thread is
+     *      inside no epoch.
+     */
+    template <typename runs_type_, typename flush_type_>
+    expected<transaction_stamp_t> publish_ingest(io_channel_t& channel, runs_type_& runs,
+                                                 flush_type_&& flush) noexcept {
+        if (runs.empty()) return ledger_->published();
+        expected<transaction_stamp_t> landed = status_t {status_code_t::contended_k,
+                                                         "Commits kept refilling the memory runs an ingest waits out"};
+        for (std::size_t attempt = 0; attempt != ingest_attempts_k; ++attempt) {
+            if (status_t const flushed = flush(); flushed.failed()) {
+                landed = flushed;
+                break;
+            }
+            ledger_->lead();
+            // A commit landing after the flush put memory runs ahead of the levels, whose stamps sit below the
+            // ingest's.
+            if (!current_->memory_runs.runs().empty()) {
+                ledger_->stop_leading();
+                continue;
+            }
+            landed = publish_ingest_leading_(channel, std::span<sorted_run_t> {runs});
+            break;
+        }
+        // A set the tree refused dropped the runs it took, and the rest are still attached here.
+        for (sorted_run_t const& run : runs)
+            if (run.attached()) [[maybe_unused]]
+                status_t const dropped = sorted_run_t::drop(tree_.volume(), channel, run.content_id());
+        runs.clear();
+        return landed;
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a store holding no memory run takes. */
@@ -1067,6 +1119,68 @@ class published_runs {
 #pragma endregion Private Types
 
 #pragma region Private Methods
+
+    /** Times an ingest flushes and looks again for memory runs before it gives up. */
+    static constexpr std::size_t ingest_attempts_k = 8;
+
+    /** What the commit of an ingest hands its publication: the set and the view it publishes, and the set they
+     *  replace, which outlives every reader of the view replaced. */
+    struct ingest_publication_t {
+
+        /** The runs publishing. */
+        published_runs* owner = nullptr;
+
+        /** The level set naming the ingested runs. */
+        std::unique_ptr<level_set_t> next_levels;
+
+        /** The view naming that set. */
+        std::unique_ptr<view_t> next_view;
+
+        /** The set it replaced, retired once the commit returns. */
+        std::unique_ptr<level_set_t> replaced;
+    };
+
+    /** Publishes the view of an ingest under the stamp its commit drew, which the ingested runs carry already. */
+    static void publish_ingest_view_(void* context, transaction_stamp_t) noexcept {
+        ingest_publication_t& ingestion = *static_cast<ingest_publication_t*>(context);
+        published_runs& owner = *ingestion.owner;
+        ingestion.replaced = owner.tree_.adopt(std::move(ingestion.next_levels));
+        ingestion.next_view->levels = &owner.tree_.levels();
+        owner.replace_view_(std::move(ingestion.next_view));
+    }
+
+    /** Stamps @p runs with the stamp the next commit draws, lays out the set and the view naming them and commits,
+     *  which only the thread holding the leader word does, letting it go on every path. */
+    expected<transaction_stamp_t> publish_ingest_leading_(io_channel_t& channel,
+                                                          std::span<sorted_run_t> runs) noexcept {
+        transaction_stamp_t const stamp = ledger_->next_stamp_leading();
+        for (sorted_run_t& run : runs)
+            if (status_t const stamped = run.assign_stamp(stamp); stamped.failed()) {
+                ledger_->stop_leading();
+                return stamped;
+            }
+        ingest_publication_t ingestion;
+        ingestion.owner = this;
+        auto [view, view_status] = next_view_(nullptr, {}, current_->oldest_readable, current_->layout_generation + 1);
+        if (view_status.failed()) {
+            ledger_->stop_leading();
+            return view_status;
+        }
+        ingestion.next_view = std::move(view);
+        auto [levels, levels_status] = tree_.prepare_ingest(channel, runs);
+        if (levels_status.failed()) {
+            ledger_->stop_leading();
+            return levels_status;
+        }
+        ingestion.next_levels = std::move(levels);
+        commit_request_t request;
+        request.context = &ingestion;
+        request.publish = &publish_ingest_view_;
+        transaction_stamp_t const landed = ledger_->commit_leading(request);
+        // Letting the leader word go waited out every reader of the replaced view, so the replaced set is unreachable.
+        tree_t::retire(std::move(ingestion.replaced));
+        return landed;
+    }
 
     /** Deltas every memory run of @p view holds. */
     [[nodiscard]] static std::size_t memory_deltas_(view_t const& view) noexcept {

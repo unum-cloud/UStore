@@ -354,6 +354,7 @@ Staging reserves no position in commit order, so a read stamp is never greater t
 - `blobs.c`: binary values and their cursors.
 - `docs.c`: JSON documents and typed column gathers.
 - `graph.c`: graph edges and vertices.
+- `arrow.c`: Apache Arrow streams: collection exports, imports and ingests.
 - `strings.c`: collection names, resolved onto identifiers and listed in text order.
 - `collection.c`: collections addressed by name, and the mapping views each answers.
 - `CMakeLists.txt`: the `ustore_python` target, installed into the `ustore` package.

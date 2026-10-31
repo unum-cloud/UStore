@@ -33,8 +33,8 @@
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <smashtable/shared.hpp>       // `st::status_t`
 
-#include "ustore/graph/adjacency_fold.hpp"         // `vram_nvidia_adjacency_fold_t`, `check_delta`, `save_delta`
-#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_stream_t`, `cuda_device_buffer`, `cuda_pinned_buffer`
+#include "ustore/graph/adjacency_fold.hpp"          // `vram_nvidia_adjacency_fold_t`, `check_delta`, `save_delta`
+#include "ustore/utilities/vram_nvidia_runtime.cuh" // `cuda_device_buffer`, `cuda_pinned_buffer`, `cuda_status`
 
 namespace unum::ustore::graph {
 
@@ -152,8 +152,8 @@ struct composed_records_kernel {
 
 #pragma endregion Kernels
 
-template <typename stream_type_>
-st::status_t vram_nvidia_adjacency_fold_t::compose(stream_type_ const& stream, std::span<delta_view_t const> changes,
+template <typename executor_type_>
+st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, std::span<delta_view_t const> changes,
                                                    std::span<std::uint64_t const> chain_starts,
                                                    st::basic_vector<byte_t>& composed,
                                                    st::basic_vector<std::uint64_t>& composed_offsets) const noexcept {
@@ -182,8 +182,11 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(stream_type_ const& stream, s
     if (total > std::numeric_limits<std::uint32_t>::max()) return status_t::invalid_argument_k;
     if (total == 0) return status_t::success_k;
 
-    int const device = stream.device();
-    cudaStream_t const handle = stream.handle();
+    int const device = executor.device();
+    cudaStream_t const handle = reinterpret_cast<cudaStream_t>(executor.stream());
+    auto const drain = [&executor]() noexcept {
+        return executor.wait().failed() ? status_t::unknown_k : status_t::success_k;
+    };
     st::expected<utilities::cuda_device_scope_t> const scope = utilities::cuda_device_scope_t::make(device);
     if (!scope) return scope.status();
 
@@ -231,9 +234,9 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(stream_type_ const& stream, s
         return status;
 
     // Every copy above waited for the stream, so growing the scratch frees nothing a kernel still reads
-    auto const grow_temporary = [&temporary, &stream](std::size_t bytes) noexcept {
+    auto const grow_temporary = [&temporary, &drain](std::size_t bytes) noexcept {
         if (bytes <= temporary.size()) return status_t::success_k;
-        status_t const drained = stream.synchronize();
+        status_t const drained = drain();
         return drained != status_t::success_k ? drained : temporary.reserve(bytes);
     };
     std::int64_t const items = static_cast<std::int64_t>(count);
@@ -299,7 +302,7 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(stream_type_ const& stream, s
     for (std::size_t chain = 0; chain != chains_count; ++chain)
         composed_offsets[chain] = std::uint64_t {offsets[chain]} * half_edge_delta_bytes_k;
     composed_offsets[chains_count] = composed_bytes;
-    return stream.synchronize();
+    return drain();
 }
 
 } // namespace unum::ustore::graph

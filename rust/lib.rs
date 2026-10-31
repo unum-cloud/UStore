@@ -194,6 +194,7 @@
 
 #![warn(missing_docs)]
 
+pub mod arrow;
 pub mod blobs;
 pub mod collection;
 pub mod db;
@@ -212,14 +213,16 @@ pub use stringtape;
 extern crate forkunion as _;
 extern crate stringzilla as _;
 
+pub use arrow::{ArrowArray, ArrowArrayStream, ArrowSchema, IngestOrder};
 pub use blobs::{Cursor, Entry, Measurement, Page, Scanned, Values};
 pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{
-    key_unknown, version, Admission, Arena, Blocking, CPUClass, CaseSensitivity, CollectionID, Collections,
-    CommitStamp, DataDirectory, Database, Deferred, DeferredView, Deferring, Description, DropMode, Durability, Engine,
-    Error, Executor, Gds, IOOptions, Isolation, Key, LevelDBOptions, Matching, Modality, Mood, NVMEOptions,
-    PatternKind, PredicateCallback, PredicateCost, ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions,
-    Snapshot, Status, Tape, Transaction, Transport, View, Wait, Watch, UUID,
+    gpu_devices, key_unknown, version, Admission, Arena, Blocking, CPUClass, CaseSensitivity, CollectionID,
+    Collections, CommitStamp, DataDirectory, Database, Deferred, DeferredView, Deferring, Description, DropMode,
+    Durability, Engine, Error, Executor, Gds, GPUClass, GPUDevice, GPUVendor, IOOptions, Isolation, Key,
+    LevelDBOptions, Matching, Modality, Mood, NVMEOptions, PatternKind, PredicateCallback, PredicateCost,
+    ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions, Snapshot, Status, Tape, Transaction, Transport,
+    View, Wait, Watch, UUID,
 };
 pub use docs::{
     Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, Document, DocumentEntry, FieldAddress, FieldEntry,

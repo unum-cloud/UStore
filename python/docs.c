@@ -295,28 +295,21 @@ int ustore_py_json_from_object(PyObject* object, yyjson_mut_doc* document, yyjso
 
 #pragma region Writes
 
-/**
- *  @brief The documents one write batch hands the ABI.
- *
- *  A tape of JSON text passes as it is. A string travels as the UTF-8 bytes it caches, so the batch
- *  holds the one document or a tuple of every document until the call finishes, which no concurrent
- *  change to the caller's list can release. A document given as a Python object is serialized into
- *  memory the batch owns until it is released.
- */
+/** The documents one write batch hands the ABI, where one given as a Python object is serialized into memory the
+ *  batch owns until it is released. */
 typedef struct documents_t {
 
-    /** The views the ABI reads, one per task or one for every task, or the tape it reads. */
-    ustore_py_contents_t contents;
-
-    /** The one document or a tuple of every document, keeping every string alive, or NULL for a column. */
-    PyObject* held;
+    /** The texts the ABI reads, a tape, or a column of scalars with nothing held. */
+    ustore_py_texts_t texts;
 
     /** The text of every serialized document, or NULL before the first. */
     yyjson_alc* serialized;
 } documents_t;
 
-/** Appends @p object serialized as JSON to @p documents, keeping the text until the batch is released. */
-static int document_serialize(PyObject* object, documents_t* documents) {
+/** Appends @p object serialized as JSON to the @c documents_t that @p state is, keeping the text until the batch is
+ *  released. */
+static int document_serialize(PyObject* object, void* state) {
+    documents_t* const documents = (documents_t*)state;
     if (!documents->serialized && !(documents->serialized = yyjson_alc_dyn_new())) {
         PyErr_NoMemory();
         return -1;
@@ -342,25 +335,7 @@ static int document_serialize(PyObject* object, documents_t* documents) {
                             "Cannot serialize the document: %s", error.msg ? error.msg : "no detail");
         return -1;
     }
-    ustore_py_contents_t* const batch = &documents->contents;
-    batch->views[batch->count].data = (uint8_t const*)text;
-    batch->views[batch->count].length = (ustore_size_t)length;
-    ++batch->count;
-    return 0;
-}
-
-/** Borrows one document: a string as its UTF-8 bytes, a buffer as it is, and any other object but None
- *  serialized when the documents are JSON, since a removal takes a verb of its own. */
-static int document_borrow(PyObject* object, ustore_docs_field_type_t type, documents_t* documents) {
-    ustore_py_contents_t* const batch = &documents->contents;
-    if (!PyUnicode_Check(object)) {
-        if (object == Py_None || type != ustore_docs_field_type_json_k || PyObject_CheckBuffer(object))
-            return ustore_py_contents_borrow(object, batch);
-        return document_serialize(object, documents);
-    }
-    Py_ssize_t length = 0;
-    char const* const text = PyUnicode_AsUTF8AndSize(object, &length);
-    if (!text) return -1;
+    ustore_py_contents_t* const batch = &documents->texts.contents;
     batch->views[batch->count].data = (uint8_t const*)text;
     batch->views[batch->count].length = (ustore_size_t)length;
     ++batch->count;
@@ -369,8 +344,7 @@ static int document_borrow(PyObject* object, ustore_docs_field_type_t type, docu
 
 /** Releases whatever @c documents_from_object acquired. */
 static void documents_release(documents_t* documents) {
-    ustore_py_contents_release(&documents->contents);
-    Py_CLEAR(documents->held);
+    ustore_py_texts_release(&documents->texts);
     if (documents->serialized) yyjson_alc_dyn_free(documents->serialized);
     documents->serialized = NULL;
 }
@@ -415,17 +389,18 @@ static int scalars_from_object(PyObject* object, ustore_docs_field_type_t type, 
 
     ustore_py_contents_spread_t const spread = values_count == 1 ? ustore_py_contents_broadcast_k
                                                                  : ustore_py_contents_per_task_k;
-    if (ustore_py_contents_reserve(&documents->contents, values_count, spread) != 0) {
+    if (ustore_py_contents_reserve(&documents->texts.contents, values_count, spread) != 0) {
         PyBuffer_Release(&buffer);
         return -1;
     }
     // One buffer backs every task, so the batch borrows once and releases once.
-    documents->contents.buffers[0] = buffer;
-    documents->contents.borrowed = 1;
-    documents->contents.count = values_count;
+    ustore_py_contents_t* const batch = &documents->texts.contents;
+    batch->buffers[0] = buffer;
+    batch->borrowed = 1;
+    batch->count = values_count;
     for (size_t task_index = 0; task_index != values_count; ++task_index) {
-        documents->contents.views[task_index].data = (uint8_t const*)buffer.buf + task_index * width;
-        documents->contents.views[task_index].length = (ustore_size_t)width;
+        batch->views[task_index].data = (uint8_t const*)buffer.buf + task_index * width;
+        batch->views[task_index].length = (ustore_size_t)width;
     }
     return 0;
 }
@@ -439,35 +414,9 @@ static int scalars_from_object(PyObject* object, ustore_docs_field_type_t type, 
  */
 static int documents_from_object(PyObject* object, ustore_docs_field_type_t type, documents_t* documents) {
     memset(documents, 0, sizeof(*documents));
-    int const tape = ustore_py_contents_from_tape(object, &documents->contents);
-    if (tape != 0) return tape < 0 ? -1 : 0;
-
-    // A string, a bytes-like object or a dict is one document for every key, not a sequence of characters or keys.
-    if (PyUnicode_Check(object) || PyObject_CheckBuffer(object) || PyDict_Check(object)) {
-        if (ustore_py_contents_reserve(&documents->contents, 1, ustore_py_contents_broadcast_k) != 0) return -1;
-        documents->held = Py_NewRef(object);
-        if (document_borrow(object, type, documents) != 0) {
-            documents_release(documents);
-            return -1;
-        }
-        return 0;
-    }
-
-    documents->held = PySequence_Tuple(object);
-    if (!documents->held)
-        return ustore_py_raise_from_cause(PyExc_TypeError, "Expected a sequence of documents or one document, not %S",
-                                          Py_TYPE(object));
-    size_t const count = (size_t)PyTuple_GET_SIZE(documents->held);
-    if (ustore_py_contents_reserve(&documents->contents, count, ustore_py_contents_per_task_k) != 0) {
-        Py_CLEAR(documents->held);
-        return -1;
-    }
-    for (size_t task_index = 0; task_index != count; ++task_index)
-        if (document_borrow(PyTuple_GET_ITEM(documents->held, (Py_ssize_t)task_index), type, documents) != 0) {
-            documents_release(documents);
-            return -1;
-        }
-    return 0;
+    // A removal takes a verb of its own, so None never serializes, and only JSON documents serialize anything else.
+    ustore_py_text_serializer_t const serializer = type == ustore_docs_field_type_json_k ? document_serialize : NULL;
+    return ustore_py_texts_from_object(object, "documents", serializer, documents, &documents->texts);
 }
 
 /**
@@ -482,17 +431,17 @@ static int documents_from_objects(PyObject* objects, documents_t* documents) {
         PyErr_Format(PyExc_TypeError, "A batch of documents is a sequence of them, not one %S", Py_TYPE(objects));
         return -1;
     }
-    documents->held = PySequence_Tuple(objects);
-    if (!documents->held)
+    documents->texts.held = PySequence_Tuple(objects);
+    if (!documents->texts.held)
         return ustore_py_raise_from_cause(PyExc_TypeError, "A batch of documents is a sequence of them, not %S",
                                           Py_TYPE(objects));
-    size_t const count = (size_t)PyTuple_GET_SIZE(documents->held);
-    if (ustore_py_contents_reserve(&documents->contents, count, ustore_py_contents_per_task_k) != 0) {
-        Py_CLEAR(documents->held);
+    size_t const count = (size_t)PyTuple_GET_SIZE(documents->texts.held);
+    if (ustore_py_contents_reserve(&documents->texts.contents, count, ustore_py_contents_per_task_k) != 0) {
+        Py_CLEAR(documents->texts.held);
         return -1;
     }
     for (size_t task_index = 0; task_index != count; ++task_index)
-        if (document_serialize(PyTuple_GET_ITEM(documents->held, (Py_ssize_t)task_index), documents) != 0) {
+        if (document_serialize(PyTuple_GET_ITEM(documents->texts.held, (Py_ssize_t)task_index), documents) != 0) {
             documents_release(documents);
             return -1;
         }
@@ -537,9 +486,9 @@ static ustore_py_verb_t const docs_write_verb = {sizeof(docs_write_call_t), docs
 
 /** Whether @p documents spell one per key of a batch of @p count, raising otherwise; one for every key always does. */
 static int documents_match(documents_t const* documents, size_t count) {
-    if (documents->contents.spread == ustore_py_contents_broadcast_k || documents->contents.count == count) return 0;
-    return ustore_py_raise(ustore_status_invalid_argument_k, "Got %zu documents for %zu keys",
-                           documents->contents.count, count);
+    ustore_py_contents_t const* const batch = &documents->texts.contents;
+    if (batch->spread == ustore_py_contents_broadcast_k || batch->count == count) return 0;
+    return ustore_py_raise(ustore_status_invalid_argument_k, "Got %zu documents for %zu keys", batch->count, count);
 }
 
 /**
@@ -562,7 +511,7 @@ static PyObject* documents_write(ustore_py_context_t const* context, ustore_py_v
         .collections = {&call->call.collection, 0},
         .keys = {keys, sizeof(ustore_key_t)},
         .id_field = cached_bytes(call->id_field),
-        .values = call->documents.contents.view,
+        .values = call->documents.texts.contents.view,
         .type = type,
         .modification = modification,
         .durability = options->durability,
@@ -682,11 +631,11 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
     size_t count = call->keys.count;
     if (args[0] == Py_None) {
         // Every key is read out of its own document, so each task needs a document of its own.
-        if (!id_field || call->documents.contents.spread == ustore_py_contents_broadcast_k) {
+        if (!id_field || call->documents.texts.contents.spread == ustore_py_contents_broadcast_k) {
             PyErr_SetString(PyExc_TypeError, "Documents without keys need a sequence of them and an 'id_field'");
             return ustore_py_call_discard(&context, &docs_write_verb, call);
         }
-        count = call->documents.contents.count;
+        count = call->documents.texts.contents.count;
     }
     else if (documents_match(&call->documents, count) != 0)
         return ustore_py_call_discard(&context, &docs_write_verb, call);

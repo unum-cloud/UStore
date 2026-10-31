@@ -703,13 +703,14 @@ struct vram_nvidia_adjacency_fold_t {
 
     /**
      *  @brief Composes chain @c c, the changes from @p chain_starts[c] to @p chain_starts[c + 1] oldest first, into the
-     *      bytes of @p composed from @p composed_offsets[c] to @p composed_offsets[c + 1], on the device of @p stream.
-     *  @tparam stream_type_ The CUDA stream the device work queues on, @c utilities::cuda_stream_t.
+     *      bytes of @p composed from @p composed_offsets[c] to @p composed_offsets[c + 1], on the device of
+     *      @p executor.
+     *  @tparam executor_type_ The executor whose stream the device work queues on, @c utilities::cuda_executor_t.
      *  @retval invalid_argument_k A delta is no change, or carries a ragged or malformed record.
      *  @retval out_of_memory_heap_k A buffer could not grow.
      */
-    template <typename stream_type_>
-    st::status_t compose(stream_type_ const& stream, std::span<delta_view_t const> changes,
+    template <typename executor_type_>
+    st::status_t compose(executor_type_& executor, std::span<delta_view_t const> changes,
                          std::span<std::uint64_t const> chain_starts, st::basic_vector<byte_t>& composed,
                          st::basic_vector<std::uint64_t>& composed_offsets) const noexcept;
 };

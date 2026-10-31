@@ -102,7 +102,7 @@ use crate::db::{
 // region: Raw Declarations
 
 /// One-to-one mirror of `c/ustore/docs.h`.
-mod ffi {
+pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 
     use super::*;
@@ -255,7 +255,7 @@ mod ffi {
 // region: Formats
 
 /// Keeps the formats and the inputs of the verbs closed over the types this module names.
-mod sealed {
+pub(crate) mod sealed {
     use super::*;
 
     /// A format with a `ustore_docs_field_type_t` of its own.

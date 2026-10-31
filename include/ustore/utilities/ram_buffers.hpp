@@ -14,6 +14,7 @@
 #include <cstring> // `std::memcpy`, `std::memset`
 
 #include <algorithm>   // `std::max`
+#include <array>       // `std::array`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::allocator_traits`
 #include <new>         // placement `new`
@@ -24,10 +25,13 @@
 
 #include <forkunion/forkunion.h>
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <stringzilla/capabilities.h>  // `sz_find_kernel_punned`, `sz_kernel_find_byteset_t`
+#include <stringzilla/strings.h>       // `sz_kernel_strings_unescape_t`
 #include <stringzilla/types.h>         // `sz_allocator_t`
 
 #include "ustore/utilities/ram_device.hpp" // `claim_t`
 #include "ustore/utilities/types.hpp"      // `expected`, `status_t`, `round_up_to_multiple`, `u32_tape`, `u64_tape`
+#include "ustore/utilities/tapes.hpp"      // `assemble_tape`, `tape_source_t`
 
 /** An arena made by @c ustore_arena_init: the memory where its executor computes, and the words its calls synchronize
  *  on. */
@@ -58,11 +62,44 @@ struct ustore_arena_handle_t {
         fu_memory_domain_id_t memory_domain;
     };
 
-    /** The memory of an arena on one CUDA device, which a VRAM executor makes and only device towers carve. */
+    /** One run of device memory, which the host bumps without touching it. */
+    struct device_block_t {
+        std::uintptr_t address;
+        std::size_t capacity;
+    };
+
+    /** The memory of an arena on one device: its runs listed on the host, oldest first, of which only the newest is
+     *  bumped, so every older one is full. */
+    struct device_blocks_t {
+
+        /** Runs an arena lists at most, as each at least doubles the one before it from a page. */
+        static constexpr std::size_t blocks_capacity_k = 32;
+
+        /** How many of @c blocks are listed. */
+        std::uint32_t count = 0;
+
+        /** Bytes handed out of the newest run. */
+        std::size_t used = 0;
+
+        std::array<device_block_t, blocks_capacity_k> blocks {};
+    };
+
+    /** The memory of an arena on one NVIDIA device, which a VRAM executor makes and its towers carve. */
     struct cuda_blocks_t {
 
-        /** The CUDA ordinal every block lives on. */
-        std::int32_t device;
+        /** The CUDA ordinal of the device every run lives on. */
+        std::int32_t device = 0;
+
+        device_blocks_t blocks;
+    };
+
+    /** The memory of an arena on one AMD device, which a VRAM executor makes and its towers carve. */
+    struct hip_blocks_t {
+
+        /** The HIP ordinal of the device every run lives on. */
+        std::int32_t device = 0;
+
+        device_blocks_t blocks;
     };
 
     /** Whether a call fills the arena, so a second call naming it finds it contended. */
@@ -71,8 +108,11 @@ struct ustore_arena_handle_t {
     /** Deferred calls naming the arena that are not final, through @c std::atomic_ref. */
     std::uint32_t deferred_calls = 0;
 
+    /** Arrow arrays reading the arena's outputs, with @c arena_freed_bit_k set once @c ustore_arena_free ran. */
+    std::uint32_t exports = 0;
+
     /** Host pages for the calls of a host executor, or one device's memory for those of a VRAM executor. */
-    std::variant<host_blocks_t, cuda_blocks_t> memory;
+    std::variant<host_blocks_t, cuda_blocks_t, hip_blocks_t> memory;
 };
 
 namespace unum::ustore::utilities {
@@ -83,8 +123,21 @@ using arena_block_t = ustore_arena_handle_t::block_t;
 /** The memory of an arena on host pages. */
 using host_blocks_t = ustore_arena_handle_t::host_blocks_t;
 
+/** One run of device memory. */
+using device_block_t = ustore_arena_handle_t::device_block_t;
+static_assert(sizeof(device_block_t) == 16);
+
+/** The runs of device memory an arena or an executor bumps. */
+using device_blocks_t = ustore_arena_handle_t::device_blocks_t;
+
 /** The memory of an arena on one CUDA device. */
 using cuda_blocks_t = ustore_arena_handle_t::cuda_blocks_t;
+
+/** The memory of an arena on one AMD device. */
+using hip_blocks_t = ustore_arena_handle_t::hip_blocks_t;
+
+/** The bit of @c ustore_arena_handle_t::exports that @c ustore_arena_free sets, so the last export frees the arena. */
+inline constexpr std::uint32_t arena_freed_bit_k = std::uint32_t {1} << 31;
 
 /** Where every allocation in an arena starts, as Apache Arrow aligns its buffers, so typed outputs read in place. */
 constexpr std::size_t arena_alignment_k = 64;
@@ -127,11 +180,28 @@ expected<std::span<element_type_>> carve(host_blocks_t& blocks, std::size_t coun
     return std::span<element_type_> {static_cast<element_type_*>(bytes), count};
 }
 
-/** Carves @p count elements off one device's @p blocks, which only the device towers of a later wave do. */
-template <typename element_type_>
-expected<std::span<element_type_>> carve(cuda_blocks_t&, std::size_t count) noexcept {
-    if (!count) return std::span<element_type_> {};
-    return status_t {status_code_t::unsupported_k, "No engine writes outputs into device memory yet"};
+/** Runs of managed memory, which the host and one device both reach, as StringZilla's device engines read what the
+ *  host lays out. */
+struct managed_blocks_t {
+    device_blocks_t blocks;
+};
+
+/** Bumps @p padded bytes, a multiple of @c arena_alignment_k, off the newest run of @p blocks, answering zero when they
+ *  do not fit; the caller's driver opens the next run. */
+inline std::uintptr_t bump(device_blocks_t& blocks, std::size_t padded) noexcept {
+    if (!blocks.count) return 0;
+    device_block_t const& newest = blocks.blocks[blocks.count - 1];
+    if (newest.capacity - blocks.used < padded) return 0;
+    std::uintptr_t const address = newest.address + blocks.used;
+    blocks.used += padded;
+    return address;
+}
+
+/** Bytes of the run to open for @p padded bytes that do not fit the newest of @p blocks: the request rounded up to a
+ *  page, and at least double the newest run. */
+inline std::size_t grown_capacity(device_blocks_t const& blocks, std::size_t padded) noexcept {
+    std::size_t const grown = blocks.count ? blocks.blocks[blocks.count - 1].capacity * arena_growth_factor_k : 0;
+    return round_up_to_multiple(std::max(grown, padded), arena_page_bytes_k);
 }
 
 /** The host blocks of @p arena, or null for an arena on a device. */
@@ -204,12 +274,9 @@ inline void rewind(host_blocks_t& blocks) noexcept {
     newest->used = sizeof(arena_block_t);
 }
 
-/** Device blocks rewind once device towers carve them. */
-inline void rewind(cuda_blocks_t&) noexcept {}
-
-/** Rewinds the memory of @p arena wherever it lives. */
+/** Rewinds the host memory of @p arena, leaving device runs to their executor, which frees them in stream order. */
 inline void arena_rewind(ustore_arena_t arena) noexcept {
-    std::visit([](auto& memory) noexcept { rewind(memory); }, arena->memory);
+    if (host_blocks_t* const blocks = host_blocks_of(arena)) rewind(*blocks);
 }
 
 /** Frees every block of @p blocks newer than @p borrowed, their first block when the caller lent it, leaving them
@@ -221,16 +288,92 @@ inline void free_blocks(host_blocks_t& blocks, arena_block_t const* borrowed = n
     }
 }
 
-/** Device blocks hold nothing until device towers carve them. */
-inline void free_blocks(cuda_blocks_t&) noexcept {}
-
-/** Frees every block of @p arena newer than @p borrowed, leaving it empty, wherever it lives. */
-inline void arena_free_blocks(ustore_arena_handle_t& arena, arena_block_t const* borrowed = nullptr) noexcept {
-    if (host_blocks_t* const blocks = std::get_if<host_blocks_t>(&arena.memory)) free_blocks(*blocks, borrowed);
-    else free_blocks(std::get<cuda_blocks_t>(arena.memory));
+/** Frees every run of @p blocks through @p free, called with each run's address, leaving them empty. */
+template <typename free_type_>
+void free_blocks(device_blocks_t& blocks, free_type_&& free) noexcept {
+    for (std::uint32_t block = 0; block != blocks.count; ++block) free(blocks.blocks[block].address);
+    blocks.count = 0, blocks.used = 0;
 }
 
-/** Frees every block of @p arena and the arena itself, where null is safe. */
+/** Frees every host block of @p arena newer than @p borrowed, leaving it empty; the runs of an arena on a device are
+ *  freed through their vendor's driver, which the host library never reaches. */
+inline void arena_free_blocks(ustore_arena_handle_t& arena, arena_block_t const* borrowed = nullptr) noexcept {
+    if (host_blocks_t* const blocks = std::get_if<host_blocks_t>(&arena.memory)) free_blocks(*blocks, borrowed);
+}
+
+/**
+ *  @brief The host arena a device executor's copies leave from and land in, whose blocks are pinned through the
+ *      driver table @p api_type_ as they grow, so those copies run asynchronously.
+ *
+ *  The driver must answer zero for a pin it took and keep the context or device the pins were taken under current
+ *  until the bounce dies.
+ */
+template <typename api_type_>
+class pinned_bounce {
+  public:
+    pinned_bounce() noexcept = default;
+
+    /** A bounce pinning through @p api, which outlives it, its blocks on @p memory_domain. */
+    pinned_bounce(api_type_ const& api, fu_memory_domain_id_t memory_domain) noexcept : api_(&api) {
+        arena_.memory = host_blocks_t {.newest = nullptr, .memory_domain = memory_domain};
+    }
+
+    pinned_bounce(pinned_bounce&& other) noexcept { swap(other); }
+    pinned_bounce& operator=(pinned_bounce&& other) noexcept {
+        swap(other);
+        return *this;
+    }
+    pinned_bounce(pinned_bounce const&) = delete;
+    pinned_bounce& operator=(pinned_bounce const&) = delete;
+    ~pinned_bounce() noexcept {
+        unpin(nullptr);
+        arena_free_blocks(arena_);
+    }
+
+    /** The arena host verbs write into and copies leave from. */
+    ustore_arena_t arena() noexcept { return &arena_; }
+
+    /** Rewinds the arena to its newest block, unpinning every older one before it is freed. */
+    void rewind() noexcept {
+        host_blocks_t& blocks = std::get<host_blocks_t>(arena_.memory);
+        unpin(blocks.newest);
+        utilities::rewind(blocks);
+    }
+
+    /** Pins every block grown since the last pin. */
+    status_t pin() noexcept {
+        host_blocks_t& blocks = std::get<host_blocks_t>(arena_.memory);
+        for (arena_block_t* block = blocks.newest; block != pinned_; block = block->previous)
+            if (api_->register_host(block, block->capacity, 0) != 0) {
+                for (arena_block_t* pinned = blocks.newest; pinned != block; pinned = pinned->previous)
+                    api_->unregister_host(pinned);
+                return {status_code_t::device_k, "The driver refused to pin the bounce"};
+            }
+        pinned_ = blocks.newest;
+        return {};
+    }
+
+  private:
+
+    /** Unpins every pinned block but @p kept, which stays pinned if it was. */
+    void unpin(arena_block_t const* kept) noexcept {
+        for (arena_block_t* block = pinned_; block; block = block->previous)
+            if (block != kept) api_->unregister_host(block);
+        if (pinned_ != kept) pinned_ = nullptr;
+    }
+
+    void swap(pinned_bounce& other) noexcept {
+        std::swap(api_, other.api_), std::swap(arena_, other.arena_), std::swap(pinned_, other.pinned_);
+    }
+
+    api_type_ const* api_ = nullptr;
+    ustore_arena_handle_t arena_ {};
+
+    /** The newest block registered with the driver, every older one registered too, or null. */
+    arena_block_t* pinned_ = nullptr;
+};
+
+/** Frees every block of @p arena, which lives on host pages, and the arena itself, where null is safe. */
 inline void arena_free(ustore_arena_t arena) noexcept {
     if (!arena) return;
     arena_free_blocks(*arena);
@@ -305,12 +448,13 @@ status_t export_strings(ustore_arena_t arena, std::size_t count, std::size_t tot
         if (offsets_status.failed()) return offsets_status;
         auto [bytes, bytes_status] = arena_allocate<byte_t>(arena, total);
         if (bytes_status.failed()) return bytes_status;
-        offsets[0] = 0;
-        for (std::size_t index = 0; index != count; ++index) {
-            ustore_bytes_view_t const string = strings(index);
-            if (string.length) std::memcpy(bytes.data() + offsets[index], string.data, string.length);
-            offsets[index + 1] = static_cast<offset_type_>(offsets[index] + string.length);
-        }
+        assemble_tape(
+            count,
+            [&](std::size_t index) noexcept {
+                ustore_bytes_view_t const string = strings(index);
+                return tape_source_t {reinterpret_cast<byte_t const*>(string.data), string.length};
+            },
+            offsets, bytes);
         if constexpr (std::is_same_v<offset_type_, std::uint32_t>) tape = u32_tape(bytes.data(), offsets.data());
         else tape = u64_tape(bytes.data(), offsets.data());
         return status_t {};
@@ -393,5 +537,15 @@ inline void stringzilla_free(void*, sz_size_t, void*, sz_stream_t) noexcept {}
 inline sz_allocator_t stringzilla_allocator(ustore_arena_t arena) noexcept {
     return {stringzilla_allocate, stringzilla_reallocate, stringzilla_free, arena};
 }
+
+/** The StringZilla kernels a handle calls directly, looked up once at open, beside the capabilities its engines
+ *  compile for. */
+struct stringzilla_kernels_t {
+    sz_capability_t capabilities = sz_cap_serial_k;
+    sz_kernel_sort_order_t sort_order = nullptr;
+    sz_kernel_utf8_count_strings_t utf8_count_strings = nullptr;
+    sz_kernel_find_byteset_t find_byteset = nullptr;
+    sz_kernel_strings_unescape_t strings_unescape = nullptr;
+};
 
 } // namespace unum::ustore::utilities

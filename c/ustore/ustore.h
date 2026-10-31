@@ -22,5 +22,6 @@
 #include "ustore/graph.h"
 #include "ustore/pages.h"
 #include "ustore/strings.h"
+#include "ustore/arrow.h"
 
 #endif // UNUM_USTORE_USTORE_H

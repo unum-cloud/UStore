@@ -920,12 +920,7 @@ int main(int argc, char** argv) {
     auto log_file = bench_config.folder.appended("single_collection_database.log");
     remove_file(log_file, muted);
 
-#if USTORE_WITH_CUDA
-    resources = std::make_shared<resources_t>(1'000'000'000'000ull, 1'000'000'000'000ull);
-    resources->gpu_devices.push_back(-1);
-#else
     resources = std::make_shared<resources_t>(1'000'000'000'000ull);
-#endif
     resources->logger = std::make_shared<logger_t>(log_file.c_str());
     initialize_posix_disk_router(bench_config.folder);
 

@@ -9,9 +9,10 @@
  *  into sorted runs that fit their bounds, planning the coalesced ranges every stored value moves in and the value
  *  offsets of every new run. Both compactors share the rules below. The device one composes chains of changes only
  *  through a device fold the caller passes, and folds on the host every chain reaching a write or a base, so without a
- *  device fold a merge of runs holding a change runs on the host. A build with @c USTORE_WITH_CUDA declares the device
- *  compactor for every compiler, its kernels in @c vram_nvidia_compaction.cuh compile under nvcc alone, and
- *  @c compaction.cu instantiates its compaction for the engine's key slots, so a host TU calls it.
+ *  device fold a merge of runs holding a change runs on the host. Every compiler sees the device compactor, which
+ *  allocates and copies through its executor: its kernels in @c vram_nvidia_compaction.cuh compile under nvcc alone,
+ *  and @c compaction.cu instantiates its compaction for the engine's key slots, so a host TU calls it, while a build
+ *  without a CUDA compiler links @c compaction_absent.cpp, which makes no device compactor.
  */
 
 #pragma once
@@ -28,7 +29,7 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`, `std::type_identity_t`
-#include <utility>     // `std::index_sequence`, `std::move`, `std::swap`
+#include <utility>     // `std::exchange`, `std::move`, `std::swap`
 #include <variant>     // `std::variant`
 
 #include <smashtable/basic_vector.hpp>           // `st::basic_vector`
@@ -37,9 +38,10 @@
 
 #include "ustore/blobs/nvme_key_slot.hpp"          // `limit`, `stored_key_concept`, `sorted_run_index_layout_t`
 #include "ustore/utilities/folds.hpp"              // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
 #include "ustore/utilities/ram_buffers.hpp"        // `local_arena_t`, `arena_allocator`
-#include "ustore/utilities/types.hpp"              // `round_up_to_multiple`
-#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_stream_t`
+#include "ustore/utilities/types.hpp"              // `round_up_to_multiple`, `expected`
+#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_executor_t`
 
 namespace unum::ustore::blobs {
 
@@ -117,6 +119,30 @@ using stamps_column_t = st::immutable_packed_array<std::uint64_t>;
 
 /** The @c delta_kind_t of one sorted run's key slots, in sorted order, packed beside its stamps. */
 using kinds_column_t = st::immutable_packed_array<std::uint8_t>;
+
+/** Where a sorted run's sections sit on its volume, all empty for a run held in memory alone, and the stamp an ingest
+ *  gave it, which only a device compactor reads, from the trailer, beside the run's index view. */
+struct sorted_run_extents_t {
+
+    /** The volume the run lives on. */
+    std::uint32_t volume = 0;
+
+    /** The index section: every cell, padding included. */
+    utilities::extent_t cells;
+
+    /** The value offsets section, empty but for a variable width. */
+    utilities::extent_t value_offsets;
+
+    /** The trailer: the saved stamps column, then the saved kinds column @c kinds_begin bytes in. */
+    utilities::extent_t trailer;
+
+    /** Where the saved kinds start inside the trailer. */
+    std::uint64_t kinds_begin = 0;
+
+    /** The stamp an ingest gave every version of a run its blob stamps zero, or zero for a run carrying its own, which
+     *  the device raises every stamp it unpacks from the trailer to. */
+    std::uint64_t assigned_stamp = 0;
+};
 
 /** The key slots of one sorted run as its sorted run index's cells hold them, and the stamp and kind of every one. */
 template <typename key_slot_type_>
@@ -506,23 +532,20 @@ constexpr key_slot_type_ padding_key_slot() noexcept {
     return padding;
 }
 
-/** Copies @p cell of a sorted run, its stamp out of @p stamps, null reading as zero, its kind out of @p kinds, null
- *  reading as a write, and its value's bytes as @c stored_value_bytes reads them, into its sorted position among
- *  @p records, skipping padding. */
+/** Copies @p cell of a sorted run, as a write stamped zero, and its value's bytes as @c stored_value_bytes reads them,
+ *  into its sorted position among @p records, skipping padding; the run's stamps and kinds land over it after. */
 template <typename key_slot_type_>
 constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout_t const& layout, std::uint64_t cell,
-                            std::uint32_t sorted_run, std::uint64_t const* stamps, std::uint8_t const* kinds,
-                            stored_value_offset_t const* value_offsets, std::uint64_t value_stride,
-                            located_key_slot<key_slot_type_>* records) noexcept {
+                            std::uint32_t sorted_run, stored_value_offset_t const* value_offsets,
+                            std::uint64_t value_stride, located_key_slot<key_slot_type_>* records) noexcept {
     std::uint64_t const sorted = layout.cell_to_sorted(cell);
     if (sorted < layout.key_slots_count)
-        records[sorted] = located_key_slot<key_slot_type_> {
-            cells[cell],
-            sorted_run,
-            kinds != nullptr ? static_cast<delta_kind_t>(kinds[sorted]) : delta_kind_t::write_k,
-            stamps != nullptr ? stamps[sorted] : std::uint64_t {0},
-            static_cast<std::uint32_t>(sorted),
-            stored_value_bytes(value_offsets, value_stride, sorted)};
+        records[sorted] = located_key_slot<key_slot_type_> {cells[cell],
+                                                            sorted_run,
+                                                            delta_kind_t::write_k,
+                                                            0,
+                                                            static_cast<std::uint32_t>(sorted),
+                                                            stored_value_bytes(value_offsets, value_stride, sorted)};
 }
 
 /**
@@ -1118,13 +1141,6 @@ struct host_compactor_t {
  *  host. */
 struct no_device_fold_t {};
 
-/** The device compactor a database's merges may run on, defined for builds with @c USTORE_WITH_CUDA. */
-class cuda_compaction_lane_t;
-
-#if USTORE_WITH_CUDA
-
-using utilities::cuda_stream_t;
-
 /** A borrowed reader of the values a fold reads, called as @c host_compactor_t calls its own, so one device compaction
  *  compiled per key slot serves a reader of any type. */
 template <typename key_slot_type_>
@@ -1168,123 +1184,292 @@ class located_value_reader {
     read_t read_ = &refuse_;
 };
 
-/** The one device compactor a database's merges run on, made once at open by whoever opens it: one stream, and device
- *  scratch every compaction reuses, grown to the largest merge it served, so a warm lane allocates nothing. */
-class cuda_compaction_lane_t {
+/** One section a device compactor reads into its scratch: an extent of a volume, landing @c into bytes past the
+ *  scratch's start. */
+struct device_section_read_t {
+
+    /** The volume the run lives on, which names the medium the transport reads it from. */
+    std::uint32_t volume = 0;
+
+    /** The section's range of that medium, aligned as an unbuffered read takes it. */
+    utilities::extent_t extent;
+
+    /** Where the bytes land, counted from the start of the scratch. */
+    std::uint64_t into = 0;
+};
+
+/** A borrowed transport moving run sections from their volumes into a device compactor's scratch, so one compaction
+ *  compiled per key slot reads through a transport of any type; an empty one reaches no volume, and the compactor
+ *  uploads every run from its memory instead. */
+class device_sections_reader_t {
   public:
 
-    /** Binds a lane to device @p ordinal with a stream of its own, its scratch never growing past @p scratch_limit
-     *  bytes, zero for no limit, failing when no such device exists. */
-    static st::expected<cuda_compaction_lane_t> make(int ordinal, std::size_t scratch_limit) noexcept;
+    /** A reader reaching no volume. */
+    device_sections_reader_t() noexcept = default;
+
+    /** Borrows @p reader, which must outlive the compactor holding it. */
+    template <typename reader_type_>
+    explicit device_sections_reader_t(reader_type_* reader) noexcept
+        : context_(reader), read_(&read_through_<reader_type_>), release_(&release_through_<reader_type_>) {}
+
+    /** Whether the reader reaches the volumes at all. */
+    explicit operator bool() const noexcept { return context_ != nullptr; }
+
+    /** Reads every one of @p reads into @p scratch, device memory, answering once every byte landed. */
+    st::status_t read(std::span<device_section_read_t const> reads, std::span<byte_t> scratch) const noexcept {
+        return read_(context_, reads, scratch);
+    }
+
+    /** Forgets the scratch it last read into, which the compactor frees next. */
+    void release() const noexcept { release_(context_); }
+
+  private:
+    using read_t = st::status_t (*)(void*, std::span<device_section_read_t const>, std::span<byte_t>) noexcept;
+    using release_t = void (*)(void*) noexcept;
+
+    template <typename reader_type_>
+    static st::status_t read_through_(void* context, std::span<device_section_read_t const> reads,
+                                      std::span<byte_t> scratch) noexcept {
+        return static_cast<reader_type_*>(context)->read(reads, scratch);
+    }
+
+    template <typename reader_type_>
+    static void release_through_(void* context) noexcept {
+        static_cast<reader_type_*>(context)->release();
+    }
+
+    static st::status_t refuse_(void*, std::span<device_section_read_t const>, std::span<byte_t>) noexcept {
+        return st::status_t::invalid_argument_k;
+    }
+
+    static void forget_nothing_(void*) noexcept {}
+
+    /** The borrowed reader. */
+    void* context_ = nullptr;
+
+    /** Calls the borrowed reader's @c read as its own type. */
+    read_t read_ = &refuse_;
+
+    /** Calls the borrowed reader's @c release as its own type. */
+    release_t release_ = &forget_nothing_;
+};
+
+/**
+ *  @brief Reads run sections into device memory through a ring of its own reaching it, cuFile's among them, on one
+ *      queue pair, registering the scratch it reads into once per scratch.
+ *  @tparam disk_type_ The ring, which must reach device memory.
+ *  @tparam waiter_type_ What a wait for completions does after a poll that moved nothing.
+ */
+template <typename disk_type_, typename waiter_type_>
+    requires utilities::ring_concept<disk_type_>
+class ring_sections_reader {
+  public:
+
+    /** Requests one batch keeps in flight. */
+    static constexpr utilities::queue_depth_t depth_k = 32;
+
+    /** Bytes one request moves at most, so a section of any size stays within one transfer of the ring. */
+    static constexpr std::uint64_t request_bytes_k = std::uint64_t {64} << 20;
+
+    /** Takes @p disk in, reading volume @c i from the medium @p media[i] names, and leases a queue pair of it. */
+    static expected<ring_sections_reader> make(disk_type_&& disk,
+                                               std::span<utilities::medium_options_t const> media) noexcept {
+        ring_sections_reader reader;
+        reader.disk_ = std::move(disk);
+        if (reader.media_.resize(media.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "The reader could not track its volumes"};
+        for (std::size_t volume = 0; volume != media.size(); ++volume) {
+            expected<utilities::registered_medium_t> registered = reader.disk_.register_medium(media[volume]);
+            if (!registered) return registered.status();
+            reader.media_[volume] = std::move(*registered);
+        }
+        expected<utilities::queue_pair_t> leased = reader.disk_.acquire_queue_pair(depth_k);
+        if (!leased) return leased.status();
+        reader.queue_pair_ = std::move(*leased);
+        return reader;
+    }
+
+    ring_sections_reader(ring_sections_reader&& other) noexcept
+        : disk_(std::move(other.disk_)), media_(std::move(other.media_)), queue_pair_(std::move(other.queue_pair_)),
+          registered_(std::move(other.registered_)) {}
+    ring_sections_reader(ring_sections_reader const&) = delete;
+    ring_sections_reader& operator=(ring_sections_reader const&) = delete;
+    ring_sections_reader& operator=(ring_sections_reader&&) = delete;
+    ~ring_sections_reader() noexcept {
+        release();
+        if (queue_pair_.held()) [[maybe_unused]]
+            status_t const released = disk_.release_queue_pair(queue_pair_);
+        for (utilities::registered_medium_t& medium : media_)
+            if (medium.held()) [[maybe_unused]]
+                status_t const detached = disk_.unregister_medium(medium);
+    }
+
+    /** Reads every one of @p reads into @p scratch, registering it first when it is new, one batch at a time. */
+    st::status_t read(std::span<device_section_read_t const> reads, std::span<byte_t> scratch) noexcept {
+        using utilities::completion_t;
+        using utilities::request_t;
+        if (registered_.held() && registered_.bytes().data() != scratch.data()) release();
+        if (!registered_.held()) {
+            expected<utilities::registered_memory_t> registered = disk_.register_memory(
+                scratch, utilities::memory_space_t::gpu_k);
+            if (!registered) return st::status_t::input_output_k;
+            registered_ = std::move(*registered);
+        }
+        std::array<request_t, depth_k> requests {};
+        std::array<completion_t, depth_k> completions {};
+        std::size_t read = 0;
+        std::uint64_t done = 0;
+        while (read != reads.size()) {
+            std::size_t staged = 0;
+            while (staged != depth_k && read != reads.size()) {
+                device_section_read_t const& section = reads[read];
+                std::uint64_t const left = section.extent.length - done;
+                std::uint64_t const length = left < request_bytes_k ? left : request_bytes_k;
+                if (section.volume >= media_.size()) return st::status_t::invalid_argument_k;
+                requests[staged] = utilities::read_request(
+                    media_[section.volume].reference(), utilities::extent_t {section.extent.offset + done, length},
+                    registered_.reference(section.into + done), queue_pair_.token(static_cast<std::uint32_t>(staged)));
+                ++staged;
+                done += length;
+                if (done == section.extent.length) ++read, done = 0;
+            }
+            for (std::size_t submitted = 0; submitted != staged;) {
+                auto [accepted, submit_status] = disk_.submit(
+                    queue_pair_, std::span<request_t const> {requests.data() + submitted, staged - submitted});
+                if (submit_status.failed()) return st::status_t::input_output_k;
+                submitted += accepted;
+            }
+            auto [completed, poll_status] = utilities::poll_completions_at_least<waiter_type_>(
+                disk_, queue_pair_, std::span<completion_t> {completions}, staged);
+            if (poll_status.failed() || completed != staged) return st::status_t::input_output_k;
+            for (std::size_t index = 0; index != staged; ++index)
+                if (!completions[index].completed_in_full()) return st::status_t::input_output_k;
+        }
+        return st::status_t::success_k;
+    }
+
+    /** Deregisters the scratch it registered, which the compactor frees next. */
+    void release() noexcept {
+        if (registered_.held()) [[maybe_unused]]
+            status_t const released = disk_.unregister_memory(registered_);
+    }
+
+  private:
+    ring_sections_reader() noexcept = default;
+
+    /** The ring, owned, and opened for this reader alone. */
+    disk_type_ disk_;
+
+    /** The medium of every volume, by volume. */
+    st::basic_vector<utilities::registered_medium_t> media_;
+
+    /** The queue pair every batch goes through. */
+    utilities::queue_pair_t queue_pair_;
+
+    /** The scratch the reads land in, as the ring registered it. */
+    utilities::registered_memory_t registered_;
+};
+
+/** Where one new sorted run starts among the survivors and the cells. */
+struct sorted_run_placement_t {
+
+    /** Index of the sorted run's first survivor. */
+    std::uint64_t first_key_slot = 0;
+
+    /** Index of the sorted run's first cell. */
+    std::uint64_t first_cell = 0;
+
+    /** Layout of the sorted run's sorted run index. */
+    sorted_run_index_layout_t layout;
+};
+
+/**
+ *  @brief The device compactor a database's merges run on, made once at open over a CUDA executor the database owns.
+ *
+ *  Every merge queues on the executor's stream and carves one context out of device scratch the compactor allocates
+ *  through the executor, grown once to the largest merge it served, while the host buffers its copies leave from and
+ *  land in are carved out of the executor's pinned bounce, rewound per merge, so a warm compactor allocates nothing.
+ *  Run sections read by extent through its sections reader where one reaches the volumes, and upload from the runs'
+ *  memory otherwise. Its kernels are only launched where nvcc compiles, in @c vram_nvidia_compaction.cuh, so no host
+ *  unit names a CUDA runtime type.
+ */
+class cuda_compactor_t {
+  public:
+
+    /** Binds a compactor to @p executor, which outlives it, reading run sections through @p sections; refused with
+     *  @c unsupported_k in a build without a CUDA compiler. */
+    static expected<cuda_compactor_t> make(utilities::cuda_executor_t& executor,
+                                           device_sections_reader_t sections = {}) noexcept;
+
+    cuda_compactor_t(cuda_compactor_t&& other) noexcept
+        : executor_(other.executor_), sections_(other.sections_), scratch_(std::exchange(other.scratch_, nullptr)),
+          scratch_bytes_(std::exchange(other.scratch_bytes_, 0)),
+          device_allocations_(std::exchange(other.device_allocations_, 0)), reads_(std::move(other.reads_)) {}
+    cuda_compactor_t& operator=(cuda_compactor_t&& other) noexcept {
+        std::swap(executor_, other.executor_), std::swap(sections_, other.sections_);
+        std::swap(scratch_, other.scratch_), std::swap(scratch_bytes_, other.scratch_bytes_);
+        std::swap(device_allocations_, other.device_allocations_), std::swap(reads_, other.reads_);
+        return *this;
+    }
+    cuda_compactor_t(cuda_compactor_t const&) = delete;
+    cuda_compactor_t& operator=(cuda_compactor_t const&) = delete;
+    ~cuda_compactor_t() noexcept;
 
     /**
      *  @brief Does what @c host_compactor_t::compact does with identical output, composing the chains of changes alone
      *      through @p device_fold and applying on the host, through @p fold, every chain that reaches a write, a
      *      removal or the bottom level's empty base.
      *
-     *  With @c no_device_fold_t it refuses runs holding a change with @c invalid_argument_k, and with no change to fold
-     *  the folds and @p read_value go unused. CUDA failures come back as statuses.
+     *  The @p extents of every run, @p upper ones first, say where its sections sit on its volume and which stamp an
+     *  ingest gave it. With @c no_device_fold_t it refuses runs holding a change with @c invalid_argument_k, and with
+     *  no change to fold the folds and @p read_value go unused. A merge whose scratch would pass the executor's limit,
+     *  or whose planned runs outgrow what the merge leaves free, refuses with @c out_of_memory_heap_k, so the tree
+     *  merges on the host.
      */
     template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
               typename allocator_type_>
         requires compactable_key_slot_concept<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                         sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, fold_type_ const& fold,
+                         std::span<sorted_run_extents_t const> extents, sorted_run_bounds_t const& bounds,
+                         compaction_stamps_t const& stamps, fold_type_ const& fold,
                          device_fold_type_ const& device_fold,
                          std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
                          compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
 
-    /** The ordinal of the device the lane runs on. */
-    int device() const noexcept { return stream_.device(); }
-
-    /** Device allocations the lane made, which stop once its scratch holds the largest merge it serves. */
+    /** Device allocations the compactor made, which stop once its scratch holds the largest merge it serves. */
     std::uint64_t device_allocations() const noexcept { return device_allocations_; }
 
   private:
+    cuda_compactor_t(utilities::cuda_executor_t& executor, device_sections_reader_t sections) noexcept
+        : executor_(&executor), sections_(sections) {}
 
-    /** One role of the lane's device scratch, which each compaction views as the elements it needs there. */
-    enum class scratch_role_t : std::uint8_t {
-        records_k,
-        merged_k,
-        run_cells_k,
-        run_stamps_k,
-        run_kinds_k,
-        run_offsets_k,
-        pinned_k,
-        temporary_k,
-        flags_k,
-        selected_k,
-        prefix_k,
-        placements_k,
-        cells_k,
-        stamps_k,
-        kinds_k,
-        fold_indices_k,
-        fold_records_k,
-        count_k,
-    };
+    /** Grows the scratch to hold @p bytes, carrying over its first @p kept_bytes past the page it starts on, and
+     *  freeing the smaller one in stream order after its reader forgot it. */
+    st::status_t reserve_(std::size_t bytes, std::size_t kept_bytes) noexcept;
 
-    /** The device bytes of one role. */
-    using scratch_t = utilities::cuda_device_buffer<std::byte>;
+    /** The executor every merge queues on and allocates through, borrowed. */
+    utilities::cuda_executor_t* executor_ = nullptr;
 
-    /** Roles the scratch holds. */
-    static constexpr std::size_t scratch_roles_k = static_cast<std::size_t>(scratch_role_t::count_k);
+    /** The transport run sections read through, empty where every run uploads from its memory. */
+    device_sections_reader_t sections_;
 
-    cuda_compaction_lane_t(cuda_stream_t&& stream, std::size_t scratch_limit) noexcept
-        : stream_(std::move(stream)), scratch_limit_(scratch_limit),
-          scratch_(scratch_of_(stream_.device(), std::make_index_sequence<scratch_roles_k> {})) {}
+    /** The device scratch every merge carves its context from, owned. */
+    byte_t* scratch_ = nullptr;
 
-    template <std::size_t... roles_>
-    static std::array<scratch_t, scratch_roles_k> scratch_of_(int device, std::index_sequence<roles_...>) noexcept {
-        return {((void)roles_, scratch_t {utilities::cuda_device_allocator<std::byte>(device)})...};
-    }
-
-    /**
-     *  @brief Points @p into at room for @p count elements in the scratch of @p role, growing it when it holds fewer
-     *      bytes, after the kernels queued so far finished with what it held.
-     *  @retval out_of_memory_heap_k The growth would take the scratch past its limit, so the merge runs on the host.
-     *  @note Device memory carries no type of its own, so a role's bytes are viewed as whatever elements a compaction
-     *      places there.
-     */
-    template <typename element_type_>
-    st::status_t room_(scratch_role_t role, std::size_t count, element_type_*& into) noexcept {
-        scratch_t& scratch = scratch_[static_cast<std::size_t>(role)];
-        std::size_t const bytes = count * sizeof(element_type_);
-        if (bytes > scratch.size()) {
-            std::size_t const others = scratch_bytes_ - scratch.size();
-            if (scratch_limit_ != 0 && others + bytes > scratch_limit_) return st::status_t::out_of_memory_heap_k;
-            if (st::status_t const drained = stream_.synchronize(); drained != st::status_t::success_k) return drained;
-            st::status_t const grown = scratch.reserve(bytes);
-            scratch_bytes_ = others + scratch.size();
-            if (grown != st::status_t::success_k) return grown;
-            ++device_allocations_;
-        }
-        into = static_cast<element_type_*>(static_cast<void*>(scratch.data()));
-        return st::status_t::success_k;
-    }
-
-    /** The stream every transfer and kernel of the lane queues on. */
-    cuda_stream_t stream_;
-
-    /** Bytes the scratch may hold across every role, zero for no limit. */
-    std::size_t scratch_limit_ = 0;
-
-    /** Bytes the scratch holds across every role. */
+    /** Bytes the scratch holds. */
     std::size_t scratch_bytes_ = 0;
 
-    /** The device scratch every compaction reuses, one buffer per role. */
-    std::array<scratch_t, scratch_roles_k> scratch_;
-
-    /** Device allocations the scratch made since the lane was made. */
+    /** Device allocations the scratch made. */
     std::uint64_t device_allocations_ = 0;
+
+    /** The sections the merge reads through @c sections_. */
+    st::basic_vector<device_section_read_t> reads_;
 };
 
-#endif
-
 /** The compactor a database's merges run on, picked once at mount by whoever opens it: the calling thread, or a warm
- *  device lane that opener owns. */
-using compactor_ref_t = std::variant<host_compactor_t, cuda_compaction_lane_t*>;
+ *  device compactor that opener owns. */
+using compactor_ref_t = std::variant<host_compactor_t, cuda_compactor_t*>;
 
 #pragma endregion Device
 

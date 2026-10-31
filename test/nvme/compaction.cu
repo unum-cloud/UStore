@@ -4,35 +4,40 @@
  *  @date September 15, 2026
  *  @brief Tests host and GPU compaction against a reference merge and against each other, for 64-bit and 16-byte keys.
  *
- *  The suite compiles as plain C++ twice: the build over the CUDA compactor adds the device cases, which the host build
- *  reports as skipped, and @c compaction_device.cu instantiates that compactor for the suite's key slots. LSM
- *  levels are generated from a seed, with overlapping and sorted runs, remove deltas, versions of one key under
- *  several stamps, and keys crowded at the edges a comparator gets wrong. Graph levels of half-edge changes check the
- *  device fold against the host fold byte for byte.
+ *  The suite compiles as plain C++ twice: over the CUDA compactor, which @c compaction_device.cu instantiates for the
+ *  suite's key slots, and over @c compaction_absent.cpp, which makes no device compactor, so its device cases report
+ *  as skipped. LSM levels are generated from a seed, with overlapping and sorted runs, remove deltas, versions of one
+ *  key under several stamps, and keys crowded at the edges a comparator gets wrong. Graph levels of half-edge changes
+ *  check the device fold against the host fold byte for byte.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
-#include <cstring> // `std::memcmp`
+#include <cstdio>  // `std::fopen`, `std::fwrite`, `std::fclose`
+#include <cstring> // `std::memcmp`, `std::memcpy`, `std::memset`
 
 #include <algorithm>   // `std::sort`, `std::unique`
 #include <array>       // `std::array`
 #include <chrono>      // `std::chrono::steady_clock`
 #include <limits>      // `std::numeric_limits`
-#include <span>        // `std::span`
+#include <span>        // `std::span`, `std::as_bytes`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::type_identity`
 
 #include <fmt/format.h>
 
+#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
+#include <forkunion/types.hpp>   // `fu::standard_yield_t`
 #include <smashtable/basic_vector.hpp>
 #include <smashtable/shared.hpp>
 
-#include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compacted_sorted_run_t`, `compaction_kind_t`
-#include "ustore/graph/adjacency_fold.hpp"         // `adjacency_fold_t`, `vram_nvidia_adjacency_fold_t`, `save_delta`
-#include "ustore/utilities/types.hpp"              // `status_t`, `status_code_t`
-#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_count_devices`, `cuda_pinned_allocator`
+#include "ustore/blobs/nvme_compaction.hpp" // `host_compactor_t`, `compacted_sorted_run_t`, `compaction_kind_t`
+#include "ustore/graph/adjacency_fold.hpp"  // `adjacency_fold_t`, `vram_nvidia_adjacency_fold_t`, `save_delta`
+#include "ustore/utilities/nvme_linux_cufile_disk.hpp" // `linux_cufile_files_disk`, `linux_cufile_disk_config_t`
+#include "ustore/utilities/types.hpp"                  // `status_t`, `status_code_t`
+#include "ustore/utilities/vram_device.hpp"            // `gpu_drivers_t`, `list_gpu_devices`
 
 #include "harness.hpp"                   // `suite_exit_code`, `expect`, `expect_eq`
 #include "nvme/compaction_key_slots.hpp" // `inline_key_slot`, `fixed_width_key_slot`, `variable_width_key_slot`
@@ -304,6 +309,9 @@ struct test_lsm_level {
 
     /** A view per sorted run into @c cells, @c columns, @c kind_columns and @c value_offsets. */
     basic_vector<sorted_run_index_view<key_slot_type_>> views;
+
+    /** Where each sorted run's sections sit in the suite's sections file, empty until @c lay_sections lays them. */
+    basic_vector<sorted_run_extents_t> extents;
 };
 
 /** The views of an LSM level's sorted runs, as a compaction takes them. */
@@ -311,6 +319,19 @@ template <typename key_slot_type_>
 std::span<sorted_run_index_view<key_slot_type_> const> views_of(
     test_lsm_level<key_slot_type_> const& lsm_level) noexcept {
     return lsm_level.views;
+}
+
+/** Where every sorted run of @p upper, then of @p lower, sits on its volume, as a device compaction takes them: as
+ *  @c lay_sections laid it, or nowhere for a run uploading from memory. */
+template <typename key_slot_type_>
+basic_vector<sorted_run_extents_t> extents_of(test_lsm_level<key_slot_type_> const& upper,
+                                              test_lsm_level<key_slot_type_> const& lower) noexcept {
+    basic_vector<sorted_run_extents_t> extents;
+    if (extents.resize(upper.views.size() + lower.views.size()) != st::status_t::success_k) return extents;
+    for (std::size_t run = 0; run != upper.extents.size(); ++run) extents[run] = upper.extents[run];
+    for (std::size_t run = 0; run != lower.extents.size(); ++run)
+        extents[upper.views.size() + run] = lower.extents[run];
+    return extents;
 }
 
 /** Assigns sorted positions to a sorted run index's cells the way the B-tree builder fills sorted runs, answering the
@@ -1111,7 +1132,19 @@ struct options_t {
 
     /** Random keys the large cases draw from, which puts their merges past the GPU threshold. */
     count_t large_universe {600'000};
+
+    /** The process's drivers, which retained device zero's primary context, or none without a device. */
+    gpu_drivers_t const* drivers = nullptr;
 };
+
+/** Spawns an executor on CUDA device zero with a stream of its own, its scratch capped at @p scratch_limit bytes, or
+ *  refuses with @c device_k where no driver reaches the device. */
+expected<cuda_executor_t> spawn_device_zero(options_t const& options, std::size_t scratch_limit) noexcept {
+    if (options.drivers == nullptr || options.drivers->cuda_contexts[0] == nullptr)
+        return status_t {status_code_t::device_k, "No CUDA device zero"};
+    return cuda_executor_t::spawn(options.drivers->cuda, options.drivers->cuda_contexts[0], 0, gpu_class_t::unknown_k,
+                                  nullptr, scratch_limit, ustore_gds_automatic_k);
+}
 
 /** Bounds where the key slots capacity cuts sorted runs. */
 inline constexpr sorted_run_bounds_t roomy_bounds_k {4096, std::uint64_t {4} << 30, 4096, 4096, 16};
@@ -1217,78 +1250,22 @@ std::size_t sorted_run_index_layout_matches_builder() {
     return failures;
 }
 
-/** A readable name of a GPU generation. */
-[[maybe_unused]] std::string_view generation_name(std::uint8_t generation) noexcept {
-    std::array<std::string_view, 5> const names {"unknown", "Ampere", "Ada", "Hopper", "Blackwell"};
-    return generation < names.size() ? names[generation] : names[0];
-}
-
-#if USTORE_WITH_CUDA
-
-/** Enumerates the devices, then round-trips a pattern through pinned and device buffers on the first one, timing it. */
-case_result_t cuda_devices_round_trip() {
+/** Lists every device the drivers reach, as the library's runtime opens them at the first VRAM call. */
+case_result_t gpu_devices_listed() {
     std::size_t failures = 0;
-    st::expected<cuda_devices_t> const devices = cuda_devices_t::make();
-    failures += expect(devices.has_value());
-    if (!devices) return failures;
-    for (std::size_t index = 0; index != devices->size(); ++index) {
-        cuda_device_t const& device = (*devices)[index];
-        fmt::println(
-            "  device {}: {}, compute capability {}.{} ({}), {} multiprocessors, {} of {} MB free, NUMA node {}",
-            device.specs.ordinal, device.specs.name, device.specs.compute_major, device.specs.compute_minor,
-            generation_name(static_cast<std::uint8_t>(device.specs.generation())), device.specs.multiprocessor_count,
-            device.memory.free_bytes >> 20, device.memory.total_bytes >> 20, device.numa_node);
-        failures += expect(device.memory.free_bytes <= device.memory.total_bytes);
-        failures += expect(device.specs.total_bytes != 0);
-        failures += expect(device.specs.multiprocessor_count > 0);
+    gpu_drivers_t const drivers;
+    std::array<gpu_device_t, 2 * gpu_devices_capacity_k> devices {};
+    std::size_t const count = list_gpu_devices(drivers, devices);
+    for (std::size_t index = 0; index != count; ++index) {
+        gpu_device_t const& device = devices[index];
+        fmt::println("  device {}: {}, architecture {}.{}, {} compute units, {} MB", index, device.name,
+                     device.architecture_major, device.architecture_minor, device.compute_units,
+                     device.memory_bytes >> 20);
+        failures += expect(device.vendor != gpu_vendor_t::unknown_k);
+        failures += expect(device.memory_bytes != 0);
+        failures += expect(device.compute_units > 0);
     }
-    if (devices->size() == 0) return case_result_t::skipped("no CUDA device", failures);
-
-    st::expected<cuda_stream_t> const stream = cuda_stream_t::make(0);
-    failures += expect(stream.has_value());
-    if (!stream) return failures;
-
-    std::size_t const count = std::size_t {1} << 20;
-    st::expected<cuda_pinned_buffer<std::uint64_t>> source = cuda_pinned_buffer<std::uint64_t>::make(
-        count, cuda_pinned_allocator<std::uint64_t> {});
-    st::expected<cuda_device_buffer<std::uint64_t>> on_device = cuda_device_buffer<std::uint64_t>::make(
-        count, cuda_device_allocator<std::uint64_t>(0));
-    st::expected<cuda_pinned_buffer<std::uint64_t>> target = cuda_pinned_buffer<std::uint64_t>::make(
-        count, cuda_pinned_allocator<std::uint64_t> {});
-    failures += expect(source.has_value() && on_device.has_value() && target.has_value());
-    if (!source || !on_device || !target) return failures;
-
-    std::uint64_t* const values = source->data();
-    for (std::size_t index = 0; index != count; ++index) values[index] = index * 0x9E3779B97F4A7C15ull;
-
-    st::expected<cuda_stopwatch_t> stopwatch = cuda_stopwatch_t::make(0);
-    st::expected<cuda_phases_t> phases = cuda_phases_t::make(*stream);
-    failures += expect(stopwatch.has_value() && phases.has_value());
-    if (!stopwatch || !phases) return failures;
-
-    failures += expect(stopwatch->start(*stream) == st::status_t::success_k);
-    failures += expect(phases->begin("copy in") == st::status_t::success_k);
-    failures += expect(on_device->copy_in(values, count, 0, stream->handle()) == st::status_t::success_k);
-    failures += expect(phases->begin("copy out") == st::status_t::success_k);
-    failures += expect(on_device->copy_out(target->data(), count, 0, stream->handle()) == st::status_t::success_k);
-    failures += expect(phases->end() == st::status_t::success_k);
-    failures += expect(stopwatch->stop(*stream) == st::status_t::success_k);
-
-    std::uint64_t const* const copied = target->data();
-    std::size_t mismatches = 0;
-    for (std::size_t index = 0; index != count; ++index) mismatches += copied[index] != values[index];
-    failures += expect_eq(mismatches, std::size_t {0});
-
-    st::expected<double> const elapsed = stopwatch->milliseconds();
-    failures += expect(elapsed.has_value() && *elapsed >= 0.0);
-    failures += expect_eq(phases->size(), std::size_t {2});
-    for (std::size_t index = 0; index != phases->size(); ++index) {
-        st::expected<double> const phase = phases->milliseconds(index);
-        failures += expect(phase.has_value() && *phase >= 0.0);
-    }
-
-    basic_vector<std::uint64_t, cuda_pinned_allocator<std::uint64_t>> pinned_vector;
-    failures += expect(pinned_vector.resize(4096) == st::status_t::success_k);
+    if (count == 0) return case_result_t::skipped("no GPU driver or device", failures);
     return failures;
 }
 
@@ -1296,62 +1273,45 @@ case_result_t cuda_devices_round_trip() {
 template <typename key_slot_type_>
 case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                        test_lsm_level<key_slot_type_> const& upper, test_lsm_level<key_slot_type_> const& lower,
-                       compaction_output<key_slot_type_> const& host) {
-    st::expected<std::size_t> const devices = cuda_count_devices();
-    if (!devices || *devices == 0) return case_result_t::skipped("no CUDA device");
+                       compaction_output<key_slot_type_> const& host, options_t const& options) {
+    expected<cuda_executor_t> executor = spawn_device_zero(options, 0);
+    if (!executor) return case_result_t::skipped("no CUDA device");
+    expected<cuda_compactor_t> compactor = cuda_compactor_t::make(*executor);
+    if (!compactor) return case_result_t::skipped("no CUDA compactor");
     std::size_t failures = 0;
-    st::expected<cuda_compaction_lane_t> compactor = cuda_compaction_lane_t::make(0, 0);
-    failures += expect(compactor.has_value());
-    if (!compactor) return failures;
     compaction_output<key_slot_type_> device;
-    st::status_t const status = compactor->compact(kind, views_of(upper), views_of(lower), bounds, stamps,
-                                                   last_write_fold_t {}, no_device_fold_t {},
+    st::status_t const status = compactor->compact(kind, views_of(upper), views_of(lower), extents_of(upper, lower),
+                                                   bounds, stamps, last_write_fold_t {}, no_device_fold_t {},
                                                    located_value_reader<key_slot_type_> {}, device);
     failures += expect(status == st::status_t::success_k);
-
-    // A status alone cannot say that the build carries no kernel image for this device, so name the CUDA error
-    if (status != st::status_t::success_k) {
-        cudaError_t const error = cudaGetLastError();
-        fmt::println(stderr, "  CUDA reported {}: {}", cudaGetErrorName(error), cudaGetErrorString(error));
-    }
     if (status == st::status_t::success_k) failures += expect_identical(host, device);
 
-    // A warm lane serves the same merge again out of the scratch it already grew, allocating nothing on the device.
+    // A warm compactor serves the same merge again out of the scratch it already grew, allocating nothing on the
+    // device.
     std::uint64_t const warmed = compactor->device_allocations();
     compaction_output<key_slot_type_> again;
-    failures += expect(compactor->compact(kind, views_of(upper), views_of(lower), bounds, stamps, last_write_fold_t {},
-                                          no_device_fold_t {}, located_value_reader<key_slot_type_> {},
-                                          again) == st::status_t::success_k);
+    failures += expect(compactor->compact(kind, views_of(upper), views_of(lower), extents_of(upper, lower), bounds,
+                                          stamps, last_write_fold_t {}, no_device_fold_t {},
+                                          located_value_reader<key_slot_type_> {}, again) == st::status_t::success_k);
     failures += expect_eq(compactor->device_allocations(), warmed);
     failures += expect_identical(host, again);
 
-    // A lane whose scratch limit no merge fits refuses before it allocates, so the tree merges on the host instead.
-    st::expected<cuda_compaction_lane_t> narrow = cuda_compaction_lane_t::make(0, 1);
+    // An executor whose scratch limit no merge fits refuses before it allocates, so the tree merges on the host
+    // instead.
+    expected<cuda_executor_t> narrow_executor = spawn_device_zero(options, 1);
+    failures += expect(narrow_executor.has_value());
+    if (!narrow_executor) return failures;
+    expected<cuda_compactor_t> narrow = cuda_compactor_t::make(*narrow_executor);
     failures += expect(narrow.has_value());
     if (!narrow) return failures;
     compaction_output<key_slot_type_> refused;
-    st::status_t const refusal = narrow->compact(kind, views_of(upper), views_of(lower), bounds, stamps,
-                                                 last_write_fold_t {}, no_device_fold_t {},
+    st::status_t const refusal = narrow->compact(kind, views_of(upper), views_of(lower), extents_of(upper, lower),
+                                                 bounds, stamps, last_write_fold_t {}, no_device_fold_t {},
                                                  located_value_reader<key_slot_type_> {}, refused);
-    failures += expect(refusal == st::status_t::out_of_memory_heap_k || upper.sorted.size() + lower.sorted.size() == 0);
+    failures += expect(refusal == st::status_t::out_of_memory_heap_k);
     failures += expect_eq(narrow->device_allocations(), std::uint64_t {0});
     return failures;
 }
-
-#else
-
-/** The device round trip skips in a build without CUDA. */
-case_result_t cuda_devices_round_trip() { return case_result_t::skipped("built without CUDA"); }
-
-/** A GPU case skips in a build without CUDA. */
-template <typename key_slot_type_>
-case_result_t gpu_case(compaction_kind_t, sorted_run_bounds_t const&, compaction_stamps_t const&,
-                       test_lsm_level<key_slot_type_> const&, test_lsm_level<key_slot_type_> const&,
-                       compaction_output<key_slot_type_> const&) {
-    return case_result_t::skipped("built without CUDA");
-}
-
-#endif
 
 /** Checks one compaction of @p upper into @p lower on the host against the reference, then on the GPU against the
  *  host. */
@@ -1359,7 +1319,7 @@ template <typename key_slot_type_>
 std::size_t report_compaction(suite_totals_t& totals, char const* host_name, char const* gpu_name,
                               compaction_kind_t kind, sorted_run_bounds_t const& bounds,
                               compaction_stamps_t const& stamps, test_lsm_level<key_slot_type_> const& upper,
-                              test_lsm_level<key_slot_type_> const& lower) {
+                              test_lsm_level<key_slot_type_> const& lower, options_t const& options) {
     if (!totals.selects(host_name) && !totals.selects(gpu_name)) return 0;
     std::size_t failures = 0;
     basic_vector<located_key_slot<key_slot_type_>> survivors;
@@ -1377,7 +1337,8 @@ std::size_t report_compaction(suite_totals_t& totals, char const* host_name, cha
     if (status == st::status_t::success_k)
         failures += check_compaction(kind, bounds, stamps, survivors, upper, lower, host);
     std::size_t const host_failures = report(totals, host_name, failures);
-    return host_failures + report(totals, gpu_name, gpu_case<key_slot_type_>, kind, bounds, stamps, upper, lower, host);
+    return host_failures +
+           report(totals, gpu_name, gpu_case<key_slot_type_>, kind, bounds, stamps, upper, lower, host, options);
 }
 
 /** The stamps a scenario compacts with: pins drawn from the stamps its levels carry, and bounds at fractions of
@@ -1446,7 +1407,7 @@ std::size_t run_scenario(suite_totals_t& totals, char const* shape, std::size_t 
     basic_vector<std::uint64_t> pins;
     compaction_stamps_t const stamps = scenario_stamps(scenario, upper, lower, random, pins);
     return report_compaction(totals, host_name, gpu_name, scenario.kind, shaped_bounds<key_slot_type_>(scenario.bounds),
-                             stamps, upper, lower);
+                             stamps, upper, lower, options);
 }
 
 #pragma endregion Cases
@@ -1652,7 +1613,7 @@ std::size_t run_handmade_case(suite_totals_t& totals, char const* shape, std::si
     failures += expect(status == st::status_t::success_k);
     if (failures != 0) return report(totals, host_name, failures);
     return report_compaction(totals, host_name, gpu_name, handmade.kind, shaped_bounds<key_slot_type_>(handmade.bounds),
-                             compaction_stamps_t {}, upper, lower);
+                             compaction_stamps_t {}, upper, lower, options);
 }
 
 #pragma endregion Handmade Cases
@@ -1854,8 +1815,6 @@ compaction_stamps_t graph_stamps(graph_levels_t const& levels, std::uint64_t cou
     return stamps;
 }
 
-#if USTORE_WITH_CUDA
-
 /** Milliseconds since @p start. */
 double milliseconds_since(std::chrono::steady_clock::time_point start) noexcept {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -1866,8 +1825,10 @@ double milliseconds_since(std::chrono::steady_clock::time_point start) noexcept 
  *  reverse, which the device output must expose. */
 case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_index, sequence_order_t order,
                              options_t const& options) {
-    st::expected<std::size_t> const devices = cuda_count_devices();
-    if (!devices || *devices == 0) return case_result_t::skipped("no CUDA device");
+    expected<cuda_executor_t> executor = spawn_device_zero(options, 0);
+    if (!executor) return case_result_t::skipped("no CUDA device");
+    expected<cuda_compactor_t> compactor = cuda_compactor_t::make(*executor);
+    if (!compactor) return case_result_t::skipped("no CUDA compactor");
     std::size_t failures = 0;
     random_t random = options.random.fork(case_index);
     graph_levels_t levels;
@@ -1918,12 +1879,11 @@ case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_in
     failures += expect(status == st::status_t::success_k);
     failures += expect(!host.folded.empty());
 
-    st::expected<cuda_compaction_lane_t> compactor = cuda_compaction_lane_t::make(0, 0);
-    failures += expect(compactor.has_value());
     if (failures != 0) return failures;
     compaction_output<graph_key_slot_t> device;
     std::chrono::steady_clock::time_point const device_start = std::chrono::steady_clock::now();
-    status = compactor->compact(graph_case.kind, views_of(levels.upper), views_of(levels.lower), roomy_bounds_k, stamps,
+    status = compactor->compact(graph_case.kind, views_of(levels.upper), views_of(levels.lower),
+                                extents_of(levels.upper, levels.lower), roomy_bounds_k, stamps,
                                 graph::adjacency_fold_t {}, graph::vram_nvidia_adjacency_fold_t {}, read_value, device);
     double const device_milliseconds = milliseconds_since(device_start);
     failures += expect(status == st::status_t::success_k);
@@ -1936,16 +1896,172 @@ case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_in
     return failures;
 }
 
-#else
+#pragma endregion Graph Folds
 
-/** A graph's device fold skips in a build without CUDA. */
-case_result_t graph_gpu_case(graph_case_t const&, std::size_t, sequence_order_t, options_t const&) {
-    return case_result_t::skipped("built without CUDA");
+#pragma region Sections By Extent
+
+/** The cuFile disk the extent case reads run sections through, as an engine's mount holds one. */
+using cufile_disk_t = linux_cufile_files_disk<fu::standard_atomic_ref, fu::standard_yield_t>;
+
+/** Appends @p bytes to @p image, zero-padded to a page, answering the extent they take in it. */
+extent_t append_section(basic_vector<byte_t>& image, std::span<byte_t const> bytes) {
+    std::uint64_t const offset = image.size();
+    std::uint64_t const length = round_up_to_multiple<std::uint64_t>(bytes.size(), portable_alignment_k);
+    if (image.resize(static_cast<std::size_t>(offset + length)) != st::status_t::success_k) return extent_t {};
+    if (!bytes.empty()) std::memcpy(image.data() + offset, bytes.data(), bytes.size());
+    std::memset(image.data() + offset + bytes.size(), 0, static_cast<std::size_t>(length - bytes.size()));
+    return extent_t {offset, length};
 }
 
-#endif
+/** Lays every run of @p level into @p image as a run's blob lays its index, value offsets and trailer, pointing each
+ *  view's extents at them, and saving @p zeroed's stamps as zeros, as an ingest writes them. */
+template <typename key_slot_type_>
+std::size_t lay_sections(test_lsm_level<key_slot_type_>& level, sorted_run_bounds_t const& bounds,
+                         std::type_identity_t<sorted_run_index_view<key_slot_type_>> const* zeroed,
+                         basic_vector<byte_t>& image) {
+    std::size_t failures = expect(level.extents.resize(level.views.size()) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    for (std::size_t run = 0; run != level.views.size(); ++run) {
+        sorted_run_index_view<key_slot_type_>& view = level.views[run];
+        std::uint64_t const cells_count = round_up_to_multiple(view.key_slots_count, bounds.branching);
+        std::size_t const count = static_cast<std::size_t>(view.key_slots_count);
+        sorted_run_extents_t& extents = level.extents[run];
+        extents.cells = append_section(image, {reinterpret_cast<byte_t const*>(view.cells),
+                                               static_cast<std::size_t>(cells_count * sizeof(key_slot_type_))});
+        extents.value_offsets = append_section(image, std::as_bytes(view.value_offsets));
+        st::expected<stamps_column_t> zeros = stamps_column_t::make(count, std::uint64_t {0});
+        st::expected<kinds_column_t> writes = kinds_column_t::make(count, std::uint8_t {0});
+        failures += expect(zeros.has_value() && writes.has_value());
+        if (failures != 0) return failures;
+        stamps_column_t const& stamps = &view == zeroed || view.stamps == nullptr ? *zeros : *view.stamps;
+        kinds_column_t const& kinds = view.kinds != nullptr ? *view.kinds : *writes;
+        basic_vector<byte_t> trailer;
+        failures += expect(trailer.resize(stamps.saved_bytes() + kinds.saved_bytes()) == st::status_t::success_k);
+        if (failures != 0) return failures;
+        std::span<std::byte> const room {reinterpret_cast<std::byte*>(trailer.data()), trailer.size()};
+        failures += expect(stamps.save(room) == st::status_t::success_k);
+        failures += expect(kinds.save(room.subspan(stamps.saved_bytes())) == st::status_t::success_k);
+        extents.trailer = append_section(image, std::span<byte_t const> {trailer});
+        extents.kinds_begin = stamps.saved_bytes();
+        failures += expect(!extents.cells.empty() || count == 0);
+    }
+    return failures;
+}
 
-#pragma endregion Graph Folds
+/** Merges levels whose run sections read by extent through cuFile, the newest run ingested with zero stamps on disk,
+ *  and expects the host's output from them, as from the same merge uploading every run from memory, timing both. */
+case_result_t gpu_reads_sections_by_extent(options_t const& options, std::string_view directory) {
+    using key_slot_t = variable_width_key_slot<std::uint64_t>;
+    if (directory.empty()) return case_result_t::skipped(needs_directory_k);
+    if (options.drivers == nullptr) return case_result_t::skipped("no CUDA device");
+    linux_cufile_probe_t const probe = cufile_disk_t::probe(options.drivers->cufile);
+    if (probe == linux_cufile_probe_t::absent_k || probe == linux_cufile_probe_t::refused_k)
+        return case_result_t::skipped("needs cuFile in direct or compat mode");
+    expected<cuda_executor_t> executor = spawn_device_zero(options, 0);
+    if (!executor) return case_result_t::skipped("no CUDA device");
+
+    std::size_t failures = 0;
+    scenario_t const& scenario = scenarios_k[8];
+    random_t random = options.random.fork(scenarios_k.size() * 2);
+    basic_vector<std::uint64_t> universe;
+    failures += expect(make_universe(options.large_universe.value, random, universe) == st::status_t::success_k);
+    test_lsm_level<key_slot_t> upper;
+    test_lsm_level<key_slot_t> lower;
+    std::span<std::uint64_t const> const keys {universe};
+    st::status_t status = add_overlapping_sorted_runs(keys, scenario, scenario.upper_sorted_runs, 1, random, upper);
+    if (status == st::status_t::success_k)
+        status = add_sorted_sorted_runs(keys, scenario, scenario.lower_sorted_runs, 0, random, lower);
+    if (status == st::status_t::success_k) status = lay_out(upper, scenario.bounds.branching);
+    if (status == st::status_t::success_k) status = lay_out(lower, scenario.bounds.branching);
+    failures += expect(status == st::status_t::success_k && !upper.views.empty());
+    if (failures != 0) return failures;
+
+    // The newest upper run is ingested: one stamp above every other in memory, and zeros in its blob
+    std::uint64_t newest = 0;
+    for (std::uint64_t const stamp : upper.stamps) newest = stamp > newest ? stamp : newest;
+    for (std::uint64_t const stamp : lower.stamps) newest = stamp > newest ? stamp : newest;
+    sorted_run_index_view<key_slot_t>& ingested = upper.views[upper.views.size() - 1];
+    st::expected<stamps_column_t> assigned = stamps_column_t::make(static_cast<std::size_t>(ingested.key_slots_count),
+                                                                   newest + 1);
+    failures += expect(assigned.has_value());
+    if (failures != 0) return failures;
+    stamps_column_t const& assigned_column = *assigned;
+    ingested.stamps = &assigned_column;
+
+    basic_vector<byte_t> image;
+    sorted_run_bounds_t const bounds = shaped_bounds<key_slot_t>(scenario.bounds);
+    failures += lay_sections(upper, bounds, &ingested, image);
+    failures += lay_sections(lower, bounds, nullptr, image);
+    if (failures != 0) return failures;
+    upper.extents[upper.extents.size() - 1].assigned_stamp = newest + 1;
+    std::string const parent {directory};
+    path_t const path {parent.c_str(), "sections.bin"};
+    std::FILE* const file = std::fopen(path.c_str(), "wb");
+    failures += expect(file != nullptr);
+    if (failures != 0) return failures;
+    failures += expect(std::fwrite(image.data(), 1, image.size(), file) == image.size());
+    failures += expect(std::fclose(file) == 0);
+
+    linux_cufile_disk_config_t config;
+    config.gds = probe == linux_cufile_probe_t::direct_k ? ustore_gds_direct_k : ustore_gds_compat_k;
+    expected<cufile_disk_t> disk = cufile_disk_t::make(options.drivers->cufile, config);
+    failures += expect_status(disk, status_code_t::success_k);
+    if (failures != 0) return failures;
+    medium_options_t request;
+    request.name = path.c_str();
+    request.access = medium_access_t::read_only_k;
+
+    basic_vector<std::uint64_t> pins;
+    compaction_stamps_t const stamps = scenario_stamps(scenario, upper, lower, random, pins);
+    auto const read_nothing = [](located_key_slot<key_slot_t> const&, arena_allocator<byte_t>&,
+                                 std::span<byte_t const>&) noexcept { return st::status_t::invalid_argument_k; };
+    compaction_output<key_slot_t> host;
+    failures += expect(host_compactor_t {}.compact(scenario.kind, views_of(upper), views_of(lower), bounds, stamps,
+                                                   last_write_fold_t {}, read_nothing,
+                                                   host) == st::status_t::success_k);
+    {
+        using reader_t = ring_sections_reader<cufile_disk_t, fu::standard_yield_t>;
+        expected<reader_t> reader = reader_t::make(std::move(*disk), std::span<medium_options_t const> {&request, 1});
+        failures += expect_status(reader, status_code_t::success_k);
+        if (failures != 0) return failures;
+        reader_t& sections = *reader;
+        expected<cuda_compactor_t> by_extent = cuda_compactor_t::make(*executor, device_sections_reader_t {&sections});
+        expected<cuda_compactor_t> from_memory = cuda_compactor_t::make(*executor);
+        failures += expect(by_extent.has_value() && from_memory.has_value());
+        if (failures != 0) return failures;
+        cuda_compactor_t& extent_compactor = *by_extent;
+        cuda_compactor_t& memory_compactor = *from_memory;
+
+        // The first merge of each grows its scratch, so the second is the one timed
+        double milliseconds[2] {};
+        cuda_compactor_t* const compactors[2] {&extent_compactor, &memory_compactor};
+        for (std::size_t index = 0; index != 2; ++index)
+            for (std::size_t round = 0; round != 2; ++round) {
+                compaction_output<key_slot_t> device;
+                std::chrono::steady_clock::time_point const start = std::chrono::steady_clock::now();
+                status = compactors[index]->compact(scenario.kind, views_of(upper), views_of(lower),
+                                                    extents_of(upper, lower), bounds, stamps, last_write_fold_t {},
+                                                    no_device_fold_t {}, located_value_reader<key_slot_t> {}, device);
+                milliseconds[index] = milliseconds_since(start);
+                failures += expect(status == st::status_t::success_k);
+                if (status == st::status_t::success_k) failures += expect_identical(host, device);
+            }
+        fmt::println("  {} key slots in {} MB of sections: by extent {:.1f} ms, from memory {:.1f} ms",
+                     upper.sorted.size() + lower.sorted.size(), image.size() >> 20, milliseconds[0], milliseconds[1]);
+
+        // Without its assigned stamp, the ingested run's zeros on disk would surface in the merge
+        upper.extents[upper.extents.size() - 1].assigned_stamp = 0;
+        compaction_output<key_slot_t> unassigned;
+        failures += expect(by_extent->compact(scenario.kind, views_of(upper), views_of(lower), extents_of(upper, lower),
+                                              bounds, stamps, last_write_fold_t {}, no_device_fold_t {},
+                                              located_value_reader<key_slot_t> {},
+                                              unassigned) == st::status_t::success_k);
+        failures += expect(differences(host, unassigned) != 0);
+    }
+    return failures;
+}
+
+#pragma endregion Sections By Extent
 
 int main(int argc, char** argv) {
     suite_options_t suite;
@@ -1959,6 +2075,8 @@ int main(int argc, char** argv) {
         return status == argument_status_t::help_k ? 0 : 1;
     options.random = suite.random();
     suite_totals_t totals = suite.totals();
+    gpu_drivers_t const drivers;
+    if (drivers.cuda_contexts[0]) options.drivers = &drivers;
 
     report(totals, "compaction.uuid_orders_like_memcmp", uuid_orders_like_memcmp, options);
     report(totals, "compaction.sorted_run_index_layout_matches_builder", sorted_run_index_layout_matches_builder);
@@ -1966,7 +2084,7 @@ int main(int argc, char** argv) {
     report(totals, "compaction.survives_follows_the_kind", survives_follows_the_kind);
     report(totals, "compaction.plan_sorted_runs_cuts_at_the_bounds", plan_sorted_runs_cuts_at_the_bounds);
     report(totals, "compaction.survives_keeps_what_readers_read", survives_keeps_what_readers_read);
-    report(totals, "cuda.devices_round_trip", cuda_devices_round_trip);
+    report(totals, "gpu.devices_listed", gpu_devices_listed);
     for (std::size_t index = 0; index != handmade_cases_k.size(); ++index) {
         handmade_case_t const& handmade = handmade_cases_k[index];
         run_handmade_case<inline_key_slot<std::uint64_t>>(totals, "inline_u64", index, handmade, options);
@@ -1990,6 +2108,7 @@ int main(int argc, char** argv) {
     for (std::size_t index = 0; index != graph_cases_k.size(); ++index)
         report(totals, graph_cases_k[index].name, graph_gpu_case, graph_cases_k[index], index,
                sequence_order_t::oldest_first_k, options);
+    report(totals, "gpu.reads_sections_by_extent", gpu_reads_sections_by_extent, options, suite.directory);
     // Reading every change's records in reverse must show in the output, or parity proves nothing about the order
     report(totals, "graph.reversed_sequences_differ", graph_gpu_case, graph_cases_k[1], std::size_t {1},
            sequence_order_t::reversed_k, options);

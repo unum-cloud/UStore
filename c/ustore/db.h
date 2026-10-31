@@ -148,8 +148,8 @@ USTORE_EXPORT char const* ustore_predicate_cost_name(ustore_predicate_cost_t cos
 /** Reads a predicate cost back from its canonical spelling; @c ustore_predicate_cheap_k when unrecognized. */
 USTORE_EXPORT ustore_predicate_cost_t ustore_predicate_cost_from_name(ustore_bytes_view_t name);
 
-/** The caller's verdict on the keys a scan lists, which host executors alone ask: a device executor refuses a call
- *  carrying one with @c ustore_status_device_k. */
+/** The caller's verdict on the keys a scan lists, always asked on the host, as a scan on a device executor lists its
+ *  pages there too. */
 typedef struct ustore_predicate_t {
 
     /** The optional handler, where @c NULL admits every key. */
@@ -545,7 +545,8 @@ typedef struct ustore_database_open_nvme_t {
  *  @par Statuses:
  *  - @c ustore_status_unsupported_k The library was built without the engine, SPDK is asked for,
  *    the volumes or the schema have another format version, the @c compactions executor is given
- *    to a library built without CUDA, or the CPU does not run the @c cpu_class.
+ *    to a library built without a CUDA compiler or drives an AMD device, or the CPU does not run
+ *    the @c cpu_class.
  *  - @c ustore_status_device_k The executor computes on a device, or the @c compactions executor is
  *    no VRAM one.
  *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
@@ -1280,6 +1281,143 @@ USTORE_EXPORT void ustore_snapshot_free(ustore_snapshot_t snapshot);
  *  @param[in,out] database The database to be closed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_database_free(ustore_database_t database);
+
+/** In what order an ingest's rows arrive, which decides whether its appends land as they come or wait to be sorted. */
+typedef enum ustore_ingest_order_t {
+
+    /** Keys strictly ascend across every append, checked as each one is written into runs of its own. */
+    ustore_ingest_sorted_k = 0,
+
+    /** Keys arrive in any order and may repeat, the last row of a key winning; every append is held until finished. */
+    ustore_ingest_unsorted_k = 1,
+
+} ustore_ingest_order_t;
+
+/** The canonical spelling of an order, as @c ustore_ingest_unsorted_k spells "unsorted", or "unrecognized". */
+USTORE_EXPORT char const* ustore_ingest_order_name(ustore_ingest_order_t order);
+
+/** Reads an order back from its canonical spelling; @c ustore_ingest_sorted_k when unrecognized. */
+USTORE_EXPORT ustore_ingest_order_t ustore_ingest_order_from_name(ustore_bytes_view_t name);
+
+/**
+ *  @brief An ingest under way into one collection, which lands every row appended to it as one commit of its own.
+ *
+ *  It joins no transaction and watches nothing: every row lands at one stamp, so a reader sees all of the ingest or
+ *  none of it, and a transaction that began before it and wrote a key it lands fails at commit. Its calls run on the
+ *  calling thread, one at a time. On NVMe it holds the database's maintenance claim from its init to its finish or
+ *  free, so flushes, compactions, creates and drops wait for it meanwhile.
+ */
+typedef struct ustore_ingest_handle_t* ustore_ingest_t;
+
+/** The arguments of @c ustore_ingest_init, which opens an ingest into one collection. */
+typedef struct ustore_ingest_init_t {
+
+    /** Output for the ingest, freed with @c ustore_ingest_free; @c NULL on failure. */
+    ustore_ingest_t* ingest;
+
+    /** An open database, which stays open until the ingest is freed. */
+    ustore_database_t database;
+
+    /** Output for the outcome, final on return. */
+    ustore_outcome_t* outcome;
+
+    /** Collection the rows land in. */
+    ustore_collection_id_t collection;
+
+    /** In what order the rows arrive. */
+    ustore_ingest_order_t order;
+
+} ustore_ingest_init_t;
+
+/**
+ *  @brief Opens an ingest into one collection.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_invalid_argument_k The @c ingest output is @c NULL, or the @c order is unknown.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The engine ingests nothing, or not into that collection's modality.
+ *  - @c ustore_status_not_found_k The collection does not exist.
+ */
+USTORE_EXPORT void ustore_ingest_init(ustore_ingest_init_t* arguments);
+
+/**
+ *  @brief The arguments of @c ustore_ingest_append, which hands an ingest one batch of rows.
+ *
+ *  The rows are copied or written before the call returns, so every view may die after it. Blobs, documents and pages
+ *  take @c keys and @c values, strings take their strings as @c values and the keys they map onto as @c keys, and edges
+ *  take @c sources, @c targets and optionally @c edges.
+ */
+typedef struct ustore_ingest_append_t {
+
+    /** The ingest, which a failed append leaves as it was. */
+    ustore_ingest_t ingest;
+
+    /** Output for the outcome, final on return. */
+    ustore_outcome_t* outcome;
+
+    /** Number of rows. */
+    ustore_size_t count;
+
+    /** Keys of blobs, documents and pages, or the keys strings map onto. */
+    ustore_keys_view_t keys;
+
+    /** Values of blobs, JSON documents and XML pages, or the strings of a strings collection. */
+    ustore_strings_view_t values;
+
+    /** Sources of edges. */
+    ustore_keys_view_t sources;
+
+    /** Targets of edges. */
+    ustore_keys_view_t targets;
+
+    /** Identifiers of edges, where @c NULL data takes @c ustore_edge_id_default_k for each. */
+    ustore_keys_view_t edges;
+
+} ustore_ingest_append_t;
+
+/**
+ *  @brief Hands an ingest one batch of rows.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c ingest is @c NULL or finished, a view the modality needs is missing,
+ *    the @c values come in an unknown layout, or a key does not ascend past every key before it under
+ *    @c ustore_ingest_sorted_k.
+ *  - @c ustore_status_malformed_k A value is past what the collection admits, a document no JSON, or a page no XML.
+ *  - @c ustore_status_capacity_exhausted_k The volume is full.
+ */
+USTORE_EXPORT void ustore_ingest_append(ustore_ingest_append_t* arguments);
+
+/** The arguments of @c ustore_ingest_finish, which lands every row appended as one commit and ends the ingest. */
+typedef struct ustore_ingest_finish_t {
+
+    /** The ingest, finished on return whatever the outcome, which only @c ustore_ingest_free still takes. */
+    ustore_ingest_t ingest;
+
+    /** Output for the outcome, final on return. */
+    ustore_outcome_t* outcome;
+
+    /** Buffered: visible on return, durable at the next flush, dropped whole by a crash before it. */
+    ustore_durability_t durability;
+
+    /** Optional output for the one stamp every row landed at; zeroed on failure. */
+    ustore_stamp_t* commit_stamp;
+
+} ustore_ingest_finish_t;
+
+/**
+ *  @brief Lands every row appended to an ingest as one commit.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c ingest is @c NULL or finished, or the @c durability is unknown.
+ *  - @c ustore_status_not_found_k The collection was dropped meanwhile.
+ *  - @c ustore_status_contended_k Memory runs kept refilling while the ingest waited them out.
+ *  - @c ustore_status_capacity_exhausted_k The volume is full.
+ */
+USTORE_EXPORT void ustore_ingest_finish(ustore_ingest_finish_t* arguments);
+
+/** Frees an ingest, dropping every row of an unfinished one; @c NULL is safe. */
+USTORE_EXPORT void ustore_ingest_free(ustore_ingest_t ingest);
 
 #ifdef __cplusplus
 }

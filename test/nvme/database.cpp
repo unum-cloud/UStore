@@ -236,12 +236,13 @@ template <typename volume_type_>
 }
 
 /** Runs the copy of the catalog blob on @p volume that save @p generation wrote names, counted off the length its
- *  fixed-width records fix. */
+ *  fixed-width records fix, for a database whose runs no ingest stamped. */
 template <typename volume_type_>
 [[nodiscard]] std::size_t runs_named_by_schema(volume_type_ const& volume, std::size_t collections,
                                                std::uint64_t generation) noexcept {
     expected<volume_blob_t> const found = volume.find(database_schema_name(schema_copy_of(generation)));
-    std::size_t const fixed = 3 * sizeof(std::uint64_t) + sizeof(schema_stamps_t) +
+    // The version, then the counts of the records, of the runs and of the ingested runs.
+    std::size_t const fixed = 4 * sizeof(std::uint64_t) + sizeof(schema_stamps_t) +
                               collections * sizeof(collection_record_t);
     if (!found || found->length < fixed) return 0;
     return static_cast<std::size_t>((found->length - fixed) / sizeof(lsm_tree_run_record_t));
@@ -752,7 +753,8 @@ std::size_t dropped_collection_is_gone(mount_type_ const& mount) {
 }
 
 /**
- *  @brief A schema that never reached the medium wastes its runs, and one naming a missing run is refused.
+ *  @brief A mount sweeps away the runs no schema names and keeps the ones it does, and a schema naming a missing run
+ *      is refused.
  *
  *  A flush seals the run first and records it second, so the only state a crash between the two leaves
  *  is a run nobody names. The other order would leave a schema naming bytes the volume never got, which
@@ -793,9 +795,17 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         (*stack)->store.reset();
 
         std::size_t const runs = run_count_of(volume);
-        std::uint64_t const wasted = run_bytes_of(volume);
         failures += expect(runs != std::size_t {0});
-        failures += expect(wasted != std::uint64_t {0});
+        failures += expect(run_bytes_of(volume) != std::uint64_t {0});
+
+        // A mount keeps every run the schema names.
+        {
+            expected<std::unique_ptr<database_t>> kept = open_database(**stack);
+            failures += expect(kept.has_value());
+            if (!kept) return failures;
+            failures += expect_eq(run_count_of(volume), runs);
+            failures += expect((*kept)->unmount().succeeded());
+        }
 
         // No copy of the schema that would have named those runs ever landed.
         {
@@ -812,8 +822,8 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         if (!reopened) return failures;
         failures += expect_eq((*reopened)->size(), std::size_t {0});
         failures += expect(!(*reopened)->has_collection(any_collection_id_t {owned_name("lost")}));
-        failures += expect_eq(run_count_of(volume), runs);
-        failures += expect_eq(run_bytes_of(volume), wasted);
+        failures += expect_eq(run_count_of(volume), std::size_t {0});
+        failures += expect_eq(run_bytes_of(volume), std::uint64_t {0});
 
         // The volume is still a volume: a fresh collection writes, flushes and answers over it.
         expected<collection_id_t> const fresh = create_named(**reopened, "fresh", test_config(8, 0));

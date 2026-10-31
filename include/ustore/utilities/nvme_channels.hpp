@@ -52,11 +52,8 @@ namespace unum::ustore::utilities {
 /** What a mount fixes about an arena before any channel carves blocks out of it. */
 struct memory_arena_config_t {
 
-    /** Bytes the arena holds, rounded up to @c portable_alignment_k when it is made. */
+    /** Bytes the arena holds on host pages, rounded up to @c portable_alignment_k when it is made. */
     std::uint64_t bytes = 0;
-
-    /** Where the bytes live, which the disk must be able to register. */
-    memory_space_t placement = memory_space_t::host_k;
 };
 
 /**
@@ -96,10 +93,10 @@ class registered_memory_arena {
     ~registered_memory_arena() noexcept { refund_(); }
 
     /**
-     *  @brief Allocates, charges and registers one arena against @p disk.
+     *  @brief Allocates, charges and registers one arena of host memory against @p disk.
      *  @param[in,out] disk The ring the arena is pinned in, which must outlive the arena.
      *  @param[in,out] constraint The budget the whole arena is charged to, once.
-     *  @param[in] config Bytes and placement, both fixed from here on.
+     *  @param[in] config Bytes, fixed from here on.
      *  @return The arena, or @c out_of_memory_k when the budget or the allocator refuses it.
      */
     template <typename disk_type_>
@@ -107,8 +104,6 @@ class registered_memory_arena {
     static expected<registered_memory_arena> make(disk_type_& disk, constraint_t& constraint,
                                                   memory_arena_config_t const& config) noexcept {
         if (config.bytes == 0) return status_t {status_code_t::invalid_argument_k, "An arena holds at least one block"};
-        if (config.placement == memory_space_t::gpu_k)
-            return status_t {status_code_t::unsupported_k, "Device memory has no arena yet"};
 
         std::size_t const bytes = static_cast<std::size_t>(round_up_to_multiple(config.bytes, portable_alignment_k));
         registered_memory_arena arena;
@@ -164,7 +159,7 @@ class registered_memory_arena {
         charged_ = 0;
     }
 
-    /** The bytes of the arena, owned here and never moved once registered. */
+    /** The bytes, owned here and never moved once registered. */
     storage_t storage_;
 
     /** The one registered memory over @c storage_, surrendered by @c unregister. */

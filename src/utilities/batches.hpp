@@ -9,8 +9,9 @@
 
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 
+#include "ustore/db.h"       // `ustore_ingest_append_t`
 #include "ustore/ranges.hpp" // `strided_iterator`, `strided`, `place_batch_t`, `edges_view_t`, `tape_string`
-#include "ustore/status.hpp" // `status_t`
+#include "ustore/status.hpp" // `status_t`, `expected`
 #include "ustore/types.hpp"  // `smallest_key_k`
 
 namespace unum::ustore::utilities {
@@ -122,6 +123,34 @@ edges_view_t edges_of(arguments_type_ const& arguments) noexcept {
     strided_span<ustore_key_t const> const targets {strided(arguments.targets), arguments.count};
     if (!arguments.edges.data) return {sources, targets};
     return {sources, targets, {strided(arguments.edges), arguments.count}};
+}
+
+/** The rows one ingest append hands an engine for a collection of keys: blobs, documents, pages or strings. */
+struct keyed_rows_t {
+
+    /** Keys of blobs, documents and pages, or the keys strings map onto. */
+    strided_span<ustore_key_t const> keys;
+
+    /** Values of blobs, documents and pages, or the strings of a strings collection. */
+    strings_arg_t values;
+
+    std::size_t size() const noexcept { return keys.size(); }
+};
+
+/** The keyed rows @p arguments append to an ingest, with @p values gathered, refusing an append that left either
+ *  column out. */
+inline expected<keyed_rows_t> keyed_rows_of(ustore_ingest_append_t const& arguments,
+                                            strings_arg_t const& values) noexcept {
+    if (arguments.count && (!arguments.keys.data || !values))
+        return status_t {status_code_t::invalid_argument_k, "Rows need their keys and values"};
+    return keyed_rows_t {{strided(arguments.keys), arguments.count}, values};
+}
+
+/** The edges @p arguments append to an ingest, refusing an append that left their sources or targets out. */
+inline expected<edges_view_t> ingest_edges_of(ustore_ingest_append_t const& arguments) noexcept {
+    if (arguments.count && (!arguments.sources.data || !arguments.targets.data))
+        return status_t {status_code_t::invalid_argument_k, "Edges need their sources and targets"};
+    return edges_of(arguments);
 }
 
 #pragma endregion Argument Packs

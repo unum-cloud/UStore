@@ -64,7 +64,6 @@
 #include <forkunion/capabilities.hpp>  // `fu::x86_pause_t`, `fu::arm64_wfet_t` & waiter kin, `fu::cpu_capabilities`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <stringzilla/capabilities.h>  // `sz_capabilities_detected_cpu`, `sz_kernel_sort_order_t`
-#include <stringzilla/sort.h>          // `sz_sort_find_kernel`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include "ustore/types.hpp"                 // `key_after`, `largest_key_k`
@@ -75,6 +74,8 @@
 #include "match.hpp"              // `compiled_match`, `compile_match`, `scan_matched`, `exhausted_t`
 #include "utilities/batches.hpp"  // `strings_arg_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "vram/matching.hpp"      // `compile_match`, `scan_matched_on_device`
+#include "vram/staging.hpp"       // `stage_inputs`
 
 namespace unum::ustore {
 using namespace unum::ustore::utilities;
@@ -111,7 +112,8 @@ struct cursor_engine {
 /** The engine of a walk at whichever home its init's executor serves. */
 template <template <home_t> typename verbs_type_>
 using cursor_engines =
-    std::variant<cursor_engine<verbs_type_, home_t::host_k>, cursor_engine<verbs_type_, home_t::vram_nvidia_k>>;
+    std::variant<cursor_engine<verbs_type_, home_t::host_k>, cursor_engine<verbs_type_, home_t::vram_nvidia_k>,
+                 cursor_engine<verbs_type_, home_t::vram_amd_k>>;
 
 #pragma region Names
 
@@ -179,6 +181,9 @@ enum class cpu_class_t : std::uint32_t {
     /** Graviton5-class Arm - Neoverse V3: the @c apple_m2_k atomics with @c WFE waits; no build compiles it yet. */
     aws_g5_k,
 
+    /** RVA23-class RISC-V, named for Alibaba's C930: @c WRS waits, Zacas compare-and-swaps and RVV string kernels. */
+    alibaba_c930_k,
+
     /** The one class of a monoversioned build: the waiter, atomic reference and string kernels @c USTORE_MARCH
      *  implies or a preset vouches for, as the libraries compiled them. */
     monoversioned_k,
@@ -231,6 +236,12 @@ struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
     using type = fu::arm64_wfe_t;
 };
 #endif
+#if FORKUNION_TARGET_RISCV64_WRS
+template <>
+struct waiter_for_cpu_class<cpu_class_t::alibaba_c930_k> {
+    using type = fu::riscv64_wrs_t;
+};
+#endif
 #if USTORE_TARGET_MONOVERSIONED
 template <>
 struct waiter_for_cpu_class<cpu_class_t::monoversioned_k> {
@@ -281,6 +292,13 @@ struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
     using type = fu::arm64_lse_atomic_ref<value_type_>;
 };
 #endif
+#if FORKUNION_TARGET_RISCV64_ZACAS
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::alibaba_c930_k> {
+    template <typename value_type_>
+    using type = fu::riscv64_zacas_atomic_ref<value_type_>;
+};
+#endif
 #if USTORE_TARGET_MONOVERSIONED
 template <>
 struct atomic_ref_for_cpu_class<cpu_class_t::monoversioned_k> {
@@ -323,6 +341,9 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
 #if USTORE_TARGET_AWS_G5
     case cpu_class_t::aws_g5_k: return true;
 #endif
+#if USTORE_TARGET_ALIBABA_C930
+    case cpu_class_t::alibaba_c930_k: return true;
+#endif
 #if USTORE_TARGET_MONOVERSIONED
     case cpu_class_t::monoversioned_k: return true;
 #endif
@@ -351,6 +372,7 @@ constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu_class) no
     case cpu_class_t::aws_g2_k: return forkunion_capabilities_of<cpu_class_t::aws_g2_k>();
     case cpu_class_t::apple_m2_k: return forkunion_capabilities_of<cpu_class_t::apple_m2_k>();
     case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
+    case cpu_class_t::alibaba_c930_k: return forkunion_capabilities_of<cpu_class_t::alibaba_c930_k>();
     case cpu_class_t::monoversioned_k: return forkunion_capabilities_of<cpu_class_t::monoversioned_k>();
     default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
     }
@@ -369,6 +391,7 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu_class) noe
     case cpu_class_t::aws_g2_k:
     case cpu_class_t::apple_m2_k:
     case cpu_class_t::aws_g5_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
+    case cpu_class_t::alibaba_c930_k: return sz_cap_serial_k | sz_cap_rvv_k;
     case cpu_class_t::monoversioned_k: return sz_capabilities_compiled_cpu_mask();
     default: return sz_cap_serial_k;
     }
@@ -406,8 +429,8 @@ struct cpu_ladder {};
 #if USTORE_TARGET_MONOVERSIONED
 using cpu_ladder_t = cpu_ladder<cpu_class_t::monoversioned_k>;
 #else
-using cpu_ladder_t =
-    cpu_ladder<cpu_class_t::intel_sierra_k, cpu_class_t::aws_g5_k, cpu_class_t::apple_m2_k, cpu_class_t::serial_k>;
+using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_sierra_k, cpu_class_t::aws_g5_k, cpu_class_t::apple_m2_k,
+                                cpu_class_t::alibaba_c930_k, cpu_class_t::serial_k>;
 #endif
 
 /** What a handle may use: the masks this machine runs when nothing is pinned, the pinned class's masks when it runs
@@ -434,6 +457,27 @@ inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t pinned) noexc
     return ceiling;
 }
 
+/** Looks up the best kernel of every @c stringzilla_kernels_t slot that @p capabilities allow, refusing a kit with any
+ *  slot left empty. */
+inline expected<stringzilla_kernels_t> pick_stringzilla_kernels(sz_capability_t capabilities) noexcept {
+    stringzilla_kernels_t kernels;
+    kernels.capabilities = capabilities;
+    sz_kernel_punned_t sort_order = nullptr, utf8_count_strings = nullptr, find_byteset = nullptr,
+                       strings_unescape = nullptr;
+    sz_capability_t picked = 0;
+    if (sz_find_kernel_punned(sz_kernel_sort_order_k, capabilities, &sort_order, &picked) != sz_success_k ||
+        sz_find_kernel_punned(sz_kernel_utf8_count_strings_k, capabilities, &utf8_count_strings, &picked) !=
+            sz_success_k ||
+        sz_find_kernel_punned(sz_kernel_find_byteset_k, capabilities, &find_byteset, &picked) != sz_success_k ||
+        sz_find_kernel_punned(sz_kernel_strings_unescape_k, capabilities, &strings_unescape, &picked) != sz_success_k)
+        return status_t {status_code_t::unsupported_k, "StringZilla serves no kernel for a string verb"};
+    kernels.sort_order = reinterpret_cast<sz_kernel_sort_order_t>(sort_order);
+    kernels.utf8_count_strings = reinterpret_cast<sz_kernel_utf8_count_strings_t>(utf8_count_strings);
+    kernels.find_byteset = reinterpret_cast<sz_kernel_find_byteset_t>(find_byteset);
+    kernels.strings_unescape = reinterpret_cast<sz_kernel_strings_unescape_t>(strings_unescape);
+    return kernels;
+}
+
 /** Opens through @p open on the newest rung of @p ladder the build compiled and @p ceiling fits, the serial floor
  *  last, calling it as <tt>open.template operator()<class>()</tt>; a class picking its parent's waiter and atomics is
  *  skipped without instantiating its variant. */
@@ -453,6 +497,76 @@ status_t open_fitting_rung(cpu_ladder<classes_...>, cpu_ceiling_t ceiling, open_
 }
 
 #pragma endregion CPU Classes
+
+#pragma region GPU Classes
+
+/** The class of @p device, read off the architecture its driver reported: an NVIDIA generation without a class of its
+ *  own runs as Ampere, one older than Ampere as none, and an AMD processor without a class as none. */
+constexpr gpu_class_t gpu_class_of(gpu_device_t const& device) noexcept {
+    std::uint32_t const major = device.architecture_major, minor = device.architecture_minor;
+    if (device.vendor == gpu_vendor_t::nvidia_k) {
+        if (major < 8) return gpu_class_t::unknown_k;
+        if (major == 8) return minor >= 9 ? gpu_class_t::nvidia_ada_k : gpu_class_t::nvidia_ampere_k;
+        if (major == 9) return gpu_class_t::nvidia_hopper_k;
+        if (major == 10) return gpu_class_t::nvidia_blackwell_k;
+        if (major == 12) return gpu_class_t::nvidia_blackwellrtx_k;
+        return gpu_class_t::nvidia_ampere_k;
+    }
+    if (device.vendor == gpu_vendor_t::amd_k) {
+        if (major == 9 && minor == 4) return gpu_class_t::amd_cdna3_k;
+        if (major == 9 && minor == 5) return gpu_class_t::amd_cdna4_k;
+        if (major == 12 && minor == 5) return gpu_class_t::amd_cdna5_k;
+    }
+    return gpu_class_t::unknown_k;
+}
+
+/** The GPU side of the process, built at its first VRAM call: every vendor's driver, and the devices some class runs
+ *  on, NVIDIA first, then AMD, an NVIDIA one only where its primary context was retained. */
+struct gpu_runtime_t {
+    gpu_drivers_t drivers;
+    gpu_device_t devices[2 * gpu_devices_capacity_k];
+    std::size_t devices_count = 0;
+
+    gpu_runtime_t() noexcept {
+        std::size_t const reported = list_gpu_devices(drivers, devices);
+        for (std::size_t position = 0; position != reported; ++position) {
+            gpu_device_t const& device = devices[position];
+            if (gpu_class_of(device) == gpu_class_t::unknown_k) continue;
+            if (device.vendor == gpu_vendor_t::nvidia_k &&
+                (device.vendor_ordinal >= gpu_devices_capacity_k || !drivers.cuda_contexts[device.vendor_ordinal]))
+                continue;
+            devices[devices_count++] = device;
+        }
+    }
+};
+
+/** The one runtime every VRAM call passes its drivers down from. */
+inline gpu_runtime_t& gpu_runtime() noexcept {
+    static gpu_runtime_t runtime;
+    return runtime;
+}
+
+/** The devices VRAM executors spawn on, a device's position here being its UStore ordinal. */
+inline std::span<gpu_device_t const> gpu_devices() noexcept {
+    gpu_runtime_t const& runtime = gpu_runtime();
+    return {runtime.devices, runtime.devices_count};
+}
+
+/** Frees every block of @p arena wherever it lives, a device's runs through the process's drivers as the executor that
+ *  made the arena may be gone, and the arena itself, where null is safe. */
+inline void destroy_arena(ustore_arena_t arena) noexcept {
+    if (!arena) return;
+    if (cuda_blocks_t* const memory = std::get_if<cuda_blocks_t>(&arena->memory)) {
+        gpu_drivers_t const& drivers = gpu_runtime().drivers;
+        free_cuda_blocks(drivers.cuda, drivers.cuda_contexts[memory->device], memory->blocks);
+    }
+    else if (hip_blocks_t* const memory = std::get_if<hip_blocks_t>(&arena->memory))
+        free_hip_blocks(gpu_runtime().drivers.hip, memory->device, memory->blocks);
+    else arena_free_blocks(*arena);
+    delete arena;
+}
+
+#pragma endregion GPU Classes
 
 /** The tag @c ustore_transaction_view and @c ustore_snapshot_view set in the low bits of a handle. */
 enum class view_tag_t : std::uintptr_t {
@@ -817,8 +931,8 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
               ustore_strings_cursor_handle_t& cursor, view_t const& view) noexcept;
 
 /** Refuses a pull on a device, as no engine walks on devices yet. */
-template <typename arguments_type_, typename cursor_type_>
-status_t pull(engine_t const&, arguments_type_ const&, cursor_type_&, view_t const&, cuda_executor_t&) noexcept {
+template <typename arguments_type_, typename cursor_type_, gpu_executor_concept executor_type_>
+status_t pull(engine_t const&, arguments_type_ const&, cursor_type_&, view_t const&, executor_type_&) noexcept {
     return {status_code_t::unsupported_k, "No engine walks on devices yet"};
 }
 
@@ -857,7 +971,7 @@ inline void finish(ustore_outcome_t& outcome, status_t status) noexcept {
 
 /** Takes @p word for one call, answering whether no other call held it. */
 inline bool take(claim_t& word) noexcept {
-    return std::atomic_ref<claim_t> {word}.exchange(claim_t::held_k, std::memory_order_acquire) == claim_t::free_k;
+    return std::atomic_ref<claim_t> {word}.exchange(claim_t::held_k, std::memory_order_seq_cst) == claim_t::free_k;
 }
 
 /** Hands @p word back to the next call. */
@@ -920,17 +1034,23 @@ claim_t* cursor_claim_of(arguments_type_ const& arguments) noexcept {
 
 /** The home of the calls on @p executor, where a null one runs them on the calling thread over host pages. */
 inline home_t home_of(ustore_executor_handle_t const* executor) noexcept {
-    return executor && std::holds_alternative<cuda_executor_t>(executor->device) ? home_t::vram_nvidia_k
-                                                                                 : home_t::host_k;
+    if (!executor) return home_t::host_k;
+    if (std::holds_alternative<cuda_executor_t>(executor->device)) return home_t::vram_nvidia_k;
+    if (std::holds_alternative<hip_executor_t>(executor->device)) return home_t::vram_amd_k;
+    return home_t::host_k;
 }
 
 /** Whether @p arena lives where calls on @p executor compute: host pages for host executors, the
  *  device of a VRAM executor for its calls. */
 inline bool arena_serves(ustore_executor_handle_t const* executor, ustore_arena_t arena) noexcept {
-    cuda_executor_t const* const device = executor ? std::get_if<cuda_executor_t>(&executor->device) : nullptr;
-    if (!device) return std::holds_alternative<host_blocks_t>(arena->memory);
-    cuda_blocks_t const* const blocks = std::get_if<cuda_blocks_t>(&arena->memory);
-    return blocks && blocks->device == device->device();
+    if (!executor) return std::holds_alternative<host_blocks_t>(arena->memory);
+    return std::visit(
+        [&]<typename device_type_>(device_type_ const& device) noexcept {
+            if constexpr (gpu_executor_concept<device_type_>)
+                return utilities::device_blocks_of(arena, device) != nullptr;
+            else return std::holds_alternative<host_blocks_t>(arena->memory);
+        },
+        executor->device);
 }
 
 /** Claims the arena, the cursor and the transaction of @p arguments, holding none when one serves
@@ -946,6 +1066,10 @@ status_t take_claims(arguments_type_ const& arguments) noexcept {
         if (!arena_serves(arguments.executor, arena))
             return {status_code_t::device_k, "The arena lives where another executor computes"};
         if (!take(arena->claim)) return {status_code_t::contended_k, "The arena serves another call"};
+        if (fu::standard_atomic_ref<std::uint32_t> {arena->exports}.load(std::memory_order_seq_cst) != 0) {
+            release(arena->claim);
+            return {status_code_t::contended_k, "Arrow still reads the arena's outputs"};
+        }
     }
     claim_t* const cursor = cursor_claim_of(arguments);
     if (cursor && !take(*cursor)) {
@@ -1319,14 +1443,16 @@ status_t visit_home(view_t const& view, visitor_type_&& visitor) noexcept {
     ustore_executor_t const executor = view.executor;
     if (cuda_executor_t* const device = executor ? std::get_if<cuda_executor_t>(&executor->device) : nullptr)
         return visitor(*device);
+    if (hip_executor_t* const device = executor ? std::get_if<hip_executor_t>(&executor->device) : nullptr)
+        return visitor(*device);
     return visitor();
 }
 
 /** Calls @p verb on @p arguments with every ragged input gathered on the host into the scratch
  *  @p view works in, then @p view and the executor of the verb's home. */
 template <typename verb_type_, typename arguments_type_, typename... executors_types_>
-status_t call_staged(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
-                     executors_types_&... executor) noexcept {
+status_t call_gathered(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
+                       executors_types_&... executor) noexcept {
     if constexpr (requires { ragged_inputs(arguments); }) {
         auto const inputs = ragged_inputs(arguments);
         std::array<strings_arg_t, std::tuple_size_v<decltype(inputs)>> strings;
@@ -1337,6 +1463,33 @@ status_t call_staged(verb_type_ verb, arguments_type_ const& arguments, view_t c
             [&](auto const&... gathered) noexcept { return verb(arguments, gathered..., view, executor...); }, strings);
     }
     else return verb(arguments, view, executor...);
+}
+
+/** Calls @p verb on @p arguments as @c call_gathered does, moving the inputs of a device call to the host first. */
+template <typename verb_type_, typename arguments_type_, typename... executors_types_>
+status_t call_staged(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
+                     executors_types_&... executor) noexcept {
+    if constexpr (sizeof...(executors_types_) != 0) {
+        arguments_type_ staged = arguments;
+        if (status_t const status = stage_inputs(gpu_runtime().drivers, executor..., staged); status.failed())
+            return status;
+        return call_gathered(verb, staged, view, executor...);
+    }
+    else return call_gathered(verb, arguments, view);
+}
+
+/** Readies @p executor for one call of @p arguments: binds its device to the calling thread, rewinds the bounce and
+ *  the managed runs, as every call before was waited for, and rewinds the call's arena, freeing its older runs in
+ *  stream order. */
+template <typename arguments_type_, gpu_executor_concept executor_type_>
+status_t open_device_call(arguments_type_ const& arguments, executor_type_& executor) noexcept {
+    if (status_t const status = executor.bind(); status.failed()) return status;
+    executor.rewind_bounce();
+    utilities::rewind(executor.managed(), executor);
+    if constexpr (requires { arguments.arena; })
+        if (device_blocks_t* const blocks = utilities::device_blocks_of(arguments.arena, executor))
+            utilities::rewind(*blocks, executor);
+    return {};
 }
 
 /** Serves @p arguments on the engine of their database, in the scratch and on the executor thread
@@ -1373,7 +1526,9 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
     if constexpr (requires { arguments.arena; }) arena_rewind(arguments.arena);
     arena_rewind(runner.scratch);
     return visit_home(view, [&]<typename... executors_types_>(executors_types_&... executor) noexcept -> status_t {
-        constexpr home_t home_k = sizeof...(executors_types_) ? home_t::vram_nvidia_k : home_t::host_k;
+        constexpr home_t home_k = home_of_executors<executors_types_...>;
+        if constexpr (home_k != home_t::host_k)
+            if (status_t const opened = open_device_call(arguments, executor...); opened.failed()) return opened;
         if constexpr (requires { arguments.cursor; })
             return pull(engine, arguments, *arguments.cursor, view, executor...);
         else if constexpr (home_k != home_t::host_k && !requires { verb_slot<arguments_type_>::template verb<home_k>; })
@@ -1404,19 +1559,17 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
             auto const verb = verbs->*verb_slot<arguments_type_>::template verb<home_k>;
             if (!verb) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
             if constexpr (carries_match<arguments_type_>) {
-                auto [match, match_status] = compile_match<home_k>(arguments, runner.scratch,
-                                                                   database->ceiling.compute);
+                auto [match, match_status] = compile_match(arguments, runner.scratch, database->ceiling.compute,
+                                                           executor...);
                 if (match_status.failed()) return match_status;
-                if constexpr (home_k == home_t::host_k) {
-                    if (!match.matches_everything())
-                        return call_staged(
-                            [&](arguments_type_ const& matched, auto const&... rest) noexcept {
+                if (!match.matches_everything())
+                    return call_staged(
+                        [&](arguments_type_ const& matched, auto&... rest) noexcept {
+                            if constexpr (home_k == home_t::host_k)
                                 return scan_matched(engine.host, match, matched, rest...);
-                            },
-                            arguments, view);
-                }
-                else if (match.reads_values())
-                    return status_t {status_code_t::unsupported_k, "Device scans match nothing yet"};
+                            else return scan_matched_on_device(engine.host, match, matched, rest...);
+                        },
+                        arguments, view, executor...);
             }
             return call_staged(verb, arguments, view, executor...);
         }
@@ -1497,15 +1650,18 @@ status_t serve_and_release(arguments_type_& arguments, view_t const& runner) noe
 }
 
 /** Opens the database @p call names through @p open_, its engine's open, which claims nothing, under the ceiling its
- *  pinned class sets, which the opened handle keeps for every later call. */
+ *  pinned class sets and the StringZilla kernels it allows, which the opened handle keeps for every later call. */
 template <typename arguments_type_, auto open_>
 status_t serve_open(arguments_type_& call, view_t const& runner) noexcept {
     ustore_cpu_class_t pinned = ustore_cpu_class_unknown_k;
     if constexpr (requires { call.cpu_class; }) pinned = call.cpu_class;
     auto const [ceiling, pick_status] = pick_cpu_ceiling(pinned);
     if (pick_status.failed()) return pick_status;
-    if (status_t const opened = open_(call, ceiling, runner); opened.failed()) return opened;
+    auto const [kernels, kernels_status] = pick_stringzilla_kernels(ceiling.compute);
+    if (kernels_status.failed()) return kernels_status;
+    if (status_t const opened = open_(call, ceiling, kernels, runner); opened.failed()) return opened;
     (*call.database)->ceiling = ceiling;
+    (*call.database)->kernels = kernels;
     return {};
 }
 
@@ -1631,9 +1787,16 @@ expected<cursor_engines<verbs_type_>> open_cursor_home(engine_t const& engine, a
                                             verb_slot<scan_type_>::template table<home_>;
     if (!verbs || !(verbs->*verb_slot<scan_type_>::template verb<home_>))
         return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
-    auto [match, match_status] = compile_match<home_>(arguments, compiled, arguments.database->ceiling.compute);
+    // A walk outlives the call opening it, so its engines cannot live in the managed runs every call rewinds
+    if constexpr (home_ != home_t::host_k)
+        if (reads_values(arguments)) return status_t {status_code_t::unsupported_k, "No engine walks on devices yet"};
+    auto [match, match_status] = compile_match(arguments, compiled, arguments.database->ceiling.compute);
     if (match_status.failed()) return match_status;
-    return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, home_> {verbs, match}};
+    if constexpr (home_ == home_t::host_k)
+        return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, home_> {verbs, match}};
+    else
+        return cursor_engines<verbs_type_> {
+            cursor_engine<verbs_type_, home_> {verbs, compiled_match<home_> {match_everything_t {}, match}}};
 }
 
 /** Opens the engine of a walk over @p scan_type_ at the home of @p executor. */
@@ -1642,9 +1805,13 @@ expected<cursor_engines<verbs_type_>> open_cursor_engine(engine_t const& engine,
                                                          ustore_executor_handle_t const* executor,
                                                          arguments_type_ const& arguments,
                                                          ustore_arena_t compiled) noexcept {
-    if (home_of(executor) == home_t::vram_nvidia_k)
+    switch (home_of(executor)) {
+    case home_t::vram_nvidia_k:
         return open_cursor_home<home_t::vram_nvidia_k, verbs_type_, scan_type_>(engine, arguments, compiled);
-    return open_cursor_home<home_t::host_k, verbs_type_, scan_type_>(engine, arguments, compiled);
+    case home_t::vram_amd_k:
+        return open_cursor_home<home_t::vram_amd_k, verbs_type_, scan_type_>(engine, arguments, compiled);
+    default: return open_cursor_home<home_t::host_k, verbs_type_, scan_type_>(engine, arguments, compiled);
+    }
 }
 
 /** Opens a cursor of @p cursor_type_ over the walk @p arguments describe, holding their database

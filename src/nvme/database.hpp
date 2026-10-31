@@ -13,15 +13,17 @@
 #include <cstring> // `std::memcpy`
 
 #include <algorithm>   // `std::max`, `std::min`, `std::sort`
+#include <array>       // `std::array`
 #include <atomic>      // `std::memory_order_acquire`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
+#include <optional>    // `std::optional`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`, `std::remove_reference_t`
 #include <utility>     // `std::in_range`, `std::make_index_sequence`, `std::move`
-#include <variant>     // `std::variant_alternative_t`, `std::variant_size_v`, `std::get_if`
+#include <variant>     // `std::variant`, `std::visit`, `std::variant_size_v`, `std::get_if`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
@@ -62,13 +64,18 @@ template <cpu_class_t cpu_class_>
 using storage_mount_of =
     typename mounted_storage<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>::files_mount_t;
 
-/** What composes the half-edge changes of a graph's merge on a device: the CUDA tower in a build carrying CUDA, and
- *  nothing otherwise, which keeps such merges on the host. */
-#if USTORE_WITH_CUDA
+/** The cuFile disk a store of @p cpu_class_ reads its run sections into device memory through. */
+template <cpu_class_t cpu_class_>
+using sections_disk_of =
+    linux_cufile_files_disk<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+
+/** What reads the sections of a store of @p cpu_class_'s runs into device memory, over a cuFile disk of its own. */
+template <cpu_class_t cpu_class_>
+using sections_reader_of = ring_sections_reader<sections_disk_of<cpu_class_>, waiter_of<cpu_class_>>;
+
+/** What composes the half-edge changes of a graph's merge on a device: the CUDA tower, which a build without a CUDA
+ *  compiler never reaches, as it makes no device compactor. */
 using graph_device_fold_t = graph::vram_nvidia_adjacency_fold_t;
-#else
-using graph_device_fold_t = blobs::no_device_fold_t;
-#endif
 
 /** The store of a blobs collection, and of the collections system collection, whose values follow
  *  @p value_layout_. */
@@ -286,9 +293,94 @@ struct nvme_variant {
     /** The table every handle the open of this class hands out is stamped with. */
     static engine_t const engine_k;
 
-    /** Implements @c ustore_database_open_nvme over a store of this class, sorting strings as @p ceiling allows. */
-    static status_t open(ustore_database_open_nvme_t const& arguments, cpu_ceiling_t ceiling,
+    /** Implements @c ustore_database_open_nvme over a store of this class, sorting strings through @p kernels. */
+    static status_t open(ustore_database_open_nvme_t const& arguments, stringzilla_kernels_t const& kernels,
                          view_t const& view) noexcept;
+};
+
+/**
+ *  @brief The device merges of a store of @p cpu_class_: an executor of their own on the device of the caller's, what
+ *      reads run sections into device memory over a cuFile disk of its own, and the compactor over both.
+ *
+ *  Sections read by DMA where the executor's GPUDirect Storage mode allows it and cuFile reaches the device, since
+ *  compat mode bounces through host pages, slower than uploading the indexes the runs already hold in memory. The
+ *  members die in reverse, the compactor first, so it frees its scratch while the reader and the executor live.
+ */
+template <cpu_class_t cpu_class_>
+class device_compaction {
+  public:
+    device_compaction() noexcept = default;
+    device_compaction(device_compaction const&) = delete;
+    device_compaction& operator=(device_compaction const&) = delete;
+
+    /** Spawns the executor on the device @p compactions computes on, opens the reader over the volume of every data
+     *  directory of @p resources, and binds the compactor over both, refusing a vendor no compactor serves before it
+     *  allocates anything. */
+    status_t open(ustore_executor_handle_t const& compactions, resources_config_t const& resources) noexcept {
+        if (std::holds_alternative<hip_executor_t>(compactions.device))
+            return {status_code_t::unsupported_k, "Merges run on NVIDIA devices and host threads alone"};
+        cuda_executor_t const* const caller = std::get_if<cuda_executor_t>(&compactions.device);
+        if (!caller) return {status_code_t::device_k, "The compactions need an executor of ustore_executor_for_vram"};
+        gpu_drivers_t const& drivers = gpu_runtime().drivers;
+        gpu_device_t twin {};
+        twin.vendor = cuda_executor_t::vendor_k;
+        twin.vendor_ordinal = static_cast<std::uint32_t>(caller->device());
+        if (status_t const spawned = spawn_gpu_executor(drivers, twin, caller->gpu_class(), nullptr,
+                                                        caller->scratch_limit(), caller->gds(), executor_);
+            spawned.failed())
+            return spawned;
+        cuda_executor_t* const executor = &std::get<cuda_executor_t>(executor_);
+        if (status_t const opened = open_sections(drivers.cufile, executor->gds(), resources); opened.failed())
+            return opened;
+        expected<cuda_compactor_t> made = cuda_compactor_t::make(
+            *executor, sections_ ? device_sections_reader_t {&sections_.value()} : device_sections_reader_t {});
+        if (!made) return made.status();
+        compactor_.emplace(std::move(*made));
+        return {};
+    }
+
+    /** The compactor every merge runs on, once @c open bound it. */
+    cuda_compactor_t* compactor() noexcept { return compactor_ ? &compactor_.value() : nullptr; }
+
+  private:
+
+    /** Opens the reader over the volume file of every data directory of @p resources where @p gds lets bytes move by
+     *  DMA and cuFile reaches the device, refusing @c ustore_gds_direct_k where it does not. */
+    status_t open_sections(cufile_api_t const& cufile, ustore_gds_t gds, resources_config_t const& resources) noexcept {
+        if (gds == ustore_gds_compat_k) return {};
+        if (sections_disk_of<cpu_class_>::probe(cufile) != linux_cufile_probe_t::direct_k) {
+            if (gds == ustore_gds_direct_k)
+                return {status_code_t::device_k, "GPUDirect Storage needs the nvidia_fs module, which is absent"};
+            return {};
+        }
+        std::size_t const volumes = resources.data_directories.size();
+        linux_cufile_disk_config_t config;
+        config.gds = ustore_gds_direct_k;
+        if (volumes > config.media_limit) config.media_limit = static_cast<std::uint16_t>(volumes);
+        auto [disk, disk_status] = sections_disk_of<cpu_class_>::make(cufile, config);
+        if (disk_status.failed()) return disk_status;
+        st::basic_vector<std::array<char, path_max_bytes_k>> paths;
+        st::basic_vector<medium_options_t> media;
+        if (paths.resize(volumes) != st::status_t::success_k || media.resize(volumes) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "The compactions could not track their volumes"};
+        for (std::size_t index = 0; index != volumes; ++index) {
+            if (status_t const joined = join_path(resources.data_directories[index].path.c_str(), volume_file_name_k,
+                                                  paths[index]);
+                joined.failed())
+                return joined;
+            media[index].name = paths[index].data();
+            media[index].access = medium_access_t::read_only_k;
+        }
+        expected<sections_reader_of<cpu_class_>> reader = sections_reader_of<cpu_class_>::make(
+            std::move(disk), std::span<medium_options_t const> {media});
+        if (!reader) return reader.status();
+        sections_.emplace(std::move(*reader));
+        return {};
+    }
+
+    std::variant<std::monostate, cuda_executor_t, hip_executor_t> executor_;
+    std::optional<sections_reader_of<cpu_class_>> sections_;
+    std::optional<cuda_compactor_t> compactor_;
 };
 
 /** Everything one open database holds, behind its database handle of the C ABI. */
@@ -298,11 +390,8 @@ struct database_state {
     /** The budgets and the mount the store borrows its router and channels from. */
     resources_shared_ptr<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>> resources;
 
-#if USTORE_WITH_CUDA
-
-    /** The one device lane every merge of the store runs on, empty for host merges, outliving the store. */
-    std::optional<cuda_compaction_lane_t> compaction_lane;
-#endif
+    /** What every device merge of the store runs on, empty for host merges, outliving the store. */
+    std::optional<device_compaction<cpu_class_>> compaction;
 
     /** The store itself, unmounted before the mount underneath it is torn down. */
     std::unique_ptr<database_of<cpu_class_>> store;
@@ -1565,11 +1654,11 @@ bool take_unless_zero(value_type_& value, ustore_size_t requested) noexcept {
     return true;
 }
 
-/** Reads the placement of the executor of @p arguments, the device executor of their merges into @p compactions, null
- *  for host merges, and their own sizes, keeping the engine's default for every zero among them. */
+/** Reads the placement of the executor of @p arguments, the executor of their merges into @p compactions, null for
+ *  host merges, and their own sizes, keeping the engine's default for every zero among them. */
 inline status_t read_options(ustore_database_open_nvme_t const& arguments, resources_config_t& resources,
                              database_config_t& transactions, user_collection_config_t& collections,
-                             cuda_executor_t const*& compactions) noexcept {
+                             ustore_executor_handle_t const*& compactions) noexcept {
     nvme_placement_t const placement = nvme_placement_of(arguments.executor);
     switch (placement.nvme.transport) {
     case ustore_transport_automatic_k: resources.io_transport = io_transport_t::automatic_k; break;
@@ -1579,9 +1668,7 @@ inline status_t read_options(ustore_database_open_nvme_t const& arguments, resou
     case ustore_transport_linux_spdk_k: resources.io_transport = io_transport_t::linux_spdk_k; break;
     default: return {status_code_t::invalid_argument_k, "Unknown transport"};
     }
-    compactions = arguments.compactions ? std::get_if<cuda_executor_t>(&arguments.compactions->device) : nullptr;
-    if (arguments.compactions && !compactions)
-        return {status_code_t::device_k, "The compactions need an executor of ustore_executor_for_vram"};
+    compactions = arguments.compactions;
 
     // Every thread of the executor, its blocking caller included, keeps a channel, and every other thread shares the
     // rest
@@ -1638,22 +1725,15 @@ status_t drop_unlisted(database_state<cpu_class_>& state, ustore_arena_t scratch
     return first;
 }
 
-/** The compactor every merge of @p state runs on: a device lane made once on the device of @p compactions, owned by
- *  @p state, and the host for null. */
+/** The compactor every merge of @p state runs on: the device compaction @p state owns over an executor of its own on
+ *  the device of @p compactions, and the host for null. */
 template <cpu_class_t cpu_class_>
-expected<compactor_ref_t> compactor_of([[maybe_unused]] database_state<cpu_class_>& state,
-                                       cuda_executor_t const* compactions) noexcept {
-#if USTORE_WITH_CUDA
-    if (compactions) {
-        st::expected<cuda_compaction_lane_t> made = cuda_compaction_lane_t::make(compactions->device(),
-                                                                                 compactions->scratch_limit());
-        if (!made) return status_t {status_code_t::device_k, "Failed to make the compaction lane on its device"};
-        cuda_compaction_lane_t& lane = state.compaction_lane.emplace(std::move(*made));
-        return compactor_ref_t {&lane};
-    }
-#endif
-    if (compactions) return status_t {status_code_t::unsupported_k, "This build carries no CUDA devices"};
-    return compactor_ref_t {};
+expected<compactor_ref_t> compactor_of(database_state<cpu_class_>& state, resources_config_t const& resources,
+                                       ustore_executor_handle_t const* compactions) noexcept {
+    if (!compactions) return compactor_ref_t {};
+    device_compaction<cpu_class_>& compaction = state.compaction.emplace();
+    if (status_t const opened = compaction.open(*compactions, resources); opened.failed()) return opened;
+    return compactor_ref_t {compaction.compactor()};
 }
 
 /** Mounts the store of @p state over the storage its resources opened, which must be the one on files, merging on
@@ -1674,7 +1754,7 @@ status_t mount_store(database_state<cpu_class_>& state, database_config_t const&
 template <cpu_class_t cpu_class_>
 expected<std::unique_ptr<database_state<cpu_class_>>> open_state(
     resources_config_t const& resources, database_config_t const& transactions, collection_config_t const& shape,
-    sz_kernel_sort_order_t sort_order, ustore_arena_t scratch, cuda_executor_t const* compactions) noexcept {
+    sz_kernel_sort_order_t sort_order, ustore_arena_t scratch, ustore_executor_handle_t const* compactions) noexcept {
     std::unique_ptr<database_state<cpu_class_>> state {new (std::nothrow) database_state<cpu_class_>};
     if (!state) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the database"};
     state->collection_shape = shape;
@@ -1687,7 +1767,7 @@ expected<std::unique_ptr<database_state<cpu_class_>>> open_state(
     state->resources = std::move(opened);
     state->store.reset(new (std::nothrow) database_of<cpu_class_> {state->resources});
     if (!state->store) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the store"};
-    auto [compactor, compactor_status] = compactor_of(*state, compactions);
+    auto [compactor, compactor_status] = compactor_of(*state, resources, compactions);
     if (compactor_status.failed()) return compactor_status;
     if (status_t const mounted = mount_store(*state, transactions, compactor); mounted.failed()) return mounted;
 
@@ -1712,8 +1792,8 @@ expected<std::unique_ptr<database_state<cpu_class_>>> open_state(
 
 /** Implements @c ustore_database_open_nvme, reserving both system collections on the first open. */
 template <cpu_class_t cpu_class_>
-status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& arguments, cpu_ceiling_t ceiling,
-                                        view_t const& view) noexcept {
+status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& arguments,
+                                        stringzilla_kernels_t const& kernels, view_t const& view) noexcept {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
 
@@ -1725,18 +1805,13 @@ status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& argum
     auto [exists, exists_status] = directory_exists(resources.directory.c_str());
     if (exists_status.failed()) return exists_status;
     if (!exists) return {status_code_t::not_found_k, "The directory doesn't exist"};
-    cuda_executor_t const* compactions = nullptr;
+    ustore_executor_handle_t const* compactions = nullptr;
     if (status_t const read = read_options(arguments, resources, transactions, collections, compactions); read.failed())
         return read;
-    sz_kernel_punned_t sort_order = nullptr;
-    sz_capability_t sort_capability = 0;
-    if (sz_sort_find_kernel(sz_kernel_sort_order_k, ceiling.compute, &sort_order, &sort_capability) != sz_success_k)
-        return {status_code_t::unsupported_k, "No StringZilla kernel sorts the strings"};
     std::unique_ptr<ustore_database_handle_t> handle {new (std::nothrow) ustore_database_handle_t {}};
     if (!handle) return {status_code_t::out_of_memory_k, "Failed to allocate the database"};
     auto [state, open_status] = open_state<cpu_class_>(resources, transactions, create_collection_config(collections),
-                                                       reinterpret_cast<sz_kernel_sort_order_t>(sort_order),
-                                                       view.scratch, compactions);
+                                                       kernels.sort_order, view.scratch, compactions);
     if (open_status.failed()) return open_status;
     state->executor = nvme_placement_of(arguments.executor).executor;
     handle->engine = &nvme_variant<cpu_class_>::engine_k, handle->state = state.release();
@@ -1893,7 +1968,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     user_collection_config_t collections = engine_collection_defaults();
     if (status_t const read = read_directories(saving, resources); read.failed()) return read;
     // The saved copy merges on host threads, whatever device the source merges on
-    cuda_executor_t const* host_merges = nullptr;
+    ustore_executor_handle_t const* host_merges = nullptr;
     if (status_t const read = read_options(saving, resources, transactions, collections, host_merges); read.failed())
         return read;
     auto [existed, exists_status] = directory_exists(resources.directory.c_str());

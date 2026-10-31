@@ -386,7 +386,7 @@ status_t read_document_fields(documents_type_ const& source, ustore_docs_read_t 
     };
     json_cells_t values;
     if (status_t const extracted = extract_fields(read.documents, task_fields.distinct, arguments.count, cell_of,
-                                                  arguments.database->ceiling.compute, view.scratch, values);
+                                                  arguments.database->kernels, view.scratch, values);
         extracted.failed())
         return extracted;
     for (std::size_t task = 0; task != arguments.count; ++task)
@@ -450,7 +450,7 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
     };
     json_cells_t values;
     if (status_t const extracted = extract_fields(documents, field_names, docs_count * fields_count, cell_of,
-                                                  arguments.database->ceiling.compute, view.scratch, values);
+                                                  arguments.database->kernels, view.scratch, values);
         extracted.failed())
         return extracted;
 

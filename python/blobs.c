@@ -544,7 +544,8 @@ static int scan_match_from_keyword(PyObject* name, PyObject* value, scan_match_t
     return 0;
 }
 
-/** Refuses the match keywords @p modality takes none of, as only blobs scans take patterns and documents a filter. */
+/** Refuses the match keywords @p modality takes none of, as only blobs scans take patterns, and documents and pages a
+ *  filter. */
 static int scan_match_admitted(scan_match_t const* match, ustore_modality_t modality) {
     if (match->patterns && modality != ustore_modality_blobs_k) {
         PyErr_SetString(PyExc_TypeError, "Only scans of blobs take patterns");
@@ -554,8 +555,8 @@ static int scan_match_admitted(scan_match_t const* match, ustore_modality_t moda
         PyErr_SetString(PyExc_TypeError, "Weights score patterns, which the call names none of");
         return -1;
     }
-    if (match->filter && modality != ustore_modality_docs_k) {
-        PyErr_SetString(PyExc_TypeError, "Only scans of documents take a filter");
+    if (match->filter && modality != ustore_modality_docs_k && modality != ustore_modality_pages_k) {
+        PyErr_SetString(PyExc_TypeError, "Only scans of documents and pages take a filter");
         return -1;
     }
     return 0;
@@ -730,6 +731,11 @@ static void docs_scan_submit(void* arguments) {
     if (scan->count) ustore_docs_scan(scan);
 }
 
+static void pages_scan_submit(void* arguments) {
+    ustore_pages_scan_t* const scan = (ustore_pages_scan_t*)arguments;
+    if (scan->count) ustore_pages_scan(scan);
+}
+
 static void vertices_scan_submit(void* arguments) {
     ustore_graph_scan_vertices_t* const scan = (ustore_graph_scan_vertices_t*)arguments;
     if (scan->count) ustore_graph_scan_vertices(scan);
@@ -739,6 +745,7 @@ static ustore_py_verb_t const scan_verb = {sizeof(keys_call_t), scan_submit, key
 
 // They answer and release as a scan of keys does, so a call opened for one runs through any of them
 static ustore_py_verb_t const docs_scan_verb = {sizeof(keys_call_t), docs_scan_submit, keys_answer, keys_release};
+static ustore_py_verb_t const pages_scan_verb = {sizeof(keys_call_t), pages_scan_submit, keys_answer, keys_release};
 static ustore_py_verb_t const vertices_scan_verb = {sizeof(keys_call_t), vertices_scan_submit, keys_answer,
                                                     keys_release};
 
@@ -782,6 +789,28 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
             .progress_state = &call->call,
         };
         return ustore_py_call_run(context, &docs_scan_verb, call, &scan);
+    }
+    if (modality == ustore_modality_pages_k) {
+        ustore_pages_scan_t scan = {
+            .database = context->database_handle,
+            .executor = ustore_py_context_executor(context),
+            .outcome = &call->call.outcome,
+            .completion = context->completion,
+            .view = context->view,
+            .count = call->tasks,
+            .collections = {&call->call.collection, 0},
+            .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
+            .filter = filter,
+            .predicate = predicate,
+            .offsets = &call->offsets,
+            .keys = &call->keys,
+            .arena = ustore_py_arena_handle(call->call.arena),
+            .wanted = wanted,
+            .mode = mode,
+            .progress = ustore_py_progress_callback(&call->call),
+            .progress_state = &call->call,
+        };
+        return ustore_py_call_run(context, &pages_scan_verb, call, &scan);
     }
     if (modality == ustore_modality_graph_k) {
         ustore_graph_scan_vertices_t scan = {
@@ -1152,8 +1181,8 @@ PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_
 
 #pragma region Cursors
 
-/** A walk over the keys of one collection of blobs, documents or graph vertices, pulled page by page into the arena
- *  each pull names. */
+/** A walk over the keys of one collection of blobs, documents, pages or graph vertices, pulled page by page into the
+ *  arena each pull names. */
 typedef struct Cursor {
 
     /** The object header every instance carries. */
@@ -1163,8 +1192,11 @@ typedef struct Cursor {
      *  holds it. */
     void* handle;
 
-    /** Which cursor of the ABI @c handle is: blobs, documents or graph vertices. */
+    /** Which cursor of the ABI @c handle is: blobs, documents, pages or graph vertices. */
     ustore_modality_t modality;
+
+    /** The encoding every pull of a walk over pages renders them into. */
+    ustore_page_encoding_t outputs_encoding;
 
     /** The predicate the walk compiled at init, which every pull asks, and what it raised. */
     ustore_py_predicate_t predicate;
@@ -1315,6 +1347,7 @@ typedef struct pull_call_t {
 
 static void pull_submit(void* arguments) { ustore_blobs_cursor_next((ustore_blobs_cursor_next_t*)arguments); }
 static void docs_pull_submit(void* arguments) { ustore_docs_cursor_next((ustore_docs_cursor_next_t*)arguments); }
+static void pages_pull_submit(void* arguments) { ustore_pages_cursor_next((ustore_pages_cursor_next_t*)arguments); }
 static void vertices_pull_submit(void* arguments) {
     ustore_graph_vertices_cursor_next((ustore_graph_vertices_cursor_next_t*)arguments);
 }
@@ -1338,11 +1371,15 @@ static ustore_py_verb_t const pull_keys_verb = {sizeof(pull_call_t), pull_submit
 /** A pull answering the keys with their values. */
 static ustore_py_verb_t const pull_pairs_verb = {sizeof(pull_call_t), pull_submit, pull_answer_pairs, pull_release};
 
-// A pull of documents or vertices answers as a pull of blobs does
+// A pull of documents, pages or vertices answers as a pull of blobs does
 static ustore_py_verb_t const docs_pull_keys_verb = {sizeof(pull_call_t), docs_pull_submit, pull_answer_keys,
                                                      pull_release};
 static ustore_py_verb_t const docs_pull_pairs_verb = {sizeof(pull_call_t), docs_pull_submit, pull_answer_pairs,
                                                       pull_release};
+static ustore_py_verb_t const pages_pull_keys_verb = {sizeof(pull_call_t), pages_pull_submit, pull_answer_keys,
+                                                      pull_release};
+static ustore_py_verb_t const pages_pull_pairs_verb = {sizeof(pull_call_t), pages_pull_submit, pull_answer_pairs,
+                                                       pull_release};
 static ustore_py_verb_t const vertices_pull_keys_verb = {sizeof(pull_call_t), vertices_pull_submit, pull_answer_keys,
                                                          pull_release};
 
@@ -1365,6 +1402,7 @@ static int cursor_close(Cursor* self) {
     ustore_modality_t const modality = self->modality;
     Py_BEGIN_ALLOW_THREADS;
     if (modality == ustore_modality_docs_k) ustore_docs_cursor_free((ustore_docs_cursor_t)handle);
+    else if (modality == ustore_modality_pages_k) ustore_pages_cursor_free((ustore_pages_cursor_t)handle);
     else if (modality == ustore_modality_graph_k)
         ustore_graph_vertices_cursor_free((ustore_graph_vertices_cursor_t)handle);
     else ustore_blobs_cursor_free((ustore_blobs_cursor_t)handle);
@@ -1394,6 +1432,8 @@ static PyObject* cursor_pull(Cursor* self, void* handle, size_t wanted, PyObject
     }
     ustore_py_verb_t const* const verb = self->modality == ustore_modality_docs_k
                                              ? (values ? &docs_pull_pairs_verb : &docs_pull_keys_verb)
+                                         : self->modality == ustore_modality_pages_k
+                                             ? (values ? &pages_pull_pairs_verb : &pages_pull_keys_verb)
                                          : self->modality == ustore_modality_graph_k ? &vertices_pull_keys_verb
                                          : values                                    ? &pull_pairs_verb
                                                                                      : &pull_keys_verb;
@@ -1414,6 +1454,23 @@ static PyObject* cursor_pull(Cursor* self, void* handle, size_t wanted, PyObject
             .written = &call->written,
             .arena = ustore_py_arena_handle(call->call.arena),
             .wanted = wanted,
+            .progress = ustore_py_progress_callback(&call->call),
+            .progress_state = &call->call,
+        };
+        page = ustore_py_call_run(&context, verb, call, &next);
+    }
+    else if (self->modality == ustore_modality_pages_k) {
+        ustore_pages_cursor_next_t next = {
+            .database = self->database,
+            .executor = ustore_py_context_executor(&context),
+            .outcome = &call->call.outcome,
+            .cursor = (ustore_pages_cursor_t)handle,
+            .keys = &call->keys,
+            .values = values ? &call->values : NULL,
+            .written = &call->written,
+            .arena = ustore_py_arena_handle(call->call.arena),
+            .wanted = wanted,
+            .outputs_encoding = self->outputs_encoding,
             .progress = ustore_py_progress_callback(&call->call),
             .progress_state = &call->call,
         };
@@ -1597,6 +1654,15 @@ char const doc_docs_cursor[] =                                                  
     "root filter such as `?@.age > 30`, matches, and its pulls reading whole documents when\n"    //
     "asked. Calls `ustore_docs_cursor_init`.";
 
+char const doc_pages_cursor[] =                                                                  //
+    "pages_cursor(start=0, /, *, collection, filter=None, predicate=None,\n"                     //
+    "predicate_cost=PredicateCost.CHEAP, outputs_encoding=PageEncoding.XML)\n"                   //
+    "answers a Cursor over pages.\n"                                                             //
+    "\n"                                                                                         //
+    "Walks as `cursor()` does, keeping the pages that hold a node of `filter`, a path in\n"      //
+    "StringZilla's XPath subset such as '/doc/b[2]', and its pulls rendering whole pages into\n" //
+    "`outputs_encoding` when asked. Calls `ustore_pages_cursor_init`.";
+
 char const doc_graph_vertices_cursor[] =                                                         //
     "graph_vertices_cursor(start=0, /, *, collection, predicate=None,\n"                         //
     "predicate_cost=PredicateCost.CHEAP) answers a Cursor over vertices.\n"                      //
@@ -1618,6 +1684,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t p
     ustore_py_verb_options_init(&options);
     scan_match_t match;
     memset(&match, 0, sizeof(match));
+    int outputs_encoding = ustore_page_encoding_xml_k;
     Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
     for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
         PyObject* const keyword = PyTuple_GET_ITEM(args_names_tuple, names_progress);
@@ -1625,6 +1692,12 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t p
         int const consumed = ustore_py_verb_option_from_keyword(&context, keyword, value, &options);
         if (consumed < 0) return NULL;
         if (consumed > 0) continue;
+        if (modality == ustore_modality_pages_k && PyUnicode_CompareWithASCIIString(keyword, "outputs_encoding") == 0) {
+            if (ustore_py_enum_from_object(value, "outputs_encoding", ustore_py_enum_page_encoding_k,
+                                           &outputs_encoding) != 0)
+                return NULL;
+            continue;
+        }
         int const matched = scan_match_from_keyword(keyword, value, &match);
         if (matched < 0) return NULL;
         if (matched == 0) {
@@ -1644,6 +1717,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t p
     if (!cursor) return NULL;
     cursor->handle = NULL;
     cursor->modality = modality;
+    cursor->outputs_encoding = (ustore_page_encoding_t)outputs_encoding;
     cursor->predicate.callable = Py_XNewRef(match.predicate);
     cursor->predicate.raised = NULL;
     cursor->database = context.database_handle;
@@ -1676,6 +1750,22 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t p
         };
         Py_BEGIN_ALLOW_THREADS;
         ustore_docs_cursor_init(&init);
+        Py_END_ALLOW_THREADS;
+    }
+    else if (modality == ustore_modality_pages_k) {
+        ustore_pages_cursor_init_t init = {
+            .cursor = (ustore_pages_cursor_t*)&cursor->handle,
+            .database = context.database_handle,
+            .executor = ustore_py_context_executor(&context),
+            .outcome = &outcome,
+            .view = context.view,
+            .collection = options.collection,
+            .start_key = start,
+            .filter = filter,
+            .predicate = predicate,
+        };
+        Py_BEGIN_ALLOW_THREADS;
+        ustore_pages_cursor_init(&init);
         Py_END_ALLOW_THREADS;
     }
     else if (modality == ustore_modality_graph_k) {
@@ -1723,6 +1813,11 @@ PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* args, Py_ssize_t
 PyObject* ustore_py_api_docs_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                     PyObject* args_names_tuple) {
     return cursor_open(self, args, positional_args_count, args_names_tuple, "docs_cursor", ustore_modality_docs_k);
+}
+
+PyObject* ustore_py_api_pages_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple) {
+    return cursor_open(self, args, positional_args_count, args_names_tuple, "pages_cursor", ustore_modality_pages_k);
 }
 
 PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,

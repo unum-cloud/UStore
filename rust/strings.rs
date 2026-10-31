@@ -13,11 +13,88 @@ use std::ptr;
 use std::slice;
 
 use crate::db::ffi::{
-    self, ustore_completion_t, ustore_database_t, ustore_enum_t, ustore_octet_t, ustore_outcome_t, ustore_size_t,
-    ustore_strings_view_t,
+    self as db_ffi, ustore_completion_t, ustore_database_t, ustore_enum_t, ustore_octet_t, ustore_outcome_t,
+    ustore_size_t, ustore_strings_view_t,
 };
 use crate::db::sealed::{Accepts, Calling};
 use crate::db::{check, fail, Address, Arena, CollectionID, Modality, Result, Status, Strings, View};
+
+// region: Raw Declarations
+
+/// One-to-one mirror of the cursors and the writes of `c/ustore/strings.h`.
+pub(crate) mod ffi {
+    #![allow(non_camel_case_types)]
+
+    use std::ffi::c_void;
+
+    use crate::db::ffi::{
+        ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t, ustore_completion_t,
+        ustore_database_t, ustore_durability_t, ustore_executor_t, ustore_key_t, ustore_keys_view_t, ustore_outcome_t,
+        ustore_patterns_t, ustore_predicate_t, ustore_progress_callback_t, ustore_size_t, ustore_strings_view_t,
+        ustore_transaction_t, ustore_view_t, ustore_watch_t,
+    };
+
+    #[repr(C)]
+    pub struct ustore_strings_write_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub transaction: ustore_transaction_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub strings: ustore_strings_view_t,
+        pub values: ustore_keys_view_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_strings_cursor_handle_t {
+        _private: [u8; 0],
+    }
+
+    pub type ustore_strings_cursor_t = *mut ustore_strings_cursor_handle_t;
+
+    #[repr(C)]
+    pub struct ustore_strings_cursor_init_t {
+        pub cursor: *mut ustore_strings_cursor_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub view: ustore_view_t,
+        pub collection: ustore_collection_id_t,
+        pub prefix: ustore_bytes_view_t,
+        pub start_string: ustore_bytes_view_t,
+        pub patterns: ustore_patterns_t,
+        pub predicate: ustore_predicate_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_strings_cursor_next_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub cursor: ustore_strings_cursor_t,
+        pub strings: *mut ustore_strings_view_t,
+        pub values: *mut *const ustore_key_t,
+        pub written: *mut ustore_size_t,
+        pub arena: ustore_arena_t,
+        pub wanted: ustore_size_t,
+        pub progress: ustore_progress_callback_t,
+        pub progress_state: *mut c_void,
+    }
+
+    extern "C" {
+        pub fn ustore_strings_write(arguments: *mut ustore_strings_write_t);
+        pub fn ustore_strings_cursor_init(arguments: *mut ustore_strings_cursor_init_t);
+        pub fn ustore_strings_cursor_next(arguments: *mut ustore_strings_cursor_next_t);
+        pub fn ustore_strings_cursor_free(cursor: ustore_strings_cursor_t);
+    }
+}
+
+// endregion: Raw Declarations
 
 // region: Outputs
 
@@ -69,7 +146,7 @@ impl<'names, 'arena> IntoIterator for &'names Names<'arena> {
 pub(crate) fn create_named(database: ustore_database_t, name: &str, modality: Modality) -> Result<CollectionID> {
     let mut collection = CollectionID::default();
     let mut outcome = ustore_outcome_t::default();
-    let mut arguments = ffi::ustore_collection_create_t {
+    let mut arguments = db_ffi::ustore_collection_create_t {
         database,
         executor: ptr::null_mut(),
         outcome: &mut outcome,
@@ -79,7 +156,7 @@ pub(crate) fn create_named(database: ustore_database_t, name: &str, modality: Mo
         collection: &mut collection,
     };
     // SAFETY: the name and the output outlive the call, which is final on return.
-    unsafe { ffi::ustore_collection_create(&mut arguments) };
+    unsafe { db_ffi::ustore_collection_create(&mut arguments) };
     check(outcome)?;
     Ok(collection)
 }
@@ -153,7 +230,7 @@ pub struct CollectionFind<'arena, Name> {
 }
 
 impl<Name: AsRef<str>> Calling for CollectionFind<'_, Name> {
-    type Arguments = ffi::ustore_collection_find_t;
+    type Arguments = db_ffi::ustore_collection_find_t;
     type Output = (CollectionID, Modality);
 
     fn arguments<Parent, Completion>(
@@ -164,7 +241,7 @@ impl<Name: AsRef<str>> Calling for CollectionFind<'_, Name> {
     ) -> Result<Option<Self::Arguments>> {
         let name = self.name.as_ref();
         self.offsets = [0, name.len() as u64];
-        Ok(Some(ffi::ustore_collection_find_t {
+        Ok(Some(db_ffi::ustore_collection_find_t {
             database: view.database(),
             executor: view.executor(),
             outcome,
@@ -180,7 +257,7 @@ impl<Name: AsRef<str>> Calling for CollectionFind<'_, Name> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_collection_find(arguments)
+        db_ffi::ustore_collection_find(arguments)
     }
 
     fn finish(self) -> Result<(CollectionID, Modality)> {
@@ -234,7 +311,7 @@ impl<Name: AsRef<str>> CollectionNames<'_, Name> {
 }
 
 impl<'arena, Name: AsRef<str>> Calling for CollectionNames<'arena, Name> {
-    type Arguments = ffi::ustore_collection_list_t;
+    type Arguments = db_ffi::ustore_collection_list_t;
     type Output = Names<'arena>;
 
     fn arguments<Parent, Completion>(
@@ -243,7 +320,7 @@ impl<'arena, Name: AsRef<str>> Calling for CollectionNames<'arena, Name> {
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        Ok(Some(ffi::ustore_collection_list_t {
+        Ok(Some(db_ffi::ustore_collection_list_t {
             database: view.database(),
             executor: view.executor(),
             outcome,
@@ -258,7 +335,7 @@ impl<'arena, Name: AsRef<str>> Calling for CollectionNames<'arena, Name> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_collection_list(arguments)
+        db_ffi::ustore_collection_list(arguments)
     }
 
     fn finish(self) -> Result<Names<'arena>> {

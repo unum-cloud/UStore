@@ -627,6 +627,75 @@ struct edge_hash_t {
 
 #pragma endregion Arithmetic and Hashing
 
+#pragma region GPU Devices
+
+/** The GPU vendors UStore drives, each through a runtime opened on first use, so one binary addresses every vendor's
+ *  devices at once and loads where none is installed. */
+enum class gpu_vendor_t : std::uint32_t {
+    unknown_k = ustore_gpu_vendor_unknown_k,
+
+    /** NVIDIA, through the CUDA driver. */
+    nvidia_k = ustore_gpu_vendor_nvidia_k,
+
+    /** AMD, through the HIP runtime. */
+    amd_k = ustore_gpu_vendor_amd_k,
+};
+
+/** The GPU generations UStore tells apart, the device twin of its CPU classes: a class implies its vendor, and within
+ *  a vendor a newer device takes the newest class it satisfies. */
+enum class gpu_class_t : std::uint32_t {
+    unknown_k = ustore_gpu_class_unknown_k,
+
+    /** Ampere-class NVIDIA and every NVIDIA GPU without a class of its own - A100, A10 & RTX 30. */
+    nvidia_ampere_k = ustore_gpu_class_nvidia_ampere_k,
+
+    /** Ada-class NVIDIA - L4, L40S & RTX 40. */
+    nvidia_ada_k = ustore_gpu_class_nvidia_ada_k,
+
+    /** Hopper-class NVIDIA - H100 & H200: thread-block clusters and their distributed shared memory. */
+    nvidia_hopper_k = ustore_gpu_class_nvidia_hopper_k,
+
+    /** Blackwell-class NVIDIA - B200, B300 & GB300: cluster launch control. */
+    nvidia_blackwell_k = ustore_gpu_class_nvidia_blackwell_k,
+
+    /** Consumer Blackwell NVIDIA - RTX 50, RTX PRO 6000 & DGX Spark. */
+    nvidia_blackwellrtx_k = ustore_gpu_class_nvidia_blackwellrtx_k,
+
+    /** CDNA3 AMD - MI300X & MI325X: gfx942, 64-wide waves. */
+    amd_cdna3_k = ustore_gpu_class_amd_cdna3_k,
+
+    /** CDNA4 AMD - MI350X & MI355X: gfx950. */
+    amd_cdna4_k = ustore_gpu_class_amd_cdna4_k,
+
+    /** CDNA5 AMD - MI400: gfx1250, 32-wide waves. */
+    amd_cdna5_k = ustore_gpu_class_amd_cdna5_k,
+};
+
+/** One GPU as its vendor's driver reports it: the vendor, that vendor's own ordinal, its raw architecture, and what a
+ *  listing reports, so no caller asks a vendor SDK; the router maps the architecture to a class. */
+struct gpu_device_t {
+    gpu_vendor_t vendor = gpu_vendor_t::unknown_k;
+    std::uint32_t vendor_ordinal = 0;
+
+    /** The CUDA compute capability or the AMD @c gfx version, major then minor. */
+    std::uint32_t architecture_major = 0;
+    std::uint32_t architecture_minor = 0;
+
+    /** Streaming multiprocessors or compute units. */
+    std::uint32_t compute_units = 0;
+
+    /** Device memory in bytes. */
+    std::uint64_t memory_bytes = 0;
+
+    /** The vendor's own name for the device, null-terminated and truncated to fit. */
+    char name[64] = {};
+};
+
+/** Devices one vendor's listing holds at most, so the process-wide listing needs no heap. */
+inline constexpr std::size_t gpu_devices_capacity_k = 64;
+
+#pragma endregion GPU Devices
+
 } // namespace utilities
 
 // The statuses every UStore call answers, in the namespace every SDK and engine opens

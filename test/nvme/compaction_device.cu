@@ -11,7 +11,7 @@
 
 #include <span> // `std::span`
 
-#include "ustore/blobs/vram_nvidia_compaction.cuh" // `cuda_compaction_lane_t`, `compaction_output`, `sorted_run_index_view`
+#include "ustore/blobs/vram_nvidia_compaction.cuh" // `cuda_compactor_t`, `compaction_output`, `sorted_run_index_view`
 #include "ustore/graph/vram_nvidia_adjacency_fold.cuh" // `adjacency_fold_t`, `vram_nvidia_adjacency_fold_t`
 #include "ustore/utilities/folds.hpp"                  // `last_write_fold_t`
 
@@ -30,42 +30,48 @@ using utilities::last_write_fold_t;
 template <typename key_slot_type_>
 using views_of = std::span<blobs::sorted_run_index_view<key_slot_type_> const>;
 
-template st::status_t blobs::cuda_compaction_lane_t::compact(
+template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::inline_key_slot<std::uint64_t>>, views_of<test::inline_key_slot<std::uint64_t>>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    std::span<blobs::sorted_run_extents_t const>, sorted_run_bounds_t const&, compaction_stamps_t const&,
+    last_write_fold_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::inline_key_slot<std::uint64_t>>,
     compaction_output<test::inline_key_slot<std::uint64_t>>&);
-template st::status_t blobs::cuda_compaction_lane_t::compact(
+template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::fixed_width_key_slot<std::uint64_t>>,
-    views_of<test::fixed_width_key_slot<std::uint64_t>>, sorted_run_bounds_t const&, compaction_stamps_t const&,
-    last_write_fold_t const&, blobs::no_device_fold_t const&,
+    views_of<test::fixed_width_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::fixed_width_key_slot<std::uint64_t>>,
     compaction_output<test::fixed_width_key_slot<std::uint64_t>>&);
-template st::status_t blobs::cuda_compaction_lane_t::compact(
+template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::variable_width_key_slot<std::uint64_t>>,
-    views_of<test::variable_width_key_slot<std::uint64_t>>, sorted_run_bounds_t const&, compaction_stamps_t const&,
-    last_write_fold_t const&, blobs::no_device_fold_t const&,
+    views_of<test::variable_width_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::variable_width_key_slot<std::uint64_t>>,
     compaction_output<test::variable_width_key_slot<std::uint64_t>>&);
-template st::status_t blobs::cuda_compaction_lane_t::compact(
-    compaction_kind_t, views_of<test::inline_key_slot<key128_t>>, views_of<test::inline_key_slot<key128_t>>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
-    blobs::located_value_reader<test::inline_key_slot<key128_t>>, compaction_output<test::inline_key_slot<key128_t>>&);
-template st::status_t blobs::cuda_compaction_lane_t::compact(
+template st::status_t blobs::cuda_compactor_t::compact(compaction_kind_t, views_of<test::inline_key_slot<key128_t>>,
+                                                       views_of<test::inline_key_slot<key128_t>>,
+                                                       std::span<blobs::sorted_run_extents_t const>,
+                                                       sorted_run_bounds_t const&, compaction_stamps_t const&,
+                                                       last_write_fold_t const&, blobs::no_device_fold_t const&,
+                                                       blobs::located_value_reader<test::inline_key_slot<key128_t>>,
+                                                       compaction_output<test::inline_key_slot<key128_t>>&);
+template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::fixed_width_key_slot<key128_t>>, views_of<test::fixed_width_key_slot<key128_t>>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    std::span<blobs::sorted_run_extents_t const>, sorted_run_bounds_t const&, compaction_stamps_t const&,
+    last_write_fold_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::fixed_width_key_slot<key128_t>>,
     compaction_output<test::fixed_width_key_slot<key128_t>>&);
-template st::status_t blobs::cuda_compaction_lane_t::compact(
+template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::variable_width_key_slot<key128_t>>,
-    views_of<test::variable_width_key_slot<key128_t>>, sorted_run_bounds_t const&, compaction_stamps_t const&,
-    last_write_fold_t const&, blobs::no_device_fold_t const&,
+    views_of<test::variable_width_key_slot<key128_t>>, std::span<blobs::sorted_run_extents_t const>,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::variable_width_key_slot<key128_t>>,
     compaction_output<test::variable_width_key_slot<key128_t>>&);
-template st::status_t blobs::cuda_compaction_lane_t::compact(
+template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::variable_width_key_slot<std::uint64_t>>,
-    views_of<test::variable_width_key_slot<std::uint64_t>>, sorted_run_bounds_t const&, compaction_stamps_t const&,
-    graph::adjacency_fold_t const&, graph::vram_nvidia_adjacency_fold_t const&,
+    views_of<test::variable_width_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, graph::adjacency_fold_t const&,
+    graph::vram_nvidia_adjacency_fold_t const&,
     blobs::located_value_reader<test::variable_width_key_slot<std::uint64_t>>,
     compaction_output<test::variable_width_key_slot<std::uint64_t>>&);
 

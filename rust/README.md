@@ -556,7 +556,7 @@ Every call through a `Collection`, and `Executor::drain`, block as well.
 
 The crate binds none of these:
 
-- The strings modality of `strings.h`, its cursors included, and the pages of `pages.h`.
+- The verbs of the strings modality of `strings.h` and of the pages of `pages.h`, beyond the pages cursor and what Arrow reaches: `export_arrow`, `import_arrow` and `ingest_arrow` move collections of either modality whole, through their cursors, `ustore_strings_write` and `ustore_pages_import`.
 - The progress of a scan and of a cursor pull, since the crate scans one range at a time and each reports a single unit once its work is done.
 - Unordered scans and the lengths a read writes beside its values.
 

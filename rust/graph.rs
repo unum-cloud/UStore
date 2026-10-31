@@ -65,7 +65,7 @@ use crate::db::{
 // region: Raw Declarations
 
 /// One-to-one mirror of `c/ustore/graph.h`.
-mod ffi {
+pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 
     use super::*;

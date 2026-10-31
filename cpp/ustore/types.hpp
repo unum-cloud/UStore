@@ -254,7 +254,8 @@ class executor_handle_t {
         return make_(ustore_executor_for_nvme, options);
     }
 
-    /** Spawns one host thread driving each CUDA device @p options name, which an NVMe executor compacts on. */
+    /** Spawns one host thread driving the NVIDIA or AMD device @p options name by its UStore ordinal, on which an NVMe
+     *  database compacts when the device is NVIDIA. */
     static expected<executor_handle_t> for_vram(ustore_executor_for_vram_t options = {}) noexcept {
         return make_(ustore_executor_for_vram, options);
     }

@@ -53,8 +53,7 @@
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <smashtable/shared.hpp>       // `st::status_t`, `st::default_allocator`
 
-#include "ustore/utilities/types.hpp"              // `status_t`, `status_code_t`, `expected`, `byte_t`
-#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_device_allocator`, when the toolkit is on the include path
+#include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -630,15 +629,6 @@ using constrained_buffer = st::basic_vector<std::byte, constrained_allocator<std
 template <template <typename> typename atomic_reference_>
 using constrained_aligned_buffer =
     st::basic_vector<std::byte, constrained_allocator<std::byte, atomic_reference_, direct_io_allocator<std::byte>>>;
-
-#if __has_include(<cuda_runtime.h>)
-
-/** Bytes of GPU memory, charged to the budget of the device they sit on. */
-template <template <typename> typename atomic_reference_>
-using constrained_device_buffer =
-    st::basic_vector<std::byte, constrained_allocator<std::byte, atomic_reference_, cuda_device_allocator<std::byte>>>;
-
-#endif
 
 #pragma endregion Vocabulary
 

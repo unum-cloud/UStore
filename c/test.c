@@ -246,6 +246,31 @@ int main(void) {
     failures += expect(pulled == 0 && found_keys == NULL, __LINE__);
     ustore_blobs_cursor_free(keys_cursor);
 
+    // A tape a read wrote exports as an Arrow column pinning its arena, which refuses the next call until released
+    ustore_arena_t exported = NULL;
+    ustore_arena_init_t exported_init = {.arena = &exported, .outcome = &outcome};
+    ustore_arena_init(&exported_init);
+    read.arena = exported;
+    ustore_blobs_read(&read);
+    failures += expect_success(&outcome, __LINE__);
+    struct ArrowSchema schema = {0};
+    struct ArrowDeviceArray column = {0};
+    failures += expect(ustore_strings_view_to_arrow(values, 3, ustore_strings_u32_tape_k, exported, &schema, &column) ==
+                           ustore_status_success_k,
+                       __LINE__);
+    ustore_blobs_read(&read);
+    failures += expect(outcome.status == ustore_status_contended_k, __LINE__);
+    ustore_strings_view_t converted = {0};
+    ustore_size_t converted_count = 0;
+    failures += expect(ustore_strings_view_from_arrow(&schema, &column.array, &converted, &converted_count) ==
+                               ustore_status_success_k &&
+                           converted_count == 3 && tape_holds(&converted, 2, "blue"),
+                       __LINE__);
+    ustore_arena_free(exported);
+    if (column.array.release) column.array.release(&column.array);
+    if (schema.release) schema.release(&schema);
+    read.arena = arena;
+
     // A strings cursor copies its prefix and walks the strings it starts, with the keys they map onto
     ustore_strings_cursor_t strings_cursor = NULL;
     ustore_strings_cursor_init_t strings_cursor_init = {.cursor = &strings_cursor,

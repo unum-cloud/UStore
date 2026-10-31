@@ -158,6 +158,25 @@
       }
     },
     {
+      "name": "linux_cuda_rocm",
+      "inherits": ["base", "linux"],
+      "displayName": "Linux CUDA and ROCm - one library over both GPU vendors",
+      "description": "ROCm's Clang compiles every host unit and NVCC hosts on Clang for the CUDA compaction, into one library that links neither vendor's runtime and drives the NVIDIA and AMD devices it opens at first use. One code per vendor, at -O0, to check that it compiles, links and loads.",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/rocm/lib/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "/opt/rocm/lib/llvm/bin/clang++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
+        "CMAKE_CUDA_FLAGS_RELWITHDEBINFO": "-O0 -Xcicc -O0 -Xptxas -O0 -DNDEBUG",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_BUILD_SHARED": "ON",
+        "USTORE_WITH_NVME": "ON",
+        "USTORE_CUDA_ARCH": "80",
+        "USTORE_ROCM_ARCH": "gfx942"
+      }
+    },
+    {
       "name": "trace",
       "inherits": "dev",
       "displayName": "Trace - where the build time goes",

@@ -430,7 +430,7 @@ typedef struct ustore_graph_scan_vertices_t {
     /** Smallest vertex every scan may return, where @c NULL data starts at the first vertex. */
     ustore_keys_view_t start_keys;
 
-    /** Optional verdict on the listed vertices, asked once per page as its @c cost says; host executors only. */
+    /** Optional verdict on the listed vertices, asked on the host once per page as its @c cost says. */
     ustore_predicate_t predicate;
 
     /** Output for @c count plus one offsets into @c keys, the last one closing the final scan, inside @c arena. */
@@ -465,8 +465,7 @@ typedef struct ustore_graph_scan_vertices_t {
  *    @c mode or a predicate cost is unknown, the @c view was made by neither view constructor or
  *    belongs to another engine, a watching scan goes through a staged transaction, or a collection
  *    holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes, or a device
- *    executor is given a predicate.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
@@ -528,7 +527,6 @@ typedef struct ustore_graph_vertices_cursor_init_t {
  *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made by
  *    neither view constructor or reads another database, or a predicate cost is unknown.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
- *  - @c ustore_status_device_k A device @c executor is given a predicate.
  */
 USTORE_EXPORT void ustore_graph_vertices_cursor_init(ustore_graph_vertices_cursor_init_t* arguments);
 

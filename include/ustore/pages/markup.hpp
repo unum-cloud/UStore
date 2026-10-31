@@ -35,12 +35,15 @@
 #include <string_view> // `std::string_view`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <stringzilla/strings.h>       // `sz_strings_unescape_best`
+#include <stringzilla/strings.h>       // `sz_strings_span_free`
 #include <stringzilla/subdocuments.h>  // `sz_subdocuments_engine_init`, `sz_subdocuments_find`
 
-#include "ustore/pages/element_tree.hpp" // `element_tree`, `element_key_t`, `placement_t`
+#include "ustore/pages/element_tree.hpp"    // `element_tree`, `element_key_t`, `placement_t`
+#include "ustore/utilities/ram_buffers.hpp" // `stringzilla_kernels_t`
 
 namespace unum::ustore::pages {
+
+using utilities::stringzilla_kernels_t;
 
 /** The encoding a page or a fragment is imported from or rendered into, numbered as @c ustore_page_encoding_t. */
 enum class page_encoding_t : std::uint8_t {
@@ -408,7 +411,7 @@ class xml_tokenizer {
         return {};
     }
 
-    status_t unescape(sz_capability_t capabilities) noexcept {
+    status_t unescape(stringzilla_kernels_t const& kernels) noexcept {
         st::basic_vector<sz_string_view_t, rebound<sz_string_view_t>> runs {rebound<sz_string_view_t>(allocator_)};
         auto enlist = [&](std::uint32_t offset, std::uint32_t length, std::uint32_t& unescaped) noexcept -> status_t {
             if (!escaped(offset, length)) return {};
@@ -428,10 +431,9 @@ class xml_tokenizer {
         if (runs.empty()) return {};
         sz_strings_view_t const strings = strings_of(runs.data(), runs.size());
         sz_size_t malformed_index = 0;
-        return stringzilla_status(
-            sz_strings_unescape_best(&strings, nullptr, runs.size(), sz_escape_html_k, &c_allocator_, &tape_,
-                                     &malformed_index, capabilities, nullptr),
-            "Failed to unescape XML");
+        return stringzilla_status(kernels.strings_unescape(&strings, nullptr, runs.size(), sz_escape_html_k,
+                                                           &c_allocator_, &tape_, &malformed_index, nullptr),
+                                  "Failed to unescape XML");
     }
 
   public:
@@ -444,12 +446,12 @@ class xml_tokenizer {
     ~xml_tokenizer() noexcept { sz_strings_span_free(&tape_, &c_allocator_, nullptr); }
 
     /** Splits @p document into tokens and decodes its escaped runs, refusing documents past 4 GiB. */
-    status_t tokenize(std::string_view document, sz_capability_t capabilities) noexcept {
+    status_t tokenize(std::string_view document, stringzilla_kernels_t const& kernels) noexcept {
         if (document.size() > ~std::uint32_t(0)) return {status_code_t::invalid_argument_k, "XML past 4 GiB"};
         document_ = document;
         tokens_.clear(), attributes_.clear();
         if (status_t status = split(); status.failed()) return status;
-        return unescape(capabilities);
+        return unescape(kernels);
     }
 
     std::span<xml_token_t const> tokens() const noexcept { return {tokens_.begin(), tokens_.end()}; }
@@ -486,15 +488,15 @@ class xml_tokenizer {
  *  @param[in] mint Called once per element in document order for its key, so an insertion can hand out the given
  *      key first and minted ones after.
  *  @param[out] tree The element tree, replacing what it held.
- *  @param[in] capabilities What the CPU runs, which bounds the kernel picked.
+ *  @param[in] kernels The StringZilla kernels the handle looked up once at open.
  */
 template <typename allocator_type_, typename mint_type_>
 status_t import_xml(std::string_view xml, element_key_t const& root_key, placement_t placement, mint_type_&& mint,
-                    element_tree<allocator_type_>& tree, sz_capability_t capabilities) noexcept {
+                    element_tree<allocator_type_>& tree, stringzilla_kernels_t const& kernels) noexcept {
     using indices_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<element_index_t>;
     using chars_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<char>;
     xml_tokenizer<allocator_type_> tokenizer(tree.allocator());
-    if (status_t status = tokenizer.tokenize(xml, capabilities); status.failed()) return status;
+    if (status_t status = tokenizer.tokenize(xml, kernels); status.failed()) return status;
     if (status_t status = tree.reset(root_key, placement); status.failed()) return status;
 
     st::basic_vector<element_index_t, indices_allocator_t> open {indices_allocator_t(tree.allocator())};
@@ -569,14 +571,14 @@ status_t import_text(std::string_view text, element_key_t const& root_key, place
     return tree.append(tree.root(), mint(), element_kind_t::text_k, {}, text, placement).status();
 }
 
-/** Replaces @p tree with @p markup in @p encoding, unescaping through the StringZilla kernels
- *  @p capabilities allow, answering @c status_code_t::unsupported_k for HTML, Markdown and JSON. */
+/** Replaces @p tree with @p markup in @p encoding, unescaping through @p kernels, answering
+ *  @c status_code_t::unsupported_k for HTML, Markdown and JSON. */
 template <typename allocator_type_, typename mint_type_>
 status_t import_markup(page_encoding_t encoding, std::string_view markup, element_key_t const& root_key,
                        placement_t placement, mint_type_&& mint, element_tree<allocator_type_>& tree,
-                       sz_capability_t capabilities) noexcept {
+                       stringzilla_kernels_t const& kernels) noexcept {
     switch (encoding) {
-    case page_encoding_t::xml_k: return import_xml(markup, root_key, placement, mint, tree, capabilities);
+    case page_encoding_t::xml_k: return import_xml(markup, root_key, placement, mint, tree, kernels);
     case page_encoding_t::text_k: return import_text(markup, root_key, placement, mint, tree);
     default: return {status_code_t::unsupported_k, "Only XML and text import for now"};
     }

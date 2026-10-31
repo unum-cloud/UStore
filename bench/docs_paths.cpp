@@ -43,15 +43,6 @@ namespace unum::ustore::bench {
 
 using namespace unum::ustore::docs;
 
-/** The StringZilla kernels this CPU allows, probed once as `src/` does before it resolves. */
-inline sz_capability_t stringzilla_capabilities() noexcept {
-    static sz_capability_t const capabilities = []() noexcept {
-        sz_capability_t probed = 0;
-        return sz_capabilities_enabled_cpu(&probed) == sz_success_k ? probed : sz_capability_t {0};
-    }();
-    return capabilities;
-}
-
 #pragma region Settings
 
 /** Command-line options of the benchmark, each field set by the flag of the same name. */
@@ -243,12 +234,12 @@ bool resolve_with_yyjson(json_documents_t const& documents, std::span<std::strin
 
 /** Extracts every field of @p fields in @p documents with one subdocuments pass. */
 bool resolve_with_subdocuments(json_documents_t const& documents, std::span<std::string_view const> fields,
-                               ustore_arena_t scratch, std::span<json_cell_t> values) noexcept {
+                               stringzilla_kernels_t const& kernels, ustore_arena_t scratch,
+                               std::span<json_cell_t> values) noexcept {
     std::size_t const count = documents.count;
     auto const cell_of = [count](std::size_t cell) noexcept { return field_cell_t {cell % count, cell / count}; };
     json_cells_t cells;
-    if (extract_fields(documents, fields, count * fields.size(), cell_of, stringzilla_capabilities(), scratch, cells)
-            .failed())
+    if (extract_fields(documents, fields, count * fields.size(), cell_of, kernels, scratch, cells).failed())
         return false;
     for (std::size_t cell = 0; cell != count * fields.size(); ++cell) values[cell] = cells[cell];
     return true;
@@ -256,8 +247,9 @@ bool resolve_with_subdocuments(json_documents_t const& documents, std::span<std:
 
 /** Runs one row: each call resolves the next batch of the corpus with @p subdocuments or yyjson, then fills
  *  @p columns. */
-row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& corpus, std::string_view name,
-              std::span<column_t const> columns, bool subdocuments) noexcept {
+row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& corpus,
+              stringzilla_kernels_t const& kernels, std::string_view name, std::span<column_t const> columns,
+              bool subdocuments) noexcept {
     std::size_t const batch_size = std::min(settings.batch_size.value, settings.documents.value);
     std::array<std::string_view, columns_k.size()> fields;
     for (std::size_t column = 0; column != columns.size(); ++column) fields[column] = columns[column].field;
@@ -275,8 +267,9 @@ row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& 
             std::size_t const first = (call % batches) * batch_size;
             json_documents_t const documents = corpus.batch(first, batch_size);
             arena_rewind(scratch);
-            bool const resolved = subdocuments ? resolve_with_subdocuments(documents, used_fields, scratch, values)
-                                               : resolve_with_yyjson(documents, used_fields, scratch, values);
+            bool const resolved = subdocuments
+                                      ? resolve_with_subdocuments(documents, used_fields, kernels, scratch, values)
+                                      : resolve_with_yyjson(documents, used_fields, scratch, values);
             if (!resolved) {
                 loop.fail();
                 continue;
@@ -309,6 +302,21 @@ int main(int argc, char** argv) {
         return 1;
     }
     executor_t& executor = *maybe_executor;
+    sz_capability_t capabilities = sz_cap_serial_k;
+    if (sz_capabilities_enabled_cpu(&capabilities) != sz_success_k) capabilities = sz_cap_serial_k;
+    sz_kernel_punned_t count_strings = nullptr, find_byteset = nullptr, unescape = nullptr;
+    sz_capability_t picked = 0;
+    if (sz_find_kernel_punned(sz_kernel_utf8_count_strings_k, capabilities, &count_strings, &picked) != sz_success_k ||
+        sz_find_kernel_punned(sz_kernel_find_byteset_k, capabilities, &find_byteset, &picked) != sz_success_k ||
+        sz_find_kernel_punned(sz_kernel_strings_unescape_k, capabilities, &unescape, &picked) != sz_success_k) {
+        fmt::println(stderr, "No StringZilla kernel for capabilities {:#x}", capabilities);
+        return 1;
+    }
+    stringzilla_kernels_t kernels;
+    kernels.capabilities = capabilities;
+    kernels.utf8_count_strings = reinterpret_cast<sz_kernel_utf8_count_strings_t>(count_strings);
+    kernels.find_byteset = reinterpret_cast<sz_kernel_find_byteset_t>(find_byteset);
+    kernels.strings_unescape = reinterpret_cast<sz_kernel_strings_unescape_t>(unescape);
 
     corpus_t corpus;
     if (!generate_corpus(settings.documents.value, settings.seed.value, corpus)) {
@@ -334,6 +342,6 @@ int main(int argc, char** argv) {
     };
     for (row_spec_t const& row : rows)
         if (settings.selects(row.name))
-            print(run_row(executor, settings, corpus, row.name, row.columns, row.subdocuments));
+            print(run_row(executor, settings, corpus, kernels, row.name, row.columns, row.subdocuments));
     return 0;
 }

@@ -1,24 +1,115 @@
-# The CUDA compiler, its codes and toolkit, and NVMe's compaction library on the device.
+# The GPU host compiler, the CUDA and ROCm codes, the bundles kernels embed through, and the CUDA toolkit.
 
-# NVMe's compaction on the device, the CUDA runtime library every engine and suite links once the build carries it. The
-# GPU half is opt-in, so a build without it leaves the toolkit alone.
-if (USTORE_CUDA_ARCH)
-    include(CheckLanguage)
+# Clang keeps a unit's host and device halves apart through the host-only passes of its CUDA and HIP modes, where other
+# host compilers trip over mixed units.
+if ((USTORE_CUDA_ARCH OR USTORE_ROCM_ARCH) AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(
+        FATAL_ERROR
+            "Every GPU build compiles its host code with Clang, found ${CMAKE_CXX_COMPILER_ID} - set CMAKE_CXX_COMPILER to clang++, and to ROCm's own clang++ for USTORE_ROCM_ARCH"
+    )
+endif ()
 
-    # A toolkit installed outside the PATH, which is where the distribution packages put it
-    if (NOT DEFINED CMAKE_CUDA_COMPILER)
-        find_program(USTORE_NVCC nvcc HINTS /usr/local/cuda/bin /opt/cuda/bin)
-        if (USTORE_NVCC)
-            set(CMAKE_CUDA_COMPILER "${USTORE_NVCC}")
+# The AMD processors a bundle embeds a code object for, as the `--offload-arch` flags of its device-only pass: `all` is
+# gfx942 for CDNA3, gfx950 for CDNA4 and gfx1250 for CDNA5, `native` the processors `rocm_agent_enumerator` lists, and
+# anything else a list of processors.
+set(ustore_rocm_architectures_ ${USTORE_ROCM_ARCH})
+if (USTORE_ROCM_ARCH STREQUAL "all")
+    set(ustore_rocm_architectures_ gfx942 gfx950 gfx1250)
+elseif (USTORE_ROCM_ARCH STREQUAL "native")
+    execute_process(
+        COMMAND rocm_agent_enumerator
+        OUTPUT_VARIABLE ustore_rocm_architectures_
+        ERROR_QUIET
+    )
+    separate_arguments(ustore_rocm_architectures_ UNIX_COMMAND "${ustore_rocm_architectures_}")
+endif ()
+set(ustore_rocm_codes_)
+foreach (architecture_ IN LISTS ustore_rocm_architectures_)
+    # `rocm_agent_enumerator` lists the host CPU too, as gfx000, and a processor once per GPU carrying it
+    if (NOT architecture_ STREQUAL "gfx000" AND NOT "--offload-arch=${architecture_}" IN_LIST ustore_rocm_codes_)
+        list(APPEND ustore_rocm_codes_ --offload-arch=${architecture_})
+    endif ()
+endforeach ()
+if (USTORE_ROCM_ARCH STREQUAL "native" AND NOT ustore_rocm_codes_)
+    message(FATAL_ERROR "USTORE_ROCM_ARCH=native found no GPU through rocm_agent_enumerator; name its processor")
+endif ()
+
+# Every NVIDIA and AMD bundle links into its target through an assembler stub.
+if (USTORE_CUDA_ARCH OR USTORE_ROCM_ARCH)
+    enable_language(ASM)
+endif ()
+
+# Every NVIDIA or AMD unit with kernels compiles twice. Host-only, through Clang's CUDA or HIP mode, it names its
+# kernels from device code alone, so nothing registers with or links a GPU runtime, which opens at first use.
+# Device-only, NVCC for NVIDIA and Clang for AMD, it compiles into a bundle of the codes the remaining arguments name, a
+# CUDA fatbin or a HIP offload bundle, with @p target_'s includes and definitions; the bundle links into @p target_
+# page-aligned in a read-only section through an assembler stub, under `<name>_bundle_start` and `<name>_bundle_end`, so
+# it travels into archives too. With no codes the bundle is empty, and its devices refuse to load it. The device pass
+# compiles @p source_, or the `DEVICE` source when the unit keeps its kernels apart, as an AMD unit must: HIP-Clang
+# refuses a kernel's address in device code, so a host function takes it, which the host pass may never compile.
+set_property(GLOBAL APPEND PROPERTY JOB_POOLS ustore_gpu_device_pass=4)
+function (ustore_gpu_bundle target_ vendor_ name_ source_)
+    cmake_parse_arguments(PARSE_ARGV 4 arg "" "DEVICE" "")
+    set(device_source_ ${source_})
+    if (arg_DEVICE)
+        set(device_source_ ${arg_DEVICE})
+    endif ()
+    set(bundle_ ${CMAKE_CURRENT_BINARY_DIR}/bundles/${target_}/${name_}.bundle)
+    if (vendor_ STREQUAL "nvidia")
+        set(host_compiler_ ${CMAKE_CXX_COMPILER})
+        if (CMAKE_CUDA_HOST_COMPILER)
+            set(host_compiler_ ${CMAKE_CUDA_HOST_COMPILER})
         endif ()
-    endif ()
-    check_language(CUDA)
-    if (NOT CMAKE_CUDA_COMPILER)
-        message(
-            WARNING
-                "UStore: no CUDA compiler found, so only the host compaction suite builds - install CUDA 13 or newer"
+        # NVCC's default leaves Turing and Ampere cubins uncompressed, ten times their compressed size.
+        set(device_only_ "${CUDAToolkit_NVCC_EXECUTABLE};-x;cu;--fatbin;--compress-mode=size;-ccbin;${host_compiler_}"
+                         --expt-relaxed-constexpr
         )
+        set(optimization_ "$<$<CONFIG:Debug>:-O0$<SEMICOLON>-Xcicc$<SEMICOLON>-O0$<SEMICOLON>-Xptxas$<SEMICOLON>-O0>"
+                          "$<$<NOT:$<CONFIG:Debug>>:-O3>"
+        )
+        set(host_only_ "-xcuda;--cuda-host-only;-nocudalib;--cuda-path=${CUDAToolkit_LIBRARY_ROOT}")
+        target_include_directories(${target_} SYSTEM PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    else ()
+        set(device_only_ "${CMAKE_CXX_COMPILER};-x;hip;--cuda-device-only;-c")
+        set(optimization_ "$<$<CONFIG:Debug>:-O0>" "$<$<NOT:$<CONFIG:Debug>>:-O3>")
+        set(host_only_ "-xhip;--cuda-host-only;-nogpulib")
     endif ()
+    set_source_files_properties(${source_} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "${host_only_}")
+    if (arg_UNPARSED_ARGUMENTS)
+        add_custom_command(
+            OUTPUT ${bundle_}
+            COMMAND
+                ${device_only_} -std=c++20 ${optimization_} ${arg_UNPARSED_ARGUMENTS}
+                "-I$<JOIN:$<TARGET_PROPERTY:${target_},INCLUDE_DIRECTORIES>,;-I>"
+                "$<$<BOOL:$<TARGET_PROPERTY:${target_},COMPILE_DEFINITIONS>>:-D$<JOIN:$<TARGET_PROPERTY:${target_},COMPILE_DEFINITIONS>,;-D>>"
+                -MD -MF ${bundle_}.d ${device_source_} -o ${bundle_}
+            DEPENDS ${device_source_}
+            DEPFILE ${bundle_}.d
+            COMMENT "Compiling the ${name_} kernels"
+            JOB_POOL ustore_gpu_device_pass
+            COMMAND_EXPAND_LISTS VERBATIM
+        )
+    else ()
+        file(WRITE ${bundle_} "")
+    endif ()
+    set(stub_ ${CMAKE_CURRENT_BINARY_DIR}/bundles/${target_}/${name_}_bundle.S)
+    file(
+        WRITE ${stub_}
+        ".section .rodata\n.balign 4096\n.globl ${name_}_bundle_start\n${name_}_bundle_start:\n"
+        ".incbin \"${bundle_}\"\n.globl ${name_}_bundle_end\n${name_}_bundle_end:\n"
+        ".section .note.GNU-stack,\"\",@progbits\n"
+    )
+    set_source_files_properties(${stub_} PROPERTIES LANGUAGE ASM OBJECT_DEPENDS ${bundle_})
+    target_sources(${target_} PRIVATE ${stub_})
+endfunction ()
+
+# The CUDA language, its codes and its toolkit, for NVMe's compaction on the device and the NVIDIA bundles. The GPU half
+# is opt-in, so a build without it leaves the toolkit alone. The siblings probed for nvcc, outside the PATH too, before
+# StringZilla enabled CUDA, and that probe's cached answer is the one this module reads.
+if (USTORE_CUDA_ARCH AND NOT CMAKE_CUDA_COMPILER)
+    message(
+        WARNING "UStore: no CUDA compiler found, so only the host compaction suite builds - install CUDA 13 or newer"
+    )
 endif ()
 if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
     # CUB is all the compaction kernels call, so plain codes cover Ampere through Blackwell: `all` carries a cubin per
@@ -33,6 +124,17 @@ if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
     else ()
         message(FATAL_ERROR "USTORE_CUDA_ARCH takes all, native or one code like 100f, not `${USTORE_CUDA_ARCH}`")
     endif ()
+    # The same codes as NVCC's flags, for the device-only passes of `ustore_gpu_bundle`, where CUDA is no language
+    set(ustore_cuda_codes_)
+    foreach (architecture_ IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if (architecture_ STREQUAL "native")
+            list(APPEND ustore_cuda_codes_ -arch=native)
+        elseif (architecture_ MATCHES "^([0-9]+[af]?)-real$")
+            list(APPEND ustore_cuda_codes_ --generate-code=arch=compute_${CMAKE_MATCH_1},code=sm_${CMAKE_MATCH_1})
+        elseif (architecture_ MATCHES "^([0-9]+[af]?)-virtual$")
+            list(APPEND ustore_cuda_codes_ --generate-code=arch=compute_${CMAKE_MATCH_1},code=compute_${CMAKE_MATCH_1})
+        endif ()
+    endforeach ()
     if (CMAKE_VERSION VERSION_LESS 3.31 AND CMAKE_CUDA_ARCHITECTURES MATCHES "1[0-9][0-9][af]")
         message(FATAL_ERROR "Three-digit \"a\" and \"f\" CUDA codes need CMake 3.31, found ${CMAKE_VERSION}")
     endif ()
@@ -44,27 +146,4 @@ if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
     # NVCC's default leaves Turing and Ampere cubins uncompressed, ten times their compressed size.
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>)
     include(cmake/cccl.cmake)
-
-    add_library(ustore_nvme_compaction STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cu")
-    target_link_libraries(
-        ustore_nvme_compaction
-        PUBLIC $<BUILD_INTERFACE:CCCL::CUB> CUDA::cudart ustore_header $<BUILD_INTERFACE:smashtable::header>
-               $<BUILD_INTERFACE:forkunion::header>
-        PRIVATE $<BUILD_INTERFACE:stringzilla::static>
-    )
-    set_target_properties(ustore_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-    target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
-    # The host pass reads nvcc's preprocessed output, where every header is the main file and every macro is expanded,
-    # so constant operands from capability macros and unused statics of the C headers would warn there and nowhere else
-    target_compile_options(
-        ustore_nvme_compaction
-        PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-constant-logical-operand,-Wno-unneeded-internal-declaration>
-    )
-    # A constexpr function is callable from a kernel, so the shared headers carry no host-device qualifier
-    target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-    # StringZilla's serial kernels, reached through the engine's key slots, carry GCC pragmas nvcc's front end does not
-    # know
-    target_compile_options(ustore_nvme_compaction PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=1675>)
-    # Every target linking the library merges on the device, and every other one takes the host branch of the merger
-    target_compile_definitions(ustore_nvme_compaction PUBLIC USTORE_WITH_CUDA=1)
 endif ()

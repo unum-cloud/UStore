@@ -32,7 +32,7 @@ use crate::docs::Bitmap;
 // region: Raw Declarations
 
 /// One-to-one mirror of `c/ustore/blobs.h`.
-mod ffi {
+pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 
     use super::*;

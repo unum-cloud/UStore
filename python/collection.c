@@ -289,6 +289,28 @@ static PyObject* Collection_get_modality(Collection* self, void* Py_UNUSED(closu
     return ustore_py_enum_to_object(ustore_py_enum_modality_k, (int)held);
 }
 
+static char const doc_Collection_arrow_c_stream[] =                                          //
+    "__arrow_c_stream__(requested_schema=None) answers an `arrow_array_stream` capsule.\n"   //
+    "\n"                                                                                     //
+    "Exports the whole collection as one Arrow stream through the receiver's view, so\n"     //
+    "`pyarrow.table(db['posters'])` reads it in place: keys as `arrow.uuid`, values as\n"    //
+    "binary, and a graph as `source`, `target` and `edge`. At the head the stream reads a\n" //
+    "snapshot it holds until released. Every batch keeps its own memory, outliving the\n"    //
+    "stream, and the requested schema is ignored, as the protocol allows.";
+
+static PyObject* Collection_arrow_c_stream(Collection* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                           PyObject* args_names_tuple) {
+    PyObject* requested = Py_None;
+    if (ustore_py_optional_argument("__arrow_c_stream__", args, positional_args_count, args_names_tuple, 0,
+                                    "requested_schema", &requested) != 0)
+        return NULL;
+    ustore_py_context_t context;
+    ustore_py_verb_options_t options;
+    ustore_modality_t held = ustore_modality_blobs_k;
+    if (collection_found(self, &context, &options, &held) != 0) return NULL;
+    return ustore_py_stream_export(&context, options.collection);
+}
+
 static char const doc_Collection_sample[] =                                                     //
     "sample(wanted) answers a dict of up to `wanted` keys drawn at random onto their values.\n" //
     "\n"                                                                                        //
@@ -399,6 +421,8 @@ static char const doc_Collection[] =                                            
     "call instead.";
 
 static PyMethodDef Collection_methods[] = {
+    {"__arrow_c_stream__", (PyCFunction)(void (*)(void))Collection_arrow_c_stream, ustore_py_method_flags_k,
+     doc_Collection_arrow_c_stream},
     {"sample", (PyCFunction)(void (*)(void))Collection_sample, METH_O, doc_Collection_sample},
     {"sample_keys", (PyCFunction)(void (*)(void))Collection_sample_keys, METH_FASTCALL, doc_Collection_sample_keys},
     {"scan", (PyCFunction)(void (*)(void))Collection_scan, METH_FASTCALL, doc_Collection_scan},

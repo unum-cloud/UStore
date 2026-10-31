@@ -1,0 +1,5 @@
+# LeakSanitizer suppressions for the `USTORE_BUILD_SANITIZERS=address` tree, which ctest passes to every suite.
+# The CUDA driver and cuFile allocate for themselves when first opened and keep it until the process ends, so a test
+# that merely probes the GPU tables is reported as leaking what `cuInit` and `cuFileDriverOpen` hold.
+leak:libcuda.so
+leak:libcufile.so

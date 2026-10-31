@@ -8,6 +8,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstring> // `std::memcpy`
 
 #include <algorithm>   // `std::find`, `std::max`, `std::reverse`
 #include <array>       // `std::array`
@@ -17,7 +18,7 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
-#include <variant>     // `std::variant`, `std::get_if`
+#include <variant>     // `std::variant`, `std::get_if`, `std::visit`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
@@ -63,6 +64,27 @@ constexpr enumerator_spelling<ustore_gds_t> gds_names_k[] {
     {ustore_gds_compat_k, "compat"},
 };
 
+/** The canonical spelling of every GPU vendor. */
+constexpr enumerator_spelling<ustore_gpu_vendor_t> gpu_vendor_names_k[] {
+    {ustore_gpu_vendor_nvidia_k, "nvidia"},
+    {ustore_gpu_vendor_amd_k, "amd"},
+};
+
+/** The canonical spelling of every GPU class. */
+constexpr enumerator_spelling<ustore_gpu_class_t> gpu_class_names_k[] {
+    {ustore_gpu_class_nvidia_ampere_k, "nvidia-ampere"},
+    {ustore_gpu_class_nvidia_ada_k, "nvidia-ada"},
+    {ustore_gpu_class_nvidia_hopper_k, "nvidia-hopper"},
+    {ustore_gpu_class_nvidia_blackwell_k, "nvidia-blackwell"},
+    {ustore_gpu_class_nvidia_blackwellrtx_k, "nvidia-blackwellrtx"},
+    {ustore_gpu_class_amd_cdna3_k, "amd-cdna3"},
+    {ustore_gpu_class_amd_cdna4_k, "amd-cdna4"},
+    {ustore_gpu_class_amd_cdna5_k, "amd-cdna5"},
+};
+
+static_assert(static_cast<std::uint32_t>(gpu_class_t::amd_cdna5_k) == ustore_gpu_class_amd_cdna5_k);
+static_assert(static_cast<std::uint32_t>(gpu_vendor_t::amd_k) == ustore_gpu_vendor_amd_k);
+
 /** The canonical spelling of every pattern kind. */
 constexpr enumerator_spelling<ustore_pattern_kind_t> pattern_kind_names_k[] {
     {ustore_pattern_regex_k, "regex"},
@@ -92,6 +114,7 @@ constexpr enumerator_spelling<ustore_cpu_class_t> cpu_class_names_k[] {
     {ustore_cpu_class_aws_g2_k, "aws-g2"},
     {ustore_cpu_class_apple_m2_k, "apple-m2"},
     {ustore_cpu_class_aws_g5_k, "aws-g5"},
+    {ustore_cpu_class_alibaba_c930_k, "alibaba-c930"},
     {ustore_cpu_class_monoversioned_k, "monoversioned"},
 };
 
@@ -333,6 +356,10 @@ ustore_predicate_cost_t ustore_predicate_cost_from_name(ustore_bytes_view_t name
 }
 char const* ustore_gds_name(ustore_gds_t gds) { return name_in(gds_names_k, gds); }
 ustore_gds_t ustore_gds_from_name(ustore_bytes_view_t name) { return value_in(gds_names_k, name); }
+char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t vendor) { return name_in(gpu_vendor_names_k, vendor); }
+ustore_gpu_vendor_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name) { return value_in(gpu_vendor_names_k, name); }
+char const* ustore_gpu_class_name(ustore_gpu_class_t gpu_class) { return name_in(gpu_class_names_k, gpu_class); }
+ustore_gpu_class_t ustore_gpu_class_from_name(ustore_bytes_view_t name) { return value_in(gpu_class_names_k, name); }
 char const* ustore_transport_name(ustore_transport_t transport) { return name_in(transport_names_k, transport); }
 ustore_transport_t ustore_transport_from_name(ustore_bytes_view_t name) { return value_in(transport_names_k, name); }
 
@@ -438,21 +465,45 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     *arguments->executor = nullptr;
     if (arguments->gds > ustore_gds_compat_k)
         return finish(outcome, {status_code_t::invalid_argument_k, "Unknown GPUDirect Storage mode"});
-#if USTORE_WITH_CUDA
-    expected<cuda_executor_t> spawned = cuda_executor_t::spawn(
-        arguments->device, static_cast<cudaStream_t>(arguments->stream), arguments->scratch_limit);
-    if (!spawned) return finish(outcome, spawned.status());
+    std::span<gpu_device_t const> const devices = gpu_devices();
+    if (arguments->device < 0 || static_cast<std::size_t>(arguments->device) >= devices.size())
+        return finish(outcome, {status_code_t::device_k, "No GPU carries the ordinal"});
+    gpu_device_t const& device = devices[static_cast<std::size_t>(arguments->device)];
+    if (device.vendor != gpu_vendor_t::nvidia_k && arguments->gds == ustore_gds_direct_k)
+        return finish(outcome, {status_code_t::device_k, "GPUDirect Storage reaches NVIDIA devices alone"});
     // One host thread keeps the device fed, as every call only queues work on its stream
     ustore_executor_t made = nullptr;
     if (status_t const status = spawn_across_machine(1, arguments->deferred_limit, fu_capabilities_all_k, made);
         status.failed())
         return finish(outcome, status);
-    made->device = std::move(*spawned);
+    if (status_t const status = spawn_gpu_executor(gpu_runtime().drivers, device, gpu_class_of(device),
+                                                   arguments->stream, arguments->scratch_limit, arguments->gds,
+                                                   made->device);
+        status.failed()) {
+        ustore_executor_free(made);
+        return finish(outcome, status);
+    }
     *arguments->executor = made;
     finish(outcome, {});
-#else
-    finish(outcome, {status_code_t::unsupported_k, "This build carries no CUDA devices"});
-#endif
+}
+
+void ustore_gpu_devices(ustore_gpu_devices_t* arguments) {
+    std::span<gpu_device_t const> const devices = gpu_devices();
+    std::size_t const copied = arguments->devices ? std::min<std::size_t>(devices.size(), arguments->devices_capacity)
+                                                  : 0;
+    for (std::size_t position = 0; position != copied; ++position) {
+        gpu_device_t const& device = devices[position];
+        ustore_gpu_device_t& listed = arguments->devices[position];
+        listed = {static_cast<ustore_gpu_vendor_t>(device.vendor),
+                  device.vendor_ordinal,
+                  static_cast<ustore_gpu_class_t>(gpu_class_of(device)),
+                  device.compute_units,
+                  device.memory_bytes,
+                  {}};
+        std::memcpy(listed.name, device.name, sizeof(listed.name));
+    }
+    if (arguments->devices_count) *arguments->devices_count = devices.size();
+    finish(*arguments->outcome, {});
 }
 
 void ustore_executor_drain(ustore_executor_drain_t* arguments) {
@@ -492,11 +543,14 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
     ustore_arena_t const arena = new (std::nothrow) ustore_arena_handle_t {};
     if (!arena) return finish(outcome, {status_code_t::out_of_memory_k, "Failed to allocate the arena"});
     // Nothing is allocated until the first call writes, on the memory domain or the device its executor names
-    if (ustore_executor_t const executor = arguments->executor) {
-        cuda_executor_t const* const device = std::get_if<cuda_executor_t>(&executor->device);
-        if (device) arena->memory = cuda_blocks_t {.device = device->device()};
-        else arena->memory = host_blocks_t {.memory_domain = executor->memory_domain};
-    }
+    if (ustore_executor_t const executor = arguments->executor)
+        std::visit(
+            [&]<typename device_type_>(device_type_ const& device) noexcept {
+                if constexpr (gpu_executor_concept<device_type_>)
+                    arena->memory = typename device_type_::arena_blocks_t {.device = device.device()};
+                else arena->memory = host_blocks_t {.memory_domain = executor->memory_domain};
+            },
+            executor->device);
     *arguments->arena = arena;
     finish(outcome, {});
 }
@@ -504,5 +558,8 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
 void ustore_arena_free(ustore_arena_t arena) {
     if (!arena) return;
     wait_deferred_calls(arena->deferred_calls);
-    arena_free(arena);
+    // A live export frees the arena on its last release instead
+    if (fu::standard_atomic_ref<std::uint32_t> {arena->exports}.fetch_add(arena_freed_bit_k,
+                                                                          std::memory_order_acq_rel) == 0)
+        destroy_arena(arena);
 }

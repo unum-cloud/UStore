@@ -1061,7 +1061,7 @@ class basic_single_collection_database {
      *      writing_channel.
      *  @param[in] config The collection's bounds and the transaction defaults.
      *  @param[in] resources The budget the conflict record, the roster and every transaction's writes are charged to.
-     *  @param[in] compactor What every merge runs on: the calling thread, or a device lane the caller owns, which
+     *  @param[in] compactor What every merge runs on: the calling thread, or a device compactor the caller owns, which
      *      outlives the database.
      *  @return The database, or @c malformed_k for a volume whose schema names another value layout.
      */
@@ -1624,7 +1624,8 @@ class basic_single_collection_database {
             std::memcpy(runs.data(), image.data() + sizeof(carried), runs.size() * sizeof(lsm_tree_run_record_t));
         generation_ = carried.stamps.generation;
         loaded_durable_ = carried.stamps.durable;
-        return collection_.restore(writing_channel_, std::span<lsm_tree_run_record_t const> {runs});
+        return collection_.restore(writing_channel_, std::span<lsm_tree_run_record_t const> {runs},
+                                   std::span<lsm_tree_run_stamp_t const> {});
     }
 
     /**
@@ -1776,7 +1777,7 @@ class basic_single_collection_database {
     /** The durable stamp of the schema copy the open read, above which a mount drops every version. */
     transaction_stamp_t loaded_durable_ = unwritten_stamp_k;
 
-    /** What every merge runs on, picked at open: the calling thread, or a lane the opener owns. */
+    /** What every merge runs on, picked at open: the calling thread, or a device compactor the opener owns. */
     compactor_ref_t compactor_;
 
     /** The order every transaction is placed in, and the last commit to write each key. */

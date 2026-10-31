@@ -547,6 +547,68 @@ std::size_t sections_sit_on_page_boundaries(mount_type_ const& mount) {
     return failures;
 }
 
+/** A run written as @c reserve, @c write_sections and @c seal_and_attach holds on its blob every byte @c write leaves
+ *  there for the same key slots under the same name. */
+template <typename mount_type_>
+std::size_t split_write_matches_write(mount_type_ const& mount) {
+    using types_t = run_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename types_t::fixture_t;
+    using guard_t = typename types_t::guard_t;
+    using volume_t = typename types_t::volume_t;
+    using variable_run_t = typename types_t::variable_run_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    failures += expect(guard.has_value());
+    if (!guard) return failures;
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
+    failures += expect(volume.has_value());
+    if (!volume) return failures;
+
+    variable_data_t data;
+    failures += build_variable(
+        1025, [](std::size_t index) -> std::int64_t { return index % 11 == 5 ? -1 : std::int64_t(index * 37 % 300); },
+        data);
+    if (failures != 0) return failures;
+    st::basic_vector<std::uint64_t> const stamps = ascending_stamps(data.key_slots.size());
+    std::span<variable_slot_t const> const key_slots {data.key_slots};
+    std::span<byte_t const> const values {data.values};
+    std::span<stored_value_offset_t const> const offsets {data.offsets};
+    uuid_t const content_id = uuid_generator();
+
+    st::basic_vector<byte_t> whole_bytes;
+    {
+        expected<variable_run_t> whole = variable_run_t::write(
+            *volume, guard->channel(), content_id, key_slots, std::span<std::uint64_t const> {stamps},
+            std::span<std::uint8_t const> {data.kinds}, 0, values, offsets, 4096);
+        failures += expect(whole.has_value());
+        if (!whole) return failures;
+        failures += expect(
+            read_raw((*fixture)->disk, guard->channel(), whole->blob(), 0, whole->blob().length, whole_bytes)
+                .succeeded());
+    }
+    failures += expect(variable_run_t::drop(*volume, guard->channel(), content_id).succeeded());
+
+    expected<sorted_run_reservation_t> reservation = variable_run_t::reserve(
+        *volume, guard->channel(), content_id, key_slots, std::span<std::uint64_t const> {stamps},
+        std::span<std::uint8_t const> {data.kinds}, 0, values, offsets, 4096);
+    failures += expect(reservation.has_value());
+    if (!reservation) return failures;
+    failures += expect(
+        variable_run_t::write_sections(*volume, guard->channel(), *reservation, key_slots, values, offsets)
+            .succeeded());
+    expected<variable_run_t> split = variable_run_t::seal_and_attach(*volume, guard->channel(), *reservation);
+    failures += expect(split.has_value());
+    if (!split) return failures;
+    st::basic_vector<byte_t> split_bytes;
+    failures += expect(
+        read_raw((*fixture)->disk, guard->channel(), split->blob(), 0, split->blob().length, split_bytes).succeeded());
+    failures += expect(same_bytes(std::span<byte_t const> {whole_bytes}, std::span<byte_t const> {split_bytes}));
+    return failures;
+}
+
 #pragma endregion Layout Cases
 
 #pragma region Truncation Cases
@@ -1193,6 +1255,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "fixed_width_reads_back", fixed_width_run_reads_back);
         report(totals, mount, "inline_needs_no_reads", inline_run_needs_no_reads);
         report(totals, mount, "sections_on_pages", sections_sit_on_page_boundaries);
+        report(totals, mount, "split_write_matches_write", split_write_matches_write);
         report(totals, mount, "truncated_index", truncated_index_is_malformed);
         report(totals, mount, "missing_is_not_found", missing_run_is_not_found);
         report(totals, mount, "point_lookup", point_lookup_finds_and_misses);

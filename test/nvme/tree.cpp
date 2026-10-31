@@ -27,8 +27,9 @@
 #include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include "ustore/blobs/nvme_key_slot.hpp" // `key_slot`
-#include "ustore/blobs/nvme_tree.hpp"     // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
+#include "ustore/blobs/nvme_key_slot.hpp"   // `key_slot`
+#include "ustore/blobs/nvme_tree.hpp"       // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
+#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`
 
 #include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
 
@@ -339,7 +340,7 @@ template <typename level_type_, typename volume_type_>
         std::span<stored_value_offset_t const> {batch.offsets}, value_max_size_k);
     failures += expect(written.has_value());
     if (!written) return failures;
-    failures += expect(level.bind_queue_pair(std::move(*written)).succeeded());
+    failures += expect(level.insert_run(std::move(*written)).succeeded());
     return failures;
 }
 
@@ -406,6 +407,79 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
         absent[index] = entry;
     }
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {absent});
+    return failures;
+}
+
+/** A run written at stamp zero and restored with the stamp an ingest assigned it is seen by a reader at that stamp and
+ *  skipped by one below it, as a commit at that stamp would be. */
+template <typename mount_type_>
+std::size_t restore_assigns_ingested_stamps(mount_type_ const& mount) {
+    using types_t = lsm_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename types_t::fixture_t;
+    using guard_t = typename types_t::guard_t;
+    using volume_t = typename types_t::volume_t;
+    using sorted_run_t = typename types_t::sorted_run_t;
+    using tree_t = typename types_t::tree_t;
+    std::size_t failures = 0;
+    constexpr std::size_t count_k = 64;
+    constexpr std::uint64_t assigned_k = 7;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    failures += expect(guard.has_value());
+    if (!guard) return failures;
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
+    failures += expect(volume.has_value());
+    if (!volume) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), memory_runs_bytes_k);
+    failures += expect(tree.has_value());
+    if (!tree) return failures;
+
+    st::basic_vector<expectation_t> model;
+    st::basic_vector<std::uint64_t> zeros;
+    failures += expect(model.resize(count_k) == st::status_t::success_k);
+    failures += expect(zeros.resize(count_k) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    for (std::size_t index = 0; index != count_k; ++index) {
+        expectation_t entry;
+        entry.stored_key = static_cast<stored_key_t>(index) * 2 + 1;
+        entry.state = lookup_result_t::written_k;
+        entry.bytes = 1 + index;
+        entry.seed = index;
+        model[index] = entry;
+        zeros[index] = 0;
+    }
+    batch_t batch;
+    failures += build_batch(std::span<expectation_t const> {model}, batch);
+    if (failures != 0) return failures;
+    uuid_t const content_id = uuid_generator();
+    expected<sorted_run_t> const written = sorted_run_t::write(
+        *volume, guard->channel(), content_id, std::span<variable_slot_t const> {batch.key_slots},
+        std::span<std::uint64_t const> {zeros}, std::span<std::uint8_t const> {batch.kinds}, 0,
+        std::span<byte_t const> {batch.values}, std::span<stored_value_offset_t const> {batch.offsets},
+        value_max_size_k);
+    failures += expect(written.has_value());
+    if (!written) return failures;
+    failures += expect_eq(written->assigned_stamp(), std::uint64_t {0});
+
+    lsm_tree_run_record_t record;
+    record.content_id = content_id;
+    lsm_tree_run_stamp_t ingested;
+    ingested.content_id = content_id;
+    ingested.stamp = assigned_k;
+    failures += expect(tree->restore(guard->channel(), std::span<lsm_tree_run_record_t const> {&record, 1},
+                                     std::span<lsm_tree_run_stamp_t const> {&ingested, 1})
+                           .succeeded());
+    typename tree_t::level_set_t const& taken = tree->levels();
+    failures += expect_eq(taken.level(0).run(0).assigned_stamp(), assigned_k);
+    std::size_t misread = 0;
+    for (expectation_t const& entry : model) {
+        lsm_tree_position_t position;
+        misread += tree->find(taken, entry.stored_key, position, assigned_k - 1) != lookup_result_t::missing_k;
+        misread += tree->find(taken, entry.stored_key, position, assigned_k) != lookup_result_t::written_k;
+    }
+    failures += expect_eq(misread, std::size_t {0});
     return failures;
 }
 
@@ -926,12 +1000,17 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     failures += expect(host.has_value());
     if (!host) return failures;
 
-    // The device side runs on a lane made once, as an engine makes its own at open, and a build without one refuses.
+    // The device side runs on a compactor made once, as an engine makes its own at open, and a build without one
+    // refuses.
     request.placement = compaction_placement_t::device_k;
-#if USTORE_WITH_CUDA
-    st::expected<cuda_compaction_lane_t> lane = cuda_compaction_lane_t::make(0, 0);
-    if (lane) request.compactor = std::addressof(*lane);
-#endif
+    gpu_drivers_t const drivers;
+    expected<cuda_executor_t> executor = status_t {status_code_t::device_k, "No CUDA device zero"};
+    if (drivers.cuda_contexts[0])
+        executor = cuda_executor_t::spawn(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class_t::unknown_k, nullptr, 0,
+                                          ustore_gds_automatic_k);
+    expected<cuda_compactor_t> compactor = executor ? cuda_compactor_t::make(*executor)
+                                                    : expected<cuda_compactor_t> {executor.status()};
+    if (compactor) request.compactor = std::addressof(*compactor);
     expected<level_t> device = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
                                                last_write_fold_t {}, no_device_fold_t {});
     if (!device) {
@@ -1173,6 +1252,7 @@ int main(int argc, char const* argv[]) {
     report(totals, "lsm.compactor_choice", compactor_choice_follows_the_threshold);
     auto const cases = [&](auto const& mount) {
         report(totals, mount, "flush_lands_on_level_zero", flush_lands_on_level_zero);
+        report(totals, mount, "restore_assigns_ingested_stamps", restore_assigns_ingested_stamps);
         report(totals, mount, "overlapping_takes_youngest", overlapping_runs_take_the_youngest);
         report(totals, mount, "drops_remove_deltas_at_bottom", compaction_drops_remove_deltas_at_the_bottom);
         report(totals, mount, "intermediate_keeps_remove_deltas", intermediate_merge_keeps_remove_deltas);

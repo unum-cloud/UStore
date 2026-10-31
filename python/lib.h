@@ -7,8 +7,9 @@
  *  One extension, one file per header of the C ABI: @c types.c owns the vocabulary every modality
  *  shares, with executors and deferred calls, @c db.c owns databases, collections, snapshots,
  *  transactions and views, @c blobs.c owns the binary verbs and cursors, @c docs.c the document verbs, @c graph.c
- *  the graph verbs, @c strings.c resolves names onto identifiers, @c collection.c answers the
- *  collections a database is indexed by, and @c lib.c owns the module glue alone. A verb is written
+ *  the graph verbs, @c pages.c the page verbs, @c strings.c resolves names onto identifiers, @c collection.c
+ *  answers the collections a database is indexed by, @c arrow.c moves whole collections as Apache Arrow streams, and
+ *  @c lib.c owns the module glue alone. A verb is written
  *  once and reached from every method table, since receivers differ only in what their calls
  *  address and how they run, and its core is reached from the collection views too, which skip the
  *  keywords.
@@ -184,8 +185,18 @@ extern PyTypeObject* MeasurementType;
 /** The named tuple of what an open database reports about itself, built at module init as `ustore.Description`. */
 extern PyTypeObject* DescriptionType;
 
+/** The named tuple of one GPU this process can drive, built at module init as <tt>ustore.GPUDevice</tt>. */
+extern PyTypeObject* GPUDeviceType;
+
+/** Lists every GPU this process can drive as a tuple of <tt>ustore.GPUDevice</tt>, as <tt>ustore.gpu_devices()</tt>
+ *  answers it. */
+PyObject* ustore_py_gpu_devices(PyObject* module, PyObject* arguments);
+
+/** The docstring of <tt>ustore.gpu_devices()</tt>. */
+extern char const ustore_py_gpu_devices_doc[];
+
 /**
- *  @brief Builds @c CapabilitiesType, @c MeasurementType and @c DescriptionType.
+ *  @brief Builds @c CapabilitiesType, @c MeasurementType, @c DescriptionType and @c GPUDeviceType.
  *  @return 0 on success, or -1 with an exception set.
  */
 int ustore_py_types_import(void);
@@ -203,6 +214,8 @@ typedef enum ustore_py_enum_t {
     ustore_py_enum_isolation_k,
     ustore_py_enum_transport_k,
     ustore_py_enum_gds_k,
+    ustore_py_enum_gpu_vendor_k,
+    ustore_py_enum_gpu_class_k,
     ustore_py_enum_pattern_kind_k,
     ustore_py_enum_case_sensitivity_k,
     ustore_py_enum_predicate_cost_k,
@@ -210,6 +223,7 @@ typedef enum ustore_py_enum_t {
     ustore_py_enum_role_k,
     ustore_py_enum_field_type_k,
     ustore_py_enum_modification_k,
+    ustore_py_enum_page_encoding_k,
     ustore_py_enums_count_k,
 } ustore_py_enum_t;
 
@@ -508,6 +522,31 @@ typedef struct ustore_py_contents_t {
     /** Storage for the buffers of a batch that fits without the heap. */
     Py_buffer inline_buffers[ustore_py_contents_inline_k];
 } ustore_py_contents_t;
+
+/**
+ *  @brief The texts one batch hands the ABI: markup, names, attribute values or documents.
+ *
+ *  A tape passes as it is. A string travels as the UTF-8 bytes it caches, so the batch holds the one text or a tuple of
+ *  every text until the call finishes, which no concurrent change to the caller's list can release, and a bytes-like
+ *  object is borrowed as it is.
+ */
+typedef struct ustore_py_texts_t {
+
+    /** The views the ABI reads, one per task or one for every task, or the tape it reads. */
+    ustore_py_contents_t contents;
+
+    /** The one text or a tuple of every text, keeping every string alive, or NULL for a tape. */
+    PyObject* held;
+} ustore_py_texts_t;
+
+/**
+ *  @brief Spells one item that is neither a string, a bytes-like object nor None as the next view of the batch it
+ *      joins, as a JSON document serializes a dict or a list.
+ *  @param[in] object The item.
+ *  @param[in] state What the gatherer's caller passed beside the serializer.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+typedef int (*ustore_py_text_serializer_t)(PyObject* object, void* state);
 
 /**
  *  @brief One tape of values a read wrote into an arena, with its presences, viewed until it rewinds.
@@ -973,6 +1012,25 @@ int ustore_py_contents_from_tape(PyObject* object, ustore_py_contents_t* batch);
 void ustore_py_contents_release(ustore_py_contents_t* batch);
 
 /**
+ *  @brief Gathers a tape, a sequence of texts, or one text for every task, where a string, a bytes-like object and a
+ *      dict are each one text rather than a sequence of characters, bytes or keys.
+ *  @param[in] object The texts, each a @c str or a bytes-like object, or an item @p serializer spells.
+ *  @param[in] argument The argument to name in a failure.
+ *  @param[in] serializer How an item of any other type joins the batch, or NULL to refuse it.
+ *  @param[in] state What @p serializer is called with.
+ *  @param[out] texts The batch, released on a failure.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+int ustore_py_texts_from_object(PyObject* object, char const* argument, ustore_py_text_serializer_t serializer,
+                                void* state, ustore_py_texts_t* texts);
+
+/**
+ *  @brief Releases whatever @c ustore_py_texts_from_object acquired.
+ *  @param[in,out] texts The batch to release.
+ */
+void ustore_py_texts_release(ustore_py_texts_t* texts);
+
+/**
  *  @brief A new @c Values over the tape a read of @p count tasks wrote into @p arena, which its call still claims.
  *  @param[in] presences The presence bits, or NULL for a tape whose every value is present, as a cursor writes one.
  *  @return A new reference, or NULL with an exception set.
@@ -1263,8 +1321,8 @@ PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb
                               ustore_modality_t modality, ustore_key_t const* start, size_t wanted,
                               ustore_scan_mode_t mode, PyObject* progress, PyObject* arena);
 
-/** Parses the arguments of one scan, as `scan` takes them, and runs it through the scan of @p modality: the body of
- *  `scan`, `docs_scan` and `graph_scan_vertices`, whose name @p name spells. */
+/** Parses the arguments of one scan, as @c scan takes them, and runs it through the scan of @p modality: the body of
+ *  @c scan, @c docs_scan, @c pages_scan and @c graph_scan_vertices, whose name @p name spells. */
 PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                 PyObject* args_names_tuple, char const* name, ustore_modality_t modality);
 
@@ -1373,6 +1431,18 @@ extern char const doc_graph_remove_edges[];
 extern char const doc_graph_write_vertices[];
 extern char const doc_graph_remove_vertices[];
 extern char const doc_graph_scan_vertices[];
+extern char const doc_pages_import[];
+extern char const doc_pages_insert[];
+extern char const doc_pages_remove[];
+extern char const doc_pages_move[];
+extern char const doc_pages_splice[];
+extern char const doc_pages_set_attributes[];
+extern char const doc_pages_remove_attributes[];
+extern char const doc_pages_read[];
+extern char const doc_pages_scan[];
+extern char const doc_pages_cursor[];
+extern char const doc_import_arrow[];
+extern char const doc_ingest_arrow[];
 
 PyObject* ustore_py_api_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                              PyObject* args_names_tuple);
@@ -1432,6 +1502,37 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
                                               PyObject* args_names_tuple);
 PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                             PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_import(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_move(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                   PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_splice(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_set_attributes(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                             PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_remove_attributes(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                                PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                   PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                   PyObject* args_names_tuple);
+PyObject* ustore_py_api_pages_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple);
+PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple);
+PyObject* ustore_py_api_ingest_arrow(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple);
+
+/**
+ *  @brief Exports @p collection through what @p context reads as an @c arrow_array_stream capsule, whose destructor
+ *      releases the stream unless a consumer moved it out.
+ *  @return A new reference, or NULL with an exception set.
+ */
+PyObject* ustore_py_stream_export(ustore_py_context_t const* context, ustore_collection_id_t collection);
 
 #pragma endregion Verbs
 

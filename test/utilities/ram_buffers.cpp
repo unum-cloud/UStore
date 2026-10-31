@@ -23,6 +23,7 @@
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
 #include "ustore/utilities/types.hpp"       // `bytes_of`, `string_of`
+#include "ustore/utilities/tapes.hpp"       // `assemble_tape`, `tape_source_t`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`, `expect_status`
 
@@ -189,6 +190,55 @@ std::size_t growing_strings_export() {
     return failures;
 }
 
+/** A tape laid out of many strings, every third empty, holds every string at its offset, at either offset width, and
+ *  a tape of no strings is its zero offset alone. */
+std::size_t assemble_tape_lays_out_both_widths() {
+    std::size_t failures = 0;
+    constexpr std::size_t count_k = 1000;
+    std::array<byte_t, 64> pattern {};
+    for (std::size_t index = 0; index != pattern.size(); ++index) pattern[index] = static_cast<byte_t>(index * 7 + 1);
+    auto const length_of = [](std::size_t index) noexcept -> std::uint64_t { return index % 3 ? index % 61 + 1 : 0; };
+    auto const sources = [&](std::size_t index) noexcept {
+        return tape_source_t {length_of(index) ? pattern.data() + index % 3 : nullptr, length_of(index)};
+    };
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index != count_k; ++index) total += length_of(index);
+
+    st::basic_vector<byte_t> bytes;
+    st::basic_vector<std::uint32_t> narrow;
+    st::basic_vector<std::uint64_t> wide;
+    failures += expect(bytes.resize(static_cast<std::size_t>(total)) == st::status_t::success_k);
+    failures += expect(narrow.resize(count_k + 1) == st::status_t::success_k);
+    failures += expect(wide.resize(count_k + 1) == st::status_t::success_k);
+    if (failures != 0) return failures;
+
+    assemble_tape(count_k, sources, std::span<std::uint64_t> {wide}, std::span<byte_t> {bytes});
+    std::size_t misplaced = 0;
+    std::uint64_t expected_offset = 0;
+    for (std::size_t index = 0; index != count_k; ++index) {
+        misplaced += wide[index] != expected_offset;
+        misplaced += std::memcmp(bytes.data() + wide[index], pattern.data() + index % 3,
+                                 static_cast<std::size_t>(length_of(index))) != 0;
+        expected_offset += length_of(index);
+    }
+    failures += expect_eq(misplaced, std::size_t {0});
+    failures += expect_eq(wide[count_k], total);
+
+    st::basic_vector<byte_t> narrow_bytes;
+    failures += expect(narrow_bytes.resize(static_cast<std::size_t>(total)) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    assemble_tape(count_k, sources, std::span<std::uint32_t> {narrow}, std::span<byte_t> {narrow_bytes});
+    std::size_t differing = 0;
+    for (std::size_t index = 0; index <= count_k; ++index) differing += narrow[index] != wide[index];
+    failures += expect_eq(differing, std::size_t {0});
+    failures += expect(std::memcmp(narrow_bytes.data(), bytes.data(), bytes.size()) == 0);
+
+    std::array<std::uint32_t, 1> none {7};
+    assemble_tape(0, sources, std::span<std::uint32_t> {none}, std::span<byte_t> {});
+    failures += expect_eq(none[0], 0u);
+    return failures;
+}
+
 } // namespace unum::ustore::test
 
 int main(int argc, char** argv) {
@@ -203,6 +253,7 @@ int main(int argc, char** argv) {
     report(totals, "arena.grow_in_place", arena_grow_in_place);
     report(totals, "arena.allocator_vector", arena_allocator_vector);
     report(totals, "growing_strings.export", growing_strings_export);
+    report(totals, "tapes.assemble_both_widths", assemble_tape_lays_out_both_widths);
 
     return suite_exit_code(totals);
 }

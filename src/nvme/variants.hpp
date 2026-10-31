@@ -48,12 +48,14 @@
 
 #include "blobs_layers/docs.hpp"  // `docs_read_over_blobs`, `docs_gist_over_blobs`, `docs_gather_over_blobs`
 #include "blobs_layers/pages.hpp" // `pages_read_over_blobs`
+#include "vram/uploads.hpp"       // `uploading_vram_tables`
 
 #include "database.hpp" // `nvme_variant`, `database_describe`, `resolve_modality`, `transaction_free`
 #include "blobs.hpp"    // `blobs_write`, `remove_values`, `read_values`, `scan_values`, `sample_values`
 #include "strings.hpp"  // `strings_write`, `strings_remove`, `strings_read`, `strings_scan`
 #include "docs.hpp"     // `docs_write`
 #include "graph.hpp"    // `graph_read_edges`, `graph_write_edges`, `graph_remove_vertices`
+#include "ingest.hpp"   // `ingest_init`, `ingest_append`, `ingest_finish`, `ingest_free`
 #include "pages.hpp"    // `pages_import`, `pages_insert`, `commit_page_edits`
 
 namespace unum::ustore::nvme {
@@ -71,6 +73,10 @@ database_verbs_t const nvme_variant<cpu_class_>::database_verbs_k {
     .collection_create = &collection_create<cpu_class_>,
     .collection_find = &collection_find<cpu_class_>,
     .collection_drop = &collection_drop<cpu_class_>,
+    .ingest_init = &ingest_init<cpu_class_>,
+    .ingest_append = &ingest_append<cpu_class_>,
+    .ingest_finish = &ingest_finish<cpu_class_>,
+    .ingest_free = &ingest_free<cpu_class_>,
     .transaction_init = &transaction_init<cpu_class_>,
     .transaction_stage = &transaction_stage<cpu_class_>,
     .transaction_commit = &transaction_commit<cpu_class_>,
@@ -148,6 +154,8 @@ engine_t const nvme_variant<cpu_class_>::engine_k {
              .docs = &docs_verbs_k,
              .graph = &graph_verbs_k,
              .pages = &pages_verbs_k},
+    .vram_nvidia = uploading_vram_tables<home_t::vram_nvidia_k>,
+    .vram_amd = uploading_vram_tables<home_t::vram_amd_k>,
 };
 
 #pragma endregion Table
