@@ -1,39 +1,25 @@
 name: Pre-Release
 
 on:
-  push:
-    branches: ["main-dev"]
+  pull_request:
+    branches: ["main", "main-dev"]
 
   workflow_dispatch: {}
 
 env:
-  GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
   BUILD_TYPE: Release
 
 
 jobs:
-  versioning:
-    name: Semantic Release
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-      with:
-        persist-credentials: false
-        ref: 'main-dev'
-    - uses: actions/setup-node@v3
-    - run: cp .github/workflows/package.json . && npm install && npx semantic-release
-  
-  
   build_ustore_amd64:
     name: Build Libraries on AMD
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-26.04
+    if: ${{ github.event_name == 'pull_request' }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main-dev'
-          
+
       - run: git submodule update --init --recursive
 
       - name: Prepare CMake, Conan and PyArrow
@@ -65,7 +51,7 @@ jobs:
         run: make -j 4 -C ./build_release
 
       - name: Upload Binaries
-        uses: actions/upload-artifact@v3.1.1
+        uses: actions/upload-artifact@v7
         with:
           name: binaries
           path: build_release/build/bin/*
@@ -73,16 +59,15 @@ jobs:
 
   test_ustore_amd64:
     name: Test Libraries on AMD
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: build_ustore_amd64
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main-dev'
 
       - name: Download a Build Artifact
-        uses: actions/download-artifact@v3.0.1
+        uses: actions/download-artifact@v8
         with:
           name: binaries
 
@@ -103,22 +88,21 @@ jobs:
 
   build_test_ustore_arm64:
     name: Build and Test Libraries on ARM
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main-dev'
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: 'arm64'
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v4
         with:
           platforms: linux/arm64
 
@@ -138,24 +122,23 @@ jobs:
 
   build_and_test_python:
     name: Build and Test Python ${{ matrix.python }} on ${{ matrix.arch }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: ${{ github.event_name == 'workflow_dispatch' }}
     strategy:
       matrix:
         arch: ["x86_64", "aarch64"]
         python: ["cp39-*", "cp310-*"]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main-dev'
 
       - name: Prepare CMake, Conan and PyArrow
         run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
 
       - name: Set up QEMU
         if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: 'arm64,amd64'
 
@@ -169,14 +152,13 @@ jobs:
 
   build_and_test_java:
     name: Build and Test Java on AMD
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main-dev'
 
       - name: Prepare CMake, Conan and PyArrow
         run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1

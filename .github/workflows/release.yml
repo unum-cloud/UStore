@@ -1,18 +1,11 @@
 name: Release
 
 on:
-  # Runs on pushes targeting the default branch
-  push:
-    branches: ["main"]
+  release:
+    types: [published]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
 # Allow one concurrent deployment
 concurrency:
@@ -21,20 +14,19 @@ concurrency:
 
 
 env:
-  GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
   BUILD_TYPE: Release
 
 
 jobs:
-  versioning:
-    name: Semantic Release
-    runs-on: ubuntu-latest
+  hooks:
+    name: Check Release Commit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
     steps:
-    - uses: actions/checkout@v3
-      with:
-        persist-credentials: false
-    - uses: actions/setup-node@v3
-    - run: cp .github/workflows/package.json . && npm install && npx semantic-release
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Check the Release Commit
+        run: .github/scripts/check-release.sh "$GITHUB_REF_NAME"
 
   # Single deploy job since we're just deploying
   deploy:
@@ -42,15 +34,19 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: versioning
+    runs-on: ubuntu-26.04
+    needs: hooks
+    # Public docs always describe the stable release.
+    if: ${{ !github.event.release.prerelease }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          ref: 'main'   
+        uses: actions/checkout@v7
       - name: Setup GitHub Pages
-        uses: actions/configure-pages@v2
+        uses: actions/configure-pages@v6
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
       - name: Clone Theme
@@ -64,24 +60,25 @@ jobs:
       - name: Copy assets
         run: cp -r assets build/docs/html/
       - name: Upload artifacts
-        uses: actions/upload-pages-artifact@v1
+        uses: actions/upload-pages-artifact@v5
         with:
           path: "./build/docs/html/"
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v1
+        uses: actions/deploy-pages@v5
 
 
   build_ustore_amd64:
     name: Build Libraries on AMD
-    runs-on: ubuntu-latest
-    needs: versioning
+    runs-on: ubuntu-26.04
+    needs: hooks
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main'
-          
+
       - run: git submodule update --init --recursive
 
       - name: Prepare CMake, Conan and PyArrow
@@ -115,33 +112,29 @@ jobs:
         run: make -j 4 -C ./build_release
 
       - name: Upload Precompiled binaries to Release Assets
-        uses: xresloader/upload-to-github-release@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          file: "./build_release/build/bin/ustore_flight_server*"
-          update_latest_release: true
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" ./build_release/build/bin/ustore_flight_server* --clobber
 
   
   build_wheel:
     name: Build Python ${{ matrix.python }} on ${{ matrix.arch }}
-    runs-on: ubuntu-latest
-    needs: deploy
+    runs-on: ubuntu-26.04
+    needs: hooks
     strategy:
       matrix:
         arch: ["x86_64", "aarch64"]
         python: ["cp39-*", "cp310-*"]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main'
       - name: Prepare CMake, Conan and PyArrow
         run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
 
       - name: Set up QEMU
         if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: 'arm64,amd64'
 
@@ -152,15 +145,16 @@ jobs:
         env:
           CIBW_ARCHS_LINUX: ${{ matrix.arch }}
           
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         with:
+          name: wheels-${{ strategy.job-index }}
           path: ./wheelhouse/*.whl
 
     
   publish_python:
     name: Publish Python
     needs: build_wheel
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     environment:
       name: pypi
       url: https://pypi.org/p/ustore
@@ -168,31 +162,32 @@ jobs:
       id-token: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v3.0.2
+        uses: actions/download-artifact@v8
         with:
+          pattern: wheels-*
           path: ./dist/
+          merge-multiple: true
 
       - name: Publish to PyPi
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: ./dist/artifact
+          packages-dir: ./dist/
           verbose: true
           print-hash: true
 
   
   build_and_publish_java:
     name: Build and Publish Java
-    needs: versioning
-    runs-on: ubuntu-latest
+    needs: hooks
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main'
       - name: Prepare CMake, Conan and PyArrow
         run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
 
@@ -228,8 +223,8 @@ jobs:
 
   build_and_publish_docker:
     name: Build and Publish Docker
-    needs: versioning
-    runs-on: ubuntu-latest
+    needs: hooks
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -238,29 +233,28 @@ jobs:
         arch: ["amd64", "arm64"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-          ref: 'main'
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: 'amd64,arm64'
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v4
         with:
           platforms: linux/amd64, linux/arm64
         
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USER }}
           password: ${{ secrets.DOCKER_PASS }}
 
       - name: Log in to GitHub Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -273,7 +267,7 @@ jobs:
           echo "version=$(cat VERSION)" >> $GITHUB_OUTPUT
 
       - name: Build and push
-        uses: docker/build-push-action@v4
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -281,8 +275,9 @@ jobs:
           build-args: |
             version=${{ steps.args.outputs.version }}
             TEST_USTORE="False"
+          # Candidates never move `latest`; the action skips the empty lines they leave.
           tags: |
             unum/ustore:${{ steps.args.outputs.version }}-jammy
-            unum/ustore:latest
+            ${{ !github.event.release.prerelease && 'unum/ustore:latest' || '' }}
             ghcr.io/unum-cloud/ustore:${{ steps.args.outputs.version }}-jammy
-            ghcr.io/unum-cloud/ustore:latest
+            ${{ !github.event.release.prerelease && 'ghcr.io/unum-cloud/ustore:latest' || '' }}

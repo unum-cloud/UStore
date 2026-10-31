@@ -2,9 +2,11 @@ cmake_minimum_required(VERSION 3.16)
 
 file(READ "VERSION" USTORE_VERSION)
 string(STRIP ${USTORE_VERSION} USTORE_VERSION)
+# `project(VERSION)` takes numbers only, so a candidate's `-rc.N` stays out of it.
+string(REGEX REPLACE "-.*$" "" USTORE_VERSION_CORE "${USTORE_VERSION}")
 project(UStore
   LANGUAGES C CXX
-  VERSION ${USTORE_VERSION}
+  VERSION ${USTORE_VERSION_CORE}
   HOMEPAGE_URL "https://github.com/unum-cloud/ustore"
   DESCRIPTION "Universal Binary DBMS Interface to manage Docs • Graphs • Blobs • Vectors × in Local • Remote × RocksDB • LevelDB • UCSet • UDisk × from C • C++ • Python • Java • GoLang"
 )
