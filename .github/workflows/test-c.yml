@@ -1,0 +1,451 @@
+name: Test C
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # The release preset builds with Clang, AppleClang on macOS, while the sanitizer presets also assume lld.
+  test_ubuntu:
+    name: Test on Ubuntu x86-64
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Toolchain on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Install Toolchain on macOS
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install Toolchain on Windows
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+      - name: Set Up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_release/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Configure
+        run: cmake --preset release
+      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
+      - name: Build the C Tests with MSVC
+        if: runner.os == 'Windows'
+        run: cmake --build --preset release --target ustore_test_c ustore_test_c_shared
+      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
+      - name: Run the C Tests against the Static and Shared Libraries
+        if: runner.os == 'Windows'
+        run: ctest --preset release --tests-regex '^ustore_test_c(_shared)?$'
+      - name: Build
+        run: cmake --build --preset release
+      - name: Test
+        run: ctest --preset release
+
+  test_ubuntu_arm:
+    name: Test on Ubuntu AArch64
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Toolchain on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Install Toolchain on macOS
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install Toolchain on Windows
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+      - name: Set Up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_release/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Configure
+        run: cmake --preset release
+      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
+      - name: Build the C Tests with MSVC
+        if: runner.os == 'Windows'
+        run: cmake --build --preset release --target ustore_test_c ustore_test_c_shared
+      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
+      - name: Run the C Tests against the Static and Shared Libraries
+        if: runner.os == 'Windows'
+        run: ctest --preset release --tests-regex '^ustore_test_c(_shared)?$'
+      - name: Build
+        run: cmake --build --preset release
+      - name: Test
+        run: ctest --preset release
+
+  test_macos:
+    name: Test on macOS ARM64
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Toolchain on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Install Toolchain on macOS
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install Toolchain on Windows
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+      - name: Set Up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_release/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Configure
+        run: cmake --preset release
+      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
+      - name: Build the C Tests with MSVC
+        if: runner.os == 'Windows'
+        run: cmake --build --preset release --target ustore_test_c ustore_test_c_shared
+      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
+      - name: Run the C Tests against the Static and Shared Libraries
+        if: runner.os == 'Windows'
+        run: ctest --preset release --tests-regex '^ustore_test_c(_shared)?$'
+      - name: Build
+        run: cmake --build --preset release
+      - name: Test
+        run: ctest --preset release
+
+  test_windows:
+    name: Test on Windows x86-64 with Visual Studio 2026
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Toolchain on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Install Toolchain on macOS
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install Toolchain on Windows
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+      - name: Set Up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_msvc2026_x64/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-msvc2026_x64-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Configure
+        run: cmake --preset msvc2026_x64
+      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
+      - name: Build the C Tests with MSVC
+        if: runner.os == 'Windows'
+        run: cmake --build --preset msvc2026_x64 --target ustore_test_c ustore_test_c_shared
+      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
+      - name: Run the C Tests against the Static and Shared Libraries
+        if: runner.os == 'Windows'
+        run: ctest --preset msvc2026_x64 --tests-regex '^ustore_test_c(_shared)?$'
+      - name: Build
+        run: cmake --build --preset msvc2026_x64
+      - name: Test
+        run: ctest --preset msvc2026_x64
+
+  test_windows_arm:
+    name: Test on Windows ARM64 with Visual Studio 2022
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Toolchain on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Install Toolchain on macOS
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install Toolchain on Windows
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+      - name: Set Up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_msvc2022_arm64/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-msvc2022_arm64-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Configure
+        run: cmake --preset msvc2022_arm64
+      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
+      - name: Build the C Tests with MSVC
+        if: runner.os == 'Windows'
+        run: cmake --build --preset msvc2022_arm64 --target ustore_test_c ustore_test_c_shared
+      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
+      - name: Run the C Tests against the Static and Shared Libraries
+        if: runner.os == 'Windows'
+        run: ctest --preset msvc2022_arm64 --tests-regex '^ustore_test_c(_shared)?$'
+      - name: Build
+        run: cmake --build --preset msvc2022_arm64
+      - name: Test
+        run: ctest --preset msvc2022_arm64
+
+  test_ubuntu_asan:
+    name: Test ASan and UBSan on Ubuntu x86-64
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Toolchain on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Install Toolchain on macOS
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install Toolchain on Windows
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+      - name: Set Up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      # Sanitizer runtimes crash under the runner kernel's 32-bit mmap randomization.
+      - name: Lower ASLR Entropy
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_debug/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-debug-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Configure
+        run: cmake --preset debug
+      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
+      - name: Build the C Tests with MSVC
+        if: runner.os == 'Windows'
+        run: cmake --build --preset debug --target ustore_test_c ustore_test_c_shared
+      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
+      - name: Run the C Tests against the Static and Shared Libraries
+        if: runner.os == 'Windows'
+        run: ctest --preset debug --tests-regex '^ustore_test_c(_shared)?$'
+      - name: Build
+        run: cmake --build --preset debug
+      - name: Test
+        run: ctest --preset debug
+
+  test_ubuntu_tsan:
+    name: Test TSan on Ubuntu x86-64
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Toolchain on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Install Toolchain on macOS
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install Toolchain on Windows
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+      - name: Set Up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      # Sanitizer runtimes crash under the runner kernel's 32-bit mmap randomization.
+      - name: Lower ASLR Entropy
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_tsan/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-tsan-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Configure
+        run: cmake --preset tsan
+      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
+      - name: Build the C Tests with MSVC
+        if: runner.os == 'Windows'
+        run: cmake --build --preset tsan --target ustore_test_c ustore_test_c_shared
+      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
+      - name: Run the C Tests against the Static and Shared Libraries
+        if: runner.os == 'Windows'
+        run: ctest --preset tsan --tests-regex '^ustore_test_c(_shared)?$'
+      - name: Build
+        run: cmake --build --preset tsan
+      - name: Test
+        run: ctest --preset tsan
+
+  # Each machine profile builds the libraries for one CPU and one GPU code; the Arm ones build natively on Arm runners,
+  # where the CUDA image also exists. Clang 22 compiles the host units, as Ubuntu 24.04's GCC predates Olympus, and the
+  # family codes like `100f` need CMake 3.31, where Ubuntu 24.04 ships 3.28. The siblings come from their pins.
+  build_machine_profile:
+    name: Build Machine Profile ${{ matrix.preset }}
+    runs-on: ${{ contains(fromJSON('["grace_hopper", "vera_rubin"]'), matrix.preset) && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
+    container: nvidia/cuda:13.4.3-devel-ubuntu26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [xeon4_hopper, xeon6_blackwell, venice_mi450, grace_hopper, vera_rubin]
+    env:
+      CC: clang-22
+      CXX: clang++-22
+    steps:
+      - name: Install Dependencies
+        run: |
+          apt-get update && apt-get install -y ninja-build g++ git python3-pip curl gnupg
+          pip install --break-system-packages "cmake>=3.31"
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/resolute/ llvm-toolchain-resolute-22 main" \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update && apt-get install -y clang-22 lld-22
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.preset }} -D CMAKE_C_COMPILER="$CC" -D CMAKE_CXX_COMPILER="$CXX" -D CMAKE_CUDA_HOST_COMPILER="$CXX"
+          cmake --build --preset ${{ matrix.preset }}
+
+  # The NDK's own toolchain builds the libraries over the RAM engine; nothing runs them.
+  build_android:
+    name: Build for Android ARM64
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build
+        run: |
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME}"
+          cmake --preset android_arm64
+          cmake --build --preset android_arm64
+
+  # The minimal and the extended module over the RAM engine; nothing runs them.
+  build_wasm:
+    name: Build WASM Module with ${{ matrix.preset }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [wasm32_emscripten, wasm64_emscripten]
+    env:
+      EMSCRIPTEN_VERSION: "6.0.9"
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Install Ninja and Emscripten
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+          (cd ~/emsdk && ./emsdk install "$EMSCRIPTEN_VERSION" && ./emsdk activate "$EMSCRIPTEN_VERSION")
+      - name: Build
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }}
+
+  verify_models:
+    name: Check Promela Models and GenMC Clients
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Install Spin, Clang and the GenMC Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y spin cmake clang-20 llvm-20-dev libffi-dev zlib1g-dev libedit-dev
+      - name: Checkout GenMC
+        uses: actions/checkout@v7
+        with:
+          repository: MPI-SWS/genmc
+          ref: 9f6c4c0772d0c42b325681581acc6a0f3eb9b5f7
+          path: genmc
+      - name: Restore the GenMC Build
+        id: genmc
+        uses: actions/cache@v6
+        with:
+          path: genmc/build
+          key: genmc-9f6c4c0-clang-20
+      - name: Build GenMC
+        if: steps.genmc.outputs.cache-hit != 'true'
+        run: |
+          cmake -S genmc -B genmc/build -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-20 -D CMAKE_CXX_COMPILER=clang++-20 -D LLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+          cmake --build genmc/build --parallel
+      - name: Check the Models and the Clients
+        run: verification/check.sh
+        env:
+          GENMC: ${{ github.workspace }}/genmc/build/bin/genmc
+          GENMC_CLANG: clang++-20

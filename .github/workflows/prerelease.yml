@@ -1,352 +1,45 @@
 name: Pre-Release
 
 on:
-  push:
-    branches: ["main-dev"]
-    paths-ignore: ["**/*.md", "LICENSE", ".gitignore", "assets/**"]
   pull_request:
-    branches: ["main-dev"]
-    paths-ignore: ["**/*.md", "LICENSE", ".gitignore", "assets/**"]
+    branches: ["main", "main-dev"]
 
-env:
-  GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
-  PYTHONUTF8: 1
-  PYTHONFAULTHANDLER: 1
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
-# Superseded pull request runs cancel; pushes to `main-dev` finish.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  versioning:
-    name: Update Version
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Run TinySemVer
-        uses: ashvardanian/tinysemver@v3
-        with:
-          verbose: "true"
-          version-file: "VERSION"
-          update-version-in: |
-            CITATION.cff:^version: (\d+\.\d+\.\d+(?:-rc\.\d+)?)
-            pyproject.toml:^version = "(\d+\.\d+\.\d+(?:-rc\.\d+)?)"
-            Cargo.toml:^version = "(\d+\.\d+\.\d+(?:-rc\.\d+)?)"
-          update-major-version-in: |
-            c/ustore/types.h:^#define USTORE_VERSION_MAJOR (\d+)
-          update-minor-version-in: |
-            c/ustore/types.h:^#define USTORE_VERSION_MINOR (\d+)
-          update-patch-version-in: |
-            c/ustore/types.h:^#define USTORE_VERSION_PATCH (\d+)
-          dry-run: "true"
-
-  lint:
-    name: Lint
+  hooks:
+    name: Check Commits
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Set Up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - name: Install Linters
-        run: |
-          python -m pip install --group lint
-          npm install --global dprint
+      - name: Check Every Commit
+        run: .github/scripts/check-commits.sh "${{ github.event.pull_request.base.sha }}"
 
-      # The same checks a commit runs locally, over everything this branch adds.
-      - name: Check
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: .githooks/lint-range "$BASE_SHA"
-
-  test_cpp:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        # The release preset builds with Clang, AppleClang on macOS, while the sanitizer presets also assume lld.
-        include:
-          - { name: "Linux x86-64", os: ubuntu-26.04, preset: release }
-          - { name: "Linux AArch64", os: ubuntu-26.04-arm, preset: release }
-          - { name: "macOS ARM64", os: macos-26, preset: release }
-          - { name: "Windows x86-64 with Visual Studio 2026", os: windows-2025-vs2026, preset: msvc2026_x64 }
-          - { name: "Windows ARM64 with Visual Studio 2022", os: windows-11-arm, preset: msvc2022_arm64 }
-          - { name: "Linux x86-64 with ASan and UBSan", os: ubuntu-26.04, preset: debug }
-          - { name: "Linux x86-64 with TSan", os: ubuntu-26.04, preset: tsan }
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-
-      - name: Install Toolchain on Linux
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
-      - name: Install Toolchain on macOS
-        if: runner.os == 'macOS'
-        run: brew install ninja
-      - name: Install Toolchain on Windows
-        if: runner.os == 'Windows'
-        run: choco install ninja -y
-      - name: Set Up MSVC
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-
-      # Sanitizer runtimes crash under the runner kernel's 32-bit mmap randomization.
-      - name: Lower ASLR Entropy
-        if: matrix.preset == 'debug' || matrix.preset == 'tsan'
-        run: sudo sysctl vm.mmap_rnd_bits=28
-
-      - name: Restore Fetched Dependencies
-        uses: actions/cache@v6
-        with:
-          path: build_${{ matrix.preset }}/_deps
-          key: deps-${{ runner.os }}-${{ runner.arch }}-${{ matrix.preset }}-${{ hashFiles('cmake/*.cmake') }}
-
-      - name: Configure
-        run: cmake --preset ${{ matrix.preset }}
-      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
-      - name: Build the C Tests with MSVC
-        if: runner.os == 'Windows'
-        run: cmake --build --preset ${{ matrix.preset }} --target ustore_test_c ustore_test_c_shared
-      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
-      - name: Run the C Tests against the Static and Shared Libraries
-        if: runner.os == 'Windows'
-        run: ctest --preset ${{ matrix.preset }} --tests-regex '^ustore_test_c(_shared)?$'
-      - name: Build
-        run: cmake --build --preset ${{ matrix.preset }}
-      - name: Test
-        run: ctest --preset ${{ matrix.preset }}
-
-  # Each machine profile builds the libraries for one CPU and one GPU code; the Arm ones build natively on Arm runners,
-  # where the CUDA image also exists. Clang 22 compiles the host units, as Ubuntu 24.04's GCC predates Olympus, and the
-  # family codes like `100f` need CMake 3.31, where Ubuntu 24.04 ships 3.28. The siblings come from their pins.
-  build_machine_profile:
-    name: Build Machine Profile ${{ matrix.preset }}
-    runs-on: ${{ contains(fromJSON('["grace_hopper", "vera_rubin"]'), matrix.preset) && 'ubuntu-24.04-arm' || 'ubuntu-26.04' }}
-    container: nvidia/cuda:13.4.3-devel-ubuntu26.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        preset: [xeon4_hopper, xeon6_blackwell, venice_mi450, grace_hopper, vera_rubin]
-    env:
-      CC: clang-22
-      CXX: clang++-22
-    steps:
-      - name: Install Dependencies
-        run: |
-          apt-get update && apt-get install -y ninja-build g++ git python3-pip curl gnupg
-          pip install --break-system-packages "cmake>=3.31"
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/resolute/ llvm-toolchain-resolute-22 main" \
-            > /etc/apt/sources.list.d/llvm.list
-          apt-get update && apt-get install -y clang-22 lld-22
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Build
-        run: |
-          cmake --preset ${{ matrix.preset }} -D CMAKE_C_COMPILER="$CC" -D CMAKE_CXX_COMPILER="$CXX" -D CMAKE_CUDA_HOST_COMPILER="$CXX"
-          cmake --build --preset ${{ matrix.preset }}
-
-  # The NDK's own toolchain builds the libraries over the RAM engine; nothing runs them.
-  build_android:
-    name: Build Android ARM64
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-      - name: Build
-        run: |
-          export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME}"
-          cmake --preset android_arm64
-          cmake --build --preset android_arm64
-
-  # The minimal and the extended module over the RAM engine; nothing runs them.
-  build_wasm:
-    name: Build WebAssembly with ${{ matrix.preset }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        preset: [wasm32_emscripten, wasm64_emscripten]
-    env:
-      EMSCRIPTEN_VERSION: "6.0.9"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-      - name: Install Ninja and Emscripten
-        run: |
-          sudo apt-get update && sudo apt-get install -y ninja-build
-          git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
-          (cd ~/emsdk && ./emsdk install "$EMSCRIPTEN_VERSION" && ./emsdk activate "$EMSCRIPTEN_VERSION")
-      - name: Build
-        run: |
-          source ~/emsdk/emsdk_env.sh
-          cmake --preset ${{ matrix.preset }}
-          cmake --build --preset ${{ matrix.preset }}
-
-  verify_models:
-    name: Check Promela Models and GenMC Clients
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-      - name: Install Spin, Clang and the GenMC Build Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y spin cmake clang-20 llvm-20-dev libffi-dev zlib1g-dev libedit-dev
-      - name: Checkout GenMC
-        uses: actions/checkout@v7
-        with:
-          repository: MPI-SWS/genmc
-          ref: 9f6c4c0772d0c42b325681581acc6a0f3eb9b5f7
-          path: genmc
-      - name: Restore the GenMC Build
-        id: genmc
-        uses: actions/cache@v6
-        with:
-          path: genmc/build
-          key: genmc-9f6c4c0-clang-20
-      - name: Build GenMC
-        if: steps.genmc.outputs.cache-hit != 'true'
-        run: |
-          cmake -S genmc -B genmc/build -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-20 -D CMAKE_CXX_COMPILER=clang++-20 -D LLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
-          cmake --build genmc/build --parallel
-      - name: Check the Models and the Clients
-        run: verification/check.sh
-        env:
-          GENMC: ${{ github.workspace }}/genmc/build/bin/genmc
-          GENMC_CLANG: clang++-20
+  test_c:
+    name: Test C
+    needs: hooks
+    uses: ./.github/workflows/test-c.yml
 
   test_python:
-    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, windows-2025, windows-11-arm]
-        python-version: ["3.12", "3.15t"]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-      - name: Set Up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: "pip"
-      - name: Build and Install
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install .
-
-      - name: Assert the GIL Stays Disabled
-        if: ${{ endsWith(matrix.python-version, 't') }}
-        run: python -c "import sys, ustore; assert not sys._is_gil_enabled(), 'importing ustore re-enabled the GIL'"
-
-      - name: Test
-        shell: bash
-        run: |
-          python -m pip install --group test
-          python -X faulthandler -m pytest -x
+    name: Test Python
+    needs: hooks
+    uses: ./.github/workflows/test-python.yml
 
   test_rust:
-    name: Rust on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, windows-2025, windows-11-arm]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-      - name: Set Up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Lint Rust
-        if: matrix.os == 'ubuntu-26.04'
-        run: cargo clippy --all-targets --features serde -- -D warnings
-      - name: Test Rust
-        run: cargo test --features serde
+    name: Test Rust
+    needs: hooks
+    uses: ./.github/workflows/test-rust.yml
 
-  # A smoke subset only; the full matrix runs on release.
-  build_wheels:
-    name: Wheels ${{ matrix.os }} cp${{ matrix.python-version }}
-    needs: test_python
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-26.04, macos-26]
-        python-version: ["312", "315t"]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-      - name: Build Wheels
-        uses: pypa/cibuildwheel@v4.3.5
-        env:
-          CIBW_BUILD: cp${{ matrix.python-version }}-*
-          CIBW_ARCHS: native
-          CIBW_SKIP: "*-musllinux_*"
-
-  build_docs:
-    name: Build Docs
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-      - name: Set Up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-      - name: Install Doxygen
-        run: |
-          curl -sSfL https://www.doxygen.nl/files/doxygen-1.18.0.linux.bin.tar.gz | tar -xz -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/doxygen-1.18.0/bin" >> "$GITHUB_PATH"
-      - name: Install Sphinx
-        run: pip install -r docs/requirements.txt
-      - name: Install UStore from the Checkout
-        run: pip install .
-      - name: Build Docs
-        run: cd docs && doxygen conf.dox && sphinx-build -M html . ../build/docs -W
+  test_docs:
+    name: Test Docs
+    needs: hooks
+    uses: ./.github/workflows/test-docs.yml

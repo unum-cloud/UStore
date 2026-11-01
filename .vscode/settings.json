@@ -203,7 +203,51 @@
     "variant": "cpp",
     "vector": "cpp"
   },
-  "python.testing.pytestArgs": ["test"],
+  "files.watcherExclude": {
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/build*/**": true,
+    "**/dist*/**": true,
+    "**/node_modules/**": true,
+    "**/target/**": true,
+    "data/**": true,
+    "datasets/**": true,
+    "forkunion/**": true,
+    "numkong/**": true,
+    "smashtable/**": true,
+    "stringzilla/**": true
+  },
+  "python.analysis.exclude": [
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/build*/**",
+    "**/dist*/**",
+    "**/node_modules/**",
+    "**/target/**",
+    "data/**",
+    "datasets/**",
+    "forkunion/**",
+    "numkong/**",
+    "smashtable/**",
+    "stringzilla/**"
+  ],
+  "python.testing.pytestArgs": [
+    "test"
+  ],
   "python.testing.pytestEnabled": true,
-  "python.testing.unittestEnabled": false
+  "python.testing.unittestEnabled": false,
+  "search.exclude": {
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/build*/**": true,
+    "**/dist*/**": true,
+    "**/node_modules/**": true,
+    "**/target/**": true,
+    "data/**": true,
+    "datasets/**": true,
+    "forkunion/**": true,
+    "numkong/**": true,
+    "smashtable/**": true,
+    "stringzilla/**": true
+  }
 }

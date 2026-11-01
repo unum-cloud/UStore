@@ -1,82 +1,68 @@
-# Temporary files
-.DS_Store
-.cache
-*.log
-tmp/
-
-# Datasets arrive through `data/<name>` symlinks
-data/*
-!data/.gitkeep
-
-# C++ builds
+# Build trees and CMake
 /build*/
 _deps
 CMakeCache.txt
 CMakeUserPresets.json
 CMakeFiles
 cmake_install.cmake
-compile_commands.json
 
-# Profiling with GProf and `perf` on Linux
+# C and C++
+*.d
+*.slo
+*.lo
+*.o
+*.obj
+*.gch
+*.pch
+*.so
+*.dylib
+*.dll
+*.lai
+*.la
+*.a
+*.lib
+*.exe
+*.out
+*.app
+
+# Profilers
 gmon.out
 perf.data
 
-# Documentation builds
-docs/_build/
-docs/doxygen/
-doxygen_docs/
-
-# Python SDK
+# Python
 __pycache__
-.pytest_cache/
-.ruff_cache/
 *.egg-info
 dist/
 wheelhouse/
 venv/
 .venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 uv.lock
 
-# Rust SDK
+# Rust
 Cargo.lock
 target/
 /.cargo/config.toml
 
-# Prerequisites
-*.d
-
-# Compiled object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled headers
-*.gch
-*.pch
-
-# Compiled dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Compiled static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Editor and agent local state
-.claude/
+# Documentation
+docs/_build/
+docs/doxygen/
+doxygen_docs/
 
 # Editors, assistants, language servers and tool caches
-.mypy_cache/
+compile_commands.json
+.cache
+.claude/
 
-# JavaScript tooling
-node_modules/
-prebuilds/
+# macOS
+.DS_Store
+
+# Local scratch
+tmp/
+*.log
+
+# Datasets arrive through `data/<name>` symlinks
+data/*
+!data/.gitkeep

@@ -1,0 +1,170 @@
+name: Release C
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    name: Check Release Commit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Check the Release Commit
+        run: .github/scripts/check-release.sh "$GITHUB_REF_NAME"
+
+  create_linux_library:
+    name: Create Library for Linux ${{ matrix.platform }}
+    needs: hooks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux_x86_64, os: ubuntu-26.04 }
+          - { platform: linux_aarch64, os: ubuntu-26.04-arm }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Install Toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_release/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Build
+        run: |
+          cmake --preset release \
+            -DUSTORE_INSTALL=ON \
+            -DUSTORE_BUILD_TEST=OFF \
+            -DUSTORE_BUILD_BENCH=OFF \
+            -DUSTORE_BUILD_TOOLS=OFF
+          cmake --build --preset release
+
+      - name: Archive the Headers, Libraries and CMake Package
+        run: |
+          archive="ustore_${{ matrix.platform }}_$(cat VERSION)"
+          cmake --install build_release --prefix "$archive"
+          tar -czf "$archive.tar.gz" "$archive"
+
+      - name: Upload Archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" ustore_${{ matrix.platform }}_*.tar.gz --clobber
+
+  create_windows_dll_library:
+    name: Create Library for Windows ${{ matrix.platform }}
+    needs: hooks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: windows_x86_64, os: windows-2025 }
+          - { platform: windows_arm64, os: windows-11-arm }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Install Toolchain
+        run: choco install ninja -y
+      # The preset names Clang, which Windows packages replace with MSVC
+      - name: Set Up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_release/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Build
+        run: |
+          cmake --preset release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+            -DUSTORE_INSTALL=ON \
+            -DUSTORE_BUILD_TEST=OFF \
+            -DUSTORE_BUILD_BENCH=OFF \
+            -DUSTORE_BUILD_TOOLS=OFF
+          cmake --build --preset release
+
+      - name: Archive the Headers, Libraries and CMake Package
+        run: |
+          archive="ustore_${{ matrix.platform }}_$(cat VERSION)"
+          cmake --install build_release --prefix "$archive"
+          tar -czf "$archive.tar.gz" "$archive"
+
+      - name: Upload Archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" ustore_${{ matrix.platform }}_*.tar.gz --clobber
+
+  create_macos_dylib_library:
+    name: Create Library for macOS ${{ matrix.platform }}
+    needs: hooks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: macos_arm64, os: macos-26 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Install Toolchain
+        run: brew install ninja
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
+        with:
+          path: build_release/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
+
+      - name: Build
+        run: |
+          cmake --preset release \
+            -DUSTORE_INSTALL=ON \
+            -DUSTORE_BUILD_TEST=OFF \
+            -DUSTORE_BUILD_BENCH=OFF \
+            -DUSTORE_BUILD_TOOLS=OFF
+          cmake --build --preset release
+
+      - name: Archive the Headers, Libraries and CMake Package
+        run: |
+          archive="ustore_${{ matrix.platform }}_$(cat VERSION)"
+          cmake --install build_release --prefix "$archive"
+          tar -czf "$archive.tar.gz" "$archive"
+
+      - name: Upload Archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" ustore_${{ matrix.platform }}_*.tar.gz --clobber

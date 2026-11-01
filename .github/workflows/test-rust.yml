@@ -1,0 +1,31 @@
+name: Test Rust
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test_rust:
+    name: Test Rust on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, windows-2025, windows-11-arm]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: git submodule update --init --recursive
+      - name: Set Up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint Rust
+        if: matrix.os == 'ubuntu-26.04'
+        run: cargo clippy --all-targets --features serde -- -D warnings
+      - name: Test Rust
+        run: cargo test --features serde
