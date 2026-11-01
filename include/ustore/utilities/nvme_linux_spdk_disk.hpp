@@ -9,19 +9,20 @@
  *  cannot lose a drive. Nothing here blocks, because the driver offers no interrupt at all:
  *  @c spdk_nvme_qpair_process_completions is the only way a command is ever seen to finish.
  *
- *  A queue pair is a queue pair rather than a label, since an @c spdk_nvme_qpair carries no lock and a
- *  second thread polling one corrupts its tracker list without a word. @c queue_pairs_limit is therefore
- *  the controller's queue-pair count, which may be fewer than the executor has threads, and a
- *  handover is a move of the queue pair announced with @c adopt.
+ *  A queue pair is a queue pair rather than a label, since an @c spdk_nvme_qpair carries no lock
+ *  and a second thread polling one corrupts its tracker list without a word. @c queue_pairs_limit
+ *  is therefore the controller's queue-pair count, which may be fewer than the executor has
+ *  threads, and a handover is a move of the queue pair announced with @c adopt.
  *
- *  The environment is the hazard the rest of the file is arranged around. @c rte_eal_init calls
- *  @c exit on the process when it wants hugepages and finds none, when the drive is still bound to
- *  the kernel @c nvme driver, or when @c /dev/vfio cannot be opened, so a failed mount would take the
- *  database down with it. @c spdk_environment_t::probe therefore decides by reading @c /proc/meminfo,
- *  @c /sys/kernel/mm/hugepages and the driver link under @c /sys/bus/pci/devices, and never
- *  initialises anything; the environment is acquired only once the probe says it can be. A fabric
- *  address has none of those hazards, since the driver copies every byte through a socket and never
- *  translates a page, so its environment runs on plain pages and the probe passes it at once.
+ *  The environment is the hazard the rest of the file is arranged around. @c rte_eal_init
+ *  calls @c exit on the process when it wants hugepages and finds none, when the drive is
+ *  still bound to the kernel @c nvme driver, or when @c /dev/vfio cannot be opened, so a
+ *  failed mount would take the database down with it. @c linux_spdk_environment::probe
+ *  therefore decides by reading @c /proc/meminfo, @c /sys/kernel/mm/hugepages and the driver
+ *  link under @c /sys/bus/pci/devices, and never initialises anything; the environment is
+ *  acquired only once the probe says it can be. A fabric address has none of those hazards,
+ *  since the driver copies every byte through a socket and never translates a page, so its
+ *  environment runs on plain pages and the probe passes it at once.
  */
 
 #pragma once
@@ -37,7 +38,6 @@
 #endif
 
 #include <array>       // `std::array`
-#include <atomic>      // `std::atomic_ref`, `std::memory_order`
 #include <bit>         // `std::has_single_bit`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -50,10 +50,10 @@
 #include <spdk/nvme.h>     // `spdk_nvme_connect`, `spdk_nvme_ns_cmd_read`, `spdk_nvme_qpair`
 #endif
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
-#include "ustore/utilities/types.hpp"     // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
+#include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -115,7 +115,7 @@ struct pci_address_t {
 };
 
 /** Which way an address reaches its controller, which decides what the machine must offer for it. */
-enum class spdk_transport_t : std::uint8_t {
+enum class linux_spdk_transport_t : std::uint8_t {
 
     /** A PCIe address, bare or behind @c trtype:PCIe, whose controller the driver claims and reaches by DMA. */
     pcie_k,
@@ -150,10 +150,10 @@ enum class spdk_transport_t : std::uint8_t {
 }
 
 /** The transport @p address names: a fabric when its @c trtype: says one, PCIe for a bare address or @c PCIe. */
-[[nodiscard]] constexpr spdk_transport_t spdk_transport_named(std::string_view address) noexcept {
+[[nodiscard]] constexpr linux_spdk_transport_t spdk_transport_named(std::string_view address) noexcept {
     std::string_view const kind = transport_field(address, "trtype:");
-    if (kind.empty() || (kind.size() == 4 && starts_with_uncased(kind, "pcie"))) return spdk_transport_t::pcie_k;
-    return spdk_transport_t::fabric_k;
+    if (kind.empty() || (kind.size() == 4 && starts_with_uncased(kind, "pcie"))) return linux_spdk_transport_t::pcie_k;
+    return linux_spdk_transport_t::fabric_k;
 }
 
 /**
@@ -326,7 +326,7 @@ inline expected<pci_address_t> pci_address_parsed(std::string_view spelled) noex
 #pragma region Configuration
 
 /** What backs the memory the driver allocates for itself, which decides what the machine must reserve. */
-enum class spdk_memory_t : std::uint8_t {
+enum class linux_spdk_memory_t : std::uint8_t {
 
     /** Hugepages the kernel reserved, which a PCIe controller's DMA needs and the probe checks for. */
     hugepages_k,
@@ -336,17 +336,17 @@ enum class spdk_memory_t : std::uint8_t {
 };
 
 /** What an environment is initialised with, decided by the transport the mount is for. */
-struct spdk_environment_config_t {
+struct linux_spdk_environment_config_t {
 
     /** Whether the driver gets hugepages and scans PCIe, or plain pages and no bus at all. */
-    spdk_memory_t memory = spdk_memory_t::plain_pages_k;
+    linux_spdk_memory_t memory = linux_spdk_memory_t::plain_pages_k;
 
     /** Megabytes of plain pages the driver takes at once, which it refuses to start without. */
     std::uint32_t plain_megabytes = 128;
 };
 
 /** What the controller says it is, as identify reports it, with the padding the spec allows trimmed. */
-struct spdk_controller_identity_t {
+struct linux_spdk_controller_identity_t {
 
     /** The serial number, which a target's RPC sets and a drive's vendor burns in. */
     char serial[21] = {};
@@ -388,19 +388,22 @@ struct linux_spdk_disk_config_t {
  *  refused rather than counted.
  *
  *  @note @c probe is the only member that is safe to call before anything is initialised, and it is
- *      the one a mount must call, since @c acquire reaches @c rte_eal_init and that calls
- *      @c exit on the whole process when the machine is not ready for it.
+ *      the one a mount must call, since @c acquire reaches @c rte_eal_init and that calls @c exit
+ *      on the whole process when the machine is not ready for it.
+ *
+ *  @tparam atomic_reference_ The reference the count of handles is owned through.
  */
-class spdk_environment_t {
+template <template <typename> typename atomic_reference_>
+class linux_spdk_environment {
   public:
 
-    spdk_environment_t() noexcept = default;
+    linux_spdk_environment() noexcept = default;
 
-    spdk_environment_t(spdk_environment_t const& other) noexcept : holders_(other.holders_) {
+    linux_spdk_environment(linux_spdk_environment const& other) noexcept : holders_(other.holders_) {
         if (holders_) count_(*holders_).fetch_add(1, std::memory_order_relaxed);
     }
 
-    spdk_environment_t& operator=(spdk_environment_t const& other) noexcept {
+    linux_spdk_environment& operator=(linux_spdk_environment const& other) noexcept {
         if (this == &other) return *this;
         forget_();
         holders_ = other.holders_;
@@ -408,16 +411,17 @@ class spdk_environment_t {
         return *this;
     }
 
-    spdk_environment_t(spdk_environment_t&& other) noexcept : holders_(std::exchange(other.holders_, nullptr)) {}
+    linux_spdk_environment(linux_spdk_environment&& other) noexcept
+        : holders_(std::exchange(other.holders_, nullptr)) {}
 
-    spdk_environment_t& operator=(spdk_environment_t&& other) noexcept {
+    linux_spdk_environment& operator=(linux_spdk_environment&& other) noexcept {
         if (this == &other) return *this;
         forget_();
         holders_ = std::exchange(other.holders_, nullptr);
         return *this;
     }
 
-    ~spdk_environment_t() noexcept { forget_(); }
+    ~linux_spdk_environment() noexcept { forget_(); }
 
     /**
      *  @brief Decides whether the environment could be initialised, by reading files and nothing else.
@@ -438,7 +442,7 @@ class spdk_environment_t {
      *  @note The driver initialises once per process: a handle acquired after the last one of an
      *      earlier environment died is refused, since DPDK keeps its state until the process exits.
      */
-    static expected<spdk_environment_t> acquire(spdk_environment_config_t const& config) noexcept;
+    static expected<linux_spdk_environment> acquire(linux_spdk_environment_config_t const& config) noexcept;
 
     /** Whether this handle holds a share of an initialised environment. */
     [[nodiscard]] bool initialised() const noexcept { return holders_ != nullptr; }
@@ -457,8 +461,8 @@ class spdk_environment_t {
 
     /** The counter of @p block as the atomic it is read and written through, once per handle copied or dropped, so
      *  no CPU class tells it apart. */
-    [[nodiscard]] static std::atomic_ref<std::int32_t> count_(holders_t& block) noexcept {
-        return std::atomic_ref<std::int32_t> {block.count};
+    [[nodiscard]] static atomic_reference_<std::int32_t> count_(holders_t& block) noexcept {
+        return atomic_reference_<std::int32_t> {block.count};
     }
 
     /** Drops this handle's share, tearing the environment down when it was the last one. */
@@ -483,9 +487,10 @@ inline constexpr std::size_t meminfo_bytes_k = 8192;
 /** Bytes of a sysfs driver link the probe reads, which is more than such a path has ever spanned. */
 inline constexpr std::size_t link_bytes_k = 512;
 
-inline linux_spdk_probe_t spdk_environment_t::probe(char const* address) noexcept {
+template <template <typename> typename atomic_reference_>
+linux_spdk_probe_t linux_spdk_environment<atomic_reference_>::probe(char const* address) noexcept {
     if (!address) return linux_spdk_probe_t::not_found_k;
-    if (spdk_transport_named(address) == spdk_transport_t::fabric_k) return linux_spdk_probe_t::available_k;
+    if (spdk_transport_named(address) == linux_spdk_transport_t::fabric_k) return linux_spdk_probe_t::available_k;
     std::string_view const named = transport_field(address, "traddr:");
     expected<pci_address_t> const parsed = pci_address_parsed(named.empty() ? std::string_view {address} : named);
     if (!parsed) return linux_spdk_probe_t::not_found_k;
@@ -512,18 +517,21 @@ inline linux_spdk_probe_t spdk_environment_t::probe(char const* address) noexcep
 
 #else
 
-inline linux_spdk_probe_t spdk_environment_t::probe(char const* address) noexcept {
+template <template <typename> typename atomic_reference_>
+linux_spdk_probe_t linux_spdk_environment<atomic_reference_>::probe(char const* address) noexcept {
     if (!address) return linux_spdk_probe_t::not_found_k;
-    return spdk_transport_named(address) == spdk_transport_t::fabric_k ? linux_spdk_probe_t::available_k
-                                                                       : linux_spdk_probe_t::not_found_k;
+    return spdk_transport_named(address) == linux_spdk_transport_t::fabric_k ? linux_spdk_probe_t::available_k
+                                                                             : linux_spdk_probe_t::not_found_k;
 }
 
 #endif
 
 #if USTORE_WITH_SPDK
 
-inline expected<spdk_environment_t> spdk_environment_t::acquire(spdk_environment_config_t const& config) noexcept {
-    bool const plain = config.memory == spdk_memory_t::plain_pages_k;
+template <template <typename> typename atomic_reference_>
+expected<linux_spdk_environment<atomic_reference_>> linux_spdk_environment<atomic_reference_>::acquire(
+    linux_spdk_environment_config_t const& config) noexcept {
+    bool const plain = config.memory == linux_spdk_memory_t::plain_pages_k;
     if (plain && config.plain_megabytes == 0)
         return status_t {status_code_t::invalid_argument_k, "Plain pages need a size the driver takes at once"};
     if (!spdk_env_dpdk_external_init())
@@ -539,7 +547,7 @@ inline expected<spdk_environment_t> spdk_environment_t::acquire(spdk_environment
     if (spdk_env_init(&options) != 0)
         return status_t {status_code_t::device_k, "The driver would not initialise its environment"};
     spdk_unaffinitize_thread();
-    spdk_environment_t environment;
+    linux_spdk_environment environment;
     environment.holders_ = new (std::nothrow) holders_t {};
     if (!environment.holders_) {
         spdk_env_fini();
@@ -548,15 +556,21 @@ inline expected<spdk_environment_t> spdk_environment_t::acquire(spdk_environment
     return environment;
 }
 
-inline void spdk_environment_t::finalize_() noexcept { spdk_env_fini(); }
+template <template <typename> typename atomic_reference_>
+void linux_spdk_environment<atomic_reference_>::finalize_() noexcept {
+    spdk_env_fini();
+}
 
 #else
 
-inline expected<spdk_environment_t> spdk_environment_t::acquire(spdk_environment_config_t const&) noexcept {
+template <template <typename> typename atomic_reference_>
+expected<linux_spdk_environment<atomic_reference_>> linux_spdk_environment<atomic_reference_>::acquire(
+    linux_spdk_environment_config_t const&) noexcept {
     return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
 }
 
-inline void spdk_environment_t::finalize_() noexcept {}
+template <template <typename> typename atomic_reference_>
+void linux_spdk_environment<atomic_reference_>::finalize_() noexcept {}
 
 #endif
 
@@ -638,7 +652,7 @@ class linux_spdk_disk {
      *  @param[in] config The queue pairs wanted, the per-queue pair depth and the ranges registered at once.
      *  @return The mounted disk, or why the controller would not answer.
      */
-    static expected<linux_spdk_disk> open(spdk_environment_t environment, char const* address,
+    static expected<linux_spdk_disk> open(linux_spdk_environment<atomic_reference_> environment, char const* address,
                                           linux_spdk_disk_config_t const& config) noexcept {
         if (status_t const sane = inspect_config_(config); sane.failed()) return sane;
         if (!address) return status_t {status_code_t::invalid_argument_k, "A controller needs an address"};
@@ -668,8 +682,10 @@ class linux_spdk_disk {
             return status_t {status_code_t::not_found_k, "The controller carries no active namespace"};
         }
 
-        spdk_nvme_ctrlr_opts const* const opts = spdk_nvme_ctrlr_get_opts(controller);
-        std::uint32_t const queues = opts && opts->num_io_queues != 0 ? opts->num_io_queues : 1u;
+        spdk_nvme_ctrlr_opts const* const controller_options = spdk_nvme_ctrlr_get_opts(controller);
+        std::uint32_t const queues = controller_options && controller_options->num_io_queues != 0
+                                         ? controller_options->num_io_queues
+                                         : 1u;
         std::uint16_t const queue_pairs = static_cast<std::uint16_t>(
             config.queue_pairs_limit < queues ? config.queue_pairs_limit : queues);
 
@@ -714,8 +730,8 @@ class linux_spdk_disk {
     }
 
     /** What the controller identifies as, which a suite checks against the serial its rig set. */
-    [[nodiscard]] spdk_controller_identity_t identity() const noexcept {
-        spdk_controller_identity_t identity;
+    [[nodiscard]] linux_spdk_controller_identity_t identity() const noexcept {
+        linux_spdk_controller_identity_t identity;
         spdk_nvme_ctrlr_data const* const data = spdk_nvme_ctrlr_get_data(controller_);
         if (!data) return identity;
         copy_trimmed_(data->sn, sizeof(data->sn), identity.serial);
@@ -764,8 +780,9 @@ class linux_spdk_disk {
      *  @brief Makes the calling thread the one that polls @p queue pair.
      *  @param[in] queue_pair The queue pair this thread has just taken over, with nothing outstanding on it.
      *
-     *  @note A queue pair carries no lock, so a second thread polling one corrupts its tracker list
-     *      in silence; that is why a handover is announced and why the queue pair must be empty first.
+     *  @note A queue pair carries no lock, so a second thread polling one corrupts its
+     *      tracker list in silence; that is why a handover is announced and why the queue
+     *      pair must be empty first.
      */
     status_t bind_queue_pair(queue_pair_t const& queue_pair) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
@@ -1259,7 +1276,7 @@ class linux_spdk_disk {
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
-    static status_t size_(st::basic_vector<element_type_>& elements, std::size_t count) noexcept {
+    static status_t size_(st::vector<element_type_>& elements, std::size_t count) noexcept {
         if (elements.resize(count) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A ring could not allocate its slots"};
         return {};
@@ -1661,25 +1678,25 @@ class linux_spdk_disk {
     }
 
     /** The environment this disk holds a share of, declared first so it outlives everything below. */
-    spdk_environment_t environment_;
+    linux_spdk_environment<atomic_reference_> environment_;
 
     /** One slot per queue pair the disk hands out, which is one queue pair each. */
-    st::basic_vector<queue_pair_slot_t> queue_pairs_;
+    st::vector<queue_pair_slot_t> queue_pairs_;
 
     /** One slot per memory range the driver has mapped for this disk. */
-    st::basic_vector<registered_memory_slot_t> registered_memories_;
+    st::vector<registered_memory_slot_t> registered_memories_;
 
     /** The namespace as a target, which is the only one this transport ever presents. */
-    st::basic_vector<registered_medium_slot_t> media_;
+    st::vector<registered_medium_slot_t> media_;
 
     /** Every queue pair's commands, in windows of @c depth_limit_ addressed through a free list. */
-    st::basic_vector<flight_t> flights_;
+    st::vector<flight_t> flights_;
 
     /** Every queue pair's held successors, in windows of @c depth_limit_ addressed through a free list. */
-    st::basic_vector<staged_t> staged_;
+    st::vector<staged_t> staged_;
 
     /** Every queue pair's own completions, in windows of @c depth_limit_ read as a circle. */
-    st::basic_vector<completion_t> locals_;
+    st::vector<completion_t> locals_;
 
     /** The controller this disk connected to, detached when the disk closes. */
     spdk_nvme_ctrlr* controller_ = nullptr;
@@ -1727,7 +1744,8 @@ class linux_spdk_disk {
   public:
 
     /** Refuses the mount, since this build carries no driver to mount with. */
-    static expected<linux_spdk_disk> open(spdk_environment_t, char const*, linux_spdk_disk_config_t const&) noexcept {
+    static expected<linux_spdk_disk> open(linux_spdk_environment<atomic_reference_>, char const*,
+                                          linux_spdk_disk_config_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
     }
 
@@ -1735,7 +1753,7 @@ class linux_spdk_disk {
     [[nodiscard]] ring_capabilities_t capabilities() const noexcept { return {}; }
 
     /** What the controller identifies as, which is nothing, since none was ever connected. */
-    [[nodiscard]] spdk_controller_identity_t identity() const noexcept { return {}; }
+    [[nodiscard]] linux_spdk_controller_identity_t identity() const noexcept { return {}; }
 
     /** Refuses the queue pair, since there is no queue pair to queue pair. */
     expected<queue_pair_t> acquire_queue_pair(std::uint32_t) noexcept {

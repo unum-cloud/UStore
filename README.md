@@ -47,7 +47,7 @@ Those paths belong to NVMe, the hyper-converged engine that v1 targets, while th
 | Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                          |
 
 - __The C ABI__ in `c/ustore/*.h` is the only interface: every call takes one argument struct, and every binding forwards to it.
-- __The modalities__ in `src/blobs_layers/docs.hpp` and `src/blobs_layers/graph.hpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
+- __The modalities__ in `src/docs_layer.hpp` and `src/graph_layer.hpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
 - __The `ram` engine__ is the reference: ordered multi-version stores in memory on SmashTable containers, persisted as one binary image when it opens with a directory.
 - __NVMe__ is the engine the hardware paths serve: each collection is an `lsm_tree` of `lsm_level`s of `lsm_sorted_run`s, point lookups search SmashTable's SIMD row kits, compactions merge sorted runs on the CPU or a GPU, GPUDirect Storage moves runs between drives and GPU memory, and a transport chosen at mount reaches the drive through io_uring, SPDK or blocking positioned I/O.
 - __RocksDB and LevelDB__ keep their own storage formats, so an application moves between them and the other engines without changing a call.
@@ -249,10 +249,10 @@ The C headers are C11, checked by `c/test.c` under every platform's compiler aga
 
 | Platform       | C ABI and `ram` | RocksDB | LevelDB | NVMe     | Python | Rust |
 | :------------- | :-------------: | :-----: | :-----: | :------- | :----: | :--: |
-| Linux x86-64   | ✅              | ✅      | ✅      | local    | ✅     | ✅   |
-| Linux AArch64  | ✅              | ✅      | ✅      | untested | ✅     | ✅   |
-| macOS arm64    | ✅              | ✅      | ✅      | untested | ✅     | ✅   |
-| Windows x86-64 | ✅              | ✅      | ✅      | untested | ✅     | ✅   |
+| Linux x86-64   |       ✅        |   ✅    |   ✅    | local    |   ✅   |  ✅  |
+| Linux AArch64  |       ✅        |   ✅    |   ✅    | untested |   ✅   |  ✅  |
+| macOS arm64    |       ✅        |   ✅    |   ✅    | untested |   ✅   |  ✅  |
+| Windows x86-64 |       ✅        |   ✅    |   ✅    | untested |   ✅   |  ✅  |
 
 Every column but NVMe is exercised by CI on all four platforms: `.github/workflows/prerelease.yml` builds and tests the C ABI and each engine, the Python extension and the Rust crate.
 The NVMe column records the suites in [`test/`](test/) on two Linux x86-64 machines rather than CI, which builds NVMe only once its sources are ported to the current C ABI; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP but is not yet mounted by the engine.
@@ -289,7 +289,7 @@ v1 is planned for mid-November 2026.
 - __NVMe__ — today its sources are being ported to the current C ABI, having passed the conformance suite on Linux over blocking and io_uring transports with GPU compaction wired in; v1 targets the port, the graph as two collections of one database, backup and export, and CI on every platform.
 - __Kernel bypass__ — today io_uring on files and block devices, with registered buffers where the memlock cap allows and plain pointers otherwise, and an SPDK transport passing the shared ring cases over NVMe/TCP; v1 targets SPDK mounted by the engine and NVMe passthrough.
 - __SIMD point lookups__ — today the sorted-run index is searched on SmashTable's kits; v1 targets one kit chosen per artifact at open.
-- __GPU__ — today LSM compaction on CUB, reached from the engine when built with CUDA, with the host and device merges checked to agree byte for byte on every transport; v1 targets GPUDirect Storage between drives and GPU memory.
+- __GPU__ — today LSM compaction in three kernels per merge, launched through the driver with no CUDA runtime, reached from the engine when built with CUDA, with the host and device merges checked to agree byte for byte on every transport; v1 targets GPUDirect Storage between drives and GPU memory.
 - __Bindings__ — today a raw CPython core in C11 with Pandas and NetworkX adapters, and a Rust crate over the same C ABI; v1 adds an executor for the NVMe engine to both.
 - __Platforms__ — today CI builds and tests the C ABI, `ram`, RocksDB, LevelDB, the Python extension and the Rust crate on Linux x86-64, Linux AArch64, macOS arm64 and Windows x86-64; v1 adds NVMe to that matrix once it builds.
 

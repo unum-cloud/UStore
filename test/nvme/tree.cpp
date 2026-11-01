@@ -4,11 +4,11 @@
  *  @date September 19, 2026
  *  @brief The LSM level and the tree over the ring: what a flush publishes, what a merge keeps, and how deep it reads.
  *
- *  The results this file exists for are @c cancelled_leaves_nothing and @c holds_its_depth. A cancelled
- *  compaction must leave the level set it was replacing live, every block of both channels back in its pool
- *  and not one byte of the volume reserved, since a merge that leaks either is worse than one that never
- *  ran. A batched read must sit at the queue pair's depth through the middle of a run rather than at the size
- *  of whatever batch a caller handed it.
+ *  The results this file exists for are @c cancelled_leaves_nothing and @c holds_its_depth. A
+ *  cancelled compaction must leave the level set it was replacing live, every block of both
+ *  channels back in its pool and not one byte of the volume reserved, since a merge that leaks
+ *  either is worse than one that never ran. A batched read must sit at the queue pair's depth
+ *  through the middle of a run rather than at the size of whatever batch a caller handed it.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -17,7 +17,6 @@
 #include <cstdlib> // `std::malloc`, `std::free`
 #include <cstring> // `std::memcmp`
 
-#include <array>   // `std::array`
 #include <memory>  // `std::addressof`, `std::align`, `std::unique_ptr`
 #include <new>     // `std::bad_alloc`, `std::align_val_t`, `std::nothrow_t`
 #include <span>    // `std::span`
@@ -25,13 +24,14 @@
 #include <utility> // `std::move`
 
 #include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_key_slot.hpp"   // `key_slot`
-#include "ustore/blobs/nvme_tree.hpp"       // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
-#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`
+#include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`
+#include "ustore/blobs/nvme_tree.hpp"              // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/utilities/vram_device.hpp"        // `gpu_drivers_t`, `kernel_tables`, `vram_nvidia_bundle`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
+#include "nvme/fixture.hpp" // `run_on_transport`, `expectation_t`, `painted`
 
 #pragma region Allocation Watch
 
@@ -129,6 +129,8 @@ void operator delete[](void* pointer, std::align_val_t, std::nothrow_t const&) n
 
 namespace unum::ustore::test {
 
+using namespace unum::ustore::test::nvme;
+
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
 
@@ -143,9 +145,13 @@ constexpr std::size_t memory_runs_bytes_k = 64ull * 1024ull;
 /** The largest value the collection under test admits. */
 constexpr stored_value_size_t value_max_size_k = 128ull * 1024ull;
 
-/** The keys and the key slots every case of this suite drives. */
-using stored_key_t = std::uint64_t;
+/** The keys and the key slots every case of this suite drives, the engine's own, so its device
+ *  merges run on the kernels the library's bundle carries. */
+using stored_key_t = st::key128_t;
 using variable_slot_t = key_slot<stored_key_t, value_layout_t::variable_width_k>;
+
+/** The key of integer @p index, as the engine reads an identity below 2^64. */
+constexpr stored_key_t key_of(std::uint64_t index) noexcept { return {0, index}; }
 
 /** The runs, the levels and the trees every case drives over the volume of @p fixture_type_. */
 template <typename fixture_type_>
@@ -172,9 +178,9 @@ struct lsm_types {
 #pragma region Model
 
 /** One stamp per key slot of a flush of @p count distinct keys, all newer than every stamp handed out before. */
-inline st::basic_vector<std::uint64_t> fresh_stamps(std::size_t count) {
+inline st::vector<std::uint64_t> fresh_stamps(std::size_t count) {
     static std::uint64_t drawn = 0;
-    st::basic_vector<std::uint64_t> stamps;
+    st::vector<std::uint64_t> stamps;
     [[maybe_unused]] st::status_t const sized = stamps.resize(count);
     for (std::size_t index = 0; index != stamps.size(); ++index) stamps[index] = ++drawn;
     return stamps;
@@ -184,16 +190,16 @@ inline st::basic_vector<std::uint64_t> fresh_stamps(std::size_t count) {
 struct batch_t {
 
     /** Key slots in ascending order of their keys. */
-    st::basic_vector<variable_slot_t> key_slots;
+    st::vector<variable_slot_t> key_slots;
 
     /** The values back to back, in the order of their key slots. */
-    st::basic_vector<byte_t> values;
+    st::vector<byte_t> values;
 
     /** Where each value starts inside @c values and one past the last. */
-    st::basic_vector<stored_value_offset_t> offsets;
+    st::vector<stored_value_offset_t> offsets;
 
     /** The @c delta_kind_t of every key slot. */
-    st::basic_vector<std::uint8_t> kinds;
+    st::vector<std::uint8_t> kinds;
 };
 
 /** Lays @p wanted out as one run's key slots, kinds and values, which must already be in ascending key order. */
@@ -215,7 +221,7 @@ struct batch_t {
         expectation_t const& entry = wanted[index];
         bool const removed = entry.state == lookup_result_t::removed_k;
         variable_slot_t slot;
-        slot.stored_key = entry.stored_key;
+        slot.stored_key = key_of(entry.stored_key);
         into.offsets[index] = static_cast<stored_value_offset_t>(written);
         into.kinds[index] = static_cast<std::uint8_t>(removed ? delta_kind_t::remove_k : delta_kind_t::write_k);
         if (!removed) {
@@ -251,15 +257,15 @@ template <typename tree_type_>
                                       std::span<expectation_t const> wanted) {
     std::size_t failures = 0;
     std::size_t const count = wanted.size();
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<lookup_result_t> results;
-    st::basic_vector<std::uint64_t> seen;
+    st::vector<stored_key_t> keys;
+    st::vector<lookup_result_t> results;
+    st::vector<std::uint64_t> seen;
     failures += expect(keys.resize(count) == st::status_t::success_k);
     failures += expect(results.resize(count) == st::status_t::success_k);
     failures += expect(seen.resize(count) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count; ++index) {
-        keys[index] = wanted[index].stored_key;
+        keys[index] = key_of(wanted[index].stored_key);
         results[index] = lookup_result_t::missing_k;
         seen[index] = 0;
     }
@@ -295,13 +301,13 @@ template <typename tree_type_>
 /** Reads every value of every run of @p level back to back, which is what two compactors must agree on. */
 template <typename level_type_>
 [[nodiscard]] std::size_t collect_level_values(level_type_ const& level, io_channel_t& channel,
-                                               st::basic_vector<byte_t>& into) {
+                                               st::vector<byte_t>& into) {
     std::size_t failures = 0;
     for (std::size_t run = 0; run != level.size(); ++run) {
         auto const& source = level.run(run);
         std::size_t const count = static_cast<std::size_t>(source.population_count());
-        st::basic_vector<std::uint64_t> positions;
-        st::basic_vector<std::size_t> starts;
+        st::vector<std::uint64_t> positions;
+        st::vector<std::size_t> starts;
         failures += expect(positions.resize(count) == st::status_t::success_k);
         failures += expect(starts.resize(count) == st::status_t::success_k);
         if (failures != 0) return failures;
@@ -372,12 +378,12 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index) * 2 + 1;
+        entry.stored_key = static_cast<std::uint64_t>(index) * 2 + 1;
         entry.state = index % 7 == 0 ? lookup_result_t::removed_k : lookup_result_t::written_k;
         entry.bytes = entry.state == lookup_result_t::written_k ? 1 + index % 1021 : 0;
         entry.seed = index;
@@ -397,12 +403,12 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
 
     // Every even key is a miss, since the model only ever wrote odd ones.
-    st::basic_vector<expectation_t> absent;
+    st::vector<expectation_t> absent;
     failures += expect(absent.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index) * 2 + 2;
+        entry.stored_key = static_cast<std::uint64_t>(index) * 2 + 2;
         entry.state = lookup_result_t::missing_k;
         absent[index] = entry;
     }
@@ -436,14 +442,14 @@ std::size_t restore_assigns_ingested_stamps(mount_type_ const& mount) {
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
-    st::basic_vector<expectation_t> model;
-    st::basic_vector<std::uint64_t> zeros;
+    st::vector<expectation_t> model;
+    st::vector<std::uint64_t> zeros;
     failures += expect(model.resize(count_k) == st::status_t::success_k);
     failures += expect(zeros.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index) * 2 + 1;
+        entry.stored_key = static_cast<std::uint64_t>(index) * 2 + 1;
         entry.state = lookup_result_t::written_k;
         entry.bytes = 1 + index;
         entry.seed = index;
@@ -476,8 +482,8 @@ std::size_t restore_assigns_ingested_stamps(mount_type_ const& mount) {
     std::size_t misread = 0;
     for (expectation_t const& entry : model) {
         lsm_tree_position_t position;
-        misread += tree->find(taken, entry.stored_key, position, assigned_k - 1) != lookup_result_t::missing_k;
-        misread += tree->find(taken, entry.stored_key, position, assigned_k) != lookup_result_t::written_k;
+        misread += tree->find(taken, key_of(entry.stored_key), position, assigned_k - 1) != lookup_result_t::missing_k;
+        misread += tree->find(taken, key_of(entry.stored_key), position, assigned_k) != lookup_result_t::written_k;
     }
     failures += expect_eq(misread, std::size_t {0});
     return failures;
@@ -508,23 +514,23 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(keys_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index);
+        entry.stored_key = static_cast<std::uint64_t>(index);
         entry.state = lookup_result_t::missing_k;
         model[index] = entry;
     }
 
     // Every flush rewrites the keys of one residue class, so the runs overlap and the last one wins.
     for (std::size_t flush = 0; flush != flushes_k; ++flush) {
-        st::basic_vector<expectation_t> batch;
+        st::vector<expectation_t> batch;
         for (std::size_t index = 0; index != keys_k; ++index) {
             if ((index + flush) % 3 != 0) continue;
             expectation_t entry;
-            entry.stored_key = static_cast<stored_key_t>(index);
+            entry.stored_key = static_cast<std::uint64_t>(index);
             entry.state = flush % 4 == 3 ? lookup_result_t::removed_k : lookup_result_t::written_k;
             entry.bytes = entry.state == lookup_result_t::written_k ? 1 + (index * 13 + flush) % 997 : 0;
             entry.seed = flush * keys_k + index;
@@ -545,7 +551,7 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
     typename tree_t::level_set_t const& taken = tree->levels();
     std::size_t visited = 0;
     std::size_t disordered = 0;
-    stored_key_t previous = 0;
+    stored_key_t previous {};
     failures += expect(taken.level(0)
                            .for_each_key_slot([&](lsm_level_position_t, variable_slot_t const& slot) noexcept {
                                if (visited != 0 && !(previous < slot.stored_key)) ++disordered;
@@ -592,22 +598,22 @@ std::size_t compaction_drops_remove_deltas_at_the_bottom(mount_type_ const& moun
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(keys_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index);
+        entry.stored_key = static_cast<std::uint64_t>(index);
         entry.state = lookup_result_t::missing_k;
         model[index] = entry;
     }
 
     for (std::size_t flush = 0; flush != flushes_k; ++flush) {
-        st::basic_vector<expectation_t> batch;
+        st::vector<expectation_t> batch;
         for (std::size_t index = 0; index != keys_k; ++index) {
             if ((index + flush) % 2 != 0) continue;
             expectation_t entry;
-            entry.stored_key = static_cast<stored_key_t>(index);
+            entry.stored_key = static_cast<std::uint64_t>(index);
             entry.state = (index % 5 == 0 && flush + 1 == flushes_k) ? lookup_result_t::removed_k
                                                                      : lookup_result_t::written_k;
             entry.bytes = entry.state == lookup_result_t::written_k ? 1 + (index * 29 + flush) % 2039 : 0;
@@ -670,11 +676,11 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     failures += expect(volume.has_value());
     if (!volume) return failures;
 
-    st::basic_vector<expectation_t> older;
-    st::basic_vector<expectation_t> newer;
+    st::vector<expectation_t> older;
+    st::vector<expectation_t> newer;
     for (std::size_t index = 0; index != keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index);
+        entry.stored_key = static_cast<std::uint64_t>(index);
         entry.state = lookup_result_t::written_k;
         entry.bytes = 1 + index % 311;
         entry.seed = index + 1;
@@ -720,13 +726,13 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     // The intermediate level answers a removed key as a key it carries, and the bottom one as a miss.
     for (std::size_t index = 0; index < keys_k; index += 3) {
         lsm_level_position_t position;
-        failures += expect(kept->find(static_cast<stored_key_t>(index), position) == lookup_result_t::removed_k);
-        failures += expect(dropped->find(static_cast<stored_key_t>(index), position) == lookup_result_t::missing_k);
+        failures += expect(kept->find(key_of(index), position) == lookup_result_t::removed_k);
+        failures += expect(dropped->find(key_of(index), position) == lookup_result_t::missing_k);
     }
     for (std::size_t index = 1; index < keys_k; index += 3) {
         lsm_level_position_t position;
-        failures += expect(kept->find(static_cast<stored_key_t>(index), position) == lookup_result_t::written_k);
-        failures += expect(dropped->find(static_cast<stored_key_t>(index), position) == lookup_result_t::written_k);
+        failures += expect(kept->find(key_of(index), position) == lookup_result_t::written_k);
+        failures += expect(dropped->find(key_of(index), position) == lookup_result_t::written_k);
     }
 
     failures += expect(kept->drop(*volume, writing->channel()).succeeded());
@@ -762,19 +768,19 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(keys_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index);
+        entry.stored_key = static_cast<std::uint64_t>(index);
         entry.state = lookup_result_t::written_k;
         entry.bytes = 1 + index % 1531;
         entry.seed = index + 3;
         model[index] = entry;
     }
     for (std::size_t flush = 0; flush != flushes_k; ++flush) {
-        st::basic_vector<expectation_t> batch;
+        st::vector<expectation_t> batch;
         for (std::size_t index = flush; index < keys_k; index += flushes_k)
             failures += expect(batch.push_back(expectation_t {model[index]}) == st::status_t::success_k);
         failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
@@ -858,19 +864,19 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(keys_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index);
+        entry.stored_key = static_cast<std::uint64_t>(index);
         entry.state = lookup_result_t::written_k;
         entry.bytes = 1 + index % 907;
         entry.seed = index + 11;
         model[index] = entry;
     }
     for (std::size_t flush = 0; flush != flushes_k; ++flush) {
-        st::basic_vector<expectation_t> batch;
+        st::vector<expectation_t> batch;
         for (std::size_t index = flush; index < keys_k; index += flushes_k)
             failures += expect(batch.push_back(expectation_t {model[index]}) == st::status_t::success_k);
         failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
@@ -887,7 +893,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
 
     compaction_cancellation<atomic_reference> cancellation;
     std::thread raiser {[&cancellation]() noexcept {
-        for (std::size_t spins = 0; spins != 64; ++spins) fu::preferred_yield_t {}(spins, spins, std::size_t {0});
+        for (std::size_t spins = 0; spins != 64; ++spins) fu::preferred_yield_t {}(&spins, spins, std::size_t {0});
         cancellation.raise();
     }};
     expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
@@ -967,11 +973,11 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     failures += expect(volume.has_value());
     if (!volume) return failures;
 
-    st::basic_vector<expectation_t> older;
-    st::basic_vector<expectation_t> newer;
+    st::vector<expectation_t> older;
+    st::vector<expectation_t> newer;
     for (std::size_t index = 0; index != keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index);
+        entry.stored_key = static_cast<std::uint64_t>(index);
         entry.state = index % 11 == 0 ? lookup_result_t::removed_k : lookup_result_t::written_k;
         entry.bytes = entry.state == lookup_result_t::written_k ? 1 + index % 613 : 0;
         entry.seed = index + 5;
@@ -1003,11 +1009,13 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     // The device side runs on a compactor made once, as an engine makes its own at open, and a build without one
     // refuses.
     request.placement = compaction_placement_t::device_k;
-    gpu_drivers_t const drivers;
+    gpu_drivers_t drivers;
+    kernel_tables<cuda_module_t> kernels;
     expected<cuda_executor_t> executor = status_t {status_code_t::device_k, "No CUDA device zero"};
-    if (drivers.cuda_contexts[0])
+    if (drivers.retain_context(0) &&
+        kernels.load(drivers.cuda, drivers.cuda_contexts[0], 0, vram_nvidia_bundle(), vram_kernel_names_k).succeeded())
         executor = cuda_executor_t::spawn(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class_t::unknown_k, nullptr, 0,
-                                          ustore_gds_automatic_k);
+                                          ustore_gds_automatic_k, kernels.table_of(vram_nvidia_bundle(), 0));
     expected<cuda_compactor_t> compactor = executor ? cuda_compactor_t::make(*executor)
                                                     : expected<cuda_compactor_t> {executor.status()};
     if (compactor) request.compactor = std::addressof(*compactor);
@@ -1041,8 +1049,8 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     failures += expect_eq(differing, std::size_t {0});
 
     // Identical cells are not identical runs until the bytes they locate come back the same too.
-    st::basic_vector<byte_t> host_values;
-    st::basic_vector<byte_t> device_values;
+    st::vector<byte_t> host_values;
+    st::vector<byte_t> device_values;
     failures += collect_level_values(*host, guard->channel(), host_values);
     failures += collect_level_values(*device, guard->channel(), device_values);
     failures += expect_eq(device_values.size(), host_values.size());
@@ -1089,11 +1097,11 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     if (!volume) return failures;
 
     // Half of the newer keys shadow older ones and half sit past them, so the survivors number 1150.
-    st::basic_vector<expectation_t> older;
-    st::basic_vector<expectation_t> newer;
+    st::vector<expectation_t> older;
+    st::vector<expectation_t> newer;
     for (std::size_t index = 0; index != older_keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index);
+        entry.stored_key = static_cast<std::uint64_t>(index);
         entry.state = index % 11 == 0 ? lookup_result_t::removed_k : lookup_result_t::written_k;
         entry.bytes = entry.state == lookup_result_t::written_k ? 1 + index % 613 : 0;
         entry.seed = index + 5;
@@ -1101,7 +1109,7 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     }
     for (std::size_t index = 0; index != newer_keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index < newer_keys_k / 2 ? index * 2 : older_keys_k + index);
+        entry.stored_key = static_cast<std::uint64_t>(index < newer_keys_k / 2 ? index * 2 : older_keys_k + index);
         entry.state = lookup_result_t::written_k;
         entry.bytes = 1 + index % 271;
         entry.seed = index + 4096;
@@ -1179,31 +1187,31 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(keys_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys_k; ++index) {
         expectation_t entry;
-        entry.stored_key = static_cast<stored_key_t>(index);
+        entry.stored_key = static_cast<std::uint64_t>(index);
         entry.state = lookup_result_t::written_k;
         entry.bytes = 1 + index % 4093;
         entry.seed = index + 7;
         model[index] = entry;
     }
     for (std::size_t flush = 0; flush != flushes_k; ++flush) {
-        st::basic_vector<expectation_t> batch;
+        st::vector<expectation_t> batch;
         for (std::size_t index = flush; index < keys_k; index += flushes_k)
             failures += expect(batch.push_back(expectation_t {model[index]}) == st::status_t::success_k);
         failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
         if (failures != 0) return failures;
     }
 
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<lookup_result_t> results;
+    st::vector<stored_key_t> keys;
+    st::vector<lookup_result_t> results;
     failures += expect(keys.resize(keys_k) == st::status_t::success_k);
     failures += expect(results.resize(keys_k) == st::status_t::success_k);
     if (failures != 0) return failures;
-    for (std::size_t index = 0; index != keys_k; ++index) keys[index] = model[index].stored_key;
+    for (std::size_t index = 0; index != keys_k; ++index) keys[index] = key_of(model[index].stored_key);
 
     // The blocks a batched read holds are counted in the pool, since the ring performs a channel's
     // requests inside the poll that hands them to the sink.

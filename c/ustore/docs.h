@@ -26,32 +26,60 @@ extern "C" {
 /**
  *  @brief Type of a document, or of a value extracted from one.
  *
- *  @c ustore_docs_field_type_json_k is JSON text, @c ustore_docs_field_type_str_k is a value printed as text, and
- *  @c ustore_docs_field_type_bin_k is the same text without a null terminator; the rest are fixed-width scalars.
+ *  Every type but JSON text, strings and binary text is a fixed-width scalar.
  */
 typedef enum ustore_docs_field_type_t {
+
+    /** JSON text. */
     ustore_docs_field_type_json_k = 0,
 
+    /** The JSON null. */
     ustore_docs_field_type_null_k = 10,
+
+    /** A boolean. */
     ustore_docs_field_type_bool_k = 11,
+
+    /** A 128-bit UUID. */
     ustore_docs_field_type_uuid_k = 12,
 
+    /** A 64-bit float. */
     ustore_docs_field_type_f64_k = 42,
+
+    /** A 32-bit float. */
     ustore_docs_field_type_f32_k = 41,
+
+    /** A 16-bit float. */
     ustore_docs_field_type_f16_k = 40,
 
+    /** A signed 64-bit integer. */
     ustore_docs_field_type_i64_k = 23,
+
+    /** A signed 32-bit integer. */
     ustore_docs_field_type_i32_k = 22,
+
+    /** A signed 16-bit integer. */
     ustore_docs_field_type_i16_k = 21,
+
+    /** A signed 8-bit integer. */
     ustore_docs_field_type_i8_k = 20,
 
+    /** An unsigned 64-bit integer. */
     ustore_docs_field_type_u64_k = 33,
+
+    /** An unsigned 32-bit integer. */
     ustore_docs_field_type_u32_k = 32,
+
+    /** An unsigned 16-bit integer. */
     ustore_docs_field_type_u16_k = 31,
+
+    /** An unsigned 8-bit integer. */
     ustore_docs_field_type_u8_k = 30,
 
-    ustore_docs_field_type_bin_k = 50,
-    ustore_docs_field_type_str_k = 51,
+    /** The text of a value without a null terminator. */
+    ustore_docs_field_type_binary_k = 50,
+
+    /** A value printed as text. */
+    ustore_docs_field_type_string_k = 51,
 } ustore_docs_field_type_t;
 
 /** Modification @c ustore_docs_write applies: an upsert, update or insert, an RFC 6902 patch, or an
@@ -79,9 +107,10 @@ USTORE_EXPORT ustore_docs_modification_t ustore_docs_modification_from_name(usto
 /**
  *  @brief The arguments of @c ustore_docs_write, which writes whole documents or fields inside them.
  *
- *  Without @c keys, the key of every document is read from its @c id_field, which must hold a non-negative
- *  integer, spelled as the key of that integer, or a UUID in canonical text. Whole documents are removed with
- *  @c ustore_blobs_remove, and fields inside them with a patch or a merge.
+ *  Without @c keys, the key of every document is read from its @c id_field, which must hold a
+ *  non-negative integer, spelled as the key of that integer, or a UUID in canonical text.
+ *  Whole documents are removed with @c ustore_docs_remove, and fields inside them with a patch
+ *  or a merge.
  */
 typedef struct ustore_docs_write_t {
 
@@ -141,12 +170,14 @@ typedef struct ustore_docs_write_t {
  *    table is full, or a callback blocks on the executor running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections or @c values are missing, so are both
- *    the @c keys and the @c id_field, the fields or values come in an unknown layout, the
- *    @c transaction belongs to another engine or is staged, the @c durability, @c watch or
- *    @c modification is unknown, a flushed write names a @c transaction, @c ustore_watch_none_k
- *    comes without one, a collection holds another modality, a patch or a modifier does not apply
- *    to its field, or a field or value is past 4 GiB.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections or @c values are missing, so are
+ *  both the @c keys and the @c id_field, the fields or values come in an unknown layout, the
+ *  @c transaction belongs to another engine or is staged, the @c durability, @c watch or
+ *  @c modification is unknown, a flushed write names a @c transaction, @c ustore_watch_none_k comes
+ *  without one, a collection holds another modality, a patch or a modifier does not apply to its
+ *  field, or a field or value is past 4 GiB.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device, or the @c type is not
  *    supported.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile, a field
@@ -165,8 +196,9 @@ USTORE_EXPORT void ustore_docs_write(ustore_docs_write_t* arguments);
 /**
  *  @brief The arguments of @c ustore_docs_read, which reads whole documents or fields inside them.
  *
- *  Whole documents read as JSON pass straight through to the engine; everything else is parsed and
- *  exported, printing scalars as text for @c ustore_docs_field_type_str_k and nested values as JSON text.
+ *  Whole documents read as JSON pass straight through to the engine; everything else is parsed
+ *  and exported, printing scalars as text for @c ustore_docs_field_type_string_k and nested
+ *  values as JSON text.
  */
 typedef struct ustore_docs_read_t {
 
@@ -219,10 +251,9 @@ typedef struct ustore_docs_read_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena or @c collections are missing, the @c keys
- *    are missing for whole documents, the fields come in an unknown layout, the @c view was made by
- *    neither view constructor or belongs to another engine, a watching read goes through a staged
- *    transaction, or a collection holds another modality.
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or @c keys are missing, the
+ *    fields come in an unknown layout, the @c view is none of the engine's, a watching read goes
+ *    through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -280,9 +311,9 @@ typedef struct ustore_docs_gist_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena or @c collections are missing, the @c view
- *    was made by neither view constructor or belongs to another engine, a watching read goes through
- *    a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or @c keys are missing,
+ *    the @c view was made by neither view constructor or belongs to another engine, a watching
+ *    read goes through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -323,12 +354,13 @@ typedef struct ustore_docs_column_view_t {
 } ustore_docs_column_view_t;
 
 /**
- *  @brief The arguments of @c ustore_docs_gather, which reads @c fields_count fields of
- *      @c count documents into columns.
+ *  @brief The arguments of @c ustore_docs_gather, which reads @c fields_count fields of @c count
+ *      documents into columns.
  *
- *  Every field lands in one @c ustore_docs_column_view_t of @c count rows inside @c arena, converted into its entry
- *  of @c outputs_types. Strings requested as @c ustore_docs_field_type_str_k end with a null terminator, which their
- *  offsets span, and binary strings do not.
+ *  Every field lands in one @c ustore_docs_column_view_t of @c count rows
+ *  inside @c arena, converted into its entry of @c outputs_types. Strings
+ *  requested as @c ustore_docs_field_type_string_k end with a null terminator,
+ *  which their offsets span, and binary strings do not.
  */
 typedef struct ustore_docs_gather_t {
 
@@ -378,10 +410,9 @@ typedef struct ustore_docs_gather_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or columns output is missing,
- *    the @c fields or their types are missing or come in an unknown layout, the @c view was made by
- *    neither view constructor or belongs to another engine, a watching read goes through a staged
- *    transaction, or a collection holds another modality.
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections, @c keys or @c columns are
+ *    missing, the @c fields or their types are missing or unknown, the @c view is foreign, a
+ *    watching read goes through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -439,10 +470,12 @@ typedef struct ustore_docs_remove_t {
  *    table is full, or a callback blocks on the executor running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections or @c keys are missing, the
- *    @c transaction belongs to another engine or is staged, the @c durability or @c watch is
- *    unknown, a flushed remove names a @c transaction, @c ustore_watch_none_k comes without one, or
- *    a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections or @c keys are missing, the
+ *  @c transaction belongs to another engine or is staged, the @c durability or @c watch is
+ *  unknown, a flushed remove names a @c transaction, @c ustore_watch_none_k comes without one, or
+ *  a collection holds another modality.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
@@ -520,10 +553,11 @@ typedef struct ustore_docs_scan_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
- *    @c mode or a predicate cost is unknown, the @c filter does not compile, the @c view was made by
- *    neither view constructor or belongs to another engine, a watching scan goes through a staged
- *    transaction, or a collection holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is missing,
+ *  the @c mode or a predicate cost is unknown, the @c filter does not compile, the @c view was made
+ *  by neither view constructor or belongs to another engine, a watching scan goes through a staged
+ *  transaction, or a collection holds another modality.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -587,9 +621,9 @@ typedef struct ustore_docs_cursor_init_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made by
- *    neither view constructor or reads another database, a predicate cost is unknown, or the
- *    @c filter does not compile.
+ *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made
+ *    by neither view constructor or reads another database, a predicate cost is unknown, or
+ *    the @c filter does not compile.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k A device @c executor is given a @c filter.
  */
@@ -643,11 +677,11 @@ typedef struct ustore_docs_cursor_next_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output is
- *    @c NULL, the cursor walks another database, a watching pull goes through a staged
+ *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output
+ *    is @c NULL, the cursor walks another database, a watching pull goes through a staged
  *    transaction, or the collection holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes, or a cursor opened
- *    for a device is pulled on host threads.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
+ *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
@@ -710,9 +744,9 @@ typedef struct ustore_docs_sample_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
- *    @c view was made by neither view constructor or belongs to another engine, a watching sample
- *    goes through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing,
+ *    the @c view was made by neither view constructor or belongs to another engine, a watching
+ *    sample goes through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running

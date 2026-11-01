@@ -20,7 +20,6 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `stderr`
-#include <cstring> // `std::memset`
 
 #include <array>       // `std::array`
 #include <new>         // `std::nothrow`
@@ -31,17 +30,28 @@
 #include <yyjson.h>
 
 #include <smashtable/basic_vector.hpp>
-#include <stringzilla/capabilities.h> // `sz_capabilities_enabled_cpu`
+#include <stringzilla/capabilities.h> // `sz_capabilities_compiled_cpu_mask`, `sz_capabilities_enabled_cpu`
 
 #include "ustore/docs/json_paths.hpp"       // `extract_fields`, `json_documents_t`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `json_lookup`, `gather_scalar`, `json_to_string`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_rewind`, `arena_free`, `growing_strings`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_rewind`, `arena_free`, `growing_strings`, `strings_ladder`
 
 #include "harness.hpp"
 
 namespace unum::ustore::bench {
 
 using namespace unum::ustore::docs;
+
+/** The widest StringZilla kernels this build compiled. */
+using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+
+/** The StringZilla capabilities this machine runs among those the build compiled, which the engines
+ *  compile for, while @c strings_kit_t keeps to a tier the build's own flags guarantee. */
+sz_capability_t strings_capabilities() noexcept {
+    sz_capability_t capabilities = sz_cap_serial_k;
+    if (sz_capabilities_enabled_cpu(&capabilities) != sz_success_k) capabilities = sz_cap_serial_k;
+    return capabilities;
+}
 
 #pragma region Settings
 
@@ -61,8 +71,8 @@ struct settings_t : shared_settings_t {
 
 /** Every generated document back to back, behind 64-bit offsets, as a read answers them. */
 struct corpus_t {
-    st::basic_vector<char> bytes;
-    st::basic_vector<std::uint64_t> offsets;
+    st::vector<char> bytes;
+    st::vector<std::uint64_t> offsets;
 
     /** The documents @b [first,first+count) as a read would answer them, all present. */
     json_documents_t batch(std::size_t first, std::size_t count) const noexcept {
@@ -79,7 +89,7 @@ struct corpus_t {
 };
 
 /** Appends @p text to @p bytes, answering whether it fit. */
-bool append(st::basic_vector<char>& bytes, std::string_view text) noexcept {
+bool append(st::vector<char>& bytes, std::string_view text) noexcept {
     std::size_t const offset = bytes.size();
     if (st::failed(bytes.resize(offset + text.size()))) return false;
     std::memcpy(bytes.data() + offset, text.data(), text.size());
@@ -159,7 +169,7 @@ constexpr std::array<column_t, 4> columns_k {{
     {"/user/followers_count", ustore_docs_field_type_u64_k},
     {"retweet_count", ustore_docs_field_type_u32_k},
     {"score", ustore_docs_field_type_f64_k},
-    {"/user/screen_name", ustore_docs_field_type_str_k},
+    {"/user/screen_name", ustore_docs_field_type_string_k},
 }};
 
 /** Converts @p value into cell @p index of a column of @p type, as the docs gather does. */
@@ -173,7 +183,8 @@ conversion_t gather_cell(ustore_docs_field_type_t type, json_cell_t const& value
         printed_number_buffer_t buffer;
         std::string_view text;
         conversion_t const conversion = json_to_string(value, buffer, text);
-        return strings.push_back(bytes_of(text), true).failed() ? conversion_t::collides_k : conversion;
+        return strings.push_back(bytes_of(text), string_end_t::null_terminated_k).failed() ? conversion_t::collides_k
+                                                                                           : conversion;
     }
     }
 }
@@ -234,22 +245,26 @@ bool resolve_with_yyjson(json_documents_t const& documents, std::span<std::strin
 
 /** Extracts every field of @p fields in @p documents with one subdocuments pass. */
 bool resolve_with_subdocuments(json_documents_t const& documents, std::span<std::string_view const> fields,
-                               stringzilla_kernels_t const& kernels, ustore_arena_t scratch,
-                               std::span<json_cell_t> values) noexcept {
+                               ustore_arena_t scratch, std::span<json_cell_t> values) noexcept {
     std::size_t const count = documents.count;
     auto const cell_of = [count](std::size_t cell) noexcept { return field_cell_t {cell % count, cell / count}; };
     json_cells_t cells;
-    if (extract_fields(documents, fields, count * fields.size(), cell_of, kernels, scratch, cells).failed())
+    if (extract_fields<strings_kit_t>(documents, fields, count * fields.size(), cell_of, strings_capabilities(),
+                                      scratch, cells)
+            .failed())
         return false;
     for (std::size_t cell = 0; cell != count * fields.size(); ++cell) values[cell] = cells[cell];
     return true;
 }
 
-/** Runs one row: each call resolves the next batch of the corpus with @p subdocuments or yyjson, then fills
- *  @p columns. */
-row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& corpus,
-              stringzilla_kernels_t const& kernels, std::string_view name, std::span<column_t const> columns,
-              bool subdocuments) noexcept {
+/** What resolves a row's fields: one subdocuments pass over the batch, or yyjson
+ *  parsing each document. */
+enum class resolver_t { yyjson_k, subdocuments_k };
+
+/** Runs one row: each call resolves the next batch of the corpus with @p resolver, then
+ *  fills @p columns. */
+row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& corpus, std::string_view name,
+              std::span<column_t const> columns, resolver_t resolver) noexcept {
     std::size_t const batch_size = std::min(settings.batch_size.value, settings.documents.value);
     std::array<std::string_view, columns_k.size()> fields;
     for (std::size_t column = 0; column != columns.size(); ++column) fields[column] = columns[column].field;
@@ -257,8 +272,8 @@ row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& 
 
     return run_threads(executor, settings, name, [&](loop_t& loop, std::size_t) noexcept {
         ustore_arena_t const scratch = new (std::nothrow) ustore_arena_handle_t {};
-        st::basic_vector<json_cell_t> values;
-        st::basic_vector<ustore_byte_t> scalars;
+        st::vector<json_cell_t> values;
+        st::vector<ustore_byte_t> scalars;
         if (!scratch || st::failed(values.resize(batch_size * columns.size())) ||
             st::failed(scalars.resize(batch_size * sizeof(std::uint64_t))))
             return loop.skip("no memory for the batch");
@@ -267,8 +282,8 @@ row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& 
             std::size_t const first = (call % batches) * batch_size;
             json_documents_t const documents = corpus.batch(first, batch_size);
             arena_rewind(scratch);
-            bool const resolved = subdocuments
-                                      ? resolve_with_subdocuments(documents, used_fields, kernels, scratch, values)
+            bool const resolved = resolver == resolver_t::subdocuments_k
+                                      ? resolve_with_subdocuments(documents, used_fields, scratch, values)
                                       : resolve_with_yyjson(documents, used_fields, scratch, values);
             if (!resolved) {
                 loop.fail();
@@ -302,22 +317,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     executor_t& executor = *maybe_executor;
-    sz_capability_t capabilities = sz_cap_serial_k;
-    if (sz_capabilities_enabled_cpu(&capabilities) != sz_success_k) capabilities = sz_cap_serial_k;
-    sz_kernel_punned_t count_strings = nullptr, find_byteset = nullptr, unescape = nullptr;
-    sz_capability_t picked = 0;
-    if (sz_find_kernel_punned(sz_kernel_utf8_count_strings_k, capabilities, &count_strings, &picked) != sz_success_k ||
-        sz_find_kernel_punned(sz_kernel_find_byteset_k, capabilities, &find_byteset, &picked) != sz_success_k ||
-        sz_find_kernel_punned(sz_kernel_strings_unescape_k, capabilities, &unescape, &picked) != sz_success_k) {
-        fmt::println(stderr, "No StringZilla kernel for capabilities {:#x}", capabilities);
-        return 1;
-    }
-    stringzilla_kernels_t kernels;
-    kernels.capabilities = capabilities;
-    kernels.utf8_count_strings = reinterpret_cast<sz_kernel_utf8_count_strings_t>(count_strings);
-    kernels.find_byteset = reinterpret_cast<sz_kernel_find_byteset_t>(find_byteset);
-    kernels.strings_unescape = reinterpret_cast<sz_kernel_strings_unescape_t>(unescape);
-
     corpus_t corpus;
     if (!generate_corpus(settings.documents.value, settings.seed.value, corpus)) {
         fmt::println(stderr, "Failed to generate the documents");
@@ -327,21 +326,20 @@ int main(int argc, char** argv) {
                  static_cast<double>(corpus.bytes.size()) / static_cast<double>(settings.documents.value));
 
     std::span<column_t const> const gathered {columns_k};
-    constexpr std::array<column_t, 1> read_k {{{"text", ustore_docs_field_type_str_k}}};
+    constexpr std::array<column_t, 1> read_k {{{"text", ustore_docs_field_type_string_k}}};
     std::span<column_t const> const read {read_k};
     struct row_spec_t {
         std::string_view name;
         std::span<column_t const> columns;
-        bool subdocuments;
+        resolver_t resolver;
     };
     row_spec_t const rows[] = {
-        {"docs_gather_4_fields_yyjson", gathered, false},
-        {"docs_gather_4_fields_subdocuments", gathered, true},
-        {"docs_read_text_yyjson", read, false},
-        {"docs_read_text_subdocuments", read, true},
+        {"docs_gather_4_fields_yyjson", gathered, resolver_t::yyjson_k},
+        {"docs_gather_4_fields_subdocuments", gathered, resolver_t::subdocuments_k},
+        {"docs_read_text_yyjson", read, resolver_t::yyjson_k},
+        {"docs_read_text_subdocuments", read, resolver_t::subdocuments_k},
     };
     for (row_spec_t const& row : rows)
-        if (settings.selects(row.name))
-            print(run_row(executor, settings, corpus, kernels, row.name, row.columns, row.subdocuments));
+        if (settings.selects(row.name)) print(run_row(executor, settings, corpus, row.name, row.columns, row.resolver));
     return 0;
 }

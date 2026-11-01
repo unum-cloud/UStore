@@ -5,21 +5,22 @@
  *  @brief The one memory range a disk pins, the channels that check a queue pair out with its blocks, and the
  *      pipelines that hold a channel's ring at its depth.
  *
- *  Every I/O buffer in the engine comes from the buffer pool, because a request addresses memory by registered
- *  memory slot and offset rather than by pointer, and a range can only be pinned once: @c io_uring answers
- *  @c EBUSY on re-registered memory and a growing arena cannot be pinned at all. So an arena is allocated,
- *  charged and registered once at mount, and everything above it borrows a block instead of
- *  allocating. A block is the unit of one request; a transfer larger than one block becomes several
- *  requests, which is mandatory anyway, since a namespace reports a maximum transfer well under the
- *  largest value a collection may hold.
+ *  Every I/O buffer in the engine comes from the buffer pool, because a request addresses memory
+ *  by registered memory slot and offset rather than by pointer, and a range can only be pinned
+ *  once: @c io_uring answers @c EBUSY on re-registered memory and a growing arena cannot be pinned
+ *  at all. So an arena is allocated, charged and registered once at mount, and everything above it
+ *  borrows a block instead of allocating. A block is the unit of one request; a transfer larger
+ *  than one block becomes several requests, which is mandatory anyway, since a namespace reports a
+ *  maximum transfer well under the largest value a collection may hold.
  *
- *  The ring's rule binds a queue pair, its blocks and its completions together: the thread that submits must be
- *  the thread that polls, and the blocks in flight must not be touched by anyone else until it does. So they live
- *  in one channel, opened at mount and borrowed by callers, rather than being held by a collection or an LSM
- *  tree - all of which outlive threads and cross them, which a queue pair may not do. An executor thread takes
- *  its own channel by the thread index every fan-out already passes it, so the common path contends with
- *  nobody. A thread outside the pool claims one of a few shared channels, or is refused and backs off, which is
- *  the contract the job gate already asks of its callers.
+ *  The ring's rule binds a queue pair, its blocks and its completions together: the thread that
+ *  submits must be the thread that polls, and the blocks in flight must not be touched by anyone
+ *  else until it does. So they live in one channel, opened at mount and borrowed by callers, rather
+ *  than being held by a collection or an LSM tree - all of which outlive threads and cross them,
+ *  which a queue pair may not do. An executor thread takes its own channel by the thread index
+ *  every fan-out already passes it, so the common path contends with nobody. A thread outside the
+ *  pool claims one of a few shared channels, or is refused and backs off, which is the contract the
+ *  job gate already asks of its callers.
  *
  *  A batch submitted whole and then waited on reaches the depth of that batch and no further, which
  *  is the shape the engine had and the reason it never reached a drive's queue. A pipeline instead
@@ -38,10 +39,11 @@
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_ring.hpp" // `registered_memory_t`, `ring_concept`, `aligned_allocator`
-#include "ustore/utilities/types.hpp"     // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp" // `registered_memory_t`, `ring_concept`, `read_request`, `write_request`, `flush_request`
+#include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`, `resource_constraint`
+#include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -148,7 +150,7 @@ class registered_memory_arena {
   private:
 
     /** The bytes, aligned so a mount demanding the portable alignment can address offset zero. */
-    using storage_t = st::basic_vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
+    using storage_t = st::vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
 
     /** Returns the charge to the budget, which both the destructor and a move assignment need. */
     void refund_() noexcept {
@@ -335,7 +337,7 @@ class buffer_pool_t {
     std::uint64_t buffer_bytes_ = 0;
 
     /** Indices of the blocks nobody holds, read and written as a stack by the owning channel alone. */
-    st::basic_vector<std::uint32_t> free_indices_;
+    st::vector<std::uint32_t> free_indices_;
 
     /** Entries of @c free_indices_ that are live, which is the stack's height. */
     std::uint32_t free_count_ = 0;
@@ -404,9 +406,9 @@ class basic_io_channel_pool;
 /**
  *  @brief One queue pair and everything the thread holding it needs, owned by the pool that opened it.
  *
- *  A channel is opened at mount and released at unmount; callers borrow one and never open one, which
- *  is what keeps the number of queue pairs equal to the number of queue pairs a controller offers rather
- *  than to the number of objects in the engine.
+ *  A channel is opened at mount and released at unmount; callers borrow one and never open one,
+ *  which is what keeps the number of queue pairs equal to the number of queue pairs a controller
+ *  offers rather than to the number of objects in the engine.
  */
 class io_channel_t {
   public:
@@ -453,7 +455,7 @@ class io_channel_t {
     buffer_pool_t streams_;
 
     /** Room for one poll, sized to the queue pair's depth. */
-    st::basic_vector<completion_t> completions_;
+    st::vector<completion_t> completions_;
 
     /** The tag the next request of this channel carries, wrapping harmlessly past the depth. */
     request_tag_t next_tag_ = 0;
@@ -672,10 +674,10 @@ class basic_io_channel_pool {
     disk_type_* disk_ = nullptr;
 
     /** One channel per executor thread first, then the shared_channels. */
-    st::basic_vector<io_channel_t> channels_;
+    st::vector<io_channel_t> channels_;
 
     /** One word per shared channel, zero while free and one while claimed. */
-    st::basic_vector<std::int32_t> shared_claims_;
+    st::vector<std::int32_t> shared_claims_;
 
     /** Channels reserved for executor threads, which is where the shared channels start. */
     std::size_t executor_channels_ = 0;
@@ -728,8 +730,8 @@ inline status_t require_completed_in_full(completed_buffer_t const& completed) n
  *  @brief Keeps a channel's ring as full as its blocks allow, polling to make room rather than waiting.
  *
  *  A caller offers transfers, flushes them to the ring and polls; the sink sees each block while
- *  the channel still owns it, copies what it needs out, and the block is recycled the moment the sink
- *  returns. A tag is the caller's own, so a sink can index whatever plan it built.
+ *  the channel still owns it, copies what it needs out, and the block is recycled the moment the
+ *  sink returns. A tag is the caller's own, so a sink can index whatever plan it built.
  */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
@@ -840,7 +842,7 @@ class basic_read_pipeline {
         // still driven to the device rather than leaving the caller reading nothing.
         while (outstanding() != 0) {
             if (status_t const flushed = submit(); flushed.failed()) return flushed;
-            if (status_t const one = poll_one_completion(sink); one.failed()) return one;
+            if (status_t const polled = poll_one_completion(sink); polled.failed()) return polled;
         }
         return {};
     }
@@ -881,7 +883,7 @@ class basic_read_pipeline {
 
     /** Removes the first @p count elements of @p elements, shifting the rest down. */
     template <typename element_type_>
-    static void drop_front_(st::basic_vector<element_type_>& elements, std::size_t count) noexcept {
+    static void drop_front_(st::vector<element_type_>& elements, std::size_t count) noexcept {
         for (std::size_t index = count; index != elements.size(); ++index)
             elements[index - count] = std::move(elements[index]);
         for (std::size_t index = 0; index != count; ++index) elements.pop_back();
@@ -897,10 +899,10 @@ class basic_read_pipeline {
     medium_reference_t medium_;
 
     /** One entry per offered request, in the order they were offered. */
-    st::basic_vector<entry_t> entries_;
+    st::vector<entry_t> entries_;
 
     /** Requests built but not yet taken by the ring. */
-    st::basic_vector<request_t> staged_;
+    st::vector<request_t> staged_;
 
     /** Requests the ring has taken and not yet handed back. */
     std::size_t outstanding_ = 0;
@@ -1081,7 +1083,7 @@ class basic_write_pipeline {
 
     /** Removes the first @p count elements of @p elements, shifting the rest down. */
     template <typename element_type_>
-    static void drop_front_(st::basic_vector<element_type_>& elements, std::size_t count) noexcept {
+    static void drop_front_(st::vector<element_type_>& elements, std::size_t count) noexcept {
         for (std::size_t index = count; index != elements.size(); ++index)
             elements[index - count] = std::move(elements[index]);
         for (std::size_t index = 0; index != count; ++index) elements.pop_back();
@@ -1097,10 +1099,10 @@ class basic_write_pipeline {
     medium_reference_t medium_;
 
     /** One entry per queued write, in the order they were committed. */
-    st::basic_vector<entry_t> entries_;
+    st::vector<entry_t> entries_;
 
     /** Writes built but not yet taken by the ring. */
-    st::basic_vector<request_t> staged_;
+    st::vector<request_t> staged_;
 
     /** Writes the ring has taken and not yet handed back. */
     std::size_t outstanding_ = 0;

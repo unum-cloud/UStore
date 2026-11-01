@@ -17,15 +17,15 @@ namespace unum::ustore {
 
 /** The canonical spelling of every document field type. */
 constexpr enumerator_spelling<ustore_docs_field_type_t> docs_field_type_names_k[] {
-    {ustore_docs_field_type_json_k, "json"}, {ustore_docs_field_type_null_k, "null"},
-    {ustore_docs_field_type_bool_k, "bool"}, {ustore_docs_field_type_uuid_k, "uuid"},
-    {ustore_docs_field_type_f64_k, "f64"},   {ustore_docs_field_type_f32_k, "f32"},
-    {ustore_docs_field_type_f16_k, "f16"},   {ustore_docs_field_type_i64_k, "i64"},
-    {ustore_docs_field_type_i32_k, "i32"},   {ustore_docs_field_type_i16_k, "i16"},
-    {ustore_docs_field_type_i8_k, "i8"},     {ustore_docs_field_type_u64_k, "u64"},
-    {ustore_docs_field_type_u32_k, "u32"},   {ustore_docs_field_type_u16_k, "u16"},
-    {ustore_docs_field_type_u8_k, "u8"},     {ustore_docs_field_type_bin_k, "bin"},
-    {ustore_docs_field_type_str_k, "str"},
+    {ustore_docs_field_type_json_k, "json"},     {ustore_docs_field_type_null_k, "null"},
+    {ustore_docs_field_type_bool_k, "bool"},     {ustore_docs_field_type_uuid_k, "uuid"},
+    {ustore_docs_field_type_f64_k, "f64"},       {ustore_docs_field_type_f32_k, "f32"},
+    {ustore_docs_field_type_f16_k, "f16"},       {ustore_docs_field_type_i64_k, "i64"},
+    {ustore_docs_field_type_i32_k, "i32"},       {ustore_docs_field_type_i16_k, "i16"},
+    {ustore_docs_field_type_i8_k, "i8"},         {ustore_docs_field_type_u64_k, "u64"},
+    {ustore_docs_field_type_u32_k, "u32"},       {ustore_docs_field_type_u16_k, "u16"},
+    {ustore_docs_field_type_u8_k, "u8"},         {ustore_docs_field_type_binary_k, "binary"},
+    {ustore_docs_field_type_string_k, "string"},
 };
 
 /** The canonical spelling of every document modification. */

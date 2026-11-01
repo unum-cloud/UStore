@@ -2,15 +2,13 @@
  *  @file include/ustore/blobs/ram_store.hpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
- *  @brief The multi-version stores of the RAM engine on SmashTable: one per collection of the kind its modality picks,
- *      the collections and the names system collections over them, and the transaction group spanning any of them under
- *      one stamp.
+ *  @brief The multi-version store of the RAM engine on SmashTable, the blobs collection over it,
+ *      the owned texts and trees the documents and pages collections file under their keys, and the
+ *      status translation every store shares.
  *
  *  Every store is a partitioned AVL tree of versions, each partition locked by a spin lock owning its word through the
  *  atomic reference and stalling through the waiter every store here takes. A blobs collection maps UUID keys onto
- *  values, a documents collection onto JSON text and a pages collection onto dense element trees, each a store of its
- *  own type, a strings collection and the names map strings onto 16-byte keys held inline, and a graph collection
- *  holds half-edges with no values.
+ *  values; each other modality's @c ram_store.hpp instantiates the same store over its own entries.
  */
 
 #pragma once
@@ -18,26 +16,18 @@
 #include <cstddef> // `std::size_t`
 #include <cstring> // `std::memcpy`
 
-#include <new>         // `std::nothrow`
-#include <string_view> // `std::string_view`
-#include <utility>     // `std::move`
-#include <variant>     // `std::in_place_type`, `std::variant`
+#include <utility> // `std::move`
 
 #include <smashtable/basic_avl_tree.hpp>
 #include <smashtable/basic_vector.hpp>
 #include <smashtable/partitioned_store.hpp>
 #include <smashtable/snapshot_store.hpp>
 
-#include "ustore/graph/half_edges.hpp"    // `half_edge_t`, `half_edge_order_t`, `half_edge_hash_t`
-#include "ustore/strings/string_keys.hpp" // `blob_t`, `string_key_t`, `string_key_order_t`, `string_key_hash_t`
-#include "ustore/utilities/types.hpp"     // `status_t`, `value_view_t`, `uuid_order_t`, `uuid_hash_t`
+#include "ustore/utilities/types.hpp" // `status_t`, `blob_t`, `value_view_t`, `uuid_order_t`, `uuid_hash_t`
 
 namespace unum::ustore::blobs {
 
-using strings::blob_t;
-using strings::string_key_hash_t;
-using strings::string_key_order_t;
-using strings::string_key_t;
+using utilities::blob_t;
 using utilities::status_code_t;
 using utilities::status_t;
 using utilities::uuid_hash_t;
@@ -95,15 +85,6 @@ inline blob_t const& blob_of(page_tree_bytes_t const& page) noexcept { return pa
 /** A value filed under its key. */
 using value_pair_t = st::mapping<ustore_key_t, blob_t>;
 
-/** A document filed under its key. */
-using document_pair_t = st::mapping<ustore_key_t, document_text_t>;
-
-/** A page filed under its key. */
-using page_pair_t = st::mapping<ustore_key_t, page_tree_bytes_t>;
-
-/** A string and the 16-byte key it maps onto, held inline. */
-using string_pair_t = st::mapping<string_key_t, ustore_key_t>;
-
 /** The lock each partition takes, owning its word through @p atomic_reference_, stalling through @p waiter_type_ and
  *  then parking. */
 template <template <typename> typename atomic_reference_, typename waiter_type_>
@@ -122,96 +103,12 @@ template <isolation_t isolation_, template <typename> typename atomic_reference_
 using values_by_key_store =
     ordered_store<value_pair_t, uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
 
-/** A documents collection: every key mapped onto the JSON text of its document, edited in place. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using documents_by_key_store =
-    ordered_store<document_pair_t, uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
-
-/** A pages collection: every key mapped onto the dense element tree of its page, edited in place. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using pages_by_key_store =
-    ordered_store<page_pair_t, uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
-
-/** A strings collection, and the names system collection, which maps names onto collection IDs. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using keys_by_string_store =
-    ordered_store<string_pair_t, string_key_order_t, string_key_hash_t, isolation_, atomic_reference_, waiter_type_>;
-
-/** A graph collection: every vertex once and every edge twice, under each of its vertices, with no values. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using half_edges_store = ordered_store<graph::half_edge_t, graph::half_edge_order_t, graph::half_edge_hash_t,
-                                       isolation_, atomic_reference_, waiter_type_>;
-
 /** The order every store of a database commits in, so one stamp spans a commit reaching any number of them: the
  *  shared default of SmashTable, which the sixteen partitions of every store embed whatever lock they take. */
 using order_t = st::commit_order_t;
 
 /** A claim on the stamp a call, a snapshot or a transaction reads at, which keeps every store it may reach alive. */
 using claim_t = order_t::snapshot_claim_t;
-
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-struct collection_store;
-
-/** What the collections system collection records of a collection: its name, and the store its entries live in,
- *  whose kind says what it holds. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-struct collection_entry {
-
-    /** The name of the collection, empty for one created without. */
-    blob_t name;
-
-    /** The store holding the collection's entries. */
-    collection_store<isolation_, atomic_reference_, waiter_type_>* store {nullptr};
-};
-
-/** A collection's UUID mapped onto what the collections system collection records of it. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using collections_pair =
-    st::mapping<ustore_collection_id_t, collection_entry<isolation_, atomic_reference_, waiter_type_>>;
-
-/** The collections system collection: every collection's UUID mapped onto its entry. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using collections_by_id_store = ordered_store<collections_pair<isolation_, atomic_reference_, waiter_type_>,
-                                              uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
-
-/** The store of one collection, of the kind its creator picked, which a drop retires rather than frees. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-struct collection_store {
-
-    /** The collection's entries. */
-    std::variant<values_by_key_store<isolation_, atomic_reference_, waiter_type_>,
-                 keys_by_string_store<isolation_, atomic_reference_, waiter_type_>,
-                 half_edges_store<isolation_, atomic_reference_, waiter_type_>,
-                 documents_by_key_store<isolation_, atomic_reference_, waiter_type_>,
-                 pages_by_key_store<isolation_, atomic_reference_, waiter_type_>>
-        entries;
-
-    /** The store retired before this one, while this one waits to be freed. */
-    collection_store* next_retired {nullptr};
-
-    /** The stamp the change that took this store out of the collections system collection published under. */
-    generation_t retirement_stamp {0};
-
-    template <typename kind_type_>
-    collection_store(std::in_place_type_t<kind_type_> kind, order_t& order) noexcept : entries(kind, order) {}
-
-    /** Allocates the store of a collection keeping its entries in a @p kind_ store, or answers null. */
-    template <template <isolation_t, template <typename> typename, typename> typename kind_>
-    static collection_store* allocate(order_t& order) noexcept {
-        return new (std::nothrow)
-            collection_store(std::in_place_type<kind_<isolation_, atomic_reference_, waiter_type_>>, order);
-    }
-};
-
-/** A transaction over both system collections and every collection store it reaches, published under one stamp. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using collections_transaction =
-    st::dynamic_transaction_group<collections_by_id_store<isolation_, atomic_reference_, waiter_type_>,
-                                  values_by_key_store<isolation_, atomic_reference_, waiter_type_>,
-                                  keys_by_string_store<isolation_, atomic_reference_, waiter_type_>,
-                                  half_edges_store<isolation_, atomic_reference_, waiter_type_>,
-                                  documents_by_key_store<isolation_, atomic_reference_, waiter_type_>,
-                                  pages_by_key_store<isolation_, atomic_reference_, waiter_type_>>;
 
 /** How many times an engine-internal commit is attempted before its conflicts reach the caller. */
 inline constexpr std::size_t commit_attempts_k = 16;
@@ -264,13 +161,6 @@ inline st::expected<blob_t> copy_blob(value_view_t value) noexcept {
 /** Views the bytes of a stored blob. */
 inline value_view_t view_of(blob_t const& blob) noexcept {
     return value_view_t {blob.data(), static_cast<ustore_length_t>(blob.size())};
-}
-
-/** The key @p text is stored under, owning a copy of its bytes. */
-inline st::expected<string_key_t> string_key_from(std::string_view text) noexcept {
-    auto [copied, copy_blob_status] = copy_blob(value_view_t {text});
-    if (st::failed(copy_blob_status)) return copy_blob_status;
-    return string_key_t {std::move(copied)};
 }
 
 } // namespace unum::ustore::blobs

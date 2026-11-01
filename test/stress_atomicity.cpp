@@ -10,13 +10,12 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstdio>  // `stderr`
 
-#include <algorithm>   // `std::ranges::max`
-#include <array>       // `std::array`
-#include <chrono>      // `std::chrono::steady_clock`
-#include <random>      // `std::mt19937`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
-#include <utility>     // `std::exchange`, `std::move`
+#include <algorithm> // `std::ranges::max`
+#include <array>     // `std::array`
+#include <chrono>    // `std::chrono::steady_clock`
+#include <random>    // `std::mt19937`
+#include <span>      // `std::span`
+#include <utility>   // `std::exchange`, `std::move`
 
 #include <fmt/format.h>
 
@@ -95,10 +94,10 @@ struct atomicity_run_t {
     arena_t arena;
 
     /** Every key a round writes, in order, so each batch is a slice of them. */
-    st::basic_vector<ustore_key_t> keys;
+    st::vector<ustore_key_t> keys;
 
     /** One slot per thread of the largest configuration. */
-    st::basic_vector<writer_slot_t> slots;
+    st::vector<writer_slot_t> slots;
 };
 
 /** The batches of one configuration, laid end to end over the keys of the run. */
@@ -216,8 +215,9 @@ std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t cons
 /**
  *  @brief Checks that batches written, or periodically erased, by competing threads hold one value in all their keys.
  *
- *  Each thread picks its own value per batch, so once all threads finish a round every batch must hold one value
- *  in all of its keys, whichever thread won it. Every round ends by clearing the database, so the next starts empty.
+ *  Each thread picks its own value per batch, so once all threads finish a round every batch must
+ *  hold one value in all of its keys, whichever thread won it. Every round ends by clearing the
+ *  database, so the next starts empty.
  *
  *  @param[in,out] run Database, keys and thread slots the run allocated once.
  *  @param[in,out] executor Pool of exactly the configuration's thread count.

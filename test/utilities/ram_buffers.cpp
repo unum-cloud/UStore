@@ -19,7 +19,7 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
 #include "ustore/utilities/types.hpp"       // `bytes_of`, `string_of`
@@ -142,14 +142,14 @@ std::size_t arena_allocator_vector() {
     std::size_t failures = 0;
     scoped_arena_t arena;
 
-    st::basic_vector<std::uint32_t, arena_allocator<std::uint32_t>> numbers {arena_allocator<std::uint32_t> {arena}};
+    st::vector<std::uint32_t, arena_allocator<std::uint32_t>> numbers {arena_allocator<std::uint32_t> {arena}};
     for (std::uint32_t number = 0; number != 5000; ++number)
         failures += expect_status(growth_status(numbers.emplace_back(number)), status_code_t::success_k);
     failures += expect_eq(numbers.size(), 5000u);
     for (std::uint32_t number = 0; number != 5000; ++number) failures += expect_eq(numbers[number], number);
     failures += expect(blocks_in(arena) > 1);
 
-    st::basic_vector<std::uint32_t, arena_allocator<std::uint32_t>> refused {arena_allocator<std::uint32_t> {}};
+    st::vector<std::uint32_t, arena_allocator<std::uint32_t>> refused {arena_allocator<std::uint32_t> {}};
     failures += expect_status(growth_status(refused.emplace_back(1u)), status_code_t::out_of_memory_k);
     return failures;
 }
@@ -169,9 +169,9 @@ std::size_t growing_strings_export() {
     for (std::size_t index = 0; index != texts.size(); ++index)
         failures += expect(string_of(column[index]) == texts[index]);
 
-    ustore_strings_view_t const own = column.tape();
-    failures += expect(own.layout == ustore_strings_u64_tape_k);
-    failures += expect_eq(own.data.u64_tape.offsets[texts.size()], 19u);
+    ustore_strings_view_t const tape = column.tape();
+    failures += expect(tape.layout == ustore_strings_u64_tape_k);
+    failures += expect_eq(tape.data.u64_tape.offsets[texts.size()], 19u);
 
     ustore_strings_view_t exported {};
     failures += expect_status(column.export_into(outputs, exported), status_code_t::success_k);
@@ -204,9 +204,9 @@ std::size_t assemble_tape_lays_out_both_widths() {
     std::uint64_t total = 0;
     for (std::size_t index = 0; index != count_k; ++index) total += length_of(index);
 
-    st::basic_vector<byte_t> bytes;
-    st::basic_vector<std::uint32_t> narrow;
-    st::basic_vector<std::uint64_t> wide;
+    st::vector<byte_t> bytes;
+    st::vector<std::uint32_t> narrow;
+    st::vector<std::uint64_t> wide;
     failures += expect(bytes.resize(static_cast<std::size_t>(total)) == st::status_t::success_k);
     failures += expect(narrow.resize(count_k + 1) == st::status_t::success_k);
     failures += expect(wide.resize(count_k + 1) == st::status_t::success_k);
@@ -224,7 +224,7 @@ std::size_t assemble_tape_lays_out_both_widths() {
     failures += expect_eq(misplaced, std::size_t {0});
     failures += expect_eq(wide[count_k], total);
 
-    st::basic_vector<byte_t> narrow_bytes;
+    st::vector<byte_t> narrow_bytes;
     failures += expect(narrow_bytes.resize(static_cast<std::size_t>(total)) == st::status_t::success_k);
     if (failures != 0) return failures;
     assemble_tape(count_k, sources, std::span<std::uint32_t> {narrow}, std::span<byte_t> {narrow_bytes});

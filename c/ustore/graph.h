@@ -126,10 +126,11 @@ typedef struct ustore_graph_read_edges_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections, @c vertices or degrees output
- *    is missing, the edges are asked without their offsets, the @c view was made by neither view
- *    constructor or belongs to another engine, a watching read goes through a staged transaction,
- *    or a collection holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections, @c vertices or degrees
+ *  output is missing, the edges are asked without their offsets, the @c view was made by neither
+ *  view constructor or belongs to another engine, a watching read goes through a staged
+ *  transaction, or a collection holds another modality.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -320,10 +321,12 @@ typedef struct ustore_graph_write_vertices_t {
  *    size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections or @c vertices are missing, the
- *    @c transaction belongs to another engine or is staged, the @c durability or @c watch is
- *    unknown, a flushed write names a @c transaction, @c ustore_watch_none_k comes without one on
- *    RocksDB and LevelDB, or a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections or @c vertices are missing, the
+ *  @c transaction belongs to another engine or is staged, the @c durability or @c watch is
+ *  unknown, a flushed write names a @c transaction, @c ustore_watch_none_k comes without one on
+ *  RocksDB and LevelDB, or a collection holds another modality.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A vertex outgrows what its NVMe collection admits.
@@ -382,10 +385,12 @@ typedef struct ustore_graph_remove_vertices_t {
  *    size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections or @c vertices are missing, the
- *    @c transaction belongs to another engine or is staged, the @c durability or @c watch is
- *    unknown, a flushed remove names a @c transaction, @c ustore_watch_none_k comes without one on
- *    RocksDB and LevelDB, or a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections or @c vertices are missing, the
+ *  @c transaction belongs to another engine or is staged, the @c durability or @c watch is
+ *  unknown, a flushed remove names a @c transaction, @c ustore_watch_none_k comes without one on
+ *  RocksDB and LevelDB, or a collection holds another modality.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A stored value is no vertex, or a vertex outgrows what its NVMe
@@ -461,10 +466,11 @@ typedef struct ustore_graph_scan_vertices_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
- *    @c mode or a predicate cost is unknown, the @c view was made by neither view constructor or
- *    belongs to another engine, a watching scan goes through a staged transaction, or a collection
- *    holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is missing,
+ *  the @c mode or a predicate cost is unknown, the @c view was made by neither view constructor or
+ *  belongs to another engine, a watching scan goes through a staged transaction, or a collection
+ *  holds another modality.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -481,9 +487,9 @@ USTORE_EXPORT void ustore_graph_scan_vertices(ustore_graph_scan_vertices_t* argu
  *  @brief An opaque handle to a walk over the vertex keys of one collection, which every pull resumes past the last key
  *      the pull before it handed out, as @c ustore_blobs_cursor_t walks.
  *
- *  It holds its database open, and the transaction or snapshot it reads through, until
- *  @c ustore_graph_vertices_cursor_free, and serves one pull at a time, so a second pull naming it finishes
- *  @c ustore_status_contended_k.
+ *  It holds its database open, and the transaction or snapshot it reads through,
+ *  until @c ustore_graph_vertices_cursor_free, and serves one pull at a time, so a
+ *  second pull naming it finishes @c ustore_status_contended_k.
  */
 typedef struct ustore_graph_vertices_cursor_handle_t* ustore_graph_vertices_cursor_t;
 
@@ -574,11 +580,11 @@ typedef struct ustore_graph_vertices_cursor_next_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output is
- *    @c NULL, the cursor walks another database, a watching pull goes through a staged
+ *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output
+ *    is @c NULL, the cursor walks another database, a watching pull goes through a staged
  *    transaction, or the collection holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes, or a cursor opened
- *    for a device is pulled on host threads.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
+ *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.

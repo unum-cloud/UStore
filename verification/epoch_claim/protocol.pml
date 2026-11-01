@@ -2,32 +2,36 @@
  *  @file verification/epoch_claim/protocol.pml
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief Spin model of @c maintenance_claim in `include/ustore/blobs/nvme_database.hpp` as an epoch:
- *      one word, odd while held and even while free, taken by a @c fetch_or and stepped by its holder.
+ *  @brief Spin model of @c maintenance_claim in <tt>include/ustore/blobs/nvme_published_runs.hpp</tt> as
+ *      an epoch: one word, odd while held and even while free, taken by a @c fetch_or and stepped
+ *      by its holder.
  *
  *  The claim orders a database's maintenance, catalog and blob writes. @c take_if_free is a
  *  sequentially consistent fence, then a @c fetch_or of the held bit with an acquire. @c release
  *  adds one with a release, which steps the odd epoch to the next even one, then fences and
  *  notifies. With @c waiting at @c handoff, a releasing holder hands the claim to the first
- *  announced thread after its own index rather than letting it go.
+ *  announced thread after its own index rather than letting it go. A blocking @c take counts itself
+ *  in @c parked_ while it parks, and @c release_claim_ in the same file retakes the claim after its
+ *  release only while that count reads zero.
  *
  *  - One holder at a time is checked in every scenario beside this file.
  *  - No compare-exchange is spelled anywhere.
  *  - @c fence_seq_cst stands in an acquire-release read-modify-write of the one word @c fences.
- *  - Every park is the futex-style @c wait_on of `monitor_wait.pml`.
+ *  - Every park is the futex-style @c wait_on of <tt>monitor_wait.pml</tt>.
  */
 #include <weak_memory.pml>
 #include <monitor_wait.pml>
 
 /** The words: the claim's epoch, the word standing in for every sequentially consistent fence, one
  *  announcement per thread, then the one word each scenario guards: a commit's published view, a
- *  collection's memory pressure, and the holders' tally. */
+ *  collection's memory pressure, and the holders' tally, and last the count of parked takes. */
 #define epoch 0
 #define fences 1
 #define announcement(t) (2 + (t))
 #define view (2 + thread_count)
 #define pressure (3 + thread_count)
 #define tally (4 + thread_count)
+#define parked_takes (5 + thread_count)
 
 /** The values of @c release_step: the epoch stepped to the next even value, or a plain flag cleared
  *  back to zero. */
@@ -110,9 +114,6 @@
 #define handoff_order order_release
 #endif
 
-/** The fenced scan before letting go; without it the look alone hands the claim. */
-#define release_scan true
-
 #define held(value) ((value) % 2 == 1)
 
 /** Thread @p t is parked on a wait that no notify has ended yet. */
@@ -120,11 +121,14 @@
 
 byte holders;                 // threads between a take and its release
 bool queued[thread_count];    // a blocking take found the claim held and does not hold it yet
+bool counted[thread_count];   // a blocking take counted itself among the parked
+byte passes[thread_count];    // retakes that took the claim while that take was counted, since it last held it
 byte successor[thread_count]; // the announcement a holder's scan stopped at
 bool found[thread_count];     // the scan stopped at an announced thread
 bool retaken[thread_count];   // the look took the claim back to hand it over
 hidden int fenced;            // scratch: the value a fence's stand-in read
 hidden int glanced;           // scratch: what a scan step or a retake read
+hidden byte passed;           // scratch: the take a retake looks at
 
 /** A sequentially consistent fence: an acquire-release read-modify-write of @c fences. Two of them
  *  are ordered like any two writes to one word, and the later one acquires everything before the
@@ -138,7 +142,7 @@ inline set_held(t, seen) {
     atomic {
         read_modify_write(t, epoch, take_order, seen, seen | 1);
         if
-        :: !held(seen) -> holders++; assert(holders == 1); queued[t] = false
+        :: !held(seen) -> holders++; assert(holders == 1); queued[t] = false; passes[t] = 0
         :: else
         fi
     }
@@ -228,18 +232,28 @@ inline take_announced(t, seen, now) {
     store(t, announcement(t), order_relaxed, idle)
 }
 
-/** The @c fetch_or, retried after a park on the odd value it read, or under @c handoff, once, and
- *  then announced: @c maintenance_claim::take. */
+/** The @c fetch_or, retried after a park on the odd value it read, counted in @c parked_takes once
+ *  from its first refusal until it holds the claim, or under @c handoff, once, and then announced:
+ *  @c maintenance_claim::take. The count is a sequentially consistent add, an acquire-release add
+ *  and the fence's stand-in taken in one step. */
 inline take(t, seen, now) {
     if
     :: waiting == retried ->
-        do
-        :: atomic { set_held(t, seen); queued[t] = held(seen) };
-           if
-           :: !held(seen) -> break
-           :: else -> wait_until_changed(t, seen, now)
-           fi
-        od
+        atomic { set_held(t, seen); queued[t] = held(seen) };
+        if
+        :: held(seen) ->
+            // One step, as it stands for one sequentially consistent read-modify-write.
+            atomic { add_no_return(t, parked_takes, order_acq_rel, 1); fence_seq_cst(t); counted[t] = true };
+            do
+            :: atomic { set_held(t, seen); queued[t] = held(seen) };
+               if
+               :: !held(seen) -> break
+               :: else -> wait_until_changed(t, seen, now)
+               fi
+            od;
+            atomic { add_no_return(t, parked_takes, order_relaxed, -1); counted[t] = false }
+        :: else
+        fi
     :: else ->
         set_held(t, seen);
         if
@@ -247,6 +261,31 @@ inline take(t, seen, now) {
         :: else
         fi
     fi
+}
+
+/** @c basic_database::release_claim_ after its release: the parked count read, which the release's
+ *  fence orders, and only while it reads zero, @c take_if_free; @p seen reads odd when nothing was
+ *  taken. A retake that takes the claim passes every take counted parked, and passes none twice. */
+inline retake(t, seen) {
+    load(t, parked_takes, order_relaxed, glanced);
+    if
+    :: glanced == 0 -> take_if_free(t, seen)
+    :: else -> seen = 1
+    fi;
+    atomic {
+        glanced = 0;
+        if
+        :: !held(seen) ->
+            for (passed : 0 .. thread_count - 1) {
+                if
+                :: counted[passed] -> passes[passed]++; assert(passes[passed] < 2)
+                :: else
+                fi
+            };
+            passed = 0
+        :: else
+        fi
+    }
 }
 
 /** The announcements read relaxed, round robin from the thread after @p t, until one reads
@@ -310,23 +349,16 @@ inline hand_over(t) {
 
 /** @c maintenance_claim::release: under @c retried the epoch let go; under @c handoff the fenced
  *  scan and the handoff, else the epoch let go, the look, and on an announcement the claim taken
- *  back and scanned for again. With @c release_look the holder looks once more after its fence, as
- *  @c release_claim_ looks at the views: finding an announcement, it takes the claim back with
- *  @c take_if_free and hands it over. */
+ *  back and scanned for again. With @c release_look the holder looks once more after its fence,
+ *  as @c release_claim_ looks at the views: finding an announcement, it takes the claim back
+ *  with @c take_if_free, fences and scans again, and hands it over. */
 inline release(t) {
     if
     :: waiting == retried -> let_go(t)
     :: else ->
         do
-        :: if
-           :: release_scan || retaken[t] ->
-               if
-               :: release_scan -> fence_seq_cst(t)
-               :: else
-               fi;
-               scan(t)
-           :: else
-           fi;
+        :: fence_seq_cst(t);
+           scan(t);
            if
            :: found[t] -> hand_over(t); break
            :: else -> successor[t] = 0

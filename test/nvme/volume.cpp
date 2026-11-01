@@ -17,18 +17,21 @@
 #include <cstring> // `std::memcpy`
 
 #include <array>   // `std::array`
-#include <memory>  // `std::unique_ptr`
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/nvme_channels.hpp" // `basic_read_pipeline`, `basic_write_pipeline`
-#include "ustore/utilities/nvme_volume.hpp"   // `basic_volume_router`
+#include "ustore/utilities/nvme_catalog.hpp" // `blob_kind_t`, `volume_header_t`, `catalog_slot_header_t`, `volume_magic_k`
+#include "ustore/utilities/nvme_mounts.hpp" // `io_transport_t`, `probed_transport`
+#include "ustore/utilities/nvme_volume.hpp" // `basic_extent_volume`, `basic_volume_router`, `volume_recovery_t`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
+#include "nvme/fixture.hpp" // `run_on_transport`, `painted`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -500,6 +503,66 @@ std::size_t volume_refuses_two_dead_slots(fixture_type_& fixture) {
     return failures;
 }
 
+/** An erased volume's medium mounts as a fresh format, and a medium opening with a SafeGraphs index
+ *  is formatted over by no mount, whatever its recovery. */
+template <typename fixture_type_>
+std::size_t volume_erases_and_spares_safegraphs(fixture_type_& fixture) {
+    using guard_t = typename fixture_type_::guard_t;
+    using volume_t = typename fixture_type_::volume_t;
+    std::size_t failures = 0;
+    expected<guard_t> guard = fixture.channels.acquire();
+    failures += expect(guard.has_value());
+    if (!guard) return failures;
+
+    medium_reference_t const medium = fixture.media[0].reference();
+    blob_label_t const label {71};
+    {
+        expected<volume_t> volume = fixture.mount_volume(guard->channel(), 0, volume_recovery_t::refuse_k);
+        failures += expect(volume.has_value());
+        if (!volume) return failures;
+        failures += expect(
+            publish_blob(fixture.disk, guard->channel(), *volume, label.name(), blob_kind_t::schema_k, 4096, 71)
+                .has_value());
+        failures += expect(volume->erase(guard->channel()).succeeded());
+    }
+
+    std::array<byte_t, volume_config_k.page_bytes> page {};
+    std::array<byte_t, volume_config_k.page_bytes> const zeroes {};
+    failures += expect(fetch_page(fixture.disk, guard->channel(), medium, 0, page).succeeded());
+    failures += expect(page == zeroes);
+    {
+        expected<volume_t> fresh = fixture.mount_volume(guard->channel(), 0, volume_recovery_t::refuse_k);
+        failures += expect(fresh.has_value());
+        if (!fresh) return failures;
+        failures += expect_status(fresh->find(label.name()), status_code_t::not_found_k);
+    }
+
+    page = zeroes;
+    std::memcpy(page.data(), &safegraphs_magic_k, sizeof(safegraphs_magic_k));
+    failures += expect(store_page(fixture.disk, guard->channel(), medium, 0, page).succeeded());
+    for (volume_recovery_t const recovery : {volume_recovery_t::refuse_k, volume_recovery_t::reformat_k})
+        failures += expect_status(fixture.mount_volume(guard->channel(), 0, recovery), status_code_t::already_exists_k);
+    std::array<byte_t, volume_config_k.page_bytes> kept {};
+    failures += expect(fetch_page(fixture.disk, guard->channel(), medium, 0, kept).succeeded());
+    failures += expect(kept == page);
+    return failures;
+}
+
+/** io_uring named outright never falls past a kernel without a ring, while an automatic choice
+ *  falls to AIO. */
+std::size_t probed_transport_refuses_a_missing_ring() {
+    std::size_t failures = 0;
+    for (linux_uring_probe_t const missing : {linux_uring_probe_t::refused_k, linux_uring_probe_t::too_old_k})
+        failures += expect_status(
+            probed_transport(io_transport_t::linux_uring_k, missing, linux_aio_probe_t::available_k),
+            status_code_t::unsupported_k);
+    auto [automatic, automatic_status] = probed_transport(io_transport_t::automatic_k, linux_uring_probe_t::too_old_k,
+                                                          linux_aio_probe_t::available_k);
+    failures += expect(automatic_status.succeeded());
+    failures += expect(automatic == io_transport_t::linux_aio_k);
+    return failures;
+}
+
 /** One flipped byte of the head is caught by its checksum rather than mounted as geometry. */
 template <typename fixture_type_>
 std::size_t volume_refuses_a_torn_head(fixture_type_& fixture) {
@@ -798,7 +861,7 @@ std::size_t volume_mount_spares_held_blocks(fixture_type_& fixture) {
 
     buffer_pool_t& pool = guard->channel().requests();
     std::uint32_t const blocks = pool.total_buffers();
-    st::basic_vector<pooled_buffer_t> held;
+    st::vector<pooled_buffer_t> held;
     for (std::uint32_t index = 0; index != blocks; ++index) {
         expected<pooled_buffer_t> block = pool.acquire();
         failures += expect(block.has_value());
@@ -994,6 +1057,7 @@ int main(int argc, char const* argv[]) {
         on_one("torn_newer_slot", [](auto& fixture) { return volume_survives_a_torn_slot(fixture); });
         on_one("two_dead_slots", [](auto& fixture) { return volume_refuses_two_dead_slots(fixture); });
         on_one("torn_head", [](auto& fixture) { return volume_refuses_a_torn_head(fixture); });
+        on_one("erase_and_safegraphs", [](auto& fixture) { return volume_erases_and_spares_safegraphs(fixture); });
         on_one("reuses_every_byte", [](auto& fixture) { return volume_reuses_every_byte(fixture); });
         on_one("duplicate_and_absent", [](auto& fixture) { return volume_refuses_a_duplicate(fixture); });
         on_one("walks_one_kind", [](auto& fixture) { return volume_walks_one_kind(fixture); });
@@ -1003,6 +1067,8 @@ int main(int argc, char const* argv[]) {
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, volume_config_k, 1, "volume", cases);
+    if (totals.selects("probed_transport"))
+        report(totals, "probed_transport", probed_transport_refuses_a_missing_ring());
 
     return suite_exit_code(totals);
 }

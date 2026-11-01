@@ -8,7 +8,7 @@
 
 #include <cstddef> // `std::size_t`
 
-#include <variant> // `std::get_if`
+#include <variant> // `std::variant`
 
 #include "ustore/blobs.h" // `ustore_blobs_write_t`, `ustore_blobs_cursor_next_t`
 

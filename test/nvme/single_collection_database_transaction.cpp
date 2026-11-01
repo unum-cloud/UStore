@@ -12,7 +12,6 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
-#include <cstring> // `std::memcmp`
 
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
@@ -24,14 +23,17 @@
 
 #include <fmt/format.h>
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_single_collection_database.hpp" // `basic_single_collection_database`, `watch_schedule_t`
+#include "ustore/blobs/nvme_single_collection_database.hpp" // `basic_single_collection_database`
+#include "ustore/blobs/nvme_transactions.hpp"               // `watch_schedule_t`
 #include "ustore/blobs/nvme_key_slot.hpp"                   // `key_slot`, `value_layout_t`
 
 #include "nvme/fixture.hpp" // `run_on_transport`, `expectation_t`, `painted`, `paint_into`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -178,10 +180,10 @@ make_stack(mount_type_ const& mount) noexcept {
 struct model_t {
 
     /** The value every key is written with, which answers @c written_k once it lands. */
-    st::basic_vector<expectation_t> planned;
+    st::vector<expectation_t> planned;
 
     /** What a lookup of every key should answer now. */
-    st::basic_vector<lookup_result_t> states;
+    st::vector<lookup_result_t> states;
 
     /** Marks the keys between @p first and @p last as present. */
     void present(std::size_t first, std::size_t last) noexcept {
@@ -222,7 +224,7 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename wri
 [[nodiscard]] std::size_t insert_range(writer_type_& writer, model_t const& model, std::size_t first,
                                        std::size_t last) {
     std::size_t failures = 0;
-    st::basic_vector<byte_t> value;
+    st::vector<byte_t> value;
     for (std::size_t index = first; index != last; ++index) {
         expectation_t const& entry = model.planned[index];
         failures += expect(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
@@ -238,7 +240,7 @@ template <typename database_type_>
 [[nodiscard]] std::size_t preload_range(database_type_& store, model_t const& model, std::size_t first,
                                         std::size_t last) {
     std::size_t failures = 0;
-    st::basic_vector<byte_t> value;
+    st::vector<byte_t> value;
     for (std::size_t index = first; index != last; ++index) {
         expectation_t const& entry = model.planned[index];
         failures += expect(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
@@ -281,10 +283,9 @@ status_t read_batch(source_type_ const& source, io_channel_t& channel, std::span
 
 /** Reads a batch of keys through the transaction @p source, watching them under @p schedule_. */
 template <watch_schedule_t schedule_, typename key_type_, typename store_type_, typename sink_type_>
-status_t read_batch(
-    single_collection_database_transaction<key_type_, store_type_, atomic_reference, waiter_t> const& source,
-    io_channel_t& channel, std::span<stored_key_t const> stored_keys, std::span<lookup_result_t> results,
-    sink_type_&& sink) noexcept {
+status_t read_batch(single_collection_database_transaction<key_type_, store_type_, atomic_reference, waiter_t>& source,
+                    io_channel_t& channel, std::span<stored_key_t const> stored_keys,
+                    std::span<lookup_result_t> results, sink_type_&& sink) noexcept {
     return source.template select<schedule_>(channel, stored_keys, results, sink);
 }
 
@@ -297,9 +298,9 @@ status_t read_batch(
 template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename source_type_>
 [[nodiscard]] std::size_t check_model(source_type_& source, io_channel_t& channel, model_t const& model) {
     std::size_t failures = 0;
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<lookup_result_t> results;
-    st::basic_vector<std::uint64_t> seen;
+    st::vector<stored_key_t> keys;
+    st::vector<lookup_result_t> results;
+    st::vector<std::uint64_t> seen;
     failures += expect(keys.resize(population_k) == st::status_t::success_k);
     failures += expect(results.resize(population_k) == st::status_t::success_k);
     failures += expect(seen.resize(population_k) == st::status_t::success_k);
@@ -321,7 +322,7 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
                            .succeeded());
     failures += expect_eq(mismatches, std::size_t {0});
 
-    st::basic_vector<byte_t> value;
+    st::vector<byte_t> value;
     std::size_t wrong_states = 0;
     std::size_t wrong_values = 0;
     for (std::size_t index = 0; index != population_k; ++index) {
@@ -496,7 +497,7 @@ std::size_t insert_by_two_intersected_transactions(mount_type_ const& mount) {
     (*second)->rollback();
 
     // A read is watched just as a write is, so rewriting what the second one read refuses its commit.
-    st::basic_vector<byte_t> value;
+    st::vector<byte_t> value;
     failures += expect(value.resize(8192) == st::status_t::success_k);
     for (std::size_t index = half_k - 1; index != population_k; ++index) {
         stored_value_size_t size = 0;
@@ -661,47 +662,47 @@ std::size_t watch_transactions(mount_type_ const& mount) {
     expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
     failures += expect(first.has_value() && second.has_value());
     if (failures != 0) return failures;
-    auto& one = **first;
+    auto& first_transaction = **first;
     auto& other = **second;
     constexpr std::size_t half_k = population_k / 2;
     std::array<stored_key_t, 1> const first_key {stored_key_t {0}};
     std::span<stored_key_t const> const watched {first_key};
 
     // Writes are watched, so the second writer of the shared key is refused.
-    failures += insert_range(one, model, 0, half_k + 1);
+    failures += insert_range(first_transaction, model, 0, half_k + 1);
     failures += insert_range(other, model, half_k, population_k);
-    failures += expect(one.commit().succeeded());
+    failures += expect(first_transaction.commit().succeeded());
     failures += expect_status(other.commit(), status_code_t::write_conflict_k);
     other.rollback();
 
     // Reads are watched too, so a commit over what the second one read refuses it.
-    failures += insert_range(one, model, 0, 1);
+    failures += insert_range(first_transaction, model, 0, 1);
     failures += check_model(other, channel, model);
-    failures += expect(one.commit().succeeded());
+    failures += expect(first_transaction.commit().succeeded());
     failures += expect_status(other.commit(), status_code_t::write_conflict_k);
     other.rollback();
 
     // Writes taken under the never schedule collide without a word.
-    failures += insert_range<watch_schedule_t::never_k>(one, model, 0, half_k + 1);
+    failures += insert_range<watch_schedule_t::never_k>(first_transaction, model, 0, half_k + 1);
     failures += insert_range<watch_schedule_t::never_k>(other, model, half_k, population_k);
-    failures += expect(one.commit().succeeded());
+    failures += expect(first_transaction.commit().succeeded());
     failures += expect(other.commit().succeeded());
 
     // And so do reads taken under it.
-    failures += insert_range<watch_schedule_t::never_k>(one, model, 0, 1);
+    failures += insert_range<watch_schedule_t::never_k>(first_transaction, model, 0, 1);
     failures += check_model<watch_schedule_t::never_k>(other, channel, model);
-    failures += expect(one.commit().succeeded());
+    failures += expect(first_transaction.commit().succeeded());
     failures += expect(other.commit().succeeded());
 
     // A watch added later checks at once, at the commit from the start, or at the commit from the call.
-    failures += insert_range(one, model, 0, 1);
-    failures += expect(one.commit().succeeded());
+    failures += insert_range(first_transaction, model, 0, 1);
+    failures += expect(first_transaction.commit().succeeded());
     failures += expect(other.template watch_more<watch_schedule_t::now_k>(watched).failed());
     failures += expect(other.template watch_more<watch_schedule_t::on_commit_k>(watched).succeeded());
     failures += expect_status(other.commit(), status_code_t::write_conflict_k);
     other.rollback();
-    failures += insert_range(one, model, 0, 1);
-    failures += expect(one.commit().succeeded());
+    failures += insert_range(first_transaction, model, 0, 1);
+    failures += expect(first_transaction.commit().succeeded());
     failures += expect(other.template watch_more<watch_schedule_t::on_commit_since_operation_k>(watched).succeeded());
     failures += expect(other.commit().succeeded());
     return failures;

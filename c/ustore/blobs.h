@@ -5,10 +5,11 @@
  *  @brief The binary interface for collections of binary values: writes, reads, scans, samples and
  *      measurements.
  *
- *  Every call takes a batch, so a single operation is a batch of one, while no sequence of single
- *  operations reaches the throughput of one batch. Keys arrive as a strided run and values as a
- *  @c ustore_strings_view_t, so a tape returned by @c ustore_blobs_read is written back without a copy, and a
- *  runtime holding its values in objects of its own passes them through an accessor.
+ *  Every call takes a batch, so a single operation is a batch of one, while no sequence of
+ *  single operations reaches the throughput of one batch. Keys arrive as a strided run and
+ *  values as a @c ustore_strings_view_t, so a tape returned by @c ustore_blobs_read is written
+ *  back without a copy, and a runtime holding its values in objects of its own passes them
+ *  through an accessor.
  */
 
 #ifndef UNUM_USTORE_BLOBS_H
@@ -73,10 +74,12 @@ typedef struct ustore_blobs_write_t {
  *    table is full, or a callback blocks on the executor running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections, @c keys or @c values are missing, the
- *    values come in an unknown layout, the @c transaction belongs to another engine or is staged,
- *    the @c durability or @c watch is unknown, a flushed write names a @c transaction,
- *    @c ustore_watch_none_k comes without one, or a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections, @c keys or @c values are missing,
+ *  the values come in an unknown layout, the @c transaction belongs to another engine or is staged,
+ *  the @c durability or @c watch is unknown, a flushed write names a @c transaction,
+ *  @c ustore_watch_none_k comes without one, or a collection holds another modality.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
@@ -130,10 +133,12 @@ typedef struct ustore_blobs_remove_t {
  *    table is full, or a callback blocks on the executor running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections or @c keys are missing, the
- *    @c transaction belongs to another engine or is staged, the @c durability or @c watch is
- *    unknown, a flushed remove names a @c transaction, @c ustore_watch_none_k comes without one, or
- *    a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections or @c keys are missing, the
+ *  @c transaction belongs to another engine or is staged, the @c durability or @c watch is
+ *  unknown, a flushed remove names a @c transaction, @c ustore_watch_none_k comes without one, or
+ *  a collection holds another modality.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
@@ -194,9 +199,9 @@ typedef struct ustore_blobs_read_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or @c keys are missing, the
- *    @c view was made by neither view constructor or belongs to another engine, a watching read goes
- *    through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or @c keys are missing,
+ *    the @c view was made by neither view constructor or belongs to another engine, a watching
+ *    read goes through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -280,10 +285,11 @@ typedef struct ustore_blobs_scan_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
- *    @c mode, a pattern kind, a case sensitivity or a predicate cost is unknown, the @c patterns do
- *    not compile, the @c view was made by neither view constructor or belongs to another engine, a
- *    watching scan goes through a staged transaction, or a collection holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is missing,
+ *  the @c mode, a pattern kind, a case sensitivity or a predicate cost is unknown, the @c patterns
+ *  do not compile, the @c view was made by neither view constructor or belongs to another engine,
+ *  a watching scan goes through a staged transaction, or a collection holds another modality.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -401,11 +407,11 @@ typedef struct ustore_blobs_cursor_next_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output is
- *    @c NULL, the cursor walks another database, a watching pull goes through a staged
+ *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output
+ *    is @c NULL, the cursor walks another database, a watching pull goes through a staged
  *    transaction, or the collection holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes, or a cursor opened
- *    for a device is pulled on host threads.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
+ *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
@@ -467,9 +473,9 @@ typedef struct ustore_blobs_sample_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
- *    @c view was made by neither view constructor or belongs to another engine, a watching sample
- *    goes through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing,
+ *    the @c view was made by neither view constructor or belongs to another engine, a watching
+ *    sample goes through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -541,9 +547,10 @@ typedef struct ustore_blobs_measure_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena or the @c collections are missing, the
- *    @c view was made by neither view constructor or belongs to another engine, a watching measure
- *    goes through a staged transaction, or a collection holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena or the @c collections are missing, the
+ *  @c view was made by neither view constructor or belongs to another engine, a watching measure
+ *  goes through a staged transaction, or a collection holds another modality.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, or a callback blocks on the executor

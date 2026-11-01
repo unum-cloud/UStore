@@ -32,7 +32,7 @@ A skip names the reason a case did not run, so a suite passing on nothing is vis
 
 ## Suites
 
-- __Conformance__ — `units.cpp`, `api.cpp`, `compilation.cpp`, `strings.cpp` and `strings_collection.cpp` check the C ABI and its C++ wrappers, identically on every engine, and `c/test.c` calls the C ABI from plain C11 once per shape of its arguments.
+- __Conformance__ — `abi/*.cpp`, `compilation.cpp` and `strings_collection.cpp` check the C ABI and its C++ wrappers, identically on every engine, and `c/test.c` calls the C ABI from plain C11 once per shape of its arguments.
 - __Tools__ — `tools.cpp` checks dataset imports and exports, and the CLI against a real directory.
 - __Components__ — `nvme/*.cpp` check the NVMe templates of `include/ustore/` below the C ABI, each on every transport the machine offers.
 - __Stress__ — `stress_atomicity.cpp` and `stress_linearizability.cpp` check atomicity and linearizability under concurrent transactions.
@@ -40,9 +40,18 @@ A skip names the reason a case did not run, so a suite passing on nothing is vis
 
 ### Conformance
 
-The C ABI scenarios — collections, transactions, snapshots, scans, documents and graphs — are written once and compiled into one executable per suite, named `ustore_test_<suite>`, which CTest runs once per engine as `ustore_test_<suite>_<engine>`, such as `ustore_test_units_rocksdb`.
+The C ABI scenarios — collections, transactions, snapshots, scans, documents and graphs — are written once and compiled into one executable per suite, named `ustore_test_<suite>`, which CTest runs once per engine as `ustore_test_<suite>_<engine>`, such as `ustore_test_abi_blobs_rocksdb`.
 Every engine answers the same questions, and the translation units build in parallel.
-`units.cpp` drives blobs, documents and graphs through the C++ wrappers, `api.cpp` checks that the C ABI accepts valid argument combinations and rejects malformed ones, and `compilation.cpp` calls every wrapper in each accepted form, so a broken call site fails to build.
+`compilation.cpp` calls every wrapper in each accepted form, so a broken call site fails to build.
+The suites of `abi/` sit at one depth, one per modality or contract, and build as `ustore_test_abi_<suite>`, each of which CTest also runs on `ram` under snapshot isolation as `ustore_test_abi_<suite>_ram_snapshot`:
+
+- `abi/database.cpp` — writes, reads, transactions and scans accept valid arguments and refuse malformed ones, and saves, compactions and their progress keep their contracts.
+- `abi/executors.cpp` — where a call's outputs land in its arena, how deferred calls wait on each other and on frees, and the C++ receivers on an executor.
+- `abi/cursors.cpp` — cursors walk whole collections, resume after writes and hold their snapshots, and predicates, patterns and filters narrow scans.
+- `abi/blobs.cpp`, `abi/docs.cpp`, `abi/graph.cpp`, `abi/pages.cpp` — each modality through the C++ wrappers, and the pages calls' refusals.
+- `abi/strings.cpp`, `abi/arrow.cpp` — the strings modality, which maps strings onto keys, and the Arrow columns of `arrow.h` read into views, exported from them and ingested.
+
+`abi/fixture.hpp` holds what several of them share: the blocking write and read calls, a deferred scan held inside its progress callback, cursor pulls, the wrappers' round trips and the sample documents and edges.
 Each suite asks the open database through `ustore_database_describe` whether it supports named collections, transactions and snapshots, and a case needing a missing capability returns without checks.
 `c/test.c` builds twice, as `ustore_test_c` against `ustore::static` and `ustore_test_c_shared` against `ustore::shared`, so a function the headers declare but the shared library does not export fails to link.
 Both build with `-Werror` wherever the compiler is not MSVC, so a header that only a C++ compiler accepts fails to build, and a shape the library misreads fails the run.
@@ -56,7 +65,7 @@ CMake builds every suite below as `ustore_test_nvme_<suite>`, the Linux transpor
 The database transaction and stress suites link the device compactor when the build carries CUDA.
 Every suite instantiates the templates with ForkUnion's standard atomic reference and a yielding waiter, as no suite picks a CPU class.
 No suite reaching the harness compiles under nvcc, since nvcc's front end crashes instantiating StringZilla's string.
-The compaction suite builds twice, as `ustore_test_nvme_compaction_host` with every test build and as `ustore_test_nvme_compaction` over the device compactor, which `nvme/compaction_device.cu` instantiates for the suite's key slots.
+The compaction suite builds twice, as `ustore_test_nvme_compaction_host` with every test build and as `ustore_test_nvme_compaction` over the device compactor, which `nvme/compaction_device.cpp` instantiates for the suite's key slots.
 
 - `nvme/ring.cpp`, `nvme/linux_uring_disk.cpp`, `nvme/linux_aio_disk.cpp`, `nvme/linux_spdk_disk.cpp` — the ring contract of `nvme/ring_cases.hpp` on the RAM and blocking transports, on io_uring with what only a kernel queue can get wrong, on Linux AIO, and on SPDK.
 - `nvme/channels.cpp` — the registered arena, the blocks channels queue pair out of it, and the pipelines that keep a ring at depth.
@@ -132,7 +141,7 @@ A failing case prints the command that reruns it alone, with its `--seed` and a 
 CTest passes `--directory` as `test_data` inside the build directory, the engine suites get `--engine`, and the tools suite additionally gets `--cli` with the CLI it drives on that engine.
 
 ```sh
-build_debug/build/bin/ustore_test_units --engine rocksdb --directory /dev/shm/ustore
+build_debug/build/bin/ustore_test_abi_blobs --engine rocksdb --directory /dev/shm/ustore
 build_debug/build/bin/ustore_test_tools --engine rocksdb --directory /dev/shm/ustore --cli build_debug/build/bin/ustore_cli
 ```
 

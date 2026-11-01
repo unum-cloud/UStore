@@ -23,14 +23,16 @@
 #include <thread>    // `std::thread`
 #include <utility>   // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/blobs/nvme_single_collection_database.hpp" // `basic_single_collection_database`, `transaction_stamp_t`
 #include "ustore/blobs/nvme_key_slot.hpp"                   // `key_slot`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`
+#include "nvme/fixture.hpp" // `run_on_transport`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -156,10 +158,10 @@ expected<typename stack_type_::database_t::database_unique_ptr_t> open_over(stac
  *  @param[out] counters The counter every present key carries.
  */
 template <typename reader_type_>
-status_t read_counters(reader_type_ const& reader, io_channel_t& channel, std::span<stored_key_t const> keys,
-                       st::basic_vector<bool>& present, st::basic_vector<std::uint64_t>& counters) noexcept {
-    st::basic_vector<lookup_result_t> results;
-    st::basic_vector<std::array<byte_t, value_bytes_k>> values;
+status_t read_counters(reader_type_& reader, io_channel_t& channel, std::span<stored_key_t const> keys,
+                       st::vector<bool>& present, st::vector<std::uint64_t>& counters) noexcept {
+    st::vector<lookup_result_t> results;
+    st::vector<std::array<byte_t, value_bytes_k>> values;
     if (results.resize(keys.size()) != st::status_t::success_k ||
         values.resize(keys.size()) != st::status_t::success_k ||
         present.resize(keys.size()) != st::status_t::success_k ||
@@ -185,9 +187,9 @@ status_t read_counters(reader_type_ const& reader, io_channel_t& channel, std::s
 /**
  *  @brief Threads commit whole chunks of keys at once, and every chunk ends written by exactly one commit.
  *
- *  Every thread writes the same chunks in turn, each chunk with a counter naming the thread and the chunk, and
- *  rolls back and writes again a chunk a conflict refused. A batched read excludes
- *  the write path, so a chunk read whole must carry one counter, whichever commit landed last.
+ *  Every thread writes the same chunks in turn, each chunk with a counter naming the thread and the
+ *  chunk, and rolls back and writes again a chunk a conflict refused. A batched read excludes the
+ *  write path, so a chunk read whole must carry one counter, whichever commit landed last.
  */
 template <typename mount_type_>
 std::size_t chunks_land_whole(mount_type_ const& mount) {
@@ -218,9 +220,9 @@ std::size_t chunks_land_whole(mount_type_ const& mount) {
             if (!changing) return;
 
             std::array<byte_t, value_bytes_k> value {};
-            st::basic_vector<stored_key_t> keys;
-            st::basic_vector<bool> present;
-            st::basic_vector<std::uint64_t> counters;
+            st::vector<stored_key_t> keys;
+            st::vector<bool> present;
+            st::vector<std::uint64_t> counters;
             worker_failures[worker] += expect(keys.resize(keys_per_chunk_k) == st::status_t::success_k);
             if (worker_failures[worker] != 0) return;
             for (std::size_t chunk = 0; chunk != chunks_k; ++chunk) {
@@ -253,9 +255,9 @@ std::size_t chunks_land_whole(mount_type_ const& mount) {
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) workers[worker].join();
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) failures += worker_failures[worker];
 
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<bool> present;
-    st::basic_vector<std::uint64_t> counters;
+    st::vector<stored_key_t> keys;
+    st::vector<bool> present;
+    st::vector<std::uint64_t> counters;
     failures += expect(keys.resize(chunks_k * keys_per_chunk_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = static_cast<stored_key_t>(index);
@@ -289,13 +291,13 @@ struct record_t {
     kind_t kind = kind_t::read_k;
 
     /** The keys it touched, in the order it touched them. */
-    st::basic_vector<stored_key_t> keys;
+    st::vector<stored_key_t> keys;
 
     /** Whether a read found each key carrying a value. */
-    st::basic_vector<bool> present;
+    st::vector<bool> present;
 
     /** The counter written under each key, or the one a read found there. */
-    st::basic_vector<std::uint64_t> counters;
+    st::vector<std::uint64_t> counters;
 };
 
 /** Orders records by the stamps their commits claimed. */
@@ -330,7 +332,7 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
     failures += expect(store.has_value());
     if (!store) return failures;
 
-    std::array<st::basic_vector<record_t>, worker_threads_k> records;
+    std::array<st::vector<record_t>, worker_threads_k> records;
     std::array<std::size_t, worker_threads_k> worker_failures {};
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
@@ -390,7 +392,7 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) workers[worker].join();
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) failures += worker_failures[worker];
 
-    st::basic_vector<record_t const*> ordered;
+    st::vector<record_t const*> ordered;
     std::size_t reads = 0;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         for (record_t const& record : records[worker]) {
@@ -420,9 +422,9 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
             }
         }
 
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<bool> present;
-    st::basic_vector<std::uint64_t> counters;
+    st::vector<stored_key_t> keys;
+    st::vector<bool> present;
+    st::vector<std::uint64_t> counters;
     failures += expect(keys.resize(keys_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys_k; ++index) keys[index] = static_cast<stored_key_t>(index);

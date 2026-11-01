@@ -32,9 +32,10 @@ class deferred_docs_collection_t;
 /**
  *  @brief Map from keys to JSON documents that only reads, cheap to construct and to copy.
  *
- *  A handle addresses either the current state of a collection or its view inside a transaction or a snapshot,
- *  holds no state of its own, so any number of threads share it, and never outlives its database.
- *  The type of a handle shapes only how values cross it, since documents are stored as JSON whatever they arrive as.
+ *  A handle addresses either the current state of a collection or its view inside a transaction or
+ *  a snapshot, holds no state of its own, so any number of threads share it, and never outlives its
+ *  database. The type of a handle shapes only how values cross it, since documents are stored as
+ *  JSON whatever they arrive as.
  */
 class docs_read_collection_t {
   protected:
@@ -301,10 +302,10 @@ struct docs_gather_t {
         values_tape_t fields;
 
         /** The collection and key of every row, which the index of @c table views. */
-        st::basic_vector<collection_key_t> rows;
+        st::vector<collection_key_t> rows;
 
         /** The field and type of every column, which the header of @c table views. */
-        st::basic_vector<field_type_t> columns;
+        st::vector<field_type_t> columns;
 
         /** Documents as rows and fields as columns, whose cells live in the arena. */
         docs_table_t table;
@@ -317,7 +318,7 @@ struct docs_gather_t {
     finished_t outputs;
 
     /** The type of every column back to back, as the arguments read them. */
-    st::basic_vector<ustore_docs_field_type_t> types;
+    st::vector<ustore_docs_field_type_t> types;
 
     /** Output for one column per field, inside the arena. */
     ustore_docs_column_view_t const* columns = nullptr;
@@ -491,8 +492,8 @@ class deferred_docs_collection_t : public deferred_docs_read_collection_t {
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
      *  @par Statuses:
-     *  - @c status_code_t::invalid_argument_k The @p keys and @p values differ in count, or the
-     *    @p fields are neither none, one, nor one per key.
+     *  - @c status_code_t::invalid_argument_k The @p keys and @p values differ in count, or
+     *    the @p fields are neither none, one, nor one per key.
      */
     template <owned_array_concept<ustore_key_t> keys_type_>
     deferred<docs_write_t> write(keys_type_ keys, values_tape_t values, values_tape_t fields = {},

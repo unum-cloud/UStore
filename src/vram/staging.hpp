@@ -4,18 +4,17 @@
  *  @date October 29, 2026
  *  @brief Where the inputs of a call on a VRAM executor live, and how they reach the host verbs that serve it.
  *
- *  Every input pointer is classified once per call, through the executor's own vendor first and the other vendor
- *  next. Pinned, managed and pageable host memory is read in place, memory on the executor's device is downloaded into
- *  its pinned bounce, and memory on any other device, of either vendor, is refused with @c device_k rather than read
- *  as host memory. Strings an accessor writes are host memory by contract.
+ *  Every input pointer is classified once per call, through the executor's own vendor first and the
+ *  other vendor next. Pinned, managed and pageable host memory is read in place, memory on the
+ *  executor's device is downloaded into its pinned bounce, and memory on any other device, of
+ *  either vendor, is refused with @c device_k rather than read as host memory. Strings an accessor
+ *  writes are host memory by contract.
  */
 
 #pragma once
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uintptr_t`
-
-#include <span> // `std::span`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 #include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `gpu_executor_concept`, `on_another_vendor`

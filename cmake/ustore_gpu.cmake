@@ -1,7 +1,7 @@
 # The GPU host compiler, the CUDA and ROCm codes, the bundles kernels embed through, and the CUDA toolkit.
 
-# Clang keeps a unit's host and device halves apart through the host-only passes of its CUDA and HIP modes, where other
-# host compilers trip over mixed units.
+# Clang hosts every GPU build: NVCC's device passes take it as their host compiler, where GCC trips over the device
+# copies of libstdc++, and AMD's device passes are its own HIP mode.
 if ((USTORE_CUDA_ARCH OR USTORE_ROCM_ARCH) AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(
         FATAL_ERROR
@@ -39,21 +39,14 @@ if (USTORE_CUDA_ARCH OR USTORE_ROCM_ARCH)
     enable_language(ASM)
 endif ()
 
-# Every NVIDIA or AMD unit with kernels compiles twice. Host-only, through Clang's CUDA or HIP mode, it names its
-# kernels from device code alone, so nothing registers with or links a GPU runtime, which opens at first use.
-# Device-only, NVCC for NVIDIA and Clang for AMD, it compiles into a bundle of the codes the remaining arguments name, a
-# CUDA fatbin or a HIP offload bundle, with @p target_'s includes and definitions; the bundle links into @p target_
-# page-aligned in a read-only section through an assembler stub, under `<name>_bundle_start` and `<name>_bundle_end`, so
-# it travels into archives too. With no codes the bundle is empty, and its devices refuse to load it. The device pass
-# compiles @p source_, or the `DEVICE` source when the unit keeps its kernels apart, as an AMD unit must: HIP-Clang
-# refuses a kernel's address in device code, so a host function takes it, which the host pass may never compile.
+# Every NVIDIA or AMD unit with kernels compiles once, device-only, NVCC for NVIDIA and Clang for AMD, into a bundle of
+# the codes the remaining arguments name, a CUDA fatbin or a HIP offload bundle, with @p target_'s includes and
+# definitions. No target compiles its host half, so nothing registers with or links a GPU runtime, which opens at first
+# use. The bundle links into @p target_ page-aligned in a read-only section through an assembler stub, under
+# `<name>_bundle_start` and `<name>_bundle_end`, so it travels into archives too. With no codes the bundle is empty, and
+# its devices refuse to load it.
 set_property(GLOBAL APPEND PROPERTY JOB_POOLS ustore_gpu_device_pass=4)
 function (ustore_gpu_bundle target_ vendor_ name_ source_)
-    cmake_parse_arguments(PARSE_ARGV 4 arg "" "DEVICE" "")
-    set(device_source_ ${source_})
-    if (arg_DEVICE)
-        set(device_source_ ${arg_DEVICE})
-    endif ()
     set(bundle_ ${CMAKE_CURRENT_BINARY_DIR}/bundles/${target_}/${name_}.bundle)
     if (vendor_ STREQUAL "nvidia")
         set(host_compiler_ ${CMAKE_CXX_COMPILER})
@@ -67,23 +60,20 @@ function (ustore_gpu_bundle target_ vendor_ name_ source_)
         set(optimization_ "$<$<CONFIG:Debug>:-O0$<SEMICOLON>-Xcicc$<SEMICOLON>-O0$<SEMICOLON>-Xptxas$<SEMICOLON>-O0>"
                           "$<$<NOT:$<CONFIG:Debug>>:-O3>"
         )
-        set(host_only_ "-xcuda;--cuda-host-only;-nocudalib;--cuda-path=${CUDAToolkit_LIBRARY_ROOT}")
         target_include_directories(${target_} SYSTEM PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     else ()
         set(device_only_ "${CMAKE_CXX_COMPILER};-x;hip;--cuda-device-only;-c")
         set(optimization_ "$<$<CONFIG:Debug>:-O0>" "$<$<NOT:$<CONFIG:Debug>>:-O3>")
-        set(host_only_ "-xhip;--cuda-host-only;-nogpulib")
     endif ()
-    set_source_files_properties(${source_} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "${host_only_}")
-    if (arg_UNPARSED_ARGUMENTS)
+    if (ARGN)
         add_custom_command(
             OUTPUT ${bundle_}
             COMMAND
-                ${device_only_} -std=c++20 ${optimization_} ${arg_UNPARSED_ARGUMENTS}
+                ${device_only_} -std=c++20 ${optimization_} ${ARGN}
                 "-I$<JOIN:$<TARGET_PROPERTY:${target_},INCLUDE_DIRECTORIES>,;-I>"
                 "$<$<BOOL:$<TARGET_PROPERTY:${target_},COMPILE_DEFINITIONS>>:-D$<JOIN:$<TARGET_PROPERTY:${target_},COMPILE_DEFINITIONS>,;-D>>"
-                -MD -MF ${bundle_}.d ${device_source_} -o ${bundle_}
-            DEPENDS ${device_source_}
+                -MD -MF ${bundle_}.d ${source_} -o ${bundle_}
+            DEPENDS ${source_}
             DEPFILE ${bundle_}.d
             COMMENT "Compiling the ${name_} kernels"
             JOB_POOL ustore_gpu_device_pass
@@ -103,8 +93,8 @@ function (ustore_gpu_bundle target_ vendor_ name_ source_)
     target_sources(${target_} PRIVATE ${stub_})
 endfunction ()
 
-# The CUDA language, its codes and its toolkit, for NVMe's compaction on the device and the NVIDIA bundles. The GPU half
-# is opt-in, so a build without it leaves the toolkit alone. The siblings probed for nvcc, outside the PATH too, before
+# The CUDA language, its codes and its toolkit, for the NVIDIA bundles and StringZilla's CUDA engines. The GPU half is
+# opt-in, so a build without it leaves the toolkit alone. The siblings probed for nvcc, outside the PATH too, before
 # StringZilla enabled CUDA, and that probe's cached answer is the one this module reads.
 if (USTORE_CUDA_ARCH AND NOT CMAKE_CUDA_COMPILER)
     message(
@@ -112,7 +102,7 @@ if (USTORE_CUDA_ARCH AND NOT CMAKE_CUDA_COMPILER)
     )
 endif ()
 if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
-    # CUB is all the compaction kernels call, so plain codes cover Ampere through Blackwell: `all` carries a cubin per
+    # The library's kernels need only plain codes, which cover Ampere through Blackwell: `all` carries a cubin per
     # generation and the floor's PTX for every later GPU, `native` the code of each visible GPU, and a named code its
     # cubin alone.
     if (USTORE_CUDA_ARCH STREQUAL "all")
@@ -145,5 +135,4 @@ if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
     find_package(CUDAToolkit REQUIRED)
     # NVCC's default leaves Turing and Ampere cubins uncompressed, ten times their compressed size.
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>)
-    include(cmake/cccl.cmake)
 endif ()

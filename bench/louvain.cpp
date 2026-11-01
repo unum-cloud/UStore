@@ -4,11 +4,12 @@
  *  @date September 17, 2026
  *  @brief Benchmarks Louvain community detection over a UStore graph collection and over the same graph in memory.
  *
- *  One edge list, read from a SNAP file or generated with planted communities, lands both in a graph
- *  collection and in an in-memory adjacency. One level optimizer and one aggregator serve either graph,
- *  so the gap between the two timings is the cost of reading each neighborhood through UStore.
- *  The store's adjacency is built by the upsert benchmark and the in-memory one before the run, so both
- *  community-detection benchmarks time the levels alone, plus the vertex scan the store needs.
+ *  One edge list, read from a SNAP file or generated with planted communities, lands both in a
+ *  graph collection and in an in-memory adjacency. One level optimizer and one aggregator serve
+ *  either graph, so the gap between the two timings is the cost of reading each neighborhood
+ *  through UStore. The store's adjacency is built by the upsert benchmark and the in-memory one
+ *  before the run, so both community-detection benchmarks time the levels alone, plus the vertex
+ *  scan the store needs.
  *
  *  Beside the flags of @c bench/harness.hpp, whose @c --seed also seeds the generated graph, it takes:
  *
@@ -38,7 +39,7 @@
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <utility>     // `std::move`, `std::swap`
+#include <utility>     // `std::move`
 
 #include <fmt/format.h>
 
@@ -138,7 +139,7 @@ struct input_edge_t {
  *  @param[in] max_edges Pairs kept at most, counted before repeats collapse.
  *  @param[out] edges Receives one entry per kept pair.
  */
-status_t read_edge_list(char const* path, std::size_t max_edges, st::basic_vector<input_edge_t>& edges) noexcept {
+status_t read_edge_list(char const* path, std::size_t max_edges, st::vector<input_edge_t>& edges) noexcept {
     auto [file, map_status] = mapped_file_t::map(path);
     if (map_status.failed()) return map_status;
 
@@ -155,7 +156,7 @@ status_t read_edge_list(char const* path, std::size_t max_edges, st::basic_vecto
 }
 
 /** Draws a planted partition: @c inner_degree edges inside each community and @c outer_degree across them. */
-status_t generate_edge_list(settings_t const& settings, st::basic_vector<input_edge_t>& edges) noexcept {
+status_t generate_edge_list(settings_t const& settings, st::vector<input_edge_t>& edges) noexcept {
     std::size_t const community_size = settings.vertices.value / settings.communities.value;
     if (community_size < 2) return {status_code_t::invalid_argument_k, "--vertices below twice --communities"};
     std::size_t const planted = community_size * settings.communities.value;
@@ -181,7 +182,7 @@ status_t generate_edge_list(settings_t const& settings, st::basic_vector<input_e
 }
 
 /** Orders @p edges, drops self-loops and collapses repeats, leaving one entry per undirected pair. */
-void canonicalize_edges(st::basic_vector<input_edge_t>& edges) noexcept {
+void canonicalize_edges(st::vector<input_edge_t>& edges) noexcept {
     input_edge_t* const begin = edges.begin();
     input_edge_t* const joined_end = std::remove_if(
         begin, edges.end(), [](input_edge_t const& edge) noexcept { return edge.lower == edge.upper; });
@@ -191,7 +192,7 @@ void canonicalize_edges(st::basic_vector<input_edge_t>& edges) noexcept {
 }
 
 /** Lays out @p edges as the C ABI's triples, all carrying the default edge identifier. */
-status_t stage_edges(std::span<input_edge_t const> edges, st::basic_vector<edge_t>& staged) noexcept {
+status_t stage_edges(std::span<input_edge_t const> edges, st::vector<edge_t>& staged) noexcept {
     if (st::failed(staged.reserve(edges.size()))) return status_code_t::out_of_memory_k;
     for (input_edge_t const& edge : edges) {
         [[maybe_unused]] st::status_t const pushed = staged.push_back(
@@ -242,13 +243,13 @@ struct weighted_entry_t {
 class adjacency_graph_t {
 
     /** Sorted distinct vertex keys, whose positions are the numbering the rows use. */
-    st::basic_vector<ustore_key_t> keys_;
+    st::vector<ustore_key_t> keys_;
 
     /** Where each vertex's row begins in @c neighbors_, with one trailing end offset. */
-    st::basic_vector<std::size_t> row_offsets_;
+    st::vector<std::size_t> row_offsets_;
 
     /** The rows of every vertex, one after another. */
-    st::basic_vector<weighted_neighbor_t> neighbors_;
+    st::vector<weighted_neighbor_t> neighbors_;
 
   public:
     adjacency_graph_t() noexcept = default;
@@ -258,7 +259,7 @@ class adjacency_graph_t {
      *
      *  @param[in,out] entries Every edge in both directions, sorted in place; a self-loop appears twice.
      */
-    static expected<adjacency_graph_t> make(st::basic_vector<weighted_entry_t>& entries) noexcept {
+    static expected<adjacency_graph_t> make(st::vector<weighted_entry_t>& entries) noexcept {
         std::sort(entries.begin(), entries.end(), entry_precedes);
 
         adjacency_graph_t graph;
@@ -324,7 +325,7 @@ class stored_graph_t {
     graph_collection_t* collection_ = nullptr;
 
     /** Sorted vertex keys of the collection, whose positions are the numbering. */
-    st::basic_vector<ustore_key_t> keys_;
+    st::vector<ustore_key_t> keys_;
 
     /** Arena every neighborhood read reuses, rewound by each. */
     arena_t arena_;
@@ -382,10 +383,10 @@ enum class level_progress_t : bool {
 struct level_t {
 
     /** Community of every vertex, named by the position of one of its members. */
-    st::basic_vector<std::size_t> communities;
+    st::vector<std::size_t> communities;
 
     /** Summed weight of every vertex's row, which is its weighted degree. */
-    st::basic_vector<double> vertex_degrees;
+    st::vector<double> vertex_degrees;
 
     /** Whether any vertex changed community. */
     level_progress_t progress = level_progress_t::settled_k;
@@ -412,9 +413,9 @@ template <typename graph_type_>
 expected<level_t> optimize_level(graph_type_& graph) noexcept {
     std::size_t const count = graph.vertices_count();
     level_t level;
-    st::basic_vector<double> community_degrees;
-    st::basic_vector<double> degrees_into_communities;
-    st::basic_vector<std::size_t> touched_communities;
+    st::vector<double> community_degrees;
+    st::vector<double> degrees_into_communities;
+    st::vector<std::size_t> touched_communities;
     if (st::failed(level.communities.resize(count)) || st::failed(level.vertex_degrees.resize(count, 0.0)) ||
         st::failed(community_degrees.resize(count, 0.0)) || st::failed(degrees_into_communities.resize(count, 0.0)) ||
         st::failed(touched_communities.reserve(count)))
@@ -483,9 +484,9 @@ expected<level_t> optimize_level(graph_type_& graph) noexcept {
 template <typename graph_type_>
 expected<score_t> score_level(graph_type_& graph, level_t const& level) noexcept {
     std::size_t const count = graph.vertices_count();
-    st::basic_vector<double> inner_weights;
-    st::basic_vector<double> total_degrees;
-    st::basic_vector<std::size_t> member_counts;
+    st::vector<double> inner_weights;
+    st::vector<double> total_degrees;
+    st::vector<std::size_t> member_counts;
     if (st::failed(inner_weights.resize(count, 0.0)) || st::failed(total_degrees.resize(count, 0.0)) ||
         st::failed(member_counts.resize(count, 0)))
         return status_code_t::out_of_memory_k;
@@ -518,7 +519,7 @@ expected<score_t> score_level(graph_type_& graph, level_t const& level) noexcept
 template <typename graph_type_>
 expected<adjacency_graph_t> aggregate_level(graph_type_& graph, level_t const& level) noexcept {
     std::size_t const count = graph.vertices_count();
-    st::basic_vector<weighted_entry_t> entries;
+    st::vector<weighted_entry_t> entries;
     for (std::size_t vertex = 0; vertex != count; ++vertex) {
         ustore_key_t const source = key_from_integer(level.communities[vertex]);
         st::status_t pushed = st::status_t::success_k;
@@ -637,7 +638,7 @@ int main(int argc, char** argv) {
     }
     executor_t& executor = *maybe_executor;
 
-    st::basic_vector<input_edge_t> edges;
+    st::vector<input_edge_t> edges;
     status_t const loaded = settings.dataset.empty()
                                 ? generate_edge_list(settings, edges)
                                 : read_edge_list(settings.dataset.data(), settings.max_edges.value, edges);
@@ -651,8 +652,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    st::basic_vector<edge_t> staged;
-    st::basic_vector<weighted_entry_t> entries;
+    st::vector<edge_t> staged;
+    st::vector<weighted_entry_t> entries;
     if (stage_edges(edges, staged).failed() || st::failed(entries.reserve(2 * edges.size()))) {
         fmt::println(stderr, "Failed to stage the edges");
         return 1;
@@ -672,15 +673,15 @@ int main(int argc, char** argv) {
     adjacency_graph_t memory_graph = *std::move(maybe_memory_graph);
     fmt::println("Graph: {} vertices, {} edges", memory_graph.vertices_count(), edges.size());
 
-    ustore_database_t raw = nullptr;
+    ustore_database_t handle = nullptr;
     ustore_outcome_t outcome {};
     settings.engine.directory = settings.directory.data();
-    open_engine(settings.engine, &raw, &outcome);
+    open_engine(settings.engine, &handle, &outcome);
     if (outcome.status != ustore_status_success_k) {
         fmt::println(stderr, "Failed to open the database: {}", outcome.message ? outcome.message : "unknown");
         return 1;
     }
-    database_t database {raw};
+    database_t database {handle};
     if (status_t const cleared = database.clear(ustore_drop_collection_k); cleared.failed()) {
         fmt::println(stderr, "Failed to clear the database: {}", cleared.message ? cleared.message : "unknown");
         return 1;

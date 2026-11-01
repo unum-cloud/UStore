@@ -27,7 +27,7 @@
 
 #include <forkunion/types.hpp> // `fu::default_alignment_k`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 #include <smashtable/shared.hpp>       // `st::default_allocator`
 
 #include "ustore/blobs/nvme_key_slot.hpp" // `transaction_stamp_t`, `unwritten_stamp_k`
@@ -51,8 +51,8 @@ class collection_view {
     using allocator_t = allocator_type_;
 
     /** The runs a view names, newest first. */
-    using runs_t = st::basic_vector<run_t const*,
-                                    typename std::allocator_traits<allocator_t>::template rebind_alloc<run_t const*>>;
+    using runs_t =
+        st::vector<run_t const*, typename std::allocator_traits<allocator_t>::template rebind_alloc<run_t const*>>;
 
     collection_view() noexcept = default;
     collection_view(collection_view&&) noexcept = default;
@@ -421,10 +421,10 @@ class epoch_domain {
 
     /** Every table of shared slots ever published, kept while a reader may still probe one, touched under
      *  @c growing_. */
-    st::basic_vector<std::unique_ptr<shared_slots_t>> tables_;
+    st::vector<std::unique_ptr<shared_slots_t>> tables_;
 
     /** Every block of shared slots, touched under @c growing_. */
-    st::basic_vector<std::unique_ptr<epoch_slot_t[]>> blocks_;
+    st::vector<std::unique_ptr<epoch_slot_t[]>> blocks_;
 
     /** One slot per executor thread, opened before anything enters. */
     std::unique_ptr<epoch_slot_t[]> executor_slots_;

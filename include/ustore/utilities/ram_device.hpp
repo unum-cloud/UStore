@@ -4,9 +4,9 @@
  *  @date September 15, 2026
  *  @brief The one owner of threads and topology, over ForkUnion's C ABI.
  *
- *  Engines, tools, tests and benchmarks dispatch through @c executor_t, a pool spawned here, or
- *  @c lent_pool_t, a pool another library lends, both through their @c pool_view_t, and only the arenas of
- *  @c utilities/ram_buffers.hpp call @c fu_* directly besides.
+ *  Engines, tools, tests and benchmarks dispatch through @c executor_t, a pool spawned here,
+ *  or @c lent_pool_t, a pool another library lends, both through their @c pool_view_t, and
+ *  only the arenas of @c utilities/ram_buffers.hpp call @c fu_* directly besides.
  */
 #pragma once
 
@@ -58,13 +58,13 @@ constexpr st::status_t status_from_(fu_status_t status) noexcept {
 }
 
 /** A callable run once on every thread, with the thread index and optionally its compute domain. */
-template <typename callback_>
-concept thread_callback = std::is_nothrow_invocable_v<callback_&, std::size_t, std::size_t> ||
-                          std::is_nothrow_invocable_v<callback_&, std::size_t>;
+template <typename callback_type_>
+concept thread_callback_concept = std::is_nothrow_invocable_v<callback_type_&, std::size_t, std::size_t> ||
+                                  std::is_nothrow_invocable_v<callback_type_&, std::size_t>;
 
 /** A callable run once per task, with the task index and the index of the thread running it. */
-template <typename callback_>
-concept task_callback = std::is_nothrow_invocable_v<callback_&, std::size_t, std::size_t>;
+template <typename callback_type_>
+concept task_callback_concept = std::is_nothrow_invocable_v<callback_type_&, std::size_t, std::size_t>;
 
 /** What the thread that spawns a pool does on every dispatch it makes afterwards. */
 enum class caller_exclusivity_t : std::uint8_t {
@@ -87,12 +87,12 @@ class pool_view_t {
     explicit constexpr pool_view_t(fu_pool_t pool) noexcept : pool_(pool) {}
 
     /** Runs @p callback once on every thread, with the thread index and, when it takes one, the compute domain. */
-    template <thread_callback callback_>
-    [[nodiscard]] st::status_t for_threads(callback_&& callback) const noexcept {
+    template <thread_callback_concept callback_type_>
+    [[nodiscard]] st::status_t for_threads(callback_type_&& callback) const noexcept {
         fu_for_threads_t const trampoline = [](fu_lambda_context_t context, std::size_t thread,
                                                std::size_t compute_domain) noexcept {
-            auto& target = *static_cast<std::remove_reference_t<callback_>*>(context);
-            if constexpr (std::is_nothrow_invocable_v<callback_&, std::size_t, std::size_t>)
+            auto& target = *static_cast<std::remove_reference_t<callback_type_>*>(context);
+            if constexpr (std::is_nothrow_invocable_v<callback_type_&, std::size_t, std::size_t>)
                 target(thread, compute_domain);
             else target(thread);
         };
@@ -100,11 +100,11 @@ class pool_view_t {
     }
 
     /** Runs @p callback over @p count tasks of uneven cost, each thread taking the next task as it finishes one. */
-    template <task_callback callback_>
-    [[nodiscard]] st::status_t for_n_dynamic(std::size_t count, callback_&& callback) const noexcept {
+    template <task_callback_concept callback_type_>
+    [[nodiscard]] st::status_t for_n_dynamic(std::size_t count, callback_type_&& callback) const noexcept {
         fu_for_task_t const trampoline = [](fu_lambda_context_t context, std::size_t task, std::size_t thread,
                                             std::size_t) noexcept {
-            (*static_cast<std::remove_reference_t<callback_>*>(context))(task, thread);
+            (*static_cast<std::remove_reference_t<callback_type_>*>(context))(task, thread);
         };
         return status_from_(fu_pool_for_n_dynamic(pool_, count, trampoline, &callback));
     }
@@ -199,7 +199,8 @@ class topology_t {
  *  @brief A ForkUnion pool spawned and deleted here, the only kind an executor parks.
  *
  *  A worker caller counts as one of the threads and runs its share of every dispatch, while a
- *  coordinator only waits. Every dispatch blocks until all threads return, and refuses while another one runs.
+ *  coordinator only waits. Every dispatch blocks until all threads return, and refuses while
+ *  another one runs.
  */
 class executor_t {
   public:
@@ -322,17 +323,17 @@ class executor_t {
     void join(fu_generation_t generation) noexcept { fu_pool_unsafe_join(pool_, generation); }
 
     /** Runs @p callback once on every thread, with the thread index and, when it takes one, the compute domain. */
-    template <thread_callback callback_>
-    [[nodiscard]] st::status_t for_threads(callback_&& callback) noexcept {
-        return view().for_threads(std::forward<callback_>(callback));
+    template <thread_callback_concept callback_type_>
+    [[nodiscard]] st::status_t for_threads(callback_type_&& callback) noexcept {
+        return view().for_threads(std::forward<callback_type_>(callback));
     }
 
     /** Runs @p callback over @p count similar-cost tasks split evenly across the threads. */
-    template <task_callback callback_>
-    [[nodiscard]] st::status_t for_n(std::size_t count, callback_&& callback) noexcept {
+    template <task_callback_concept callback_type_>
+    [[nodiscard]] st::status_t for_n(std::size_t count, callback_type_&& callback) noexcept {
         fu_for_task_t const trampoline = [](fu_lambda_context_t context, std::size_t task, std::size_t thread,
                                             std::size_t) noexcept {
-            (*static_cast<std::remove_reference_t<callback_>*>(context))(task, thread);
+            (*static_cast<std::remove_reference_t<callback_type_>*>(context))(task, thread);
         };
         return status_from_(fu_pool_for_n(pool_, count, trampoline, &callback));
     }

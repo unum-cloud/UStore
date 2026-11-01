@@ -37,7 +37,7 @@
     {
       "label": "Build Debug SmashTable Test",
       "detail": "Unit suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_abi_blobs",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -45,7 +45,7 @@
     {
       "label": "Build Debug RocksDB Test",
       "detail": "Unit suite on RocksDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_abi_blobs",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -53,7 +53,7 @@
     {
       "label": "Build Debug LevelDB Test",
       "detail": "Unit suite on LevelDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_abi_blobs",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -61,7 +61,7 @@
     {
       "label": "Build Debug NVMe Test",
       "detail": "Unit suite on NVMe, which configures only once src/nvme compiles",
-      "command": "cmake --preset debug -DUSTORE_WITH_NVME=ON && cmake --build --preset debug --target ustore_test_units",
+      "command": "cmake --preset debug -DUSTORE_WITH_NVME=ON && cmake --build --preset debug --target ustore_test_abi_blobs",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -69,7 +69,7 @@
     {
       "label": "Build Debug Strings Test",
       "detail": "Strings modality suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_strings",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_abi_strings",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]

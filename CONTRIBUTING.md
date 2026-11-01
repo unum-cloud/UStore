@@ -41,7 +41,7 @@ Only `release` and the Windows presets add RocksDB and LevelDB; every other pres
 `USTORE_MULTIVERSIONED` is the build kind: `ON` by default, a multiversioned build of every CPU class the toolchain compiles, picked at runtime, or with `OFF` a monoversioned build of one `monoversioned` class and no named class, `serial` included.
 That class takes the waiter, atomic reference and string kernels StringZilla and ForkUnion enabled: what the floor implies, plus what `-D <LIB>_TARGET_<CAP>=1` vouches for where no compiler macro reports it, like `FORKUNION_TARGET_ARM64_WFET=1` on Vera.
 A handle pinned below it, or opened on a CPU lacking it, gets `ustore_status_unsupported_k`, and both switches are seeded from the environment variables of the same name.
-`USTORE_CUDA_ARCH` adds NVMe's GPU compaction, whose CUB kernels need only plain codes: `all` compiles a cubin per generation from Ampere through Blackwell and the Ampere PTX for every later GPU, `native` the code of each visible GPU, and one code like `100f` its cubin alone.
+`USTORE_CUDA_ARCH` adds NVMe's GPU compaction, whose kernels need only plain codes: `all` compiles a cubin per generation from Ampere through Blackwell and the Ampere PTX for every later GPU, `native` the code of each visible GPU, and one code like `100f` its cubin alone.
 The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set `USTORE_MARCH` with `USTORE_MULTIVERSIONED=OFF` and the one CUDA code of their GPU, and CI compiles each of them.
 
 ## Layout and Namespaces
@@ -54,7 +54,7 @@ The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera
 | `include/ustore/<dir>/` | header-only templates the engines instantiate        | `unum::ustore::<dir>`             |
 | `src/lib.hpp`           | the router every exported call goes through          | `unum::ustore`                    |
 | `src/*.cpp`             | one source per public header, documents and graphs   | `unum::ustore`                    |
-| `src/engine.hpp`        | the table of calls every engine fills                | `unum::ustore`                    |
+| `src/engine.hpp`        | the calls every engine fills, and the CPU classes    | `unum::ustore`                    |
 | `src/utilities/`        | batches, outputs and progress over the C ABI's types | `unum::ustore::utilities`         |
 | `src/<engine>/`         | `engine.cpp` and the glue of `ram` and `nvme`        | `unum::ustore::<engine>`          |
 | `src_oracles/<engine>/` | `engine.cpp` of RocksDB and LevelDB, kept as oracles | `unum::ustore::oracles::<engine>` |
@@ -77,6 +77,8 @@ A file name never repeats its directory — `include/ustore/blobs/nvme_tree.hpp`
 - Class templates carry no suffix: `class lsm_tree`, never `class lsm_tree_gt`.
 - Template type parameters end in `_type_` and private members in one underscore, so a parameter never shadows a member: `typename locations_type_` beside `locations_type_ locations_`.
 - Identifiers are whole words: `index`, `count`, `transaction`, `directory` — never `i`, `cnt`, `txn`, `dir`.
+- `init`, `min`, `max`, `id`, `gds`, `ref` and vendor terms are whole words of the vocabulary and stay as they are.
+- A transport type carries its operating system, as in `linux_spdk_environment`, while a type mirroring a vendor's own struct or API table keeps the vendor word, as in `cufile_api_t`.
 - A type is named `<domain>_<role>`: the domain word says what it holds and the role word what it does, as in `lsm_tree`, `lsm_level`, `lsm_sorted_run`, `sorted_run_index`, `key_slot`, `stored_value`, `write_buffer` and `graph_store`.
   Only C ABI terms stay one word — `database`, `collection`, `transaction`, `snapshot` — and no name is a metaphor or a legacy project name.
 - A file is named after its main type without `_t` and never repeats its directory; C++ headers are `.hpp`, never `.h` or `.tcc`.
@@ -92,8 +94,8 @@ No macro stands in for a template head, an argument list or a code pattern:
 
 ```cpp
 // Rejected
-#define lsm_tree_def_m template <typename stored_key_, value_layout_t value_layout_>
-#define lsm_tree_args_m stored_key_, value_layout_
+#define lsm_tree_def_m template <typename stored_key_type_, value_layout_t value_layout_>
+#define lsm_tree_args_m stored_key_type_, value_layout_
 lsm_tree_def_m class lsm_tree;
 
 // Written out, constrained by a concept
@@ -117,11 +119,11 @@ No owning standard type that can throw appears in `cpp/` or `src/`:
 | Instead of                     | Use                                                                        |
 | :----------------------------- | :------------------------------------------------------------------------- |
 | `std::string`                  | StringZilla `sz::string` through `try_assign`, `try_reserve`, `try_resize` |
-| `std::vector`                  | SmashTable `basic_vector` through `make()`                                 |
+| `std::vector`                  | SmashTable `vector` through `make()`                                       |
 | `std::unordered_map`           | SmashTable `basic_hash_table`                                              |
 | `std::unordered_set`           | SmashTable `basic_hash_table`                                              |
 | `std::map`, `std::set`         | SmashTable `basic_avl_tree`, or `basic_wb_tree` for rank and select        |
-| An array sized once            | SmashTable `basic_vector` through `resize()`, which returns a status       |
+| An array sized once            | SmashTable `vector` through `resize()`, which returns a status             |
 | `std::thread`, `std::function` | The ForkUnion executor below, and a template callback parameter            |
 
 Non-owning `std::span` and `std::string_view` are welcome.
@@ -155,7 +157,8 @@ The arenas place their blocks with `fu_allocate_on_domain_id` and release them w
 
 ### Includes and Printing
 
-Includes form groups separated by blank lines, alphabetical inside each: C library headers such as `<cstdint>`, platform headers such as `<unistd.h>`, C++ standard headers, external libraries such as `<rocksdb/db.h>` and `<yyjson.h>`, sibling projects such as `<smashtable/basic_vector.hpp>`, then UStore's own headers in quotes, such as `"ustore/db.h"`, `"ustore/utilities/ram_buffers.hpp"` and `"utilities/batches.hpp"`.
+Includes form groups separated by blank lines, alphabetical inside each: C library headers such as `<cstdint>`, platform headers such as `<unistd.h>`, C++ standard headers, external libraries such as `<rocksdb/db.h>` and `<yyjson.h>`, sibling projects such as `<smashtable/basic_vector.hpp>`, then UStore's own headers in quotes, such as `"ustore/db.h"`, `"ustore/utilities/ram_buffers.hpp"` and `"utilities/batches.hpp"`, where headers private to `src/` are written relative to `src/`.
+An include's trailing comment lists in backticks the symbols the file takes from that header, and no other.
 Sibling projects are reached through the aliases `fu`, `st` and `sz`, declared once in `cpp/ustore/types.hpp`, never through spelled-out `ashvardanian::` namespaces or local aliases.
 C++ prints through `fmt::println` — no iostreams, no `printf`.
 Discard a result through `[[maybe_unused]] T const result = call();`, never `(void)call();`, and declare return types before the name, never after an arrow.
@@ -250,16 +253,33 @@ cargo test --no-default-features --features rocksdb  # RAM and RocksDB alone
 
 ## Commits
 
-- The subject is `Verb: Summary` with one of `Add`, `Break`, `Build`, `Chore`, `Docs`, `Fix`, `Improve`, `Make`, `Release`, and the summary starts with a capital.
+`.githooks/commit-msg` checks every message:
+
+- The title reads `<Verb>: <Summary>`, where the verb is one of `Add`, `Break`, `Chore`, `Docs`, `Fix`, `Improve` or `Make`.
+- The summary opens with a capital letter, unless it opens with a code identifier, which keeps its own case.
+- The title runs to at most 80 characters, and a body line to at most 100 columns, unless it holds a URL or is indented code.
+- The message carries no AI-assistant attribution, since authorship is the human who committed.
 - `Break` marks a change to what the project offers, such as a dropped modality or binding; `Chore` removes or rearranges without changing it.
 - The body is prose wrapped near 80 columns and explains the change in primary logic, not renames or formatting.
 - One commit per topic, however many files it touches; an intermediate commit may leave the tree unbuildable.
-- No AI-assistant attribution of any kind.
+
+Git's merge, `fixup!` and `squash!` titles are exempt from the title rules.
+A `Release: vX.Y.Z` title is exempt too, but its commit must stamp every version site, and no other commit may change `VERSION`.
+`.githooks/pre-commit` formats and judges the staged lines, and `.githooks/selftest` runs both hooks against their fixtures.
+On a pull request, `.github/scripts/check-commits.sh` replays `commit-msg` over every commit and runs `pre-commit` over the whole range.
+
+## Releases
+
+`.github/scripts/mint-release.sh X.Y.Z` cuts a release from a clean checkout of the branch it ships.
+It stamps every version site and commits `Release: vX.Y.Z`.
+`.github/scripts/check-release.sh` then checks that commit, even in a clone where `core.hooksPath` is unset, before the script tags it and pushes both.
+Then it publishes the GitHub release, marking `X.Y.Z-rc.N` candidates as prereleases.
+Publishing starts every `release-<binding>.yml` at once, and each runs `check-release.sh` before it builds anything, so each registry trusts only its own binding's file.
 
 ## Implementing a New Engine
 
 An engine fills the table of calls in `src/engine.hpp`, one entry per call of the C ABI.
-For documents and graphs it plugs in the shared implementations of `src/blobs_layers/docs.hpp` and `src/blobs_layers/graph.hpp`, which run on its own reads and writes, as RocksDB and LevelDB do, or serves them itself, as `ram` serves graphs on half-edges of its own.
+For documents and graphs it plugs in the shared implementations of `src/docs_layer.hpp` and `src/graph_layer.hpp`, which run on its own reads and writes, as RocksDB and LevelDB do, or serves them itself, as `ram` serves graphs on half-edges of its own.
 An entry the engine leaves null answers `ustore_status_unsupported_k`, as every pages entry does today.
 Start with these, in order:
 

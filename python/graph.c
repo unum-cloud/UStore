@@ -17,34 +17,35 @@
  *  @brief Walks the keywords of a verb whose only keyword of its own is the vertex role.
  *  @param[in] context The database and view the verb runs against.
  *  @param[in] verb The method's name, as a failure should read it.
- *  @param[in] args The fast-call arguments, positional ones first.
- *  @param[in] positional_args_count Positional arguments the call carried.
- *  @param[in] args_names_tuple The keyword names, or NULL when none followed.
+ *  @param[in] arguments The fast-call arguments, positional ones first.
+ *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[in] required_positional Positional arguments the verb fixes.
  *  @param[out] options Where every shared keyword lands.
  *  @param[out] role The role the call names, which starts as either end of an edge.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int role_options_from_keywords(ustore_py_context_t const* context, char const* verb, PyObject* const* args,
-                                      Py_ssize_t positional_args_count, PyObject* args_names_tuple,
+static int role_options_from_keywords(ustore_py_context_t const* context, char const* verb, PyObject* const* arguments,
+                                      Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
                                       Py_ssize_t required_positional, ustore_py_verb_options_t* options,
                                       ustore_vertex_role_t* role) {
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked(verb, positional_args_count,
-                                                                           args_names_tuple, required_positional);
-    if (args_names_count < 0) return -1;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
+        verb, positional_arguments_count, keyword_names_tuple, required_positional);
+    if (keyword_names_count < 0) return -1;
     ustore_py_verb_options_init(options);
     int chosen = ustore_vertex_role_any_k;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        int const consumed = ustore_py_verb_option_from_keyword(context, name, args[args_progress], options);
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        int const consumed = ustore_py_verb_option_from_keyword(context, name, arguments[arguments_progress], options);
         if (consumed < 0) return -1;
         if (consumed > 0) continue;
         if (PyUnicode_CompareWithASCIIString(name, "role") != 0) {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
             return -1;
         }
-        if (ustore_py_enum_from_object(args[args_progress], "role", ustore_py_enum_role_k, &chosen) != 0) return -1;
+        if (ustore_py_enum_from_object(arguments[arguments_progress], "role", ustore_py_enum_role_k, &chosen) != 0)
+            return -1;
     }
     *role = (ustore_vertex_role_t)chosen;
     return 0;
@@ -77,36 +78,37 @@ static void edge_batches_release(edge_batches_t* batches) {
  *  @brief Reads the sources, targets, optional edge identifiers and shared keywords of an edge verb.
  *  @param[in] context The database and view the verb runs against.
  *  @param[in] verb The method's name, as a failure should read it.
- *  @param[in] args The fast-call arguments, positional ones first.
- *  @param[in] positional_args_count Positional arguments the call carried.
- *  @param[in] args_names_tuple The keyword names, or NULL when none followed.
+ *  @param[in] arguments The fast-call arguments, positional ones first.
+ *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[out] batches The keys and options the verb runs with.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int edge_batches_from_args(ustore_py_context_t const* context, char const* verb, PyObject* const* args,
-                                  Py_ssize_t positional_args_count, PyObject* args_names_tuple,
+static int edge_batches_from_args(ustore_py_context_t const* context, char const* verb, PyObject* const* arguments,
+                                  Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
                                   edge_batches_t* batches) {
     memset(batches, 0, sizeof(*batches));
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked(verb, positional_args_count,
-                                                                           args_names_tuple, 2);
-    if (args_names_count < 0) return -1;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(verb, positional_arguments_count,
+                                                                                 keyword_names_tuple, 2);
+    if (keyword_names_count < 0) return -1;
     ustore_py_verb_options_init(&batches->options);
     PyObject* edges_object = Py_None;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        int const consumed = ustore_py_verb_option_from_keyword(context, name, args[args_progress], &batches->options);
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        int const consumed = ustore_py_verb_option_from_keyword(context, name, arguments[arguments_progress],
+                                                                &batches->options);
         if (consumed < 0) return -1;
         if (consumed > 0) continue;
         if (PyUnicode_CompareWithASCIIString(name, "edges") != 0) {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
             return -1;
         }
-        edges_object = args[args_progress];
+        edges_object = arguments[arguments_progress];
     }
 
-    if (ustore_py_keys_from_object(args[0], &batches->sources) != 0) return -1;
-    if (ustore_py_keys_from_object(args[1], &batches->targets) != 0 ||
+    if (ustore_py_keys_from_object(arguments[0], &batches->sources) != 0) return -1;
+    if (ustore_py_keys_from_object(arguments[1], &batches->targets) != 0 ||
         (edges_object != Py_None && ustore_py_keys_from_object(edges_object, &batches->edges) != 0)) {
         edge_batches_release(batches);
         return -1;
@@ -174,13 +176,14 @@ static ustore_py_verb_t const edges_remove_verb = {sizeof(edges_write_call_t), e
  *  @return The call, or NULL with an exception set.
  */
 static edges_write_call_t* edges_write_open(PyObject* self, char const* name, ustore_py_verb_t const* verb,
-                                            PyObject* const* args, Py_ssize_t positional_args_count,
-                                            PyObject* args_names_tuple, ustore_py_context_t* context,
+                                            PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                            PyObject* keyword_names_tuple, ustore_py_context_t* context,
                                             edges_write_call_t* stack) {
     if (ustore_py_context_from_object(self, context) != 0 || ustore_py_context_writable(context) != 0) return NULL;
     edges_write_call_t* const call = ustore_py_call_open(context, verb, stack);
     if (!call) return NULL;
-    if (edge_batches_from_args(context, name, args, positional_args_count, args_names_tuple, &call->batches) == 0) {
+    if (edge_batches_from_args(context, name, arguments, positional_arguments_count, keyword_names_tuple,
+                               &call->batches) == 0) {
         call->call.collection = call->batches.options.collection;
         return call;
     }
@@ -188,12 +191,13 @@ static edges_write_call_t* edges_write_open(PyObject* self, char const* name, us
     return NULL;
 }
 
-PyObject* ustore_py_api_graph_write_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                          PyObject* args_names_tuple) {
+PyObject* ustore_py_api_graph_write_edges(PyObject* self, PyObject* const* arguments,
+                                          Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     edges_write_call_t stack;
-    edges_write_call_t* const call = edges_write_open(self, "graph_write_edges", &edges_write_verb, args,
-                                                      positional_args_count, args_names_tuple, &context, &stack);
+    edges_write_call_t* const call = edges_write_open(self, "graph_write_edges", &edges_write_verb, arguments,
+                                                      positional_arguments_count, keyword_names_tuple, &context,
+                                                      &stack);
     if (!call) return NULL;
     edge_batches_t const* const batches = &call->batches;
     ustore_graph_write_edges_t write = {
@@ -228,12 +232,13 @@ char const doc_graph_remove_edges[] =                                           
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"         //
     "    returning.";
 
-PyObject* ustore_py_api_graph_remove_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                           PyObject* args_names_tuple) {
+PyObject* ustore_py_api_graph_remove_edges(PyObject* self, PyObject* const* arguments,
+                                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     edges_write_call_t stack;
-    edges_write_call_t* const call = edges_write_open(self, "graph_remove_edges", &edges_remove_verb, args,
-                                                      positional_args_count, args_names_tuple, &context, &stack);
+    edges_write_call_t* const call = edges_write_open(self, "graph_remove_edges", &edges_remove_verb, arguments,
+                                                      positional_arguments_count, keyword_names_tuple, &context,
+                                                      &stack);
     if (!call) return NULL;
     edge_batches_t const* const batches = &call->batches;
     ustore_graph_remove_edges_t remove = {
@@ -385,29 +390,30 @@ static PyObject* edges_read_run(ustore_py_context_t const* context, ustore_py_ve
 }
 
 /** Reads the edges or the degrees of the vertices `vertices, arena` name, as @p verb answers them. */
-static PyObject* edges_read(PyObject* self, char const* name, ustore_py_verb_t const* verb, PyObject* const* args,
-                            Py_ssize_t positional_args_count, PyObject* args_names_tuple) {
+static PyObject* edges_read(PyObject* self, char const* name, ustore_py_verb_t const* verb, PyObject* const* arguments,
+                            Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     ustore_py_verb_options_t options;
     ustore_vertex_role_t role = ustore_vertex_role_any_k;
-    if (role_options_from_keywords(&context, name, args, positional_args_count, args_names_tuple, 2, &options, &role) !=
-        0)
+    if (role_options_from_keywords(&context, name, arguments, positional_arguments_count, keyword_names_tuple, 2,
+                                   &options, &role) != 0)
         return NULL;
     edges_read_call_t stack;
     edges_read_call_t* const call = ustore_py_call_open(&context, verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(args[0], &call->vertices) != 0 ||
-        ustore_py_arena_claim(args[1], &call->call.arena) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0 ||
+        ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, verb, call);
     call->role = role;
     call->call.collection = options.collection;
     return edges_read_run(&context, verb, call);
 }
 
-PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                         PyObject* args_names_tuple) {
-    return edges_read(self, "graph_read_edges", &neighborhoods_verb, args, positional_args_count, args_names_tuple);
+PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* arguments,
+                                         Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    return edges_read(self, "graph_read_edges", &neighborhoods_verb, arguments, positional_arguments_count,
+                      keyword_names_tuple);
 }
 
 char const doc_graph_degrees[] =                                                            //
@@ -424,9 +430,9 @@ char const doc_graph_degrees[] =                                                
     "Returns:\n"                                                                            //
     "  tuple[int | None, ...]: The degree of every vertex, None where it is absent.";
 
-PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                      PyObject* args_names_tuple) {
-    return edges_read(self, "graph_degrees", &degrees_verb, args, positional_args_count, args_names_tuple);
+PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                      PyObject* keyword_names_tuple) {
+    return edges_read(self, "graph_degrees", &degrees_verb, arguments, positional_arguments_count, keyword_names_tuple);
 }
 
 char const doc_graph_contains[] =                                                        //
@@ -441,14 +447,15 @@ char const doc_graph_contains[] =                                               
     "Returns:\n"                                                                         //
     "  bool: Whether the vertex is present.";
 
-PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                       PyObject* args_names_tuple) {
+PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* arguments,
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("graph_contains", positional_args_count, args_names_tuple, 1) < 0)
+    if (ustore_py_keyword_names_count_checked("graph_contains", positional_arguments_count, keyword_names_tuple, 1) < 0)
         return NULL;
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
     edges_read_call_t stack;
     edges_read_call_t* const call = ustore_py_call_open(&context, &contains_verb, &stack);
@@ -456,7 +463,7 @@ PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* args, Py
     call->vertices.keys = call->vertices.inline_keys;
     call->vertices.count = 1;
     PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
-    if (!arena || ustore_py_key_from_object(args[0], call->vertices.inline_keys) != 0 ||
+    if (!arena || ustore_py_key_from_object(arguments[0], call->vertices.inline_keys) != 0 ||
         ustore_py_arena_claim(arena, &call->call.arena) != 0) {
         Py_XDECREF(arena);
         return ustore_py_call_discard(&context, &contains_verb, call);
@@ -516,20 +523,22 @@ static ustore_py_verb_t const vertices_write_verb = {sizeof(vertices_write_call_
 static ustore_py_verb_t const vertices_remove_verb = {sizeof(vertices_write_call_t), vertices_remove_submit,
                                                       ustore_py_call_answer_none, vertices_write_release};
 
-PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                             PyObject* args_names_tuple) {
+PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* arguments,
+                                             Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("graph_write_vertices", positional_args_count, args_names_tuple, 1) < 0)
+    if (ustore_py_keyword_names_count_checked("graph_write_vertices", positional_arguments_count, keyword_names_tuple,
+                                              1) < 0)
         return NULL;
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     vertices_write_call_t stack;
     vertices_write_call_t* const call = ustore_py_call_open(&context, &vertices_write_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(args[0], &call->vertices) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0)
         return ustore_py_call_discard(&context, &vertices_write_verb, call);
     call->call.collection = options.collection;
     ustore_graph_write_vertices_t write = {
@@ -561,20 +570,20 @@ char const doc_graph_remove_vertices[] =                                        
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"       //
     "    returning.";
 
-PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                              PyObject* args_names_tuple) {
+PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* arguments,
+                                              Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
     ustore_py_verb_options_t options;
     ustore_vertex_role_t role = ustore_vertex_role_any_k;
-    if (role_options_from_keywords(&context, "graph_remove_vertices", args, positional_args_count, args_names_tuple, 1,
-                                   &options, &role) != 0)
+    if (role_options_from_keywords(&context, "graph_remove_vertices", arguments, positional_arguments_count,
+                                   keyword_names_tuple, 1, &options, &role) != 0)
         return NULL;
 
     vertices_write_call_t stack;
     vertices_write_call_t* const call = ustore_py_call_open(&context, &vertices_remove_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(args[0], &call->vertices) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0)
         return ustore_py_call_discard(&context, &vertices_remove_verb, call);
     call->role = role;
     call->call.collection = options.collection;
@@ -614,10 +623,10 @@ char const doc_graph_scan_vertices[] =                                          
     "Raises:\n"                                                                                        //
     "  CancelledError: The progress callable stopped the scan.";
 
-PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                            PyObject* args_names_tuple) {
-    return ustore_py_api_scan_of(self, args, positional_args_count, args_names_tuple, "graph_scan_vertices",
-                                 ustore_modality_graph_k);
+PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* arguments,
+                                            Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    return ustore_py_api_scan_of(self, arguments, positional_arguments_count, keyword_names_tuple,
+                                 "graph_scan_vertices", ustore_modality_graph_k);
 }
 
 #pragma endregion Vertices

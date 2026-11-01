@@ -16,8 +16,10 @@
 #include "ustore/ranges.hpp" // `strided`, `strided_iterator`
 #include "ustore/strings.h"
 
+#include "ustore/strings/ram_store.hpp" // `string_pair_t`
+
 #include "database.hpp"           // `database_state`, `with_source`, `serve_write`, `read_strings`, `scan_strings`
-#include "utilities/batches.hpp"  // `strings_arg_t`
+#include "utilities/batches.hpp"  // `strings_arg_t`, `validate_choices`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -46,6 +48,8 @@ store_status_t stage_string_runs(source_type_& source, strided_iterator<ustore_c
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_write_t const& arguments,
                strings_arg_t const& texts, view_t const& view) noexcept {
+    if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
+        return status;
     if (!arguments.count) return {};
     strided_iterator<ustore_key_t const> const values = strided(arguments.values);
     if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their values"};
@@ -63,6 +67,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_wri
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_remove_t const& arguments,
                strings_arg_t const& texts, view_t const& view) noexcept {
+    if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
+        return status;
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);

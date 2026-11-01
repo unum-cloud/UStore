@@ -20,7 +20,6 @@
 #include <algorithm>   // `std::sort`, `std::unique`
 #include <array>       // `std::array`
 #include <chrono>      // `std::chrono::steady_clock`
-#include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`, `std::as_bytes`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -33,8 +32,10 @@
 #include <smashtable/basic_vector.hpp>
 #include <smashtable/shared.hpp>
 
-#include "ustore/blobs/nvme_compaction.hpp" // `host_compactor_t`, `compacted_sorted_run_t`, `compaction_kind_t`
-#include "ustore/graph/adjacency_fold.hpp"  // `adjacency_fold_t`, `vram_nvidia_adjacency_fold_t`, `save_delta`
+#include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compacted_sorted_run_t`, `compaction_kind_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/graph/adjacency_fold.hpp"         // `adjacency_fold_t`, `save_delta`
+#include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
 #include "ustore/utilities/nvme_linux_cufile_disk.hpp" // `linux_cufile_files_disk`, `linux_cufile_disk_config_t`
 #include "ustore/utilities/types.hpp"                  // `status_t`, `status_code_t`
 #include "ustore/utilities/vram_device.hpp"            // `gpu_drivers_t`, `list_gpu_devices`
@@ -44,9 +45,10 @@
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
+using namespace unum::ustore::test::nvme;
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
-using st::basic_vector;
+using st::vector;
 
 #pragma region Key Slots
 
@@ -78,8 +80,8 @@ inline_key_slot<stored_key_type_> make_key_slot(std::type_identity<inline_key_sl
     inline_key_slot<stored_key_type_> key_slot;
     key_slot.stored_key = key;
     if (state == key_slot_state_t::removed_k) return key_slot;
-    key_slot.size = static_cast<std::uint32_t>(1 + random.below(8));
-    for (std::uint8_t& byte : key_slot.data) byte = static_cast<std::uint8_t>(random.next());
+    key_slot.size = static_cast<std::uint32_t>(1 + random.below(sizeof(key_slot.data)));
+    for (byte_t& byte : key_slot.data) byte = static_cast<byte_t>(random.next());
     return key_slot;
 }
 
@@ -152,7 +154,7 @@ bool same_key_slot(key_slot_type_ const& first, key_slot_type_ const& second) no
 inline constexpr std::uint64_t shared_high_word_k = 0x0123456789ABCDEFull;
 
 /** Appends 64-bit keys a comparator most often gets wrong: both ends, the sign boundary and small integers. */
-st::status_t append_adversarial_keys(basic_vector<std::uint64_t>& keys) noexcept {
+st::status_t append_adversarial_keys(vector<std::uint64_t>& keys) noexcept {
     constexpr std::uint64_t ones = ~std::uint64_t {0};
     constexpr std::uint64_t sign = std::uint64_t {1} << 63;
     std::array<std::uint64_t, 9> const edges {0, 1, 2, ones, ones - 1, ones - 2, sign - 1, sign, sign + 1};
@@ -169,7 +171,7 @@ st::status_t append_adversarial_keys(basic_vector<std::uint64_t>& keys) noexcept
 
 /** Appends 16-byte keys a comparator most often gets wrong: all zeros, all ones, equal high words and integer
  *  identities. */
-st::status_t append_adversarial_keys(basic_vector<st::key128_t>& keys) noexcept {
+st::status_t append_adversarial_keys(vector<st::key128_t>& keys) noexcept {
     constexpr std::uint64_t ones = ~std::uint64_t {0};
     constexpr std::uint64_t sign = std::uint64_t {1} << 63;
     std::array<st::key128_t, 10> const edges {{{0, 0},
@@ -210,7 +212,7 @@ st::key128_t random_key(random_t& random, std::type_identity<st::key128_t>) noex
 
 /** Fills @p universe with the adversarial keys and @p random_keys random ones, sorted and unique. */
 template <typename stored_key_type_>
-st::status_t make_universe(std::uint64_t random_keys, random_t& random, basic_vector<stored_key_type_>& universe) {
+st::status_t make_universe(std::uint64_t random_keys, random_t& random, vector<stored_key_type_>& universe) {
     universe.clear();
     st::status_t status = append_adversarial_keys(universe);
     if (status != st::status_t::success_k) return status;
@@ -278,40 +280,40 @@ template <typename key_slot_type_>
 struct test_lsm_level {
 
     /** Every sorted run's key slots in ascending order, one sorted run after another. */
-    basic_vector<key_slot_type_> sorted;
+    vector<key_slot_type_> sorted;
 
     /** The stamp of every key slot of @c sorted, newest first among the versions of one key. */
-    basic_vector<std::uint64_t> stamps;
+    vector<std::uint64_t> stamps;
 
     /** The @c delta_kind_t of every key slot of @c sorted. */
-    basic_vector<std::uint8_t> kinds;
+    vector<std::uint8_t> kinds;
 
     /** Bytes the value of every key slot of @c sorted takes in its run's values section. */
-    basic_vector<std::uint32_t> sizes;
+    vector<std::uint32_t> sizes;
 
     /** Key slots in each sorted run. */
-    basic_vector<std::uint64_t> counts;
+    vector<std::uint64_t> counts;
 
     /** Every sorted run's cells, one sorted run after another. */
-    basic_vector<key_slot_type_> cells;
+    vector<key_slot_type_> cells;
 
     /** Every sorted run's stamps packed, as a run keeps them, or none for an LSM level without stamps. */
-    basic_vector<stamps_column_t> columns;
+    vector<stamps_column_t> columns;
 
     /** Every sorted run's kinds packed, as a run keeps them. */
-    basic_vector<kinds_column_t> kind_columns;
+    vector<kinds_column_t> kind_columns;
 
     /** Every sorted run's value offsets, one per key slot and one past the last, for a variable width alone. */
-    basic_vector<stored_value_offset_t> value_offsets;
+    vector<stored_value_offset_t> value_offsets;
 
     /** Where each sorted run's key slots start in @c sorted. */
-    basic_vector<std::uint64_t> firsts;
+    vector<std::uint64_t> firsts;
 
     /** A view per sorted run into @c cells, @c columns, @c kind_columns and @c value_offsets. */
-    basic_vector<sorted_run_index_view<key_slot_type_>> views;
+    vector<sorted_run_index_view<key_slot_type_>> views;
 
     /** Where each sorted run's sections sit in the suite's sections file, empty until @c lay_sections lays them. */
-    basic_vector<sorted_run_extents_t> extents;
+    vector<sorted_run_extents_t> extents;
 };
 
 /** The views of an LSM level's sorted runs, as a compaction takes them. */
@@ -324,9 +326,9 @@ std::span<sorted_run_index_view<key_slot_type_> const> views_of(
 /** Where every sorted run of @p upper, then of @p lower, sits on its volume, as a device compaction takes them: as
  *  @c lay_sections laid it, or nowhere for a run uploading from memory. */
 template <typename key_slot_type_>
-basic_vector<sorted_run_extents_t> extents_of(test_lsm_level<key_slot_type_> const& upper,
-                                              test_lsm_level<key_slot_type_> const& lower) noexcept {
-    basic_vector<sorted_run_extents_t> extents;
+vector<sorted_run_extents_t> extents_of(test_lsm_level<key_slot_type_> const& upper,
+                                        test_lsm_level<key_slot_type_> const& lower) noexcept {
+    vector<sorted_run_extents_t> extents;
     if (extents.resize(upper.views.size() + lower.views.size()) != st::status_t::success_k) return extents;
     for (std::size_t run = 0; run != upper.extents.size(); ++run) extents[run] = upper.extents[run];
     for (std::size_t run = 0; run != lower.extents.size(); ++run)
@@ -362,7 +364,7 @@ st::status_t pick_key_slots(std::span<typename key_slot_type_::stored_key_t cons
                             std::uint64_t era, random_t& random, test_lsm_level<key_slot_type_>& lsm_level) noexcept {
     std::uint64_t const half = stamps_per_sorted_run_k / 2;
     std::uint64_t const base = era * stamps_per_sorted_run_k;
-    basic_vector<std::uint64_t>& stamps = lsm_level.stamps;
+    vector<std::uint64_t>& stamps = lsm_level.stamps;
     auto const pick = [&](typename key_slot_type_::stored_key_t const& key) noexcept {
         key_slot_state_t const state = random_state(scenario, random);
         std::uint32_t size = 0;
@@ -451,7 +453,7 @@ st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level, std::uint64_t br
     status = lsm_level.kind_columns.resize(kinded ? lsm_level.counts.size() : 0);
     if (status != st::status_t::success_k) return status;
 
-    basic_vector<std::uint64_t> positions;
+    vector<std::uint64_t> positions;
     key_slot_type_ const poison = poison_key_slot<key_slot_type_>();
     std::uint64_t first = 0;
     std::uint64_t first_cell = 0;
@@ -507,10 +509,10 @@ st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level, std::uint64_t br
 template <typename key_slot_type_>
 st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot_type_> const& upper,
                                  test_lsm_level<key_slot_type_> const& lower, compaction_stamps_t const& stamps,
-                                 basic_vector<located_key_slot<key_slot_type_>>& survivors) noexcept {
+                                 vector<located_key_slot<key_slot_type_>>& survivors) noexcept {
     using record_t = located_key_slot<key_slot_type_>;
-    basic_vector<record_t> all;
-    st::status_t status = all.resize(upper.sorted.size() + lower.sorted.size());
+    vector<record_t> records;
+    st::status_t status = records.resize(upper.sorted.size() + lower.sorted.size());
     if (status != st::status_t::success_k) return status;
 
     std::size_t written = 0;
@@ -524,7 +526,7 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
                 delta_kind_t const kind = lsm_level->kinds.empty()
                                               ? delta_kind_t::write_k
                                               : static_cast<delta_kind_t>(lsm_level->kinds[first + position]);
-                all[written++] = record_t {
+                records[written++] = record_t {
                     lsm_level->sorted[first + position], sorted_run, kind, stamp, static_cast<std::uint32_t>(position),
                     lsm_level->sizes[first + position]};
             }
@@ -536,7 +538,7 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
     auto const rank = [upper_count](std::uint32_t index) noexcept {
         return index < upper_count ? upper_count - 1 - index : std::uint64_t {index};
     };
-    std::stable_sort(all.data(), all.data() + all.size(),
+    std::stable_sort(records.data(), records.data() + records.size(),
                      [&rank](record_t const& first, record_t const& second) noexcept {
                          if (first.key_slot.stored_key < second.key_slot.stored_key) return true;
                          if (second.key_slot.stored_key < first.key_slot.stored_key) return false;
@@ -546,19 +548,19 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
     bool const drops_removals = (kind == compaction_kind_t::overlapping_into_bottom_k) |
                                 (kind == compaction_kind_t::sorted_into_bottom_k);
     std::uint64_t const oldest_pin = stamps.pinned_count != 0 ? stamps.pinned[0] : ~std::uint64_t {0};
-    basic_vector<std::uint8_t> kept;
-    status = kept.resize(all.size());
+    vector<std::uint8_t> kept;
+    status = kept.resize(records.size());
     if (status != st::status_t::success_k) return status;
     survivors.clear();
-    for (std::size_t begin = 0; begin != all.size();) {
+    for (std::size_t begin = 0; begin != records.size();) {
         std::size_t end = begin + 1;
-        while (end != all.size() && all[end].key_slot.stored_key == all[begin].key_slot.stored_key) ++end;
+        while (end != records.size() && records[end].key_slot.stored_key == records[begin].key_slot.stored_key) ++end;
         for (std::size_t index = begin; index != end; ++index) kept[index] = 0;
 
         // The newest version at or below each of the ceiling, the horizon and every pin is read by someone
         auto const keep_newest_at_or_below = [&](std::uint64_t bound) noexcept {
             for (std::size_t index = begin; index != end; ++index)
-                if (all[index].stamp <= bound && all[index].stamp <= stamps.ceiling) {
+                if (records[index].stamp <= bound && records[index].stamp <= stamps.ceiling) {
                     kept[index] = 1;
                     return;
                 }
@@ -567,13 +569,13 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
         keep_newest_at_or_below(stamps.horizon);
         for (std::uint64_t pin = 0; pin != stamps.pinned_count; ++pin) keep_newest_at_or_below(stamps.pinned[pin]);
         for (std::size_t index = begin; index != end; ++index)
-            if (all[index].stamp > stamps.horizon && all[index].stamp <= stamps.ceiling) kept[index] = 1;
+            if (records[index].stamp > stamps.horizon && records[index].stamp <= stamps.ceiling) kept[index] = 1;
 
         for (std::size_t index = begin; index != end; ++index) {
             if (!kept[index]) continue;
-            bool const hides_nothing = all[index].stamp <= stamps.horizon && all[index].stamp <= oldest_pin;
-            if (drops_removals && all[index].kind == delta_kind_t::remove_k && hides_nothing) continue;
-            status = survivors.push_back(record_t {all[index]});
+            bool const hides_nothing = records[index].stamp <= stamps.horizon && records[index].stamp <= oldest_pin;
+            if (drops_removals && records[index].kind == delta_kind_t::remove_k && hides_nothing) continue;
+            status = survivors.push_back(record_t {records[index]});
             if (status != st::status_t::success_k) return status;
         }
         begin = end;
@@ -602,7 +604,7 @@ std::uint64_t source_begin_of(located_key_slot<key_slot_type_> const& record, so
 template <typename key_slot_type_>
 std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& bounds,
                              compaction_stamps_t const& stamps,
-                             basic_vector<located_key_slot<key_slot_type_>> const& wanted_survivors,
+                             vector<located_key_slot<key_slot_type_>> const& wanted_survivors,
                              test_lsm_level<key_slot_type_> const& upper, test_lsm_level<key_slot_type_> const& lower,
                              compaction_output<key_slot_type_> const& output) {
     using stored_key_t = typename key_slot_type_::stored_key_t;
@@ -661,8 +663,8 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
     std::size_t unordered = 0;
     std::size_t kept_removals = 0;
 
-    basic_vector<std::uint64_t> positions;
-    basic_vector<std::uint64_t> cell_of;
+    vector<std::uint64_t> positions;
+    vector<std::uint64_t> cell_of;
     stored_key_t previous {};
     std::uint64_t first = 0;
     std::uint64_t first_cell = 0;
@@ -704,8 +706,8 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
         std::uint64_t into_range = 0;
         for (std::uint64_t position = 0; position != count; ++position) {
             located_key_slot<key_slot_type_> const& wanted = wanted_survivors[first + position];
-            key_slot_type_ const& got = output.cells[first_cell + cell_of[position]];
-            wrong_key_slots += !same_key_slot(got, wanted.key_slot);
+            key_slot_type_ const& actual = output.cells[first_cell + cell_of[position]];
+            wrong_key_slots += !same_key_slot(actual, wanted.key_slot);
             if (offsets)
                 wrong_offsets += output.value_offsets[first + position + 1] - output.value_offsets[first + position] !=
                                  wanted.size;
@@ -730,8 +732,8 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
                              output.kinds[first + position] == static_cast<std::uint8_t>(delta_kind_t::remove_k) &&
                              stamps.pinned_count == 0 && stamps.horizon == ~std::uint64_t {0};
             if (first + position != 0)
-                unordered += got.stored_key < previous || (!versioned && got.stored_key == previous);
-            previous = got.stored_key;
+                unordered += actual.stored_key < previous || (!versioned && actual.stored_key == previous);
+            previous = actual.stored_key;
         }
         wrong_bytes += running != sorted_run.stored_values_bytes;
         wrong_copies += range != ranges_end;
@@ -922,10 +924,10 @@ std::size_t survives_follows_the_kind() {
 /** Checks that the split cuts sorted runs at the key slots capacity, at the file limit, and never below one. */
 std::size_t plan_sorted_runs_cuts_at_the_bounds() {
     std::size_t failures = 0;
-    basic_vector<compacted_sorted_run_t> sorted_runs;
+    vector<compacted_sorted_run_t> sorted_runs;
 
     // Stored value bytes read out of a prefix sum the caller fills, as both compactors read theirs
-    basic_vector<std::uint64_t> prefix;
+    vector<std::uint64_t> prefix;
     auto const read_prefix = [&prefix](std::uint64_t index, std::uint64_t& bytes) noexcept {
         bytes = prefix[index];
         return st::status_t::success_k;
@@ -1067,10 +1069,10 @@ std::size_t plan_sorted_runs_cuts_at_the_bounds() {
  *  past the ceiling, and a remove delta at the bottom only where a reader still needs it. */
 std::size_t survives_keeps_what_readers_read() {
     std::size_t failures = 0;
-    auto const version = [](std::uint64_t stamp, bool removal) noexcept {
+    auto const version = [](std::uint64_t stamp, delta_kind_t kind) noexcept {
         located_key_slot<checked_key_slot_t> record = checked_record(7, 0);
         record.stamp = stamp;
-        if (removal) record.kind = delta_kind_t::remove_k;
+        record.kind = kind;
         return record;
     };
     constexpr compaction_kind_t bottom = compaction_kind_t::sorted_into_bottom_k;
@@ -1085,38 +1087,39 @@ std::size_t survives_keeps_what_readers_read() {
     std::array<bool, 6> const wanted {true, false, true, false, true, false};
     std::size_t wrong = 0;
     for (std::size_t index = 0; index != chain.size(); ++index) {
-        located_key_slot<checked_key_slot_t> const current = version(chain[index], false);
-        located_key_slot<checked_key_slot_t> const previous = version(index ? chain[index - 1] : 0, false);
+        located_key_slot<checked_key_slot_t> const current = version(chain[index], delta_kind_t::write_k);
+        located_key_slot<checked_key_slot_t> const previous = version(index ? chain[index - 1] : 0,
+                                                                      delta_kind_t::write_k);
         wrong += survives(index ? &previous : nullptr, current, intermediate, stamps) != wanted[index];
     }
     failures += expect_eq(wrong, std::size_t {0});
 
     // A remove delta some reader sees stays even at the bottom; one older than every reader drops
-    located_key_slot<checked_key_slot_t> const newer = version(50, false);
-    failures += expect(survives(&newer, version(30, true), bottom, stamps));
-    failures += expect(!survives(&newer, version(10, true), bottom, stamps));
-    failures += expect(survives(&newer, version(10, true), intermediate, stamps));
+    located_key_slot<checked_key_slot_t> const newer = version(50, delta_kind_t::write_k);
+    failures += expect(survives(&newer, version(30, delta_kind_t::remove_k), bottom, stamps));
+    failures += expect(!survives(&newer, version(10, delta_kind_t::remove_k), bottom, stamps));
+    failures += expect(survives(&newer, version(10, delta_kind_t::remove_k), intermediate, stamps));
 
     // Past the horizon every version survives, and so does the newest beneath it
     compaction_stamps_t durable;
     durable.horizon = 30;
-    failures += expect(survives(&newer, version(45, false), intermediate, durable));
-    located_key_slot<checked_key_slot_t> const above = version(45, false);
-    failures += expect(survives(&above, version(25, false), intermediate, durable));
-    located_key_slot<checked_key_slot_t> const beneath = version(25, false);
-    failures += expect(!survives(&beneath, version(20, false), intermediate, durable));
-    failures += expect(survives(&newer, version(45, true), bottom, durable));
+    failures += expect(survives(&newer, version(45, delta_kind_t::write_k), intermediate, durable));
+    located_key_slot<checked_key_slot_t> const above = version(45, delta_kind_t::write_k);
+    failures += expect(survives(&above, version(25, delta_kind_t::write_k), intermediate, durable));
+    located_key_slot<checked_key_slot_t> const beneath = version(25, delta_kind_t::write_k);
+    failures += expect(!survives(&beneath, version(20, delta_kind_t::write_k), intermediate, durable));
+    failures += expect(survives(&newer, version(45, delta_kind_t::remove_k), bottom, durable));
 
     // Past the ceiling nothing survives, and the newest beneath it leads its key
     compaction_stamps_t mounted;
     mounted.horizon = 30;
     mounted.ceiling = 30;
-    failures += expect(!survives(static_cast<located_key_slot<checked_key_slot_t> const*>(nullptr), version(45, false),
-                                 intermediate, mounted));
-    located_key_slot<checked_key_slot_t> const dropped = version(45, false);
-    failures += expect(survives(&dropped, version(25, false), intermediate, mounted));
-    located_key_slot<checked_key_slot_t> const leader = version(25, false);
-    failures += expect(!survives(&leader, version(20, false), intermediate, mounted));
+    failures += expect(!survives(static_cast<located_key_slot<checked_key_slot_t> const*>(nullptr),
+                                 version(45, delta_kind_t::write_k), intermediate, mounted));
+    located_key_slot<checked_key_slot_t> const dropped = version(45, delta_kind_t::write_k);
+    failures += expect(survives(&dropped, version(25, delta_kind_t::write_k), intermediate, mounted));
+    located_key_slot<checked_key_slot_t> const leader = version(25, delta_kind_t::write_k);
+    failures += expect(!survives(&leader, version(20, delta_kind_t::write_k), intermediate, mounted));
     return failures;
 }
 
@@ -1135,7 +1138,15 @@ struct options_t {
 
     /** The process's drivers, which retained device zero's primary context, or none without a device. */
     gpu_drivers_t const* drivers = nullptr;
+
+    /** Device zero's table of the library's kernels, or none where the build links no bundle. */
+    kernel_table<cuda_module_t> const* kernels = nullptr;
 };
+
+/** Loads the library's bundle onto device zero into @p tables and answers its table, or null where
+ *  this build of the suite links no bundle, as its host build does. */
+kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t const& drivers,
+                                                 kernel_tables<cuda_module_t>& tables) noexcept;
 
 /** Spawns an executor on CUDA device zero with a stream of its own, its scratch capped at @p scratch_limit bytes, or
  *  refuses with @c device_k where no driver reaches the device. */
@@ -1143,7 +1154,7 @@ expected<cuda_executor_t> spawn_device_zero(options_t const& options, std::size_
     if (options.drivers == nullptr || options.drivers->cuda_contexts[0] == nullptr)
         return status_t {status_code_t::device_k, "No CUDA device zero"};
     return cuda_executor_t::spawn(options.drivers->cuda, options.drivers->cuda_contexts[0], 0, gpu_class_t::unknown_k,
-                                  nullptr, scratch_limit, ustore_gds_automatic_k);
+                                  nullptr, scratch_limit, ustore_gds_automatic_k, options.kernels);
 }
 
 /** Bounds where the key slots capacity cuts sorted runs. */
@@ -1222,7 +1233,7 @@ std::size_t uuid_orders_like_memcmp(options_t const& options) {
 std::size_t sorted_run_index_layout_matches_builder() {
     std::size_t failures = 0;
     std::size_t mismatches = 0;
-    basic_vector<std::uint64_t> positions;
+    vector<std::uint64_t> positions;
     auto const check = [&](std::uint64_t count, std::uint64_t branching) {
         sorted_run_index_layout_t const layout(count, branching);
         std::uint64_t const rows = divide_round_up(count, branching);
@@ -1274,6 +1285,8 @@ template <typename key_slot_type_>
 case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                        test_lsm_level<key_slot_type_> const& upper, test_lsm_level<key_slot_type_> const& lower,
                        compaction_output<key_slot_type_> const& host, options_t const& options) {
+    if constexpr (!std::is_same_v<typename key_slot_type_::stored_key_t, st::key128_t>)
+        return case_result_t::skipped("the bundle carries merge kernels for 16-byte keys alone");
     expected<cuda_executor_t> executor = spawn_device_zero(options, 0);
     if (!executor) return case_result_t::skipped("no CUDA device");
     expected<cuda_compactor_t> compactor = cuda_compactor_t::make(*executor);
@@ -1322,7 +1335,7 @@ std::size_t report_compaction(suite_totals_t& totals, char const* host_name, cha
                               test_lsm_level<key_slot_type_> const& lower, options_t const& options) {
     if (!totals.selects(host_name) && !totals.selects(gpu_name)) return 0;
     std::size_t failures = 0;
-    basic_vector<located_key_slot<key_slot_type_>> survivors;
+    vector<located_key_slot<key_slot_type_>> survivors;
     st::status_t status = reference_survivors(kind, upper, lower, stamps, survivors);
     failures += expect(status == st::status_t::success_k);
     if (failures != 0) return report(totals, host_name, failures);
@@ -1346,7 +1359,7 @@ std::size_t report_compaction(suite_totals_t& totals, char const* host_name, cha
 template <typename key_slot_type_>
 compaction_stamps_t scenario_stamps(scenario_t const& scenario, test_lsm_level<key_slot_type_> const& upper,
                                     test_lsm_level<key_slot_type_> const& lower, random_t& random,
-                                    basic_vector<std::uint64_t>& pins) noexcept {
+                                    vector<std::uint64_t>& pins) noexcept {
     compaction_stamps_t stamps;
     std::uint64_t const range = (scenario.upper_sorted_runs + 2) * stamps_per_sorted_run_k;
     auto const at = [range](std::uint64_t per_mille) noexcept {
@@ -1384,7 +1397,7 @@ std::size_t run_scenario(suite_totals_t& totals, char const* shape, std::size_t 
 
     std::size_t failures = 0;
     random_t random = options.random.fork(scenario_index);
-    basic_vector<stored_key_t> universe;
+    vector<stored_key_t> universe;
     std::uint64_t const random_keys = scenario.random_keys != 0 ? scenario.random_keys : options.large_universe.value;
     st::status_t status = make_universe(random_keys, random, universe);
     failures += expect(status == st::status_t::success_k);
@@ -1404,7 +1417,7 @@ std::size_t run_scenario(suite_totals_t& totals, char const* shape, std::size_t 
     if (status == st::status_t::success_k) status = lay_out(lower, scenario.bounds.branching);
     failures += expect(status == st::status_t::success_k);
     if (failures != 0) return report(totals, host_name, failures);
-    basic_vector<std::uint64_t> pins;
+    vector<std::uint64_t> pins;
     compaction_stamps_t const stamps = scenario_stamps(scenario, upper, lower, random, pins);
     return report_compaction(totals, host_name, gpu_name, scenario.kind, shaped_bounds<key_slot_type_>(scenario.bounds),
                              stamps, upper, lower, options);
@@ -1418,7 +1431,7 @@ std::size_t run_scenario(suite_totals_t& totals, char const* shape, std::size_t 
 inline constexpr std::size_t lettered_keys_count_k = 26;
 
 /** The 26 lettered 64-bit keys, ascending: both ends of the type, the sign boundary, and powers of two between. */
-st::status_t append_lettered_keys(basic_vector<std::uint64_t>& keys) noexcept {
+st::status_t append_lettered_keys(vector<std::uint64_t>& keys) noexcept {
     constexpr std::uint64_t ones = ~std::uint64_t {0};
     constexpr std::uint64_t sign = std::uint64_t {1} << 63;
     std::array<std::uint64_t, lettered_keys_count_k> const lettered {
@@ -1457,7 +1470,7 @@ st::status_t append_lettered_keys(basic_vector<std::uint64_t>& keys) noexcept {
 }
 
 /** The 26 lettered 16-byte keys, ascending: both ends of the type, one shared high word, and the sign boundary. */
-st::status_t append_lettered_keys(basic_vector<st::key128_t>& keys) noexcept {
+st::status_t append_lettered_keys(vector<st::key128_t>& keys) noexcept {
     constexpr std::uint64_t ones = ~std::uint64_t {0};
     constexpr std::uint64_t sign = std::uint64_t {1} << 63;
     std::array<st::key128_t, lettered_keys_count_k> const lettered {{
@@ -1590,7 +1603,7 @@ std::size_t run_handmade_case(suite_totals_t& totals, char const* shape, std::si
 
     std::size_t failures = 0;
     random_t random = options.random.fork(scenarios_k.size() + case_index);
-    basic_vector<stored_key_t> lettered;
+    vector<stored_key_t> lettered;
     st::status_t status = append_lettered_keys(lettered);
     failures += expect(status == st::status_t::success_k);
     failures += expect_eq(lettered.size(), lettered_keys_count_k);
@@ -1621,7 +1634,7 @@ std::size_t run_handmade_case(suite_totals_t& totals, char const* shape, std::si
 #pragma region Graph Folds
 
 /** The key slot a graph's merges move: a vertex's key, its value found through its run's value offsets. */
-using graph_key_slot_t = variable_width_key_slot<std::uint64_t>;
+using graph_key_slot_t = variable_width_key_slot<st::key128_t>;
 
 /** The LSM levels of a graph collection, and the values every key slot of theirs locates. */
 struct graph_levels_t {
@@ -1633,10 +1646,10 @@ struct graph_levels_t {
     test_lsm_level<graph_key_slot_t> lower;
 
     /** The values of every key slot of both levels back to back, the upper level's runs first. */
-    basic_vector<byte_t> values;
+    vector<byte_t> values;
 
     /** Where the value of every key slot starts in @c values, in the same order. */
-    basic_vector<std::uint64_t> value_begins;
+    vector<std::uint64_t> value_begins;
 
     /** Records across every change delta of both levels. */
     std::uint64_t half_edges = 0;
@@ -1718,7 +1731,7 @@ st::status_t add_graph_key_slot(graph_case_t const& graph_case, std::uint64_t ve
     if (lower && roll < graph_case.bases_per_mille) kind = delta_kind_t::write_k;
     else if (lower && roll < graph_case.bases_per_mille + graph_case.removals_per_mille) kind = delta_kind_t::remove_k;
 
-    basic_vector<graph::half_edge_delta_t> deltas;
+    vector<graph::half_edge_delta_t> deltas;
     std::uint64_t const count = 1 + random.below(2 * records);
     for (std::uint64_t index = 0; index != count && kind != delta_kind_t::remove_k; ++index)
         if (st::status_t const status = deltas.push_back(random_half_edge(random)); status != st::status_t::success_k)
@@ -1745,7 +1758,7 @@ st::status_t add_graph_key_slot(graph_case_t const& graph_case, std::uint64_t ve
     else levels.half_edges += kept;
 
     graph_key_slot_t key_slot;
-    key_slot.stored_key = vertex;
+    key_slot.stored_key = st::key128_t {0, vertex};
     std::size_t const begin = levels.values.size();
     std::uint32_t const size = static_cast<std::uint32_t>(kept * graph::half_edge_delta_bytes_k);
     st::status_t status = levels.values.resize(begin + size);
@@ -1796,7 +1809,7 @@ st::status_t make_graph_levels(graph_case_t const& graph_case, sorted_run_bounds
 
 /** Pins @p count stamps drawn from the levels, as readers would. */
 compaction_stamps_t graph_stamps(graph_levels_t const& levels, std::uint64_t count, random_t& random,
-                                 basic_vector<std::uint64_t>& pins) noexcept {
+                                 vector<std::uint64_t>& pins) noexcept {
     pins.clear();
     std::size_t const total = levels.upper.stamps.size() + levels.lower.stamps.size();
     for (std::uint64_t pin = 0; pin != count && total != 0; ++pin) {
@@ -1834,7 +1847,7 @@ case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_in
     graph_levels_t levels;
     failures += expect(make_graph_levels(graph_case, roomy_bounds_k, random, levels) == st::status_t::success_k);
     if (failures != 0) return failures;
-    basic_vector<std::uint64_t> pins;
+    vector<std::uint64_t> pins;
     compaction_stamps_t const stamps = graph_stamps(levels, graph_case.pinned, random, pins);
 
     using record_t = located_key_slot<graph_key_slot_t>;
@@ -1901,10 +1914,10 @@ case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_in
 #pragma region Sections By Extent
 
 /** The cuFile disk the extent case reads run sections through, as an engine's mount holds one. */
-using cufile_disk_t = linux_cufile_files_disk<fu::standard_atomic_ref, fu::standard_yield_t>;
+using linux_cufile_disk_t = linux_cufile_files_disk<fu::standard_atomic_ref, fu::standard_yield_t>;
 
 /** Appends @p bytes to @p image, zero-padded to a page, answering the extent they take in it. */
-extent_t append_section(basic_vector<byte_t>& image, std::span<byte_t const> bytes) {
+extent_t append_section(vector<byte_t>& image, std::span<byte_t const> bytes) {
     std::uint64_t const offset = image.size();
     std::uint64_t const length = round_up_to_multiple<std::uint64_t>(bytes.size(), portable_alignment_k);
     if (image.resize(static_cast<std::size_t>(offset + length)) != st::status_t::success_k) return extent_t {};
@@ -1918,7 +1931,7 @@ extent_t append_section(basic_vector<byte_t>& image, std::span<byte_t const> byt
 template <typename key_slot_type_>
 std::size_t lay_sections(test_lsm_level<key_slot_type_>& level, sorted_run_bounds_t const& bounds,
                          std::type_identity_t<sorted_run_index_view<key_slot_type_>> const* zeroed,
-                         basic_vector<byte_t>& image) {
+                         vector<byte_t>& image) {
     std::size_t failures = expect(level.extents.resize(level.views.size()) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t run = 0; run != level.views.size(); ++run) {
@@ -1935,7 +1948,7 @@ std::size_t lay_sections(test_lsm_level<key_slot_type_>& level, sorted_run_bound
         if (failures != 0) return failures;
         stamps_column_t const& stamps = &view == zeroed || view.stamps == nullptr ? *zeros : *view.stamps;
         kinds_column_t const& kinds = view.kinds != nullptr ? *view.kinds : *writes;
-        basic_vector<byte_t> trailer;
+        vector<byte_t> trailer;
         failures += expect(trailer.resize(stamps.saved_bytes() + kinds.saved_bytes()) == st::status_t::success_k);
         if (failures != 0) return failures;
         std::span<std::byte> const room {reinterpret_cast<std::byte*>(trailer.data()), trailer.size()};
@@ -1951,10 +1964,10 @@ std::size_t lay_sections(test_lsm_level<key_slot_type_>& level, sorted_run_bound
 /** Merges levels whose run sections read by extent through cuFile, the newest run ingested with zero stamps on disk,
  *  and expects the host's output from them, as from the same merge uploading every run from memory, timing both. */
 case_result_t gpu_reads_sections_by_extent(options_t const& options, std::string_view directory) {
-    using key_slot_t = variable_width_key_slot<std::uint64_t>;
+    using key_slot_t = variable_width_key_slot<st::key128_t>;
     if (directory.empty()) return case_result_t::skipped(needs_directory_k);
     if (options.drivers == nullptr) return case_result_t::skipped("no CUDA device");
-    linux_cufile_probe_t const probe = cufile_disk_t::probe(options.drivers->cufile);
+    linux_cufile_probe_t const probe = linux_cufile_disk_t::probe(options.drivers->cufile);
     if (probe == linux_cufile_probe_t::absent_k || probe == linux_cufile_probe_t::refused_k)
         return case_result_t::skipped("needs cuFile in direct or compat mode");
     expected<cuda_executor_t> executor = spawn_device_zero(options, 0);
@@ -1963,11 +1976,11 @@ case_result_t gpu_reads_sections_by_extent(options_t const& options, std::string
     std::size_t failures = 0;
     scenario_t const& scenario = scenarios_k[8];
     random_t random = options.random.fork(scenarios_k.size() * 2);
-    basic_vector<std::uint64_t> universe;
+    vector<st::key128_t> universe;
     failures += expect(make_universe(options.large_universe.value, random, universe) == st::status_t::success_k);
     test_lsm_level<key_slot_t> upper;
     test_lsm_level<key_slot_t> lower;
-    std::span<std::uint64_t const> const keys {universe};
+    std::span<st::key128_t const> const keys {universe};
     st::status_t status = add_overlapping_sorted_runs(keys, scenario, scenario.upper_sorted_runs, 1, random, upper);
     if (status == st::status_t::success_k)
         status = add_sorted_sorted_runs(keys, scenario, scenario.lower_sorted_runs, 0, random, lower);
@@ -1988,7 +2001,7 @@ case_result_t gpu_reads_sections_by_extent(options_t const& options, std::string
     stamps_column_t const& assigned_column = *assigned;
     ingested.stamps = &assigned_column;
 
-    basic_vector<byte_t> image;
+    vector<byte_t> image;
     sorted_run_bounds_t const bounds = shaped_bounds<key_slot_t>(scenario.bounds);
     failures += lay_sections(upper, bounds, &ingested, image);
     failures += lay_sections(lower, bounds, nullptr, image);
@@ -2003,15 +2016,15 @@ case_result_t gpu_reads_sections_by_extent(options_t const& options, std::string
     failures += expect(std::fclose(file) == 0);
 
     linux_cufile_disk_config_t config;
-    config.gds = probe == linux_cufile_probe_t::direct_k ? ustore_gds_direct_k : ustore_gds_compat_k;
-    expected<cufile_disk_t> disk = cufile_disk_t::make(options.drivers->cufile, config);
+    config.gds = probe == linux_cufile_probe_t::direct_k ? ustore_gds_direct_k : ustore_gds_compatibility_k;
+    expected<linux_cufile_disk_t> disk = linux_cufile_disk_t::make(options.drivers->cufile, config);
     failures += expect_status(disk, status_code_t::success_k);
     if (failures != 0) return failures;
     medium_options_t request;
     request.name = path.c_str();
     request.access = medium_access_t::read_only_k;
 
-    basic_vector<std::uint64_t> pins;
+    vector<std::uint64_t> pins;
     compaction_stamps_t const stamps = scenario_stamps(scenario, upper, lower, random, pins);
     auto const read_nothing = [](located_key_slot<key_slot_t> const&, arena_allocator<byte_t>&,
                                  std::span<byte_t const>&) noexcept { return st::status_t::invalid_argument_k; };
@@ -2020,7 +2033,7 @@ case_result_t gpu_reads_sections_by_extent(options_t const& options, std::string
                                                    last_write_fold_t {}, read_nothing,
                                                    host) == st::status_t::success_k);
     {
-        using reader_t = ring_sections_reader<cufile_disk_t, fu::standard_yield_t>;
+        using reader_t = ring_sections_reader<linux_cufile_disk_t, fu::standard_yield_t>;
         expected<reader_t> reader = reader_t::make(std::move(*disk), std::span<medium_options_t const> {&request, 1});
         failures += expect_status(reader, status_code_t::success_k);
         if (failures != 0) return failures;
@@ -2075,8 +2088,9 @@ int main(int argc, char** argv) {
         return status == argument_status_t::help_k ? 0 : 1;
     options.random = suite.random();
     suite_totals_t totals = suite.totals();
-    gpu_drivers_t const drivers;
-    if (drivers.cuda_contexts[0]) options.drivers = &drivers;
+    gpu_drivers_t drivers;
+    kernel_tables<cuda_module_t> kernels;
+    if (drivers.retain_context(0)) options.drivers = &drivers, options.kernels = suite_kernels(drivers, kernels);
 
     report(totals, "compaction.uuid_orders_like_memcmp", uuid_orders_like_memcmp, options);
     report(totals, "compaction.sorted_run_index_layout_matches_builder", sorted_run_index_layout_matches_builder);

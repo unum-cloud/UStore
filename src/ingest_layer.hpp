@@ -1,5 +1,5 @@
 /**
- *  @file src/blobs_layers/ingest.hpp
+ *  @file src/ingest_layer.hpp
  *  @author Ash Vardanian
  *  @date October 29, 2026
  *  @brief The values an ingest lands for its keyed rows, as an engine keeping every document and page as one value
@@ -19,8 +19,8 @@
 #include "ustore/pages/element_tree.hpp"    // `placement_t`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_rewind`, `arena_copy`, `arena_free_blocks`
 
-#include "blobs_layers/pages.hpp" // `import_page_tree`, `element_key_of`, `clock_stamp`, `page_allocator_t`
-#include "utilities/batches.hpp"  // `keyed_rows_t`
+#include "pages_layer.hpp"       // `import_page_tree`, `element_key_of`, `clock_stamp`, `page_allocator_t`
+#include "utilities/batches.hpp" // `keyed_rows_t`
 
 namespace unum::ustore {
 
@@ -45,14 +45,14 @@ inline ingest_values_t ingest_values_of(ustore_modality_t modality) noexcept {
 }
 
 /** The bytes an ingest files for the value of every keyed row, parsing documents and pages, and keeping every page
- *  tree until @c rewind. */
-class ingest_value_parser_t {
+ *  tree until @c rewind, unescaping pages through @p strings_kit_type_. */
+template <strings_kit_concept strings_kit_type_>
+class ingest_value_parser {
   public:
-    ingest_value_parser_t(ingest_values_t values, stringzilla_kernels_t const& kernels) noexcept
-        : values_(values), kernels_(kernels), placement_ {clock_stamp(), 0} {}
-    ingest_value_parser_t(ingest_value_parser_t const&) = delete;
-    ingest_value_parser_t& operator=(ingest_value_parser_t const&) = delete;
-    ~ingest_value_parser_t() noexcept {
+    explicit ingest_value_parser(ingest_values_t values) noexcept : values_(values), placement_ {clock_stamp(), 0} {}
+    ingest_value_parser(ingest_value_parser const&) = delete;
+    ingest_value_parser& operator=(ingest_value_parser const&) = delete;
+    ~ingest_value_parser() noexcept {
         arena_free_blocks(parsing_);
         arena_free_blocks(trees_);
     }
@@ -72,9 +72,9 @@ class ingest_value_parser_t {
             if (parsed.failed()) return parsed;
             return bytes;
         }
-        auto [tree, tree_status] = import_page_tree(pages::page_encoding_t::xml_k, string_of(given),
-                                                    element_key_of(rows.keys[row]), placement_, kernels_,
-                                                    page_allocator_t {&parsing_});
+        auto [tree, tree_status] = import_page_tree<strings_kit_type_>(pages::page_encoding_t::xml_k, string_of(given),
+                                                                       element_key_of(rows.keys[row]), placement_,
+                                                                       page_allocator_t {&parsing_});
         if (tree_status.failed()) return tree_status;
         ++placement_.sequence;
         auto [kept, kept_status] = arena_copy<byte_t>(&trees_, tree);
@@ -84,7 +84,6 @@ class ingest_value_parser_t {
 
   private:
     ingest_values_t values_ = ingest_values_t::bytes_k;
-    stringzilla_kernels_t const& kernels_;
 
     /** Where every page of the ingest is placed, its sequence counting the pages parsed so far. */
     pages::placement_t placement_;

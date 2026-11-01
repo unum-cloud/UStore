@@ -4,16 +4,18 @@
  *  @date September 19, 2026
  *  @brief The SPDK transport: its probe on any machine, and the ring contract over an NVMe/TCP target.
  *
- *  The probe is what keeps a failed mount from killing the process: @c rte_eal_init calls @c exit
- *  when it wants hugepages and finds none, when the drive is still the kernel's, or when
- *  @c /dev/vfio will not open, so the decision is made by reading files rather than by trying, and
- *  the parsers the probe is built from are exercised against synthetic text.
+ *  The probe is what keeps a failed mount from killing the process: @c rte_eal_init
+ *  calls @c exit when it wants hugepages and finds none, when the drive is still the
+ *  kernel's, or when @c /dev/vfio will not open, so the decision is made by reading
+ *  files rather than by trying, and the parsers the probe is built from are exercised
+ *  against synthetic text.
  *
- *  The ring cases run over a fabric, since a fabric needs no hugepage, no VFIO and no root. With
- *  @c --spdk-address the suite connects to a target that is already up; with @c --spdk-root it
- *  starts one itself through @c scripts/rigs/spdk_target.sh, a malloc bdev exported over NVMe/TCP,
- *  and stops it after. A namespace never answers a partial transfer, so the shared cases run with the
- *  read past the namespace refused whole rather than clipped.
+ *  The ring cases run over a fabric, since a fabric needs no hugepage, no VFIO and no
+ *  root. With @c --spdk-address the suite connects to a target that is already up;
+ *  with @c --spdk-root it starts one itself through @c scripts/rigs/spdk_target.sh, a
+ *  malloc bdev exported over NVMe/TCP, and stops it after. A namespace never answers a
+ *  partial transfer, so the shared cases run with the read past the namespace refused
+ *  whole rather than clipped.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -30,9 +32,9 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
 
-#include "ustore/utilities/types.hpp" // `status_t`, `expected`
+#include "ustore/utilities/types.hpp" // `expected`
 
-#include "ustore/utilities/nvme_linux_spdk_disk.hpp" // `linux_spdk_disk_t`, `spdk_environment_t`, `linux_spdk_probe_t`
+#include "ustore/utilities/nvme_linux_spdk_disk.hpp" // `linux_spdk_disk_t`, `linux_spdk_environment_t`, `linux_spdk_probe_t`
 #include "ustore/utilities/nvme_ring.hpp"            // `ring_concept`, `queue_pair_t`
 
 #include "nvme/ring_cases.hpp" // `ring_cases`, `ring_edge_t`, every transport-independent result
@@ -44,10 +46,13 @@
 
 namespace unum::ustore::test {
 
+using namespace unum::ustore::test::nvme;
+
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
 
 using linux_spdk_disk_t = linux_spdk_disk<atomic_reference, waiter_t>;
+using linux_spdk_environment_t = linux_spdk_environment<atomic_reference>;
 
 #pragma region Fixtures
 
@@ -64,7 +69,7 @@ constexpr char const* fabric_address_k =
 [[maybe_unused]] constexpr std::uint16_t spdk_queue_pairs_k = 4;
 
 /** The flags this suite adds to the shared ones. */
-struct spdk_suite_flags_t {
+struct linux_spdk_suite_flags_t {
 
     /** An SPDK tree with a finished build, whose target the suite starts and stops through the rig. */
     std::string_view root;
@@ -136,12 +141,12 @@ MemFree:         98765432 kB
 /** A bogus address answers @c not_found_k, without a crash and without a wait. */
 [[nodiscard]] std::size_t spdk_refuses_an_absent_address() {
     std::size_t failures = 0;
-    failures += expect(spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe(nullptr) == linux_spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe("") == linux_spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe("not an address") == linux_spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe("0000:ff:1f.7:0") == linux_spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe("/dev/nvme0n1") == linux_spdk_probe_t::not_found_k);
+    failures += expect(linux_spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
+    failures += expect(linux_spdk_environment_t::probe(nullptr) == linux_spdk_probe_t::not_found_k);
+    failures += expect(linux_spdk_environment_t::probe("") == linux_spdk_probe_t::not_found_k);
+    failures += expect(linux_spdk_environment_t::probe("not an address") == linux_spdk_probe_t::not_found_k);
+    failures += expect(linux_spdk_environment_t::probe("0000:ff:1f.7:0") == linux_spdk_probe_t::not_found_k);
+    failures += expect(linux_spdk_environment_t::probe("/dev/nvme0n1") == linux_spdk_probe_t::not_found_k);
     return failures;
 }
 
@@ -214,16 +219,17 @@ MemFree:         98765432 kB
 /** A fabric transport ID probes available at once, since nothing on the machine can stand in its way. */
 [[nodiscard]] std::size_t spdk_passes_a_fabric_address() {
     std::size_t failures = 0;
-    failures += expect(spdk_transport_named(fabric_address_k) == spdk_transport_t::fabric_k);
-    failures += expect(spdk_transport_named("TRTYPE:tcp traddr:10.0.0.1") == spdk_transport_t::fabric_k);
-    failures += expect(spdk_transport_named("trtype:PCIe traddr:0000:01:00.0") == spdk_transport_t::pcie_k);
-    failures += expect(spdk_transport_named("0000:01:00.0") == spdk_transport_t::pcie_k);
-    failures += expect(spdk_transport_named("") == spdk_transport_t::pcie_k);
+    failures += expect(spdk_transport_named(fabric_address_k) == linux_spdk_transport_t::fabric_k);
+    failures += expect(spdk_transport_named("TRTYPE:tcp traddr:10.0.0.1") == linux_spdk_transport_t::fabric_k);
+    failures += expect(spdk_transport_named("trtype:PCIe traddr:0000:01:00.0") == linux_spdk_transport_t::pcie_k);
+    failures += expect(spdk_transport_named("0000:01:00.0") == linux_spdk_transport_t::pcie_k);
+    failures += expect(spdk_transport_named("") == linux_spdk_transport_t::pcie_k);
     failures += expect(transport_field("trtype:TCP traddr:10.0.0.1 trsvcid:4420", "traddr:") == "10.0.0.1");
     failures += expect(transport_field("trtype:TCP traddr:10.0.0.1 trsvcid:4420", "trsvcid:") == "4420");
     failures += expect(transport_field("trtype:TCP", "traddr:").empty());
-    failures += expect(spdk_environment_t::probe(fabric_address_k) == linux_spdk_probe_t::available_k);
-    failures += expect(spdk_environment_t::probe("trtype:PCIe traddr:0000:ff:1f.7") == linux_spdk_probe_t::not_found_k);
+    failures += expect(linux_spdk_environment_t::probe(fabric_address_k) == linux_spdk_probe_t::available_k);
+    failures += expect(linux_spdk_environment_t::probe("trtype:PCIe traddr:0000:ff:1f.7") ==
+                       linux_spdk_probe_t::not_found_k);
     return failures;
 }
 
@@ -237,10 +243,10 @@ MemFree:         98765432 kB
     std::string_view const first = first_pci_address(address);
     if (first.empty()) {
         fmt::println("  this machine lists no PCIe device, so every address probes not_found_k");
-        return failures + expect(spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
+        return failures + expect(linux_spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
     }
 
-    linux_spdk_probe_t const result = spdk_environment_t::probe(address.data());
+    linux_spdk_probe_t const result = linux_spdk_environment_t::probe(address.data());
     fmt::println("  probe({}) answers {}, with {} of {} hugepages free", first, describe(result), hugepages.free_pages,
                  hugepages.total_pages);
     if (hugepages.free_pages == 0) failures += expect(result == linux_spdk_probe_t::without_hugepages_k);
@@ -287,12 +293,12 @@ enum class rig_state_t : std::uint8_t {
 };
 
 /** A target the suite started itself, stopped when the handle dies. */
-class spdk_rig_t {
+class linux_spdk_rig_t {
   public:
-    spdk_rig_t() noexcept = default;
-    spdk_rig_t(spdk_rig_t const&) = delete;
-    spdk_rig_t& operator=(spdk_rig_t const&) = delete;
-    ~spdk_rig_t() noexcept { down(); }
+    linux_spdk_rig_t() noexcept = default;
+    linux_spdk_rig_t(linux_spdk_rig_t const&) = delete;
+    linux_spdk_rig_t& operator=(linux_spdk_rig_t const&) = delete;
+    ~linux_spdk_rig_t() noexcept { down(); }
 
     /** Starts the target of @p root, answering whether it listens; the address and the serial follow. */
     [[nodiscard]] bool up(std::string_view root) noexcept {
@@ -341,7 +347,7 @@ class spdk_rig_t {
 /** The controller identifies as the serial the rig set; a foreign target's serial is only printed. */
 [[nodiscard]] std::size_t spdk_identifies_the_controller(linux_spdk_disk_t& disk, std::string_view wanted) {
     std::size_t failures = 0;
-    spdk_controller_identity_t const identity = disk.identity();
+    linux_spdk_controller_identity_t const identity = disk.identity();
     fmt::println("  serial {}, model {}", identity.serial, identity.model);
     failures += expect(std::strlen(identity.serial) != 0);
     if (!wanted.empty()) failures += expect(std::string_view {identity.serial} == wanted);
@@ -367,7 +373,8 @@ class spdk_rig_t {
 
 /** Connects to @p address, checks what the controller says it is, and runs the ring contract over it. */
 void spdk_transport(suite_totals_t& totals, char const* address, std::string_view serial) {
-    expected<spdk_environment_t> environment = spdk_environment_t::acquire(spdk_environment_config_t {});
+    expected<linux_spdk_environment_t> environment = linux_spdk_environment_t::acquire(
+        linux_spdk_environment_config_t {});
     if (report(totals, "linux-spdk.environment", expect_status(environment, status_code_t::success_k)) != 0) return;
 
     linux_spdk_disk_config_t config;
@@ -399,7 +406,7 @@ void spdk_transport(suite_totals_t& totals, char const* address, std::string_vie
 }
 
 /** Runs the transport where the flags name a target, starting one through the rig when asked to. */
-void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_suite_flags_t const& flags) {
+void spdk_suite(suite_totals_t& totals, suite_options_t const& options, linux_spdk_suite_flags_t const& flags) {
     if (!options.spdk_address.empty()) {
         spdk_transport(totals, options.spdk_address.data(), flags.serial);
         return;
@@ -408,7 +415,7 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_sui
         report(totals, "linux-spdk", case_result_t::skipped("needs --spdk-address or --spdk-root"));
         return;
     }
-    spdk_rig_t rig;
+    linux_spdk_rig_t rig;
     if (report(totals, "linux-spdk.rig", expect(rig.up(flags.root))) != 0) return;
     fmt::println("  target at {}", rig.address());
     spdk_transport(totals, rig.address(), flags.serial.empty() ? std::string_view {rig.serial()} : flags.serial);
@@ -424,13 +431,14 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_sui
 /** Every entry point answers @c unsupported_k in a build that carries no driver, and nothing crashes. */
 [[nodiscard]] std::size_t spdk_refuses_without_the_option() {
     std::size_t failures = 0;
-    failures += expect_status(spdk_environment_t::acquire(spdk_environment_config_t {}), status_code_t::unsupported_k);
+    failures += expect_status(linux_spdk_environment_t::acquire(linux_spdk_environment_config_t {}),
+                              status_code_t::unsupported_k);
 
     linux_spdk_disk_config_t config;
     config.queue_pairs_limit = 4;
     config.depth_limit = 8;
     config.registered_memory_limit = 4;
-    expected<linux_spdk_disk_t> disk = linux_spdk_disk_t::open(spdk_environment_t {}, absent_address_k, config);
+    expected<linux_spdk_disk_t> disk = linux_spdk_disk_t::open(linux_spdk_environment_t {}, absent_address_k, config);
     failures += expect_status(disk, status_code_t::unsupported_k);
 
     linux_spdk_disk_t empty;
@@ -464,7 +472,7 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_sui
 }
 
 /** Checks the refusals, and reports that the transport itself needs a build that carries the driver. */
-void spdk_suite(suite_totals_t& totals, suite_options_t const&, spdk_suite_flags_t const&) {
+void spdk_suite(suite_totals_t& totals, suite_options_t const&, linux_spdk_suite_flags_t const&) {
     report(totals, "linux-spdk.refuses_without_the_option", spdk_refuses_without_the_option);
     report(totals, "linux-spdk", case_result_t::skipped("needs a build with USTORE_WITH_SPDK"));
 }
@@ -482,7 +490,7 @@ int main(int argc, char const* argv[]) {
     using namespace unum::ustore::utilities;
 
     suite_options_t options;
-    spdk_suite_flags_t flags;
+    linux_spdk_suite_flags_t flags;
     std::array<flag_t, 2> const suite_flags {{
         {"--spdk-root", "path", "SPDK tree with a finished build, whose target the suite starts and stops",
          &flags.root},

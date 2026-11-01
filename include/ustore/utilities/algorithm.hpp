@@ -24,8 +24,8 @@
 namespace unum::ustore::utilities {
 
 /** The position of the first element of a sorted range that is not less than @p wanted. */
-template <std::ranges::random_access_range range_, typename wanted_>
-std::size_t offset_in_sorted(range_ const& sorted, wanted_ const& wanted) noexcept {
+template <std::ranges::random_access_range range_type_, typename wanted_type_>
+std::size_t offset_in_sorted(range_type_ const& sorted, wanted_type_ const& wanted) noexcept {
     return static_cast<std::size_t>(std::ranges::lower_bound(sorted, wanted) - std::ranges::begin(sorted));
 }
 
@@ -37,8 +37,8 @@ std::size_t offset_in_sorted(range_ const& sorted, wanted_ const& wanted) noexce
  *      answering a status, and address a key with @c operator[].
  *  @see https://en.wikipedia.org/wiki/Reservoir_sampling
  */
-template <typename iterator_, typename outputs_type_>
-status_t reservoir_sample_iterator(iterator_&& iterator, std::size_t limit, outputs_type_& outputs) {
+template <typename iterator_type_, typename outputs_type_>
+status_t reservoir_sample_iterator(iterator_type_&& iterator, std::size_t limit, outputs_type_& outputs) {
 
     auto const seed = static_cast<std::minstd_rand::result_type>(
         std::chrono::steady_clock::now().time_since_epoch().count());
@@ -61,29 +61,30 @@ status_t reservoir_sample_iterator(iterator_&& iterator, std::size_t limit, outp
 }
 
 /** Inserts trivially copyable elements at @p offset of a buffer with spare capacity and returns the new length. */
-template <typename element_>
+template <typename element_type_>
 std::size_t trivial_insert( //
-    element_* begin, std::size_t old_length, std::size_t offset, element_ const* inserted_begin,
-    element_ const* inserted_end) noexcept {
+    element_type_* begin, std::size_t old_length, std::size_t offset, element_type_ const* inserted_begin,
+    element_type_ const* inserted_end) noexcept {
 
-    static_assert(std::is_trivially_copyable_v<element_>);
+    static_assert(std::is_trivially_copyable_v<element_type_>);
     auto const inserted_length = static_cast<std::size_t>(inserted_end - inserted_begin);
     auto const following_length = old_length - offset;
     // An empty range may hold null pointers, which `memmove` and `memcpy` must never receive, even for zero bytes
     if (following_length)
-        std::memmove(begin + offset + inserted_length, begin + offset, following_length * sizeof(element_));
-    if (inserted_length) std::memcpy(begin + offset, inserted_begin, inserted_length * sizeof(element_));
+        std::memmove(begin + offset + inserted_length, begin + offset, following_length * sizeof(element_type_));
+    if (inserted_length) std::memcpy(begin + offset, inserted_begin, inserted_length * sizeof(element_type_));
     return old_length + inserted_length;
 }
 
 /** Erases trivially copyable elements from a buffer and returns the new length. */
-template <typename element_>
-std::size_t trivial_erase(element_* begin, std::size_t old_length, std::size_t removed_offset,
+template <typename element_type_>
+std::size_t trivial_erase(element_type_* begin, std::size_t old_length, std::size_t removed_offset,
                           std::size_t removed_length) noexcept {
 
-    static_assert(std::is_trivially_copyable_v<element_>);
+    static_assert(std::is_trivially_copyable_v<element_type_>);
     auto const following_length = old_length - (removed_offset + removed_length);
-    std::memmove(begin + removed_offset, begin + removed_offset + removed_length, following_length * sizeof(element_));
+    std::memmove(begin + removed_offset, begin + removed_offset + removed_length,
+                 following_length * sizeof(element_type_));
     return old_length - removed_length;
 }
 
@@ -167,8 +168,10 @@ static_assert(sorted_128_cursor_concept<sorted_128_cursor_t>);
  *  @param[in,out] second The second walk, advanced as it is read.
  *  @param[in] callback Takes the shared key and answers a status, where a failure stops the walk and is returned.
  */
-template <sorted_128_cursor_concept first_cursor_, sorted_128_cursor_concept second_cursor_, typename callback_type_>
-status_t intersect_sorted_128(first_cursor_& first, second_cursor_& second, callback_type_&& callback) noexcept {
+template <sorted_128_cursor_concept first_cursor_type_, sorted_128_cursor_concept second_cursor_type_,
+          typename callback_type_>
+status_t intersect_sorted_128(first_cursor_type_& first, second_cursor_type_& second,
+                              callback_type_&& callback) noexcept {
     while (first.valid() && second.valid()) {
         ustore_key_t const first_key = first.key(), second_key = second.key();
         int const order = compare_128(first_key, second_key);

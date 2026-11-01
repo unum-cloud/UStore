@@ -21,17 +21,8 @@ function (ustore_sibling name_ override_ repository_ tag_)
     endif ()
 endfunction ()
 
-# The siblings build for the floor and the build kind UStore builds for.
-foreach (sibling_ IN ITEMS FORKUNION STRINGZILLA SMASHTABLE)
-    set(${sibling_}_MARCH "${USTORE_MARCH}")
-    set(${sibling_}_MULTIVERSIONED "${USTORE_MULTIVERSIONED}")
-endforeach ()
-# StringZilla's CUDA engines match the values of filtered scans on NVIDIA executors, for the codes UStore builds, over
-# the static runtime CMake's own `CMAKE_CUDA_RUNTIME_LIBRARY` names, which the shared library keeps local, so it still
-# names no GPU runtime as needed. CUDA 13 keeps CCCL under `include/cccl`, so the toolkit's include path never shadows
-# the pinned one. Its ROCm tier stays off, as it would link the HIP runtime.
+# A toolkit installed outside the PATH, which is where the distribution packages put it
 if (USTORE_CUDA_ARCH)
-    # A toolkit installed outside the PATH, which is where the distribution packages put it
     if (NOT DEFINED CMAKE_CUDA_COMPILER)
         find_program(USTORE_NVCC nvcc HINTS /usr/local/cuda/bin /opt/cuda/bin)
         if (USTORE_NVCC)
@@ -40,27 +31,27 @@ if (USTORE_CUDA_ARCH)
     endif ()
     include(CheckLanguage)
     check_language(CUDA)
-    if (CMAKE_CUDA_COMPILER)
-        set(STRINGZILLA_CUDA_ARCH "${USTORE_CUDA_ARCH}")
-        set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
-    endif ()
 endif ()
+
+# The siblings build for the floor, the build kind and the sanitizer UStore builds for, so ThreadSanitizer sees their
+# barriers and ForkUnion drops the atomics it cannot see. StringZilla's own GPU tiers stay off, as the library's bundles
+# walk its values and they would link a GPU runtime.
+foreach (sibling_ IN ITEMS FORKUNION STRINGZILLA SMASHTABLE)
+    set(${sibling_}_MARCH "${USTORE_MARCH}")
+    set(${sibling_}_MULTIVERSIONED "${USTORE_MULTIVERSIONED}")
+    set(${sibling_}_BUILD_SANITIZERS "${USTORE_BUILD_SANITIZERS}")
+endforeach ()
 
 # ForkUnion's C ABI, linked statically into every engine and suite
 ustore_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
     53b2c33f7fd2f06c5c6e36de8104ec7a19a66696
 )
-# Every UStore thread runs inside ForkUnion's compiled pool, whose barriers ThreadSanitizer sees only once that archive
-# is instrumented as well
-if (USTORE_BUILD_SANITIZERS STREQUAL "thread")
-    target_link_libraries(forkunion_static PRIVATE ustore_sanitizers)
-endif ()
 
 # SmashTable's containers, header-only
 ustore_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable.git
-    3ad4d089bfd8d3e5700e7bd81108d2183cead4dd
+    c1b59dce551149728e5564180ffe2bbfbc78dde9
 )
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
@@ -68,5 +59,5 @@ ustore_sibling(
 # numkong::header link, once something includes its headers.
 ustore_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla.git
-    54ddcf0bc679b79226a6373859ff6181a1f064c2
+    27c5a0f01906694cba512218b51ede9fe4c70f13
 )

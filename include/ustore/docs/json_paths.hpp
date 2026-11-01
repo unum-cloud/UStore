@@ -6,13 +6,12 @@
  *      a batch of documents, into typed values the reads and gathers of documents convert, with no other parser.
  *
  *  A field is a JSON Pointer when it starts with a slash and a top-level key otherwise, and an
- *  empty field addresses the whole document. Each field compiles into one JSONPath,
- *  <tt>$['a']['b']</tt>, where a token spelling an array index becomes the union <tt>['0',0]</tt>,
- *  as a pointer resolves it. One engine compiles the paths of every field of a call, entering only
- *  the first member of each name as a pointer does, and one @c sz_subdocuments_find pass over the
- *  documents the cells read locates the node of every cell. The first byte of each node tells what
- *  it holds, strings then unescape in one batch, and numbers parse as yyjson parses them inside a
- *  document.
+ *  empty field addresses the whole document. Each field compiles into one JSONPath, <tt>$['a']['b']</tt>,
+ *  where a token spelling an array index becomes the union <tt>['0',0]</tt>, as a pointer resolves it. One
+ *  engine compiles the paths of every field of a call, entering only the first member of each name
+ *  as a pointer does, and one @c sz_subdocuments_find pass over the documents the cells read
+ *  locates the node of every cell. The first byte of each node tells what it holds, strings then
+ *  unescape in one batch, and numbers parse as yyjson parses them inside a document.
  *
  *  A document the engine finds malformed fails the call, comments and NaN or Infinity among it, though a container no
  *  path enters is skipped unread. A value read as JSON prints canonically at the top level, and a container prints
@@ -21,42 +20,33 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`, `std::max_align_t`
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
-#include <cstring> // `std::memcpy`, `std::memset`
+#include <cstring> // `std::memcpy`
 
 #include <charconv>    // `std::to_chars`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
-#include <smashtable/basic_vector.hpp>     // `st::basic_vector`
+#include <smashtable/basic_vector.hpp>     // `st::vector`
 #include <stringzilla/find.h>              // `sz_byteset_init`, `sz_byteset_add_u8`
 #include <stringzilla/strings.h>           // `sz_strings_span_t`, `sz_strings_from_string_views`
 #include <stringzilla/subdocuments.h>      // `sz_subdocuments_engine_init`, `sz_subdocuments_find`
 
 #include "ustore/docs/json_values.hpp"      // `json_cell_t`, `print_number`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `stringzilla_kernels_t`
-#include "ustore/utilities/types.hpp"       // `value_view_t`, `byte_t`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `strings_kit_concept`
+#include "ustore/utilities/types.hpp"       // `value_view_t`, `stringzilla_view`, `tape_string`
 
 namespace unum::ustore::docs {
 
 using utilities::arena_allocator;
 using utilities::growth_status;
+using utilities::strings_kit_concept;
 using utilities::stringzilla_allocator;
-using utilities::stringzilla_kernels_t;
-
-#pragma region StringZilla Bridges
-
-/** Views @p text as StringZilla's pointer and length. */
-inline sz_string_view_t stringzilla_view(std::string_view text) noexcept {
-    sz_string_view_t view;
-    view.start = text.data();
-    view.length = text.size();
-    return view;
-}
-
-#pragma endregion StringZilla Bridges
+using utilities::stringzilla_refusal;
+using utilities::stringzilla_view;
+using utilities::tape_string;
 
 #pragma region Field Translation
 
@@ -64,21 +54,27 @@ inline sz_string_view_t stringzilla_view(std::string_view text) noexcept {
 constexpr std::uint64_t json_path_index_limit_k = (std::uint64_t {1} << 53) - 1;
 
 /** Appends @p bytes to @p path. */
-inline status_t append_to_path(st::basic_vector<char, arena_allocator<char>>& path, std::string_view bytes) noexcept {
+inline status_t append_to_path(st::vector<char, arena_allocator<char>>& path, std::string_view bytes) noexcept {
     std::size_t const offset = path.size();
     if (status_t const status = growth_status(path.resize(offset + bytes.size())); status.failed()) return status;
     if (!bytes.empty()) std::memcpy(path.data() + offset, bytes.data(), bytes.size());
     return {};
 }
 
-/** Appends @p key unescaped from an RFC 6901 token when @p pointer, as a single-quoted RFC 9535 name. */
-inline status_t append_quoted_name(st::basic_vector<char, arena_allocator<char>>& path, std::string_view key,
-                                   bool pointer) noexcept {
+/** How a name is spelled: as the literal key, or as an RFC 6901 token, whose escapes stand for a
+ *  tilde and a slash. */
+enum class key_spelling_t : bool { literal_k, pointer_token_k };
+
+/** Appends @p key as a single-quoted RFC 9535 name, unescaped first when @p spelling is a pointer
+ *  token. */
+inline status_t append_quoted_name(st::vector<char, arena_allocator<char>>& path, std::string_view key,
+                                   key_spelling_t spelling) noexcept {
     if (status_t const status = append_to_path(path, "'"); status.failed()) return status;
     constexpr char hex_digits_k[] = "0123456789abcdef";
     for (std::size_t index = 0; index != key.size(); ++index) {
         char character = key[index];
-        if (pointer && character == '~') character = key[++index] == '0' ? '~' : '/';
+        if (spelling == key_spelling_t::pointer_token_k && character == '~')
+            character = key[++index] == '0' ? '~' : '/';
         auto const byte = static_cast<unsigned char>(character);
         char escaped[6] = {'\\', character};
         std::size_t escaped_length = 2;
@@ -115,14 +111,14 @@ inline bool is_valid_pointer(std::string_view field) noexcept {
 
 /** Spells into @p path the JSONPath @p field resolves through, the root alone for an empty field, answering false for
  *  an invalid JSON Pointer, which no document holds. */
-inline expected<bool> json_path_of(std::string_view field,
-                                   st::basic_vector<char, arena_allocator<char>>& path) noexcept {
+inline expected<bool> json_path_of(std::string_view field, st::vector<char, arena_allocator<char>>& path) noexcept {
     if (status_t const status = growth_status(path.resize(0)); status.failed()) return status;
     if (status_t const status = append_to_path(path, "$"); status.failed()) return status;
     if (field.empty()) return true;
     if (!field.starts_with('/')) {
         if (status_t const status = append_to_path(path, "["); status.failed()) return status;
-        if (status_t const status = append_quoted_name(path, field, false); status.failed()) return status;
+        if (status_t const status = append_quoted_name(path, field, key_spelling_t::literal_k); status.failed())
+            return status;
         if (status_t const status = append_to_path(path, "]"); status.failed()) return status;
         return true;
     }
@@ -133,7 +129,8 @@ inline expected<bool> json_path_of(std::string_view field,
         if (end == std::string_view::npos) end = field.size();
         std::string_view const token = field.substr(begin, end - begin);
         if (status_t const status = append_to_path(path, "["); status.failed()) return status;
-        if (status_t const status = append_quoted_name(path, token, true); status.failed()) return status;
+        if (status_t const status = append_quoted_name(path, token, key_spelling_t::pointer_token_k); status.failed())
+            return status;
         if (std::uint64_t index = 0; is_index_token(token, index)) {
             char printed[24];
             std::string_view const digits = print_number(printed, printed + sizeof(printed), index);
@@ -234,25 +231,6 @@ class subdocuments_engine_t {
     }
 };
 
-/** The status of a failed StringZilla call of a read, @p failed being what the read was doing. */
-inline status_t stringzilla_failure(sz_status_t status, char const* failed) noexcept {
-    if (status == sz_bad_alloc_k) return {status_code_t::out_of_memory_k, failed};
-    if (status == sz_invalid_syntax_k || status == sz_invalid_utf8_k)
-        return {status_code_t::malformed_k, "Failed to parse the document"};
-    return {status_code_t::internal_k, failed};
-}
-
-/** The bytes of string @p index of @p tape, which an unescape wrote. */
-inline std::string_view tape_string(sz_strings_span_t const& tape, std::size_t index) noexcept {
-    if (tape.layout == sz_strings_u64_tape_k) {
-        sz_u64_t const* const offsets = tape.data.u64_tape.offsets;
-        return {tape.data.u64_tape.data + offsets[index],
-                static_cast<std::size_t>(offsets[index + 1] - offsets[index])};
-    }
-    sz_u32_t const* const offsets = tape.data.u32_tape.offsets;
-    return {tape.data.u32_tape.data + offsets[index], static_cast<std::size_t>(offsets[index + 1] - offsets[index])};
-}
-
 /**
  *  @brief Extracts the value of every cell, as a JSON Pointer lookup over its parsed document would find it, through
  *      one subdocuments pass over the documents the cells read.
@@ -261,14 +239,16 @@ inline std::string_view tape_string(sz_strings_span_t const& tape, std::size_t i
  *  @param[in] fields The fields the cells address, each a JSON Pointer, a top-level key, or empty for the document.
  *  @param[in] cells_count How many cells there are.
  *  @param[in] cell_of Called as <tt>cell_of(index)</tt>, answering the @c field_cell_t of cell @p index.
- *  @param[in] kernels The StringZilla kernels the handle looked up once at open.
+ *  @param[in] strings The StringZilla capabilities the subdocuments engine compiles for, every one
+ *      the class runs.
  *  @param[in] scratch Holds the engine, the columns and every value, until it rewinds.
  *  @param[out] cells The value of every cell, missing where a document or its field is.
  *  @retval malformed_k A document a cell reads breaks RFC 8259, or a string's escapes do not decode.
+ *  @tparam strings_kit_type_ The StringZilla kernels of the calling CPU class.
  */
-template <typename cell_of_type_>
+template <strings_kit_concept strings_kit_type_, typename cell_of_type_>
 status_t extract_fields(json_documents_t const& documents, std::span<std::string_view const> fields,
-                        std::size_t cells_count, cell_of_type_ const& cell_of, stringzilla_kernels_t const& kernels,
+                        std::size_t cells_count, cell_of_type_ const& cell_of, sz_capability_t strings,
                         ustore_arena_t scratch, json_cells_t& cells) noexcept {
     auto [tokens, tokens_status] = arena_allocate<json_token_t>(scratch, cells_count);
     if (tokens_status.failed()) return tokens_status;
@@ -288,10 +268,10 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     // Every field compiles into one path, which fields spelling the same path share
     auto [path_of_field, map_status] = arena_allocate<std::size_t>(scratch, fields.size());
     if (map_status.failed()) return map_status;
-    st::basic_vector<sz_string_view_t, arena_allocator<sz_string_view_t>> paths {{scratch}};
+    st::vector<sz_string_view_t, arena_allocator<sz_string_view_t>> paths {{scratch}};
     st::hash_map<std::string_view, std::size_t, st::default_hash_t, st::equal_to_t, arena_allocator<std::byte>>
         known_paths {{}, {}, arena_allocator<std::byte> {scratch}};
-    st::basic_vector<char, arena_allocator<char>> path {{scratch}};
+    st::vector<char, arena_allocator<char>> path {{scratch}};
     for (std::size_t field_index = 0; field_index != fields.size(); ++field_index) {
         auto [valid, path_status] = json_path_of(fields[field_index], path);
         if (path_status.failed()) return path_status;
@@ -318,7 +298,7 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     auto [walked_of_document, walked_status] = arena_allocate<std::size_t>(scratch, documents_count);
     if (walked_status.failed()) return walked_status;
     for (std::size_t& walked : walked_of_document) walked = no_index_k;
-    st::basic_vector<sz_string_view_t, arena_allocator<sz_string_view_t>> walked {{scratch}};
+    st::vector<sz_string_view_t, arena_allocator<sz_string_view_t>> walked {{scratch}};
     for (std::size_t cell_index = 0; cell_index != cells_count; ++cell_index) {
         field_cell_t const cell = cell_of(cell_index);
         if (path_of_field[cell.field] == no_index_k || walked_of_document[cell.document] != no_index_k) continue;
@@ -334,9 +314,9 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     subdocuments_engine_t engine;
     sz_strings_view_t paths_view {};
     sz_strings_from_string_views(paths.data(), paths.size(), &paths_view);
-    if (sz_status_t const compiled = engine.compile(paths_view, allocator, kernels.capabilities);
-        compiled != sz_success_k)
-        return stringzilla_failure(compiled, "The fields compile into no path the engine takes");
+    if (sz_status_t const compiled = engine.compile(paths_view, allocator, strings); compiled != sz_success_k)
+        return stringzilla_refusal(compiled, status_code_t::invalid_argument_k,
+                                   "The fields compile into no path the engine takes");
 
     // With first members only, a field path selects at most one node of a document
     std::size_t const slots_count = walked.size() * paths.size();
@@ -347,7 +327,7 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     sz_strings_view_t walked_view {};
     sz_strings_from_string_views(walked.data(), walked.size(), &walked_view);
     if (sz_status_t const found = engine.find(walked_view, matches, matches_offsets); found != sz_success_k)
-        return stringzilla_failure(found, "The engine could not walk the documents");
+        return stringzilla_refusal(found, status_code_t::malformed_k, "Failed to parse the document");
     std::size_t const matches_count = static_cast<std::size_t>(matches_offsets[walked.size()]);
     if (matches_count > slots_count) return {status_code_t::internal_k, "A field path selected more than one node"};
     auto [match_of_slot, slots_status] = arena_allocate<std::size_t>(scratch, slots_count);
@@ -359,8 +339,8 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     }
 
     // Every cell takes its token, strings keeping their quotes until one batched unescape below
-    st::basic_vector<sz_string_view_t, arena_allocator<sz_string_view_t>> escaped {{scratch}};
-    st::basic_vector<std::size_t, arena_allocator<std::size_t>> string_cells {{scratch}};
+    st::vector<sz_string_view_t, arena_allocator<sz_string_view_t>> escaped {{scratch}};
+    st::vector<std::size_t, arena_allocator<std::size_t>> string_cells {{scratch}};
     for (std::size_t cell_index = 0; cell_index != cells_count; ++cell_index) {
         field_cell_t const cell = cell_of(cell_index);
         std::size_t const path_index = path_of_field[cell.field];
@@ -389,32 +369,35 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     sz_strings_from_string_views(escaped.data(), escaped.size(), &escaped_view);
     sz_size_t malformed_index = 0;
     // RFC 8259 strings hold well-formed UTF-8 and no raw control byte, which writes refuse and reads check alike
-    if (sz_status_t const status = kernels.utf8_count_strings(&escaped_view, nullptr, escaped.size(), nullptr,
-                                                              &malformed_index, nullptr);
+    if (sz_status_t const status = strings_kit_type_::utf8_count_strings(&escaped_view, nullptr, escaped.size(),
+                                                                         nullptr, &malformed_index, nullptr);
         status != sz_success_k)
-        return stringzilla_failure(status, "The strings of the fields are not UTF-8");
+        return stringzilla_refusal(status, status_code_t::malformed_k, "Failed to parse the document");
     sz_byteset_t controls;
     sz_byteset_init(&controls);
     for (unsigned control = 0; control != 0x20; ++control) sz_byteset_add_u8(&controls, static_cast<sz_u8_t>(control));
     for (sz_string_view_t const& body : escaped) {
         sz_cptr_t control = nullptr;
-        if (sz_status_t const status = kernels.find_byteset(body.start, body.length, &controls, &control, nullptr);
+        if (sz_status_t const status = strings_kit_type_::find_byteset(body.start, body.length, &controls, &control,
+                                                                       nullptr);
             status != sz_success_k)
-            return stringzilla_failure(status, "The strings of the fields could not be checked");
+            return stringzilla_refusal(status, status_code_t::malformed_k,
+                                       "The strings of the fields could not be checked");
         if (control) return {status_code_t::malformed_k, "Failed to parse the document"};
     }
     sz_strings_span_t unescaped {};
-    if (sz_status_t const status = kernels.strings_unescape(&escaped_view, nullptr, escaped.size(), sz_escape_json_k,
-                                                            &allocator, &unescaped, &malformed_index, nullptr);
+    if (sz_status_t const status = strings_kit_type_::strings_unescape(&escaped_view, nullptr, escaped.size(),
+                                                                       sz_escape_json_k, &allocator, &unescaped,
+                                                                       &malformed_index, nullptr);
         status != sz_success_k)
-        return stringzilla_failure(status, "The strings of the fields did not unescape");
+        return stringzilla_refusal(status, status_code_t::malformed_k, "Failed to parse the document");
     for (std::size_t string_index = 0; string_index != string_cells.size(); ++string_index)
         bytes[string_cells[string_index]] = tape_string(unescaped, string_index);
     return {};
 }
 
 /** Appends @p bytes to @p text. */
-inline status_t append_text(st::basic_vector<char, arena_allocator<char>>& text, std::string_view bytes) noexcept {
+inline status_t append_text(st::vector<char, arena_allocator<char>>& text, std::string_view bytes) noexcept {
     std::size_t const offset = text.size();
     if (status_t const status = growth_status(text.resize(offset + bytes.size())); status.failed()) return status;
     if (!bytes.empty()) std::memcpy(text.data() + offset, bytes.data(), bytes.size());
@@ -423,7 +406,7 @@ inline status_t append_text(st::basic_vector<char, arena_allocator<char>>& text,
 
 /** Appends the JSON @p json to @p text without the blank space between its tokens, its strings and numbers as
  *  written. */
-inline status_t append_minified(st::basic_vector<char, arena_allocator<char>>& text, std::string_view json) noexcept {
+inline status_t append_minified(st::vector<char, arena_allocator<char>>& text, std::string_view json) noexcept {
     std::size_t begin = 0;
     for (std::size_t position = 0; position != json.size(); ++position) {
         char const character = json[position];
@@ -442,36 +425,21 @@ inline status_t append_minified(st::basic_vector<char, arena_allocator<char>>& t
     return append_text(text, json.substr(begin < json.size() ? begin : json.size()));
 }
 
-/** Appends @p body to @p text as a JSON string, escaped as yyjson writes one. */
-inline status_t append_json_string(st::basic_vector<char, arena_allocator<char>>& text,
-                                   std::string_view body) noexcept {
-    constexpr char hex_digits_k[] = "0123456789ABCDEF";
+/** Appends @p body to @p text as a JSON string, escaped by StringZilla into @p scratch. */
+template <strings_kit_concept strings_kit_type_>
+status_t append_json_string(st::vector<char, arena_allocator<char>>& text, std::string_view body,
+                            ustore_arena_t scratch) noexcept {
+    sz_string_view_t const view = stringzilla_view(body);
+    sz_strings_view_t strings {};
+    sz_strings_from_string_views(&view, 1, &strings);
+    sz_allocator_t allocator = stringzilla_allocator(scratch);
+    sz_strings_span_t escaped {};
+    if (sz_status_t const status = strings_kit_type_::strings_escape(&strings, nullptr, 1, sz_escape_json_k, &allocator,
+                                                                     &escaped, nullptr);
+        status != sz_success_k)
+        return stringzilla_refusal(status, status_code_t::malformed_k, "The string did not escape");
     if (status_t const status = append_text(text, "\""); status.failed()) return status;
-    std::size_t begin = 0;
-    for (std::size_t position = 0; position != body.size(); ++position) {
-        auto const byte = static_cast<unsigned char>(body[position]);
-        char escaped[6] = {'\\', static_cast<char>(byte), 0, 0, 0, 0};
-        std::size_t escaped_length = 2;
-        switch (byte) {
-        case '"':
-        case '\\': break;
-        case '\b': escaped[1] = 'b'; break;
-        case '\t': escaped[1] = 't'; break;
-        case '\n': escaped[1] = 'n'; break;
-        case '\f': escaped[1] = 'f'; break;
-        case '\r': escaped[1] = 'r'; break;
-        default:
-            if (byte >= 0x20) continue;
-            escaped[1] = 'u', escaped[2] = '0', escaped[3] = '0';
-            escaped[4] = hex_digits_k[byte >> 4], escaped[5] = hex_digits_k[byte & 15];
-            escaped_length = 6;
-        }
-        if (status_t const status = append_text(text, body.substr(begin, position - begin)); status.failed())
-            return status;
-        if (status_t const status = append_text(text, {escaped, escaped_length}); status.failed()) return status;
-        begin = position + 1;
-    }
-    if (status_t const status = append_text(text, body.substr(begin)); status.failed()) return status;
+    if (status_t const status = append_text(text, tape_string(escaped, 0)); status.failed()) return status;
     return append_text(text, "\"");
 }
 
@@ -531,8 +499,9 @@ inline std::string_view print_json_real(double real, printed_number_buffer_t& bu
 
 /** Prints @p value as JSON text into @p scratch: a scalar canonically, a container minified, nothing for a missing
  *  value. */
-inline expected<value_view_t> json_text_of(json_cell_t const& value, ustore_arena_t scratch) noexcept {
-    st::basic_vector<char, arena_allocator<char>> text {{scratch}};
+template <strings_kit_concept strings_kit_type_>
+expected<value_view_t> json_text_of(json_cell_t const& value, ustore_arena_t scratch) noexcept {
+    st::vector<char, arena_allocator<char>> text {{scratch}};
     printed_number_buffer_t printed;
     status_t status;
     switch (value.token) {
@@ -540,7 +509,7 @@ inline expected<value_view_t> json_text_of(json_cell_t const& value, ustore_aren
     case json_token_t::null_k: status = append_text(text, "null"); break;
     case json_token_t::false_k: status = append_text(text, false_k); break;
     case json_token_t::true_k: status = append_text(text, true_k); break;
-    case json_token_t::string_k: status = append_json_string(text, value.bytes); break;
+    case json_token_t::string_k: status = append_json_string<strings_kit_type_>(text, value.bytes, scratch); break;
     case json_token_t::object_k:
     case json_token_t::array_k: status = append_minified(text, value.bytes); break;
     case json_token_t::number_k:

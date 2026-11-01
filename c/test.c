@@ -352,7 +352,7 @@ int main(void) {
     failures += expect_success(&outcome, __LINE__);
     char const fields_joined[] = "yearname";
     uint32_t const fields_offsets[3] = {0, 4, 8};
-    ustore_docs_field_type_t const types[2] = {ustore_docs_field_type_u64_k, ustore_docs_field_type_bin_k};
+    ustore_docs_field_type_t const types[2] = {ustore_docs_field_type_u64_k, ustore_docs_field_type_binary_k};
     ustore_docs_column_view_t const* columns = NULL;
     ustore_docs_gather_t gather = {.database = database,
                                    .outcome = &outcome,

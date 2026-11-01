@@ -39,14 +39,12 @@
 #include <cstring> // `std::memcpy`, `std::memset`
 
 #include <algorithm> // `std::sort`, `std::min`, `std::max`
-#include <compare>   // `std::strong_ordering`
 #include <limits>    // `std::numeric_limits`
 #include <memory>    // `std::allocator_traits`
 #include <new>       // placement `new`
 #include <span>      // `std::span`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::status_t`
+#include <smashtable/shared.hpp> // `st::status_t`
 
 #include "ustore/utilities/algorithm.hpp" // `compare_128`, `intersect_sorted_128`, `sorted_128_cursor_concept`
 #include "ustore/utilities/folds.hpp"     // `delta_kind_t`, `delta_view_t`, `fold_concept`
@@ -71,26 +69,28 @@ using id_entity_t = ustore_key_t;
 
 /** The label of a vertex or an edge, where a negative one is unknown. */
 struct label_t {
-    std::int32_t raw = -1;
+    std::int32_t value = -1;
 
     friend constexpr auto operator<=>(label_t const&, label_t const&) noexcept = default;
-    constexpr bool is_unknown() const noexcept { return raw < 0; }
+    constexpr bool is_unknown() const noexcept { return value < 0; }
 };
 
 /** Bitmask of the parts a vertex plays in an edge. */
 struct role_t {
-    std::uint8_t raw = 0;
+    std::uint8_t bits = 0;
 
     friend constexpr auto operator<=>(role_t, role_t) noexcept = default;
-    friend constexpr bool operator&(role_t first, role_t second) noexcept { return first.raw & second.raw; }
+    friend constexpr bool operator&(role_t first, role_t second) noexcept { return first.bits & second.bits; }
     friend constexpr role_t operator|(role_t first, role_t second) noexcept {
-        return role_t {static_cast<std::uint8_t>(first.raw | second.raw)};
+        return role_t {static_cast<std::uint8_t>(first.bits | second.bits)};
     }
 
-    constexpr bool is_unknown() const noexcept { return !raw; }
-    constexpr role_t allow(role_t other) const noexcept { return role_t {static_cast<std::uint8_t>(raw | other.raw)}; }
+    constexpr bool is_unknown() const noexcept { return !bits; }
+    constexpr role_t allow(role_t other) const noexcept {
+        return role_t {static_cast<std::uint8_t>(bits | other.bits)};
+    }
     constexpr role_t disallow(role_t other) const noexcept {
-        return role_t {static_cast<std::uint8_t>(raw & ~other.raw)};
+        return role_t {static_cast<std::uint8_t>(bits & ~other.bits)};
     }
 };
 
@@ -114,16 +114,16 @@ struct labeled_edge_t {
     direction_t direction = direction_t::directed_k;
 
     /** Compares everything but the direction. */
-    static constexpr bool equals(labeled_edge_t const& lhs, labeled_edge_t const& rhs) noexcept {
-        return lhs.id == rhs.id && lhs.first == rhs.first && lhs.second == rhs.second && lhs.label == rhs.label &&
-               lhs.weight == rhs.weight;
+    static constexpr bool equals(labeled_edge_t const& left, labeled_edge_t const& right) noexcept {
+        return left.id == right.id && left.first == right.first && left.second == right.second &&
+               left.label == right.label && left.weight == right.weight;
     }
 
-    friend constexpr bool operator==(labeled_edge_t const& lhs, labeled_edge_t const& rhs) noexcept {
-        return equals(lhs, rhs);
+    friend constexpr bool operator==(labeled_edge_t const& left, labeled_edge_t const& right) noexcept {
+        return equals(left, right);
     }
-    friend constexpr auto operator<=>(labeled_edge_t const& lhs, labeled_edge_t const& rhs) noexcept {
-        return lhs.id <=> rhs.id;
+    friend constexpr auto operator<=>(labeled_edge_t const& left, labeled_edge_t const& right) noexcept {
+        return left.id <=> right.id;
     }
 
     constexpr explicit operator bool() const noexcept {
@@ -179,14 +179,14 @@ struct labeled_half_edge_t {
         edge.label = edge_label;
         edge.weight = edge_weight;
 
-        switch (role.raw) {
-        case dedge_source_k.raw:
+        switch (role.bits) {
+        case dedge_source_k.bits:
             edge.direction = direction_t::directed_k;
             edge.first = vertex;
             edge.second = neighbor_id;
             break;
 
-        case dedge_target_k.raw:
+        case dedge_target_k.bits:
             edge.direction = direction_t::directed_k;
             edge.first = neighbor_id;
             edge.second = vertex;
@@ -274,8 +274,8 @@ inline void save_delta(half_edge_delta_t const& delta, byte_t* destination) noex
     std::memcpy(destination + delta_neighbor_offset_k, &delta.neighbor, 16);
     std::memcpy(destination + delta_edge_offset_k, &delta.edge, 16);
     std::memcpy(destination + delta_weight_offset_k, &delta.weight, 4);
-    std::memcpy(destination + delta_label_offset_k, &delta.label.raw, 4);
-    std::memcpy(destination + delta_role_offset_k, &delta.role.raw, 1);
+    std::memcpy(destination + delta_label_offset_k, &delta.label.value, 4);
+    std::memcpy(destination + delta_role_offset_k, &delta.role.bits, 1);
     std::memcpy(destination + delta_operation_offset_k, &delta.operation, 1);
 }
 
@@ -285,8 +285,8 @@ inline half_edge_delta_t load_delta(byte_t const* source) noexcept {
     std::memcpy(&delta.neighbor, source + delta_neighbor_offset_k, 16);
     std::memcpy(&delta.edge, source + delta_edge_offset_k, 16);
     std::memcpy(&delta.weight, source + delta_weight_offset_k, 4);
-    std::memcpy(&delta.label.raw, source + delta_label_offset_k, 4);
-    std::memcpy(&delta.role.raw, source + delta_role_offset_k, 1);
+    std::memcpy(&delta.label.value, source + delta_label_offset_k, 4);
+    std::memcpy(&delta.role.bits, source + delta_role_offset_k, 1);
     std::memcpy(&delta.operation, source + delta_operation_offset_k, 1);
     return delta;
 }
@@ -425,9 +425,10 @@ inline status_t check_base(half_edge_deltas_view_t base) noexcept {
 /**
  *  @brief Walks the live half-edges of a vertex value merged with a composed chain of changes, in one pass.
  *
- *  An insert in the chain adds or overwrites the half-edge it names, a removal hides the one it names, and a removal
- *  of the vertex at the head of the chain hides the whole value, so the walk yields exactly the records
- *  @c adjacency_fold_t::apply writes, without writing them. A seek leaps over both arrays by binary search.
+ *  An insert in the chain adds or overwrites the half-edge it names, a removal hides the one it
+ *  names, and a removal of the vertex at the head of the chain hides the whole value, so the walk
+ *  yields exactly the records @c adjacency_fold_t::apply writes, without writing them. A seek leaps
+ *  over both arrays by binary search.
  */
 class half_edge_cursor_t {
   public:
@@ -651,9 +652,9 @@ struct adjacency_fold_t {
 
         // The newest removal of the vertex sorts last among the leading ones and cuts everything older
         std::size_t index = 0;
-        std::uint32_t cut = 0;
+        std::uint32_t removal_sequence = 0;
         for (; index != total && operation_of(entries[index].record) == half_edge_operation_t::remove_vertex_k; ++index)
-            cut = entries[index].sequence;
+            removal_sequence = entries[index].sequence;
         std::size_t const removals = index ? 1 : 0;
         std::size_t kept = 0;
         while (index != total) {
@@ -662,7 +663,8 @@ struct adjacency_fold_t {
                 ++newest;
             sequenced_record_t const winner = entries[newest];
             index = newest + 1;
-            if (removals && (winner.sequence < cut || operation_of(winner.record) == half_edge_operation_t::remove_k))
+            if (removals &&
+                (winner.sequence < removal_sequence || operation_of(winner.record) == half_edge_operation_t::remove_k))
                 continue;
             entries[kept++] = winner;
         }
@@ -691,29 +693,6 @@ struct adjacency_fold_t {
 };
 
 static_assert(utilities::fold_concept<adjacency_fold_t>);
-
-/**
- *  @brief The device fold of graph adjacency, composing on one NVIDIA device what @c adjacency_fold_t composes on the
- *      host, for a compaction's chains of half-edge changes all at once.
- *
- *  Host translation units name it, as the tree and the engine pick it for a graph's merges; its @c compose runs on
- *  NVIDIA devices and is defined in @c vram_nvidia_adjacency_fold.cuh, which only nvcc compiles.
- */
-struct vram_nvidia_adjacency_fold_t {
-
-    /**
-     *  @brief Composes chain @c c, the changes from @p chain_starts[c] to @p chain_starts[c + 1] oldest first, into the
-     *      bytes of @p composed from @p composed_offsets[c] to @p composed_offsets[c + 1], on the device of
-     *      @p executor.
-     *  @tparam executor_type_ The executor whose stream the device work queues on, @c utilities::cuda_executor_t.
-     *  @retval invalid_argument_k A delta is no change, or carries a ragged or malformed record.
-     *  @retval out_of_memory_heap_k A buffer could not grow.
-     */
-    template <typename executor_type_>
-    st::status_t compose(executor_type_& executor, std::span<delta_view_t const> changes,
-                         std::span<std::uint64_t const> chain_starts, st::basic_vector<byte_t>& composed,
-                         st::basic_vector<std::uint64_t>& composed_offsets) const noexcept;
-};
 
 #pragma endregion Fold
 

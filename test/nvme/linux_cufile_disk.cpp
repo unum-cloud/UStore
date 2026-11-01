@@ -4,15 +4,16 @@
  *  @date October 29, 2026
  *  @brief The ring contract on cuFile, and what only a transport reaching device memory can get wrong.
  *
- *  The transport-independent cases of @c ring_cases.hpp run on host memory registered with cuFile. What is added here
- *  is device memory: a read into it and a write out of it, and the refusal of DMA where the @c nvidia_fs module is
- *  absent. Device memory comes from a @c libcuda this suite opens itself, and the suite skips
- *  cleanly where either library is absent. It needs @c --directory, off tmpfs, as every unbuffered transport.
+ *  The transport-independent cases of @c ring_cases.hpp run on host memory registered
+ *  with cuFile. What is added here is device memory: a read into it and a write out
+ *  of it, and the refusal of DMA where the @c nvidia_fs module is absent. Device
+ *  memory comes from a @c libcuda this suite opens itself, and the suite skips
+ *  cleanly where either library is absent. It needs @c --directory, off tmpfs, as
+ *  every unbuffered transport.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`
 
 #include <array>   // `std::array`
 #include <span>    // `std::span`
@@ -24,6 +25,8 @@
 #include "nvme/ring_cases.hpp" // `ring_cases`, every transport-independent result
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -202,7 +205,7 @@ void cufile_transport(suite_totals_t& totals, char const* directory) {
     config.depth_limit = 64;
     config.registered_memory_limit = 8;
     config.media_limit = 4;
-    config.gds = ustore_gds_compat_k;
+    config.gds = ustore_gds_compatibility_k;
     expected<linux_cufile_files_disk_t> disk = linux_cufile_files_disk_t::make(cufile(), config);
     if (report(totals, "cufile.mount", expect_status(disk, status_code_t::success_k)) != 0) return;
     report(totals, "cufile.reaches_gpu_memory", expect(disk->capabilities().reaches_gpu_memory));

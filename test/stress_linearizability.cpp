@@ -11,14 +11,13 @@
 #include <cstdio>  // `stderr`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::fill`, `std::max`, `std::ranges::max`
-#include <array>       // `std::array`
-#include <chrono>      // `std::chrono::steady_clock`
-#include <limits>      // `std::numeric_limits`
-#include <random>      // `std::mt19937`, `std::uniform_int_distribution`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
-#include <utility>     // `std::exchange`, `std::move`
+#include <algorithm> // `std::fill`, `std::max`, `std::ranges::max`
+#include <array>     // `std::array`
+#include <chrono>    // `std::chrono::steady_clock`
+#include <limits>    // `std::numeric_limits`
+#include <random>    // `std::mt19937`, `std::uniform_int_distribution`
+#include <span>      // `std::span`
+#include <utility>   // `std::exchange`, `std::move`
 
 #include <fmt/format.h>
 
@@ -166,16 +165,16 @@ struct linearizability_run_t {
     arena_t arena;
 
     /** One slot per thread of the largest configuration. */
-    st::basic_vector<writer_slot_t> slots;
+    st::vector<writer_slot_t> slots;
 
     /** Per-thread logs laid end to end, each holding its thread's writes in staging order. */
-    st::basic_vector<operation_t> operations;
+    st::vector<operation_t> operations;
 
     /** The committed write that wins each key in the replay, indexed by key. */
-    st::basic_vector<operation_t const*> latest;
+    st::vector<operation_t const*> latest;
 
     /** Keys the replay leaves inserted, read back in one call. */
-    st::basic_vector<ustore_key_t> present_keys;
+    st::vector<ustore_key_t> present_keys;
 };
 
 #pragma region Setup

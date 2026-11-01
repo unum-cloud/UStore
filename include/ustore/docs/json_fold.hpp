@@ -2,28 +2,32 @@
  *  @file include/ustore/docs/json_fold.hpp
  *  @author Ash Vardanian
  *  @date October 16, 2026
- *  @brief The docs fold: a whole document as the base, and deltas that each apply one modification of
- *      @c ustore_docs_write to one field, replayed in commit order and composed without a base where that is sound.
+ *  @brief The docs fold: a whole document as the base, and deltas that each apply one modification
+ *      of @c ustore_docs_write to one field, replayed in commit order and composed without a base
+ *      where that is sound.
  *
- *  A delta carries a stamp, its modification, its field and the JSON text of its value, and a chain of them is what a
- *  @c delta_kind_t::change_k delta of the store holds. Beyond the five modifications of @c ustore_docs_write, a delta
- *  may write a whole document as it is, as a whole JSON upsert and @c ustore_blobs_write store it, or remove it.
+ *  A delta carries a stamp, its modification, its field and the JSON text of its value, and a chain
+ *  of them is what a @c delta_kind_t::change_k delta of the store holds. Beyond the five
+ *  modifications of @c ustore_docs_write, a delta may write a whole document as it is, as a whole
+ *  JSON upsert and @c ustore_blobs_write store it, or remove it.
  *
- *  Each modification replays exactly as <tt>src/blobs_layers/docs.hpp</tt> reads, modifies and
- *  writes back a document today. A field of a missing document, and an update or a patch of a whole
- *  missing document, fail with @c status_code_t::not_found_k, and inserting a whole document that
- *  exists fails with @c status_code_t::already_exists_k. Then the document and the value parse, so
- *  either one malformed fails with @c status_code_t::malformed_k, and a patch whose test or path
- *  fails answers @c status_code_t::invalid_argument_k. A write, a removal and an upsert of a whole
+ *  Each modification replays exactly as <tt>src/docs_layer.hpp</tt> reads, modifies and writes back a
+ *  document today. A field of a missing document, and an update or a patch of a whole missing
+ *  document, fail with @c status_code_t::not_found_k, and inserting a whole document that exists
+ *  fails with @c status_code_t::already_exists_k. Then the document and the value parse, so either
+ *  one malformed fails with @c status_code_t::malformed_k, and a patch whose test or path fails
+ *  answers @c status_code_t::invalid_argument_k. A write, a removal and an upsert of a whole
  *  document close the chain: no base or older delta matters after them, so they also clear a
  *  failure older deltas left, as an LSM that drops what they close would.
  *
- *  Composition keeps the chain minus what merges soundly for every base. After the newest closing delta the document
- *  is known, so the chain folds into one write or removal, unless a delta fails there. Before it, an upsert or an
- *  RFC 7386 merge of a field absorbs the newer upserts and merges of the same field, as long as every delta between
- *  them modifies a disjoint field, keeping its own position in the document. Two merges compose only where one merge
- *  patch expresses both: a member the older patch removes or replaces by a scalar cannot be merged into again. Adjacent
- *  RFC 6902 patches of one field concatenate their operations. Composition keeps the newest stamp of what it merges.
+ *  Composition keeps the chain minus what merges soundly for every base. After the newest closing
+ *  delta the document is known, so the chain folds into one write or removal, unless a delta fails
+ *  there. Before it, an upsert or an RFC 7386 merge of a field absorbs the newer upserts and merges
+ *  of the same field, as long as every delta between them modifies a disjoint field, keeping its
+ *  own position in the document. Two merges compose only where one merge patch expresses both: a
+ *  member the older patch removes or replaces by a scalar cannot be merged into again. Adjacent RFC
+ *  6902 patches of one field concatenate their operations. Composition keeps the newest stamp of
+ *  what it merges.
  */
 
 #pragma once
@@ -37,7 +41,7 @@
 
 #include <yyjson.h> // `yyjson_mut_merge_patch`, `yyjson_mut_obj`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/docs/json_patch.hpp"       // `modify`, `modification_t`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `any_parse`, `json_mutable`, `json_dump`
@@ -194,7 +198,7 @@ struct document_state_t {
 /** The bytes an existing empty document views, so they never read as missing. */
 inline constexpr byte_t empty_document_k[1] = {};
 
-/** Applies @p delta to @p document as <tt>src/blobs_layers/docs.hpp</tt> reads, modifies and writes
+/** Applies @p delta to @p document as <tt>src/docs_layer.hpp</tt> reads, modifies and writes
  *  it back, in @p arena. */
 inline status_t apply_delta(document_state_t& document, json_delta_t const& delta, ustore_arena_t arena) noexcept {
     switch (delta.modification) {
@@ -572,8 +576,8 @@ struct json_fold_t {
     expected<std::span<byte_t const>> compose(std::span<delta_view_t const> deltas,
                                               arena_allocator<byte_t>& allocator) const noexcept {
         ustore_arena_t const arena = allocator.arena;
-        st::basic_vector<json_delta_t, arena_allocator<json_delta_t>> chain {arena_allocator<json_delta_t>(arena)};
-        st::basic_vector<std::uint8_t, arena_allocator<std::uint8_t>> keep {arena_allocator<std::uint8_t>(arena)};
+        st::vector<json_delta_t, arena_allocator<json_delta_t>> chain {arena_allocator<json_delta_t>(arena)};
+        st::vector<std::uint8_t, arena_allocator<std::uint8_t>> keep {arena_allocator<std::uint8_t>(arena)};
         status_t status = for_each_delta(deltas, [&](json_delta_t const& delta) noexcept -> status_t {
             return growth_status(chain.push_back(json_delta_t(delta)));
         });

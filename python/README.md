@@ -51,7 +51,7 @@ with ustore.Database.open_ram() as database:
     people = database.collection_create("people", modality=ustore.Modality.DOCS)
     database.docs_write([10, 11], ['{"name": "Lex", "tweets": 2221}', '{"name": "Joe"}'], collection=people)
     database.docs_gist([10, 11], arena, collection=people)  # ("/name", "/tweets")
-    types = [ustore.FieldType.STR, ustore.FieldType.I64]
+    types = [ustore.FieldType.STRING, ustore.FieldType.I64]
     columns = database.docs_gather([10, 11], ["name", "tweets"], types, arena, collection=people)
     columns[1], columns.validities(1)                   # memoryview of "q", bitmap bytes
     prices = np.array([1.5, 2.5], dtype=np.float64)
@@ -119,7 +119,7 @@ Python's `in` must answer a bool, an assignment and `del` discard what they answ
 
 ```python
 async def fan_out(database, executor, keys, key, sources, targets):
-    later, types = database.deferred(executor), [ustore.FieldType.STR, ustore.FieldType.I64]
+    later, types = database.deferred(executor), [ustore.FieldType.STRING, ustore.FieldType.I64]
     gathering = later.docs_gather(keys, ["name", "tweets"], types, ustore.Arena(executor), collection="people")
     linking = later.graph_write_edges(sources, targets, collection="follows")
     present = later.contains(key, collection="movies")       # Deferred[bool], since `key in ...` must answer a bool

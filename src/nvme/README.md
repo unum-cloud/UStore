@@ -26,19 +26,21 @@ A type is named after what it holds and what it does, from the whole database do
 
 The types are templates of `include/ustore/`, which `variants.hpp` instantiates once per CPU class, in `unum::ustore::blobs` for the LSM layers and `unum::ustore::utilities` for the I/O kits beneath them:
 
-- `utilities/nvme_ring.hpp` — allocators, completion counters, identifiers, extents and the ring.
+- `utilities/nvme_ring.hpp` — completion counters, disk and file identifiers, extents and the ring.
 - `utilities/nvme_disks.hpp` — the disk base, the memory disk and the blocking floor.
 - `utilities/nvme_linux_uring_disk.hpp`, `nvme_linux_aio_disk.hpp`, `nvme_linux_spdk_disk.hpp` — the Linux transports.
 - `utilities/nvme_channels.hpp` — the buffer pool, the I/O channels and the pipelines.
-- `utilities/nvme_volume.hpp` — text, catalogs, volumes, the router, the mount and the shared resources.
+- `utilities/nvme_catalog.hpp` — the checksum, blob names and kinds, layouts and index of a volume's catalog.
+- `utilities/nvme_volume.hpp` — the extent allocator, volumes and the router.
+- `utilities/nvme_mounts.hpp` — the transport probe, the erased files disk, the mount and the shared resources.
 - `blobs/nvme_key_slot.hpp` — identifiers, value layouts, stored keys and values, key slots and the sorted run index.
 - `blobs/nvme_sorted_run.hpp` — `lsm_sorted_run`.
-- `blobs/nvme_compaction.hpp` and `vram_nvidia_compaction.cuh` — the host compactor, and the kernels of the device one.
+- `blobs/nvme_compaction.hpp`, `vram_nvidia_compaction.hpp` and `vram_nvidia_compaction.cuh` — the host compactor, the host face of the device one, and its kernels.
 - `blobs/nvme_tree.hpp` — configurations and schemas, `lsm_level`, its merger and `lsm_tree`.
 - `blobs/nvme_store.hpp` — the value cache, `nvme_store`, its snapshot and `nvme_store_cursor`.
-- `blobs/nvme_transaction_deltas.hpp` — `transaction_deltas`.
-- `blobs/nvme_database.hpp` and `nvme_single_collection_database.hpp` — both databases, their snapshots, transactions, registries and read sets.
-- `graph/adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below.
+- `blobs/nvme_transactions.hpp` — `transaction_deltas`, the read sets, `transaction_registry` and `transaction_core`, which both databases compose.
+- `blobs/nvme_database.hpp` and `nvme_single_collection_database.hpp` — both databases, their snapshots and transactions over the shared registry and core.
+- `graph/adjacency_fold.hpp`, `vram_nvidia_adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below, and the host face of its device fold.
 
 The sorted run index is a B-tree of the run's key slots, and the merger hands the compactor each run's index.
 
@@ -141,7 +143,7 @@ Only `ram` is refused, since the database the ABI names keeps its volumes in fil
 
 Compaction merges sorted key slots and plans how their stored values migrate into the new sorted runs, and `compaction_kind_t` names the merge: overlapping or sorted runs, into an intermediate or the bottom level, where remove deltas are dropped.
 The host and GPU compactors share one comparator, survival rule, sorted run split and placement, so their outputs match field by field.
-The GPU compactor runs on CUB from CCCL 3.4.2 with no Thrust, takes its devices, streams and buffers from `include/ustore/utilities/vram_nvidia_device.hpp`, and is chosen once a device is present and a merge exceeds `cuda_compaction_threshold_k`, 900,000 key slots.
+The GPU compactor launches three kernels of the library's bundle per merge, ranking, packing and placing, links no CUDA runtime, CUB or Thrust, takes its devices, streams and buffers from `include/ustore/utilities/vram_nvidia_device.hpp`, and is chosen once a device is present and a merge exceeds `cuda_compaction_threshold_k`, 900,000 key slots.
 GPU compaction is part of v1 and runs on both Hopper and Blackwell.
 
 ## Storage I/O
@@ -179,7 +181,7 @@ On a raw block device or an SPDK namespace, UStore shares one layout with USearc
 - __Slots.__ The device is cut into 1 GiB slots, 2³⁰ bytes counted from byte 0. A volume starts on a slot boundary and its `capacity_bytes` covers whole slots. A database's volumes may occupy separate slot ranges, as the router already spreads one database over several volumes.
 - __No label.__ Slot 0 holds whatever file starts there, and the drive carries no table of contents.
 - __Self-describing starts.__ The first block of a volume's first slot is its `volume_header_t`: the `USTOREV1` magic, `capacity_bytes`, the owning database's UUID and a CRC-32C over the header.
-- __Live or free.__ A mapper reads the first 4 KiB of each slot in order. A slot is live only when a known magic and its check both verify, and then the mapper skips the slots the length covers; any other slot is free. USearch recognizes this header as it is laid out in `nvme_volume.hpp` today, so a change to it is a change to the shared convention.
+- __Live or free.__ A mapper reads the first 4 KiB of each slot in order. A slot is live only when a known magic and its check both verify, and then the mapper skips the slots the length covers; any other slot is free. USearch recognizes this header as it is laid out in `nvme_catalog.hpp` today, so a change to it is a change to the shared convention.
 - __Deletion.__ Destroying a volume zeroes the first block of its first slot, with `BLKZEROOUT` or an SPDK write-zeroes, so stale bytes never read as a live volume.
 
 Every I/O buffer comes from one registered arena, because a range can be pinned only once — io_uring answers `EBUSY` on re-registration and a growing arena cannot be pinned at all.

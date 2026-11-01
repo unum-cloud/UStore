@@ -6,18 +6,20 @@
  *      engine `--engine` names, the read-modify-write path on the in-memory engine and change deltas on NVMe, and
  *      checks that composed chains apply like the chains they replace.
  *
- *  Random streams write, upsert, update, insert, patch, merge and remove whole documents and fields of them, with
- *  values of every type, malformed values and patches whose tests fail. Every modification runs through the engine
- *  and through the fold over the base and the pending chain, which must answer the same status and the same bytes.
- *  Chains compose and bases absorb chains at random points, as compaction would. Composition is then checked alone
- *  on random chains and bases, including malformed and empty documents, against applying the chain as it is. On NVMe,
- *  random modifications also run beside the in-memory engine while their records flush, compact and reopen.
+ *  Random streams write, upsert, update, insert, patch, merge and remove whole documents and
+ *  fields of them, with values of every type, malformed values and patches whose tests fail.
+ *  Every modification runs through the engine and through the fold over the base and the pending
+ *  chain, which must answer the same status and the same bytes. Chains compose and bases absorb
+ *  chains at random points, as compaction would. Composition is then checked alone on random
+ *  chains and bases, including malformed and empty documents, against applying the chain as it
+ *  is. On NVMe, random modifications also run beside the in-memory engine while their records
+ *  flush, compact and reopen.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`, `std::int64_t`
-#include <cstring> // `std::memcpy`, `std::strlen`
+#include <cstring> // `std::strlen`
 
 #include <algorithm>   // `std::min`
 #include <map>         // `std::map`
@@ -139,79 +141,79 @@ class value_writer_t {
     std::string_view pick(std::span<std::string_view const> pool) noexcept { return pool[random_.below(pool.size())]; }
 
     /** A value nested up to @p depth, with @p nulls in objects as often as a merge patch removes members. */
-    void value(std::string& out, std::size_t depth, std::size_t nulls = 0) {
+    void value(std::string& text, std::size_t depth, std::size_t nulls = 0) {
         std::uint64_t const kind = depth >= 3 ? 2 : random_.below(4);
         if (kind == 0) {
-            out += '{';
+            text += '{';
             std::size_t const members = random_.below(4);
             for (std::size_t member = 0; member != members; ++member) {
-                if (member) out += ',';
-                out += '"', out += pick(keys_k), out += "\":";
-                if (nulls && random_.below(nulls) == 0) out += "null";
-                else value(out, depth + 1, nulls);
+                if (member) text += ',';
+                text += '"', text += pick(keys_k), text += "\":";
+                if (nulls && random_.below(nulls) == 0) text += "null";
+                else value(text, depth + 1, nulls);
             }
-            out += '}';
+            text += '}';
         }
         else if (kind == 1) {
-            out += '[';
+            text += '[';
             std::size_t const elements = random_.below(3);
             for (std::size_t element = 0; element != elements; ++element) {
-                if (element) out += ',';
-                value(out, depth + 1, nulls);
+                if (element) text += ',';
+                value(text, depth + 1, nulls);
             }
-            out += ']';
+            text += ']';
         }
-        else out += pick(scalars_k);
+        else text += pick(scalars_k);
     }
 
     /** A whole document, an object at its root most of the time. */
     std::string document() {
-        std::string out;
+        std::string text;
         if (random_.below(8)) {
-            out += '{';
+            text += '{';
             std::size_t const members = random_.below(5);
             for (std::size_t member = 0; member != members; ++member) {
-                if (member) out += ',';
-                out += '"', out += pick(keys_k), out += "\":";
-                value(out, 1);
+                if (member) text += ',';
+                text += '"', text += pick(keys_k), text += "\":";
+                value(text, 1);
             }
-            out += '}';
+            text += '}';
         }
-        else value(out, 0);
-        return out;
+        else value(text, 0);
+        return text;
     }
 
     /** An RFC 7386 patch, an object with removals most of the time. */
     std::string merge_patch() {
-        std::string out;
+        std::string text;
         if (random_.below(6)) {
-            out += '{';
+            text += '{';
             std::size_t const members = 1 + random_.below(3);
             for (std::size_t member = 0; member != members; ++member) {
-                if (member) out += ',';
-                out += '"', out += pick(keys_k), out += "\":";
-                value(out, 1, 3);
+                if (member) text += ',';
+                text += '"', text += pick(keys_k), text += "\":";
+                value(text, 1, 3);
             }
-            out += '}';
+            text += '}';
         }
-        else value(out, 1);
-        return out;
+        else value(text, 1);
+        return text;
     }
 
     /** An object nested @p depth levels below a document, whose members are removals one time in @p nulls and
      *  nested objects half the rest of the time. */
     std::string nested_object(std::size_t depth, std::size_t nulls) {
-        std::string out = "{";
+        std::string text = "{";
         std::size_t const members = 1 + random_.below(3);
         for (std::size_t member = 0; member != members; ++member) {
-            if (member) out += ',';
-            out += '"', out += pick(std::span<std::string_view const>(keys_k).first(3)), out += "\":";
-            if (nulls && random_.below(nulls) == 0) out += "null";
-            else if (depth < 2 && random_.below(2)) out += nested_object(depth + 1, nulls);
-            else out += pick(scalars_k);
+            if (member) text += ',';
+            text += '"', text += pick(std::span<std::string_view const>(keys_k).first(3)), text += "\":";
+            if (nulls && random_.below(nulls) == 0) text += "null";
+            else if (depth < 2 && random_.below(2)) text += nested_object(depth + 1, nulls);
+            else text += pick(scalars_k);
         }
-        out += '}';
-        return out;
+        text += '}';
+        return text;
     }
 
     /** An RFC 6902 patch of one to three operations over a few paths, whose tests pass now and then. */
@@ -219,22 +221,22 @@ class value_writer_t {
         static constexpr std::string_view operations_k[] = {"add", "remove", "replace", "move", "copy", "test"};
         static constexpr std::string_view paths_k[] = {"", "/a", "/b", "/a/0", "/0", "/-", "/a/b", "/c", "/x~1y"};
         static constexpr std::string_view small_k[] = {"1", "0", "null", "\"s\"", "{}", "[]", "true"};
-        std::string out = "[";
+        std::string text = "[";
         std::size_t const count = 1 + random_.below(3);
         for (std::size_t index = 0; index != count; ++index) {
-            if (index) out += ',';
+            if (index) text += ',';
             std::string_view const operation = pick(operations_k);
-            out += "{\"op\":\"", out += operation, out += "\",\"path\":\"", out += pick(paths_k), out += '"';
-            if (operation == "move" || operation == "copy") out += ",\"from\":\"", out += pick(paths_k), out += '"';
+            text += "{\"op\":\"", text += operation, text += "\",\"path\":\"", text += pick(paths_k), text += '"';
+            if (operation == "move" || operation == "copy") text += ",\"from\":\"", text += pick(paths_k), text += '"';
             if (operation == "add" || operation == "replace" || operation == "test") {
-                out += ",\"value\":";
-                if (random_.below(2)) out += pick(small_k);
-                else value(out, 2);
+                text += ",\"value\":";
+                if (random_.below(2)) text += pick(small_k);
+                else value(text, 2);
             }
-            out += '}';
+            text += '}';
         }
-        out += ']';
-        return out;
+        text += ']';
+        return text;
     }
 
     /** Text that is no strict JSON, NaN and comments included, which every write refuses. */
@@ -312,7 +314,7 @@ operation_t random_operation(random_t& random, value_writer_t& writer, typed_ups
             operation.value.assign(reinterpret_cast<char const*>(&flag), sizeof(flag));
             break;
         }
-        default: operation.type = ustore_docs_field_type_str_k, operation.value = "text \"q\" \xC3\xA9"; break;
+        default: operation.type = ustore_docs_field_type_string_k, operation.value = "text \"q\" \xC3\xA9"; break;
         }
     }
     return operation;
@@ -413,10 +415,10 @@ std::size_t json_fold_codec() {
                            return same ? status_t {} : status_t {status_code_t::internal_k, "differs"};
                        }).succeeded());
     failures += expect_eq(index, std::size_t(4));
-    for (std::size_t cut = 1; cut != chain.size(); ++cut) {
+    for (std::size_t prefix_length = 1; prefix_length != chain.size(); ++prefix_length) {
         std::size_t boundaries = 0, offset = 0;
-        for (json_delta_t const& delta : deltas) boundaries += (offset += encoded_size(delta)) == cut;
-        status_t const truncated = for_each_delta(chain.first(cut),
+        for (json_delta_t const& delta : deltas) boundaries += (offset += encoded_size(delta)) == prefix_length;
+        status_t const truncated = for_each_delta(chain.first(prefix_length),
                                                   [](json_delta_t const&) noexcept { return status_t {}; });
         failures += expect(truncated.succeeded() == (boundaries == 1));
     }
@@ -811,18 +813,18 @@ std::size_t json_fold_own_changes(config_t const& config) {
     auto [transaction, transaction_status] = database.transaction();
     failures += expect(transaction_status.succeeded());
     if (failures) return failures;
-    reference_t own {database, collection};
-    own.transaction = transaction.transaction();
+    reference_t uncommitted {database, collection};
+    uncommitted.transaction = transaction.transaction();
     constexpr ustore_docs_field_type_t json_k = ustore_docs_field_type_json_k;
-    failures += expect(own.modify(ustore_docs_modify_upsert_k, "b", "2", json_k).succeeded());
-    failures += expect_document(own, R"({"a":1,"b":2})", "an upsert of a field");
-    failures += expect(own.modify(ustore_docs_modify_merge_k, {}, R"({"c":3})", json_k).succeeded());
+    failures += expect(uncommitted.modify(ustore_docs_modify_upsert_k, "b", "2", json_k).succeeded());
+    failures += expect_document(uncommitted, R"({"a":1,"b":2})", "an upsert of a field");
+    failures += expect(uncommitted.modify(ustore_docs_modify_merge_k, {}, R"({"c":3})", json_k).succeeded());
     failures += expect(
-        own.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"remove","path":"/a"}])", json_k).succeeded());
+        uncommitted.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"remove","path":"/a"}])", json_k).succeeded());
     failures += expect_status(
-        own.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"test","path":"/a","value":1}])", json_k),
+        uncommitted.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"test","path":"/a","value":1}])", json_k),
         status_code_t::invalid_argument_k);
-    failures += expect_document(own, R"({"b":2,"c":3})", "a merge and a patch over it");
+    failures += expect_document(uncommitted, R"({"b":2,"c":3})", "a merge and a patch over it");
     failures += expect_document(head, R"({"a":1})", "the head before the commit");
     failures += expect(transaction.commit().has_value());
     failures += expect_document(head, R"({"b":2,"c":3})", "the head after the commit");

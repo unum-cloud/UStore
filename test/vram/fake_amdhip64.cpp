@@ -200,6 +200,13 @@ __attribute__((visibility("default"))) int hipModuleGetFunction(void** function,
     return success_k;
 }
 
+__attribute__((visibility("default"))) int hipFuncGetAttribute(int* value, int, void*) {
+    *value = 0;
+    return success_k;
+}
+
+__attribute__((visibility("default"))) int hipFuncSetAttribute(void const*, int, int) { return not_supported_k; }
+
 __attribute__((visibility("default"))) int hipModuleLaunchKernel(void*, unsigned, unsigned, unsigned, unsigned,
                                                                  unsigned, unsigned, unsigned, void*, void**, void**) {
     return not_supported_k;

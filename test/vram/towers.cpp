@@ -2,8 +2,9 @@
  *  @file test/vram/towers.cpp
  *  @author Ash Vardanian
  *  @date October 29, 2026
- *  @brief Every read verb on a VRAM executor of each listed GPU against the same verb on the host: listings, device
- *      arenas, input staging with its cross-vendor refusal, and the upload tower's copies.
+ *  @brief Every read verb on a VRAM executor of each listed GPU against the same verb on the host:
+ *      listings, device arenas, input staging with its cross-vendor refusal, the upload tower's
+ *      copies, and tapes the device assembles.
  *
  *  The suite keeps an executor of its own on every device, through the same driver tables the library uses, to place
  *  inputs on the device and fetch outputs back. With the HIP stand-in on @c LD_LIBRARY_PATH it also counts what one
@@ -18,7 +19,6 @@
 #include <dlfcn.h> // `dlopen`, `dlsym`
 
 #include <array>       // `std::array`
-#include <memory>      // `std::unique_ptr`
 #include <span>        // `std::span`, `std::as_writable_bytes`
 #include <string>      // `std::string`, `std::to_string`
 #include <string_view> // `std::string_view`
@@ -28,7 +28,7 @@
 #include <fmt/format.h>
 
 #include "ustore/ustore.h"
-#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `spawn_gpu_executor`
+#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `spawn_gpu_executor`, `kernel_tables`, `assemble_tape`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_success`, `report`
 
@@ -82,8 +82,11 @@ class mover_t {
         gpu_device_t device;
         device.vendor = static_cast<gpu_vendor_t>(listed.vendor);
         device.vendor_ordinal = listed.vendor_ordinal;
-        return spawn_gpu_executor(drivers_, device, static_cast<gpu_class_t>(listed.gpu_class), nullptr, 0,
-                                  ustore_gds_automatic_k, executor_);
+        if (status_t const opened = open_gpu_device(drivers_, device, cuda_kernels_, hip_kernels_); opened.failed())
+            return opened;
+        return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, device,
+                                  static_cast<gpu_class_t>(listed.gpu_class), nullptr, 0, ustore_gds_automatic_k,
+                                  executor_);
     }
 
     ~mover_t() noexcept {
@@ -108,7 +111,7 @@ class mover_t {
 
     /** Copies @p host onto the device, freed with the mover. */
     template <typename element_type_>
-    element_type_ const* place(std::span<element_type_ const> host) noexcept {
+    element_type_* place(std::span<element_type_ const> host) noexcept {
         std::uintptr_t address = 0;
         copy([&](auto& executor) noexcept {
             auto [allocated, allocated_status] = executor.allocate_async(host.size_bytes());
@@ -117,7 +120,7 @@ class mover_t {
             placed_.push_back(address);
             return executor.upload_async(address, std::as_bytes(host));
         });
-        return reinterpret_cast<element_type_ const*>(address);
+        return reinterpret_cast<element_type_*>(address);
     }
 
     /** Whether @p pointer lies on this mover's device. */
@@ -130,13 +133,7 @@ class mover_t {
     /** The first failure of a copy, sticky until the mover dies. */
     status_t status() const noexcept { return status_; }
 
-  private:
-    template <typename body_type_>
-    void visit(body_type_&& body) noexcept {
-        std::visit(device_visitor<body_type_> {body}, executor_);
-    }
-
-    /** Runs @p body's copy on the device and waits for it, keeping the first failure. */
+    /** Runs @p body's work on the device and waits for it, keeping the first failure. */
     template <typename body_type_>
     void copy(body_type_&& body) noexcept {
         visit([&](auto& executor) noexcept {
@@ -145,7 +142,22 @@ class mover_t {
         });
     }
 
+    /** Whether the device loaded the library's kernels. */
+    bool launches() noexcept {
+        bool loaded = false;
+        visit([&](auto& executor) noexcept { loaded = executor.kernels() != nullptr; });
+        return loaded;
+    }
+
+  private:
+    template <typename body_type_>
+    void visit(body_type_&& body) noexcept {
+        std::visit(device_visitor<body_type_> {body}, executor_);
+    }
+
     gpu_drivers_t drivers_;
+    kernel_tables<cuda_module_t> cuda_kernels_;
+    kernel_tables<hip_module_t> hip_kernels_;
     std::variant<std::monostate, cuda_executor_t, hip_executor_t> executor_;
     std::vector<std::uintptr_t> placed_;
     status_t status_;
@@ -302,6 +314,12 @@ std::size_t expect_tape(mover_t& mover, ustore_strings_view_t const& host, ustor
 
 #pragma region Cases
 
+/** What a listing verb answers: a scan from the first key, or a sample whose draw is random. */
+enum class listing_kind_t : bool { scan_k, sample_k };
+
+/** Whether the device serves a call, or refuses it as unsupported. */
+enum class device_service_t : bool { unsupported_k, served_k };
+
 std::size_t vram_listing(ustore_gpu_device_t listed) {
     std::size_t failures = expect(listed.vendor != ustore_gpu_vendor_unknown_k);
     failures += expect(listed.gpu_class != ustore_gpu_class_unknown_k);
@@ -334,6 +352,84 @@ std::size_t vram_arenas(std::size_t ordinal, config_t config) {
     read.executor = call.executor;
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
+    return failures;
+}
+
+/** A read's outputs in a device arena export as Arrow columns living on that device, in place and
+ *  with their offsets converted to the other width, counting the same bytes. */
+std::size_t vram_exports(std::size_t ordinal, ustore_gpu_device_t listed, config_t config) {
+    device_call_t call {ordinal};
+    if (expect(call.status.succeeded())) return 1;
+    mover_t mover;
+    if (expect(mover.open(listed).succeeded())) return 1;
+    fixture_t fixture {config, "exports"};
+    if (fixture.failures) return fixture.failures;
+    std::size_t failures = 0;
+    ustore_key_t const key = fixture.keys.front();
+    ustore_strings_view_t values {};
+    ustore_outcome_t outcome {};
+    ustore_blobs_read_t read {.database = fixture.database, .executor = call.executor, .outcome = &outcome};
+    read.count = 1, read.collections = {&fixture.blobs, 0}, read.keys = {&key, 0}, read.values = &values;
+    read.arena = call.arena;
+    ustore_blobs_read(&read);
+    failures += expect_success(outcome);
+    if (failures) return failures;
+
+    ArrowSchema schema {};
+    ArrowDeviceArray array {};
+    failures += expect(ustore_strings_view_to_arrow(values, 1, values.layout, call.arena, &schema, &array) ==
+                       ustore_status_success_k);
+    ArrowDeviceType const vendor = listed.vendor == ustore_gpu_vendor_amd_k ? ARROW_DEVICE_ROCM : ARROW_DEVICE_CUDA;
+    failures += expect(array.device_type == vendor);
+    failures += expect(array.device_id == static_cast<std::int64_t>(listed.vendor_ordinal));
+    failures += expect(array.sync_event == nullptr);
+    // The two offsets of the one value, of either width, fetched from the device
+    auto const offsets_of = [&](ArrowDeviceArray const& exported, ustore_strings_layout_t layout) noexcept {
+        if (layout == ustore_strings_u64_tape_k)
+            return mover.fetch(static_cast<std::uint64_t const*>(exported.array.buffers[1]), 2);
+        std::vector<std::uint32_t> const narrow = mover.fetch(
+            static_cast<std::uint32_t const*>(exported.array.buffers[1]), 2);
+        return std::vector<std::uint64_t> {narrow.begin(), narrow.end()};
+    };
+    std::vector<std::uint64_t> const in_place = offsets_of(array, values.layout);
+    if (array.array.release) array.array.release(&array.array);
+    if (schema.release) schema.release(&schema);
+
+    ustore_strings_layout_t const other = values.layout == ustore_strings_u64_tape_k ? ustore_strings_u32_tape_k
+                                                                                     : ustore_strings_u64_tape_k;
+    failures += expect(ustore_strings_view_to_arrow(values, 1, other, call.arena, &schema, &array) ==
+                       ustore_status_success_k);
+    failures += expect(array.device_type == vendor);
+    std::vector<std::uint64_t> const converted = offsets_of(array, other);
+    failures += expect(mover.status().succeeded());
+    failures += expect(converted[0] == 0 && converted[1] == in_place[1] - in_place[0]);
+    if (array.array.release) array.array.release(&array.array);
+    if (schema.release) schema.release(&schema);
+    return failures;
+}
+
+/** A cursor opened on host threads walks there alone, so pulling it on a device is refused with
+ *  @c ustore_status_device_k. */
+std::size_t vram_cursors(std::size_t ordinal, config_t config) {
+    device_call_t call {ordinal};
+    if (expect(call.status.succeeded())) return 1;
+    fixture_t fixture {config, "cursors"};
+    if (fixture.failures) return fixture.failures;
+    std::size_t failures = 0;
+    ustore_outcome_t outcome {};
+    ustore_blobs_cursor_t cursor = nullptr;
+    ustore_blobs_cursor_init_t opened {.cursor = &cursor, .database = fixture.database, .outcome = &outcome};
+    opened.collection = fixture.blobs, opened.start_key = fixture.keys.front();
+    ustore_blobs_cursor_init(&opened);
+    failures += expect_success(outcome);
+    if (failures) return failures;
+    ustore_key_t const* found = nullptr;
+    ustore_size_t written = 0;
+    ustore_blobs_cursor_next_t pull {.database = fixture.database, .executor = call.executor, .outcome = &outcome};
+    pull.cursor = cursor, pull.keys = &found, pull.written = &written, pull.arena = call.arena, pull.wanted = 1;
+    ustore_blobs_cursor_next(&pull);
+    failures += expect(outcome.status == ustore_status_device_k);
+    ustore_blobs_cursor_free(cursor);
     return failures;
 }
 
@@ -376,7 +472,7 @@ std::size_t vram_reads(std::size_t ordinal, ustore_gpu_device_t listed, config_t
     }
     // Every listing verb: one scan from the first key, and a sample, whose draw is random, compared by its offsets
     auto const listing = [&]<typename arguments_type_>(void (*verb)(arguments_type_*), ustore_collection_id_t& from,
-                                                       bool sampled) {
+                                                       listing_kind_t kind) {
         ustore_length_t const *host_offsets = nullptr, *device_offsets = nullptr;
         ustore_key_t const *host_keys = nullptr, *device_keys = nullptr;
         arguments_type_ host {.database = fixture.database, .count = 1}, device = host;
@@ -391,15 +487,16 @@ std::size_t vram_reads(std::size_t ordinal, ustore_gpu_device_t listed, config_t
         verb(&host), verb(&device);
         std::size_t listed_failures = expect_success(host_outcome) + expect_success(device_outcome);
         listed_failures += expect_column(mover, host_offsets, device_offsets, 2);
-        if (!sampled && host_offsets) listed_failures += expect_column(mover, host_keys, device_keys, host_offsets[1]);
+        if (kind == listing_kind_t::scan_k && host_offsets)
+            listed_failures += expect_column(mover, host_keys, device_keys, host_offsets[1]);
         return listed_failures;
     };
-    failures += listing(&ustore_blobs_scan, fixture.blobs, false);
-    failures += listing(&ustore_blobs_sample, fixture.blobs, true);
-    failures += listing(&ustore_docs_scan, fixture.docs, false);
-    failures += listing(&ustore_docs_sample, fixture.docs, true);
-    failures += listing(&ustore_graph_scan_vertices, fixture.graph, false);
-    failures += listing(&ustore_pages_scan, fixture.pages, false);
+    failures += listing(&ustore_blobs_scan, fixture.blobs, listing_kind_t::scan_k);
+    failures += listing(&ustore_blobs_sample, fixture.blobs, listing_kind_t::sample_k);
+    failures += listing(&ustore_docs_scan, fixture.docs, listing_kind_t::scan_k);
+    failures += listing(&ustore_docs_sample, fixture.docs, listing_kind_t::sample_k);
+    failures += listing(&ustore_graph_scan_vertices, fixture.graph, listing_kind_t::scan_k);
+    failures += listing(&ustore_pages_scan, fixture.pages, listing_kind_t::scan_k);
 
     {
         ustore_octet_t const *host_presences = nullptr, *device_presences = nullptr;
@@ -470,7 +567,7 @@ std::size_t vram_reads(std::size_t ordinal, ustore_gpu_device_t listed, config_t
     {
         tape_t fields;
         fields.push("name"), fields.push("score"), fields.push("id");
-        ustore_docs_field_type_t const types[3] = {ustore_docs_field_type_str_k, ustore_docs_field_type_f64_k,
+        ustore_docs_field_type_t const types[3] = {ustore_docs_field_type_string_k, ustore_docs_field_type_f64_k,
                                                    ustore_docs_field_type_i64_k};
         std::size_t const widths[3] = {0, sizeof(double), sizeof(std::int64_t)};
         ustore_docs_column_view_t const *host_columns = nullptr, *device_columns = nullptr;
@@ -694,17 +791,18 @@ case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, con
     fixture_t fixture {config, "matching"};
     if (fixture.failures) return fixture.failures;
     std::size_t failures = 0;
-    // NVIDIA devices match values through StringZilla's CUDA engines where the build holds them, AMD ones never
-    sz_capability_t compiled = 0;
-    sz_capabilities_compiled_cuda(&compiled);
-    bool const matches_values = listed.vendor == ustore_gpu_vendor_nvidia_k && (compiled & sz_cap_cuda_k);
+    // Every device matches values through the library's kernels, but the stand-in HIP driver, which
+    // loads no bundle
+    device_service_t const matches_values = listed.vendor == ustore_gpu_vendor_nvidia_k || !fake_hip_counters()
+                                                ? device_service_t::served_k
+                                                : device_service_t::unsupported_k;
     ustore_predicate_t const even_cheap {.callback = &admit_even_keys, .cost = ustore_predicate_cheap_k};
     ustore_predicate_t const even_expensive {.callback = &admit_even_keys, .cost = ustore_predicate_expensive_k};
 
     // Every filtered listing wants a quarter of the collection, so a sparse filter pages through it several times
     auto const filtered = [&]<typename arguments_type_, typename narrow_type_>(
                               void (*verb)(arguments_type_*), ustore_collection_id_t& from, narrow_type_ const& narrow,
-                              bool served, std::size_t least, std::size_t most) {
+                              device_service_t service, std::size_t least, std::size_t most) {
         ustore_length_t const *host_offsets = nullptr, *device_offsets = nullptr;
         ustore_key_t const *host_keys = nullptr, *device_keys = nullptr;
         float const *host_scores = nullptr, *device_scores = nullptr;
@@ -725,7 +823,8 @@ case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, con
         std::size_t matched = expect_success(host_outcome) + expect(host_offsets != nullptr);
         if (matched) return matched;
         matched += expect(host_offsets[1] >= least && host_offsets[1] <= most);
-        if (!served) return matched + expect(device_outcome.status == ustore_status_unsupported_k);
+        if (service == device_service_t::unsupported_k)
+            return matched + expect(device_outcome.status == ustore_status_unsupported_k);
         matched += expect_success(device_outcome) + expect_column(mover, host_offsets, device_offsets, 2);
         matched += expect_column(mover, host_keys, device_keys, host_offsets[1]);
         return matched + expect_column(mover, host_scores, device_scores, host_offsets[1]);
@@ -764,7 +863,8 @@ case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, con
         device.outcome = &device_outcome, device.executor = call.executor, device.arena = call.arena;
         ustore_blobs_scan(&host), ustore_blobs_scan(&device);
         failures += expect_success(host_outcome) + expect(host_offsets && host_offsets[1] > 0);
-        if (!matches_values) failures += expect(device_outcome.status == ustore_status_unsupported_k);
+        if (matches_values == device_service_t::unsupported_k)
+            failures += expect(device_outcome.status == ustore_status_unsupported_k);
         else if (host_offsets) {
             failures += expect_success(device_outcome) + expect_column(mover, host_offsets, device_offsets, 2);
             failures += expect_column(mover, host_keys, device_keys, host_offsets[1]);
@@ -781,11 +881,12 @@ case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, con
         matches_values, 1, wanted - 1);
     // A predicate alone reads no values, so every vendor serves it
     failures += filtered(
-        &ustore_blobs_scan, fixture.blobs, [&](ustore_blobs_scan_t& scan) { scan.predicate = even_expensive; }, true,
-        wanted, wanted);
+        &ustore_blobs_scan, fixture.blobs, [&](ustore_blobs_scan_t& scan) { scan.predicate = even_expensive; },
+        device_service_t::served_k, wanted, wanted);
     failures += filtered(
         &ustore_graph_scan_vertices, fixture.graph,
-        [&](ustore_graph_scan_vertices_t& scan) { scan.predicate = even_cheap; }, true, wanted, wanted);
+        [&](ustore_graph_scan_vertices_t& scan) { scan.predicate = even_cheap; }, device_service_t::served_k, wanted,
+        wanted);
     // Documents with a member past 40, their even keys asked after the values matched, and a path none holds
     failures += filtered(
         &ustore_docs_scan, fixture.docs,
@@ -797,10 +898,11 @@ case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, con
     failures += filtered(
         &ustore_docs_scan, fixture.docs, [&](ustore_docs_scan_t& scan) { scan.filter = bytes_of("$.missing"); },
         matches_values, 0, 0);
-    // StringZilla's GPU walks evaluate no bare filter, so every device refuses one
+    // A filter the kernels do not walk matches on the host, so every device serving
+    // matches serves it
     failures += filtered(
         &ustore_docs_scan, fixture.docs, [&](ustore_docs_scan_t& scan) { scan.filter = bytes_of("?@.score > 40"); },
-        false, wanted, wanted);
+        matches_values, wanted, wanted);
     // Every page holds a bold element, and none an italic one
     failures += filtered(
         &ustore_pages_scan, fixture.pages, [&](ustore_pages_scan_t& scan) { scan.filter = bytes_of("//b"); },
@@ -826,12 +928,58 @@ case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, con
         device.outcome = &device_outcome, device.executor = call.executor, device.arena = call.arena;
         ustore_strings_scan(&host), ustore_strings_scan(&device);
         failures += expect_success(host_outcome) + expect(host_offsets && host_offsets[1] > 0);
-        if (!matches_values) failures += expect(device_outcome.status == ustore_status_unsupported_k);
+        if (matches_values == device_service_t::unsupported_k)
+            failures += expect(device_outcome.status == ustore_status_unsupported_k);
         else if (host_offsets) {
             failures += expect_success(device_outcome) + expect_column(mover, host_offsets, device_offsets, 2);
             failures += expect_tape(mover, host_strings, device_strings, host_offsets[1]);
         }
     }
+    return failures;
+}
+
+/** A tape the device assembles from strings it holds lays out byte for byte as the
+ *  host's @c assemble_tape lays it, across several blocks of the offsets scan and
+ *  segments of the gather, empty strings among them. */
+case_result_t vram_tapes(ustore_gpu_device_t listed) {
+    mover_t mover;
+    if (expect(mover.open(listed).succeeded())) return 1;
+    if (!mover.launches()) return case_result_t::skipped("the library embeds no kernels for the device");
+    std::size_t failures = 0;
+    std::vector<std::string> strings;
+    for (std::size_t index = 0; index != 3 * tape_block_threads_k + 5; ++index)
+        strings.push_back(std::string(index % 11, static_cast<char>('a' + index % 26)));
+    std::string joined;
+    for (std::string const& string : strings) joined += string;
+    char const* const placed = mover.place(std::span<char const> {joined});
+    std::vector<tape_source_t> host_sources, device_sources;
+    std::size_t offset = 0;
+    for (std::string const& string : strings) {
+        host_sources.push_back({reinterpret_cast<std::byte const*>(string.data()), string.size()});
+        device_sources.push_back({reinterpret_cast<std::byte const*>(placed + offset), string.size()});
+        offset += string.size();
+    }
+
+    std::vector<std::uint32_t> host_offsets(strings.size() + 1);
+    std::vector<std::byte> host_bytes(joined.size());
+    assemble_tape<std::uint32_t>(
+        strings.size(), [&](std::size_t index) noexcept { return host_sources[index]; },
+        std::span<std::uint32_t> {host_offsets}, std::span<std::byte> {host_bytes});
+
+    // The outputs start poisoned, so every byte the device leaves unwritten shows
+    std::vector<std::uint32_t> const poisoned_offsets(host_offsets.size(), ~std::uint32_t {0});
+    std::vector<std::byte> const poisoned_bytes(host_bytes.size(), std::byte {0xFF});
+    tape_source_t const* const sources = mover.place(std::span<tape_source_t const> {device_sources});
+    std::uint32_t* const offsets = mover.place(std::span {poisoned_offsets});
+    std::byte* const bytes = mover.place(std::span {poisoned_bytes});
+    mover.copy([&](auto& executor) noexcept {
+        return assemble_tape<std::uint32_t>(executor, std::span<tape_source_t const> {sources, strings.size()},
+                                            std::span<std::uint32_t> {offsets, host_offsets.size()},
+                                            std::span<std::byte> {bytes, host_bytes.size()});
+    });
+    failures += expect(mover.status().succeeded());
+    failures += expect(mover.fetch(offsets, host_offsets.size()) == host_offsets);
+    failures += expect(mover.fetch(bytes, host_bytes.size()) == host_bytes);
     return failures;
 }
 
@@ -860,11 +1008,18 @@ int main(int argc, char** argv) {
         std::string const prefix = fmt::format("vram.{}{}.", ustore_gpu_vendor_name(listed.vendor), ordinal);
         report(totals, (prefix + "listing").c_str(), vram_listing, listed);
         report(totals, (prefix + "arenas").c_str(), vram_arenas, ordinal, config);
+        report(totals, (prefix + "cursors").c_str(), vram_cursors, ordinal, config);
+        report(totals, (prefix + "exports").c_str(), vram_exports, ordinal, listed, config);
         report(totals, (prefix + "reads").c_str(), vram_reads, ordinal, listed, config);
         report(totals, (prefix + "staging").c_str(), vram_staging, ordinal, listed, devices, config);
         report(totals, (prefix + "warm_calls").c_str(), vram_warm_calls, ordinal, listed, config);
         report(totals, (prefix + "frees_everything").c_str(), vram_frees_everything, ordinal, listed, config);
         report(totals, (prefix + "matching").c_str(), vram_matching, ordinal, listed, config);
+        // A build embedding no kernels for the vendor, like the one the HIP stand-in runs under,
+        // lists no tape case
+        bool const embeds = listed.vendor == ustore_gpu_vendor_nvidia_k ? !vram_nvidia_bundle().empty()
+                                                                        : !vram_amd_bundle().empty();
+        if (embeds) report(totals, (prefix + "tapes").c_str(), vram_tapes, listed);
     }
     return suite_exit_code(totals);
 }

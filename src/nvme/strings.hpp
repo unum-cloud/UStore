@@ -19,7 +19,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
 #include "database.hpp"           // `database_state`, `string_task_t`, `stage_strings`, `read_string`, `scan_strings`
-#include "utilities/batches.hpp"  // `strings_arg_t`
+#include "utilities/batches.hpp"  // `strings_arg_t`, `validate_choices`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -66,6 +66,8 @@ status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t con
 template <cpu_class_t cpu_class_>
 status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t const& texts,
                        view_t const& view) noexcept {
+    if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
+        return status;
     if (!arguments.count) return {};
     strided_iterator<ustore_key_t const> const values = strided(arguments.values);
     if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their keys"};
@@ -76,6 +78,8 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
 template <cpu_class_t cpu_class_>
 status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t const& texts,
                         view_t const& view) noexcept {
+    if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
+        return status;
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
     return serve_strings_write<cpu_class_>(arguments, texts, strided_iterator<ustore_key_t const> {}, view);

@@ -5,28 +5,27 @@
  *  @brief The database, transaction and snapshot handles of the C++ wrappers, and the receivers that run their calls
  *      on an executor, blocking or deferred.
  *
- *  A receiver chooses where a call runs and the verb stays: @c on gives the same collections and proxies, running
- *  blocking on an executor, while @c deferred gives collections whose verbs take owned inputs and answer a
- *  @c deferred call. Snapshots hand out read-only collections and proxies, so nothing can write through one.
+ *  A receiver chooses where a call runs and the verb stays: @c on gives the same collections and
+ *  proxies, running blocking on an executor, while @c deferred gives collections whose verbs take
+ *  owned inputs and answer a @c deferred call. Snapshots hand out read-only collections and
+ *  proxies, so nothing can write through one.
  */
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
-
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <utility>     // `std::exchange`, `std::forward`, `std::move`, `std::swap`
+#include <utility>     // `std::exchange`, `std::forward`, `std::swap`
 
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include "ustore/blobs_collection.hpp"   // `blobs_collection_t`, `deferred_blobs_collection_t`
 #include "ustore/blobs_ref.hpp"          // `blobs_ref`, `blobs_read_ref`
-#include "ustore/docs_collection.hpp"    // `docs_collection_t`, `deferred_docs_collection_t`
-#include "ustore/graph_collection.hpp"   // `graph_collection_t`, `deferred_graph_collection_t`
-#include "ustore/ranges.hpp"             // `strided_span`, `keys_view_t`, `place_batch_t`
+#include "ustore/docs_collection.hpp"    // what `find` and `create` take as a template argument
+#include "ustore/graph_collection.hpp"   // what `find` and `create` take as a template argument
+#include "ustore/ranges.hpp"             // `strided_span`, `place_batch_t`
 #include "ustore/status.hpp"             // `status_t`, `expected`, `deferred`
-#include "ustore/strings_collection.hpp" // `strings_collection_t`, `deferred_strings_collection_t`
+#include "ustore/strings_collection.hpp" // what `find` and `create` take as a template argument
 #include "ustore/types.hpp"              // `arena_t`, `receiver_t`, `read_stamp_t`, `commit_stamp_t`
 #include "ustore/ustore.h"
 
@@ -76,8 +75,8 @@ inline expected<ustore_collection_id_t> collection_named(receiver_t const& recei
 }
 
 /**
- *  Reads the collection @p name was given, as the overload above, refusing one that holds another modality than
- *  @p modality.
+ *  @brief Reads the collection @p name was given, as the overload above, refusing one that holds
+ *      another modality than @p modality.
  *
  *  @par Statuses:
  *  - @c status_code_t::not_found_k No collection carries @p name.
@@ -289,13 +288,13 @@ class deferred_transaction_t {
   public:
     explicit deferred_transaction_t(receiver_t receiver) noexcept : receiver_(receiver) {}
 
-    /** The collection named @p name, read and written through the transaction, as the deferred twin of
-     *  @p collection_. */
-    template <typename collection_ = blobs_collection_t>
-    expected<typename collection_::deferred_t> find(std::string_view name) const noexcept {
-        auto [found, find_status] = collection_named(receiver_, name, collection_::modality_k);
+    /** The collection named @p name, read and written through the transaction, as the deferred twin
+     *  of the read-only twin of @p collection_type_. */
+    template <typename collection_type_ = blobs_collection_t>
+    expected<typename collection_type_::deferred_t> find(std::string_view name) const noexcept {
+        auto [found, find_status] = collection_named(receiver_, name, collection_type_::modality_k);
         if (find_status.failed()) return find_status;
-        return typename collection_::deferred_t {receiver_, found};
+        return typename collection_type_::deferred_t {receiver_, found};
     }
 
     expected<deferred_blobs_collection_t> operator[](std::string_view name) const noexcept { return find(name); }
@@ -353,12 +352,13 @@ class deferred_snapshot_t {
   public:
     explicit deferred_snapshot_t(receiver_t receiver) noexcept : receiver_(receiver) {}
 
-    /** The collection named @p name at the snapshot, as the deferred twin of the read-only twin of @p collection_. */
-    template <typename collection_ = blobs_collection_t>
-    expected<typename collection_::read_only_t::deferred_t> find(std::string_view name) const noexcept {
-        auto [found, find_status] = collection_named(receiver_, name, collection_::modality_k);
+    /** The collection named @p name at the snapshot, as the deferred twin of the
+     *  read-only twin of @p collection_type_. */
+    template <typename collection_type_ = blobs_collection_t>
+    expected<typename collection_type_::read_only_t::deferred_t> find(std::string_view name) const noexcept {
+        auto [found, find_status] = collection_named(receiver_, name, collection_type_::modality_k);
         if (find_status.failed()) return find_status;
-        return typename collection_::read_only_t::deferred_t {receiver_, found};
+        return typename collection_type_::read_only_t::deferred_t {receiver_, found};
     }
 
     expected<deferred_blobs_read_collection_t> operator[](std::string_view name) const noexcept { return find(name); }
@@ -387,12 +387,12 @@ class deferred_database_t {
   public:
     explicit deferred_database_t(receiver_t receiver) noexcept : receiver_(receiver) {}
 
-    /** The collection named @p name at the head, as the deferred twin of @p collection_. */
-    template <typename collection_ = blobs_collection_t>
-    expected<typename collection_::deferred_t> find(std::string_view name) const noexcept {
-        auto [found, find_status] = collection_named(receiver_, name, collection_::modality_k);
+    /** The collection named @p name at the head, as the deferred twin of @p collection_type_. */
+    template <typename collection_type_ = blobs_collection_t>
+    expected<typename collection_type_::deferred_t> find(std::string_view name) const noexcept {
+        auto [found, find_status] = collection_named(receiver_, name, collection_type_::modality_k);
         if (find_status.failed()) return find_status;
-        return typename collection_::deferred_t {receiver_, found};
+        return typename collection_type_::deferred_t {receiver_, found};
     }
 
     /** The binary collection @p collection identifies, resolved beforehand, so addressing it never blocks. */
@@ -400,9 +400,9 @@ class deferred_database_t {
         return deferred_blobs_collection_t {receiver_, collection};
     }
 
-    /** Creates a collection holding the modality of @p collection_ under @p name, which the call copies and no other
-     *  collection may carry, answering its identifier. */
-    template <typename collection_ = blobs_collection_t>
+    /** Creates a collection holding the modality of @p collection_type_ under @p name, which the
+     *  call copies and no other collection may carry, answering its identifier. */
+    template <typename collection_type_ = blobs_collection_t>
     deferred<create_t> create(std::string_view name) const noexcept {
         return deferred<create_t>::submit([&](create_t& verb, ustore_collection_create_t& arguments) noexcept {
             auto [copied, copy_status] = own_bytes_(name, verb.name);
@@ -410,7 +410,7 @@ class deferred_database_t {
             arguments.database = receiver_.database;
             arguments.executor = receiver_.executor;
             if (!name.empty()) arguments.name = copied;
-            arguments.modality = collection_::modality_k;
+            arguments.modality = collection_type_::modality_k;
             arguments.collection = &verb.collection;
             return status_t {};
         });
@@ -512,7 +512,7 @@ class transaction_ref_t {
     }
 
     template <typename keys_argument_type_>
-        requires has_collection_concept<batch_element_t<keys_argument_type_>>
+        requires has_collection_concept<batch_element_of<keys_argument_type_>>
     blobs_ref<keys_argument_type_> operator[](keys_argument_type_&& keys) noexcept {
         return blobs_ref<keys_argument_type_> {receiver_, std::forward<keys_argument_type_>(keys)};
     }
@@ -523,15 +523,16 @@ class transaction_ref_t {
     expected<bool> contains(std::string_view name) noexcept { return collection_exists(receiver_, name); }
 
     /**
-     *  Opens a view of one collection that follows this transaction.
-     *  @tparam collection_ One of @c blobs_collection_t, @c docs_collection_t, @c graph_collection_t or
-     *      @c strings_collection_t.
+     *  @brief Opens a view of one collection that follows this transaction.
+     *
+     *  @tparam collection_type_ The collection type: @c blobs_collection_t, @c docs_collection_t,
+     *      as well as @c graph_collection_t or @c strings_collection_t.
      */
-    template <typename collection_ = blobs_collection_t>
-    expected<collection_> find(std::string_view name) noexcept {
-        auto [found, lookup_status] = collection_named(receiver_, name, collection_::modality_k);
+    template <typename collection_type_ = blobs_collection_t>
+    expected<collection_type_> find(std::string_view name) noexcept {
+        auto [found, lookup_status] = collection_named(receiver_, name, collection_type_::modality_k);
         if (lookup_status.failed()) return lookup_status;
-        return collection_ {receiver_, found};
+        return collection_type_ {receiver_, found};
     }
 
     /** Opens the transaction, or clears it for reuse, keeping its memory and starting a new generation. */
@@ -658,7 +659,7 @@ class snapshot_ref_t {
     }
 
     template <typename keys_argument_type_>
-        requires has_collection_concept<batch_element_t<keys_argument_type_>>
+        requires has_collection_concept<batch_element_of<keys_argument_type_>>
     blobs_read_ref<keys_argument_type_> operator[](keys_argument_type_&& keys) noexcept {
         return blobs_read_ref<keys_argument_type_> {receiver_, std::forward<keys_argument_type_>(keys)};
     }
@@ -672,15 +673,16 @@ class snapshot_ref_t {
     expected<bool> contains(std::string_view name) noexcept { return collection_exists(receiver_, name); }
 
     /**
-     *  Opens a read-only view of one collection at the snapshot.
-     *  @tparam collection_ One of @c blobs_collection_t, @c docs_collection_t, @c graph_collection_t or
-     *      @c strings_collection_t, or their read-only twins.
+     *  @brief Opens a read-only view of one collection at the snapshot.
+     *
+     *  @tparam collection_type_ The collection type: @c blobs_collection_t, @c docs_collection_t,
+     *      as well as @c graph_collection_t or @c strings_collection_t, or their read-only twins.
      */
-    template <typename collection_ = blobs_collection_t>
-    expected<typename collection_::read_only_t> find(std::string_view name) noexcept {
-        auto [found, lookup_status] = collection_named(receiver_, name, collection_::modality_k);
+    template <typename collection_type_ = blobs_collection_t>
+    expected<typename collection_type_::read_only_t> find(std::string_view name) noexcept {
+        auto [found, lookup_status] = collection_named(receiver_, name, collection_type_::modality_k);
         if (lookup_status.failed()) return lookup_status;
-        return typename collection_::read_only_t {receiver_, found};
+        return typename collection_type_::read_only_t {receiver_, found};
     }
 
     /** Saves the snapshot as a new database at @p path, reporting the bytes saved to @p progress, which may cancel the
@@ -803,10 +805,10 @@ class database_ref_t {
     /** Lists the collections at the head, with their identifiers in @p arena. */
     expected<collections_list_t> collections(arena_t& arena) noexcept { return list_collections(receiver_, arena); }
 
-    /** Creates a collection holding the modality of @p collection_ under @p name, which no other collection may
-     *  carry. */
-    template <typename collection_ = blobs_collection_t>
-    expected<collection_> create(std::string_view name) noexcept {
+    /** Creates a collection holding the modality of @p collection_type_ under @p name, which no
+     *  other collection may carry. */
+    template <typename collection_type_ = blobs_collection_t>
+    expected<collection_type_> create(std::string_view name) noexcept {
         ustore_outcome_t outcome {};
         ustore_collection_id_t collection {};
         ustore_collection_create_t create {};
@@ -814,33 +816,35 @@ class database_ref_t {
         create.executor = receiver_.executor;
         create.outcome = &outcome;
         create.name = bytes_of(name);
-        create.modality = collection_::modality_k;
+        create.modality = collection_type_::modality_k;
         create.collection = &collection;
         ustore_collection_create(&create);
         if (status_t const status {outcome}; status.failed()) return status;
-        return collection_ {receiver_, collection};
+        return collection_type_ {receiver_, collection};
     }
 
     /**
-     *  The collection named @p name, refusing one that holds another modality than @p collection_.
+     *  @brief The collection named @p name, refusing one that holds another modality than
+     *      @p collection_type_.
      *
      *  @par Statuses:
      *  - @c status_code_t::not_found_k No collection carries @p name.
-     *  - @c status_code_t::invalid_argument_k The collection holds another modality than @p collection_.
+     *  - @c status_code_t::invalid_argument_k The collection holds another modality than
+     *    @p collection_type_.
      */
-    template <typename collection_ = blobs_collection_t>
-    expected<collection_> find(std::string_view name) noexcept {
-        auto [found, find_status] = collection_named(receiver_, name, collection_::modality_k);
+    template <typename collection_type_ = blobs_collection_t>
+    expected<collection_type_> find(std::string_view name) noexcept {
+        auto [found, find_status] = collection_named(receiver_, name, collection_type_::modality_k);
         if (find_status.failed()) return find_status;
-        return collection_ {receiver_, found};
+        return collection_type_ {receiver_, found};
     }
 
     /** The collection named @p name, created when no collection carries the name. */
-    template <typename collection_ = blobs_collection_t>
-    expected<collection_> find_or_create(std::string_view name) noexcept {
-        expected<collection_> found = find<collection_>(name);
+    template <typename collection_type_ = blobs_collection_t>
+    expected<collection_type_> find_or_create(std::string_view name) noexcept {
+        expected<collection_type_> found = find<collection_type_>(name);
         if (found || found.code() != status_code_t::not_found_k) return found;
-        return create<collection_>(name);
+        return create<collection_type_>(name);
     }
 
     /** Drops the collection @p name addresses, which takes the name with it. */

@@ -1,4 +1,9 @@
-"""Binary values over the C ABI: single and batch access, scans, samples, measurements and deferred calls."""
+"""Binary values over the C ABI: single and batch access, scans, samples, measurements and deferred calls.
+
+File: test/blobs.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import asyncio
 import gc
@@ -567,7 +572,7 @@ def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path):
         ustore.Database.open_nvme(tmp_path, compactions=executor)
     # A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries
     with pytest.raises((ustore.UnsupportedError, ustore.DeviceError)):
-        ustore.Executor.for_vram(1 << 20, gds=ustore.Gds.COMPAT)
+        ustore.Executor.for_vram(1 << 20, gds=ustore.Gds.COMPATIBILITY)
 
 
 def test_a_database_opens_on_an_executor(engine: str, tmp_path):

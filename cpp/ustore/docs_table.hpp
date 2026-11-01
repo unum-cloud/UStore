@@ -28,16 +28,16 @@ namespace unum::ustore {
 
 /** Whether a gathered column of @p type holds strings, which offsets address, rather than scalars. */
 constexpr bool is_variable_length(ustore_docs_field_type_t type) noexcept {
-    return type == ustore_docs_field_type_str_k || type == ustore_docs_field_type_bin_k;
+    return type == ustore_docs_field_type_string_k || type == ustore_docs_field_type_binary_k;
 }
 
 /** Element types stored as offsets into a joined tape rather than as fixed-width scalars. */
-template <typename element_>
-concept variable_length_element_concept = std::same_as<element_, value_view_t> ||
-                                          std::same_as<element_, std::string_view>;
+template <typename element_type_>
+concept variable_length_element_concept = std::same_as<element_type_, value_view_t> ||
+                                          std::same_as<element_type_, std::string_view>;
 
 /** One entry of a column, with the flags @c ustore_docs_gather reports for it. */
-template <typename element_>
+template <typename element_type_>
 struct cell {
 
     /** Whether the value was found and converted. */
@@ -50,21 +50,21 @@ struct cell {
     bool collides {false};
 
     /** The value, meaningful only when @c valid. */
-    element_ value {};
+    element_type_ value {};
 };
 
 /** Column of fixed-width scalars, viewing the arena of the gather. */
-template <typename element_>
-class column_view_scalar {
+template <typename element_type_>
+class scalar_column_view {
     ustore_docs_column_view_t arrays_ {};
     ustore_size_t count_ {0};
     std::string_view name_ {};
 
   public:
-    using cell_t = cell<element_>;
+    using cell_t = cell<element_type_>;
     using value_type = cell_t;
 
-    column_view_scalar(ustore_docs_column_view_t const& arrays, ustore_size_t count,
+    scalar_column_view(ustore_docs_column_view_t const& arrays, ustore_size_t count,
                        std::string_view name = {}) noexcept
         : arrays_(arrays), count_(count), name_(name) {}
 
@@ -72,67 +72,67 @@ class column_view_scalar {
     std::size_t size() const noexcept { return count_; }
 
     cell_t operator[](std::size_t index) const noexcept {
-        element_ const* const scalars = reinterpret_cast<element_ const*>(arrays_.scalars);
+        element_type_ const* const scalars = reinterpret_cast<element_type_ const*>(arrays_.scalars);
         return {bits_view_t {arrays_.validities}[index], bits_view_t {arrays_.conversions}[index],
                 bits_view_t {arrays_.collisions}[index], scalars[index]};
     }
 };
 
 /** Column of strings, a tape of either offset width inside the arena of the gather. */
-template <typename element_>
-class column_view_varlen {
+template <typename element_type_>
+class variable_length_column_view {
     ustore_docs_column_view_t arrays_ {};
     ustore_size_t count_ {0};
     std::string_view name_ {};
-    ustore_docs_field_type_t type_ {ustore_docs_field_type_str_k};
+    ustore_docs_field_type_t type_ {ustore_docs_field_type_string_k};
 
   public:
-    using cell_t = cell<element_>;
+    using cell_t = cell<element_type_>;
     using value_type = cell_t;
 
-    column_view_varlen(ustore_docs_column_view_t const& arrays, ustore_size_t count, std::string_view name,
-                       ustore_docs_field_type_t type) noexcept
+    variable_length_column_view(ustore_docs_column_view_t const& arrays, ustore_size_t count, std::string_view name,
+                                ustore_docs_field_type_t type) noexcept
         : arrays_(arrays), count_(count), name_(name), type_(type) {}
 
     std::string_view name() const noexcept { return name_; }
     std::size_t size() const noexcept { return count_; }
 
     cell_t operator[](std::size_t index) const noexcept {
-        using character_t = typename element_::value_type;
+        using character_t = typename element_type_::value_type;
         ustore_bytes_view_t const bytes = tape_string(arrays_.strings, index);
         std::size_t length = bytes.length;
         // A text column spans the null terminator of every value, which the cell leaves out
-        if (type_ == ustore_docs_field_type_str_k && length) --length;
+        if (type_ == ustore_docs_field_type_string_k && length) --length;
         auto const begin = reinterpret_cast<character_t const*>(bytes.data);
         return {bits_view_t {arrays_.validities}[index], bits_view_t {arrays_.conversions}[index],
-                bits_view_t {arrays_.collisions}[index], element_ {begin, length}};
+                bits_view_t {arrays_.collisions}[index], element_type_ {begin, length}};
     }
 };
 
-/** Column view matching how @p element_ is stored. */
-template <typename element_>
-using column_view = std::conditional_t<variable_length_element_concept<element_>, column_view_varlen<element_>,
-                                       column_view_scalar<element_>>;
+/** Column view matching how @p element_type_ is stored. */
+template <typename element_type_>
+using column_view = std::conditional_t<variable_length_element_concept<element_type_>,
+                                       variable_length_column_view<element_type_>, scalar_column_view<element_type_>>;
 
 /** Column whose type is known only at runtime, viewed as a typed column through @c as. */
-class column_view_t {
+class dynamic_column_view_t {
     ustore_docs_column_view_t arrays_ {};
     ustore_size_t count_ {0};
     std::string_view name_ {};
     ustore_docs_field_type_t type_ {ustore_docs_field_type_json_k};
 
   public:
-    column_view_t(ustore_docs_column_view_t const& arrays, ustore_size_t count, std::string_view name = {},
-                  ustore_docs_field_type_t type = ustore_docs_field_type_json_k) noexcept
+    dynamic_column_view_t(ustore_docs_column_view_t const& arrays, ustore_size_t count, std::string_view name = {},
+                          ustore_docs_field_type_t type = ustore_docs_field_type_json_k) noexcept
         : arrays_(arrays), count_(count), name_(name), type_(type) {}
 
     std::string_view name() const noexcept { return name_; }
     ustore_docs_field_type_t type() const noexcept { return type_; }
     std::size_t size() const noexcept { return count_; }
 
-    template <typename element_>
-    column_view<element_> as() const noexcept {
-        if constexpr (variable_length_element_concept<element_>) return {arrays_, count_, name_, type_};
+    template <typename element_type_>
+    column_view<element_type_> as() const noexcept {
+        if constexpr (variable_length_element_concept<element_type_>) return {arrays_, count_, name_, type_};
         else return {arrays_, count_, name_};
     }
 
@@ -186,11 +186,11 @@ struct table_header {
     /** Field and type of every column, in order. */
     std::array<field_type_t, sizeof...(column_types_)> columns;
 
-    template <typename element_>
-    table_header<column_types_..., element_> with(std::string_view name) && noexcept {
-        table_header<column_types_..., element_> extended;
+    template <typename element_type_>
+    table_header<column_types_..., element_type_> with(std::string_view name) && noexcept {
+        table_header<column_types_..., element_type_> extended;
         std::copy_n(columns.begin(), columns.size(), extended.columns.begin());
-        extended.columns.back() = field_type_t {name, docs_field_type<element_>()};
+        extended.columns.back() = field_type_t {name, docs_field_type<element_type_>()};
         return extended;
     }
 
@@ -230,8 +230,9 @@ class docs_table {
     static constexpr bool is_dynamic_k = std::is_same_v<std::tuple<std::monostate>, types_tuple_t>;
 
     template <std::size_t index_>
-    using column_of = std::conditional_t<is_dynamic_k, //
-                                         column_view_t, column_view<std::tuple_element_t<index_, types_tuple_t>>>;
+    using column_of =
+        std::conditional_t<is_dynamic_k, //
+                           dynamic_column_view_t, column_view<std::tuple_element_t<index_, types_tuple_t>>>;
 
     ustore_size_t docs_count_ {0};
     ustore_size_t fields_count_ {0};
@@ -257,12 +258,12 @@ class docs_table {
     table_index_view_t index() const noexcept { return {collections_, keys_, docs_count_}; }
     table_header_view_t header() const noexcept { return {fields_, types_, fields_count_}; }
 
-    template <typename element_ = std::monostate>
+    template <typename element_type_ = std::monostate>
     auto column(std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        column_view_t const punned {columns_[index], docs_count_, fields_[signed_index], types_[signed_index]};
-        if constexpr (std::is_same_v<element_, std::monostate>) return punned;
-        else return punned.template as<element_>();
+        dynamic_column_view_t const punned {columns_[index], docs_count_, fields_[signed_index], types_[signed_index]};
+        if constexpr (std::is_same_v<element_type_, std::monostate>) return punned;
+        else return punned.template as<element_type_>();
     }
 
     template <std::size_t index_>

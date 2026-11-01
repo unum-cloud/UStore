@@ -4,10 +4,11 @@
  *  @date September 27, 2026
  *  @brief The ring contract on Linux AIO, and what only a transport without kernel links can get wrong.
  *
- *  The shapes are the ones @c test/nvme_ring.cpp runs against every other transport. What is added
- *  here is what AIO alone can break: a chain kept in user space, released link by link and cut or
- *  cancelled while its tail is still held; a batch @c io_submit takes only a prefix of; a flush the
- *  kernel refuses and the disk performs synchronously instead; and batches at the depths a drive wants.
+ *  The shapes are the ones @c test/nvme_ring.cpp runs against every other transport. What is
+ *  added here is what AIO alone can break: a chain kept in user space, released link by link and
+ *  cut or cancelled while its tail is still held; a batch @c io_submit takes only a prefix of; a
+ *  flush the kernel refuses and the disk performs synchronously instead; and batches at the
+ *  depths a drive wants.
  *
  *  The suite needs @c --directory and refuses tmpfs, which accepts @c O_DIRECT and ignores alignment
  *  outright, hiding exactly the mistakes this transport can make.
@@ -21,7 +22,7 @@
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`
 
@@ -30,6 +31,8 @@
 #include "nvme/ring_cases.hpp" // `ring_cases`, every transport-independent result
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -114,8 +117,8 @@ std::size_t aio_moves_batches_at_depth(linux_aio_files_disk_t& disk, medium_refe
             for (std::size_t index = 0; index != count; ++index) paint(source.subspan(index * block, block), index);
             paint(destination, count);
 
-            st::basic_vector<request_t> requests;
-            st::basic_vector<completion_t> completions;
+            st::vector<request_t> requests;
+            st::vector<completion_t> completions;
             failures += expect(requests.resize(count) == st::status_t::success_k);
             failures += expect(completions.resize(count) == st::status_t::success_k);
             if (failures != 0) return failures;
@@ -299,7 +302,7 @@ std::size_t aio_polls_through_a_narrow_window(linux_aio_files_disk_t& disk, medi
         disk, deep_queue_depth_k * block_bytes_k, deep_queue_depth_k,
         [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
             std::size_t failures = 0;
-            st::basic_vector<request_t> batch;
+            st::vector<request_t> batch;
             failures += expect(batch.resize(deep_queue_depth_k) == st::status_t::success_k);
             if (failures != 0) return failures;
             for (std::size_t round = 0; round != 3; ++round) {
@@ -326,9 +329,9 @@ std::size_t aio_polls_through_a_narrow_window(linux_aio_files_disk_t& disk, medi
 /**
  *  @brief A flush the kernel refuses runs as @c fdatasync instead, and reports what that answered.
  *
- *  @c /dev/null takes a buffered write and has no @c fsync, so @c io_submit refuses the flush with
- *  @c EINVAL, exactly as a kernel older than 4.18 refuses every one, and the synchronous fallback then
- *  fails the same way; the flush must come back failed rather than vanish or pass.
+ *  @c /dev/null takes a buffered write and has no @c fsync, so @c io_submit refuses the flush
+ *  with @c EINVAL, exactly as a kernel older than 4.18 refuses every one, and the synchronous
+ *  fallback then fails the same way; the flush must come back failed rather than vanish or pass.
  */
 std::size_t aio_flushes_synchronously_where_the_kernel_refuses() {
     std::size_t failures = 0;

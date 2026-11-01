@@ -8,11 +8,18 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
+#include <cstdint> // `std::uint64_t`, `std::uintptr_t`
 
-#include "ustore/db.h"       // `ustore_ingest_append_t`
+#include <chrono>      // `std::chrono::steady_clock`
+#include <limits>      // `std::numeric_limits`
+#include <string_view> // `std::string_view`
+
+#include "ustore/db.h"       // `ustore_ingest_append_t`, `ustore_collection_create_t`, `ustore_drop_mode_t`
 #include "ustore/ranges.hpp" // `strided_iterator`, `strided`, `place_batch_t`, `edges_view_t`, `tape_string`
 #include "ustore/status.hpp" // `status_t`, `expected`
-#include "ustore/types.hpp"  // `smallest_key_k`
+#include "ustore/types.hpp"  // `smallest_key_k`, `string_of`
+
+#include "utilities/outputs.hpp" // `collection_find_outputs_t`
 
 namespace unum::ustore::utilities {
 
@@ -42,7 +49,7 @@ struct strings_arg_t {
 
     ustore_bytes_view_t operator[](std::size_t index) const noexcept {
         if (view.layout == ustore_strings_accessor_k) return gathered[index];
-        return tape_string(view, index);
+        return ustore::tape_string(view, index);
     }
 };
 
@@ -83,6 +90,43 @@ struct sample_batch_t {
     std::size_t size() const noexcept { return count; }
     sample_task_t operator[](std::size_t index) const noexcept {
         return {collections[static_cast<std::ptrdiff_t>(index)], wanted};
+    }
+};
+
+/** The tasks of a scan of any modality. */
+template <typename arguments_type_>
+scan_batch_t scans_of(arguments_type_ const& arguments) noexcept {
+    return {strided(arguments.collections), strided(arguments.start_keys), arguments.wanted, arguments.count};
+}
+
+/** The tasks of a sample of any modality. */
+template <typename arguments_type_>
+sample_batch_t samples_of(arguments_type_ const& arguments) noexcept {
+    return {strided(arguments.collections), arguments.wanted, arguments.count};
+}
+
+/** A splitmix64 generator, drawing the positions a reservoir keeps. */
+struct sample_generator_t {
+    using result_type = std::uint64_t;
+
+    /** The state every draw advances. */
+    std::uint64_t state;
+
+    static constexpr result_type min() noexcept { return 0; }
+    static constexpr result_type max() noexcept { return std::numeric_limits<result_type>::max(); }
+
+    /** A generator seeded by the clock and the address @p salt, so two samples of one
+     *  moment still differ. */
+    static sample_generator_t seeded(void const* salt) noexcept {
+        auto const now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        return sample_generator_t {now ^ reinterpret_cast<std::uintptr_t>(salt)};
+    }
+
+    result_type operator()() noexcept {
+        std::uint64_t mixed = (state += 0x9E3779B97F4A7C15ull);
+        mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;
+        mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBull;
+        return mixed ^ (mixed >> 31);
     }
 };
 
@@ -157,18 +201,25 @@ inline expected<edges_view_t> ingest_edges_of(ustore_ingest_append_t const& argu
 
 #pragma region Validation
 
-/** Checks the keys and choices of a removal, which a write shares. */
-inline status_t validate_remove(ustore_transaction_t const transaction, place_batch_t const& places,
-                                ustore_durability_t const durability, ustore_watch_t const watch) noexcept {
-
+/** Checks the durability and watch of a write or a removal against its transaction,
+ *  or its absence. */
+inline status_t validate_choices(ustore_transaction_t const transaction, ustore_durability_t const durability,
+                                 ustore_watch_t const watch) noexcept {
     if (durability != ustore_durability_buffered_k && durability != ustore_durability_flushed_k)
         return {status_code_t::invalid_argument_k, "Unknown durability"};
     if (watch != ustore_watch_keys_k && watch != ustore_watch_none_k)
         return {status_code_t::invalid_argument_k, "Unknown watch"};
     if (transaction && durability == ustore_durability_flushed_k)
         return {status_code_t::invalid_argument_k, "A transaction flushes at commit, not at a write"};
+    return {};
+}
+
+/** Checks the keys and choices of a removal, which a write shares. */
+inline status_t validate_remove(ustore_transaction_t const transaction, place_batch_t const& places,
+                                ustore_durability_t const durability, ustore_watch_t const watch) noexcept {
+    if (status_t const status = validate_choices(transaction, durability, watch); status.failed()) return status;
     if (!transaction && watch == ustore_watch_none_k)
-        return {status_code_t::invalid_argument_k, "Only a transaction watches keys"};
+        return {status_code_t::invalid_argument_k, "Keys stay unwatched only inside a transaction"};
     if (!places.count && places.keys_begin) return {status_code_t::invalid_argument_k, "Keys were given for no tasks"};
     if (places.count && !places.keys_begin) return {status_code_t::invalid_argument_k, "No keys were provided"};
     return {};
@@ -196,6 +247,32 @@ status_t validate_scan(arguments_type_ const& arguments) noexcept {
         return {status_code_t::invalid_argument_k, "Unknown scan mode"};
     if (!arguments.offsets || !arguments.keys)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
+    return {};
+}
+
+/** Checks the output and the name of a collection create, answering the name, empty for
+ *  an unnamed collection. */
+inline expected<std::string_view> validate_collection_create(ustore_collection_create_t const& arguments) noexcept {
+    if (!arguments.collection) return status_t {status_code_t::invalid_argument_k, "Need an output for the collection"};
+    std::string_view const name = string_of(arguments.name);
+    if (arguments.name.data && name.empty())
+        return status_t {status_code_t::invalid_argument_k, "A name is never empty"};
+    return name;
+}
+
+/** Checks the names and the output of a collection find of at least one name, and
+ *  opens its columns. */
+inline expected<collection_find_outputs_t> validate_collection_find(ustore_collection_find_t const& arguments,
+                                                                    strings_arg_t const& names) noexcept {
+    if (!names || !arguments.collections)
+        return status_t {status_code_t::invalid_argument_k, "Need the names and an output for the identifiers"};
+    return collection_find_outputs_t::make(arguments);
+}
+
+/** Checks that @p mode names one of the three drop modes. */
+inline status_t validate_drop_mode(ustore_drop_mode_t mode) noexcept {
+    if (mode != ustore_drop_collection_k && mode != ustore_drop_pairs_k && mode != ustore_drop_values_k)
+        return {status_code_t::invalid_argument_k, "Unknown drop mode"};
     return {};
 }
 

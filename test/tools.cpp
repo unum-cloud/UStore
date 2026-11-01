@@ -207,7 +207,7 @@ struct fixture_paths_t {
 
 #pragma endregion Fixtures
 
-#pragma region Helpers
+#pragma region Test Database
 
 /** A database opened in one directory, freed on destruction. */
 class test_database_t {
@@ -340,7 +340,7 @@ struct json_document_t {
     return found;
 }
 
-#pragma endregion Helpers
+#pragma endregion Test Database
 
 #pragma region Checks
 
@@ -355,7 +355,7 @@ struct edge_row_t {
 [[nodiscard]] std::size_t check_edges(char const* path) noexcept {
     std::size_t failures = 0;
     sz::string_t content;
-    st::basic_vector<edge_row_t> edges;
+    st::vector<edge_row_t> edges;
     if (!read_file(path, content)) return expect(!"the exported edges are readable");
 
     std::size_t line_index = 0;
@@ -805,7 +805,7 @@ template <typename... arguments_type_>
 
 /** Creates, imports into, exports and drops a named collection, and refuses an import naming no collection. */
 [[nodiscard]] std::size_t cli_round_trip(fixture_paths_t const& paths, config_t const& config,
-                                         char const* cli) noexcept {
+                                         char const* executable) noexcept {
     std::size_t failures = 0;
     char const* const directory = paths.directory;
     // The engine's name is a literal or a word of `argv`, so it ends in a null either way
@@ -813,7 +813,7 @@ template <typename... arguments_type_>
     char const* const collection = "collection1";
     char const* const input = paths.documents_ndjson.c_str();
     char const* const output = paths.exported_ndjson.c_str();
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "create",
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", directory, "collection", "create",
                                       "--collection", collection),
                           0);
     {
@@ -822,16 +822,16 @@ template <typename... arguments_type_>
     }
 
     failures += expect_eq(
-        run_command(cli, "--engine", engine, "--directory", directory, "collection", "import", "--input", input,
+        run_command(executable, "--engine", engine, "--directory", directory, "collection", "import", "--input", input,
                     "--id-field", "id", "--memory-limit", "1MB", "--collection", collection),
         0);
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "export",
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", directory, "collection", "export",
                                       "--output", output, "--memory-limit", "1MB", "--collection", collection),
                           0);
     failures += check_documents(output, input, field_selection_t::whole_k);
     [[maybe_unused]] int const removed_named = std::remove(output);
 
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "drop",
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", directory, "collection", "drop",
                                       "--collection", collection),
                           0);
     {
@@ -840,8 +840,8 @@ template <typename... arguments_type_>
     }
 
     // Documents live only in collections of documents, so an import naming none is refused
-    failures += expect(run_command(cli, "--engine", engine, "--directory", directory, "collection", "import", "--input",
-                                   input, "--id-field", "id", "--memory-limit", "1MB") != 0);
+    failures += expect(run_command(executable, "--engine", engine, "--directory", directory, "collection", "import",
+                                   "--input", input, "--id-field", "id", "--memory-limit", "1MB") != 0);
     return failures;
 }
 
@@ -1065,7 +1065,7 @@ struct arrow_read_t {
 
 /** Imports a stream of @p modality through the CLI, by path or, for blobs, through standard input with the modality
  *  read off its columns, exports it to <tt>.arrows</tt>, and checks every row and the schema's modality come back. */
-[[nodiscard]] std::size_t arrow_round_trip(fixture_paths_t const& paths, config_t const& config, char const* cli,
+[[nodiscard]] std::size_t arrow_round_trip(fixture_paths_t const& paths, config_t const& config, char const* executable,
                                            ustore_modality_t modality) {
     std::size_t failures = 0;
     std::string const name = std::string("arrow_") + ustore_modality_name(modality);
@@ -1076,13 +1076,14 @@ struct arrow_read_t {
 
     char const* const engine = config.engine().data();
     bool const piped = modality == ustore_modality_blobs_k;
-    failures += expect_eq(
-        run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "import", "--collection",
-                    name.c_str(), "--input", piped ? "-" : input.c_str(), piped ? "<" : "", piped ? input.c_str() : ""),
-        0);
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "export",
-                                      "--collection", name.c_str(), "--output", output.c_str(), "--batch-rows", "1000"),
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
+                                      "import", "--collection", name.c_str(), "--input", piped ? "-" : input.c_str(),
+                                      piped ? "<" : "", piped ? input.c_str() : ""),
                           0);
+    failures += expect_eq(
+        run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                    "--collection", name.c_str(), "--output", output.c_str(), "--batch-rows", "1000"),
+        0);
     arrow_read_t read;
     failures += read_arrow_file(output.c_str(), read);
     failures += expect_eq(read.modality, std::string(ustore_modality_name(modality)));
@@ -1096,7 +1097,7 @@ struct arrow_read_t {
 /** An export to <tt>--output -</tt> writes only Arrow bytes to standard output, a stream ending at its marker, and its
  *  status line to standard error. */
 [[nodiscard]] std::size_t arrow_stdout_only_arrow(fixture_paths_t const& paths, config_t const& config,
-                                                  char const* cli) {
+                                                  char const* executable) {
     std::size_t failures = 0;
     path_t const input {paths.files.c_str(), "stdout.in.arrows"};
     path_t const output {paths.files.c_str(), "stdout.out"};
@@ -1105,12 +1106,12 @@ struct arrow_read_t {
     if (!write_arrow_stream(input.c_str(), table)) return expect(!"the Arrow input is written");
 
     char const* const engine = config.engine().data();
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "import",
-                                      "--collection", "stdout", "--input", input.c_str()),
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
+                                      "import", "--collection", "stdout", "--input", input.c_str()),
                           0);
     failures += expect_eq(
-        run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "export", "--collection",
-                    "stdout", "--output", "-", ">", output.c_str(), "2>", errors.c_str()),
+        run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                    "--collection", "stdout", "--output", "-", ">", output.c_str(), "2>", errors.c_str()),
         0);
     arrow_read_t read;
     failures += read_arrow_file(output.c_str(), read);
@@ -1125,7 +1126,7 @@ struct arrow_read_t {
 
 /** An <tt>.arrow</tt> file exported at 4096 bytes starts every body on a page and imports back whole. */
 [[nodiscard]] std::size_t arrow_file_direct_alignment(fixture_paths_t const& paths, config_t const& config,
-                                                      char const* cli) {
+                                                      char const* executable) {
     std::size_t failures = 0;
     path_t const input {paths.files.c_str(), "direct.in.arrows"};
     path_t const file {paths.files.c_str(), "direct.arrow"};
@@ -1134,12 +1135,13 @@ struct arrow_read_t {
     if (!write_arrow_stream(input.c_str(), table)) return expect(!"the Arrow input is written");
 
     char const* const engine = config.engine().data();
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "import",
-                                      "--collection", "direct", "--input", input.c_str()),
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
+                                      "import", "--collection", "direct", "--input", input.c_str()),
                           0);
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "export",
-                                      "--collection", "direct", "--output", file.c_str(), "--alignment", "4096"),
-                          0);
+    failures += expect_eq(
+        run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                    "--collection", "direct", "--output", file.c_str(), "--alignment", "4096"),
+        0);
     sz::string_t content;
     if (!read_file(file.c_str(), content)) return failures + expect(!"the Arrow file is readable");
     std::span<std::byte const> const bytes = std::as_bytes(std::span(content));
@@ -1159,11 +1161,11 @@ struct arrow_read_t {
     }
     failures += expect_same_rows(read.rows, table.rows);
 
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "import",
-                                      "--collection", "direct_copy", "--input", file.c_str()),
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
+                                      "import", "--collection", "direct_copy", "--input", file.c_str()),
                           0);
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "export",
-                                      "--collection", "direct_copy", "--output", output.c_str()),
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
+                                      "export", "--collection", "direct_copy", "--output", output.c_str()),
                           0);
     arrow_read_t copied;
     failures += read_arrow_file(output.c_str(), copied);
@@ -1178,7 +1180,7 @@ struct arrow_read_t {
 /** A bulk import either lands every row, or, on an engine that ingests no stream, fails cleanly with nothing written to
  *  standard output and drops the collection it created. */
 [[nodiscard]] std::size_t arrow_bulk_lands_or_refuses(fixture_paths_t const& paths, config_t const& config,
-                                                      char const* cli) {
+                                                      char const* executable) {
     std::size_t failures = 0;
     path_t const input {paths.files.c_str(), "bulk.in.arrows"};
     path_t const output {paths.files.c_str(), "bulk.out.arrows"};
@@ -1188,14 +1190,14 @@ struct arrow_read_t {
     if (!write_arrow_stream(input.c_str(), table)) return expect(!"the Arrow input is written");
 
     char const* const engine = config.engine().data();
-    int const bulk = run_command(cli, "--engine", engine, "--directory", paths.directory, "collection", "import",
+    int const bulk = run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
                                  "--collection", "bulk", "--input", input.c_str(), "--ingest", "unsorted", ">",
                                  printed.c_str(), "2>", errors.c_str());
     sz::string_t out_text, error_text;
     failures += expect(read_file(printed.c_str(), out_text) && out_text.size() == 0);
     failures += expect(read_file(errors.c_str(), error_text));
     if (bulk == 0) {
-        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection",
+        failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
                                           "export", "--collection", "bulk", "--output", output.c_str()),
                               0);
         arrow_read_t read;
@@ -1216,10 +1218,10 @@ struct arrow_read_t {
 
 /** The name and modality of every named collection the CLI lists in @p directory on @p engine, sorted, as a snapshot
  *  export skips the unnamed ones. */
-[[nodiscard]] std::size_t list_collections(char const* cli, char const* engine, char const* directory,
+[[nodiscard]] std::size_t list_collections(char const* executable, char const* engine, char const* directory,
                                            char const* listing, std::vector<std::string>& collections) {
     std::size_t failures = expect_eq(
-        run_command(cli, "--engine", engine, "--directory", directory, "collection", "list", ">", listing), 0);
+        run_command(executable, "--engine", engine, "--directory", directory, "collection", "list", ">", listing), 0);
     sz::string_t text;
     failures += expect(read_file(listing, text));
     for (sz::string_view_t line : sz::split(text.view(), "\n")) {
@@ -1236,7 +1238,7 @@ struct arrow_read_t {
 /** A snapshot export of every modality, imported on NVMe when the build has it and on the suite's engine otherwise,
  *  holds the same collections with the same rows, and a second export into the same directory is refused. */
 [[nodiscard]] std::size_t snapshot_export_import(fixture_paths_t const& paths, config_t const& config,
-                                                 char const* cli) {
+                                                 char const* executable) {
     std::size_t failures = 0;
     char const* const engine = config.engine().data();
     path_t const snapshot {paths.files.c_str(), "snapshot"};
@@ -1254,40 +1256,41 @@ struct arrow_read_t {
         std::string const name = std::string("snapshot_") + ustore_modality_name(modality);
         path_t const input {paths.files.c_str(), (name + ".arrows").c_str()};
         if (!write_arrow_stream(input.c_str(), modality_table(modality))) return expect(!"the Arrow input is written");
-        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection",
+        failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
                                           "import", "--collection", name.c_str(), "--input", input.c_str()),
                               0);
         [[maybe_unused]] int const removed = std::remove(input.c_str());
     }
-    failures += expect_eq(
-        run_command(cli, "--engine", engine, "--directory", paths.directory, "snapshot", "export", snapshot.c_str()),
-        0);
-    failures += expect(run_command(cli, "--engine", engine, "--directory", paths.directory, "snapshot", "export",
+    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "snapshot",
+                                      "export", snapshot.c_str()),
+                          0);
+    failures += expect(run_command(executable, "--engine", engine, "--directory", paths.directory, "snapshot", "export",
                                    snapshot.c_str(), "2>", listing.c_str()) != 0);
 
     // The NVMe engine opens only where the build has it, which a listing of an empty directory probes
-    bool const has_nvme = run_command(cli, "--engine", "nvme", "--directory", target.c_str(), "collection", "list", ">",
-                                      listing.c_str(), "2>&1") == 0;
+    bool const has_nvme = run_command(executable, "--engine", "nvme", "--directory", target.c_str(), "collection",
+                                      "list", ">", listing.c_str(), "2>&1") == 0;
     char const* const target_engine = has_nvme ? "nvme" : engine;
-    failures += expect_eq(run_command(cli, "--engine", target_engine, "--directory", target.c_str(), "snapshot",
+    failures += expect_eq(run_command(executable, "--engine", target_engine, "--directory", target.c_str(), "snapshot",
                                       "import", snapshot.c_str()),
                           0);
 
     std::vector<std::string> source_collections, target_collections;
-    failures += list_collections(cli, engine, paths.directory, listing.c_str(), source_collections);
-    failures += list_collections(cli, target_engine, target.c_str(), listing.c_str(), target_collections);
+    failures += list_collections(executable, engine, paths.directory, listing.c_str(), source_collections);
+    failures += list_collections(executable, target_engine, target.c_str(), listing.c_str(), target_collections);
     failures += expect(source_collections.size() >= std::size(modalities));
     failures += expect(source_collections == target_collections);
     for (std::string const& collection : source_collections) {
         std::string const name = collection.substr(0, collection.find('\t'));
         path_t const source_output {paths.files.c_str(), "snapshot.source.arrows"};
         path_t const target_output {paths.files.c_str(), "snapshot.target.arrows"};
-        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", paths.directory, "collection",
+        failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
                                           "export", "--collection", name.c_str(), "--output", source_output.c_str()),
                               0);
-        failures += expect_eq(run_command(cli, "--engine", target_engine, "--directory", target.c_str(), "collection",
-                                          "export", "--collection", name.c_str(), "--output", target_output.c_str()),
-                              0);
+        failures += expect_eq(
+            run_command(executable, "--engine", target_engine, "--directory", target.c_str(), "collection", "export",
+                        "--collection", name.c_str(), "--output", target_output.c_str()),
+            0);
         arrow_read_t source_read, target_read;
         failures += read_arrow_file(source_output.c_str(), source_read);
         failures += read_arrow_file(target_output.c_str(), target_read);
@@ -1301,9 +1304,9 @@ struct arrow_read_t {
 
 #pragma endregion Arrow
 
-/** Runs every case against the fixtures written under the directory of @p config, and the CLI at @p cli unless it is
- *  empty. */
-void run_cases(suite_totals_t& totals, config_t const& config, std::string_view cli) noexcept {
+/** Runs every case against the fixtures written under the directory of @p config, and the CLI at
+ *  @p executable unless it is empty. */
+void run_cases(suite_totals_t& totals, config_t const& config, std::string_view executable) noexcept {
     fixture_paths_t const paths {config.directory()};
     if (!write_fixtures(paths)) {
         report(totals, "tools.fixtures", 1);
@@ -1347,8 +1350,8 @@ void run_cases(suite_totals_t& totals, config_t const& config, std::string_view 
     report(totals, "invalid.docs_export.csv", docs_export_rejects_invalid_tasks, config, exported_csv);
 
     // The CLI path views into `argv`, so it ends in a null terminator
-    if (cli.empty()) report(totals, "tools.cli", case_result_t::skipped("needs --cli"));
-    else report(totals, "tools.cli", cli_round_trip, paths, config, cli.data());
+    if (executable.empty()) report(totals, "tools.cli", case_result_t::skipped("needs --cli"));
+    else report(totals, "tools.cli", cli_round_trip, paths, config, executable.data());
 
     constexpr ustore_modality_t modalities[] {ustore_modality_blobs_k, ustore_modality_docs_k,
                                               ustore_modality_strings_k, ustore_modality_graph_k,
@@ -1357,19 +1360,21 @@ void run_cases(suite_totals_t& totals, config_t const& config, std::string_view 
                                               "arrow.strings_round_trip", "arrow.graph_round_trip",
                                               "arrow.pages_round_trip"};
     for (std::size_t index = 0; index != std::size(modalities); ++index)
-        if (cli.empty()) report(totals, round_trip_names[index], case_result_t::skipped("needs --cli"));
-        else report(totals, round_trip_names[index], arrow_round_trip, paths, config, cli.data(), modalities[index]);
-    if (cli.empty()) {
+        if (executable.empty()) report(totals, round_trip_names[index], case_result_t::skipped("needs --cli"));
+        else
+            report(totals, round_trip_names[index], arrow_round_trip, paths, config, executable.data(),
+                   modalities[index]);
+    if (executable.empty()) {
         report(totals, "arrow.stdout_only_arrow", case_result_t::skipped("needs --cli"));
         report(totals, "arrow.file_direct_alignment", case_result_t::skipped("needs --cli"));
         report(totals, "arrow.bulk_lands_or_refuses", case_result_t::skipped("needs --cli"));
         report(totals, "snapshot.export_import", case_result_t::skipped("needs --cli"));
     }
     else {
-        report(totals, "arrow.stdout_only_arrow", arrow_stdout_only_arrow, paths, config, cli.data());
-        report(totals, "arrow.file_direct_alignment", arrow_file_direct_alignment, paths, config, cli.data());
-        report(totals, "arrow.bulk_lands_or_refuses", arrow_bulk_lands_or_refuses, paths, config, cli.data());
-        report(totals, "snapshot.export_import", snapshot_export_import, paths, config, cli.data());
+        report(totals, "arrow.stdout_only_arrow", arrow_stdout_only_arrow, paths, config, executable.data());
+        report(totals, "arrow.file_direct_alignment", arrow_file_direct_alignment, paths, config, executable.data());
+        report(totals, "arrow.bulk_lands_or_refuses", arrow_bulk_lands_or_refuses, paths, config, executable.data());
+        report(totals, "snapshot.export_import", snapshot_export_import, paths, config, executable.data());
     }
 }
 
@@ -1379,9 +1384,9 @@ int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
     suite_options_t options;
-    std::string_view cli;
+    std::string_view executable;
     std::array<flag_t, 1> const flags {{
-        {"--cli", "path", "the CLI executable its case runs, skipped without it", &cli},
+        {"--cli", "path", "the CLI executable its case runs, skipped without it", &executable},
     }};
     if (argument_status_t const status = parse_suite_options(argc, argv, options, flags);
         status != argument_status_t::parsed_k)
@@ -1396,7 +1401,7 @@ int main(int argc, char** argv) {
     char const* const directory = maybe_directory->path();
     config_t const config {options.engine, directory};
 
-    if (directory) run_cases(totals, config, cli);
+    if (directory) run_cases(totals, config, executable);
     else report(totals, "tools", case_result_t::skipped(needs_directory_k));
     return suite_exit_code(totals);
 }

@@ -17,7 +17,6 @@
 #include <cstring> // `std::memcmp`
 
 #include <algorithm>       // `std::find`, `std::min`, `std::next_permutation`
-#include <map>             // `std::map`
 #include <memory>          // `std::unique_ptr`, `std::align`
 #include <new>             // `std::nothrow`
 #include <random>          // `std::mt19937_64`
@@ -25,20 +24,23 @@
 #include <span>            // `std::span`
 #include <string>          // `std::string`
 #include <string_view>     // `std::string_view`
-#include <utility>         // `std::pair`
+#include <utility>         // `std::move`
 #include <vector>          // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`
 
 #include "ustore/pages/element_tree.hpp" // `element_tree`, `mint_key`
-#include "ustore/pages/page_edits.hpp"   // `edit_t`, `encode_edits`, `decode_edit`
+#include "ustore/pages/page_edits.hpp"   // `edit_t`, `encode_edits`
 #include "ustore/pages/page_fold.hpp"    // `page_fold_t`, `page_state`
 
 #include "model.hpp" // `model_page_t`, `model_edit_t`, `node_spec_t`, `hex`
 
 namespace unum::ustore::test {
 
+using namespace unum::ustore::test::pages;
+
 using namespace unum::ustore::pages;
+using namespace unum::ustore::test::pages;
 
 #pragma region Harness
 
@@ -112,17 +114,17 @@ void run(char const* name, body_type_&& body, std::size_t& failed) {
     failed += failures != 0;
 }
 
-#pragma endregion
+#pragma endregion Harness
 
 #pragma region Reference Model
 
 /** Every live element of @p tree in preorder, keys included, placements left out as the model keeps none. */
 std::string dump_tree(tree_t const& tree) {
     std::string result;
-    element_index_t const top = tree.root();
-    for (element_index_t at = top; at != no_element_k; at = tree.next_in_preorder(at, top)) {
+    element_index_t const root = tree.root();
+    for (element_index_t at = root; at != no_element_k; at = tree.next_in_preorder(at, root)) {
         std::size_t depth = 0;
-        for (element_index_t up = at; up != top; up = tree[up].parent) ++depth;
+        for (element_index_t up = at; up != root; up = tree[up].parent) ++depth;
         result += std::string(depth * 2, ' ') + hex(tree[at].key) + " " + std::to_string(int(tree[at].kind)) + " <" +
                   std::string(tree.name(at)) + "> [" + std::string(tree.text(at)) + "]";
         for (element_index_t attribute = tree[at].first_attribute; attribute != no_element_k;
@@ -143,7 +145,7 @@ std::string dump_page(expected<std::span<byte_t const>> const& page, test_arena_
     return dump_tree(tree);
 }
 
-#pragma endregion
+#pragma endregion Reference Model
 
 #pragma region Random Streams
 
@@ -175,6 +177,10 @@ struct commit_t {
     bytes_t chain;
 };
 
+/** Which keys a random pick may land on: any live element, or elements alone, which
+ *  parents must be. */
+enum class key_filter_t : bool { any_kind_k, elements_only_k };
+
 /** Generates commits against a model that tracks what is live, aiming mostly at live elements and sometimes at
  *  removed or unknown ones, so the forgiving rules run too. */
 class stream_generator_t {
@@ -194,10 +200,11 @@ class stream_generator_t {
         static constexpr std::string_view names[] = {"id", "class", "href", "x"};
         return std::string(names[random_() % 4]);
     }
-    element_key_t any_key(bool elements_only) {
+    element_key_t any_key(key_filter_t filter) {
         std::vector<element_key_t> candidates;
         for (auto const& [key, element] : model_.elements)
-            if (!elements_only || element.kind == element_kind_t::element_k) candidates.push_back(key);
+            if (filter == key_filter_t::any_kind_k || element.kind == element_kind_t::element_k)
+                candidates.push_back(key);
         std::uint64_t const roll = random_() % 10;
         if (roll == 0 && !retired_.empty()) return retired_[random_() % retired_.size()];
         if (roll == 1) return mint_key(999, 0, std::uint32_t(random_() % 4));
@@ -259,23 +266,23 @@ class stream_generator_t {
                 edit.modification = modification_t::insert_k;
                 edit.fragment = fragment(commit.stamp, sequence, 3);
                 edit.element = edit.fragment.front().key;
-                edit.parent = random_() % 4 == 0 ? nil_key_k : any_key(true);
-                edit.anchor = random_() % 3 == 0 ? nil_key_k : any_key(false);
+                edit.parent = random_() % 4 == 0 ? nil_key_k : any_key(key_filter_t::elements_only_k);
+                edit.anchor = random_() % 3 == 0 ? nil_key_k : any_key(key_filter_t::any_kind_k);
             }
             else if (roll < 45) {
                 edit.modification = modification_t::remove_k;
-                edit.element = any_key(false);
+                edit.element = any_key(key_filter_t::any_kind_k);
                 if (edit.element.is_nil()) edit.element = page_;
             }
             else if (roll < 57) {
                 edit.modification = modification_t::move_k;
-                edit.element = any_key(false);
-                edit.parent = random_() % 4 == 0 ? nil_key_k : any_key(true);
-                edit.anchor = random_() % 3 == 0 ? nil_key_k : any_key(false);
+                edit.element = any_key(key_filter_t::any_kind_k);
+                edit.parent = random_() % 4 == 0 ? nil_key_k : any_key(key_filter_t::elements_only_k);
+                edit.anchor = random_() % 3 == 0 ? nil_key_k : any_key(key_filter_t::any_kind_k);
             }
             else if (roll < 80) {
                 edit.modification = modification_t::splice_k;
-                edit.element = any_key(false);
+                edit.element = any_key(key_filter_t::any_kind_k);
                 std::size_t const length = model_.live(edit.element) ? model_.elements.at(edit.element).text.size() : 4;
                 edit.text_start = random_() % 3 == 0 ? 0 : random_() % (length + 3);
                 edit.text_length = random_() % 4;
@@ -293,13 +300,13 @@ class stream_generator_t {
             }
             else if (roll < 93) {
                 edit.modification = modification_t::set_attributes_k;
-                edit.element = any_key(false);
+                edit.element = any_key(key_filter_t::any_kind_k);
                 edit.field = attribute_name();
                 edit.value = text(3);
             }
             else {
                 edit.modification = modification_t::remove_attributes_k;
-                edit.element = any_key(false);
+                edit.element = any_key(key_filter_t::any_kind_k);
                 edit.field = attribute_name();
             }
 
@@ -344,7 +351,7 @@ std::vector<delta_view_t> deltas_of(std::vector<commit_t> const& commits, std::s
     return deltas;
 }
 
-#pragma endregion
+#pragma endregion Random Streams
 
 #pragma region Cases
 
@@ -383,11 +390,13 @@ std::size_t edit_codec() {
         });
         failures += check(status.succeeded() && index == commit.edits.size());
         failures += check(boundaries.back() == commit.chain.size());
-        for (std::size_t cut = 1; cut < commit.chain.size(); cut += 1 + commit.chain.size() / 7) {
-            bool const whole = std::find(boundaries.begin(), boundaries.end(), cut) != boundaries.end();
-            failures += check(for_each_edit({commit.chain.data(), cut}, [](edit_t const&) noexcept -> status_t {
-                                  return {};
-                              }).code == (whole ? status_code_t::success_k : status_code_t::malformed_k));
+        for (std::size_t prefix_length = 1; prefix_length < commit.chain.size();
+             prefix_length += 1 + commit.chain.size() / 7) {
+            bool const whole = std::find(boundaries.begin(), boundaries.end(), prefix_length) != boundaries.end();
+            failures += check(
+                for_each_edit({commit.chain.data(), prefix_length}, [](edit_t const&) noexcept -> status_t {
+                    return {};
+                }).code == (whole ? status_code_t::success_k : status_code_t::malformed_k));
         }
     }
     bytes_t unknown(edit_header_bytes_k, byte_t(0));
@@ -421,8 +430,8 @@ std::size_t random_streams() {
         page_fold_t const fold;
         test_arena_t scratch;
         bytes_allocator_t scratch_allocator(&scratch);
-        auto const all = deltas_of(commits, 0, commits.size());
-        failures += check_equal(dump_page(fold.apply({}, all, scratch_allocator), scratch), snapshots.back());
+        auto const chain = deltas_of(commits, 0, commits.size());
+        failures += check_equal(dump_page(fold.apply({}, chain, scratch_allocator), scratch), snapshots.back());
 
         for (std::size_t trial = 0; trial != 8; ++trial) {
             std::size_t const split = random() % commits.size();
@@ -624,7 +633,7 @@ std::size_t concurrent_inserts_converge() {
     return failures;
 }
 
-#pragma endregion
+#pragma endregion Cases
 
 } // namespace unum::ustore::test
 

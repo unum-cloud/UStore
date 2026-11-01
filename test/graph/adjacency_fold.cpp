@@ -17,7 +17,6 @@
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`, `std::int32_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
-#include <algorithm>       // `std::min`, `std::shuffle`
 #include <map>             // `std::map`
 #include <memory>          // `std::unique_ptr`, `std::align`
 #include <new>             // `std::nothrow`
@@ -129,10 +128,10 @@ using model_adjacency_t = std::map<model_key_t, model_payload_t>;
 static void model_apply(model_adjacency_t& adjacency, half_edge_delta_t const& delta) {
     switch (delta.operation) {
     case half_edge_operation_t::insert_k:
-        adjacency[model_key_t {delta.neighbor, delta.edge, delta.role.raw}] = {delta.weight, delta.label.raw};
+        adjacency[model_key_t {delta.neighbor, delta.edge, delta.role.bits}] = {delta.weight, delta.label.value};
         break;
     case half_edge_operation_t::remove_k:
-        adjacency.erase(model_key_t {delta.neighbor, delta.edge, delta.role.raw});
+        adjacency.erase(model_key_t {delta.neighbor, delta.edge, delta.role.bits});
         break;
     case half_edge_operation_t::remove_vertex_k: adjacency.clear(); break;
     }
@@ -155,23 +154,30 @@ static bytes_t value_of_model(model_adjacency_t const& adjacency) {
     return bytes;
 }
 
+/** Whether a random key's first eight bytes are random too, or shared with every other key spelled
+ *  so. */
+enum class key_prefix_t : bool { random_k, shared_k };
+
 /** Random keys from small pools, sharing their first or last eight bytes, so 128-bit orders get exercised. */
 struct key_pools_t {
     std::vector<ustore_key_t> vertices, neighbors, edges;
 
     explicit key_pools_t(std::mt19937_64& generator, std::size_t vertex_count = 6, std::size_t neighbor_count = 220) {
-        auto random_key = [&](bool share) {
+        auto random_key = [&](key_prefix_t prefix) {
             ustore_key_t key {};
             for (std::size_t index = 0; index != 16; ++index) key.uuid.bytes[index] = std::uint8_t(generator());
-            if (share)
+            if (prefix == key_prefix_t::shared_k)
                 for (std::size_t index = 0; index != 8; ++index) key.uuid.bytes[index] = std::uint8_t(index);
             return key;
         };
-        for (std::size_t index = 0; index != vertex_count; ++index) vertices.push_back(random_key(false));
+        for (std::size_t index = 0; index != vertex_count; ++index)
+            vertices.push_back(random_key(key_prefix_t::random_k));
         // Vertices are neighbors too, so loops and shared neighbors show up
         for (ustore_key_t const& vertex : vertices) neighbors.push_back(vertex);
-        while (neighbors.size() != neighbor_count) neighbors.push_back(random_key(generator() % 2));
-        for (std::size_t index = 0; index != 4; ++index) edges.push_back(random_key(index % 2));
+        while (neighbors.size() != neighbor_count)
+            neighbors.push_back(random_key(generator() % 2 ? key_prefix_t::shared_k : key_prefix_t::random_k));
+        for (std::size_t index = 0; index != 4; ++index)
+            edges.push_back(random_key(index % 2 ? key_prefix_t::shared_k : key_prefix_t::random_k));
     }
 };
 
@@ -187,9 +193,9 @@ static half_edge_delta_t random_delta(std::mt19937_64& generator, key_pools_t co
     if (generator() % 1000 < vertex_removal_permille) return half_edge_delta_t::remove_vertex();
     if (generator() % 100 < removal_percent) {
         if (!model.empty() && generator() % 4) {
-            auto it = model.begin();
-            std::advance(it, generator() % model.size());
-            return half_edge_delta_t::remove(it->first.neighbor, it->first.edge, role_t {it->first.role});
+            auto picked = model.begin();
+            std::advance(picked, generator() % model.size());
+            return half_edge_delta_t::remove(picked->first.neighbor, picked->first.edge, role_t {picked->first.role});
         }
         return half_edge_delta_t::remove(pools.neighbors[generator() % pools.neighbors.size()],
                                          pools.edges[generator() % pools.edges.size()], random_role(generator));
@@ -199,7 +205,7 @@ static half_edge_delta_t random_delta(std::mt19937_64& generator, key_pools_t co
     half_edge.edge_id = pools.edges[generator() % pools.edges.size()];
     half_edge.role = random_role(generator);
     half_edge.edge_weight = float(generator() % 1000) / 8;
-    half_edge.edge_label.raw = std::int32_t(generator() % 5) - 1;
+    half_edge.edge_label.value = std::int32_t(generator() % 5) - 1;
     return half_edge_delta_t::insert(half_edge);
 }
 
@@ -292,34 +298,36 @@ static std::size_t check_reads(stored_vertex_t const& vertex, model_adjacency_t 
     for (std::size_t probe = 0; probe != 6; ++probe) {
         ustore_key_t neighbor = pools.neighbors[generator() % pools.neighbors.size()];
         if (probe % 2 && !model.empty()) {
-            auto it = model.begin();
-            std::advance(it, generator() % model.size());
-            neighbor = it->first.neighbor;
+            auto picked = model.begin();
+            std::advance(picked, generator() % model.size());
+            neighbor = picked->first.neighbor;
         }
         model_adjacency_t wanted, found;
         for (auto const& [key, payload] : model)
             if (key.neighbor == neighbor) wanted[key] = payload;
         status_t const to = adjacency->edges_to(neighbor, [&](labeled_half_edge_t const& half_edge) noexcept {
-            found[model_key_t {half_edge.neighbor_id, half_edge.edge_id, half_edge.role.raw}] = {
-                half_edge.edge_weight, half_edge.edge_label.raw};
+            found[model_key_t {half_edge.neighbor_id, half_edge.edge_id, half_edge.role.bits}] = {
+                half_edge.edge_weight, half_edge.edge_label.value};
             return status_t {};
         });
         failures += check(to.succeeded() && value_of_model(found) == value_of_model(wanted));
 
         // Edges lose which end of a directed loop was read, so they compare by identifier, payload and direction
-        std::multiset<std::tuple<std::uint64_t, std::uint64_t, float, std::int32_t, bool>> wanted_edges, found_edges;
-        auto edge_row = [](ustore_key_t const& id, float weight, std::int32_t label, bool directed) {
+        std::multiset<std::tuple<std::uint64_t, std::uint64_t, float, std::int32_t, direction_t>> wanted_edges,
+            found_edges;
+        auto edge_row = [](ustore_key_t const& id, float weight, std::int32_t label, direction_t direction) {
             std::uint64_t halves[2];
             std::memcpy(halves, &id, 16);
-            return std::tuple {halves[0], halves[1], weight, label, directed};
+            return std::tuple {halves[0], halves[1], weight, label, direction};
         };
         for (auto const& [key, payload] : wanted)
-            wanted_edges.insert(edge_row(key.edge, payload.weight, payload.label, key.role != edge_member_k.raw));
+            wanted_edges.insert(
+                edge_row(key.edge, payload.weight, payload.label,
+                         key.role != edge_member_k.bits ? direction_t::directed_k : direction_t::undirected_k));
         std::size_t endpoint_failures = 0;
         status_t const between = edges_between(*adjacency, neighbor, [&](labeled_edge_t const& edge) noexcept {
             if (!edge.contains(vertex.vertex) || !edge.contains(neighbor)) ++endpoint_failures;
-            found_edges.insert(
-                edge_row(edge.id, edge.weight, edge.label.raw, edge.direction == direction_t::directed_k));
+            found_edges.insert(edge_row(edge.id, edge.weight, edge.label.value, edge.direction));
             return status_t {};
         });
         failures += check(between.succeeded() && !endpoint_failures && found_edges == wanted_edges);
@@ -490,9 +498,9 @@ std::size_t compose_matches_sequential() {
         // Three parts compose alike in either grouping and as a whole, byte for byte
         std::size_t const first_cut = generator() % (views.size() + 1);
         std::size_t const second_cut = first_cut + generator() % (views.size() - first_cut + 1);
-        std::span<delta_view_t const> const all(views);
+        std::span<delta_view_t const> const deltas(views);
         std::span<delta_view_t const> const parts[3] = {
-            all.first(first_cut), all.subspan(first_cut, second_cut - first_cut), all.subspan(second_cut)};
+            deltas.first(first_cut), deltas.subspan(first_cut, second_cut - first_cut), deltas.subspan(second_cut)};
         auto composed_of = [&](std::span<delta_view_t const> part) {
             return part.empty() ? bytes_t {} : composed_bytes(part, arena);
         };

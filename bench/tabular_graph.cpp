@@ -29,12 +29,11 @@
 #include <cstdint> // `std::uintmax_t`
 #include <cstdio>  // `stderr`
 
-#include <array>            // `std::array`
-#include <initializer_list> // `std::initializer_list`
-#include <filesystem>       // `std::filesystem::directory_iterator`, `std::filesystem::file_size`
-#include <string>           // `std::string`, what `std::filesystem::path::string` answers, and the row names
-#include <string_view>      // `std::string_view`
-#include <system_error>     // `std::error_code`
+#include <array>        // `std::array`
+#include <filesystem>   // `std::filesystem::directory_iterator`, `std::filesystem::file_size`
+#include <string>       // `std::string`, what `std::filesystem::path::string` answers, and the row names
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::error_code`
 
 #include <fmt/format.h>
 
@@ -132,7 +131,7 @@ struct tabular_t {
     sz::string_t paths;
 
     /** The listed input files, whose shares the import threads take. */
-    st::basic_vector<source_file_t> files;
+    st::vector<source_file_t> files;
 
     /** The null-terminated path of the input file at @p index. */
     [[nodiscard]] char const* path(std::size_t index) const noexcept { return paths.data() + files[index].path_offset; }

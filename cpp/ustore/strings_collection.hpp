@@ -139,9 +139,10 @@ class strings_cursor_t {
 /**
  *  @brief A stream over the strings of one prefix that pulls them in pages from a cursor, in the order of their text.
  *
- *  As shorthand for a range-based loop, which has no place for an arena, it owns one arena for its lifetime, where
- *  @c strings_cursor_t takes the caller's per pull. The prefix it walks is borrowed, so it outlives the stream, a page
- *  short of the read-ahead ends the walk, and a default-constructed stream is the end of every walk.
+ *  As shorthand for a range-based loop, which has no place for an arena, it owns one arena for its
+ *  lifetime, where @c strings_cursor_t takes the caller's per pull. The prefix it walks is
+ *  borrowed, so it outlives the stream, a page short of the read-ahead ends the walk, and a
+ *  default-constructed stream is the end of every walk.
  */
 class strings_stream_t {
 

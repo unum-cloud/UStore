@@ -52,7 +52,7 @@ constexpr std::string_view page_absent_k = "<absent>";
 
 #pragma endregion Shape
 
-#pragma region Helpers
+#pragma region Pages Client
 
 /** Opens the NVMe engine over @p directory, every collection flushing past 64 KiB, every level twice the one above. */
 expected<database_t> open_small_nvme(char const* directory) noexcept {
@@ -156,10 +156,11 @@ struct pages_client_t {
         strided_strings<std::string_view> const fields {{&name, 0}};
         strided_strings<std::string_view> const values {{&value, 0}};
         ustore_outcome_t outcome {};
-        ustore_pages_set_attributes_t set {};
-        address(set, outcome, page);
-        set.elements = {&element, 0}, set.fields = fields.view(), set.values = values.view();
-        ustore_pages_set_attributes(&set);
+        ustore_pages_set_attributes_t set_attributes {};
+        address(set_attributes, outcome, page);
+        set_attributes.elements = {&element, 0}, set_attributes.fields = fields.view(),
+        set_attributes.values = values.view();
+        ustore_pages_set_attributes(&set_attributes);
         return status_t {outcome};
     }
 
@@ -202,7 +203,7 @@ expected<pages_client_t> pages_client(ustore_database_t database, std::string_vi
     return pages_client_t {database, collection, nullptr, std::move(arena)};
 }
 
-#pragma endregion Helpers
+#pragma endregion Pages Client
 
 #pragma region Cases
 
@@ -279,9 +280,9 @@ case_result_t fold_survives_maintenance(char const* directory, random_t random) 
         for (char& character : result) character = alphabet[draws.below(alphabet.size())];
         return result;
     };
-    auto const escaped = [](std::string const& raw) {
+    auto const escaped = [](std::string const& text) {
         std::string result;
-        for (char const character : raw)
+        for (char const character : text)
             if (character == '&') result += "&amp;";
             else if (character == '<') result += "&lt;";
             else if (character == '>') result += "&gt;";

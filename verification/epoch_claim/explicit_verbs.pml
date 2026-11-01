@@ -3,18 +3,24 @@
  *  @author Ash Vardanian
  *  @date October 20, 2026
  *  @brief Two explicit verbs taking the claim blocking, through @c claim_channel_, beside a
- *      committer trying it once, each holder adding one to a tally under it.
+ *      committer trying it in rounds, each holder adding one to a tally under it.
  *
  *  The takers are @c flush, @c compact or @c create_collection: @c take, parked between attempts.
- *  The trier is @c maintain: @c take_if_free once, and the tally only if it took the claim. Every
- *  holder reads the tally relaxed, checks it counts every holder before it, and writes it back one
- *  higher, relaxed as well, so only the claim's acquire and release carry it between holders.
+ *  The trier is @c maintain followed by @c release_claim_, @c rounds times: @c take_if_free, and
+ *  only if it took the claim, the tally, the release and the retake, with the tally once more
+ *  under a retaken claim. Every holder reads the tally relaxed, checks it counts every holder
+ *  before it, and writes it back one higher, relaxed as well, so only the claim's acquire and
+ *  release carry it between holders.
  *
  *  - One holder at a time, and every holder reads its predecessors' writes.
  *  - Nobody parks for good: every taker's park ends with a release's notify.
- *  - Fairness is not asserted here.
+ *  - No retake passes a parked taker twice.
  *
- *  @verify pass sc,rc11,far
+ *  @budget 8192: the handoff and weaker-memory searches store about 1.5 GB of states each
+ *  @verify pass sc: a parked taker is never passed twice by retakes, since a retake reads the
+ *      parked count after the fence that follows its own release
+ *  @verify pass rc11 rounds=1: one retake under weaker memory; two rounds need more than 16 GB
+ *      under rc11 and one more than 8 GB under far, so only sequential memory checks a second pass
  *  @verify fail rc11 take_order=order_relaxed: relaxed, the next holder reads the tally from before
  *      the last holder's increment
  *  @verify fail rc11 release_order=order_relaxed: relaxed, the next holder reads the tally from
@@ -23,7 +29,8 @@
  *      still held and park, and the add landing later notifies nobody
  *  @verify stuck sc recheck=false: without it, a release landing between the taker's load and its
  *      park notifies nobody, and the taker sleeps for good
- *  @verify pass sc,rc11 release_step=cleared: with finite holders a flag starves nobody
+ *  @verify pass sc release_step=cleared: with finite holders a flag starves nobody
+ *  @verify pass rc11 rounds=1 release_step=cleared: the same under weaker memory, one round wide
  *  @verify pass sc waiting=handoff: a taker refused once announces itself and a releasing holder
  *      hands it the claim
  *  @verify stuck sc,rc11,far waiting=handoff release_look=false: with no look after letting go,
@@ -38,11 +45,11 @@
  *      predecessor's increment to the handed taker without the release
  */
 #define thread_count 3
-#define location_count (5 + thread_count)
+#define location_count (6 + thread_count)
 #ifdef waiting // set only to handoff, whose value the protocol defines after the shape
-#define history_depth 22
+#define history_depth 30
 #else
-#define history_depth 10
+#define history_depth 18
 #endif
 #include <epoch_claim/protocol.pml>
 
@@ -65,16 +72,27 @@ proctype taker(byte t) {
     landed(t)
 }
 
-/** @c maintain: the claim tried once, and the tally only if taken. */
+/** @c maintain and @c release_claim_ in rounds: the claim tried, and only if taken, the tally, the
+ *  release, the retake, and under a retaken claim the tally and the release once more. */
 proctype trier(byte t) {
+    byte round;
     int seen, seen_tally;
-    take_if_free(t, seen);
-    if
-    :: !held(seen) ->
-        increment(t, seen_tally);
-        release(t)
-    :: else
-    fi;
+    for (round : 1 .. rounds) {
+        take_if_free(t, seen);
+        if
+        :: !held(seen) ->
+            increment(t, seen_tally);
+            release(t);
+            retake(t, seen);
+            if
+            :: !held(seen) ->
+                increment(t, seen_tally);
+                release(t)
+            :: else
+            fi
+        :: else
+        fi
+    };
     landed(t)
 }
 

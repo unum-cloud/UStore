@@ -18,7 +18,6 @@
 #include <iterator>        // `std::back_inserter`
 #include <random>          // `std::mt19937_64`
 #include <source_location> // `std::source_location`
-#include <span>            // `std::span`
 #include <vector>          // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`

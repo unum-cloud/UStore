@@ -518,7 +518,7 @@ ustore_docs_read(&(ustore_docs_read_t){
     .fields = {.layout = ustore_strings_u32_tape_k, .data.u32_tape = {(uint8_t const*)field, field_offsets}},
     .values = &person,
     .arena = arena,
-    .outputs_type = ustore_docs_field_type_str_k,
+    .outputs_type = ustore_docs_field_type_string_k,
 });
 ```
 

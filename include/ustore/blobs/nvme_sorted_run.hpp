@@ -50,14 +50,15 @@
 #include <type_traits> // `std::remove_reference_t`
 #include <utility>     // `std::declval`, `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/blobs/nvme_compaction.hpp"   // `stamps_column_t`, `kinds_column_t`
 #include "ustore/blobs/nvme_key_slot.hpp"     // `key_slot`, `sorted_run_index_layout_t`, `value_layout_t`
-#include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`, `pooled_buffer_t`, `basic_read_pipeline`
-#include "ustore/utilities/nvme_ring.hpp"     // `read_request`, `extent_t`, `uuid_t`
-#include "ustore/utilities/nvme_volume.hpp"   // `volume_blob_t`, `blob_name_t`, `blob_kind_t`, `magic_of`
-#include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`, `basic_read_pipeline`
+#include "ustore/utilities/nvme_ring.hpp" // `read_request`, `request_t`, `completion_t`, `extent_t`, `portable_alignment_k`
+#include "ustore/utilities/nvme_catalog.hpp" // `blob_name_t`, `blob_kind_t`, `magic_of`
+#include "ustore/utilities/nvme_volume.hpp"  // `volume_blob_t`
+#include "ustore/utilities/types.hpp"        // `status_t`, `status_code_t`, `expected`, `byte_t`, `uuid_t`
 
 namespace unum::ustore::blobs {
 
@@ -363,9 +364,9 @@ inline expected<kinds_column_t> pack_kinds(std::span<std::uint8_t const> kinds) 
 /**
  *  @brief One immutable run of key slots and the values they locate, held as one blob of one volume.
  *
- *  The run borrows the volume and the blob, and owns only its index, its columns and its tails. Every call that
- *  moves bytes takes the channel the calling thread holds, since a queue pair belongs to one thread while it
- *  is held and a run outlives every thread that ever reads it.
+ *  The run borrows the volume and the blob, and owns only its index, its columns and its tails.
+ *  Every call that moves bytes takes the channel the calling thread holds, since a queue pair
+ *  belongs to one thread while it is held and a run outlives every thread that ever reads it.
  *
  *  @tparam waiter_type_ What the core does while it waits for an index read or a barrier.
  */
@@ -461,8 +462,9 @@ class lsm_sorted_run {
 #pragma region Setup and Teardown
 
     /**
-     *  @brief Writes a whole run into a fresh reservation of @p volume and records it under @p content_id, which is
-     *      @c reserve, @c write_sections and @c seal_and_attach in a row.
+     *  @brief Writes a whole run into a fresh reservation of @p volume and
+     *      records it under @p content_id, which is @c reserve, @c write_sections
+     *      and @c seal_and_attach in a row.
      *  @param[in,out] volume The volume the blob is reserved on, borrowed and outliving the run.
      *  @param[in,out] channel The channel the sections are queued on, held by the calling thread.
      *  @param[in] content_id The identifier the run is named by, which must name no blob yet.
@@ -471,8 +473,8 @@ class lsm_sorted_run {
      *  @param[in] stamps The stamp of every key slot, in the same order.
      *  @param[in] kinds The @c delta_kind_t of every key slot, in the same order.
      *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
-     *  @param[in] stored_values The values back to back in sorted order, which for a fixed-width run are
-     *      @p value_max_size bytes per key slot, removals included.
+     *  @param[in] stored_values The values back to back in sorted order, which for a fixed-width
+     *      run are @p value_max_size bytes per key slot, removals included.
      *  @param[in] value_offsets Where each key slot's value starts inside @p stored_values and one past the last, for
      *      a variable-width run alone; none otherwise.
      *  @param[in] value_max_size The largest value the writing collection admits, which is the width of every value
@@ -866,8 +868,8 @@ class lsm_sorted_run {
     /**
      *  @brief Gives every version of a run written at stamp zero the stamp @p stamp, in memory alone, which an ingest
      *      does once its commit draws the stamp and a mount does again from the schema, as the blob keeps its zeros.
-     *  @return Success, @c invalid_argument_k for a zero @p stamp or a run carrying stamps of its own, or
-     *      @c out_of_memory_k with the run unchanged.
+     *  @return Success, @c invalid_argument_k for a zero @p stamp or a run carrying stamps of its
+     *      own, or @c out_of_memory_k with the run unchanged.
      */
     status_t assign_stamp(std::uint64_t stamp) noexcept {
         if (stamp == 0) return {status_code_t::invalid_argument_k, "A run is assigned a stamp above zero"};
@@ -1026,7 +1028,7 @@ class lsm_sorted_run {
             return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
         std::size_t const depth = channel.queue_pair().depth();
-        st::basic_vector<pending_read_t> pending;
+        st::vector<pending_read_t> pending;
         if (pending.resize(depth) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A run could not track its reads in flight"};
 
@@ -1202,7 +1204,7 @@ class lsm_sorted_run {
     static status_t write_trailer(write_pipeline_t& writer, volume_blob_t const& blob,
                                   sorted_run_header_t const& header, stamps_column_t const& stamps,
                                   kinds_column_t const& kinds) noexcept {
-        st::basic_vector<byte_t> saved;
+        st::vector<byte_t> saved;
         if (saved.resize(static_cast<std::size_t>(header.stamps_bytes + header.kinds_bytes)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A run could not lay its trailer out"};
         std::span<byte_t> const room {saved};
@@ -1404,7 +1406,7 @@ class lsm_sorted_run {
         std::uint64_t const section = sorted_run_layout_t::trailer_bytes(header_.stamps_bytes, header_.kinds_bytes);
         std::uint64_t const offset = sorted_run_layout_t::stamps_offset(
             header_.key_slots_count, header_.stored_values_bytes, header_.key_tails_bytes);
-        st::basic_vector<byte_t> saved;
+        st::vector<byte_t> saved;
         if (saved.resize(static_cast<std::size_t>(section)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A run could not hold its trailer"};
         if (status_t const read = read_bytes_(channel, offset, std::span<byte_t> {saved}); read.failed()) return read;
@@ -1474,11 +1476,11 @@ class lsm_sorted_run {
     sorted_run_index_layout_t layout_;
 
     /** The cells of the index, read whole at open and owned for the life of the run. */
-    st::basic_vector<key_slot_t> cells_;
+    st::vector<key_slot_t> cells_;
 
     /** One offset per key slot into the values section and one past the last, read whole at open, none for a run
      *  finding its values by stride or holding them inline. */
-    st::basic_vector<stored_value_offset_t> value_offsets_;
+    st::vector<stored_value_offset_t> value_offsets_;
 
     /** The stamp of every key slot in sorted order, packed from the run's floor, read whole at open. */
     stamps_column_t stamps_;
@@ -1487,10 +1489,10 @@ class lsm_sorted_run {
     kinds_column_t kinds_;
 
     /** One offset per key slot into @c tails_ and one past the last, read whole at open, none for whole keys. */
-    st::basic_vector<std::uint32_t> tail_offsets_;
+    st::vector<std::uint32_t> tail_offsets_;
 
     /** The tails of every key back to back in sorted order, read whole at open, none for whole keys. */
-    st::basic_vector<byte_t> tails_;
+    st::vector<byte_t> tails_;
 
     /** The stamp @c assign_stamp gave the run, zero while its stamps are the ones its blob carries. */
     std::uint64_t assigned_stamp_ = 0;

@@ -176,22 +176,22 @@ typedef struct page_keywords_t {
  *  @param[out] keywords Where every keyword of the verb's own lands, both encodings starting at XML.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int page_keywords_from_args(ustore_py_context_t const* context, char const* verb, PyObject* const* args,
-                                   Py_ssize_t positional_args_count, PyObject* args_names_tuple,
+static int page_keywords_from_args(ustore_py_context_t const* context, char const* verb, PyObject* const* arguments,
+                                   Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
                                    Py_ssize_t required_positional, char const* const* admitted,
                                    ustore_py_verb_options_t* options, page_keywords_t* keywords) {
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked(verb, positional_args_count,
-                                                                           args_names_tuple, required_positional);
-    if (args_names_count < 0) return -1;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
+        verb, positional_arguments_count, keyword_names_tuple, required_positional);
+    if (keyword_names_count < 0) return -1;
     ustore_py_verb_options_init(options);
     memset(keywords, 0, sizeof(*keywords));
     // HTML leads the enum, yet no engine parses it, so XML is what a caller naming none means.
     keywords->encoding = ustore_page_encoding_xml_k;
     keywords->outputs_encoding = ustore_page_encoding_xml_k;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[args_progress];
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[arguments_progress];
         int const consumed = ustore_py_verb_option_from_keyword(context, name, value, options);
         if (consumed < 0) return -1;
         if (consumed > 0) continue;
@@ -329,19 +329,20 @@ static ustore_py_verb_t const remove_attributes_verb = {sizeof(edit_call_t), rem
  *  @param[in] stack The caller's storage, used while the call blocks.
  *  @return The call, or NULL with an exception set.
  */
-static edit_call_t* edit_open(PyObject* self, char const* name, ustore_py_verb_t const* verb, PyObject* const* args,
-                              Py_ssize_t positional_args_count, PyObject* args_names_tuple,
-                              Py_ssize_t required_positional, char const* const* admitted, ustore_py_context_t* context,
+static edit_call_t* edit_open(PyObject* self, char const* name, ustore_py_verb_t const* verb,
+                              PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                              PyObject* keyword_names_tuple, Py_ssize_t required_positional,
+                              char const* const* admitted, ustore_py_context_t* context,
                               ustore_py_verb_options_t* options, page_keywords_t* keywords, edit_call_t* stack) {
     if (ustore_py_context_from_object(self, context) != 0 || ustore_py_context_writable(context) != 0) return NULL;
-    if (page_keywords_from_args(context, name, args, positional_args_count, args_names_tuple, required_positional,
-                                admitted, options, keywords) != 0)
+    if (page_keywords_from_args(context, name, arguments, positional_arguments_count, keyword_names_tuple,
+                                required_positional, admitted, options, keywords) != 0)
         return NULL;
     edit_call_t* const call = ustore_py_call_open(context, verb, stack);
     if (!call) return NULL;
     call->tasks.count = 1;
     call->call.collection = options->collection;
-    if (spread_keys_from_object(args[0], "pages", &call->tasks, &call->pages) == 0) return call;
+    if (spread_keys_from_object(arguments[0], "pages", &call->tasks, &call->pages) == 0) return call;
     ustore_py_call_discard(context, verb, call);
     return NULL;
 }
@@ -365,19 +366,21 @@ char const doc_pages_import[] =                                                 
     "  progress (Callable[[int, int], bool | None], optional): Called with the bytes parsed\n"    //
     "    and the bytes in all; a falsy answer other than None cancels the call.\n"                //
     "Raises:\n"                                                                                   //
+    "  TypeError: A markup is neither a str nor bytes-like, a dict included, which documents\n"   //
+    "    take and pages do not.\n"                                                                //
     "  MalformedError: A markup does not parse.\n"                                                //
     "  UnsupportedError: The encoding is HTML, Markdown or JSON.";
 
-PyObject* ustore_py_api_pages_import(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple) {
+PyObject* ustore_py_api_pages_import(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
     edit_call_t stack;
-    edit_call_t* const call = edit_open(self, "pages_import", &import_verb, args, positional_args_count,
-                                        args_names_tuple, 2, import_keywords, &context, &options, &keywords, &stack);
+    edit_call_t* const call = edit_open(self, "pages_import", &import_verb, arguments, positional_arguments_count,
+                                        keyword_names_tuple, 2, import_keywords, &context, &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_texts_from_object(args[1], "markups", &call->tasks, &call->values) != 0)
+    if (spread_texts_from_object(arguments[1], "markups", &call->tasks, &call->values) != 0)
         return ustore_py_call_discard(&context, &import_verb, call);
     call->call.progress = Py_XNewRef(keywords.progress);
     ustore_pages_import_t import = {
@@ -425,19 +428,21 @@ char const doc_pages_insert[] =                                                 
     "Returns:\n"                                                                                  //
     "  tuple[UUID, ...]: The key every inserted element ended up with, minted or given.\n"        //
     "Raises:\n"                                                                                   //
+    "  TypeError: A fragment is neither a str nor bytes-like, a dict included, which\n"           //
+    "    documents take and pages do not.\n"                                                      //
     "  NotFoundError: A page does not exist.\n"                                                   //
     "  MalformedError: A fragment does not parse.";
 
-PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple) {
+PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
     edit_call_t stack;
-    edit_call_t* const call = edit_open(self, "pages_insert", &insert_verb, args, positional_args_count,
-                                        args_names_tuple, 2, insert_keywords, &context, &options, &keywords, &stack);
+    edit_call_t* const call = edit_open(self, "pages_insert", &insert_verb, arguments, positional_arguments_count,
+                                        keyword_names_tuple, 2, insert_keywords, &context, &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_texts_from_object(args[1], "fragments", &call->tasks, &call->values) != 0 ||
+    if (spread_texts_from_object(arguments[1], "fragments", &call->tasks, &call->values) != 0 ||
         spread_keys_from_object(keywords.elements, "elements", &call->tasks, &call->elements) != 0 ||
         spread_keys_from_object(keywords.parents, "parents", &call->tasks, &call->parents) != 0 ||
         spread_keys_from_object(keywords.anchors, "anchors", &call->tasks, &call->anchors) != 0)
@@ -484,16 +489,16 @@ char const doc_pages_remove[] =                                                 
     "Raises:\n"                                                                                //
     "  NotFoundError: A page does not exist.";
 
-PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple) {
+PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
     edit_call_t stack;
-    edit_call_t* const call = edit_open(self, "pages_remove", &remove_verb, args, positional_args_count,
-                                        args_names_tuple, 2, no_keywords, &context, &options, &keywords, &stack);
+    edit_call_t* const call = edit_open(self, "pages_remove", &remove_verb, arguments, positional_arguments_count,
+                                        keyword_names_tuple, 2, no_keywords, &context, &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(args[1], "elements", &call->tasks, &call->elements) != 0)
+    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0)
         return ustore_py_call_discard(&context, &remove_verb, call);
     ustore_pages_remove_t remove = {
         .database = context.database_handle,
@@ -530,16 +535,16 @@ char const doc_pages_move[] =                                                   
     "Raises:\n"                                                                                   //
     "  NotFoundError: A page does not exist.";
 
-PyObject* ustore_py_api_pages_move(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple) {
+PyObject* ustore_py_api_pages_move(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
     edit_call_t stack;
-    edit_call_t* const call = edit_open(self, "pages_move", &move_verb, args, positional_args_count, args_names_tuple,
-                                        2, move_keywords, &context, &options, &keywords, &stack);
+    edit_call_t* const call = edit_open(self, "pages_move", &move_verb, arguments, positional_arguments_count,
+                                        keyword_names_tuple, 2, move_keywords, &context, &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(args[1], "elements", &call->tasks, &call->elements) != 0 ||
+    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0 ||
         spread_keys_from_object(keywords.parents, "parents", &call->tasks, &call->parents) != 0 ||
         spread_keys_from_object(keywords.anchors, "anchors", &call->tasks, &call->anchors) != 0)
         return ustore_py_call_discard(&context, &move_verb, call);
@@ -580,19 +585,19 @@ char const doc_pages_splice[] =                                                 
     "Raises:\n"                                                                                 //
     "  NotFoundError: A page does not exist.";
 
-PyObject* ustore_py_api_pages_splice(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple) {
+PyObject* ustore_py_api_pages_splice(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
     edit_call_t stack;
-    edit_call_t* const call = edit_open(self, "pages_splice", &splice_verb, args, positional_args_count,
-                                        args_names_tuple, 5, no_keywords, &context, &options, &keywords, &stack);
+    edit_call_t* const call = edit_open(self, "pages_splice", &splice_verb, arguments, positional_arguments_count,
+                                        keyword_names_tuple, 5, no_keywords, &context, &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(args[1], "elements", &call->tasks, &call->elements) != 0 ||
-        spread_lengths_from_object(args[2], "starts", &call->tasks, &call->text_starts) != 0 ||
-        spread_lengths_from_object(args[3], "lengths", &call->tasks, &call->text_lengths) != 0 ||
-        spread_texts_from_object(args[4], "texts", &call->tasks, &call->values) != 0)
+    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0 ||
+        spread_lengths_from_object(arguments[2], "starts", &call->tasks, &call->text_starts) != 0 ||
+        spread_lengths_from_object(arguments[3], "lengths", &call->tasks, &call->text_lengths) != 0 ||
+        spread_texts_from_object(arguments[4], "texts", &call->tasks, &call->values) != 0)
         return ustore_py_call_discard(&context, &splice_verb, call);
     ustore_pages_splice_t splice = {
         .database = context.database_handle,
@@ -631,18 +636,19 @@ char const doc_pages_set_attributes[] =                                         
     "Raises:\n"                                                                                //
     "  NotFoundError: A page does not exist.";
 
-PyObject* ustore_py_api_pages_set_attributes(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                             PyObject* args_names_tuple) {
+PyObject* ustore_py_api_pages_set_attributes(PyObject* self, PyObject* const* arguments,
+                                             Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
     edit_call_t stack;
-    edit_call_t* const call = edit_open(self, "pages_set_attributes", &set_attributes_verb, args, positional_args_count,
-                                        args_names_tuple, 4, no_keywords, &context, &options, &keywords, &stack);
+    edit_call_t* const call = edit_open(self, "pages_set_attributes", &set_attributes_verb, arguments,
+                                        positional_arguments_count, keyword_names_tuple, 4, no_keywords, &context,
+                                        &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(args[1], "elements", &call->tasks, &call->elements) != 0 ||
-        spread_texts_from_object(args[2], "fields", &call->tasks, &call->fields) != 0 ||
-        spread_texts_from_object(args[3], "values", &call->tasks, &call->values) != 0)
+    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0 ||
+        spread_texts_from_object(arguments[2], "fields", &call->tasks, &call->fields) != 0 ||
+        spread_texts_from_object(arguments[3], "values", &call->tasks, &call->values) != 0)
         return ustore_py_call_discard(&context, &set_attributes_verb, call);
     ustore_pages_set_attributes_t set = {
         .database = context.database_handle,
@@ -679,18 +685,18 @@ char const doc_pages_remove_attributes[] =                                      
     "Raises:\n"                                                                                //
     "  NotFoundError: A page does not exist.";
 
-PyObject* ustore_py_api_pages_remove_attributes(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                                PyObject* args_names_tuple) {
+PyObject* ustore_py_api_pages_remove_attributes(PyObject* self, PyObject* const* arguments,
+                                                Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
     edit_call_t stack;
-    edit_call_t* const call = edit_open(self, "pages_remove_attributes", &remove_attributes_verb, args,
-                                        positional_args_count, args_names_tuple, 3, no_keywords, &context, &options,
-                                        &keywords, &stack);
+    edit_call_t* const call = edit_open(self, "pages_remove_attributes", &remove_attributes_verb, arguments,
+                                        positional_arguments_count, keyword_names_tuple, 3, no_keywords, &context,
+                                        &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(args[1], "elements", &call->tasks, &call->elements) != 0 ||
-        spread_texts_from_object(args[2], "fields", &call->tasks, &call->fields) != 0)
+    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0 ||
+        spread_texts_from_object(arguments[2], "fields", &call->tasks, &call->fields) != 0)
         return ustore_py_call_discard(&context, &remove_attributes_verb, call);
     ustore_pages_remove_attributes_t remove = {
         .database = context.database_handle,
@@ -770,23 +776,23 @@ char const doc_pages_read[] =                                                   
     "Raises:\n"                                                                                  //
     "  UnsupportedError: The encoding is HTML, Markdown or JSON.";
 
-PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple) {
+PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
-    if (page_keywords_from_args(&context, "pages_read", args, positional_args_count, args_names_tuple, 2, read_keywords,
-                                &options, &keywords) != 0)
+    if (page_keywords_from_args(&context, "pages_read", arguments, positional_arguments_count, keyword_names_tuple, 2,
+                                read_keywords, &options, &keywords) != 0)
         return NULL;
 
     read_call_t stack;
     read_call_t* const call = ustore_py_call_open(&context, &read_verb, &stack);
     if (!call) return NULL;
     call->tasks.count = 1;
-    if (spread_keys_from_object(args[0], "pages", &call->tasks, &call->pages) != 0 ||
+    if (spread_keys_from_object(arguments[0], "pages", &call->tasks, &call->pages) != 0 ||
         spread_keys_from_object(keywords.elements, "elements", &call->tasks, &call->elements) != 0 ||
-        ustore_py_arena_claim(args[1], &call->call.arena) != 0)
+        ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &read_verb, call);
     call->call.collection = options.collection;
     ustore_pages_read_t read = {
@@ -830,9 +836,9 @@ char const doc_pages_scan[] =                                                   
     "Raises:\n"                                                                                 //
     "  CancelledError: The progress callable stopped the scan.";
 
-PyObject* ustore_py_api_pages_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple) {
-    return ustore_py_api_scan_of(self, args, positional_args_count, args_names_tuple, "pages_scan",
+PyObject* ustore_py_api_pages_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple) {
+    return ustore_py_api_scan_of(self, arguments, positional_arguments_count, keyword_names_tuple, "pages_scan",
                                  ustore_modality_pages_k);
 }
 

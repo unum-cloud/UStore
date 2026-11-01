@@ -15,10 +15,9 @@
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
 #include <array>       // `std::array`
-#include <atomic>      // `std::atomic`
 #include <chrono>      // `std::chrono::steady_clock`
 #include <limits>      // `std::numeric_limits`
-#include <memory>      // `std::unique_ptr`, `std::make_shared`
+#include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string>      // `std::string`
@@ -26,18 +25,20 @@
 #include <thread>      // `std::thread`
 #include <type_traits> // `std::is_same_v`
 #include <utility>     // `std::move`
-#include <variant>     // `std::visit`
 
 #include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_database.hpp"   // `basic_database`
-#include "ustore/strings/nvme_store.hpp"    // `strings::nvme_store`, `strings::nvme_transaction`
-#include "ustore/utilities/nvme_volume.hpp" // `resources_t`
+#include "ustore/blobs/nvme_database.hpp"    // `basic_database`
+#include "ustore/strings/nvme_store.hpp"     // `strings::nvme_store`, `strings::nvme_transaction`
+#include "ustore/utilities/nvme_catalog.hpp" // `blob_kind_t`, `blob_name_t`
+#include "ustore/utilities/nvme_volume.hpp"  // `basic_volume_router`, `volume_blob_t`, `volume_id_t`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
+#include "nvme/fixture.hpp" // `run_on_transport`, `painted`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -65,14 +66,15 @@ struct database_types {
     template <value_layout_t value_layout_>
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
                                       last_write_fold_t, no_device_fold_t>;
-    using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t>;
-    template <typename... stores_>
-    using database_of =
-        basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, layout_store_tags<stores_...>, stores_...>;
-    using database_t =
-        database_of<strings_store_t, blobs_store_of<value_layout_t::inline_12_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_44_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
-                    blobs_store_of<value_layout_t::variable_width_k>>;
+    using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+    using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t, strings_kit_t>;
+    template <typename... store_types_>
+    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t,
+                                             layout_store_tags<store_types_...>, store_types_...>;
+    using database_t = basic_database_of<strings_store_t, blobs_store_of<value_layout_t::inline_12_bytes_k>,
+                                         blobs_store_of<value_layout_t::inline_44_bytes_k>,
+                                         blobs_store_of<value_layout_t::fixed_width_k>,
+                                         blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
 
     /** A fixture, the router over its one volume, and the database mounted over the router. */
@@ -306,7 +308,7 @@ expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t
 /** Copies the whole medium of volume zero of @p fixture into @p image, block by block on @p channel, which is what a
  *  crash would leave on it at this moment. */
 template <typename fixture_type_>
-status_t capture_medium(fixture_type_& fixture, io_channel_t& channel, st::basic_vector<byte_t>& image) noexcept {
+status_t capture_medium(fixture_type_& fixture, io_channel_t& channel, st::vector<byte_t>& image) noexcept {
     std::uint64_t const capacity = fixture.config.volume_bytes;
     std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
     if (block == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
@@ -397,7 +399,7 @@ std::size_t named_collections_round_trip(mount_type_ const& mount) {
     failures += expect_eq(store.size(), std::size_t {3});
 
     constexpr std::size_t keys_k = 200;
-    st::basic_vector<byte_t> value;
+    st::vector<byte_t> value;
     failures += expect(value.resize(value_max_size_k) == st::status_t::success_k);
     for (std::size_t index = 0; index != keys_k; ++index) {
         std::array<byte_t, 8> const counter = counted(index * 7 + 1);
@@ -426,7 +428,7 @@ std::size_t named_collections_round_trip(mount_type_ const& mount) {
         store.insert(any_collection_id_t {*fixed}, stored_key_t {9999}, stored_value_view_t {value.data(), 511}),
         status_code_t::malformed_k);
 
-    st::basic_vector<byte_t> into;
+    st::vector<byte_t> into;
     failures += expect(into.resize(value_max_size_k) == st::status_t::success_k);
     std::size_t mismatches = 0;
     for (std::size_t index = 0; index != keys_k; ++index) {
@@ -569,7 +571,7 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     (*reopened).reset();
 
     // A database of fewer stores refuses a catalog naming a store it lacks, and leaves it whole for one that has.
-    using numbers_only_t = typename types_t::template database_of<
+    using numbers_only_t = typename types_t::template basic_database_of<
         typename types_t::template blobs_store_of<value_layout_t::inline_12_bytes_k>>;
     {
         numbers_only_t narrow {(*stack)->fixture->resources};
@@ -578,7 +580,7 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     }
 
     // A database listing its stores in another order mounts every collection in the store its tag names.
-    using reordered_t = typename types_t::template database_of<
+    using reordered_t = typename types_t::template basic_database_of<
         typename types_t::template blobs_store_of<value_layout_t::variable_width_k>,
         typename types_t::template blobs_store_of<value_layout_t::fixed_width_k>,
         typename types_t::template blobs_store_of<value_layout_t::inline_12_bytes_k>>;
@@ -633,7 +635,7 @@ std::size_t strings_survive_reopen(mount_type_ const& mount) {
             keys[index][position] = painted(index, position);
     }
     {
-        strings::nvme_transaction<database_t, strings_store_t> written {*(*stack)->store, &sz_sort_order_serial};
+        strings::nvme_transaction<database_t, strings_store_t> written {*(*stack)->store};
         auto [held, begin_status] = (*stack)->store->create_transaction(test_database_config().default_transaction);
         failures += expect(begin_status.succeeded());
         if (failures != 0) return failures;
@@ -698,7 +700,7 @@ std::size_t dropped_collection_is_gone(mount_type_ const& mount) {
     failures += expect(doomed.has_value());
     if (failures != 0) return failures;
 
-    st::basic_vector<byte_t> value;
+    st::vector<byte_t> value;
     failures += expect(value.resize(value_max_size_k) == st::status_t::success_k);
     for (std::size_t index = 0; index != 400; ++index) {
         for (std::size_t position = 0; position != value.size(); ++position) value[position] = painted(index, position);
@@ -943,7 +945,7 @@ case_result_t crash_keeps_a_prefix_of_commits(mount_type_ const& mount) {
     stored_value_size_t size = 0;
     failures += expect(store.select(left, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
     failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {2});
-    st::basic_vector<byte_t> image;
+    st::vector<byte_t> image;
     {
         expected<guard_t> guard = (*stack)->fixture->channels.acquire();
         failures += expect(guard.has_value());
@@ -990,7 +992,7 @@ std::size_t user_data_round_trips(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    st::basic_vector<byte_t> saved;
+    st::vector<byte_t> saved;
     failures += expect(saved.resize(3000) == st::status_t::success_k);
     for (std::size_t index = 0; index != saved.size(); ++index) saved[index] = painted(77, index);
     failures += expect((*stack)->store->save_user_data(bytes_view_t {saved}).succeeded());
@@ -1002,7 +1004,7 @@ std::size_t user_data_round_trips(mount_type_ const& mount) {
     failures += expect(reopened.has_value());
     if (!reopened) return failures;
 
-    st::basic_vector<byte_t> loaded;
+    st::vector<byte_t> loaded;
     failures += expect(loaded.resize(3000) == st::status_t::success_k);
     failures += expect((*reopened)->load_user_data(bytes_span_t {loaded}).succeeded());
     failures += expect_eq(std::memcmp(loaded.data(), saved.data(), saved.size()), 0);
@@ -1048,11 +1050,11 @@ std::size_t commit_is_all_or_nothing(mount_type_ const& mount) {
     failures += expect(second.has_value());
     if (failures != 0) return failures;
 
-    std::atomic<bool> writing {true};
-    std::atomic<std::size_t> half_applied {0};
-    std::atomic<std::size_t> observations {0};
+    bool writing {true};
+    std::size_t half_applied {0};
+    std::size_t observations {0};
     std::thread reader {[&]() noexcept {
-        while (writing.load(std::memory_order_acquire)) {
+        while (atomic_reference<bool> {writing}.load(std::memory_order_acquire)) {
             expected<typename database_t::snapshot_t> taken = store.pin_stamp();
             if (!taken) continue;
             stored_value_size_t left = 0;
@@ -1063,9 +1065,9 @@ std::size_t commit_is_all_or_nothing(mount_type_ const& mount) {
                 lookup_result_t const there = taken->find(any_collection_id_t {*second}, static_cast<stored_key_t>(key),
                                                           right);
                 if ((here == lookup_result_t::written_k) != (there == lookup_result_t::written_k))
-                    half_applied.fetch_add(1, std::memory_order_relaxed);
+                    atomic_reference<std::size_t> {half_applied}.fetch_add(1, std::memory_order_relaxed);
             }
-            observations.fetch_add(1, std::memory_order_relaxed);
+            atomic_reference<std::size_t> {observations}.fetch_add(1, std::memory_order_relaxed);
         }
     }};
 
@@ -1083,14 +1085,15 @@ std::size_t commit_is_all_or_nothing(mount_type_ const& mount) {
         }
         failures += expect((*transaction)->commit().succeeded());
     }
-    writing.store(false, std::memory_order_release);
+    atomic_reference<bool> {writing}.store(false, std::memory_order_release);
     reader.join();
 
-    failures += expect_eq(half_applied.load(std::memory_order_relaxed), std::size_t {0});
-    failures += expect(observations.load(std::memory_order_relaxed) != 0);
+    failures += expect_eq(atomic_reference<std::size_t> {half_applied}.load(std::memory_order_relaxed),
+                          std::size_t {0});
+    failures += expect(atomic_reference<std::size_t> {observations}.load(std::memory_order_relaxed) != 0);
 
     // Every write of every committed transaction is in the store afterwards.
-    st::basic_vector<byte_t> into;
+    st::vector<byte_t> into;
     failures += expect(into.resize(8) == st::status_t::success_k);
     std::size_t mismatches = 0;
     for (std::size_t key = 0; key != keys_k; ++key) {
@@ -1150,7 +1153,7 @@ std::size_t conflict_leaves_the_other_collection_untouched(mount_type_ const& mo
 
     // The quiet collection never saw the refused transaction's write.
     failures += expect(!store.contains(any_collection_id_t {*quiet}, stored_key_t {2}));
-    st::basic_vector<byte_t> into;
+    st::vector<byte_t> into;
     failures += expect(into.resize(8) == st::status_t::success_k);
     stored_value_size_t size = 0;
     failures += expect(
@@ -1210,7 +1213,7 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
     failures += expect(handler.last_commit_stamp() != invalid_transaction_stamp_k);
 
     // A transaction that has read something cannot move its watches, so a renewal refuses it.
-    st::basic_vector<byte_t> into;
+    st::vector<byte_t> into;
     failures += expect(into.resize(8) == st::status_t::success_k);
     stored_value_size_t size = 0;
     failures += expect(
@@ -1267,7 +1270,7 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
         store.insert(any_collection_id_t {*left}, stored_key_t {2}, stored_value_view_t {newer}).succeeded());
     failures += expect(store.remove(any_collection_id_t {*right}, stored_key_t {1}).succeeded());
 
-    st::basic_vector<byte_t> into;
+    st::vector<byte_t> into;
     failures += expect(into.resize(8) == st::status_t::success_k);
     for (std::size_t round = 0; round != 2; ++round) {
         stored_value_size_t size = 0;
@@ -1380,25 +1383,25 @@ std::size_t drop_proceeds_beside_the_snapshot(mount_type_ const& mount) {
     failures += expect(
         store.insert(any_collection_id_t {*doomed}, stored_key_t {1}, stored_value_view_t {value}).succeeded());
 
-    std::atomic<bool> dropped {false};
-    std::atomic<bool> succeeded {false};
+    bool dropped {false};
+    bool succeeded {false};
     std::thread dropper;
     {
         expected<typename database_t::snapshot_t> taken = store.pin_stamp();
         failures += expect(taken.has_value());
         if (!taken) return failures;
         dropper = std::thread {[&]() noexcept {
-            succeeded.store(store.drop_collection(any_collection_id_t {*doomed}).succeeded(),
-                            std::memory_order_relaxed);
-            dropped.store(true, std::memory_order_release);
+            atomic_reference<bool> {succeeded}.store(store.drop_collection(any_collection_id_t {*doomed}).succeeded(),
+                                                     std::memory_order_relaxed);
+            atomic_reference<bool> {dropped}.store(true, std::memory_order_release);
         }};
         dropper.join();
         stored_value_size_t size = 0;
         failures += expect(taken->find(any_collection_id_t {*doomed}, stored_key_t {1}, size) ==
                            lookup_result_t::missing_k);
     }
-    failures += expect(dropped.load(std::memory_order_acquire));
-    failures += expect(succeeded.load(std::memory_order_relaxed));
+    failures += expect(atomic_reference<bool> {dropped}.load(std::memory_order_acquire));
+    failures += expect(atomic_reference<bool> {succeeded}.load(std::memory_order_relaxed));
     failures += expect(!store.has_collection(any_collection_id_t {*doomed}));
     return failures;
 }
@@ -1435,15 +1438,15 @@ std::size_t threads_commit_serializably(mount_type_ const& mount) {
     failures += expect(
         store.insert(any_collection_id_t {*right}, stored_key_t {0}, stored_value_view_t {zero}).succeeded());
 
-    std::atomic<std::size_t> landed {0};
-    std::atomic<std::size_t> refused {0};
-    std::atomic<std::size_t> thread_failures {0};
+    std::size_t landed {0};
+    std::size_t refused {0};
+    std::size_t thread_failures {0};
     std::array<std::thread, threads_k> workers;
     for (std::size_t worker = 0; worker != threads_k; ++worker)
         workers[worker] = std::thread {[&]() noexcept {
             expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
             if (!transaction) {
-                thread_failures.fetch_add(1, std::memory_order_relaxed);
+                atomic_reference<std::size_t> {thread_failures}.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             transaction_t& handler = **transaction;
@@ -1456,7 +1459,7 @@ std::size_t threads_commit_serializably(mount_type_ const& mount) {
                     status_t read = handler.template select<watch_schedule_t::on_commit_k>(
                         any_collection_id_t {*left}, stored_key_t {0}, stored_value_span_t {buffer}, size);
                     if (read.failed()) {
-                        thread_failures.fetch_add(1, std::memory_order_relaxed);
+                        atomic_reference<std::size_t> {thread_failures}.fetch_add(1, std::memory_order_relaxed);
                         return;
                     }
                     std::uint64_t const here = counter_of(std::span<byte_t const> {buffer.data(), size});
@@ -1464,7 +1467,7 @@ std::size_t threads_commit_serializably(mount_type_ const& mount) {
                     read = handler.template select<watch_schedule_t::on_commit_k>(
                         any_collection_id_t {*right}, stored_key_t {0}, stored_value_span_t {buffer}, size);
                     if (read.failed()) {
-                        thread_failures.fetch_add(1, std::memory_order_relaxed);
+                        atomic_reference<std::size_t> {thread_failures}.fetch_add(1, std::memory_order_relaxed);
                         return;
                     }
                     std::uint64_t const there = counter_of(std::span<byte_t const> {buffer.data(), size});
@@ -1477,31 +1480,33 @@ std::size_t threads_commit_serializably(mount_type_ const& mount) {
                         written = handler.insert(any_collection_id_t {*right}, stored_key_t {0},
                                                  stored_value_view_t {raised_there});
                     if (written.failed()) {
-                        thread_failures.fetch_add(1, std::memory_order_relaxed);
+                        atomic_reference<std::size_t> {thread_failures}.fetch_add(1, std::memory_order_relaxed);
                         return;
                     }
 
                     status_t const commit = handler.commit();
                     if (commit.succeeded()) {
-                        landed.fetch_add(1, std::memory_order_relaxed);
+                        atomic_reference<std::size_t> {landed}.fetch_add(1, std::memory_order_relaxed);
                         committed = true;
                         continue;
                     }
                     if (!(commit == status_code_t::write_conflict_k)) {
-                        thread_failures.fetch_add(1, std::memory_order_relaxed);
+                        atomic_reference<std::size_t> {thread_failures}.fetch_add(1, std::memory_order_relaxed);
                         return;
                     }
-                    refused.fetch_add(1, std::memory_order_relaxed);
+                    atomic_reference<std::size_t> {refused}.fetch_add(1, std::memory_order_relaxed);
                     handler.rollback();
                 }
             }
         }};
     for (std::size_t worker = 0; worker != threads_k; ++worker) workers[worker].join();
 
-    failures += expect_eq(thread_failures.load(std::memory_order_relaxed), std::size_t {0});
-    failures += expect_eq(landed.load(std::memory_order_relaxed), threads_k * increments_k);
+    failures += expect_eq(atomic_reference<std::size_t> {thread_failures}.load(std::memory_order_relaxed),
+                          std::size_t {0});
+    failures += expect_eq(atomic_reference<std::size_t> {landed}.load(std::memory_order_relaxed),
+                          threads_k * increments_k);
 
-    st::basic_vector<byte_t> into;
+    st::vector<byte_t> into;
     failures += expect(into.resize(8) == st::status_t::success_k);
     stored_value_size_t size = 0;
     failures += expect(
@@ -1560,15 +1565,15 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
         named[committer] = *created;
     }
 
-    std::array<std::atomic<std::uint64_t>, committers_k> started {};
-    std::array<std::atomic<std::uint64_t>, committers_k> returned {};
+    std::array<std::uint64_t, committers_k> started {};
+    std::array<std::uint64_t, committers_k> returned {};
     for (std::size_t committer = 0; committer != committers_k; ++committer) {
-        started[committer].store(no_round_k, std::memory_order_relaxed);
-        returned[committer].store(no_round_k, std::memory_order_relaxed);
+        atomic_reference<std::uint64_t> {started[committer]}.store(no_round_k, std::memory_order_relaxed);
+        atomic_reference<std::uint64_t> {returned[committer]}.store(no_round_k, std::memory_order_relaxed);
     }
-    std::atomic<std::size_t> committing {committers_k};
-    std::atomic<std::size_t> wrong {0};
-    std::atomic<std::size_t> reads {0};
+    std::size_t committing {committers_k};
+    std::size_t wrong {0};
+    std::size_t reads {0};
 
     std::array<std::thread, committers_k> committers;
     for (std::size_t committer = 0; committer != committers_k; ++committer)
@@ -1579,21 +1584,22 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
                 std::memcpy(value.data(), &round, sizeof(round));
                 for (std::size_t position = sizeof(round); position != bytes; ++position)
                     value[position] = painted(round, position);
-                started[committer].store(round, std::memory_order_release);
+                atomic_reference<std::uint64_t> {started[committer]}.store(round, std::memory_order_release);
                 if (store
                         .insert(any_collection_id_t {named[committer]}, stored_key_t {round % keys_k},
                                 stored_value_view_t {value.data(), bytes})
                         .failed())
-                    wrong.fetch_add(1, std::memory_order_relaxed);
-                returned[committer].store(round, std::memory_order_release);
+                    atomic_reference<std::size_t> {wrong}.fetch_add(1, std::memory_order_relaxed);
+                atomic_reference<std::uint64_t> {returned[committer]}.store(round, std::memory_order_release);
             }
-            committing.fetch_sub(1, std::memory_order_release);
+            atomic_reference<std::size_t> {committing}.fetch_sub(1, std::memory_order_release);
         }};
 
     std::thread flusher {[&]() noexcept {
-        while (committing.load(std::memory_order_acquire) != 0) {
-            if (store.flush().failed()) wrong.fetch_add(1, std::memory_order_relaxed);
-            if (store.needs_compaction() && store.compact().failed()) wrong.fetch_add(1, std::memory_order_relaxed);
+        while (atomic_reference<std::size_t> {committing}.load(std::memory_order_acquire) != 0) {
+            if (store.flush().failed()) atomic_reference<std::size_t> {wrong}.fetch_add(1, std::memory_order_relaxed);
+            if (store.needs_compaction() && store.compact().failed())
+                atomic_reference<std::size_t> {wrong}.fetch_add(1, std::memory_order_relaxed);
         }
     }};
 
@@ -1601,21 +1607,25 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
     for (std::size_t reader = 0; reader != readers_k; ++reader)
         readers[reader] = std::thread {[&, reader]() noexcept {
             std::array<byte_t, 128> into {};
-            for (std::uint64_t step = reader; committing.load(std::memory_order_acquire) != 0; ++step) {
+            for (std::uint64_t step = reader;
+                 atomic_reference<std::size_t> {committing}.load(std::memory_order_acquire) != 0; ++step) {
                 std::size_t const committer = step % committers_k;
                 std::uint64_t const key = (step * 7) % keys_k;
-                std::uint64_t const before = returned[committer].load(std::memory_order_acquire);
+                std::uint64_t const before = atomic_reference<std::uint64_t> {returned[committer]}.load(
+                    std::memory_order_acquire);
                 stored_value_size_t size = 0;
                 status_t const read = store.select(any_collection_id_t {named[committer]}, stored_key_t {key},
                                                    std::span<byte_t> {into}, size);
-                std::uint64_t const after = started[committer].load(std::memory_order_acquire);
-                reads.fetch_add(1, std::memory_order_relaxed);
+                std::uint64_t const after = atomic_reference<std::uint64_t> {started[committer]}.load(
+                    std::memory_order_acquire);
+                atomic_reference<std::size_t> {reads}.fetch_add(1, std::memory_order_relaxed);
 
                 // The last round that wrote this key and returned before the read began, if any did.
                 bool const owed = before != no_round_k && before >= key;
                 std::uint64_t const least = owed ? before - (before - key) % keys_k : no_round_k;
                 if (read.failed()) {
-                    if (owed || !(read == status_code_t::not_found_k)) wrong.fetch_add(1, std::memory_order_relaxed);
+                    if (owed || !(read == status_code_t::not_found_k))
+                        atomic_reference<std::size_t> {wrong}.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 std::uint64_t round = 0;
@@ -1624,7 +1634,7 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
                 if (owed && round < least) torn = true;
                 for (std::size_t position = sizeof(round); !torn && position != size; ++position)
                     torn = into[position] != painted(round, position);
-                if (torn) wrong.fetch_add(1, std::memory_order_relaxed);
+                if (torn) atomic_reference<std::size_t> {wrong}.fetch_add(1, std::memory_order_relaxed);
             }
         }};
 
@@ -1632,8 +1642,8 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
     flusher.join();
     for (std::thread& reader : readers) reader.join();
 
-    failures += expect_eq(wrong.load(std::memory_order_relaxed), std::size_t {0});
-    failures += expect(reads.load(std::memory_order_relaxed) != 0);
+    failures += expect_eq(atomic_reference<std::size_t> {wrong}.load(std::memory_order_relaxed), std::size_t {0});
+    failures += expect(atomic_reference<std::size_t> {reads}.load(std::memory_order_relaxed) != 0);
 
     // Once every commit returned, a point read probes at most (F − 1)(T + 1) memory runs, T = ⌈log_F commits⌉.
     std::uint64_t const fan_in = config.lsm_tree.level_enlarge_factor;
@@ -1698,28 +1708,31 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
 
     any_collection_id_t const by_name {owned_name("left")};
     any_collection_id_t const churned {owned_name("churn")};
-    std::atomic<reader_phase_t> phase {reader_phase_t::racing_k};
-    std::atomic<std::size_t> answered {0};
-    std::atomic<std::size_t> mismatched {0};
+    reader_phase_t phase {reader_phase_t::racing_k};
+    std::size_t answered {0};
+    std::size_t mismatched {0};
 
     // The leader word is taken before the first reader starts, so a lookup that wants it counts nothing at all.
     store.ledger().lead();
     std::array<std::thread, readers_k> readers;
     for (std::size_t reader = 0; reader != readers_k; ++reader)
         readers[reader] = std::thread {[&]() noexcept {
-            while (phase.load(std::memory_order_relaxed) == reader_phase_t::racing_k) {
-                if (store.collection_id(by_name) != *left) mismatched.fetch_add(1, std::memory_order_relaxed);
+            while (atomic_reference<reader_phase_t> {phase}.load(std::memory_order_relaxed) ==
+                   reader_phase_t::racing_k) {
+                if (store.collection_id(by_name) != *left)
+                    atomic_reference<std::size_t> {mismatched}.fetch_add(1, std::memory_order_relaxed);
                 collection_config_t shape;
-                if (store.collection_config(*left, shape).failed()) mismatched.fetch_add(1, std::memory_order_relaxed);
+                if (store.collection_config(*left, shape).failed())
+                    atomic_reference<std::size_t> {mismatched}.fetch_add(1, std::memory_order_relaxed);
                 [[maybe_unused]] bool const seen = store.has_collection(churned);
-                answered.fetch_add(1, std::memory_order_relaxed);
+                atomic_reference<std::size_t> {answered}.fetch_add(1, std::memory_order_relaxed);
             }
         }};
 
     std::chrono::steady_clock::time_point const started = std::chrono::steady_clock::now();
     std::size_t progressed = 0;
     while (std::chrono::steady_clock::now() - started < patience_k) {
-        progressed = answered.load(std::memory_order_relaxed);
+        progressed = atomic_reference<std::size_t> {answered}.load(std::memory_order_relaxed);
         if (progressed >= readers_k * rounds_k) break;
         fu::preferred_yield_t {}(answered, progressed, std::size_t {0});
     }
@@ -1734,10 +1747,10 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
         failures += expect(store.drop_collection(any_collection_id_t {*created}).succeeded());
     }
 
-    phase.store(reader_phase_t::retiring_k, std::memory_order_relaxed);
+    atomic_reference<reader_phase_t> {phase}.store(reader_phase_t::retiring_k, std::memory_order_relaxed);
     for (std::size_t reader = 0; reader != readers_k; ++reader) readers[reader].join();
 
-    failures += expect_eq(mismatched.load(std::memory_order_relaxed), std::size_t {0});
+    failures += expect_eq(atomic_reference<std::size_t> {mismatched}.load(std::memory_order_relaxed), std::size_t {0});
     failures += expect(store.collection_id(by_name) == *left);
     failures += expect(!store.has_collection(churned));
     return failures;

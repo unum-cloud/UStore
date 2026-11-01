@@ -10,10 +10,10 @@
 
 #include <cstdint> // `std::uint8_t`
 
-#include <atomic> // `std::atomic`, `std::memory_order_acquire`
-
 #include "ustore/status.hpp" // `status_t`
 #include "ustore/types.h"    // `ustore_progress_callback_t`, `ustore_size_t`
+
+#include "engine.hpp" // `floor_atomic_ref`
 
 namespace unum::ustore::utilities {
 
@@ -38,8 +38,8 @@ enum class reporting_t : std::uint8_t {
 class progress_t {
     ustore_progress_callback_t callback_ = nullptr;
     void* state_ = nullptr;
-    std::atomic<ustore_size_t> finished_ {0};
-    std::atomic<reporting_t> reporting_ {reporting_t::idle_k};
+    ustore_size_t finished_ = 0;
+    reporting_t reporting_ = reporting_t::idle_k;
     ustore_size_t total_ = 0;
 
   public:
@@ -48,14 +48,16 @@ class progress_t {
 
     /** Counts @p units finished and reports when no other thread is; false asks the call to unwind. */
     bool advance(ustore_size_t units) noexcept {
-        finished_.fetch_add(units, std::memory_order_relaxed);
+        floor_atomic_ref<ustore_size_t> const finished {finished_};
+        finished.fetch_add(units, std::memory_order_relaxed);
         if (!callback_) return true;
+        floor_atomic_ref<reporting_t> const reporting {reporting_};
         reporting_t observed = reporting_t::idle_k;
-        if (!reporting_.compare_exchange_strong(observed, reporting_t::reporting_k, std::memory_order_acquire,
-                                                std::memory_order_acquire))
+        if (!reporting.compare_exchange_strong(observed, reporting_t::reporting_k, std::memory_order_acquire,
+                                               std::memory_order_acquire))
             return observed != reporting_t::cancelled_k;
-        bool const carries_on = callback_(finished_.load(std::memory_order_relaxed), total_, state_) != ustore_cancel_k;
-        reporting_.store(carries_on ? reporting_t::idle_k : reporting_t::cancelled_k, std::memory_order_release);
+        bool const carries_on = callback_(finished.load(std::memory_order_relaxed), total_, state_) != ustore_cancel_k;
+        reporting.store(carries_on ? reporting_t::idle_k : reporting_t::cancelled_k, std::memory_order_release);
         return carries_on;
     }
 };

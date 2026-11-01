@@ -20,17 +20,17 @@
 
 #include <concepts>    // `std::convertible_to`, `std::same_as`
 #include <span>        // `std::span`
-#include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`
 #include <variant>     // `std::variant`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 #include <stringzilla/regex.h>         // `sz_regex_engine_t`, `sz_regex_engine_init`, `sz_regex_contains`
 #include <stringzilla/subdocuments.h>  // `sz_subdocuments_engine_t`, `sz_subdocuments_contains`
 #include <stringzilla/substrings.h>    // `sz_substrings_engine_t`, `sz_substrings_contains`
 
 #include "ustore/types.hpp"                 // `key_after`, `largest_key_k`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_rewind`, `export_strings`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_rewind`
+#include "ustore/utilities/types.hpp"       // `stringzilla_refusal`
 
 #include "engine.hpp"             // `home_t`, `home_tables`, `view_t`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `validate_scan`
@@ -52,13 +52,6 @@ struct candidates_t {
     std::span<float> scores;
     std::size_t count = 0;
 };
-
-/** Translates a StringZilla refusal, carrying its static message. */
-inline status_t stringzilla_refusal(sz_status_t status) noexcept {
-    if (status == sz_bad_alloc_k) return {status_code_t::out_of_memory_k, sz_status_name(status)};
-    if (status == sz_missing_kernel_k) return {status_code_t::unsupported_k, sz_status_name(status)};
-    return {status_code_t::invalid_argument_k, sz_status_name(status)};
-}
 
 /** The matcher of a match reading no values. */
 struct match_everything_t {};
@@ -149,7 +142,8 @@ struct compiled_match<home_t::host_k> {
             status = sz_substrings_contains(*substrings, &strings, contained.data(), nullptr);
         else if (sz_subdocuments_engine_t* const* const paths = std::get_if<sz_subdocuments_engine_t*>(&matcher))
             status = sz_subdocuments_contains(*paths, &strings, contained.data(), &malformed_index, nullptr);
-        if (status != sz_success_k) return stringzilla_refusal(status);
+        if (status != sz_success_k)
+            return stringzilla_refusal(status, status_code_t::invalid_argument_k, "Failed to match the values");
         return narrow(views, contained.data(), candidates);
     }
 
@@ -174,7 +168,8 @@ struct compiled_match<home_t::host_k> {
                                                .average_document_length = 0.0f};
         sz_status_t const scoring = sz_substrings_bm25_scores(scorer, &scored, nullptr, &parameters, weights,
                                                               candidates.scores.data(), 1, nullptr);
-        if (scoring != sz_success_k) return stringzilla_refusal(scoring);
+        if (scoring != sz_success_k)
+            return stringzilla_refusal(scoring, status_code_t::invalid_argument_k, "Failed to score the values");
         return {};
     }
 };
@@ -190,6 +185,14 @@ struct compiled_match<home_> {
 
     /** The caller's predicate and the BM25 scorer, whose own matcher reads no values. */
     compiled_match<home_t::host_k> host;
+
+    /** @c matcher rebased onto its tables' copy in the executor's managed runs, which the kernels
+     *  take by value, or nothing for an engine no kernel walks, which the host matches. */
+    std::variant<match_everything_t, sz_regex_engine_t, sz_substrings_engine_t, sz_subdocuments_engine_t> on_device;
+
+    /** The column images a regex group or chunk primes from, in the executor's managed
+     *  runs, or null. */
+    std::uint32_t const* images = nullptr;
 
     /** Whether the match reads the values of the keys it narrows. */
     bool reads_values() const noexcept { return !std::holds_alternative<match_everything_t>(matcher); }
@@ -273,7 +276,9 @@ inline status_t compile_patterns(ustore_patterns_t const& patterns, ustore_arena
         sz_size_t malformed_index = 0;
         sz_status_t const status = sz_regex_engine_init(compiled.data(), &strings, sensitivity, &malformed_index,
                                                         capabilities, &engine_memory, nullptr);
-        if (status != sz_success_k) return stringzilla_refusal(status);
+        if (status != sz_success_k)
+            return stringzilla_refusal(status, status_code_t::invalid_argument_k,
+                                       "Failed to compile the regular expression");
         matcher = compiled.data();
         return {};
     }
@@ -282,7 +287,8 @@ inline status_t compile_patterns(ustore_patterns_t const& patterns, ustore_arena
     sz_status_t const status = sz_substrings_engine_init(
         compiled.data(), &strings, sensitivity, sz_substrings_leftmost_longest_k,
         STRINGZILLA_SUBSTRINGS_HOT_STATES_AUTO, 0, 0, capabilities, &engine_memory, nullptr);
-    if (status != sz_success_k) return stringzilla_refusal(status);
+    if (status != sz_success_k)
+        return stringzilla_refusal(status, status_code_t::invalid_argument_k, "Failed to compile the patterns");
     matcher = compiled.data();
     return {};
 }
@@ -306,7 +312,8 @@ inline status_t compile_filter(ustore_bytes_view_t filter, sz_subdocuments_forma
     sz_status_t const status = sz_subdocuments_engine_init(compiled.data(), &paths, format,
                                                            sz_subdocuments_options_none_k, &malformed_index,
                                                            capabilities, &engine_memory, nullptr);
-    if (status != sz_success_k) return stringzilla_refusal(status);
+    if (status != sz_success_k)
+        return stringzilla_refusal(status, status_code_t::invalid_argument_k, "Failed to compile the filter");
     matcher = compiled.data();
     return {};
 }
@@ -418,10 +425,10 @@ status_t read_page_values(home_tables<home_t::host_k> const& engine, ustore_data
 }
 
 /** The scores of the keys or strings a listing kept, grown in scratch beside them. */
-using scores_sink_t = st::basic_vector<float, arena_allocator<float>>;
+using scores_sink_t = st::vector<float, arena_allocator<float>>;
 
 /** The keys a keyed listing kept, grown in scratch until they reach the call's arena. */
-using keyed_survivors_t = st::basic_vector<ustore_key_t, arena_allocator<ustore_key_t>>;
+using keyed_survivors_t = st::vector<ustore_key_t, arena_allocator<ustore_key_t>>;
 
 /**
  *  @brief Appends to @p survivors up to @p wanted keys of @p collection from @p start on that @p match keeps, listing
@@ -578,8 +585,9 @@ status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ con
 #pragma region Strings Listings
 
 /**
- *  @brief Appends to @p survivors up to @p wanted strings of @p collection under @p prefix from @p start on that
- *      @p match keeps, listing pages through the host strings scan of @p engine in @p page, which every page rewinds.
+ *  @brief Appends to @p survivors up to @p wanted strings of @p collection under @p prefix
+ *      from @p start on that @p match keeps, listing pages through the host strings scan
+ *      of @p engine in @p page, which every page rewinds.
  *
  *  The predicate sees the keys the strings map onto, which a read of every page's strings finds. Answers the string
  *  the next listing resumes at in @p resume, kept in @p resume_bytes, or nothing once the prefix ends.
@@ -688,7 +696,7 @@ status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ con
     auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(view.scratch, arguments.count + 1);
     if (offsets_status.failed()) return offsets_status;
     growing_strings<arena_allocator<byte_t>> survivors {arena_allocator<byte_t> {view.scratch}};
-    st::basic_vector<byte_t, arena_allocator<byte_t>> resume_bytes {arena_allocator<byte_t> {view.scratch}};
+    st::vector<byte_t, arena_allocator<byte_t>> resume_bytes {arena_allocator<byte_t> {view.scratch}};
     scores_sink_t scores {arena_allocator<float> {view.scratch}};
     bool const scored = arguments.scores && match.scores();
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};

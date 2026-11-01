@@ -5,9 +5,10 @@
  *  @brief Strided iterators, spans and tapes that view the batched arguments and results of the C ABI, the
  *      adapters that turn C++ locations and values into them, and the owned batches deferred calls take.
  *
- *  A strided layout advances by a byte stride instead of @c sizeof, so a zero stride repeats one value.
- *  A tape indexes variable-length values by a base pointer and N+1 gapless offsets of 32 or 64 bits, as every
- *  call exports them into its arena, and any other run of strings reaches the C ABI through an accessor.
+ *  A strided layout advances by a byte stride instead of @c sizeof, so a zero stride repeats one
+ *  value. A tape indexes variable-length values by a base pointer and N+1 gapless offsets of 32 or
+ *  64 bits, as every call exports them into its arena, and any other run of strings reaches the C
+ *  ABI through an accessor.
  */
 
 #pragma once
@@ -27,44 +28,44 @@
 #include <type_traits> // `std::remove_cvref_t`, `std::conditional_t`, `std::remove_reference_t`
 #include <utility>     // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 #include <stringzilla/stringzilla.hpp> // `sz::strings_t`, `sz::strings_view_t`, `sz::indexed_container_iterator`
 
-#include "ustore/types.hpp" // `value_view_t`, `divide_round_up`, `collection_key_field_t`, `edge_t`
+#include "ustore/types.hpp" // `value_view_t`, `collection_key_field_t`, `edge_t`
 
 namespace unum::ustore {
 
 #pragma region Batches
 
 /** A batch of locations or values rather than a single one, recognized by its nested @c value_type. */
-template <typename type_>
-concept batch_concept = requires { typename std::remove_cvref_t<type_>::value_type; };
+template <typename batch_type_>
+concept batch_concept = requires { typename std::remove_cvref_t<batch_type_>::value_type; };
 
 /** A batch that carries its own byte stride instead of stepping by the size of its elements. */
-template <typename type_>
-concept strided_batch_concept = batch_concept<type_> &&
-                                requires(std::remove_cvref_t<type_> const& elements) { elements.stride(); };
+template <typename batch_type_>
+concept strided_batch_concept = batch_concept<batch_type_> &&
+                                requires(std::remove_cvref_t<batch_type_> const& elements) { elements.stride(); };
 
 /** Resolves a single location or value to itself. */
-template <typename type_>
+template <typename batch_type_>
 struct batch_element {
-    using type = std::remove_cvref_t<type_>;
+    using type = std::remove_cvref_t<batch_type_>;
 };
 
 /** Resolves a batch to the type of its elements. */
-template <batch_concept type_>
-struct batch_element<type_> {
-    using type = typename std::remove_cvref_t<type_>::value_type;
+template <batch_concept batch_type_>
+struct batch_element<batch_type_> {
+    using type = typename std::remove_cvref_t<batch_type_>::value_type;
 };
 
-template <typename type_>
-using batch_element_t = typename batch_element<type_>::type;
+template <typename batch_type_>
+using batch_element_of = typename batch_element<batch_type_>::type;
 
 /** Elements a deferred call can own, moved into it whole: a vector of them, or a fixed array, which spans exactly the
  *  bytes of its elements. */
 template <typename array_type_, typename element_type_>
 concept owned_array_concept =
-    std::same_as<array_type_, st::basic_vector<element_type_>> ||
+    std::same_as<array_type_, st::vector<element_type_>> ||
     std::same_as<array_type_, std::array<element_type_, sizeof(array_type_) / sizeof(element_type_)>>;
 
 /** Values, strings or fields a deferred call owns and passes to the C ABI as a tape. */
@@ -76,48 +77,49 @@ using values_tape_t = sz::strings_t;
 
 /** A pointer that advances by a byte stride instead of the size of its element.
  *  A zero stride repeats one element, so every task of a batch can share a single argument. */
-template <typename element_>
+template <typename element_type_>
 class strided_iterator {
   public:
-    using element_t = element_;
+    using element_t = element_type_;
     using iterator_category = std::random_access_iterator_tag;
     using difference_type = std::ptrdiff_t;
-    using value_type = std::remove_cv_t<element_>;
-    using pointer = element_*;
-    using reference = element_&;
+    using value_type = std::remove_cv_t<element_type_>;
+    using pointer = element_type_*;
+    using reference = element_type_&;
 
   private:
-    element_* raw_ {nullptr};
+    element_type_* pointer_ {nullptr};
     ustore_size_t stride_ {0};
 
-    element_* upshift(std::ptrdiff_t bytes) const noexcept { return (element_*)((char*)raw_ + bytes); }
-    element_* downshift(std::ptrdiff_t bytes) const noexcept { return (element_*)((char*)raw_ - bytes); }
+    element_type_* upshift(std::ptrdiff_t bytes) const noexcept { return (element_type_*)((char*)pointer_ + bytes); }
+    element_type_* downshift(std::ptrdiff_t bytes) const noexcept { return (element_type_*)((char*)pointer_ - bytes); }
     std::ptrdiff_t signed_stride() const noexcept { return static_cast<std::ptrdiff_t>(stride_); }
 
   public:
-    strided_iterator(element_* raw = nullptr, ustore_size_t stride = 0) noexcept : raw_(raw), stride_(stride) {}
+    strided_iterator(element_type_* pointer = nullptr, ustore_size_t stride = 0) noexcept
+        : pointer_(pointer), stride_(stride) {}
 
-    element_& operator[](std::ptrdiff_t index) const noexcept { return *upshift(signed_stride() * index); }
+    element_type_& operator[](std::ptrdiff_t index) const noexcept { return *upshift(signed_stride() * index); }
 
     strided_iterator& operator++() noexcept {
-        raw_ = upshift(signed_stride());
+        pointer_ = upshift(signed_stride());
         return *this;
     }
 
     strided_iterator& operator--() noexcept {
-        raw_ = downshift(signed_stride());
+        pointer_ = downshift(signed_stride());
         return *this;
     }
 
     strided_iterator operator++(int) noexcept {
         strided_iterator const previous = *this;
-        raw_ = upshift(signed_stride());
+        pointer_ = upshift(signed_stride());
         return previous;
     }
 
     strided_iterator operator--(int) noexcept {
         strided_iterator const previous = *this;
-        raw_ = downshift(signed_stride());
+        pointer_ = downshift(signed_stride());
         return previous;
     }
 
@@ -132,47 +134,47 @@ class strided_iterator {
     }
 
     strided_iterator& operator+=(std::ptrdiff_t count) noexcept {
-        raw_ = upshift(count * signed_stride());
+        pointer_ = upshift(count * signed_stride());
         return *this;
     }
 
     strided_iterator& operator-=(std::ptrdiff_t count) noexcept {
-        raw_ = downshift(count * signed_stride());
+        pointer_ = downshift(count * signed_stride());
         return *this;
     }
 
     /** The number of strides between two iterators, meaningful only for a stride that is a multiple of the element. */
     std::ptrdiff_t operator-(strided_iterator other) const noexcept {
         if (!stride_) return 0;
-        return (raw_ - other.raw_) * static_cast<std::ptrdiff_t>(sizeof(element_)) / signed_stride();
+        return (pointer_ - other.pointer_) * static_cast<std::ptrdiff_t>(sizeof(element_type_)) / signed_stride();
     }
 
-    explicit operator bool() const noexcept { return raw_ != nullptr; }
+    explicit operator bool() const noexcept { return pointer_ != nullptr; }
 
     /** Whether a zero stride repeats the same element forever. */
     bool repeats() const noexcept { return !stride_; }
 
     /** Whether the elements sit next to each other without gaps. */
-    bool is_continuous() const noexcept { return stride_ == sizeof(element_); }
+    bool is_continuous() const noexcept { return stride_ == sizeof(element_type_); }
 
     ustore_size_t stride() const noexcept { return stride_; }
-    element_& operator*() const noexcept { return *raw_; }
-    element_* operator->() const noexcept { return raw_; }
-    element_* get() const noexcept { return raw_; }
+    element_type_& operator*() const noexcept { return *pointer_; }
+    element_type_* operator->() const noexcept { return pointer_; }
+    element_type_* get() const noexcept { return pointer_; }
 
     friend bool operator==(strided_iterator const& first, strided_iterator const& second) noexcept {
-        return first.raw_ == second.raw_;
+        return first.pointer_ == second.pointer_;
     }
 
     friend std::strong_ordering operator<=>(strided_iterator const& first, strided_iterator const& second) noexcept {
-        return first.raw_ <=> second.raw_;
+        return first.pointer_ <=> second.pointer_;
     }
 
     /** Views one member of every element with the same stride. */
-    template <typename member_, typename parent_>
-    auto members(member_ parent_::* member_pointer) const noexcept {
-        using member_t = std::conditional_t<std::is_const_v<element_>, member_ const, member_>;
-        return strided_iterator<member_t> {raw_ ? &(raw_->*member_pointer) : nullptr, stride_};
+    template <typename member_type_, typename parent_type_>
+    auto members(member_type_ parent_type_::* member_pointer) const noexcept {
+        using member_t = std::conditional_t<std::is_const_v<element_type_>, member_type_ const, member_type_>;
+        return strided_iterator<member_t> {pointer_ ? &(pointer_->*member_pointer) : nullptr, stride_};
     }
 };
 
@@ -182,15 +184,15 @@ class bits_span_t {
 
     /** A proxy for one bit that reads as and assigns from @c bool. */
     class ref_t {
-        ustore_octet_t* raw_ = nullptr;
+        ustore_octet_t* octet_ = nullptr;
         ustore_octet_t mask_ = 0;
 
       public:
-        ref_t(ustore_octet_t& raw) noexcept : raw_(&raw), mask_(0) {}
-        ref_t(ustore_octet_t* raw, ustore_octet_t mask) noexcept : raw_(raw), mask_(mask) {}
-        operator bool() const noexcept { return *raw_ & mask_; }
+        ref_t(ustore_octet_t& octet) noexcept : octet_(&octet), mask_(0) {}
+        ref_t(ustore_octet_t* octet, ustore_octet_t mask) noexcept : octet_(octet), mask_(mask) {}
+        operator bool() const noexcept { return *octet_ & mask_; }
         ref_t& operator=(std::same_as<bool> auto value) noexcept {
-            *raw_ = value ? (*raw_ | mask_) : (*raw_ & ~mask_);
+            *octet_ = value ? (*octet_ | mask_) : (*octet_ & ~mask_);
             return *this;
         }
     };
@@ -238,14 +240,15 @@ class bits_view_t {
     bool operator==(bits_view_t const& other) const noexcept { return begin_ == other.begin_; }
 };
 
-/** A counted run of strided elements, writable unless @p element_ is @c const, as @c std::span is. */
-template <typename element_>
+/** A counted run of strided elements, writable unless @p element_type_ is @c const, like
+ *  @c std::span. */
+template <typename element_type_>
 class strided_span {
   public:
-    using element_t = element_;
-    using iterator_t = strided_iterator<element_>;
-    using value_type = std::remove_cv_t<element_>;
-    using reference = element_&;
+    using element_t = element_type_;
+    using iterator_t = strided_iterator<element_type_>;
+    using value_type = std::remove_cv_t<element_type_>;
+    using reference = element_type_&;
 
   private:
     iterator_t begin_ {nullptr};
@@ -255,13 +258,13 @@ class strided_span {
     strided_span() = default;
     strided_span(iterator_t begin, ustore_size_t count) noexcept : begin_(begin), count_(count) {}
 
-    element_* data() const noexcept { return begin_.get(); }
+    element_type_* data() const noexcept { return begin_.get(); }
     iterator_t begin() const noexcept { return begin_; }
     iterator_t end() const noexcept { return begin_ + static_cast<std::ptrdiff_t>(count_); }
-    element_& at(std::size_t index) const noexcept { return begin_[static_cast<std::ptrdiff_t>(index)]; }
-    element_& operator[](std::size_t index) const noexcept { return at(index); }
+    element_type_& at(std::size_t index) const noexcept { return begin_[static_cast<std::ptrdiff_t>(index)]; }
+    element_type_& operator[](std::size_t index) const noexcept { return at(index); }
 
-    strided_span<element_ const> immutable() const noexcept { return {{begin_.get(), begin_.stride()}, count_}; }
+    strided_span<element_type_ const> immutable() const noexcept { return {{begin_.get(), begin_.stride()}, count_}; }
     strided_span subspan(std::size_t offset, std::size_t count) const noexcept {
         return {begin_ + static_cast<std::ptrdiff_t>(offset), count};
     }
@@ -273,8 +276,8 @@ class strided_span {
     explicit operator bool() const noexcept { return static_cast<bool>(begin_); }
 
     /** Views one member of every element with the same stride. */
-    template <typename member_, typename parent_>
-    auto members(member_ parent_::* member_pointer) const noexcept {
+    template <typename member_type_, typename parent_type_>
+    auto members(member_type_ parent_type_::* member_pointer) const noexcept {
         auto const member_begin = begin_.members(member_pointer);
         using member_t = typename std::remove_cvref_t<decltype(member_begin)>::element_t;
         return strided_span<member_t> {member_begin, count_};
@@ -290,18 +293,18 @@ class strided_span {
 };
 
 /** Views a contiguous container as a strided span that steps by the size of its elements. */
-template <std::ranges::contiguous_range container_>
-    requires std::ranges::sized_range<container_>
-strided_span<std::remove_reference_t<std::ranges::range_reference_t<container_>>> strided(
-    container_&& container) noexcept {
-    using element_t = std::ranges::range_value_t<container_>;
+template <std::ranges::contiguous_range container_type_>
+    requires std::ranges::sized_range<container_type_>
+strided_span<std::remove_reference_t<std::ranges::range_reference_t<container_type_>>> strided(
+    container_type_&& container) noexcept {
+    using element_t = std::ranges::range_value_t<container_type_>;
     return {{std::ranges::data(container), sizeof(element_t)}, std::ranges::size(container)};
 }
 
 /** Views the contiguous elements from @p begin up to @p end as a strided span. */
-template <typename element_>
-strided_span<element_> strided(element_* begin, element_* end) noexcept {
-    return {{begin, sizeof(element_)}, static_cast<std::size_t>(end - begin)};
+template <typename element_type_>
+strided_span<element_type_> strided(element_type_* begin, element_type_* end) noexcept {
+    return {{begin, sizeof(element_type_)}, static_cast<std::size_t>(end - begin)};
 }
 
 /** Iterates the strided run @p view of the C ABI describes, such as a @c ustore_keys_view_t, null when it has no
@@ -316,19 +319,19 @@ strided_iterator<std::remove_reference_t<decltype(*view_type_ {}.data)>> strided
 }
 
 /** A pair of iterators, so that a move-only stream can drive a range-based loop. */
-template <typename iterator_>
+template <typename iterator_type_>
 class range {
-    iterator_ begin_ {};
-    iterator_ end_ {};
+    iterator_type_ begin_ {};
+    iterator_type_ end_ {};
 
   public:
     range() = default;
-    range(iterator_ begin, iterator_ end) noexcept : begin_(std::move(begin)), end_(std::move(end)) {}
+    range(iterator_type_ begin, iterator_type_ end) noexcept : begin_(std::move(begin)), end_(std::move(end)) {}
 
-    iterator_ const& begin() const& noexcept { return begin_; }
-    iterator_ const& end() const& noexcept { return end_; }
-    iterator_&& begin() && noexcept { return std::move(begin_); }
-    iterator_&& end() && noexcept { return std::move(end_); }
+    iterator_type_ const& begin() const& noexcept { return begin_; }
+    iterator_type_ const& end() const& noexcept { return end_; }
+    iterator_type_&& begin() && noexcept { return std::move(begin_); }
+    iterator_type_&& end() && noexcept { return std::move(end_); }
 };
 
 #pragma endregion Strided Spans
@@ -380,16 +383,16 @@ struct place_batch_t {
 
 /** Edges as three strided columns of sources, targets and edge identifiers, which the offsets of the read that
  *  exported them split by vertex. */
-template <typename id_>
+template <typename id_type_>
 struct edges_span {
 
-    using id_t = id_;
-    using tuple_t = std::conditional_t<std::is_const_v<id_>, edge_t const, edge_t>;
-    static_assert(sizeof(tuple_t) == 3 * sizeof(id_));
+    using id_t = id_type_;
+    using tuple_t = std::conditional_t<std::is_const_v<id_type_>, edge_t const, edge_t>;
+    static_assert(sizeof(tuple_t) == 3 * sizeof(id_type_));
 
-    strided_span<id_> sources;
-    strided_span<id_> targets;
-    strided_span<id_> ids;
+    strided_span<id_type_> sources;
+    strided_span<id_type_> targets;
+    strided_span<id_type_> ids;
 
     /** One offset per vertex of the read plus one, counted in edges, where a missing vertex spans none; empty for edges
      *  no read exported. */
@@ -397,12 +400,14 @@ struct edges_span {
 
     edges_span() = default;
 
-    edges_span(strided_span<id_> sources, strided_span<id_> targets, strided_span<id_> ids) noexcept
+    edges_span(strided_span<id_type_> sources, strided_span<id_type_> targets, strided_span<id_type_> ids) noexcept
         : sources(sources), targets(targets), ids(ids) {}
 
     /** Edges between @p sources and @p targets that all carry the default edge identifier. */
-    edges_span(strided_span<id_> sources, strided_span<id_> targets) noexcept : sources(sources), targets(targets) {
-        static_assert(std::is_const_v<id_>, "Only a read-only view can point at the shared default edge identifier");
+    edges_span(strided_span<id_type_> sources, strided_span<id_type_> targets) noexcept
+        : sources(sources), targets(targets) {
+        static_assert(std::is_const_v<id_type_>,
+                      "Only a read-only view can point at the shared default edge identifier");
         ids = {{&ustore_edge_id_default_k, 0}, 1};
     }
 
@@ -430,9 +435,9 @@ struct edges_span {
         return {sources.subspan(begin, count), targets.subspan(begin, count), ids.subspan(begin, count)};
     }
 
-    operator edges_span<id_ const>() const noexcept { return immutable(); }
-    edges_span<id_ const> immutable() const noexcept {
-        edges_span<id_ const> result {sources.immutable(), targets.immutable(), ids.immutable()};
+    operator edges_span<id_type_ const>() const noexcept { return immutable(); }
+    edges_span<id_type_ const> immutable() const noexcept {
+        edges_span<id_type_ const> result {sources.immutable(), targets.immutable(), ids.immutable()};
         result.offsets = offsets;
         return result;
     }
@@ -449,10 +454,10 @@ inline edges_view_t exported_edges(ustore_key_t const* edges, ustore_length_t co
 }
 
 /** Views a contiguous container of @c edge_t as strided edge columns. */
-template <std::ranges::contiguous_range tuples_>
-    requires std::ranges::sized_range<tuples_>
-auto edges(tuples_&& tuples) noexcept {
-    using element_t = std::remove_reference_t<std::ranges::range_reference_t<tuples_>>;
+template <std::ranges::contiguous_range tuples_type_>
+    requires std::ranges::sized_range<tuples_type_>
+auto edges(tuples_type_&& tuples) noexcept {
+    using element_t = std::remove_reference_t<std::ranges::range_reference_t<tuples_type_>>;
     using result_t = std::conditional_t<std::is_const_v<element_t>, edges_view_t, edges_span<ustore_key_t>>;
     auto const begin = std::ranges::data(tuples);
     return result_t(begin, begin + std::ranges::size(tuples));
@@ -463,11 +468,11 @@ auto edges(tuples_&& tuples) noexcept {
 #pragma region Location Adapters
 
 /** Stores a location by value and hands out references to it. */
-template <typename location_>
+template <typename location_type_>
 class location_store {
   public:
-    using plain_t = location_;
-    using store_t = location_;
+    using plain_t = location_type_;
+    using store_t = location_type_;
 
   private:
     store_t store_ {};
@@ -481,19 +486,19 @@ class location_store {
 };
 
 /** Widens a single key into a full location stored by value. */
-template <key_location_concept location_>
-class location_store<location_> : public location_store<collection_key_field_t> {
+template <key_location_concept location_type_>
+class location_store<location_type_> : public location_store<collection_key_field_t> {
   public:
     using location_store<collection_key_field_t>::location_store;
 };
 
 /** Stores a caller-owned location by pointer, so a batch is never copied. */
-template <typename location_>
-    requires(!key_location_concept<location_>)
-class location_store<location_&> {
+template <typename location_type_>
+    requires(!key_location_concept<location_type_>)
+class location_store<location_type_&> {
   public:
-    using plain_t = location_;
-    using store_t = location_*;
+    using plain_t = location_type_;
+    using store_t = location_type_*;
 
   private:
     store_t store_ {nullptr};
@@ -522,7 +527,7 @@ template <typename locations_type_>
 struct places_arg_extractor {
 
     using location_t = locations_type_;
-    using element_t = batch_element_t<locations_type_>;
+    using element_t = batch_element_of<locations_type_>;
     static constexpr bool is_one_k = !batch_concept<locations_type_>;
 
     ustore_size_t count(location_t const& locations) noexcept {
@@ -619,10 +624,10 @@ using utilities::u64_tape;
 
 /** The tape @p strings pass to the C ABI as, or a zeroed view, the input's default, when they hold none. */
 inline ustore_strings_view_t tape_of(values_tape_t const& strings) noexcept {
-    sz_strings_span_t const& raw = strings.raw;
-    if (!raw.count) return {};
-    if (raw.layout == sz_strings_u64_tape_k) return u64_tape(raw.data.u64_tape.data, raw.data.u64_tape.offsets);
-    return u32_tape(raw.data.u32_tape.data, raw.data.u32_tape.offsets);
+    sz_strings_span_t const& span = strings.raw;
+    if (!span.count) return {};
+    if (span.layout == sz_strings_u64_tape_k) return u64_tape(span.data.u64_tape.data, span.data.u64_tape.offsets);
+    return u32_tape(span.data.u32_tape.data, span.data.u32_tape.offsets);
 }
 
 /** StringZilla's view of the @p count strings of an output @p tape, of either offset width. */
@@ -743,9 +748,9 @@ class values_view_t {
 
     /** The tape the values live in, where a missing value is an empty one, which a write takes back as it is. */
     ustore_strings_view_t tape() const noexcept {
-        sz_strings_view_t const& raw = strings_.raw;
-        if (raw.layout == sz_strings_u64_tape_k) return u64_tape(raw.data.u64_tape.data, raw.data.u64_tape.offsets);
-        return u32_tape(raw.data.u32_tape.data, raw.data.u32_tape.offsets);
+        sz_strings_view_t const& view = strings_.raw;
+        if (view.layout == sz_strings_u64_tape_k) return u64_tape(view.data.u64_tape.data, view.data.u64_tape.offsets);
+        return u32_tape(view.data.u32_tape.data, view.data.u32_tape.offsets);
     }
 };
 
@@ -840,23 +845,24 @@ struct values_arg_extractor<strings_type_> {
 #pragma region Algorithms
 
 /** Writes the first @p count transformed elements into @p output. */
-template <typename output_iterator_, typename iterator_, typename transform_ = std::identity>
-void transform_n(iterator_ begin, std::size_t count, output_iterator_ output, transform_ transform = {}) {
+template <typename output_iterator_type_, typename iterator_type_, typename transform_type_ = std::identity>
+void transform_n(iterator_type_ begin, std::size_t count, output_iterator_type_ output,
+                 transform_type_ transform = {}) {
     for (std::size_t index = 0; index != count; ++index) output[index] = transform(begin[index]);
 }
 
 /** Whether the first @p count elements strictly ascend. */
-template <typename iterator_>
-bool all_ascending(iterator_ begin, std::size_t count) {
+template <typename iterator_type_>
+bool all_ascending(iterator_type_ begin, std::size_t count) {
     for (std::size_t index = 1; index < count; ++index)
         if (!(begin[index - 1] < begin[index])) return false;
     return true;
 }
 
 /** Sorts the elements, gathers the distinct ones at the front, and returns how many there are. */
-template <std::random_access_iterator iterator_>
-    requires std::sortable<iterator_>
-std::size_t sort_and_deduplicate(iterator_ begin, iterator_ end) {
+template <std::random_access_iterator iterator_type_>
+    requires std::sortable<iterator_type_>
+std::size_t sort_and_deduplicate(iterator_type_ begin, iterator_type_ end) {
     std::ranges::sort(begin, end);
     return static_cast<std::size_t>(std::ranges::unique(begin, end).begin() - begin);
 }

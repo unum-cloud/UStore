@@ -35,11 +35,11 @@
  *      @c fetch_or
  */
 #define thread_count 2
-#define location_count (4 + thread_count)
+#define location_count (6 + thread_count)
 #ifdef waiting // set only to handoff, whose value the protocol defines after the shape
 #define history_depth 20
 #else
-#define history_depth 9
+#define history_depth 10
 #endif
 #include <epoch_claim/protocol.pml>
 

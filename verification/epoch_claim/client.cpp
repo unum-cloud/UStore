@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date October 20, 2026
  *  @brief GenMC client for the epoch claim of @c maintenance_claim in
- *      `include/ustore/blobs/nvme_database.hpp`, spelled line for line over @c std::atomic.
+ *      <tt>include/ustore/blobs/nvme_published_runs.hpp</tt>, spelled line for line over @c std::atomic.
  *
  *  ForkUnion's references spell the same calls as single instructions, which GenMC cannot load, so
  *  the claim's word is a @c std::atomic here: @c fetch_or for both takes, @c fetch_add for the
@@ -87,12 +87,16 @@ class maintenance_claim {
     }
 
     void take() noexcept {
-        for (;;) {
-            std::uint32_t const seen = epoch_.fetch_or(1, knobs_.take_order);
-            if (seen % 2 == 0) return;
-            wait_until_changed_(seen);
-        }
+        std::uint32_t seen = epoch_.fetch_or(1, knobs_.take_order);
+        if (seen % 2 == 0) return;
+        parked_.fetch_add(1, std::memory_order_seq_cst);
+        while ((seen = epoch_.fetch_or(1, knobs_.take_order)) % 2 != 0) wait_until_changed_(seen);
+        parked_.fetch_sub(1, std::memory_order_relaxed);
     }
+
+    /** Whether a blocking @c take is parked on the claim, which a holder about to retake
+     *  it yields to. */
+    [[nodiscard]] bool anyone_parked() noexcept { return parked_.load(std::memory_order_seq_cst) != 0; }
 
     void wait_until_released() noexcept {
         std::uint32_t const seen = epoch_.load(std::memory_order_acquire);
@@ -118,6 +122,7 @@ class maintenance_claim {
     }
 
     std::atomic<std::uint32_t> epoch_;
+    std::atomic<std::uint32_t> parked_ {0};
     std::atomic<std::uint32_t>* parked_on_;
     std::atomic<std::uint32_t> wakes_ {0}; // ? Ghost: a woken retry is no zero-net-effect spin to GenMC
 };
@@ -146,12 +151,15 @@ void* commit(void* argument) noexcept {
     return nullptr;
 }
 
-/** @c release_claim_: the release, one look at the view, and the claim retaken only if it is due. */
+/** @c release_claim_: the release, one look at the view, and the claim retaken only if it is due
+ *  and nobody is parked on it. */
 template <knobs_t const& knobs_>
 void* hold(void* argument) noexcept {
     auto& shared = *static_cast<maintenance<knobs_>*>(argument);
     shared.claim.release();
-    if (shared.view.load(std::memory_order_acquire) != 1 || !shared.claim.take_if_free()) return nullptr;
+    if (shared.view.load(std::memory_order_acquire) != 1 || shared.claim.anyone_parked() ||
+        !shared.claim.take_if_free())
+        return nullptr;
     maintain(shared);
     shared.claim.release();
     return nullptr;

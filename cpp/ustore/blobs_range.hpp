@@ -275,8 +275,8 @@ class keys_stream_t {
     keys_stream_t& operator=(keys_stream_t const&) = delete;
 
     /** Opens a stream over the keys of @p collection, which holds @p modality, from @p start,
-     *  pulling @p read_ahead of them a page into an arena of its own, made where the executor of
-     *  @p receiver computes. */
+     *  pulling @p read_ahead of them a page into an arena of its own, made where the executor
+     *  of @p receiver computes. */
     static expected<keys_stream_t> make(receiver_t receiver, ustore_collection_id_t collection, ustore_key_t start,
                                         std::size_t read_ahead = default_read_ahead_k,
                                         ustore_modality_t modality = ustore_modality_blobs_k) noexcept {

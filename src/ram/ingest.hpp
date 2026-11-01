@@ -23,16 +23,19 @@
 #include <utility>     // `std::move`
 #include <variant>     // `std::variant`, `std::get_if`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/db.h" // `ustore_ingest_init_t`, `ustore_ingest_append_t`, `ustore_ingest_finish_t`
 
+#include "ustore/docs/ram_store.hpp"        // `document_pair_t`
 #include "ustore/graph/half_edges.hpp"      // `half_edge_t`, `half_edge_direction_t`
+#include "ustore/pages/ram_store.hpp"       // `page_pair_t`
+#include "ustore/strings/ram_store.hpp"     // `string_pair_t`, `string_key_from`
 #include "ustore/utilities/ram_buffers.hpp" // `growth_status`
 
-#include "blobs_layers/ingest.hpp" // `ingest_value_parser_t`, `ingest_values_t`
-#include "database.hpp"            // `database_state`, `transaction_source`, `for_each_run`, `persist`
-#include "utilities/batches.hpp"   // `keyed_rows_t`, `keyed_rows_of`, `ingest_edges_of`
+#include "database.hpp"          // `database_state`, `transaction_source`, `for_each_run`, `persist`
+#include "ingest_layer.hpp"      // `ingest_value_parser`, `ingest_values_t`
+#include "utilities/batches.hpp" // `keyed_rows_t`, `keyed_rows_of`, `ingest_edges_of`
 
 namespace unum::ustore::ram {
 
@@ -42,18 +45,18 @@ using utilities::keyed_rows_t;
 
 /** The entries an ingest gathered for one collection, in the order of their rows. */
 template <typename entry_type_>
-using ingested_entries = st::basic_vector<entry_type_>;
+using ingested_entries = st::vector<entry_type_>;
 
 /** The entries of whichever kind of store an ingest's collection lives in, in the order @c collection_store lists. */
 using any_ingested_entries_t =
     std::variant<ingested_entries<value_pair_t>, ingested_entries<string_pair_t>, ingested_entries<half_edge_t>,
-                 ingested_entries<document_pair_t>, ingested_entries<page_pair_t>>;
+                 ingested_entries<docs::document_pair_t>, ingested_entries<pages::page_pair_t>>;
 
 /** What an ingest lands as the values of entries of @p entry_type_. */
 template <typename entry_type_>
-inline constexpr ingest_values_t ingest_values_for = std::is_same_v<entry_type_, document_pair_t>
+inline constexpr ingest_values_t ingest_values_for = std::is_same_v<entry_type_, docs::document_pair_t>
                                                          ? ingest_values_t::documents_k
-                                                     : std::is_same_v<entry_type_, page_pair_t>
+                                                     : std::is_same_v<entry_type_, pages::page_pair_t>
                                                          ? ingest_values_t::pages_k
                                                          : ingest_values_t::bytes_k;
 
@@ -70,10 +73,10 @@ inline constexpr status_t descending_key_k {status_code_t::invalid_argument_k,
 
 /** Appends the entries of @p rows to @p entries, as a store of @p store_type_ files them, parsing every document and
  *  page through @p value_parser, and refusing a key that does not ascend when @p order promises it. */
-template <typename store_type_>
+template <typename store_type_, strings_kit_concept strings_kit_type_>
 status_t gather_rows(keyed_rows_t const& rows, ustore_ingest_order_t order,
                      ingested_entries<typename store_type_::value_t>& entries,
-                     ingest_value_parser_t& value_parser) noexcept {
+                     ingest_value_parser<strings_kit_type_>& value_parser) noexcept {
     using entry_t = typename store_type_::value_t;
     if (status_t const reserved = growth_status(entries.reserve(entries.size() + rows.size())); reserved.failed())
         return reserved;
@@ -199,7 +202,7 @@ struct ingest_state {
     database_state<cpu_class_, isolation_>& database;
     ustore_collection_id_t collection;
     ustore_ingest_order_t order;
-    ingest_value_parser_t value_parser;
+    ingest_value_parser<strings_kit_of<cpu_class_>> value_parser;
     any_ingested_entries_t entries;
 };
 
@@ -239,7 +242,7 @@ status_t ingest_init(ustore_ingest_init_t const& arguments, view_t const& view) 
                                                 });
     if (opened.failed()) return opened;
     ingest_state<cpu_class_, isolation_>* const ingest = new (std::nothrow) ingest_state<cpu_class_, isolation_> {
-        database, arguments.collection, arguments.order, ingest_value_parser_t {values, arguments.database->kernels},
+        database, arguments.collection, arguments.order, ingest_value_parser<strings_kit_of<cpu_class_>> {values},
         std::move(entries)};
     if (!ingest) return {status_code_t::out_of_memory_k, "Failed to allocate the ingest"};
     (*arguments.ingest)->state = ingest;

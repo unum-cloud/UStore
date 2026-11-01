@@ -107,14 +107,14 @@ static int opening_executor(opening_t* opening, PyObject* object) {
  *  @param[in] verb The constructor's name, as a failure should read it.
  *  @return The keyword count, or -1 with an exception set.
  */
-static Py_ssize_t opening_positional(opening_t* opening, char const* verb, PyObject* const* args,
-                                     Py_ssize_t positional_args_count, PyObject* args_names_tuple) {
-    if (positional_args_count > 1) {
+static Py_ssize_t opening_positional(opening_t* opening, char const* verb, PyObject* const* arguments,
+                                     Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    if (positional_arguments_count > 1) {
         PyErr_Format(PyExc_TypeError, "Database.%s() takes at most one positional argument", verb);
         return -1;
     }
-    if (positional_args_count == 1 && opening_directory(opening, args[0]) != 0) return -1;
-    return args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
+    if (positional_arguments_count == 1 && opening_directory(opening, arguments[0]) != 0) return -1;
+    return keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
 }
 
 /** Reads @p object, a sequence of paths or of @b (path,max_bytes) pairs, as the data directories. */
@@ -200,7 +200,7 @@ static char const doc_Database[] =                                              
     "`graph` and `table` views create it on their first write. Its verbs run on the calling\n" //
     "thread; `on(executor)` and `deferred(executor)` answer views running them on threads.";
 
-static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
+static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
     PyErr_SetString(PyExc_TypeError,
                     "Database() names no engine: use open_ram, open_rocksdb, view_rocksdb, open_leveldb or open_nvme");
@@ -227,17 +227,17 @@ static char const doc_Database_open_ram[] =                                     
     "Raises:\n"                                                                              //
     "  UnsupportedError: The CPU does not run the `cpu_class`.";
 
-static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple) {
+static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* arguments,
+                                   Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     opening_t opening = {0};
     int isolation = ustore_isolation_strict_serializable_k;
     int cpu_class = ustore_cpu_class_unknown_k;
-    Py_ssize_t const args_names_count = opening_positional(&opening, "open_ram", args, positional_args_count,
-                                                           args_names_tuple);
-    if (args_names_count < 0) goto failed;
-    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[positional_args_count + names_progress];
+    Py_ssize_t const keyword_names_count = opening_positional(&opening, "open_ram", arguments,
+                                                              positional_arguments_count, keyword_names_tuple);
+    if (keyword_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
         int read = -1;
         if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "isolation") == 0)
@@ -294,14 +294,14 @@ static char const doc_Database_open_rocksdb[] =                                 
     "  UnsupportedError: This build carries no RocksDB engine.";
 
 /** Reads the arguments both RocksDB constructors take: the directory, the data directories and the executor. */
-static int rocksdb_opening(opening_t* opening, char const* verb, PyObject* const* args,
-                           Py_ssize_t positional_args_count, PyObject* args_names_tuple) {
-    Py_ssize_t const args_names_count = opening_positional(opening, verb, args, positional_args_count,
-                                                           args_names_tuple);
-    if (args_names_count < 0) return -1;
-    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[positional_args_count + names_progress];
+static int rocksdb_opening(opening_t* opening, char const* verb, PyObject* const* arguments,
+                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    Py_ssize_t const keyword_names_count = opening_positional(opening, verb, arguments, positional_arguments_count,
+                                                              keyword_names_tuple);
+    if (keyword_names_count < 0) return -1;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
         int read = -1;
         if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "data_directories") == 0)
@@ -313,10 +313,10 @@ static int rocksdb_opening(opening_t* opening, char const* verb, PyObject* const
     return 0;
 }
 
-static PyObject* Database_open_rocksdb(PyObject* Py_UNUSED(type), PyObject* const* args,
-                                       Py_ssize_t positional_args_count, PyObject* args_names_tuple) {
+static PyObject* Database_open_rocksdb(PyObject* Py_UNUSED(type), PyObject* const* arguments,
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     opening_t opening = {0};
-    if (rocksdb_opening(&opening, "open_rocksdb", args, positional_args_count, args_names_tuple) != 0) {
+    if (rocksdb_opening(&opening, "open_rocksdb", arguments, positional_arguments_count, keyword_names_tuple) != 0) {
         opening_release(&opening);
         return NULL;
     }
@@ -356,10 +356,10 @@ static char const doc_Database_view_rocksdb[] =                                 
     "Raises:\n"                                                                              //
     "  UnsupportedError: This build carries no RocksDB engine.";
 
-static PyObject* Database_view_rocksdb(PyObject* Py_UNUSED(type), PyObject* const* args,
-                                       Py_ssize_t positional_args_count, PyObject* args_names_tuple) {
+static PyObject* Database_view_rocksdb(PyObject* Py_UNUSED(type), PyObject* const* arguments,
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     opening_t opening = {0};
-    if (rocksdb_opening(&opening, "view_rocksdb", args, positional_args_count, args_names_tuple) != 0) {
+    if (rocksdb_opening(&opening, "view_rocksdb", arguments, positional_arguments_count, keyword_names_tuple) != 0) {
         opening_release(&opening);
         return NULL;
     }
@@ -392,15 +392,15 @@ static char const doc_Database_open_leveldb[] =                                 
     "Raises:\n"                                                                              //
     "  UnsupportedError: This build carries no LevelDB engine.";
 
-static PyObject* Database_open_leveldb(PyObject* Py_UNUSED(type), PyObject* const* args,
-                                       Py_ssize_t positional_args_count, PyObject* args_names_tuple) {
+static PyObject* Database_open_leveldb(PyObject* Py_UNUSED(type), PyObject* const* arguments,
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     opening_t opening = {0};
-    Py_ssize_t const args_names_count = opening_positional(&opening, "open_leveldb", args, positional_args_count,
-                                                           args_names_tuple);
-    if (args_names_count < 0) goto failed;
-    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[positional_args_count + names_progress];
+    Py_ssize_t const keyword_names_count = opening_positional(&opening, "open_leveldb", arguments,
+                                                              positional_arguments_count, keyword_names_tuple);
+    if (keyword_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
         int read = -1;
         if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(&opening, value);
@@ -453,16 +453,16 @@ static char const doc_Database_open_nvme[] =                                    
     "    `cpu_class`.\n"                                                                        //
     "  DeviceError: The `compactions` executor was not made by Executor.for_vram().";
 
-static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple) {
+static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* arguments,
+                                    Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     opening_t opening = {0};
     ustore_database_open_nvme_t open_nvme = {0};
-    Py_ssize_t const args_names_count = opening_positional(&opening, "open_nvme", args, positional_args_count,
-                                                           args_names_tuple);
-    if (args_names_count < 0) goto failed;
-    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[positional_args_count + names_progress];
+    Py_ssize_t const keyword_names_count = opening_positional(&opening, "open_nvme", arguments,
+                                                              positional_arguments_count, keyword_names_tuple);
+    if (keyword_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
         nvme_size_keyword_t const* keyword = nvme_size_keywords;
         while (keyword->name && PyUnicode_CompareWithASCIIString(name, keyword->name) != 0) ++keyword;
         size_t size = 0;
@@ -535,8 +535,9 @@ static PyObject* Database_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
 
 static PyObject* Database_enter(PyObject* self, PyObject* Py_UNUSED(ignored)) { return Py_NewRef(self); }
 
-static PyObject* Database_exit(PyObject* self, PyObject* const* Py_UNUSED(args),
-                               Py_ssize_t Py_UNUSED(positional_args_count), PyObject* Py_UNUSED(args_names_tuple)) {
+static PyObject* Database_exit(PyObject* self, PyObject* const* Py_UNUSED(arguments),
+                               Py_ssize_t Py_UNUSED(positional_arguments_count),
+                               PyObject* Py_UNUSED(keyword_names_tuple)) {
     return Database_close(self, NULL);
 }
 
@@ -575,16 +576,16 @@ static int database_context(PyObject* self, char const* verb, ustore_py_context_
  *  @param[out] progress The callable, borrowed, or NULL when the call carried none.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int progress_keyword(char const* verb, PyObject* const* args, Py_ssize_t positional_args_count,
-                            PyObject* args_names_tuple, Py_ssize_t required, PyObject** progress) {
+static int progress_keyword(char const* verb, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                            PyObject* keyword_names_tuple, Py_ssize_t required, PyObject** progress) {
     *progress = NULL;
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked(verb, positional_args_count,
-                                                                           args_names_tuple, required);
-    if (args_names_count < 0) return -1;
-    if (args_names_count == 0) return 0;
-    if (args_names_count == 1 &&
-        PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(args_names_tuple, 0), "progress") == 0)
-        return ustore_py_progress_from_object(args[required], progress);
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(verb, positional_arguments_count,
+                                                                                 keyword_names_tuple, required);
+    if (keyword_names_count < 0) return -1;
+    if (keyword_names_count == 0) return 0;
+    if (keyword_names_count == 1 &&
+        PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(keyword_names_tuple, 0), "progress") == 0)
+        return ustore_py_progress_from_object(arguments[required], progress);
     PyErr_Format(PyExc_TypeError, "%s() takes 'progress' as its only keyword", verb);
     return -1;
 }
@@ -652,12 +653,12 @@ static void compact_submit(void* arguments) { ustore_database_compact((ustore_da
 static ustore_py_verb_t const compact_verb = {sizeof(ustore_py_call_t), compact_submit, ustore_py_call_answer_none,
                                               header_release};
 
-static PyObject* Database_compact(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple) {
+static PyObject* Database_compact(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     PyObject* progress = NULL;
     if (database_context(self, "compact", &context) != 0 ||
-        progress_keyword("compact", args, positional_args_count, args_names_tuple, 0, &progress) != 0)
+        progress_keyword("compact", arguments, positional_arguments_count, keyword_names_tuple, 0, &progress) != 0)
         return NULL;
     ustore_py_call_t stack;
     ustore_py_call_t* const call = ustore_py_call_open(&context, &compact_verb, &stack);
@@ -751,20 +752,22 @@ static char const doc_Database_collection_create[] =                            
     "  AlreadyExistsError: A collection already carries the name.\n"                          //
     "  InvalidArgumentError: The name is empty or starts with `_`, reserved for the system.";
 
-static PyObject* Database_collection_create(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                            PyObject* args_names_tuple) {
+static PyObject* Database_collection_create(PyObject* self, PyObject* const* arguments,
+                                            Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
 
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked("collection_create", positional_args_count,
-                                                                           args_names_tuple, 1);
-    if (args_names_count < 0) return NULL;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
+        "collection_create", positional_arguments_count, keyword_names_tuple, 1);
+    if (keyword_names_count < 0) return NULL;
 
     PyObject* modality_object = NULL;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        if (PyUnicode_CompareWithASCIIString(name, "modality") == 0) { modality_object = args[args_progress]; }
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        if (PyUnicode_CompareWithASCIIString(name, "modality") == 0) {
+            modality_object = arguments[arguments_progress];
+        }
         else {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
             return NULL;
@@ -777,12 +780,12 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
     }
     int modality = ustore_modality_blobs_k;
     if (ustore_py_enum_from_object(modality_object, "modality", ustore_py_enum_modality_k, &modality) != 0) return NULL;
-    if (!PyUnicode_Check(args[0])) {
-        PyErr_Format(PyExc_TypeError, "A collection name is a string, got %S", Py_TYPE(args[0]));
+    if (!PyUnicode_Check(arguments[0])) {
+        PyErr_Format(PyExc_TypeError, "A collection name is a string, got %S", Py_TYPE(arguments[0]));
         return NULL;
     }
     Py_ssize_t name_length = 0;
-    char const* const name = PyUnicode_AsUTF8AndSize(args[0], &name_length);
+    char const* const name = PyUnicode_AsUTF8AndSize(arguments[0], &name_length);
     if (!name) return NULL;
 
     ustore_collection_id_t created = {{{0}}};
@@ -858,11 +861,12 @@ static void find_release(void* erased) {
 
 static ustore_py_verb_t const find_verb = {sizeof(find_call_t), find_submit, find_answer, find_release};
 
-static PyObject* Database_collection_find(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count) {
+static PyObject* Database_collection_find(PyObject* self, PyObject* const* arguments,
+                                          Py_ssize_t positional_arguments_count) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("collection_find", positional_args_count, NULL, 2) < 0) return NULL;
-    PyObject* const name_object = args[0];
+    if (ustore_py_keyword_names_count_checked("collection_find", positional_arguments_count, NULL, 2) < 0) return NULL;
+    PyObject* const name_object = arguments[0];
     find_call_t stack;
     find_call_t* const call = ustore_py_call_open(&context, &find_verb, &stack);
     if (!call) return NULL;
@@ -874,7 +878,7 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* args,
         return ustore_py_call_discard(&context, &find_verb, call);
     call->name = Py_NewRef(name_object);
     call->text.length = (ustore_size_t)length;
-    if (ustore_py_arena_claim(args[1], &call->call.arena) != 0)
+    if (ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &find_verb, call);
     ustore_collection_find_t find = {
         .database = context.database_handle,
@@ -1001,21 +1005,21 @@ static char const doc_Database_collection_names[] =                             
     "Returns:\n"                                                                               //
     "  tuple[str, ...]: The names recorded for collections, in order.";
 
-static PyObject* Database_collection_names(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                           PyObject* args_names_tuple) {
+static PyObject* Database_collection_names(PyObject* self, PyObject* const* arguments,
+                                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
 
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked("collection_names", positional_args_count,
-                                                                           args_names_tuple, 1);
-    if (args_names_count < 0) return NULL;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
+        "collection_names", positional_arguments_count, keyword_names_tuple, 1);
+    if (keyword_names_count < 0) return NULL;
 
     PyObject* after_object = Py_None;
     size_t limit = 1024;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[args_progress];
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[arguments_progress];
         if (PyUnicode_CompareWithASCIIString(name, "after") == 0) { after_object = value; }
         else if (PyUnicode_CompareWithASCIIString(name, "limit") == 0) {
             if (ustore_py_size_from_object(value, "limit", &limit) != 0) return NULL;
@@ -1036,7 +1040,7 @@ static PyObject* Database_collection_names(PyObject* self, PyObject* const* args
         after = PyUnicode_AsUTF8AndSize(after_object, &after_length);
         if (!after) return NULL;
     }
-    return ustore_py_collection_names(&context, after, (size_t)after_length, limit, args[0]);
+    return ustore_py_collection_names(&context, after, (size_t)after_length, limit, arguments[0]);
 }
 
 static char const doc_Database_collection_drop[] =                                           //
@@ -1053,14 +1057,14 @@ static char const doc_Database_collection_drop[] =                              
     "Raises:\n"                                                                              //
     "  NotFoundError: No collection carries the name.";
 
-static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                          PyObject* args_names_tuple) {
+static PyObject* Database_collection_drop(PyObject* self, PyObject* const* arguments,
+                                          Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
 
     PyObject* mode_object = NULL;
-    if (ustore_py_optional_argument("collection_drop", args, positional_args_count, args_names_tuple, 1, "mode",
-                                    &mode_object) != 0)
+    if (ustore_py_optional_argument("collection_drop", arguments, positional_arguments_count, keyword_names_tuple, 1,
+                                    "mode", &mode_object) != 0)
         return NULL;
     int mode = ustore_drop_collection_k;
     if (mode_object && ustore_py_enum_from_object(mode_object, "mode", ustore_py_enum_drop_mode_k, &mode) != 0)
@@ -1068,7 +1072,7 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
 
     // A name resolves first, and the collection it addresses takes the name with it when it goes
     ustore_collection_id_t collection = {{{0}}};
-    if (ustore_py_collection_from_object(&context, args[0], &collection) != 0) return NULL;
+    if (ustore_py_collection_from_object(&context, arguments[0], &collection) != 0) return NULL;
     ustore_outcome_t outcome = {0};
     ustore_collection_drop_t drop = {0};
     drop.database = context.database_handle;
@@ -1098,7 +1102,7 @@ static char const doc_Snapshot[] =                                              
     "\n"                                                                                      //
     "Used as a context manager, it closes on exit.";
 
-static PyObject* Snapshot_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
+static PyObject* Snapshot_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
     PyErr_SetString(PyExc_TypeError, "A snapshot is built through Database.snapshot()");
     return NULL;
@@ -1202,10 +1206,11 @@ static void save_release(void* erased) {
 
 static ustore_py_verb_t const save_verb = {sizeof(save_call_t), save_submit, ustore_py_call_answer_none, save_release};
 
-static PyObject* Snapshot_save(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                               PyObject* args_names_tuple) {
+static PyObject* Snapshot_save(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                               PyObject* keyword_names_tuple) {
     PyObject* progress = NULL;
-    if (progress_keyword("save", args, positional_args_count, args_names_tuple, 1, &progress) != 0) return NULL;
+    if (progress_keyword("save", arguments, positional_arguments_count, keyword_names_tuple, 1, &progress) != 0)
+        return NULL;
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (!context.snapshot) {
@@ -1215,7 +1220,7 @@ static PyObject* Snapshot_save(PyObject* self, PyObject* const* args, Py_ssize_t
     save_call_t stack;
     save_call_t* const call = ustore_py_call_open(&context, &save_verb, &stack);
     if (!call) return NULL;
-    if (!PyUnicode_FSConverter(args[0], &call->path)) return ustore_py_call_discard(&context, &save_verb, call);
+    if (!PyUnicode_FSConverter(arguments[0], &call->path)) return ustore_py_call_discard(&context, &save_verb, call);
     call->call.progress = Py_XNewRef(progress);
     ustore_snapshot_save_t save = {
         .snapshot = context.snapshot,
@@ -1242,8 +1247,9 @@ static PyObject* Snapshot_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
 
 static PyObject* Snapshot_enter(PyObject* self, PyObject* Py_UNUSED(ignored)) { return Py_NewRef(self); }
 
-static PyObject* Snapshot_exit(PyObject* self, PyObject* const* Py_UNUSED(args),
-                               Py_ssize_t Py_UNUSED(positional_args_count), PyObject* Py_UNUSED(args_names_tuple)) {
+static PyObject* Snapshot_exit(PyObject* self, PyObject* const* Py_UNUSED(arguments),
+                               Py_ssize_t Py_UNUSED(positional_arguments_count),
+                               PyObject* Py_UNUSED(keyword_names_tuple)) {
     snapshot_close((Snapshot*)self);
     Py_RETURN_NONE;
 }
@@ -1288,7 +1294,7 @@ static char const doc_Transaction[] =                                           
     "here: its reads resolve the name through this transaction, while its writes resolve\n"   //
     "it at the head, where a missing collection is created.";
 
-static PyObject* Transaction_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
+static PyObject* Transaction_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                     PyObject* Py_UNUSED(keywords)) {
     PyErr_SetString(PyExc_TypeError, "A transaction is built through Database.transaction()");
     return NULL;
@@ -1324,8 +1330,8 @@ static char const doc_Database_transaction[] =                                  
     "Raises:\n"                                                                             //
     "  UnsupportedError: The engine has no transactions.";
 
-static PyObject* Database_transaction(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                      PyObject* args_names_tuple) {
+static PyObject* Database_transaction(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                      PyObject* keyword_names_tuple) {
     Database* const database = (Database*)self;
     if (!database->handle) {
         ustore_py_raise(ustore_status_uninitialized_k, "The database is closed");
@@ -1333,8 +1339,8 @@ static PyObject* Database_transaction(PyObject* self, PyObject* const* args, Py_
     }
 
     PyObject* watch_object = NULL;
-    if (ustore_py_optional_argument("transaction", args, positional_args_count, args_names_tuple, 0, "watch",
-                                    &watch_object) != 0)
+    if (ustore_py_optional_argument("transaction", arguments, positional_arguments_count, keyword_names_tuple, 0,
+                                    "watch", &watch_object) != 0)
         return NULL;
     int watch = ustore_watch_keys_k;
     if (watch_object && ustore_py_enum_from_object(watch_object, "watch", ustore_py_enum_watch_k, &watch) != 0)
@@ -1409,14 +1415,14 @@ static char const doc_Transaction_commit[] =                                    
     "Raises:\n"                                                                               //
     "  ConflictError: A concurrent writer touched what this transaction watched.";
 
-static PyObject* Transaction_commit(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple) {
+static PyObject* Transaction_commit(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (transaction_context(self, "commit", &context) != 0) return NULL;
 
     PyObject* durability_object = NULL;
-    if (ustore_py_optional_argument("commit", args, positional_args_count, args_names_tuple, 0, "durability",
-                                    &durability_object) != 0)
+    if (ustore_py_optional_argument("commit", arguments, positional_arguments_count, keyword_names_tuple, 0,
+                                    "durability", &durability_object) != 0)
         return NULL;
     int durability = ustore_durability_buffered_k;
     if (durability_object &&
@@ -1525,11 +1531,11 @@ static PyObject* Transaction_close(PyObject* self, PyObject* Py_UNUSED(ignored))
 
 static PyObject* Transaction_enter(PyObject* self, PyObject* Py_UNUSED(ignored)) { return Py_NewRef(self); }
 
-static PyObject* Transaction_exit(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* Py_UNUSED(args_names_tuple)) {
+static PyObject* Transaction_exit(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* Py_UNUSED(keyword_names_tuple)) {
     // A body that raised leaves the staged work unpublished, since the exception is the caller's
     // answer about whether the work was wanted at all.
-    int const raised = positional_args_count >= 1 && args[0] != Py_None;
+    int const raised = positional_arguments_count >= 1 && arguments[0] != Py_None;
     PyObject* const committed = raised || !((Transaction*)self)->handle ? Py_NewRef(Py_None)
                                                                         : Transaction_commit(self, NULL, 0, NULL);
     transaction_close((Transaction*)self);
@@ -1573,7 +1579,8 @@ static char const doc_DeferredView[] =                                          
     "instead. Every pull of a cursor blocks, so it opens none. A view never changes after it\n" //
     "is made, so threads share it freely.";
 
-static PyObject* View_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args), PyObject* Py_UNUSED(keywords)) {
+static PyObject* View_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
+                             PyObject* Py_UNUSED(keywords)) {
     PyErr_SetString(PyExc_TypeError, "A view is built through on(), deferred(), watched() or unwatched()");
     return NULL;
 }

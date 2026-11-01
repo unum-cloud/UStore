@@ -31,7 +31,7 @@
 
 #include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`
 #include <forkunion/types.hpp>         // `fu::standard_yield_t`
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk`, `file_buffering_t`
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
@@ -39,11 +39,12 @@
 
 #include "ustore/utilities/nvme_channels.hpp" // `registered_memory_arena`, `memory_arena_config_t`
 #include "ustore/blobs/nvme_store.hpp"        // `lookup_result_t`, `commit_ledger`, `stamp_pin`
-#include "ustore/utilities/nvme_volume.hpp"   // `shared_resources`, `resources_shared_ptr`
+#include "ustore/utilities/nvme_mounts.hpp"   // `shared_resources`, `resources_shared_ptr`
+#include "ustore/utilities/nvme_volume.hpp"   // `basic_extent_volume`, `volume_format_t`, `volume_recovery_t`
 
-#include "harness.hpp" // `describe`, `expect_status`, `suite_totals_t`
+#include "harness.hpp" // `expect_status`, `suite_totals_t`
 
-namespace unum::ustore::test {
+namespace unum::ustore::test::nvme {
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -70,15 +71,16 @@ using commit_ledger_t = commit_ledger<atomic_reference, waiter_t>;
 using stamp_pin_t = stamp_pin<atomic_reference, waiter_t>;
 using countdown_t = countdown<atomic_reference, waiter_t>;
 
-/** Where among @p stores_ each tag's store sits, every store of a suite's database tagged by its value layout. */
-template <typename... stores_>
+/** Where among @p store_types_ each tag's store sits, every store of a suite's database tagged by
+ *  its value layout. */
+template <typename... store_types_>
 struct layout_store_tags {
 
     /** The index of the store whose values follow the layout @p store_tag spells, or the count of the stores. */
     static constexpr std::size_t index_of(std::uint16_t store_tag) noexcept {
-        std::uint16_t const tags[] {static_cast<std::uint16_t>(stores_::key_slot_t::value_layout_k)...};
+        std::uint16_t const tags[] {static_cast<std::uint16_t>(store_types_::key_slot_t::value_layout_k)...};
         std::size_t index = 0;
-        while (index != sizeof...(stores_) && tags[index] != store_tag) ++index;
+        while (index != sizeof...(store_types_) && tags[index] != store_tag) ++index;
         return index;
     }
 };
@@ -409,7 +411,7 @@ struct basic_fixture {
     channel_pool_t channels;
 
     /** One medium per volume, closed in the destructor. */
-    st::basic_vector<registered_medium_t> media;
+    st::vector<registered_medium_t> media;
 
     /** The numbers this fixture was mounted with. */
     fixture_config_t config;
@@ -772,4 +774,4 @@ inline void paint_into(expectation_t const& entry, std::span<byte_t> into) noexc
 
 #pragma endregion Byte Painters
 
-} // namespace unum::ustore::test
+} // namespace unum::ustore::test::nvme

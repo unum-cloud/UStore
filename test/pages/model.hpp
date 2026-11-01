@@ -2,12 +2,13 @@
  *  @file test/pages/model.hpp
  *  @author Ash Vardanian
  *  @date October 16, 2026
- *  @brief The naive reference model of a page that `test/pages/page_fold.cpp` checks the fold against, and that
- *      `test/units.cpp` checks every engine's pages calls against.
+ *  @brief The naive reference model of a page that <tt>test/pages/page_fold.cpp</tt> checks the fold
+ *      against, and that <tt>test/abi/pages.cpp</tt> checks every engine's pages calls against.
  *
- *  The model keeps a page as a map from keys to elements with vectors of children, and applies every edit by the
- *  forgiving rules `page_fold.hpp` names, with nothing shared with the templates beyond the key and kind types. It
- *  renders XML and text as `markup.hpp` documents them, again without its code.
+ *  The model keeps a page as a map from keys to elements with vectors of children, and applies
+ *  every edit by the forgiving rules <tt>page_fold.hpp</tt> names, with nothing shared with the templates
+ *  beyond the key and kind types. It renders XML and text as <tt>markup.hpp</tt> documents them, again
+ *  without its code.
  */
 #pragma once
 
@@ -23,7 +24,7 @@
 #include "ustore/pages/element_tree.hpp" // `element_key_t`, `element_kind_t`
 #include "ustore/pages/page_edits.hpp"   // `modification_t`
 
-namespace unum::ustore::test {
+namespace unum::ustore::test::pages {
 
 using namespace unum::ustore::pages;
 
@@ -219,13 +220,14 @@ struct model_page_t {
         return result;
     }
 
-    static std::string escaped(std::string const& bytes, bool inside_attribute) {
+    static std::string escaped(std::string const& bytes) {
         std::string result;
         for (char character : bytes)
             if (character == '&') result += "&amp;";
             else if (character == '<') result += "&lt;";
-            else if (character == '>' && !inside_attribute) result += "&gt;";
-            else if (character == '"' && inside_attribute) result += "&quot;";
+            else if (character == '>') result += "&gt;";
+            else if (character == '"') result += "&quot;";
+            else if (character == '\'') result += "&#39;";
             else result += character;
         return result;
     }
@@ -233,7 +235,7 @@ struct model_page_t {
     void render_xml_into(element_key_t const& key, std::string& result) const {
         model_element_t const& element = elements.at(key);
         if (element.kind == element_kind_t::text_k) {
-            result += escaped(element.text, false);
+            result += escaped(element.text);
             return;
         }
         if (element.kind == element_kind_t::comment_k) {
@@ -244,14 +246,13 @@ struct model_page_t {
         bool const content = !element.text.empty() || !element.children.empty();
         if (named) {
             result += "<" + element.name;
-            for (auto const& [name, value] : element.attributes)
-                result += " " + name + "=\"" + escaped(value, true) + "\"";
+            for (auto const& [name, value] : element.attributes) result += " " + name + "=\"" + escaped(value) + "\"";
             result += content ? ">" : "/>";
         }
-        result += escaped(element.text, false);
+        result += escaped(element.text);
         for (element_key_t const& child : element.children) render_xml_into(child, result);
         if (named && content) result += "</" + element.name + ">";
     }
 };
 
-} // namespace unum::ustore::test
+} // namespace unum::ustore::test::pages

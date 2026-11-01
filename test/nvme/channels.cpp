@@ -4,9 +4,10 @@
  *  @date September 19, 2026
  *  @brief The registered arena, the blocks channels queue pair out of it, and the pipelines that fill a ring.
  *
- *  The result this file exists for is @c holds_its_depth: a pipeline must keep the ring at the
- *  queue pair's depth through the middle of a long run, since a batch that is submitted whole and waited
- *  on reaches the depth of that batch and no further, which is the defect the pipelines replace.
+ *  The result this file exists for is @c holds_its_depth: a pipeline must keep the ring at
+ *  the queue pair's depth through the middle of a long run, since a batch that is submitted
+ *  whole and waited on reaches the depth of that batch and no further, which is the defect
+ *  the pipelines replace.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -19,13 +20,15 @@
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/nvme_channels.hpp" // `buffer_pool_t`, `pooled_buffer_t`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`
+#include "nvme/fixture.hpp" // `run_on_transport`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -107,7 +110,7 @@ std::size_t pool_exhausts_and_recycles(mount_type_ const& mount) {
     buffer_pool_t& pool = guard->channel().requests();
     failures += expect_eq(pool.available_buffers(), channels_config_k.request_buffers);
 
-    st::basic_vector<pooled_buffer_t> held;
+    st::vector<pooled_buffer_t> held;
     for (std::uint32_t index = 0; index != channels_config_k.request_buffers; ++index) {
         expected<pooled_buffer_t> block = pool.acquire();
         failures += expect(block.has_value());
@@ -185,7 +188,7 @@ std::size_t channels_separate_executor_threads(mount_type_ const& mount) {
 
     std::array<std::uint16_t, threads_k> queue_pairs {};
     std::array<std::size_t, threads_k> thread_failures {};
-    st::basic_vector<std::thread> workers;
+    st::vector<std::thread> workers;
     for (std::size_t index = 0; index != threads_k; ++index)
         failures += expect(workers.push_back(std::thread {[&, index]() noexcept {
             expected<guard_t> guard = (*fixture)->channels.acquire(index);
@@ -216,7 +219,7 @@ std::size_t channels_refuse_beyond_their_spares(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    st::basic_vector<guard_t> guards;
+    st::vector<guard_t> guards;
     for (std::size_t index = 0; index != spares_k; ++index) {
         expected<guard_t> guard = (*fixture)->channels.acquire();
         failures += expect(guard.has_value());
@@ -306,8 +309,8 @@ std::size_t pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
 /**
  *  @brief The result this file exists for: a long run sits at the queue pair's depth, not at a batch's.
  *
- *  The old shape built every request, submitted once and waited, so the depth was the batch size.
- *  A pipeline refills as completions retire, so the observed in-flight count reaches the queue pair's
+ *  The old shape built every request, submitted once and waited, so the depth was the batch size. A
+ *  pipeline refills as completions retire, so the observed in-flight count reaches the queue pair's
  *  depth and stays there through the middle of the run.
  */
 template <typename mount_type_>

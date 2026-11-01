@@ -19,13 +19,14 @@
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_ring.hpp" // `aligned_allocator`
+#include "ustore/utilities/nvme_ring.hpp"   // `ring_concept`, `queue_pair_t`, `request_t`, `completion_t`, `extent_t`
+#include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`
 
 #include "nvme/fixture.hpp" // `case_label_t`, `same_bytes`
 
-namespace unum::ustore::test {
+namespace unum::ustore::test::nvme {
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -57,7 +58,7 @@ enum class ring_edge_t : std::uint8_t {
 };
 
 /** A buffer unbuffered I/O accepts, which every case registers before submitting against it. */
-using test_buffer_t = st::basic_vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
+using test_buffer_t = st::vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
 
 /** Allocates @p bytes of aligned memory, answering an empty buffer when it does not fit. */
 [[nodiscard]] test_buffer_t make_buffer(std::size_t bytes) noexcept {
@@ -698,7 +699,7 @@ std::size_t ring_exhausts_its_slots(disk_type_& disk, [[maybe_unused]] medium_re
     std::size_t failures = 0;
     ring_capabilities_t const limits = disk.capabilities();
 
-    st::basic_vector<queue_pair_t> queue_pairs;
+    st::vector<queue_pair_t> queue_pairs;
     for (std::uint16_t index = 0; index != limits.queue_pairs_limit; ++index) {
         expected<queue_pair_t> leased = disk.acquire_queue_pair(1);
         failures += expect(leased.has_value());
@@ -714,7 +715,7 @@ std::size_t ring_exhausts_its_slots(disk_type_& disk, [[maybe_unused]] medium_re
     test_buffer_t buffer = make_buffer(block_bytes_k);
     failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
     if (buffer.size() != block_bytes_k) return failures;
-    st::basic_vector<registered_memory_t> ranges;
+    st::vector<registered_memory_t> ranges;
     bool refused = false;
     for (std::size_t attempt = 0; attempt != registered_memories_probe_k && !refused; ++attempt) {
         expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
@@ -1004,4 +1005,6 @@ void on_medium(suite_totals_t& totals, char const* name, disk_type_& disk, mediu
     return request;
 }
 
-} // namespace unum::ustore::test
+#pragma endregion Drivers
+
+} // namespace unum::ustore::test::nvme

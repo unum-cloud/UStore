@@ -1,5 +1,5 @@
 /**
- *  @file test/arrow.cpp
+ *  @file test/abi/arrow.cpp
  *  @author Ash Vardanian
  *  @date October 29, 2026
  *  @brief Tests of @c arrow.h: Arrow columns read into views, views exported as columns pinning their arena, and the
@@ -19,7 +19,6 @@
 #include <optional>    // `std::optional`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
-#include <utility>     // `std::move`
 #include <vector>      // `std::vector`
 
 #include <fmt/format.h>
@@ -521,6 +520,33 @@ std::size_t arrow_exports_pin_the_arena(config_t const& config) {
     failures += expect_eq(ustore_strings_view_from_arrow(&wide_schema, &wide_array.array, &widened, &widened_count),
                           ustore_status_success_k);
     failures += expect(widened_count == written && cell_of(widened, 39) == cell_of(values, 39));
+
+    // A wide tape narrows from its first byte, and one spanning past 32 bits is refused before its
+    // bytes are looked for
+    ustore_strings_view_t sliced = widened;
+    sliced.data.u64_tape.offsets = widened.data.u64_tape.offsets + 1;
+    ArrowSchema sliced_schema {};
+    ArrowDeviceArray sliced_array {};
+    failures += expect_eq(ustore_strings_view_to_arrow(sliced, written - 1, ustore_strings_u32_tape_k, arena,
+                                                       &sliced_schema, &sliced_array),
+                          ustore_status_success_k);
+    ustore_strings_view_t narrowed {};
+    ustore_size_t narrowed_count = 0;
+    failures += expect_eq(
+        ustore_strings_view_from_arrow(&sliced_schema, &sliced_array.array, &narrowed, &narrowed_count),
+        ustore_status_success_k);
+    failures += expect(narrowed_count == written - 1 && cell_of(narrowed, 38) == cell_of(values, 39));
+    sliced_array.array.release(&sliced_array.array);
+    sliced_schema.release(&sliced_schema);
+    std::uint64_t const far_offsets[] {5ull << 30, (5ull << 30) + (std::uint64_t {1} << 32)};
+    ustore_strings_view_t far {};
+    far.layout = ustore_strings_u64_tape_k;
+    far.data.u64_tape.data = widened.data.u64_tape.data, far.data.u64_tape.offsets = far_offsets;
+    ArrowSchema far_schema {};
+    ArrowDeviceArray far_array {};
+    failures += expect_eq(
+        ustore_strings_view_to_arrow(far, 1, ustore_strings_u32_tape_k, arena, &far_schema, &far_array),
+        ustore_status_capacity_exhausted_k);
     wide_array.array.release(&wide_array.array);
     wide_schema.release(&wide_schema);
 

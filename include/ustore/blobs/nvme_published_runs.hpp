@@ -14,9 +14,9 @@
  *  seals, watches and drain, and hands the drain to @c published_runs::flush, which lists the memory runs it writes
  *  out and the versions that survive, and publishes whatever level set the drain's tree flush made current.
  *
- *  Whoever replaces a view holds the ledger's leader word, a commit for its swap, and a merge, a flush or a compaction
- *  only around its own; letting the word go, it waits until every reader that entered before has left, then frees
- *  the view and the runs it no longer names before returning.
+ *  Whoever replaces a view holds the ledger's leader word, a commit for its swap, and a merge, a
+ *  flush or a compaction only around its own; letting the word go, it waits until every reader that
+ *  entered before has left, then frees the view and the runs it drops before returning.
  */
 
 #pragma once
@@ -26,7 +26,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 
 #include <algorithm> // `std::max`, `std::min`, `std::sort`
-#include <atomic>    // `std::memory_order_acquire`, `std::memory_order_release`
+#include <atomic>    // `std::atomic_thread_fence`, `std::memory_order_acquire`, `std::memory_order_release`
 #include <memory>    // `std::unique_ptr`
 #include <new>       // `std::nothrow`
 #include <span>      // `std::span`
@@ -34,7 +34,7 @@
 
 #include <forkunion/types.hpp> // `fu::default_alignment_k`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`, `st::assume_reserved`
+#include <smashtable/basic_vector.hpp> // `st::vector`, `st::assume_reserved`
 #include <smashtable/shared.hpp>       // `st::basic_commit_order`, `st::standard_waiting_policy`
 
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`
@@ -42,9 +42,8 @@
 #include "ustore/blobs/nvme_tree.hpp"            // `lsm_tree`, `collection_config_t`, `compaction_stamps_t`
 #include "ustore/utilities/folds.hpp"            // `fold_concept`
 #include "ustore/utilities/nvme_channels.hpp"    // `io_channel_t`
-#include "ustore/utilities/nvme_ring.hpp"        // `resource_constraint`, `constrained_allocator`
-#include "ustore/utilities/ram_buffers.hpp"      // `local_arena_t`, `arena_allocator`
-#include "ustore/utilities/types.hpp"            // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`, `arena_allocator`, `resource_constraint`, `constrained_allocator`
+#include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::blobs {
 
@@ -362,27 +361,28 @@ class commit_ledger {
     /** The stamp below which no reader and no mount can tell two stamps apart, which a run's column counts from. */
     [[nodiscard]] transaction_stamp_t floor() noexcept { return std::min(low_water_mark(), durable_stamp()); }
 
-    /** As @c floor, ignoring the memory runs of the view @p own registers, which a flush is about to write out. */
-    [[nodiscard]] transaction_stamp_t floor_besides(pin_t const& own) noexcept {
-        return std::min(low_water_mark(), horizon_besides(own));
+    /** As @c floor, ignoring the memory runs of the view @p own_pin registers, which a flush is
+     *  about to write out. */
+    [[nodiscard]] transaction_stamp_t floor_besides(pin_t const& own_pin) noexcept {
+        return std::min(low_water_mark(), horizon_besides(own_pin));
     }
 
     /**
-     *  @brief As @c durable_stamp, ignoring the memory runs of the view @p own registers.
+     *  @brief As @c durable_stamp, ignoring the memory runs of the view @p own_pin registers.
      *
      *  The published stamp is read first: every commit at or below it published its views and bounded them before it
      *  landed, so a bound read after it covers that commit, and a commit above it is past the answer anyway.
      */
-    [[nodiscard]] transaction_stamp_t horizon_besides(pin_t const& own) noexcept {
+    [[nodiscard]] transaction_stamp_t horizon_besides(pin_t const& own_pin) noexcept {
         transaction_stamp_t horizon = published();
         guard_t const held {claim_};
         for (pin_t const* pin = views_.next_; pin != &views_; pin = pin->next_)
-            if (pin != &own) horizon = std::min(horizon, load_(pin->stamp_));
+            if (pin != &own_pin) horizon = std::min(horizon, load_(pin->stamp_));
         return horizon;
     }
 
     /** Every stamp a reader pins, ascending and distinct. */
-    status_t pinned_readers(st::basic_vector<transaction_stamp_t>& into) noexcept {
+    status_t pinned_readers(st::vector<transaction_stamp_t>& into) noexcept {
         into.clear();
         {
             guard_t const held {claim_};
@@ -575,7 +575,200 @@ void stamp_pin<atomic_reference_, waiter_type_>::release() noexcept {
     claim_.retire();
 }
 
+/**
+ *  @brief One moment of a store: a stamp pinned in its ledger, which every read through the
+ *      snapshot answers at.
+ *  @tparam store_type_ The store read, which must outlive the snapshot.
+ *
+ *  A snapshot holds no view and no level set, so it never delays a publication: every merge
+ *  keeps the versions a pinned stamp reads, and every read re-enters the store through the
+ *  view published then.
+ */
+template <typename store_type_>
+class pinned_snapshot {
+  public:
+
+    /** The store read. */
+    using store_t = store_type_;
+
+    pinned_snapshot() noexcept = default;
+    pinned_snapshot(pinned_snapshot const&) = delete;
+    pinned_snapshot& operator=(pinned_snapshot const&) = delete;
+    pinned_snapshot(pinned_snapshot&&) noexcept = default;
+    pinned_snapshot& operator=(pinned_snapshot&&) noexcept = default;
+
+    /** The newest stamp @p store published, pinned in its ledger until the snapshot dies. */
+    [[nodiscard]] static pinned_snapshot of(store_t& store) noexcept {
+        pinned_snapshot taken;
+        taken.store_ = &store;
+        taken.stamp_ = store.ledger().pin_reader(taken.pin_);
+        return taken;
+    }
+
+    /** The stamp every read through this snapshot answers at. */
+    [[nodiscard]] transaction_stamp_t stamp() const noexcept { return stamp_; }
+
+    /** The store read, borrowed and outliving the snapshot. */
+    [[nodiscard]] store_t& store() const noexcept { return *store_; }
+
+  private:
+
+    /** The store read, borrowed and outliving the snapshot. */
+    store_t* store_ = nullptr;
+
+    /** The pin that keeps every version at the stamp. */
+    typename store_t::pin_t pin_;
+
+    /** The stamp pinned. */
+    transaction_stamp_t stamp_ = unwritten_stamp_k;
+};
+
 #pragma endregion Stamps
+
+#pragma region Maintenance Claim
+
+/**
+ *  @brief The claim a database's maintenance, schema and blob writes run under, which callers park
+ *      on rather than spin on, so a caller parked on one holder wakes once that holder lets it go,
+ *      whoever takes it next.
+ *
+ *  The claim is one word kept as the epoch clock of ForkUnion's @c flat_pool: @b odd while held
+ *  and @b even while free, stepped only by the take that finds it even and by its holder's
+ *  release, so every epoch advances it by two. A take sets the held bit, which leaves an odd word
+ *  as it was, and answers by the parity it read; a release adds one.
+ *
+ *  A committer finding it held returns at once rather than waiting, and every holder looks at the
+ *  views again after it lets go. The fence after each release pairs with the fence before each
+ *  attempt, so either the committer takes the claim, or the holder that refused it reads the views
+ *  the committer published.
+ *
+ *  @tparam atomic_reference_ The reference the claim's word is owned through.
+ *  @tparam waiter_type_ What a caller finding the claim held does between attempts,
+ *      before it parks.
+ */
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+class maintenance_claim {
+  public:
+
+    /** Spins through @p waiter_type_, then parks on the claim's word. */
+    using waiting_policy_t = st::standard_waiting_policy<waiter_type_>;
+
+    /**
+     *  @brief The claim of @p owner_type_, held for the life of the guard and handed back through
+     *      the owner, which maintains whatever a commit left due meanwhile.
+     *
+     *  It orders whatever rewrites the schema, a tree or a blob: creates, drops, the maintenance
+     *  commits pay for, the explicit flushes and compactions, and the caller's own blob. No read
+     *  takes it. A commit takes it once it landed, or returns at once when another caller has it,
+     *  since every holder looks at the views again after it lets go.
+     */
+    template <typename owner_type_>
+    class guard {
+      public:
+
+        guard() noexcept = default;
+        guard(guard const&) = delete;
+        guard& operator=(guard const&) = delete;
+
+        /** Takes @p owner's claim, parked while another caller holds it. */
+        explicit guard(owner_type_& owner) noexcept : owner_(&owner) { owner.claim_.take(); }
+
+        /** Takes @p owner's claim if no caller holds it, or answers a guard holding nothing. */
+        [[nodiscard]] static guard taken_if_free(owner_type_& owner) noexcept {
+            guard taken;
+            if (owner.claim_.take_if_free()) taken.owner_ = &owner;
+            return taken;
+        }
+
+        guard(guard&& other) noexcept : owner_(std::exchange(other.owner_, nullptr)) {}
+
+        guard& operator=(guard&& other) noexcept {
+            if (this == &other) return *this;
+            release_();
+            owner_ = std::exchange(other.owner_, nullptr);
+            return *this;
+        }
+
+        ~guard() noexcept { release_(); }
+
+        /** Whether this guard holds the claim. */
+        [[nodiscard]] bool holding() const noexcept { return owner_ != nullptr; }
+
+      private:
+
+        /** Hands the claim back through the owner, which only a guard holding it does. */
+        void release_() noexcept {
+            if (owner_) std::exchange(owner_, nullptr)->release_claim_();
+        }
+
+        /** The owner whose claim this guard holds, null once moved from or never taken. */
+        owner_type_* owner_ = nullptr;
+    };
+
+    /** Takes the claim, parked on each epoch it finds held until that holder lets it go, counted
+     *  among the parked from its first refusal until it holds the claim, so no holder retakes the
+     *  claim past it. */
+    void take() noexcept {
+        atomic_reference_<std::uint32_t> const epoch {epoch_};
+        atomic_reference_<std::uint32_t> const parked {parked_};
+        // Only the held bit of the old word is tested, so x86 sets it with `lock bts` and reloads
+        // the word to park on.
+        if (epoch.fetch_or(1, std::memory_order_acquire) % 2 == 0) return;
+        // Counted across retries: a holder that reads none parked after its release is seen by
+        // the next `fetch_or`.
+        parked.add(1, std::memory_order_seq_cst);
+        while (epoch.fetch_or(1, std::memory_order_acquire) % 2 != 0) {
+            std::uint32_t const seen = epoch.load(std::memory_order_relaxed);
+            if (seen % 2 != 0) waiting_policy_t {}.wait_until_changed(&epoch_, seen);
+        }
+        parked.sub(1, std::memory_order_relaxed);
+    }
+
+    /** Whether a blocking @c take is parked on the claim, which a holder about to retake
+     *  it yields to. */
+    [[nodiscard]] bool anyone_parked() const noexcept {
+        return atomic_reference_<std::uint32_t const> {parked_}.load(std::memory_order_seq_cst) != 0;
+    }
+
+    /** Takes the claim if no caller holds it, and answers whether it did. */
+    [[nodiscard]] bool take_if_free() noexcept {
+        // Pairs with the fence after a release: either this reads the release, or that holder reads
+        // what came before.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return atomic_reference_<std::uint32_t> {epoch_}.fetch_or(1, std::memory_order_acquire) % 2 == 0;
+    }
+
+    /** Parks until the caller holding the claim now lets it go, or returns at once while
+     *  nobody holds it. */
+    void wait_until_released() noexcept {
+        atomic_reference_<std::uint32_t> const epoch {epoch_};
+        std::uint32_t const seen = epoch.load(std::memory_order_acquire);
+        if (seen % 2 == 0) return;
+        // The wait reloads relaxed; this reload acquires, so a woken caller reads what the holder
+        // wrote at once.
+        do waiting_policy_t {}.wait_until_changed(&epoch_, seen);
+        while (epoch.load(std::memory_order_acquire) == seen);
+    }
+
+    /** Hands the claim back, which only its holder does, and wakes every caller parked on it; the
+     *  holder looks at the views again only after this. */
+    void release() noexcept {
+        atomic_reference_<std::uint32_t> {epoch_}.add(1, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        waiting_policy_t {}.notify_waiters(&epoch_);
+    }
+
+  private:
+
+    /** The claim's epoch: odd while held, even while free, stepped by whoever takes or
+     *  lets it go. */
+    alignas(fu::default_alignment_k) std::uint32_t epoch_ = 0;
+
+    /** How many blocking takes are parked on the epoch right now. */
+    std::uint32_t parked_ = 0;
+};
+
+#pragma endregion Maintenance Claim
 
 /** How full a collection's memory runs would be with one more commit, against the bounds it was mounted with. */
 enum class memory_pressure_t : std::uint8_t {
@@ -906,7 +1099,7 @@ class published_runs {
     template <utilities::fold_concept fold_type_>
     status_t merge_memory_runs(fold_type_ const& fold) noexcept {
         std::size_t const fan_in = config_.lsm_tree.level_enlarge_factor;
-        st::basic_vector<memory_run_t const*> group;
+        st::vector<memory_run_t const*> group;
         if (group.resize(fan_in) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A merge could not list its memory runs"};
         for (;;) {
@@ -918,7 +1111,7 @@ class published_runs {
                 for (std::size_t index = 0; index != fan_in; ++index) group[index] = due[index];
             }
 
-            st::basic_vector<transaction_stamp_t> readers;
+            st::vector<transaction_stamp_t> readers;
             if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
             compaction_stamps_t survival;
             survival.pinned = readers.data();
@@ -939,7 +1132,7 @@ class published_runs {
             if (merged_status.failed()) return merged_status;
             std::unique_ptr<memory_run_t> merged_run {new (std::nothrow) memory_run_t {std::move(merged)}};
             // The replaced runs, freed here once the publication waited out every reader that could hold one.
-            st::basic_vector<std::unique_ptr<memory_run_t>> away;
+            st::vector<std::unique_ptr<memory_run_t>> away;
             if (!merged_run || away.reserve(fan_in) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "No room to merge memory runs"};
             if (status_t const published = publish_merged_(std::span<memory_run_t const* const> {group},
@@ -974,7 +1167,7 @@ class published_runs {
 
         // A replaced version survives as a merge would keep it: for a pinned reader, or for a mount promising the
         // durable horizon this flush leaves; at or below both, every stamp reads alike, so the run packs only above.
-        st::basic_vector<transaction_stamp_t> readers;
+        st::vector<transaction_stamp_t> readers;
         if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
         compaction_stamps_t survival;
         survival.pinned = readers.data();
@@ -1002,7 +1195,7 @@ class published_runs {
                                            device_fold_type_ const& device_fold,
                                            lsm_tree_publication_hook_t const& published) noexcept {
         // A pinned reader keeps the version it reads, and the durable horizon keeps the version a mount falls back to.
-        st::basic_vector<transaction_stamp_t> readers;
+        st::vector<transaction_stamp_t> readers;
         if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
         compaction_stamps_t stamps;
         stamps.pinned = readers.data();
@@ -1081,8 +1274,7 @@ class published_runs {
 #pragma region Private Types
 
     /** The versions one merge carries over, before and after they are sorted into a run's order. */
-    using stamped_deltas_t =
-        st::basic_vector<stamped_delta_t, constrained_allocator<stamped_delta_t, atomic_reference_>>;
+    using stamped_deltas_t = st::vector<stamped_delta_t, constrained_allocator<stamped_delta_t, atomic_reference_>>;
 
     /** What a publication of a new level set hands its hooks: the memory runs it wrote out, the view naming the set,
      *  and the hook it calls once no reader is left in the views before it. */
@@ -1092,7 +1284,7 @@ class published_runs {
         published_runs* owner = nullptr;
 
         /** The memory runs a flush wrote out, newest first, as the view it read named them; none for a merge. */
-        st::basic_vector<memory_run_t const*> flushed;
+        st::vector<memory_run_t const*> flushed;
 
         /** The horizon the merge kept, which the published view raises its oldest readable stamp to. */
         transaction_stamp_t oldest_readable = unwritten_stamp_k;
@@ -1101,7 +1293,7 @@ class published_runs {
         std::unique_ptr<view_t> next;
 
         /** The flushed runs, taken over under the leader word and freed once no reader can hold one. */
-        st::basic_vector<std::unique_ptr<memory_run_t>> freed;
+        st::vector<std::unique_ptr<memory_run_t>> freed;
 
         /** The hook of whoever records the new set, called last, or null for none. */
         lsm_tree_publication_hook_t const* chained = nullptr;
@@ -1321,8 +1513,7 @@ class published_runs {
      *  @param[in] horizon The stamp published when the merge began, which a head reader below it reads past.
      */
     status_t publish_merged_(std::span<memory_run_t const* const> group, std::unique_ptr<memory_run_t> merged,
-                             st::basic_vector<std::unique_ptr<memory_run_t>>& away,
-                             transaction_stamp_t horizon) noexcept {
+                             st::vector<std::unique_ptr<memory_run_t>>& away, transaction_stamp_t horizon) noexcept {
         ledger_->lead();
         std::span<memory_run_t const* const> const runs = current_->memory_runs.runs();
         std::size_t first = 0;
@@ -1385,7 +1576,7 @@ class published_runs {
 
     /** Every memory run the current view names, oldest first, freed by the flush that writes them out or the merge
      *  that replaces them, once no reader can reach them. */
-    st::basic_vector<std::unique_ptr<memory_run_t>> memory_runs_;
+    st::vector<std::unique_ptr<memory_run_t>> memory_runs_;
 
     /** The view a leader laid out for the commit it prepared, published or forgotten before it lets the word go. */
     std::unique_ptr<view_t> prepared_view_;

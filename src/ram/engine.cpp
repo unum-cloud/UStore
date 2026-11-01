@@ -4,22 +4,24 @@
  *  @date January 9, 2023
  *  @brief Embedded in-memory engine on SmashTable, strictly serializable or snapshot-isolated as configured at open.
  *
- *  Every collection keeps a partitioned multi-version store of its own, of the kind its modality picks: key UUIDs
- *  mapped onto values for blobs, onto JSON text for documents and onto dense element trees for pages, strings mapped
- *  onto 16-byte keys for strings, and the half-edges of a graph. Documents and pages are edited in place, each edit
- *  reading, modifying and writing them back inside one transaction. No stored key carries its collection. The
- *  @c _collections system collection maps every collection's UUID onto its name and its store, whose kind says its
- *  modality, and the @c _names system collection, a store of the strings kind, maps every name onto its collection's
- *  UUID. Every store is built into one commit order, so a transaction spanning any number of them publishes under one
- *  stamp and a snapshot reads all of them at it. Dropping a collection retires its store at the drop's stamp, and the
- *  store is freed once no reader holds an older one. A database with a directory persists as one binary image,
- *  rewritten whole on a flush and on close.
+ *  Every collection keeps a partitioned multi-version store of its own, of the kind its modality
+ *  picks: key UUIDs mapped onto values for blobs, onto JSON text for documents and onto dense
+ *  element trees for pages, strings mapped onto 16-byte keys for strings, and the half-edges of a
+ *  graph. Documents and pages are edited in place, each edit reading, modifying and writing them
+ *  back inside one transaction. No stored key carries its collection. The @c _collections system
+ *  collection maps every collection's UUID onto its name and its store, whose kind says its
+ *  modality, and the @c _names system collection, a store of the strings kind, maps every name onto
+ *  its collection's UUID. Every store is built into one commit order, so a transaction spanning any
+ *  number of them publishes under one stamp and a snapshot reads all of them at it. Dropping a
+ *  collection retires its store at the drop's stamp, and the store is freed once no reader holds an
+ *  older one. A database with a directory persists as one binary image, rewritten whole on a flush
+ *  and on close.
  *
- *  Every CPU class this build compiled has a variant per isolation level, its calls instantiated in
- *  <tt>src/ram/variants_&lt;class&gt;.cpp</tt> with the class's atomic reference and waiter, which
- *  the partition locks own their words through. An open walks the classes newest first and takes
- *  the first one its ceiling fits, ending on the serial floor, and every handle the variant hands
- *  out carries its table.
+ *  Every CPU class this build compiled has a variant per isolation level, its calls instantiated
+ *  in <tt>src/ram/variants_&lt;class&gt;.cpp</tt> with the class's atomic reference and waiter, which the
+ *  partition locks own their words through. An open walks the classes newest first and takes the
+ *  first one its ceiling fits, ending on the serial floor, and every handle the variant hands out
+ *  carries its table.
  */
 
 #include <string_view> // `std::string_view`
@@ -32,14 +34,34 @@
 
 namespace unum::ustore::ram {
 
+#if USTORE_TARGET_INTEL_ICELAKE
+extern template struct ram_variant<cpu_class_t::intel_icelake_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::intel_icelake_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_INTEL_ICELAKE
+#if USTORE_TARGET_INTEL_SKYLAKE
+extern template struct ram_variant<cpu_class_t::intel_skylake_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::intel_skylake_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_INTEL_SKYLAKE
 #if USTORE_TARGET_INTEL_SIERRA
 extern template struct ram_variant<cpu_class_t::intel_sierra_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::intel_sierra_k, isolation_t::strict_serializable_k>;
 #endif // USTORE_TARGET_INTEL_SIERRA
+#if USTORE_TARGET_INTEL_HASWELL
+extern template struct ram_variant<cpu_class_t::intel_haswell_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::intel_haswell_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_INTEL_HASWELL
+#if USTORE_TARGET_AWS_G5
+extern template struct ram_variant<cpu_class_t::aws_g5_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::aws_g5_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_AWS_G5
 #if USTORE_TARGET_APPLE_M2
 extern template struct ram_variant<cpu_class_t::apple_m2_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::apple_m2_k, isolation_t::strict_serializable_k>;
 #endif // USTORE_TARGET_APPLE_M2
+#if USTORE_TARGET_AWS_G2
+extern template struct ram_variant<cpu_class_t::aws_g2_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::aws_g2_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_AWS_G2
 #if USTORE_TARGET_ALIBABA_C930
 extern template struct ram_variant<cpu_class_t::alibaba_c930_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::alibaba_c930_k, isolation_t::strict_serializable_k>;
@@ -74,13 +96,11 @@ status_t open_in(arguments_type_ const& arguments, cpu_ceiling_t ceiling, std::s
     });
 }
 
-status_t init(ustore_database_init_ram_t const& arguments, cpu_ceiling_t ceiling, stringzilla_kernels_t const&,
-              view_t const&) noexcept {
+status_t init(ustore_database_init_ram_t const& arguments, cpu_ceiling_t ceiling, view_t const&) noexcept {
     return open_in(arguments, ceiling, {});
 }
 
-status_t open(ustore_database_open_ram_t const& arguments, cpu_ceiling_t ceiling, stringzilla_kernels_t const&,
-              view_t const&) noexcept {
+status_t open(ustore_database_open_ram_t const& arguments, cpu_ceiling_t ceiling, view_t const&) noexcept {
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
     return open_in(arguments, ceiling, string_of(arguments.directory));
 }

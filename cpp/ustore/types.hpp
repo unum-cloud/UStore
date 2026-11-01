@@ -80,26 +80,26 @@ struct collection_key_field_t {
 };
 
 /** A location that names the collection it lives in. */
-template <typename location_>
-concept has_collection_concept = requires(location_ const& location) { location.collection; };
+template <typename location_type_>
+concept has_collection_concept = requires(location_type_ const& location) { location.collection; };
 
 /** A location that narrows its value down to one document field. */
-template <typename location_>
-concept has_field_concept = requires(location_ const& location) { location.field; };
+template <typename location_type_>
+concept has_field_concept = requires(location_type_ const& location) { location.field; };
 
 /** A single key with its collection, that widens into a @c collection_key_field_t. */
-template <typename location_>
-concept key_location_concept = std::same_as<std::remove_cvref_t<location_>, collection_key_t>;
+template <typename location_type_>
+concept key_location_concept = std::same_as<std::remove_cvref_t<location_type_>, collection_key_t>;
 
 #pragma endregion Locations
 
 #pragma region Variable Length Views
 
 /** Views the bytes of a contiguous container. */
-template <std::ranges::contiguous_range container_>
-    requires std::ranges::sized_range<container_>
-value_view_t value_view(container_&& container) noexcept {
-    using element_t = std::ranges::range_value_t<container_>;
+template <std::ranges::contiguous_range container_type_>
+    requires std::ranges::sized_range<container_type_>
+value_view_t value_view(container_type_&& container) noexcept {
+    using element_t = std::ranges::range_value_t<container_type_>;
     return {reinterpret_cast<byte_t const*>(std::ranges::data(container)),
             std::ranges::size(container) * sizeof(element_t)};
 }
@@ -157,14 +157,14 @@ using owned_value_t = owned<value_view_t>;
 /** What shorthand answers for a call answering @p answer_type_: a scalar copied out of its one-off arena, or a view
  *  owning that arena. */
 template <typename answer_type_>
-using one_off_t = std::conditional_t<std::is_scalar_v<answer_type_>, answer_type_, owned<answer_type_>>;
+using one_off_answer_of = std::conditional_t<std::is_scalar_v<answer_type_>, answer_type_, owned<answer_type_>>;
 
 /** Runs @p verb on an arena made for it alone where @p executor computes, as shorthand with no place for an arena
  *  does, answering a scalar copied out of that arena or a view that owns it. */
 template <typename verb_type_>
 auto in_one_off_arena(ustore_executor_t executor, verb_type_&& verb) noexcept {
     using answer_t = typename std::invoke_result_t<verb_type_&, arena_t&>::value_type;
-    using result_t = expected<one_off_t<answer_t>>;
+    using result_t = expected<one_off_answer_of<answer_t>>;
     auto [arena, arena_status] = arena_t::make(executor);
     if (arena_status.failed()) return result_t {arena_status};
     auto [answer, answer_status] = verb(arena);
@@ -304,23 +304,23 @@ class progress_arg_t {
 
 #pragma region Adapters
 
-/** The document field type that stores @p element_. */
-template <typename element_>
+/** The document field type that stores @p element_type_. */
+template <typename element_type_>
 constexpr ustore_docs_field_type_t docs_field_type() noexcept {
-    if constexpr (std::is_same_v<element_, bool>) return ustore_docs_field_type_bool_k;
-    if constexpr (std::is_same_v<element_, f64_t>) return ustore_docs_field_type_f64_k;
-    if constexpr (std::is_same_v<element_, f32_t>) return ustore_docs_field_type_f32_k;
-    if constexpr (std::is_same_v<element_, i64_t>) return ustore_docs_field_type_i64_k;
-    if constexpr (std::is_same_v<element_, i32_t>) return ustore_docs_field_type_i32_k;
-    if constexpr (std::is_same_v<element_, i16_t>) return ustore_docs_field_type_i16_k;
-    if constexpr (std::is_same_v<element_, i8_t>) return ustore_docs_field_type_i8_k;
-    if constexpr (std::is_same_v<element_, u64_t>) return ustore_docs_field_type_u64_k;
-    if constexpr (std::is_same_v<element_, u32_t>) return ustore_docs_field_type_u32_k;
-    if constexpr (std::is_same_v<element_, u16_t>) return ustore_docs_field_type_u16_k;
-    if constexpr (std::is_same_v<element_, u8_t>) return ustore_docs_field_type_u8_k;
-    if constexpr (std::is_same_v<element_, value_view_t>) return ustore_docs_field_type_bin_k;
-    if constexpr (std::is_same_v<element_, std::string_view> || std::is_same_v<element_, char const*>)
-        return ustore_docs_field_type_str_k;
+    if constexpr (std::is_same_v<element_type_, bool>) return ustore_docs_field_type_bool_k;
+    if constexpr (std::is_same_v<element_type_, f64_t>) return ustore_docs_field_type_f64_k;
+    if constexpr (std::is_same_v<element_type_, f32_t>) return ustore_docs_field_type_f32_k;
+    if constexpr (std::is_same_v<element_type_, i64_t>) return ustore_docs_field_type_i64_k;
+    if constexpr (std::is_same_v<element_type_, i32_t>) return ustore_docs_field_type_i32_k;
+    if constexpr (std::is_same_v<element_type_, i16_t>) return ustore_docs_field_type_i16_k;
+    if constexpr (std::is_same_v<element_type_, i8_t>) return ustore_docs_field_type_i8_k;
+    if constexpr (std::is_same_v<element_type_, u64_t>) return ustore_docs_field_type_u64_k;
+    if constexpr (std::is_same_v<element_type_, u32_t>) return ustore_docs_field_type_u32_k;
+    if constexpr (std::is_same_v<element_type_, u16_t>) return ustore_docs_field_type_u16_k;
+    if constexpr (std::is_same_v<element_type_, u8_t>) return ustore_docs_field_type_u8_k;
+    if constexpr (std::is_same_v<element_type_, value_view_t>) return ustore_docs_field_type_binary_k;
+    if constexpr (std::is_same_v<element_type_, std::string_view> || std::is_same_v<element_type_, char const*>)
+        return ustore_docs_field_type_string_k;
     return ustore_docs_field_type_json_k;
 }
 

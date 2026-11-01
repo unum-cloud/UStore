@@ -11,11 +11,12 @@
  *  requests to @c cuFileBatchIOSubmit, and @c poll_completions asks @c cuFileBatchIOGetStatus for whatever landed with
  *  a minimum of zero, so neither waits.
  *
- *  With the @c nvidia_fs kernel module loaded, bytes move by DMA between the drive and device memory. Without it,
- *  compat mode moves them through host memory inside the library, which the driver must allow through
- *  @c CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE. Like Linux AIO, a batch has no links, so a chain lives in user space,
- *  and cuFile has no flush, so a flush runs @c fdatasync on the submitting thread. Device memory is registered and
- *  moved under the CUDA context current on the thread that registers it.
+ *  With the @c nvidia_fs kernel module loaded, bytes move by DMA between the drive and device
+ *  memory. Without it, compat mode moves them through host memory inside the library, which
+ *  the driver must allow through @c CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE. Like Linux AIO,
+ *  a batch has no links, so a chain lives in user space, and cuFile has no flush, so a flush
+ *  runs @c fdatasync on the submitting thread. Device memory is registered and moved under the
+ *  CUDA context current on the thread that registers it.
  *
  *  The cuFile driver is process-wide and opened at the first mount; it is never closed here, since the library closes
  *  it at exit and another mount of the same process may still hold it.
@@ -23,7 +24,6 @@
 
 #pragma once
 
-#include <cerrno>  // `errno`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int64_t`, `std::uint64_t`
 
@@ -31,13 +31,13 @@
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/blocking_files.hpp"        // `shared_library_t`
 #include "ustore/utilities/nvme_disks.hpp"            // `native_file_t`, `open_native_file`, `flush_native_file`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `direct_alignment_of`, `direct_alignment_t`
-#include "ustore/utilities/nvme_ring.hpp"             // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
-#include "ustore/utilities/types.hpp"                 // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
+#include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -302,7 +302,7 @@ class linux_cufile_files_disk {
             return status_t {status_code_t::invalid_argument_k, "A disk keeps one identifier for an empty handle"};
         if (config.media_limit == 0 || config.registered_memory_limit == 0)
             return status_t {status_code_t::invalid_argument_k, "A disk needs a medium and a range to move between"};
-        if (config.gds > ustore_gds_compat_k)
+        if (config.gds > ustore_gds_compatibility_k)
             return status_t {status_code_t::invalid_argument_k, "Unknown GPUDirect Storage mode"};
 
         linux_cufile_files_disk disk;
@@ -312,7 +312,7 @@ class linux_cufile_files_disk {
             [[maybe_unused]] cufile_error_t const allowed = api.set_parameter(cufile_parameter_allow_compat_mode_k,
                                                                               true);
         }
-        if (config.gds == ustore_gds_compat_k) {
+        if (config.gds == ustore_gds_compatibility_k) {
             [[maybe_unused]] cufile_error_t const forced = api.set_parameter(cufile_parameter_force_compat_mode_k,
                                                                              true);
         }
@@ -579,19 +579,19 @@ class linux_cufile_files_disk {
         std::size_t const credit = slot->depth - outstanding_(*slot);
         std::size_t const taking = requests.size() < credit ? requests.size() : credit;
         std::uint32_t linked = no_seat_k;
-        bool cut = false;
+        bool chain_broken = false;
         for (std::size_t index = 0; index != taking; ++index) {
             request_t const& request = requests[index];
-            if (cut) {
+            if (chain_broken) {
                 push_local_(*slot, base, cancelled_completion_(request.token));
-                cut = chains_next_(request);
+                chain_broken = chains_next_(request);
                 continue;
             }
             status_t const defect = inspect_(request);
             if (defect.failed()) {
                 push_local_(*slot, base, failed_completion_(request.token, defect));
                 linked = no_seat_k;
-                cut = chains_next_(request);
+                chain_broken = chains_next_(request);
                 continue;
             }
             std::uint32_t const seat = take_seat_(*slot, base);
@@ -792,7 +792,7 @@ class linux_cufile_files_disk {
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
-    static status_t size_(st::basic_vector<element_type_>& elements, std::size_t count) noexcept {
+    static status_t size_(st::vector<element_type_>& elements, std::size_t count) noexcept {
         if (elements.resize(count) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A disk could not allocate its slots"};
         return {};
@@ -1110,29 +1110,29 @@ class linux_cufile_files_disk {
     cufile_api_t const* api_ = nullptr;
 
     /** One slot per queue pair the disk hands out, each with its own batch. */
-    st::basic_vector<queue_pair_slot_t> queue_pairs_;
+    st::vector<queue_pair_slot_t> queue_pairs_;
 
     /** One slot per memory range the disk registers. */
-    st::basic_vector<registered_memory_slot_t> registered_memories_;
+    st::vector<registered_memory_slot_t> registered_memories_;
 
     /** One slot per medium the disk opens. */
-    st::basic_vector<registered_medium_slot_t> media_;
+    st::vector<registered_medium_slot_t> media_;
 
     /** Every queue pair's seats, in windows of @c depth_limit_. */
-    st::basic_vector<flight_t> flights_;
+    st::vector<flight_t> flights_;
 
     /** Every queue pair's free seats, stacked in windows of @c depth_limit_. */
-    st::basic_vector<std::uint32_t> seats_;
+    st::vector<std::uint32_t> seats_;
 
     /** Every queue pair's requests awaiting @c cuFileBatchIOSubmit, contiguous as it reads them, in windows of
      *  @c depth_limit_. */
-    st::basic_vector<cufile_io_parameters_t> staged_;
+    st::vector<cufile_io_parameters_t> staged_;
 
     /** Every queue pair's room for the events one status query copies out, in windows of @c depth_limit_. */
-    st::basic_vector<cufile_io_event_t> events_;
+    st::vector<cufile_io_event_t> events_;
 
     /** Every queue pair's own completions, in windows of @c depth_limit_ read as a circle. */
-    st::basic_vector<completion_t> locals_;
+    st::vector<completion_t> locals_;
 
     /** Requests one queue pair may keep in flight, the depth of every batch, and the stride of every window. */
     queue_depth_t depth_limit_ = 0;

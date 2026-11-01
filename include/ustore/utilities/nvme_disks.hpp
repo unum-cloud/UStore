@@ -10,15 +10,17 @@
  *  registered memory, batching and completion routing. A transport supplies only the moves a device
  *  makes against a medium, and @c basic_disk turns them into the ring of @c nvme_ring.hpp.
  *
- *  Depth on the blocking floor comes from queue pairs rather than threads: a submitted batch waits in the
- *  queue pair's window and the queue pair's own @c poll performs it, so the queue pair pays for its own I/O on the
- *  thread that asked for it. Nothing is parked, nothing is woken, and nothing forks.
+ *  Depth on the blocking floor comes from queue pairs rather than threads: a submitted batch
+ *  waits in the queue pair's window and the queue pair's own @c poll performs it, so the queue
+ *  pair pays for its own I/O on the thread that asked for it. Nothing is parked, nothing is
+ *  woken, and nothing forks.
  *
- *  The memory disk keeps a volume in memory behind the same ring, so a suite exercises the contract without a
- *  device. The blocking floor is the transport every platform has. POSIX issues @c pread and @c pwrite, Windows
- *  issues @c ReadFile and @c WriteFile with an @c OVERLAPPED offset, and neither keeps a file cursor, so the
- *  same registered medium serves every executor thread at once. Depth comes from those threads rather than
- *  from a device queue, which is why the floor is a floor and not a medium.
+ *  The memory disk keeps a volume in memory behind the same ring, so a suite exercises the contract
+ *  without a device. The blocking floor is the transport every platform has. POSIX issues @c pread
+ *  and @c pwrite, Windows issues @c ReadFile and @c WriteFile with an @c OVERLAPPED offset, and
+ *  neither keeps a file cursor, so the same registered medium serves every executor thread at once.
+ *  Depth comes from those threads rather than from a device queue, which is why the floor is a
+ *  floor and not a medium.
  */
 
 #pragma once
@@ -40,17 +42,17 @@
 #include <sys/ioctl.h> // `ioctl`
 #endif
 
-#include <atomic>   // `std::memory_order`
 #include <bit>      // `std::has_single_bit`
 #include <concepts> // `std::same_as`
 #include <limits>   // `std::numeric_limits`
 #include <span>     // `std::span`
-#include <utility>  // `std::exchange`, `std::move`
+#include <utility>  // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`, `aligned_allocator`
-#include "ustore/utilities/types.hpp"     // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`, `is_address_aligned`
+#include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`
+#include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -109,16 +111,16 @@ struct disk_config_t {
 /**
  *  @brief Turns a positioned-I/O device into the submission and completion ring callers drive.
  *
- *  Depth is partitioned rather than pooled: every queue pair reserves @c depth_limit requests of its own,
- *  so one queue pair that stops polling cannot starve another, and a full ring is always the queue pair's own
- *  doing. Completions are routed by the queue pair bits of their token and never appear in another
- *  queue pair's poll.
+ *  Depth is partitioned rather than pooled: every queue pair reserves @c depth_limit requests of
+ *  its own, so one queue pair that stops polling cannot starve another, and a full ring is always
+ *  the queue pair's own doing. Completions are routed by the queue pair bits of their token and
+ *  never appear in another queue pair's poll.
  *
  *  Ordering between two submitted requests is never promised. Two writes may reach the medium in
- *  either order, and a flush covers only what the queue pair has already completed, so durability is written
- *  as submit, poll, flush, poll. A bounded sequence that must be ordered says so with
- *  @c request_chaining_t::chained_k, which runs the chain in submission order and cuts it with
- *  @c cancelled_k at the first short or failed result.
+ *  either order, and a flush covers only what the queue pair has already completed, so
+ *  durability is written as submit, poll, flush, poll. A bounded sequence that must be ordered
+ *  says so with @c request_chaining_t::chained_k, which runs the chain in submission order and
+ *  cuts it with @c cancelled_k at the first short or failed result.
  *
  *  @tparam atomic_reference_ The reference the claim, cancellation and in-flight words are owned through.
  */
@@ -328,9 +330,9 @@ class basic_disk {
      *  @return How many were taken, which is zero on a full ring and never a reason to block.
      *
      *  @note Only a token that is not this queue pair's is refused here, since it would misroute a
-     *      completion. Every other defect - a stale registered memory, a misaligned extent, an oversized
-     *      transfer - is reported on that one request's completion, which is where a real ring
-     *      reports it and where a batch of many keeps its other entries.
+     *      completion. Every other defect - a stale registered memory, a misaligned extent, an
+     *      oversized transfer - is reported on that one request's completion, which is where a real
+     *      ring reports it and where a batch of many keeps its other entries.
      */
     expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
@@ -467,7 +469,7 @@ class basic_disk {
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
-    static status_t size_(st::basic_vector<element_type_>& elements, std::size_t count) noexcept {
+    static status_t size_(st::vector<element_type_>& elements, std::size_t count) noexcept {
         if (elements.resize(count) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A ring could not allocate its slots"};
         return {};
@@ -625,25 +627,27 @@ class basic_disk {
     /**
      *  @brief Performs everything one queue pair has submitted, and stages the completions for its poll.
      *
-     *  Every request runs on the thread that polls it, in submission order, so a chain gets the
-     *  ordering it was promised and nothing here forks. Depth comes from queue pairs rather than threads:
+     *  Every request runs on the thread that polls it, in submission order, so a chain gets
+     *  the ordering it was promised and nothing here forks. Depth comes from queue pairs
+     *  rather than threads:
      *  a pool dispatch blocks until all its threads return and admits one caller at a time, so
-     *  fanning a batch out here would serialize two queue pairs against each other, and a batch issued
-     *  from inside a background job would fork a pool that is already forked.
+     *  fanning a batch out here would serialize two queue pairs against each other, and a batch
+     *  issued from inside a background job would fork a pool that is already forked.
      */
     void perform_(queue_pair_slot_t& slot, std::uint32_t base) noexcept {
         std::uint32_t const count = slot.pending_count;
         if (count == 0) return;
 
         bool const cancelled = cancelled_(slot).load(std::memory_order_acquire) != 0;
-        bool cut = false;
+        bool chain_broken = false;
         for (std::uint32_t index = 0; index != count; ++index) {
             request_t const& request = pending_[base + index];
-            completion_t const completion = cancelled || cut ? cancelled_completion_(request) : perform_one_(request);
+            completion_t const completion = cancelled || chain_broken ? cancelled_completion_(request)
+                                                                      : perform_one_(request);
             ready_[ready_place_(slot, base, index)] = completion;
             restore_(request);
-            cut = request.chaining == request_chaining_t::chained_k &&
-                  (cut || completion.state != completion_state_t::completed_k);
+            chain_broken = request.chaining == request_chaining_t::chained_k &&
+                           (chain_broken || completion.state != completion_state_t::completed_k);
         }
 
         slot.ready_count += count;
@@ -660,19 +664,19 @@ class basic_disk {
     queue_depth_t depth_limit_ = 0;
 
     /** One slot per queue pair the ring hands out. */
-    st::basic_vector<queue_pair_slot_t> queue_pairs_;
+    st::vector<queue_pair_slot_t> queue_pairs_;
 
     /** One slot per memory range the ring pins. */
-    st::basic_vector<registered_memory_slot_t> registered_memories_;
+    st::vector<registered_memory_slot_t> registered_memories_;
 
     /** One slot per medium the ring registers. */
-    st::basic_vector<registered_medium_slot_t> media_;
+    st::vector<registered_medium_slot_t> media_;
 
     /** Every queue pair's submitted requests, in windows of @c depth_limit_. */
-    st::basic_vector<request_t> pending_;
+    st::vector<request_t> pending_;
 
     /** Every queue pair's performed completions, in windows of @c depth_limit_ read as a circle. */
-    st::basic_vector<completion_t> ready_;
+    st::vector<completion_t> ready_;
 };
 
 #pragma endregion Disk
@@ -796,10 +800,10 @@ class memory_device_t {
   private:
 
     /** One volume, aligned so a mount demanding the portable alignment can still address offset zero. */
-    using storage_t = st::basic_vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
+    using storage_t = st::vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
 
     /** One entry per registered medium, empty where a slot is free. */
-    st::basic_vector<storage_t> volumes_;
+    st::vector<storage_t> volumes_;
 
     /** Memory, offset and length alignment the ring holds requests to. */
     std::uint64_t alignment_ = 1;
@@ -1060,9 +1064,9 @@ inline status_t truncate_native_file(native_file_t file, std::uint64_t bytes) no
  *  @brief One open file, read and written at absolute offsets by any number of threads at once.
  *
  *  Neither @c pread nor an @c OVERLAPPED @c ReadFile moves a shared cursor, so the device needs no
- *  lock of its own and a queue pair per thread is the only concurrency control. A short result is not an
- *  error here: a read that meets the end of the file, and a write that meets a full volume, answer
- *  the prefix they moved and let the ring report it as a partial transfer.
+ *  lock of its own and a queue pair per thread is the only concurrency control. A short result is
+ *  not an error here: a read that meets the end of the file, and a write that meets a full volume,
+ *  answer the prefix they moved and let the ring report it as a partial transfer.
  */
 class blocking_files_device_t {
   public:
@@ -1195,7 +1199,7 @@ class blocking_files_device_t {
     }
 
     /** One entry per registered medium, @c invalid_native_file_k where a slot is free. */
-    st::basic_vector<native_file_t> files_;
+    st::vector<native_file_t> files_;
 
     /** Whether the page cache stands in the path, which fixes the reported alignments. */
     file_buffering_t buffering_ = file_buffering_t::buffered_k;

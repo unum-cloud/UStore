@@ -26,7 +26,7 @@
 #include <fmt/color.h>  // `fmt::color`, `fmt::fg`, `fmt::text_style`
 #include <fmt/format.h> // `fmt::println`, `fmt::format_to_n`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::argsort`
 
 #include "ustore/db.h"       // `ustore_database_t`, `ustore_outcome_t`
@@ -545,14 +545,14 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
  *  otherwise. */
 [[nodiscard]] bool import_snapshot(ustore_database_t database, std::string_view path) noexcept {
     std::error_code error;
-    st::basic_vector<sz::string_t> files;
+    st::vector<sz::string_t> files;
     bool held = true;
     for (std::filesystem::directory_iterator entry {std::filesystem::path {path}, error};
          held && !error && entry != std::filesystem::directory_iterator {}; entry.increment(error))
         if (entry->path().extension() == ".arrow")
             held = st::succeeded(files.push_back(sz::string_t {})) &&
                    files.back().assign(sz::string_view_t {entry->path().string()}) == sz::status_t::success_k;
-    st::basic_vector<sz_size_t> order;
+    st::vector<sz_size_t> order;
     held = held && st::succeeded(order.resize(files.size())) &&
            sz::succeeded(sz::argsort(
                files, [](sz::string_t const& file) noexcept { return file.view(); }, std::span<sz_size_t> {order}));

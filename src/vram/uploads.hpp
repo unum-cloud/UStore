@@ -18,7 +18,7 @@
 #include <utility> // `std::index_sequence`, `std::make_index_sequence`
 
 #include "ustore/utilities/ram_buffers.hpp" // `device_blocks_t`
-#include "ustore/utilities/vram_device.hpp" // `device_blocks_of`, `gpu_executor_concept`
+#include "ustore/utilities/vram_device.hpp" // `device_blocks_of`
 
 #include "engine.hpp"       // `home_tables`, `home_executor`, `engine_of`, `database_of`
 #include "lib.hpp"          // `verb_slot`

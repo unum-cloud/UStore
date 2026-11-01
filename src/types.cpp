@@ -12,7 +12,6 @@
 
 #include <algorithm>   // `std::find`, `std::max`, `std::reverse`
 #include <array>       // `std::array`
-#include <atomic>      // `std::atomic_ref`, `std::memory_order_release`
 #include <bit>         // `std::bit_ceil`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -20,7 +19,7 @@
 #include <utility>     // `std::move`
 #include <variant>     // `std::variant`, `std::get_if`, `std::visit`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/types.h" // `ustore_executor_for_ram_t`, `ustore_arena_init_t`, `ustore_version`
 
@@ -61,7 +60,7 @@ constexpr enumerator_spelling<ustore_mood_t> mood_names_k[] {
 constexpr enumerator_spelling<ustore_gds_t> gds_names_k[] {
     {ustore_gds_automatic_k, "automatic"},
     {ustore_gds_direct_k, "direct"},
-    {ustore_gds_compat_k, "compat"},
+    {ustore_gds_compatibility_k, "compatibility"},
 };
 
 /** The canonical spelling of every GPU vendor. */
@@ -147,9 +146,7 @@ void publish_results(ustore_executor_handle_t& executor, std::uint32_t count) no
         finish(*result.outcome, result.status);
         for (std::uint32_t* const deferred_calls : result.deferred_counts) {
             if (!deferred_calls) continue;
-            std::atomic_ref<std::uint32_t> const calls {*deferred_calls};
-            calls.fetch_sub(1, std::memory_order_release);
-            calls.notify_all();
+            floor_atomic_ref<std::uint32_t> {*deferred_calls}.fetch_sub(1, std::memory_order_release);
         }
     }
 }
@@ -159,15 +156,15 @@ void publish_results(ustore_executor_handle_t& executor, std::uint32_t count) no
  *  The batch's table positions are freed before any of its outcomes is final, so a caller seeing one final may submit
  *  again at once. Nothing reads a slot after that, since a submission may refill it. */
 std::uint32_t serve_batch(ustore_executor_handle_t& executor) noexcept {
-    std::uint32_t const head = std::atomic_ref<std::uint32_t> {executor.head}.load(std::memory_order_relaxed);
+    std::uint32_t const head = floor_atomic_ref<std::uint32_t> {executor.head}.load(std::memory_order_relaxed);
     std::size_t const mask = executor.deferred.size() - 1;
     deferred_slot_t& first = executor.deferred[head & mask];
-    if (std::atomic_ref<std::uint32_t> {first.ready}.load(std::memory_order_acquire) != head + 1) return 0;
+    if (floor_atomic_ref<std::uint32_t> {first.ready}.load(std::memory_order_acquire) != head + 1) return 0;
     std::uint32_t const first_ticket = first.ticket;
     std::uint32_t count = 1;
     for (; count != executor.deferred_limit; ++count) {
         deferred_slot_t& slot = executor.deferred[(head + count) & mask];
-        if (std::atomic_ref<std::uint32_t> {slot.ready}.load(std::memory_order_acquire) != head + count + 1 ||
+        if (floor_atomic_ref<std::uint32_t> {slot.ready}.load(std::memory_order_acquire) != head + count + 1 ||
             slot.ticket != first_ticket + count)
             break;
     }
@@ -181,7 +178,7 @@ std::uint32_t serve_batch(ustore_executor_handle_t& executor) noexcept {
     // A lent pool running its lender's dispatch refuses ours and runs nothing, so the driver runs the batch itself
     if (st::failed(view_of(executor.pool).for_n_dynamic(count, serve_task)))
         for (std::uint32_t task = 0; task != count; ++task) serve_task(task, executor.runners.size() - 1);
-    std::atomic_ref<std::uint32_t> {executor.head}.store(head + count, std::memory_order_release);
+    floor_atomic_ref<std::uint32_t> {executor.head}.store(head + count, std::memory_order_release);
     publish_results(executor, count);
     advance_finished(executor, first_ticket + count);
     return count;
@@ -189,17 +186,17 @@ std::uint32_t serve_batch(ustore_executor_handle_t& executor) noexcept {
 
 /** Serves the deferred table of @p executor on its driver thread until @c ustore_executor_free stops it. */
 void drive(ustore_executor_handle_t& executor) noexcept {
-    std::atomic_ref<std::uint32_t> const doorbell {executor.doorbell};
+    floor_atomic_ref<std::uint32_t const> const doorbell {executor.doorbell};
     for (;;) {
         std::uint32_t const rung = doorbell.load(std::memory_order_acquire);
         if (serve_batch(executor) != 0) continue;
-        if (std::atomic_ref<driver_state_t> {executor.state}.load(std::memory_order_acquire) ==
+        if (floor_atomic_ref<driver_state_t> {executor.state}.load(std::memory_order_acquire) ==
             driver_state_t::stopping_k)
             return;
-        if (std::atomic_ref<ustore_mood_t> {executor.mood}.load(std::memory_order_relaxed) == ustore_mood_spinning_k)
+        if (floor_atomic_ref<ustore_mood_t> {executor.mood}.load(std::memory_order_relaxed) == ustore_mood_spinning_k)
             continue;
         if (executor_t* const owned = std::get_if<executor_t>(&executor.pool)) owned->park(parked_check_micros_k);
-        doorbell.wait(rung, std::memory_order_acquire);
+        host_verbs().await_change(&executor.doorbell, rung);
     }
 }
 
@@ -224,7 +221,7 @@ status_t pool_failure(st::status_t status) noexcept {
 /** Reads into @p domains the memory domains @p options name, refusing one @p topology lacks, or every domain the
  *  process may allocate on when they name none. */
 status_t read_memory_domains(ustore_ram_options_t const& options, topology_t const& topology,
-                             st::basic_vector<fu_memory_domain_id_t>& domains) noexcept {
+                             st::vector<fu_memory_domain_id_t>& domains) noexcept {
     std::size_t const available = topology.memory_domains_count();
     bool const derived = !options.memory_domains || !options.memory_domains_count;
     std::size_t const count = derived ? available : static_cast<std::size_t>(options.memory_domains_count);
@@ -314,18 +311,9 @@ static status_t make_executor(std::variant<executor_t, lent_pool_t> pool, topolo
     return {};
 }
 
-ustore_status_t ustore_outcome_wait(ustore_outcome_t* outcome) {
-    std::atomic_ref<ustore_status_t> const word {outcome->status};
-    for (;;) {
-        ustore_status_t const seen = word.load(std::memory_order_acquire);
-        if (seen != ustore_status_deferred_k) return seen;
-        word.wait(seen, std::memory_order_acquire);
-    }
-}
+ustore_status_t ustore_outcome_wait(ustore_outcome_t* outcome) { return host_verbs().wait(outcome); }
 
-ustore_status_t ustore_outcome_status(ustore_outcome_t* outcome) {
-    return std::atomic_ref<ustore_status_t> {outcome->status}.load(std::memory_order_acquire);
-}
+ustore_status_t ustore_outcome_status(ustore_outcome_t* outcome) { return host_verbs().load(outcome); }
 
 char const* ustore_status_name(ustore_status_t status) { return name_in(status_names_k, status); }
 
@@ -381,7 +369,7 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
     fu_capabilities_t const allowed = forkunion_allowed_of(ceiling);
     st::expected<topology_t> topology = topology_t::make();
     if (!topology) return finish(outcome, pool_failure(topology.status()));
-    st::basic_vector<fu_memory_domain_id_t> domains;
+    st::vector<fu_memory_domain_id_t> domains;
     if (status_t const status = read_memory_domains(arguments->ram, *topology, domains); status.failed())
         return finish(outcome, status);
     std::size_t threads = arguments->threads;
@@ -409,7 +397,7 @@ void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
     if (!pool) return finish(outcome, pool_failure(pool.status()));
     st::expected<topology_t> topology = topology_t::make();
     if (!topology) return finish(outcome, pool_failure(topology.status()));
-    st::basic_vector<fu_memory_domain_id_t> domains;
+    st::vector<fu_memory_domain_id_t> domains;
     if (status_t const status = read_memory_domains(arguments->ram, *topology, domains); status.failed())
         return finish(outcome, status);
     finish(outcome, make_executor(*pool, *topology, domains, arguments->deferred_limit, fu_capabilities_all_k,
@@ -422,7 +410,7 @@ static status_t spawn_across_machine(std::size_t threads, std::size_t deferred_l
                                      ustore_executor_t& made) noexcept {
     st::expected<topology_t> topology = topology_t::make();
     if (!topology) return pool_failure(topology.status());
-    st::basic_vector<fu_memory_domain_id_t> domains;
+    st::vector<fu_memory_domain_id_t> domains;
     if (status_t const status = read_memory_domains({}, *topology, domains); status.failed()) return status;
     if (!executor_t::spawns_threads()) {
         if (threads > 1) return {status_code_t::unsupported_k, "This build spawns no threads"};
@@ -463,7 +451,7 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     if (!arguments->executor)
         return finish(outcome, {status_code_t::invalid_argument_k, "The call needs an output for the executor"});
     *arguments->executor = nullptr;
-    if (arguments->gds > ustore_gds_compat_k)
+    if (arguments->gds > ustore_gds_compatibility_k)
         return finish(outcome, {status_code_t::invalid_argument_k, "Unknown GPUDirect Storage mode"});
     std::span<gpu_device_t const> const devices = gpu_devices();
     if (arguments->device < 0 || static_cast<std::size_t>(arguments->device) >= devices.size())
@@ -476,9 +464,9 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     if (status_t const status = spawn_across_machine(1, arguments->deferred_limit, fu_capabilities_all_k, made);
         status.failed())
         return finish(outcome, status);
-    if (status_t const status = spawn_gpu_executor(gpu_runtime().drivers, device, gpu_class_of(device),
-                                                   arguments->stream, arguments->scratch_limit, arguments->gds,
-                                                   made->device);
+    gpu_runtime_t& runtime = gpu_runtime();
+    if (status_t const status = runtime.spawn(device, gpu_class_of(device), arguments->stream, arguments->scratch_limit,
+                                              arguments->gds, made->device);
         status.failed()) {
         ustore_executor_free(made);
         return finish(outcome, status);
@@ -514,21 +502,19 @@ void ustore_executor_drain(ustore_executor_drain_t* arguments) {
     if (!executor) return finish(outcome, {});
     if (runs_here(*executor))
         return finish(outcome, {status_code_t::contended_k, "A callback cannot drain the executor running it"});
-    std::atomic_ref<ustore_mood_t> {executor->mood}.store(arguments->mood, std::memory_order_relaxed);
+    floor_atomic_ref<ustore_mood_t> {executor->mood}.store(arguments->mood, std::memory_order_relaxed);
     wait_finished(*executor,
-                  tickets_of(std::atomic_ref<std::uint64_t> {executor->submitted}.load(std::memory_order_acquire)));
+                  tickets_of(floor_atomic_ref<std::uint64_t> {executor->submitted}.load(std::memory_order_acquire)));
     finish(outcome, {});
 }
 
 void ustore_executor_free(ustore_executor_t executor) {
     if (!executor) return;
     wait_finished(*executor,
-                  tickets_of(std::atomic_ref<std::uint64_t> {executor->submitted}.load(std::memory_order_acquire)));
+                  tickets_of(floor_atomic_ref<std::uint64_t> {executor->submitted}.load(std::memory_order_acquire)));
     if (executor->state == driver_state_t::serving_k) {
-        std::atomic_ref<driver_state_t> {executor->state}.store(driver_state_t::stopping_k, std::memory_order_release);
-        std::atomic_ref<std::uint32_t> const doorbell {executor->doorbell};
-        doorbell.fetch_add(1, std::memory_order_release);
-        doorbell.notify_all();
+        floor_atomic_ref<driver_state_t> {executor->state}.store(driver_state_t::stopping_k, std::memory_order_release);
+        floor_atomic_ref<std::uint32_t> {executor->doorbell}.fetch_add(1, std::memory_order_release);
         executor->driver.join(executor->generation);
     }
     for (runner_t& runner : executor->runners) arena_free_blocks(runner.scratch);
@@ -559,7 +545,6 @@ void ustore_arena_free(ustore_arena_t arena) {
     if (!arena) return;
     wait_deferred_calls(arena->deferred_calls);
     // A live export frees the arena on its last release instead
-    if (fu::standard_atomic_ref<std::uint32_t> {arena->exports}.fetch_add(arena_freed_bit_k,
-                                                                          std::memory_order_acq_rel) == 0)
+    if (floor_atomic_ref<std::uint32_t> {arena->exports}.fetch_add(arena_freed_bit_k, std::memory_order_acq_rel) == 0)
         destroy_arena(arena);
 }

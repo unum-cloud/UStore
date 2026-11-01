@@ -2,46 +2,31 @@
  *  @file test/nvme/compaction_key_slots.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
- *  @brief The key slots the compaction suite merges, shared by its host translation unit and its device one.
+ *  @brief The key slots the compaction suite merges, the engine's own, shared by its host
+ *      translation unit and its device one, so its 16-byte cases run on the kernels the
+ *      library's bundle carries.
  */
 #pragma once
 
-#include <cstdint> // `std::uint8_t`, `std::uint32_t`
+#include "ustore/blobs/nvme_key_slot.hpp" // `key_slot`, `limit`, `value_layout_t`
 
-#include "ustore/blobs/nvme_key_slot.hpp" // `limit`, `value_layout_t`
-
-namespace unum::ustore::test {
+namespace unum::ustore::test::nvme {
 
 using blobs::limit;
 
-/** Stored values of up to eight bytes inside the key slot, laid out as UStoreNVMe's inline 8-byte key slots are. */
+/** Stored values of up to twelve bytes inside the key slot, the engine's inline
+ *  12-byte key slots. */
 template <typename stored_key_type_>
-struct inline_key_slot {
-    using stored_key_t = stored_key_type_;
+using inline_key_slot = blobs::key_slot<stored_key_type_, blobs::value_layout_t::inline_12_bytes_k>;
 
-    stored_key_t stored_key = limit<stored_key_t>::max();
-    std::uint32_t size = 0;
-    std::uint8_t data[8] = {};
-};
-
-/** Stored values of one width in the stored values section, found by stride, as UStoreNVMe's fixed-width key slots
- *  find theirs. */
+/** Stored values of one width in the stored values section, found by stride, the engine's
+ *  fixed-width key slots. */
 template <typename stored_key_type_>
-struct fixed_width_key_slot {
-    using stored_key_t = stored_key_type_;
-    static constexpr blobs::value_layout_t value_layout_k = blobs::value_layout_t::fixed_width_k;
+using fixed_width_key_slot = blobs::key_slot<stored_key_type_, blobs::value_layout_t::fixed_width_k>;
 
-    stored_key_t stored_key = limit<stored_key_t>::max();
-};
-
-/** Stored values of any width in the stored values section, found through value offsets, as UStoreNVMe's
- *  variable-width key slots find theirs. */
+/** Stored values of any width in the stored values section, found through value offsets, the
+ *  engine's variable-width key slots. */
 template <typename stored_key_type_>
-struct variable_width_key_slot {
-    using stored_key_t = stored_key_type_;
-    static constexpr blobs::value_layout_t value_layout_k = blobs::value_layout_t::variable_width_k;
+using variable_width_key_slot = blobs::key_slot<stored_key_type_, blobs::value_layout_t::variable_width_k>;
 
-    stored_key_t stored_key = limit<stored_key_t>::max();
-};
-
-} // namespace unum::ustore::test
+} // namespace unum::ustore::test::nvme

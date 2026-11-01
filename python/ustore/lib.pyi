@@ -2,6 +2,10 @@
 
 Stub files are never executed, so PEP 688's `Buffer` is read by any checker regardless of the
 interpreter running the tests. The package floor is 3.12.
+
+File: python/ustore/lib.pyi
+Author: Ash Vardanian
+Date: September 16, 2026
 """
 
 from collections.abc import Callable, Generator, Iterator, Sequence
@@ -189,7 +193,7 @@ class Gds(IntEnum):
 
     AUTOMATIC = 0
     DIRECT = 1
-    COMPAT = 2
+    COMPATIBILITY = 2
 
 class GPUVendor(IntEnum):
     """The vendor whose runtime drives a GPU, valued as `ustore_gpu_vendor_t`."""
@@ -243,8 +247,8 @@ class FieldType(IntEnum):
     F16 = 40
     F32 = 41
     F64 = 42
-    BIN = 50
-    STR = 51
+    BINARY = 50
+    STRING = 51
 
 class Modification(IntEnum):
     """What a document write applies, valued as `ustore_docs_modification_t`."""
@@ -1463,7 +1467,7 @@ class DeferredView:
           field (str, optional): A top-level key or a JSON Pointer to read inside every
             document; None reads whole documents.
           outputs_type (FieldType, optional): `FieldType.JSON` for JSON text, or
-            `FieldType.STR` to print scalars as text.
+            `FieldType.STRING` to print scalars as text.
         Returns:
           Values: One entry per key, None where the document or the field is absent.
         """
@@ -1503,9 +1507,9 @@ class DeferredView:
           fields (Sequence[str]): Top-level keys or JSON Pointers, the columns of the result.
           outputs_types (FieldType | Sequence[FieldType]): One type per field, or one for
             every field: a fixed-width scalar from `FieldType.BOOL` to `FieldType.U8`,
-            `FieldType.UUID`, `FieldType.STR` or `FieldType.BIN`. A `FieldType.F16` column
-            exports as a half-precision view NumPy reads as float16, and a `FieldType.UUID`
-            column as sixteen bytes per document.
+            `FieldType.UUID`, `FieldType.STRING` or `FieldType.BINARY`. A `FieldType.F16`
+            column exports as a half-precision view NumPy reads as float16, and a
+            `FieldType.UUID` column as sixteen bytes per document.
           arena (Arena): Where the columns land, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
         Returns:
@@ -1868,7 +1872,7 @@ class DeferredView:
           modification (Modification, optional): An upsert, update or insert, an RFC 6902
             `Modification.PATCH` or an RFC 7386 `Modification.MERGE`.
           type (FieldType, optional): How every document is spelled: `FieldType.JSON`,
-            `FieldType.STR` for a plain string, `FieldType.NULL`, or the raw bytes of
+            `FieldType.STRING` for a plain string, `FieldType.NULL`, or the raw bytes of
             `FieldType.BOOL`, `FieldType.F64`, `FieldType.F32`, `FieldType.I64` through
             `FieldType.U8`.
           id_field (str, optional): The field holding every key when `keys` is None.

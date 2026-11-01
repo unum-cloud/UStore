@@ -298,10 +298,10 @@ static char const doc_Collection_arrow_c_stream[] =                             
     "snapshot it holds until released. Every batch keeps its own memory, outliving the\n"    //
     "stream, and the requested schema is ignored, as the protocol allows.";
 
-static PyObject* Collection_arrow_c_stream(Collection* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                           PyObject* args_names_tuple) {
+static PyObject* Collection_arrow_c_stream(Collection* self, PyObject* const* arguments,
+                                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     PyObject* requested = Py_None;
-    if (ustore_py_optional_argument("__arrow_c_stream__", args, positional_args_count, args_names_tuple, 0,
+    if (ustore_py_optional_argument("__arrow_c_stream__", arguments, positional_arguments_count, keyword_names_tuple, 0,
                                     "requested_schema", &requested) != 0)
         return NULL;
     ustore_py_context_t context;
@@ -368,15 +368,16 @@ static char const doc_Collection_sample_keys[] =                                
     "Returns:\n"                                                                               //
     "  Keys: One run of keys, in no particular order.";
 
-static PyObject* Collection_sample_keys(Collection* self, PyObject* const* args, Py_ssize_t positional_args_count) {
-    if (ustore_py_args_names_count_checked("sample_keys", positional_args_count, NULL, 2) < 0) return NULL;
+static PyObject* Collection_sample_keys(Collection* self, PyObject* const* arguments,
+                                        Py_ssize_t positional_arguments_count) {
+    if (ustore_py_keyword_names_count_checked("sample_keys", positional_arguments_count, NULL, 2) < 0) return NULL;
     size_t wanted = 0;
-    if (ustore_py_size_from_object(args[0], "wanted", &wanted) != 0) return NULL;
+    if (ustore_py_size_from_object(arguments[0], "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     ustore_modality_t held = ustore_modality_blobs_k;
     if (collection_found(self, &context, &options, &held) != 0) return NULL;
-    return ustore_py_keys_sample(&context, &options, held, wanted, args[1]);
+    return ustore_py_keys_sample(&context, &options, held, wanted, arguments[1]);
 }
 
 static char const doc_Collection_scan[] =                                                   //
@@ -391,17 +392,17 @@ static char const doc_Collection_scan[] =                                       
     "Returns:\n"                                                                            //
     "  Keys: One run of keys, in ascending order.";
 
-static PyObject* Collection_scan(Collection* self, PyObject* const* args, Py_ssize_t positional_args_count) {
-    if (ustore_py_args_names_count_checked("scan", positional_args_count, NULL, 3) < 0) return NULL;
+static PyObject* Collection_scan(Collection* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count) {
+    if (ustore_py_keyword_names_count_checked("scan", positional_arguments_count, NULL, 3) < 0) return NULL;
     ustore_key_t start = {0};
     size_t wanted = 0;
-    if (ustore_py_key_from_object(args[0], &start) != 0) return NULL;
-    if (ustore_py_size_from_object(args[1], "wanted", &wanted) != 0) return NULL;
+    if (ustore_py_key_from_object(arguments[0], &start) != 0) return NULL;
+    if (ustore_py_size_from_object(arguments[1], "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     ustore_modality_t held = ustore_modality_blobs_k;
     if (collection_found(self, &context, &options, &held) != 0) return NULL;
-    return ustore_py_keys_scan(&context, &options, held, &start, wanted, ustore_scan_ordered_k, NULL, args[2]);
+    return ustore_py_keys_scan(&context, &options, held, &start, wanted, ustore_scan_ordered_k, NULL, arguments[2]);
 }
 
 static char const doc_Collection[] =                                                           //

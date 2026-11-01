@@ -28,19 +28,18 @@
 #include <array>       // `std::array`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <thread>      // `std::thread`
 #include <utility>     // `std::move`
-
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`
 
 #include "ustore/utilities/nvme_disks.hpp"            // `native_file_t`, `close_native_file`, `blocking_files_disk_t`
-#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk_t`, `linux_uring_probe_t`
+#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk_t`
 
 #include "nvme/ring_cases.hpp" // `ring_cases`, every transport-independent result
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -214,10 +213,10 @@ std::size_t uring_counts_completions_after_a_cancel(linux_uring_files_disk_t& di
 /**
  *  @brief More completions than the queue holds still all arrive, which is what overflow costs.
  *
- *  The mount sizes the completion queue at four times the credit, so a queue pair alone can never fill
- *  it; what can is the completion every cancelling entry posts for itself. Asking to cancel far more
- *  often than the queue has seats puts the kernel over the edge, and from there every completion
- *  sits in the kernel's overflow list until a poll enters again to flush it.
+ *  The mount sizes the completion queue at four times the credit, so a queue pair alone can never
+ *  fill it; what can is the completion every cancelling entry posts for itself. Asking to cancel
+ *  far more often than the queue has seats puts the kernel over the edge, and from there every
+ *  completion sits in the kernel's overflow list until a poll enters again to flush it.
  */
 std::size_t uring_polls_an_overflowed_queue(linux_uring_files_disk_t& disk, medium_reference_t medium) {
     constexpr std::size_t cancels_k = 64;

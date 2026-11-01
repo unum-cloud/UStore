@@ -1,4 +1,9 @@
-"""JSON documents over the C ABI: whole and field writes, modifications, reads, gists and typed gathers."""
+"""JSON documents over the C ABI: whole and field writes, modifications, reads, gists and typed gathers.
+
+File: test/docs.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import asyncio
 import gc
@@ -127,7 +132,7 @@ def test_documents_read_back_as_zero_copy_views(view, docs, arena):
 @pytest.mark.parametrize(("field", "as_json", "as_string"), FIELD_READS)
 def test_field_reads(view, docs, arena, field: str, as_json: bytes | None, as_string: bytes | None):
     view.docs_write([6], json.dumps(NESTED), collection=docs)
-    for kind, expected in ((FieldType.JSON, as_json), (FieldType.STR, as_string)):
+    for kind, expected in ((FieldType.JSON, as_json), (FieldType.STRING, as_string)):
         found = view.docs_read([6], arena, field=field, outputs_type=kind, collection=docs)
         assert (None if found[0] is None else bytes(found[0])) == expected
 
@@ -165,7 +170,7 @@ def test_merging_null_removes_a_field(view, docs, arena, patch: dict, expected: 
     ("field_type", "raw", "expected"),
     [
         (FieldType.JSON, b"[1, 2]", [1, 2]),
-        (FieldType.STR, b"hello", "hello"),
+        (FieldType.STRING, b"hello", "hello"),
         (FieldType.NULL, b"", None),
         (FieldType.BOOL, b"\x01", True),
         (FieldType.F64, struct.pack("d", 1.5), 1.5),
@@ -258,7 +263,7 @@ def test_whole_document_modifications_create_missing_documents(view, docs, arena
             ustore.MalformedError,
         ),
         (
-            lambda view: view.docs_write([1], b"zz", field="v", type=FieldType.BIN, collection="docs"),
+            lambda view: view.docs_write([1], b"zz", field="v", type=FieldType.BINARY, collection="docs"),
             ustore.UnsupportedError,
         ),
         (lambda view: view.docs_write([1], "{}", type=FieldType.F16, collection="docs"), ustore.UnsupportedError),
@@ -363,14 +368,14 @@ def test_gather_refuses_a_value_past_the_range_of_its_column(view, docs, arena, 
     assert columns[0][0] == 0
 
 
-@pytest.mark.parametrize("field_type", [FieldType.STR, FieldType.BIN])
+@pytest.mark.parametrize("field_type", [FieldType.STRING, FieldType.BINARY])
 @pytest.mark.parametrize(
     ("value", "text"), [("x", "x"), (3, "3"), (2.5, "2.5"), (True, "true"), ("", ""), (None, None), ({"k": 1}, None)]
 )
 def test_gather_strings(view, docs, arena, field_type: FieldType, value, text: str | None):
     view.docs_write([0], json.dumps({"v": value}), collection=docs)
     column = view.docs_gather([0], ["v"], field_type, arena, collection=docs)[0]
-    expected = None if text is None else text if field_type is FieldType.STR else text.encode()
+    expected = None if text is None else text if field_type is FieldType.STRING else text.encode()
     assert column == (expected,)
 
 
@@ -380,7 +385,7 @@ def test_gather_columns_line_up_with_keys(view, docs, arena, count: int):
     view.docs_write(
         keys, [json.dumps({"n": key, "name": f"row-{key}", "half": key / 2}) for key in keys], collection=docs
     )
-    types = (FieldType.I64, FieldType.STR, FieldType.F64)
+    types = (FieldType.I64, FieldType.STRING, FieldType.F64)
     columns = view.docs_gather([*keys, count], ["n", "name", "half"], types, arena, collection=docs)
     assert len(columns) == 3
     assert columns.rows == count + 1
@@ -433,7 +438,9 @@ def test_a_deferred_docs_write_lands_once_waited(view, docs, later, arena):
 def test_a_deferred_docs_read_answers_once_waited(view, docs, later, arena):
     view.docs_write([1], json.dumps(NESTED), collection=docs)
     assert decoded(later.docs_read([1, 2], arena, collection=docs).wait()) == [NESTED, None]
-    assert bytes(later.docs_read([1], arena, field="s", outputs_type=FieldType.STR, collection=docs).wait()[0]) == b"x"
+    assert (
+        bytes(later.docs_read([1], arena, field="s", outputs_type=FieldType.STRING, collection=docs).wait()[0]) == b"x"
+    )
 
 
 def test_a_deferred_docs_gist_answers_once_waited(view, docs, later, arena):
@@ -443,7 +450,7 @@ def test_a_deferred_docs_gist_answers_once_waited(view, docs, later, arena):
 
 def test_a_deferred_docs_gather_answers_once_waited(view, docs, later, arena):
     view.docs_write([1, 2], ['{"n": 1, "s": "x"}', '{"n": 2}'], collection=docs)
-    columns = later.docs_gather([1, 2], ["n", "s"], [FieldType.I64, FieldType.STR], arena, collection=docs).wait()
+    columns = later.docs_gather([1, 2], ["n", "s"], [FieldType.I64, FieldType.STRING], arena, collection=docs).wait()
     assert list(columns[0]) == [1, 2]
     assert columns[1] == ("x", None)
 

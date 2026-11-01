@@ -12,28 +12,30 @@
  *  Nothing here allocates an I/O buffer. A caller's span is never registered memory, so the bytes are
  *  copied out of the channel's own blocks either way, and that one copy is the whole of the read path.
  *
- *  A value cache hit is copied out of a slot the cache refills in place, between two loads of the slot's sequence,
- *  so a read that finds a key there costs one hash probe and one copy, and a displaced value is never freed apart.
- *  The bound is a count rather than a byte total, derived once from the budget and
- *  the width the collection's values take.
+ *  A value cache hit is copied out of a slot the cache refills in place, between two loads of the
+ *  slot's sequence, so a read that finds a key there costs one hash probe and one copy, and a
+ *  displaced value is never freed apart. The bound is a count rather than a byte total, derived
+ *  once from the budget and the width the collection's values take.
  *
- *  A read copies no run and moves no byte to find its place: it announces itself on its own slot of the ledger's
- *  epochs, loads the published stamp and then the view, and walks the immutable runs the view names. A
- *  publication replaces the view beside rather than in place, so the runs a reader walks stay readable until
- *  it leaves. A snapshot is a pinned stamp, which every merge keeps the versions of.
+ *  A read copies no run and moves no byte to find its place: it announces itself on its own slot of
+ *  the ledger's epochs, loads the published stamp and then the view, and walks the immutable runs
+ *  the view names. A publication replaces the view beside rather than in place, so the runs a
+ *  reader walks stay readable until it leaves. A snapshot is a pinned stamp, which every merge
+ *  keeps the versions of.
  *
- *  A run answers a key slot by sorted position, so an ordered walk is a merge over one cursor per run, memory
- *  runs included, and nothing is materialized. Where several runs carry the same key the newest memory run
- *  wins, then the shallowest level, and inside a level that may overlap the youngest run. There is no prefetcher,
- *  and adding one would be a mistake rather than an optimization: a scan that wants bytes hands the next keys to
- *  @c nvme_store::select, which already refills the ring as completions retire, while a second pipeline reading
- *  ahead on the same channel would poll the first one's completions and drop them.
+ *  A run answers a key slot by sorted position, so an ordered walk is a merge over one cursor per
+ *  run, memory runs included, and nothing is materialized. Where several runs carry the same key
+ *  the newest memory run wins, then the shallowest level, and inside a level that may overlap the
+ *  youngest run. There is no prefetcher, and adding one would be a mistake rather than an
+ *  optimization: a scan that wants bytes hands the next keys to @c nvme_store::select, which
+ *  already refills the ring as completions retire, while a second pipeline reading ahead on the
+ *  same channel would poll the first one's completions and drop them.
  */
 
 #pragma once
 
 #include <cassert> // `assert`
-#include <cstddef> // `std::byte`, `std::size_t`
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
@@ -41,27 +43,25 @@
 #include <array>     // `std::array`
 #include <atomic>    // `std::memory_order_acquire`
 #include <bit>       // `std::bit_floor`
-#include <concepts>  // `std::same_as`
 #include <limits>    // `std::numeric_limits`
 #include <memory>    // `std::unique_ptr`
 #include <new>       // `std::nothrow`
 #include <span>      // `std::span`
 #include <utility>   // `std::move`, `std::swap`
 
-#include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
-#include <smashtable/basic_ring.hpp>       // `st::basic_ring`, `st::ring_eviction_t`
-#include <smashtable/basic_vector.hpp>     // `st::basic_vector`
+#include <smashtable/basic_hash_table.hpp> // `st::assume_reserved`
+#include <smashtable/basic_vector.hpp>     // `st::vector`
 #include <smashtable/shared.hpp>           // `st::status_t`
 
 #include "ustore/blobs/nvme_memory_run.hpp"     // `keyed_delta`, `memory_run`, `sealed_deltas`
 #include "ustore/blobs/nvme_key_slot.hpp"       // `limit`, `stored_value_size_t`, `value_layout_t`
 #include "ustore/blobs/nvme_published_runs.hpp" // `published_runs`, `commit_ledger`, `stamp_pin`
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree`, `lsm_tree_position_t`, `collection_config_t`
-#include "ustore/utilities/folds.hpp"           // `fold_concept`, `fold_delta_pair`, `last_write_fold_t`
+#include "ustore/utilities/folds.hpp"           // `fold_concept`
 #include "ustore/utilities/nvme_channels.hpp"   // `io_channel_t`
-#include "ustore/utilities/nvme_ring.hpp"       // `resource_constraint`, `constrained_allocator`
-#include "ustore/utilities/ram_buffers.hpp"     // `local_arena_t`, `arena_allocator`
-#include "ustore/utilities/types.hpp"           // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp"       // `portable_alignment_k`
+#include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`, `arena_allocator`, `resource_constraint`, `constrained_buffer`
+#include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`, `uuid_generator`
 
 namespace unum::ustore::blobs {
 
@@ -206,7 +206,7 @@ class value_cache {
 #pragma region Private Types
 
     /** One pointer per slot to the words it owns, null until its first fill, charged to the budget. */
-    using slots_t = st::basic_vector<std::uint64_t*, constrained_allocator<std::uint64_t*, atomic_reference_>>;
+    using slots_t = st::vector<std::uint64_t*, constrained_allocator<std::uint64_t*, atomic_reference_>>;
 
     /** Allocates the words of a slot from the same budget. */
     using words_allocator_t = constrained_allocator<std::uint64_t, atomic_reference_>;
@@ -533,8 +533,8 @@ class nvme_store {
      *  @param[out] size Bytes the value takes, which is zero for anything but @c written_k.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
-     *  @return What the key carries, or @c incomplete_k for a fold's chain reaching a level whose values only a
-     *      @c select reads.
+     *  @return What the key carries, or @c incomplete_k for a fold's chain reaching a level whose
+     *      values only a @c select reads.
      */
     [[nodiscard]] lookup_result_t find(stored_key_t stored_key, stored_value_size_t& size,
                                        transaction_stamp_t stamp = head_stamp_k,
@@ -752,8 +752,9 @@ class nvme_store {
     }
 
     /**
-     *  @brief Hands @p visitor the newest version at or below @p stamp of every key from @p from up that the run at
-     *      @p run_index of @p counted carries, in that run's order, with no other run consulted.
+     *  @brief Hands @p visitor the newest version at or below @p stamp of every key from @p from
+     *      up that the run at @p run_index of @p counted carries, in that run's order, with no
+     *      other run consulted.
      *  @param[in] counted The runs as @c count_runs counted them, which the index names one of.
      *  @param[in] run_index Which of the counted runs to walk.
      *  @param[in] from The first key to hand out.
@@ -1093,7 +1094,7 @@ class nvme_store {
         // The rows laid out before take a run of their own when these overflow it, so no run below holds one of them
         if (!drained.key_slots.empty() &&
             ingested_run_overflows_(drained.key_slots.size() + rows.size(), drained.stored_values.size() + bytes))
-            if (status_t const cut = write_ingested_run_(channel, ingested); cut.failed()) return cut;
+            if (status_t const written = write_ingested_run_(channel, ingested); written.failed()) return written;
         std::size_t const runs_before = ingested.runs.size();
         std::size_t const slots_before = drained.key_slots.size();
         std::size_t const values_before = drained.stored_values.size();
@@ -1119,9 +1120,9 @@ class nvme_store {
      */
     expected<transaction_stamp_t> publish_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
         if (!ingested.drained.key_slots.empty())
-            if (status_t const cut = write_ingested_run_(channel, ingested); cut.failed()) {
+            if (status_t const written = write_ingested_run_(channel, ingested); written.failed()) {
                 drop_ingest(channel, ingested);
-                return cut;
+                return written;
             }
         return runs_.publish_ingest(channel, ingested.runs, [&]() noexcept { return flush(channel); });
     }
@@ -1185,7 +1186,7 @@ class nvme_store {
 
     /** A column one flush writes, charging the store's budget. */
     template <typename element_type_>
-    using drained_column = st::basic_vector<element_type_, constrained_allocator<element_type_, atomic_reference_>>;
+    using drained_column = st::vector<element_type_, constrained_allocator<element_type_, atomic_reference_>>;
 
     /** The columns one flush or one ingested run writes, every one charging the store's budget. */
     struct drained_t {
@@ -1229,14 +1230,13 @@ class nvme_store {
     };
 
     /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
-    using stamped_deltas_t =
-        st::basic_vector<stamped_delta_t, constrained_allocator<stamped_delta_t, atomic_reference_>>;
+    using stamped_deltas_t = st::vector<stamped_delta_t, constrained_allocator<stamped_delta_t, atomic_reference_>>;
 
     /** The deltas one commit of its own hands over. */
-    using deltas_t = st::basic_vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
+    using deltas_t = st::vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
 
     /** The keys of a batch that neither a memory run nor the cache answered. */
-    using deferred_keys_t = st::basic_vector<stored_key_t, constrained_allocator<stored_key_t, atomic_reference_>>;
+    using deferred_keys_t = st::vector<stored_key_t, constrained_allocator<stored_key_t, atomic_reference_>>;
 
   public:
     struct ingest_runs_t {
@@ -1245,7 +1245,7 @@ class nvme_store {
         drained_t drained;
 
         /** The runs written so far, in ascending order of their keys. */
-        st::basic_vector<sorted_run_t> runs;
+        st::vector<sorted_run_t> runs;
 
         /** The last key laid out, which the next row must ascend past. */
         stored_key_t last {};
@@ -1254,15 +1254,13 @@ class nvme_store {
   private:
 
     /** The caller's request every deferred key came from. */
-    using deferred_requests_t = st::basic_vector<std::size_t, constrained_allocator<std::size_t, atomic_reference_>>;
+    using deferred_requests_t = st::vector<std::size_t, constrained_allocator<std::size_t, atomic_reference_>>;
 
     /** What the tree answered for every deferred key. */
-    using deferred_answers_t =
-        st::basic_vector<lookup_result_t, constrained_allocator<lookup_result_t, atomic_reference_>>;
+    using deferred_answers_t = st::vector<lookup_result_t, constrained_allocator<lookup_result_t, atomic_reference_>>;
 
     /** Bytes the tree delivered for every deferred key. */
-    using deferred_delivered_t =
-        st::basic_vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>>;
+    using deferred_delivered_t = st::vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>>;
 
 #pragma endregion Private Types
 
@@ -1351,7 +1349,7 @@ class nvme_store {
                                              utilities::arena_allocator<byte_t>& arena,
                                              std::span<byte_t const>& value) const noexcept {
         value = {};
-        st::basic_vector<delta_view_t, utilities::arena_allocator<delta_view_t>> chain {
+        st::vector<delta_view_t, utilities::arena_allocator<delta_view_t>> chain {
             utilities::arena_allocator<delta_view_t> {arena}};
         delta_view_t closing {delta_kind_t::remove_k, {}};
         bool closed = false;
@@ -1593,7 +1591,7 @@ class nvme_store {
                 return laid;
             first = end;
             if (first != rows.size())
-                if (status_t const cut = write_ingested_run_(channel, ingested); cut.failed()) return cut;
+                if (status_t const written = write_ingested_run_(channel, ingested); written.failed()) return written;
         }
         return {};
     }
@@ -2007,10 +2005,10 @@ class nvme_store_cursor {
     view_t const* view_ = nullptr;
 
     /** The next sorted position inside every memory run of the view, newest run first. */
-    st::basic_vector<std::size_t> memory_positions_;
+    st::vector<std::size_t> memory_positions_;
 
     /** One cursor per run of every level the view names. */
-    st::basic_vector<run_cursor_t> cursors_;
+    st::vector<run_cursor_t> cursors_;
 
     /** The keys of the page, then the key the next page starts at. */
     std::array<entry_t, page_keys_k + 1> page_ {};

@@ -5,11 +5,12 @@
  *  @brief The pages fold: a dense base and chains of edits, applied in commit order into the page's current shape,
  *      and composed without a base where that is sound.
  *
- *  Edits apply forgivingly, because concurrent transactions that watch nothing may commit edits whose targets another
- *  one removed, and a fold that refused them would leave the page unreadable. An edit of a missing element, under a
- *  parent that is missing or no element, or moving an element into its own subtree does nothing. An anchor that is Nil,
- *  missing or under another parent lands the element at the front. An insertion whose fragment holds a live key does
- *  nothing, a splice clamps its start and length to the text, and attributes are only set on and removed from
+ *  Edits apply forgivingly, because concurrent transactions that watch nothing may commit edits
+ *  whose targets another one removed, and a fold that refused them would leave the page unreadable.
+ *  An edit of a missing element, under a parent that is missing or no element, or moving an element
+ *  into its own subtree does nothing. An anchor that is Nil, missing or under another parent lands
+ *  the element at the front. An insertion whose fragment holds a live key does nothing, a splice
+ *  clamps its start and length to the text, and attributes are only set on and removed from
  *  elements. Removing the root empties it, and removing Nil removes the page until the next import.
  *
  *  Composition without a base keeps the chain, minus what is provably dead or mergeable for every base. The newest
@@ -23,12 +24,12 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint64_t`
+#include <cstdint> // `std::uint8_t`
 #include <cstring> // `std::memcpy`
 
 #include <span> // `std::span`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/pages/element_tree.hpp" // `element_tree`, `page_view_t`
 #include "ustore/pages/page_edits.hpp"   // `edit_t`, `for_each_edit`, `encode_edits`
@@ -168,9 +169,9 @@ struct page_fold_t {
         using flags_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint8_t>;
         using blocks_allocator_t =
             typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::span<byte_t>>;
-        st::basic_vector<edit_t, edits_allocator_t> edits {edits_allocator_t(allocator)};
-        st::basic_vector<std::uint8_t, flags_allocator_t> keep {flags_allocator_t(allocator)};
-        st::basic_vector<std::span<byte_t>, blocks_allocator_t> blocks {blocks_allocator_t(allocator)};
+        st::vector<edit_t, edits_allocator_t> edits {edits_allocator_t(allocator)};
+        st::vector<std::uint8_t, flags_allocator_t> keep {flags_allocator_t(allocator)};
+        st::vector<std::span<byte_t>, blocks_allocator_t> blocks {blocks_allocator_t(allocator)};
         auto release = [&]() noexcept {
             for (std::span<byte_t> block : blocks) allocator.deallocate(block.data(), block.size());
         };

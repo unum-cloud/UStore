@@ -70,7 +70,8 @@ static size_t field_type_width(ustore_docs_field_type_t type) {
 
 /** Whether a gather has a column layout for @p type: a fixed-width scalar, a UUID, a string or bytes. */
 static int field_type_gathers(ustore_docs_field_type_t type) {
-    return field_type_width(type) != 0 || type == ustore_docs_field_type_str_k || type == ustore_docs_field_type_bin_k;
+    return field_type_width(type) != 0 || type == ustore_docs_field_type_string_k ||
+           type == ustore_docs_field_type_binary_k;
 }
 
 /**
@@ -563,7 +564,7 @@ char const doc_docs_write[] =                                                   
     "  modification (Modification, optional): An upsert, update or insert, an RFC 6902\n"            //
     "    `Modification.PATCH` or an RFC 7386 `Modification.MERGE`.\n"                                //
     "  type (FieldType, optional): How every document is spelled: `FieldType.JSON`,\n"               //
-    "    `FieldType.STR` for a plain string, `FieldType.NULL`, or the raw bytes of\n"                //
+    "    `FieldType.STRING` for a plain string, `FieldType.NULL`, or the raw bytes of\n"             //
     "    `FieldType.BOOL`, `FieldType.F64`, `FieldType.F32`, `FieldType.I64` through\n"              //
     "    `FieldType.U8`.\n"                                                                          //
     "  id_field (str, optional): The field holding every key when `keys` is None.\n"                 //
@@ -575,13 +576,13 @@ char const doc_docs_write[] =                                                   
     "  NotFoundError: A field is written inside a document that does not exist.\n"                   //
     "  AlreadyExistsError: An insert names a document that already exists.";
 
-PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple) {
+PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked("docs_write", positional_args_count,
-                                                                           args_names_tuple, 2);
-    if (args_names_count < 0) return NULL;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
+        "docs_write", positional_arguments_count, keyword_names_tuple, 2);
+    if (keyword_names_count < 0) return NULL;
 
     ustore_py_verb_options_t options;
     ustore_py_verb_options_init(&options);
@@ -589,10 +590,10 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
     int type = ustore_docs_field_type_json_k;
     PyObject* field = NULL;
     PyObject* id_field = NULL;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[args_progress];
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[arguments_progress];
         int const consumed = ustore_py_verb_option_from_keyword(&context, name, value, &options);
         if (consumed < 0) return NULL;
         if (consumed > 0) continue;
@@ -619,17 +620,18 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
     call->id_field = Py_XNewRef(id_field);
 
     // A fixed-width type given a buffer is a column of scalars, which splits in place per key.
-    int const columnar = field_type_width((ustore_docs_field_type_t)type) != 0 && args[0] != Py_None &&
-                         !PyUnicode_Check(args[1]) && PyObject_CheckBuffer(args[1]);
-    if (args[0] != Py_None && ustore_py_keys_from_object(args[0], &call->keys) != 0)
+    int const columnar = field_type_width((ustore_docs_field_type_t)type) != 0 && arguments[0] != Py_None &&
+                         !PyUnicode_Check(arguments[1]) && PyObject_CheckBuffer(arguments[1]);
+    if (arguments[0] != Py_None && ustore_py_keys_from_object(arguments[0], &call->keys) != 0)
         return ustore_py_call_discard(&context, &docs_write_verb, call);
-    int const gathered = columnar ? scalars_from_object(args[1], (ustore_docs_field_type_t)type, call->keys.count,
-                                                        &call->documents)
-                                  : documents_from_object(args[1], (ustore_docs_field_type_t)type, &call->documents);
+    int const gathered = columnar
+                             ? scalars_from_object(arguments[1], (ustore_docs_field_type_t)type, call->keys.count,
+                                                   &call->documents)
+                             : documents_from_object(arguments[1], (ustore_docs_field_type_t)type, &call->documents);
     if (gathered != 0) return ustore_py_call_discard(&context, &docs_write_verb, call);
 
     size_t count = call->keys.count;
-    if (args[0] == Py_None) {
+    if (arguments[0] == Py_None) {
         // Every key is read out of its own document, so each task needs a document of its own.
         if (!id_field || call->documents.texts.contents.spread == ustore_py_contents_broadcast_k) {
             PyErr_SetString(PyExc_TypeError, "Documents without keys need a sequence of them and an 'id_field'");
@@ -655,20 +657,22 @@ char const doc_docs_remove[] =                                                  
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"      //
     "    returning.";
 
-PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple) {
+PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("docs_remove", positional_args_count, args_names_tuple, 1) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("docs_remove", positional_arguments_count, keyword_names_tuple, 1) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     ustore_py_remove_call_t stack;
     ustore_py_remove_call_t* const call = ustore_py_call_open(&context, &ustore_py_remove_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_subscript(args[0], &call->keys) < 0)
+    if (ustore_py_keys_from_subscript(arguments[0], &call->keys) < 0)
         return ustore_py_call_discard(&context, &ustore_py_remove_verb, call);
     return ustore_py_values_remove(&context, &options, ustore_modality_docs_k, call);
 }
@@ -691,7 +695,7 @@ char const doc_docs_read[] =                                                    
     "  field (str, optional): A top-level key or a JSON Pointer to read inside every\n"        //
     "    document; None reads whole documents.\n"                                              //
     "  outputs_type (FieldType, optional): `FieldType.JSON` for JSON text, or\n"               //
-    "    `FieldType.STR` to print scalars as text.\n"                                          //
+    "    `FieldType.STRING` to print scalars as text.\n"                                       //
     "Returns:\n"                                                                               //
     "  Values: One entry per key, None where the document or the field is absent.";
 
@@ -792,22 +796,22 @@ PyObject* ustore_py_document_contains(ustore_py_context_t const* context, ustore
     return answer;
 }
 
-PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple) {
+PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked("docs_read", positional_args_count,
-                                                                           args_names_tuple, 2);
-    if (args_names_count < 0) return NULL;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
+        "docs_read", positional_arguments_count, keyword_names_tuple, 2);
+    if (keyword_names_count < 0) return NULL;
 
     ustore_py_verb_options_t options;
     ustore_py_verb_options_init(&options);
     int type = ustore_docs_field_type_json_k;
     PyObject* field = NULL;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[args_progress];
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[arguments_progress];
         int const consumed = ustore_py_verb_option_from_keyword(&context, name, value, &options);
         if (consumed < 0) return NULL;
         if (consumed > 0) continue;
@@ -827,10 +831,10 @@ PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssiz
     ustore_py_read_call_t* const call = ustore_py_call_open(&context, &ustore_py_docs_read_verb, &stack);
     if (!call) return NULL;
     call->field = Py_XNewRef(field);
-    if (ustore_py_keys_from_object(args[0], &call->keys) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0)
         return ustore_py_call_discard(&context, &ustore_py_docs_read_verb, call);
     return ustore_py_docs_read(&context, &options, (ustore_docs_field_type_t)type, &ustore_py_docs_read_verb, call,
-                               args[1]);
+                               arguments[1]);
 }
 
 char const doc_docs_gist[] =                                                                  //
@@ -889,20 +893,23 @@ static void gist_release(void* erased) {
 
 static ustore_py_verb_t const gist_verb = {sizeof(gist_call_t), gist_submit, gist_answer, gist_release};
 
-PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple) {
+PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("docs_gist", positional_args_count, args_names_tuple, 2) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("docs_gist", positional_arguments_count, keyword_names_tuple, 2) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     gist_call_t stack;
     gist_call_t* const call = ustore_py_call_open(&context, &gist_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(args[0], &call->keys) != 0 || ustore_py_arena_claim(args[1], &call->call.arena) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
+        ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &gist_verb, call);
     call->call.collection = options.collection;
     ustore_docs_gist_t gist = {
@@ -941,9 +948,9 @@ char const doc_docs_scan[] =                                                    
     "Raises:\n"                                                                              //
     "  CancelledError: The progress callable stopped the scan.";
 
-PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple) {
-    return ustore_py_api_scan_of(self, args, positional_args_count, args_names_tuple, "docs_scan",
+PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple) {
+    return ustore_py_api_scan_of(self, arguments, positional_arguments_count, keyword_names_tuple, "docs_scan",
                                  ustore_modality_docs_k);
 }
 
@@ -960,9 +967,9 @@ char const doc_docs_sample[] =                                                  
     "Returns:\n"                                                                                //
     "  Keys: One run of keys, in no particular order.";
 
-PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple) {
-    return ustore_py_api_sample_of(self, args, positional_args_count, args_names_tuple, "docs_sample",
+PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple) {
+    return ustore_py_api_sample_of(self, arguments, positional_arguments_count, keyword_names_tuple, "docs_sample",
                                    ustore_modality_docs_k);
 }
 
@@ -999,9 +1006,9 @@ char const doc_docs_gather[] =                                                  
     "  fields (Sequence[str]): Top-level keys or JSON Pointers, the columns of the result.\n" //
     "  outputs_types (FieldType | Sequence[FieldType]): One type per field, or one for\n"     //
     "    every field: a fixed-width scalar from `FieldType.BOOL` to `FieldType.U8`,\n"        //
-    "    `FieldType.UUID`, `FieldType.STR` or `FieldType.BIN`. A `FieldType.F16` column\n"    //
-    "    exports as a half-precision view NumPy reads as float16, and a `FieldType.UUID`\n"   //
-    "    column as sixteen bytes per document.\n"                                             //
+    "    `FieldType.UUID`, `FieldType.STRING` or `FieldType.BINARY`. A `FieldType.F16`\n"     //
+    "    column exports as a half-precision view NumPy reads as float16, and a\n"             //
+    "    `FieldType.UUID` column as sixteen bytes per document.\n"                            //
     "  arena (Arena): Where the columns land, rewound by this call.\n"                        //
     "  collection (UUID | str): The collection, by identifier or by name.\n"                  //
     "Returns:\n"                                                                              //
@@ -1052,17 +1059,19 @@ static void gather_release(void* erased) {
 
 static ustore_py_verb_t const gather_verb = {sizeof(gather_call_t), gather_submit, gather_answer, gather_release};
 
-PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple) {
+PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("docs_gather", positional_args_count, args_names_tuple, 4) < 0) return NULL;
-
-    ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_keyword_names_count_checked("docs_gather", positional_arguments_count, keyword_names_tuple, 4) < 0)
         return NULL;
 
-    if (PyUnicode_Check(args[1])) {
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
+        return NULL;
+
+    if (PyUnicode_Check(arguments[1])) {
         PyErr_SetString(PyExc_TypeError, "The fields are a sequence of strings, not one string");
         return NULL;
     }
@@ -1070,13 +1079,13 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
     gather_call_t* const call = ustore_py_call_open(&context, &gather_verb, &stack);
     if (!call) return NULL;
     // The tuple keeps every field name alive while the call reads the UTF-8 bytes they cache.
-    call->fields_held = PySequence_Tuple(args[1]);
+    call->fields_held = PySequence_Tuple(arguments[1]);
     if (!call->fields_held) return ustore_py_call_discard(&context, &gather_verb, call);
     size_t const fields_count = (size_t)PyTuple_GET_SIZE(call->fields_held);
 
     // One `FieldType` is an int, and stands for every field
-    int const broadcast = PyLong_Check(args[2]);
-    PyObject* const types_held = broadcast ? NULL : PySequence_Tuple(args[2]);
+    int const broadcast = PyLong_Check(arguments[2]);
+    PyObject* const types_held = broadcast ? NULL : PySequence_Tuple(arguments[2]);
     if (!broadcast && !types_held) return ustore_py_call_discard(&context, &gather_verb, call);
     if (types_held && (size_t)PyTuple_GET_SIZE(types_held) != fields_count) {
         ustore_py_raise(ustore_status_invalid_argument_k, "Got %zd outputs types for %zu fields",
@@ -1093,7 +1102,7 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
 
     for (size_t field_index = 0; !failed && field_index != fields_count; ++field_index) {
         PyObject* const field = PyTuple_GET_ITEM(call->fields_held, (Py_ssize_t)field_index);
-        PyObject* const type_object = types_held ? PyTuple_GET_ITEM(types_held, (Py_ssize_t)field_index) : args[2];
+        PyObject* const type_object = types_held ? PyTuple_GET_ITEM(types_held, (Py_ssize_t)field_index) : arguments[2];
         if (!PyUnicode_Check(field)) {
             PyErr_Format(PyExc_TypeError, "A field is a string, got %S", Py_TYPE(field));
             failed = 1;
@@ -1118,8 +1127,8 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
     }
     Py_XDECREF(types_held);
 
-    if (failed || ustore_py_keys_from_object(args[0], &call->keys) != 0 ||
-        ustore_py_arena_claim(args[3], &call->call.arena) != 0)
+    if (failed || ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
+        ustore_py_arena_claim(arguments[3], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &gather_verb, call);
     call->call.collection = options.collection;
     ustore_docs_gather_t gather = {
@@ -1188,7 +1197,7 @@ static ustore_docs_column_view_t const* columns_column(Columns const* self, size
 /** Copies the strings of the column @p column of @p type into a tuple, with None where a row is not valid. */
 static PyObject* column_strings(ustore_docs_column_view_t const* column, ustore_docs_field_type_t type, size_t rows) {
     // A string column spans the null terminator of every row, which a binary one does not write.
-    ustore_size_t const terminator = type == ustore_docs_field_type_str_k ? 1 : 0;
+    ustore_size_t const terminator = type == ustore_docs_field_type_string_k ? 1 : 0;
     PyObject* strings = PyTuple_New((Py_ssize_t)rows);
     for (size_t row = 0; strings && row != rows; ++row) {
         PyObject* entry = NULL;
@@ -1198,8 +1207,8 @@ static PyObject* column_strings(ustore_docs_column_view_t const* column, ustore_
             Py_ssize_t const length = (Py_ssize_t)(string.length - terminator);
             // Nothing but empty strings leaves the strings without an address.
             char const* const text = length ? (char const*)string.data : "";
-            entry = type == ustore_docs_field_type_str_k ? PyUnicode_DecodeUTF8(text, length, "strict")
-                                                         : PyBytes_FromStringAndSize(text, length);
+            entry = type == ustore_docs_field_type_string_k ? PyUnicode_DecodeUTF8(text, length, "strict")
+                                                            : PyBytes_FromStringAndSize(text, length);
         }
         if (!entry) Py_CLEAR(strings);
         else PyTuple_SET_ITEM(strings, (Py_ssize_t)row, entry);

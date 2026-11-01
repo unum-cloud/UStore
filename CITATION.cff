@@ -7,13 +7,6 @@ version: 1.0.0-rc.1
 doi: 10.5281/zenodo.7537042
 repository-code: https://github.com/unum-cloud/UStore
 url: https://www.unum.cloud/ustore
-identifiers:
-  - type: doi
-    value: 10.5281/zenodo.7537042
-    description: "Concept DOI — all versions"
-  - type: doi
-    value: 10.5281/zenodo.8263173
-    description: "v0.13.12 — version DOI"
 abstract: >-
   UStore is a GPU-accelerated embedded transactional database built for high-throughput NVMe
   devices, taking a hyper-converged design where storage and compute share one node rather than

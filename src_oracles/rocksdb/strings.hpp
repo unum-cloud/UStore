@@ -21,7 +21,7 @@
 #include "ustore/ranges.hpp" // `strided`, `strided_iterator`
 
 #include "database.hpp"           // `database_t`, `transaction_t`, `refuse_collections`, `buffer_write`, `watch`
-#include "utilities/batches.hpp"  // `strings_arg`
+#include "utilities/batches.hpp"  // `validate_choices`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -30,6 +30,8 @@ namespace unum::ustore::oracles::rocksdb {
 #pragma region Strings
 
 status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t const& texts, view_t const& view) {
+    if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
+        return status;
     if (!arguments.count) return {};
     strided_iterator<ustore_key_t const> const values = strided(arguments.values);
     if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their values"};
@@ -59,6 +61,8 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
 }
 
 status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t const& texts, view_t const& view) {
+    if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
+        return status;
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
 

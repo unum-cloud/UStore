@@ -22,16 +22,16 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::conditional_t`, `std::is_arithmetic_v`, `std::is_trivially_copyable_v`
-#include <utility>     // `std::move`
 #include <variant>     // `std::variant`, `std::visit`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 #include <smashtable/row_layout.hpp>   // `st::key128_t`
 #include <smashtable/shared.hpp>       // `st::hash`
 
-#include "ustore/utilities/folds.hpp"     // `delta_kind_t`
-#include "ustore/utilities/nvme_ring.hpp" // `disk_id_t`, `file_id_t`, `uuid_t`, `string_t`, `bytes_span_t`
-#include "ustore/utilities/types.hpp"     // `status_t`, `status_code_t`, `expected`, `byte_t`, the rounding helpers
+#include "ustore/utilities/folds.hpp"       // `delta_kind_t`
+#include "ustore/utilities/nvme_ring.hpp"   // `disk_id_t`, `file_id_t`
+#include "ustore/utilities/ram_buffers.hpp" // `heap_allocator`, `buffer_alignment_k`
+#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_t`, `bytes_span_t`, `bytes_view_t`, `to_status`
 
 namespace unum::ustore::blobs {
 
@@ -576,10 +576,10 @@ class stored_value_locations {
     static constexpr bool is_inline_k = is_inline(value_layout_k);
 
     /** Where every value of the batch sits. */
-    st::basic_vector<stored_value_location_t, allocator_<stored_value_location_t>> locations;
+    st::vector<stored_value_location_t, allocator_<stored_value_location_t>> locations;
 
     /** Where every value of the batch lands inside the batch's buffer, before its padding. */
-    st::basic_vector<std::size_t, allocator_<std::size_t>> aligned_offsets_in_buffer;
+    st::vector<std::size_t, allocator_<std::size_t>> aligned_offsets_in_buffer;
 
     /** How many of the batch's locations name a value. */
     std::size_t stored_values_found = 0;
@@ -593,8 +593,8 @@ class stored_value_locations {
     static expected<stored_value_locations> make(std::size_t count,
                                                  allocator_<stored_value_location_t> allocator = {}) noexcept {
         stored_value_locations batch;
-        batch.locations = st::basic_vector<stored_value_location_t, allocator_<stored_value_location_t>> {allocator};
-        batch.aligned_offsets_in_buffer = st::basic_vector<std::size_t, allocator_<std::size_t>> {
+        batch.locations = st::vector<stored_value_location_t, allocator_<stored_value_location_t>> {allocator};
+        batch.aligned_offsets_in_buffer = st::vector<std::size_t, allocator_<std::size_t>> {
             allocator_<std::size_t> {allocator}};
         if (st::status_t const status = batch.locations.resize(count); status != st::status_t::success_k)
             return to_status(status);
@@ -817,9 +817,9 @@ struct storage_limits_t {
 
 #pragma region Key Slot
 
-template <typename stored_key_, value_layout_t value_layout_, key_tails_t key_tails_ = key_tails_t::absent_k>
+template <typename stored_key_type_, value_layout_t value_layout_, key_tails_t key_tails_ = key_tails_t::absent_k>
 struct key_slot {
-    using stored_key_t = stored_key_;
+    using stored_key_t = stored_key_type_;
     static constexpr value_layout_t value_layout_k = value_layout_;
 
     stored_key_t stored_key = limit<stored_key_t>::max();
@@ -837,9 +837,9 @@ struct key_slot {
 };
 
 /** A key slot of a fixed-width value, which its run finds by stride from the key slot's sorted position. */
-template <typename stored_key_>
-struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
-    using stored_key_t = stored_key_;
+template <typename stored_key_type_>
+struct key_slot<stored_key_type_, value_layout_t::fixed_width_k> {
+    using stored_key_t = stored_key_type_;
     static constexpr value_layout_t value_layout_k = value_layout_t::fixed_width_k;
 
     stored_key_t stored_key = limit<stored_key_t>::max();
@@ -851,9 +851,9 @@ struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
 };
 
 /** A key slot of a variable-width value, which its run finds through the value offsets column by sorted position. */
-template <typename stored_key_, key_tails_t key_tails_>
-struct key_slot<stored_key_, value_layout_t::variable_width_k, key_tails_> {
-    using stored_key_t = stored_key_;
+template <typename stored_key_type_, key_tails_t key_tails_>
+struct key_slot<stored_key_type_, value_layout_t::variable_width_k, key_tails_> {
+    using stored_key_t = stored_key_type_;
     static constexpr value_layout_t value_layout_k = value_layout_t::variable_width_k;
     static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
 
@@ -866,9 +866,9 @@ struct key_slot<stored_key_, value_layout_t::variable_width_k, key_tails_> {
 };
 
 /** A key slot holding its 16-byte value inline, with no size, as every value has the same one. */
-template <typename stored_key_, key_tails_t key_tails_>
-struct key_slot<stored_key_, value_layout_t::uuid_k, key_tails_> {
-    using stored_key_t = stored_key_;
+template <typename stored_key_type_, key_tails_t key_tails_>
+struct key_slot<stored_key_type_, value_layout_t::uuid_k, key_tails_> {
+    using stored_key_t = stored_key_type_;
     static constexpr value_layout_t value_layout_k = value_layout_t::uuid_k;
     static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
     static constexpr stored_value_size_t size = 16;
@@ -905,9 +905,10 @@ inline constexpr std::uint64_t sorted_run_index_levels_capacity_k = 32;
 /**
  *  @brief Maps between a sorted run index's cells and the sorted order of the key slots they hold.
  *
- *  Cells form rows of @c branching stored breadth-first, row @c p parenting rows @c p*(branching+1)+1 through
- *  @c p*(branching+1)+branching+1, and an in-order walk visits the cells in ascending order. Only sorted positions
- *  below @c key_slots_count hold key slots; the positions past them up to @c cells_count are padding.
+ *  Cells form rows of @c branching stored breadth-first, row @c p parenting rows
+ *  @c p*(branching+1)+1 through @c p*(branching+1)+branching+1, and an in-order walk visits the
+ *  cells in ascending order. Only sorted positions below @c key_slots_count hold key slots; the
+ *  positions past them up to @c cells_count are padding.
  */
 struct sorted_run_index_layout_t {
 

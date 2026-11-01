@@ -4,11 +4,11 @@
  *  @date October 18, 2026
  *  @brief One commit's deltas for one collection, sealed into sorted columns and stamped once into an immutable run.
  *
- *  A committer seals its private deltas off every shared path, sorting them and copying their bytes, and the leader
- *  that orders the commit stamps the sealed columns into a @c memory_run, which no one changes afterwards. A delta
- *  is a key, a kind and the bytes between two neighbouring offsets, so a removal and an empty value differ by kind and
- *  neither needs a sentinel. The stamps and the kinds are packed columns, which spend no bits at all on a run of one
- *  commit's writes.
+ *  A committer seals its private deltas off every shared path, sorting them and copying their
+ *  bytes, and the leader that orders the commit stamps the sealed columns into a @c memory_run,
+ *  which no one changes afterwards. A delta is a key, a kind and the bytes between two neighbouring
+ *  offsets, so a removal and an empty value differ by kind and neither needs a sentinel. The stamps
+ *  and the kinds are packed columns, which spend no bits at all on a run of one commit's writes.
  */
 
 #pragma once
@@ -22,7 +22,7 @@
 #include <span>      // `std::span`
 #include <utility>   // `std::move`
 
-#include <smashtable/basic_vector.hpp>           // `st::basic_vector`
+#include <smashtable/basic_vector.hpp>           // `st::vector`
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
 #include <smashtable/shared.hpp>                 // `st::default_allocator`, `st::expected`
 
@@ -165,13 +165,11 @@ class sealed_deltas {
 
   private:
     using stored_keys_t =
-        st::basic_vector<stored_key_t,
-                         typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_key_t>>;
+        st::vector<stored_key_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_key_t>>;
     using offsets_t =
-        st::basic_vector<stored_value_offset_t,
-                         typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_value_offset_t>>;
-    using values_t =
-        st::basic_vector<byte_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<byte_t>>;
+        st::vector<stored_value_offset_t,
+                   typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_value_offset_t>>;
+    using values_t = st::vector<byte_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<byte_t>>;
 
     explicit sealed_deltas(allocator_t const& allocator) noexcept
         : stored_keys_(typename stored_keys_t::allocator_t(allocator)),

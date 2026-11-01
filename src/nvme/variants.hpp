@@ -7,20 +7,20 @@
  *
  *  Every call is a template on the CPU class, whose atomic reference and waiter instantiate the
  *  store, and @c nvme_variant names the table of one class and its open. Its members are defined
- *  below it, so the explicit instantiation in <tt>src/nvme/variants_&lt;class&gt;.cpp</tt> compiles
- *  every call of the class there, and the @c extern one in <tt>src/nvme/engine.cpp</tt> keeps them
- *  out of the unit that picks the class.
+ *  below it, so the explicit instantiation in <tt>src/nvme/variants_&lt;class&gt;.cpp</tt> compiles every call
+ *  of the class there, and the @c extern one in <tt>src/nvme/engine.cpp</tt> keeps them out of the unit
+ *  that picks the class.
  *
- *  One mount opens the volumes and one database of 16-byte keys lives on them. Every collection of
- *  the C ABI is one collection of that database under the same UUID, and two more are the engine's
- *  own system collections. The collections system collection, @c collections_collection_k, maps
- *  every other collection's UUID onto its name, while the store schema records its modality, which
- *  a mount needs before it opens the collection. The names system collection,
- *  @c names_collection_k, maps every name onto the bare UUID of its collection. A strings
- *  collection, and the names, live in the strings store of
- *  <tt>include/ustore/strings/nvme_store.hpp</tt>, keyed by whole strings, each mapped onto a
- *  16-byte key held in its cell, and a transaction's strings ride in the share of it every
- *  transaction here joins.
+ *  One mount opens the volumes and one database of 16-byte keys lives on them. Every
+ *  collection of the C ABI is one collection of that database under the same UUID, and
+ *  two more are the engine's own system collections. The collections system
+ *  collection, @c collections_collection_k, maps every other collection's UUID onto
+ *  its name, while the store schema records its modality, which a mount needs before
+ *  it opens the collection. The names system collection, @c names_collection_k, maps
+ *  every name onto the bare UUID of its collection. A strings collection, and the
+ *  names, live in the strings store of <tt>include/ustore/strings/nvme_store.hpp</tt>, keyed
+ *  by whole strings, each mapped onto a 16-byte key held in its cell, and a
+ *  transaction's strings ride in the share of it every transaction here joins.
  *
  *  Every write of a caller goes through a transaction of the database, the caller's or one the call commits alone, so
  *  the registry records every commit a watched read may conflict with. The two system collections, which no caller's
@@ -46,9 +46,9 @@
 
 #pragma once
 
-#include "blobs_layers/docs.hpp"  // `docs_read_over_blobs`, `docs_gist_over_blobs`, `docs_gather_over_blobs`
-#include "blobs_layers/pages.hpp" // `pages_read_over_blobs`
-#include "vram/uploads.hpp"       // `uploading_vram_tables`
+#include "docs_layer.hpp"   // `docs_read_over_blobs`, `docs_gist_over_blobs`, `docs_gather_over_blobs`
+#include "pages_layer.hpp"  // `pages_read_over_blobs`
+#include "vram/uploads.hpp" // `uploading_vram_tables`
 
 #include "database.hpp" // `nvme_variant`, `database_describe`, `resolve_modality`, `transaction_free`
 #include "blobs.hpp"    // `blobs_write`, `remove_values`, `read_values`, `scan_values`, `sample_values`
@@ -56,7 +56,7 @@
 #include "docs.hpp"     // `docs_write`
 #include "graph.hpp"    // `graph_read_edges`, `graph_write_edges`, `graph_remove_vertices`
 #include "ingest.hpp"   // `ingest_init`, `ingest_append`, `ingest_finish`, `ingest_free`
-#include "pages.hpp"    // `pages_import`, `pages_insert`, `commit_page_edits`
+#include "pages.hpp"    // `pages_import`, `pages_insert`
 
 namespace unum::ustore::nvme {
 
@@ -115,9 +115,9 @@ strings_verbs<home_t::host_k> const nvme_variant<cpu_class_>::strings_verbs_k {
 template <cpu_class_t cpu_class_>
 docs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::docs_verbs_k {
     .write = &docs_write<cpu_class_>,
-    .read = &docs_read_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
+    .read = &docs_read_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality<cpu_class_>>,
     .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
-    .gather = &docs_gather_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
+    .gather = &docs_gather_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality<cpu_class_>>,
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
     .sample = &sample_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
@@ -142,7 +142,7 @@ pages_verbs<home_t::host_k> const nvme_variant<cpu_class_>::pages_verbs_k {
     .splice = &pages_splice<cpu_class_>,
     .set_attributes = &pages_set_attributes<cpu_class_>,
     .remove_attributes = &pages_remove_attributes<cpu_class_>,
-    .read = &pages_read_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
+    .read = &pages_read_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality<cpu_class_>>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_pages_k>,
 };
 

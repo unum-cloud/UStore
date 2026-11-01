@@ -7,10 +7,10 @@
  *
  *  Every page is its dense element tree, filed under its key in the pages store of its collection.
  *  An edit call reads the trees of the pages it touches, watched, applies its tasks by
- *  <tt>ustore/pages/page_edits.hpp</tt> through the paths of <tt>src/blobs_layers/pages.hpp</tt>,
- *  and writes every new tree back or erases the pages it removed, inside one SmashTable
- *  transaction: the caller's, or one of the call's own, retried on conflicts. A read renders the
- *  trees as the view sees them. A call naming a collection of another modality is refused.
+ *  <tt>ustore/pages/page_edits.hpp</tt> through the paths of <tt>src/pages_layer.hpp</tt>, and writes every new
+ *  tree back or erases the pages it removed, inside one SmashTable transaction: the caller's, or
+ *  one of the call's own, retried on conflicts. A read renders the trees as the view sees them. A
+ *  call naming a collection of another modality is refused.
  */
 
 #pragma once
@@ -22,9 +22,10 @@
 #include "ustore/pages.h"    // `ustore_pages_import_t`, `ustore_pages_read_t`
 #include "ustore/ranges.hpp" // `place_batch_t`, `values_view_t`, `strided_iterator`
 
-#include "blobs_layers/pages.hpp" // `touched_page_t`, `serve_import`, `serve_insert`, `read_pages`
+#include "ustore/pages/ram_store.hpp" // `page_pair_t`
 
 #include "database.hpp" // `database_state`, `with_source`, `read_into_scratch`, `stage_runs_of`, `serve_read_modify_write`
+#include "pages_layer.hpp" // `touched_page_t`, `serve_import`, `serve_insert`, `read_pages`
 
 namespace unum::ustore::ram {
 
@@ -37,7 +38,7 @@ expected<values_view_t> read_page_trees(source_type_& source, place_batch_t cons
                                         store_status_t& failure) noexcept {
     ustore_octet_t const* presences = nullptr;
     ustore_strings_view_t trees {};
-    status_t const status = read_into_scratch<page_pair_t>(source, places, view, presences, trees, failure);
+    status_t const status = read_into_scratch<pages::page_pair_t>(source, places, view, presences, trees, failure);
     if (status.failed()) return status;
     return values_view_t {places.count, presences, trees};
 }
@@ -64,7 +65,7 @@ struct pages_in_store {
         page_allocator_t allocator {view.scratch};
         strided_iterator<touched_page_t const> const touched {pages.data(), sizeof(touched_page_t)};
         status_t outcome;
-        store_status_t const staged = stage_runs_of<page_pair_t>(
+        store_status_t const staged = stage_runs_of<pages::page_pair_t>(
             source, touched.members(&touched_page_t::place).members(&collection_key_t::collection), pages.size(),
             outcome, [&](auto& part, std::size_t first, std::size_t end) noexcept -> store_status_t {
                 for (std::size_t index = first; index != end; ++index) {
@@ -80,7 +81,8 @@ struct pages_in_store {
                         outcome = tree_status;
                         return store_status_t::invalid_argument_k;
                     }
-                    store_status_t const written = stage_upsert<page_pair_t>(part, page.place.key, value_view_t {tree});
+                    store_status_t const written = stage_upsert<pages::page_pair_t>(part, page.place.key,
+                                                                                    value_view_t {tree});
                     if (st::failed(written)) return written;
                 }
                 return store_status_t::success_k;
@@ -109,7 +111,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_import_t const& arguments,
                strings_arg_t const& values, view_t const& view) noexcept {
     return edit_in_store(state, arguments, view, [&](pages_in_store<cpu_class_, isolation_> const& land) noexcept {
-        return serve_import(arguments, values, view, land);
+        return serve_import<typename ram_variant<cpu_class_, isolation_>::strings_kit_t>(arguments, values, view, land);
     });
 }
 
@@ -118,7 +120,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_insert_t const& arguments,
                strings_arg_t const& values, view_t const& view) noexcept {
     return edit_in_store(state, arguments, view, [&](pages_in_store<cpu_class_, isolation_> const& land) noexcept {
-        return serve_insert(arguments, values, view, land);
+        return serve_insert<typename ram_variant<cpu_class_, isolation_>::strings_kit_t>(arguments, values, view, land);
     });
 }
 
@@ -173,8 +175,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_read_
                view_t const& view) noexcept {
     return with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept -> status_t {
         store_status_t failure = store_status_t::success_k;
-        return read_pages(arguments, view,
-                          [&]() noexcept { return read_page_trees(source, places_of(arguments), view, failure); });
+        return read_pages<typename ram_variant<cpu_class_, isolation_>::strings_kit_t>(
+            arguments, view, [&]() noexcept { return read_page_trees(source, places_of(arguments), view, failure); });
     });
 }
 
@@ -182,7 +184,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_read_
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_scan_t const& arguments,
                view_t const& view) noexcept {
-    return scan_keys<page_pair_t>(state, arguments, view);
+    return scan_keys<pages::page_pair_t>(state, arguments, view);
 }
 
 #pragma endregion Page Calls

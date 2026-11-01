@@ -2,9 +2,9 @@
  *  @file test/tools/arrow_ipc.cpp
  *  @author Ash Vardanian
  *  @date October 29, 2026
- *  @brief Unit tests of the Arrow IPC codec in <tt>tools/arrow_ipc.hpp</tt>: schemas and batches written and
- *      read back through IPC and the C Data interface, absolute alignment, legacy prefixes, refusals, truncation,
- *      footers, nested lists and structs, and the bytes pyarrow writes.
+ *  @brief Unit tests of the Arrow IPC codec in <tt>tools/arrow_ipc.hpp</tt>: schemas and batches written
+ *      and read back through IPC and the C Data interface, absolute alignment, legacy prefixes,
+ *      refusals, truncation, footers, nested lists and structs, and the bytes pyarrow writes.
  *
  *  The golden bytes come from pyarrow 26, so the hand-numbered FlatBuffers slots are checked against Arrow's own writer
  *  with no Python at test time.
@@ -15,12 +15,11 @@
 #include <cstdint> // `std::int32_t`, `std::int64_t`, `std::uint8_t`, `std::uint64_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
-#include <algorithm>        // `std::copy`
-#include <array>            // `std::array`
-#include <initializer_list> // `std::initializer_list`
-#include <span>             // `std::span`
-#include <string_view>      // `std::string_view`
-#include <vector>           // `std::vector`
+#include <algorithm>   // `std::copy`
+#include <array>       // `std::array`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include "arrow_ipc.hpp"
 
@@ -49,8 +48,8 @@ using namespace unum::ustore::tools;
 #pragma region Golden Bytes
 
 /** pyarrow's <tt>ipc.new_file</tt> of a @c key <tt>pa.uuid()</tt> and a @c value <tt>pa.binary()</tt> column, both
- *  non-nullable, with schema metadata <tt>ustore.modality=blobs</tt>, holding batches of keys 1 and 2 with values
- *  @c alpha and empty, then key 3 with @c omega. */
+ *  non-nullable, with schema metadata <tt>ustore.modality=blobs</tt>, holding batches of keys 1 and 2 with
+ *  values @c alpha and empty, then key 3 with @c omega. */
 constexpr std::uint8_t pyarrow_file_k[] {
     0x41, 0x52, 0x52, 0x4f, 0x57, 0x31, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x78, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x0a, 0x00, 0x0e, 0x00, 0x06, 0x00, 0x05, 0x00, 0x08, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x01,
@@ -375,31 +374,32 @@ assembled_t file_start(ipc_options_t options = {}) {
 }
 
 /** Appends a schema message, measured first through an empty output. */
-std::size_t append_schema(assembled_t& out, ipc_schema_t const& schema) {
+std::size_t append_schema(assembled_t& assembled, ipc_schema_t const& schema) {
     std::size_t failures = 0, needed = 0, written = 0;
-    std::size_t const start = out.bytes.size();
-    failures += expect_eq(ipc_write_schema(schema, out.options, start, {}, needed), ipc_status_t::too_small_k);
-    out.bytes.resize(start + needed);
-    failures += expect_eq(ipc_write_schema(schema, out.options, start, std::span(out.bytes).subspan(start), written),
-                          ipc_status_t::success_k);
+    std::size_t const start = assembled.bytes.size();
+    failures += expect_eq(ipc_write_schema(schema, assembled.options, start, {}, needed), ipc_status_t::too_small_k);
+    assembled.bytes.resize(start + needed);
+    failures += expect_eq(
+        ipc_write_schema(schema, assembled.options, start, std::span(assembled.bytes).subspan(start), written),
+        ipc_status_t::success_k);
     failures += expect_eq(written, needed);
-    failures += expect_eq(out.bytes.size() % out.options.alignment, 0u);
+    failures += expect_eq(assembled.bytes.size() % assembled.options.alignment, 0u);
     return failures;
 }
 
 /** Appends a batch message and its body gathered with zero padding, checking the gathers alias the batch's buffers. */
-std::size_t append_batch(assembled_t& out, ipc_schema_t const& schema, ipc_batch_t const& batch) {
+std::size_t append_batch(assembled_t& assembled, ipc_schema_t const& schema, ipc_batch_t const& batch) {
     std::size_t failures = 0, needed = 0, written = 0;
     std::uint64_t body_bytes = 0;
     std::array<ipc_gather_t, ipc_buffers_max_k> gathers {};
-    std::size_t const start = out.bytes.size();
-    failures += expect_eq(ipc_write_batch(schema, batch, out.options, start, {}, needed, gathers, body_bytes),
+    std::size_t const start = assembled.bytes.size();
+    failures += expect_eq(ipc_write_batch(schema, batch, assembled.options, start, {}, needed, gathers, body_bytes),
                           ipc_status_t::too_small_k);
-    failures += expect_eq(ipc_write_batch(schema, batch, out.options, start, {}, needed, {}, body_bytes),
+    failures += expect_eq(ipc_write_batch(schema, batch, assembled.options, start, {}, needed, {}, body_bytes),
                           ipc_status_t::too_small_k);
-    out.bytes.resize(start + needed);
-    failures += expect_eq(ipc_write_batch(schema, batch, out.options, start, std::span(out.bytes).subspan(start),
-                                          written, gathers, body_bytes),
+    assembled.bytes.resize(start + needed);
+    failures += expect_eq(ipc_write_batch(schema, batch, assembled.options, start,
+                                          std::span(assembled.bytes).subspan(start), written, gathers, body_bytes),
                           ipc_status_t::success_k);
     failures += expect_eq(written, needed);
     std::uint64_t gathered = 0;
@@ -407,33 +407,35 @@ std::size_t append_batch(assembled_t& out, ipc_schema_t const& schema, ipc_batch
         ipc_gather_t const& gather = gathers[index];
         failures += expect(gather.bytes.data() == batch.buffers[index].data());
         failures += expect_eq(gather.bytes.size(), batch.buffers[index].size());
-        out.bytes.insert(out.bytes.end(), gather.bytes.begin(), gather.bytes.end());
-        out.bytes.resize(out.bytes.size() + gather.padding);
+        assembled.bytes.insert(assembled.bytes.end(), gather.bytes.begin(), gather.bytes.end());
+        assembled.bytes.resize(assembled.bytes.size() + gather.padding);
         gathered += gather.bytes.size() + gather.padding;
     }
     failures += expect_eq(gathered, body_bytes);
-    out.blocks.push_back(
+    assembled.blocks.push_back(
         {static_cast<std::int64_t>(start), static_cast<std::int32_t>(written), static_cast<std::int64_t>(body_bytes)});
     return failures;
 }
 
 /** Appends the end-of-stream marker. */
-std::size_t append_end_of_stream(assembled_t& out) {
+std::size_t append_end_of_stream(assembled_t& assembled) {
     std::size_t written = 0;
-    std::size_t const start = out.bytes.size();
-    out.bytes.resize(start + 8);
-    return expect_eq(ipc_write_end_of_stream(std::span(out.bytes).subspan(start), written), ipc_status_t::success_k) +
+    std::size_t const start = assembled.bytes.size();
+    assembled.bytes.resize(start + 8);
+    return expect_eq(ipc_write_end_of_stream(std::span(assembled.bytes).subspan(start), written),
+                     ipc_status_t::success_k) +
            expect_eq(written, 8u);
 }
 
 /** Appends the footer of a file, measured first through an empty output. */
-std::size_t append_footer(assembled_t& out, ipc_schema_t const& schema) {
+std::size_t append_footer(assembled_t& assembled, ipc_schema_t const& schema) {
     std::size_t failures = 0, needed = 0, written = 0;
-    failures += expect_eq(ipc_write_footer(schema, out.blocks, {}, needed), ipc_status_t::too_small_k);
-    std::size_t const start = out.bytes.size();
-    out.bytes.resize(start + needed);
-    failures += expect_eq(ipc_write_footer(schema, out.blocks, std::span(out.bytes).subspan(start), written),
-                          ipc_status_t::success_k);
+    failures += expect_eq(ipc_write_footer(schema, assembled.blocks, {}, needed), ipc_status_t::too_small_k);
+    std::size_t const start = assembled.bytes.size();
+    assembled.bytes.resize(start + needed);
+    failures += expect_eq(
+        ipc_write_footer(schema, assembled.blocks, std::span(assembled.bytes).subspan(start), written),
+        ipc_status_t::success_k);
     failures += expect_eq(written, needed);
     return failures;
 }
@@ -501,14 +503,14 @@ std::size_t compare_metadata(std::span<ipc_key_value_t const> actual, std::span<
 std::size_t compare_fields(std::span<ipc_field_t const> actual, std::span<ipc_field_t const> wanted) {
     std::size_t failures = expect_eq(actual.size(), wanted.size());
     for (std::size_t index = 0; index != wanted.size() && index != actual.size(); ++index) {
-        ipc_field_t const &got = actual[index], &field = wanted[index];
-        failures += expect_eq(got.name, field.name);
-        failures += expect(got.type == field.type);
-        failures += expect_eq(got.width, field.width);
-        failures += expect(got.signedness == field.signedness);
-        failures += expect(got.nullability == field.nullability);
-        failures += compare_metadata(got.metadata, field.metadata);
-        failures += compare_fields(got.children, field.children);
+        ipc_field_t const &actual_field = actual[index], &field = wanted[index];
+        failures += expect_eq(actual_field.name, field.name);
+        failures += expect(actual_field.type == field.type);
+        failures += expect_eq(actual_field.width, field.width);
+        failures += expect(actual_field.signedness == field.signedness);
+        failures += expect(actual_field.nullability == field.nullability);
+        failures += compare_metadata(actual_field.metadata, field.metadata);
+        failures += compare_fields(actual_field.children, field.children);
     }
     return failures;
 }
@@ -782,14 +784,14 @@ std::size_t truncated_input() {
     std::span<std::byte const> const stream = std::span<std::byte const>(file.bytes).subspan(8, stream_end - 8);
     schema_storage_t read;
     failures += expect_eq(read_stream(stream, read, [](ipc_batch_t const&, std::size_t) {}), ipc_status_t::success_k);
-    for (std::size_t cut = 0; cut != stream.size(); ++cut)
-        failures += expect_eq(read_stream(stream.first(cut), read, [](ipc_batch_t const&, std::size_t) {}),
+    for (std::size_t prefix_length = 0; prefix_length != stream.size(); ++prefix_length)
+        failures += expect_eq(read_stream(stream.first(prefix_length), read, [](ipc_batch_t const&, std::size_t) {}),
                               ipc_status_t::truncated_k);
 
     std::array<ipc_block_t, 4> blocks {};
     std::size_t blocks_count = 0;
-    for (std::size_t cut = 0; cut != file.bytes.size(); ++cut)
-        failures += expect_eq(ipc_read_footer(std::span<std::byte const>(file.bytes).first(cut), read.fields,
+    for (std::size_t prefix_length = 0; prefix_length != file.bytes.size(); ++prefix_length)
+        failures += expect_eq(ipc_read_footer(std::span<std::byte const>(file.bytes).first(prefix_length), read.fields,
                                               read.metadata, read.schema, blocks, blocks_count),
                               ipc_status_t::truncated_k);
     return failures;

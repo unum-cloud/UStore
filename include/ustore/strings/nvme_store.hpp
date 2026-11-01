@@ -26,26 +26,24 @@
 
 #include <algorithm>   // `std::max`, `std::min`
 #include <compare>     // `std::strong_ordering`
-#include <concepts>    // `std::same_as`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`, `std::as_bytes`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::is_same_v`, `std::remove_cvref_t`
+#include <type_traits> // `std::is_same_v`
 #include <utility>     // `std::move`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`
-#include <smashtable/basic_vector.hpp>     // `st::basic_vector`
-#include <stringzilla/stringzilla.hpp>     // `sz::string_view_t`
+#include <smashtable/basic_vector.hpp>     // `st::vector`
 
 #include "ustore/blobs/nvme_published_runs.hpp" // `published_runs`, `memory_pressure_t`, `memory_shape_t`
 #include "ustore/blobs/nvme_store.hpp"          // `commit_ledger`, `stamp_pin`, `lookup_result_t`
-#include "ustore/blobs/nvme_database.hpp"       // `transaction_share_t`
+#include "ustore/blobs/nvme_transactions.hpp"   // `transaction_share_t`
 #include "ustore/blobs/nvme_tree.hpp"           // `collection_config_t`, `lsm_tree_publication_hook_t`
 #include "ustore/strings/string_keys.hpp"       // `head_of`, `head_length_of`, `tail_of`, `head_prefix_bytes_k`
 #include "ustore/strings/nvme_memory_run.hpp"   // `memory_run`, `sealed_deltas`, `kept_versions`
 #include "ustore/utilities/folds.hpp"           // `last_write_fold_t`, `delta_view_t`
-#include "ustore/utilities/ram_buffers.hpp"     // `local_arena_t`
+#include "ustore/utilities/ram_buffers.hpp"     // `local_arena_t`, `strings_kit_concept`
 #include "ustore/utilities/types.hpp"           // `status_t`, `expected`, `byte_t`
 
 namespace unum::ustore::strings {
@@ -134,13 +132,13 @@ struct listed_string_t {
 struct strings_page_t {
 
     /** The strings back to back. */
-    st::basic_vector<char> texts;
+    st::vector<char> texts;
 
     /** Where each string sits in @c texts, in order. */
-    st::basic_vector<listed_string_t> listed;
+    st::vector<listed_string_t> listed;
 
     /** A string put back together from a head and a tail before it lands in @c texts. */
-    st::basic_vector<char> whole;
+    st::vector<char> whole;
 
     /** Strings the page lists. */
     [[nodiscard]] std::size_t size() const noexcept { return listed.size(); }
@@ -158,20 +156,28 @@ struct strings_page_t {
 /**
  *  @brief Strings memory runs and an LSM tree of strings runs behind one published view, keyed by whole strings.
  *
- *  A reader announces itself in its ledger's epochs, loads the published stamp and then the view, and walks immutable
- *  runs with no lock. A committer seals its strings into one memory run on its own thread, and the ledger's leader
- *  publishes a view naming it ahead of the others. Merges of memory runs, flushes, compactions and truncations follow
- *  @c blobs::nvme_store, and are serialized by the database that owns the store. A string's newest version answers it,
- *  a removal included, and every version a pinned reader or a mount needs survives a merge.
+ *  A reader announces itself in its ledger's epochs, loads the published stamp and then the view,
+ *  and walks immutable runs with no lock. A committer seals its strings into one memory run on its
+ *  own thread, and the ledger's leader publishes a view naming it ahead of the others. Merges of
+ *  memory runs, flushes, compactions and truncations follow @c blobs::nvme_store, and are
+ *  serialized by the database that owns the store. A string's newest version answers it, a removal
+ *  included, and every version a pinned reader or a mount needs survives a merge.
  *
  *  @tparam atomic_reference_ The reference the published view, the budget and the ledger own their words through.
  *  @tparam waiter_type_ What a core waiting on a read, a barrier or the ledger does between attempts, before it parks.
+ *  @tparam strings_kit_type_ The StringZilla kernels every seal sorts and every transaction hashes
+ *      its strings through.
  */
-template <typename volume_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename volume_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          utilities::strings_kit_concept strings_kit_type_>
 class nvme_store {
   public:
 
 #pragma region Types
+
+    /** The StringZilla kernels every seal sorts and every transaction hashes
+     *  its strings through. */
+    using strings_kit_t = strings_kit_type_;
 
     /** The cell every run of this store holds: the head of a string and the 16 bytes of its value, in runs that carry
      *  the tails of their strings, which tell the strings of one head apart. */
@@ -366,7 +372,7 @@ class nvme_store {
         level_set_t const& levels = *view.levels;
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
-        st::basic_vector<cursor_t> cursors;
+        st::vector<cursor_t> cursors;
         if (cursors.reserve(runs) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A walk could not hold a cursor per run"};
         st::key128_t const from_head = head_of(from);
@@ -455,9 +461,8 @@ class nvme_store {
      *  @brief Sorts and copies @p deltas into one commit's sealed deltas for this store, on the committer's thread and
      *      off every shared path, and allocates the run they become; no deltas seal into no run.
      *  @param[in] deltas One delta per string, which this sorts in place: writes of one 16-byte key and removals.
-     *  @param[in] sort_order The StringZilla sort kernel src/ picked for the CPU.
      */
-    expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas, sz_kernel_sort_order_t sort_order) const noexcept {
+    expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas) const noexcept {
         for (keyed_delta_t const& each : deltas) {
             if (each.delta.kind == delta_kind_t::change_k)
                 return status_t {status_code_t::invalid_argument_k, "A string takes whole values and removals"};
@@ -466,7 +471,8 @@ class nvme_store {
         }
         sealed_commit_t sealed;
         if (deltas.empty()) return sealed;
-        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, sort_order, allocator_t {runs_.constraint()});
+        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, strings_kit_type_::sort_order,
+                                                                  allocator_t {runs_.constraint()});
         if (seal_status.failed()) return seal_status;
         sealed.deltas = std::move(sealed_deltas);
         sealed.run.reset(new (std::nothrow) memory_run_t {});
@@ -475,10 +481,9 @@ class nvme_store {
     }
 
     /** Seals one value per string of @p texts, a repeated string taking its last value, out of @p values cut by
-     *  @p sizes, each of which names 16 bytes, sorting through the kernel @p sort_order src/ picked. */
+     *  @p sizes, each of which names 16 bytes. */
     expected<sealed_commit_t> seal_writes(std::span<std::string_view const> texts, std::span<byte_t const> values,
-                                          std::span<stored_value_size_t const> sizes,
-                                          sz_kernel_sort_order_t sort_order) const noexcept {
+                                          std::span<stored_value_size_t const> sizes) const noexcept {
         if (sizes.size() != texts.size())
             return status_t {status_code_t::invalid_argument_k, "A batched insert names the size of every value"};
         std::uint64_t total = 0;
@@ -493,17 +498,16 @@ class nvme_store {
                                            delta_view_t {delta_kind_t::write_k, values.subspan(offset, sizes[index])}};
             offset += sizes[index];
         }
-        return seal_last_of_each_(deltas, sort_order);
+        return seal_last_of_each_(deltas);
     }
 
-    /** Seals a removal of every string of @p texts, sorting through the kernel @p sort_order src/ picked. */
-    expected<sealed_commit_t> seal_removals(std::span<std::string_view const> texts,
-                                            sz_kernel_sort_order_t sort_order) const noexcept {
+    /** Seals a removal of every string of @p texts. */
+    expected<sealed_commit_t> seal_removals(std::span<std::string_view const> texts) const noexcept {
         auto [deltas, deltas_status] = deltas_of_(texts.size());
         if (deltas_status.failed()) return deltas_status;
         for (std::size_t index = 0; index != texts.size(); ++index)
             deltas[index] = keyed_delta_t {texts[index], delta_view_t {delta_kind_t::remove_k, {}}};
-        return seal_last_of_each_(deltas, sort_order);
+        return seal_last_of_each_(deltas);
     }
 
     /** How full the memory runs of the published view would be with @p sealed beside them. */
@@ -690,7 +694,8 @@ class nvme_store {
                                drained.tails.size() + tails > ingested_tails_max_bytes_k;
         if (overflows && !drained.key_slots.empty() &&
             drained.key_slots.back().stored_key != head_of(rows.front().stored_key))
-            if (status_t const cut = write_ingested_run_(channel, drained, ingested.runs); cut.failed()) return cut;
+            if (status_t const written = write_ingested_run_(channel, drained, ingested.runs); written.failed())
+                return written;
         std::size_t const runs_before = ingested.runs.size();
         std::size_t const cells_before = drained.key_slots.size();
         std::size_t const tails_before = drained.tails.size();
@@ -714,9 +719,10 @@ class nvme_store {
      *  above every level holding their keys, flushing the memory runs first, as the blobs store does. */
     expected<transaction_stamp_t> publish_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
         if (!ingested.drained.key_slots.empty())
-            if (status_t const cut = write_ingested_run_(channel, ingested.drained, ingested.runs); cut.failed()) {
+            if (status_t const written = write_ingested_run_(channel, ingested.drained, ingested.runs);
+                written.failed()) {
                 drop_ingest(channel, ingested);
-                return cut;
+                return written;
             }
         return runs_.publish_ingest(channel, ingested.runs, [&]() noexcept { return flush(channel); });
     }
@@ -766,10 +772,10 @@ class nvme_store {
     using reading_t = typename published_runs_t::reading_t;
 
     /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
-    using stamped_deltas_t = st::basic_vector<stamped_delta_t>;
+    using stamped_deltas_t = st::vector<stamped_delta_t>;
 
     /** The deltas one batch of its own hands over. */
-    using deltas_t = st::basic_vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
+    using deltas_t = st::vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
 
     /** The newest version of one string a read found: what it does, and its bytes in a memory run or its position in a
      *  run of a level. */
@@ -803,11 +809,11 @@ class nvme_store {
 
     /** The columns one flush writes: cells holding the values in ascending order, their stamps, kinds, and tails. */
     struct drained_t {
-        st::basic_vector<key_slot_t> key_slots;
-        st::basic_vector<std::uint64_t> stamps;
-        st::basic_vector<std::uint8_t> kinds;
-        st::basic_vector<std::uint32_t> tail_offsets;
-        st::basic_vector<byte_t> tails;
+        st::vector<key_slot_t> key_slots;
+        st::vector<std::uint64_t> stamps;
+        st::vector<std::uint8_t> kinds;
+        st::vector<std::uint32_t> tail_offsets;
+        st::vector<byte_t> tails;
 
         /** Empties every column for the next run, keeping what they hold room for. */
         void clear() noexcept { key_slots.clear(), stamps.clear(), kinds.clear(), tail_offsets.clear(), tails.clear(); }
@@ -829,10 +835,10 @@ class nvme_store {
         drained_t drained;
 
         /** The runs written so far, in ascending order of their strings. */
-        st::basic_vector<sorted_run_t> runs;
+        st::vector<sorted_run_t> runs;
 
         /** The last string laid out, which the next one must ascend past. */
-        st::basic_vector<char> last;
+        st::vector<char> last;
     };
 
   private:
@@ -1017,8 +1023,7 @@ class nvme_store {
 
     /** Writes the cells, stamps, kinds and tails laid out so far as one run of stamp zero into @p runs, and empties
      *  them for the next. */
-    status_t write_ingested_run_(io_channel_t& channel, drained_t& drained,
-                                 st::basic_vector<sorted_run_t>& runs) noexcept {
+    status_t write_ingested_run_(io_channel_t& channel, drained_t& drained, st::vector<sorted_run_t>& runs) noexcept {
         if (runs.reserve(runs.size() + 1) != st::status_t::success_k ||
             drained.tail_offsets.push_back(static_cast<std::uint32_t>(drained.tails.size())) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "An ingest could not hold another run"};
@@ -1050,7 +1055,8 @@ class nvme_store {
             bool const full = drained.key_slots.size() >= blobs::storage_limits_t::memory_runs_max_deltas_k ||
                               drained.tails.size() + tail.size() > ingested_tails_max_bytes_k;
             if (full && !drained.key_slots.empty() && drained.key_slots.back().stored_key != head)
-                if (status_t const cut = write_ingested_run_(channel, drained, ingested.runs); cut.failed()) return cut;
+                if (status_t const written = write_ingested_run_(channel, drained, ingested.runs); written.failed())
+                    return written;
 
             key_slot_t built {};
             built.stored_key = head;
@@ -1076,11 +1082,11 @@ class nvme_store {
     }
 
     /** Seals the last delta of every string of @p deltas, which a batch naming a string twice takes. */
-    expected<sealed_commit_t> seal_last_of_each_(deltas_t& deltas, sz_kernel_sort_order_t sort_order) const noexcept {
-        auto [kept, sort_status] = sort_unique_strings(std::span<keyed_delta_t> {deltas}, sort_order, keep_t::last_k,
-                                                       deltas.get_allocator());
+    expected<sealed_commit_t> seal_last_of_each_(deltas_t& deltas) const noexcept {
+        auto [kept, sort_status] = sort_unique_strings(std::span<keyed_delta_t> {deltas}, strings_kit_type_::sort_order,
+                                                       keep_t::last_k, deltas.get_allocator());
         if (sort_status.failed()) return sort_status;
-        return seal(std::span<keyed_delta_t> {deltas.data(), kept}, sort_order);
+        return seal(std::span<keyed_delta_t> {deltas.data(), kept});
     }
 
 #pragma endregion Private Methods
@@ -1128,10 +1134,9 @@ class nvme_transaction {
     /** One delta a commit hands a store over. */
     using keyed_delta_t = keyed_delta<std::string_view>;
 
-    /** A transaction of @p database writing and watching nothing yet, joined to none, which seals its strings in
-     *  order through the StringZilla sort kernel @p sort_order src/ picked for the CPU. */
-    nvme_transaction(database_t& database, sz_kernel_sort_order_t sort_order) noexcept
-        : database_(&database), sort_order_(sort_order), writes_(place_hash_t {&tape_}, place_equals_t {&tape_}) {
+    /** A transaction of @p database writing and watching nothing yet, joined to none. */
+    explicit nvme_transaction(database_t& database) noexcept
+        : database_(&database), writes_(place_hash_t {&tape_}, place_equals_t {&tape_}) {
         share_.context = this;
         share_.prepare = &prepare_share_;
         share_.publish = &publish_share_;
@@ -1303,12 +1308,13 @@ class nvme_transaction {
 
     /** Hashes a string of a collection through StringZilla, the same whether a tape or a caller holds it. */
     struct place_hash_t {
-        st::basic_vector<char> const* tape = nullptr;
+        st::vector<char> const* tape = nullptr;
 
         [[nodiscard]] std::size_t hash_(collection_id_t const& collection, std::string_view text) const noexcept {
             // StringZilla takes no null pointer, which an empty string may view.
-            std::size_t const hashed = text.empty() ? 0 : sz::string_view_t {text}.hash();
-            return hashed ^ (collection_id_hash_t {}(collection) * 0x9E3779B97F4A7C15ull);
+            sz_u64_t hashed = 0;
+            if (!text.empty()) store_t::strings_kit_t::hash(text.data(), text.size(), 0, &hashed, nullptr);
+            return static_cast<std::size_t>(hashed) ^ (collection_id_hash_t {}(collection) * 0x9E3779B97F4A7C15ull);
         }
         std::size_t operator()(place_t const& place) const noexcept {
             return hash_(place.collection, std::string_view {tape->data() + place.offset, place.size});
@@ -1318,7 +1324,7 @@ class nvme_transaction {
 
     /** Tells two strings of a collection apart, whether a tape or a caller holds them. */
     struct place_equals_t {
-        st::basic_vector<char> const* tape = nullptr;
+        st::vector<char> const* tape = nullptr;
 
         [[nodiscard]] std::string_view text_(place_t const& place) const noexcept {
             return std::string_view {tape->data() + place.offset, place.size};
@@ -1378,8 +1384,8 @@ class nvme_transaction {
      *  memory runs are past twice their bounds. */
     status_t seal_() noexcept {
         sealed_.clear();
-        st::basic_vector<keyed_delta_t> deltas;
-        st::basic_vector<collection_id_t> collections;
+        st::vector<keyed_delta_t> deltas;
+        st::vector<collection_id_t> collections;
         status_t listed;
         [[maybe_unused]] st::status_t const walked = writes_.for_each([&](auto const& slot) noexcept {
             collection_id_t const collection = slot.key_ref().collection;
@@ -1401,7 +1407,7 @@ class nvme_transaction {
             if (status_t const made = with_store_(collection,
                                                   [&](store_t& store) noexcept -> status_t {
                                                       auto [commit, seal_status] = store.seal(
-                                                          std::span<keyed_delta_t> {deltas}, sort_order_);
+                                                          std::span<keyed_delta_t> {deltas});
                                                       if (seal_status.failed()) return seal_status;
                                                       sealed.commit = std::move(commit);
                                                       return {};
@@ -1489,26 +1495,23 @@ class nvme_transaction {
     /** The database every collection lives in, which outlives this. */
     database_t* database_ = nullptr;
 
-    /** The StringZilla kernel the strings of every seal are sorted by, which src/ picked for the CPU. */
-    sz_kernel_sort_order_t sort_order_ = nullptr;
-
     /** Every string this transaction wrote or watched, back to back. */
-    st::basic_vector<char> tape_;
+    st::vector<char> tape_;
 
     /** The last write of every string, located on the tape. */
     writes_t writes_;
 
     /** Every string read and watched. */
-    st::basic_vector<read_watch_t> reads_;
+    st::vector<read_watch_t> reads_;
 
     /** Every closed range of strings a walk listed. */
-    st::basic_vector<range_watch_t> ranges_;
+    st::vector<range_watch_t> ranges_;
 
     /** Every prefix a walk passed the end of, beside the string it walked from. */
-    st::basic_vector<range_watch_t> prefixes_;
+    st::vector<range_watch_t> prefixes_;
 
     /** The strings sealed per written collection, between a stage or a commit and its landing. */
-    st::basic_vector<sealed_collection_t> sealed_;
+    st::vector<sealed_collection_t> sealed_;
 
     /** What joins this to a database transaction. */
     transaction_share_t share_;

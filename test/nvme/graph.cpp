@@ -16,15 +16,16 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::strlen`
 
-#include <algorithm> // `std::sort`, `std::ranges::equal`
+#include <algorithm> // `std::sort`
 #include <array>     // `std::array`
-#include <atomic>    // `std::atomic`
 #include <set>       // `std::set`
 #include <thread>    // `std::thread`
 #include <tuple>     // `std::tuple`
 #include <vector>    // `std::vector`
 
 #include <fmt/format.h>
+
+#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
 
 #include "ustore/ustore.hpp"
 
@@ -68,7 +69,7 @@ constexpr std::size_t bottom_rounds_k = 32;
 
 #pragma endregion Shape
 
-#pragma region Helpers
+#pragma region Edge Fixtures
 
 /** Opens the NVMe engine over @p directory, every collection flushing past @p memory_runs_bytes when not zero, every
  *  level @p enlarge_factor times the one above, and every value @p value_size bytes when not zero. */
@@ -111,7 +112,7 @@ std::size_t expect_degree(graph_collection_t& graph, std::uint64_t vertex, ustor
     return failures;
 }
 
-#pragma endregion Helpers
+#pragma endregion Edge Fixtures
 
 #pragma region Model
 
@@ -292,14 +293,14 @@ case_result_t concurrent_adds_commit(char const* directory) {
     failures += expect(reading.commit().has_value());
     failures += expect_degree(graph, 0, 3);
 
-    std::atomic<std::size_t> refused {0};
+    std::size_t refused = 0;
     std::vector<std::thread> threads;
     for (std::size_t thread = 0; thread != adding_threads_k; ++thread)
         threads.emplace_back([&, thread] {
             for (std::size_t round = 0; round != transactions_per_thread_k; ++round) {
                 auto [transaction, begin_status] = database.transaction();
                 if (begin_status.failed()) {
-                    refused.fetch_add(1);
+                    fu::standard_atomic_ref<std::size_t> {refused}.add(1, std::memory_order_relaxed);
                     continue;
                 }
                 auto [adding, adding_status] = transaction.find<graph_collection_t>("adds");
@@ -307,11 +308,11 @@ case_result_t concurrent_adds_commit(char const* directory) {
                 bool const committed = adding_status.succeeded() &&
                                        adding.write_edge(edge_of(0, leaf, leaf)).succeeded() &&
                                        transaction.commit().has_value();
-                if (!committed) refused.fetch_add(1);
+                if (!committed) fu::standard_atomic_ref<std::size_t> {refused}.add(1, std::memory_order_relaxed);
             }
         });
     for (std::thread& thread : threads) thread.join();
-    failures += expect_eq(refused.load(), 0u);
+    failures += expect_eq(fu::standard_atomic_ref<std::size_t> {refused}.load(std::memory_order_acquire), 0u);
     failures += expect_degree(graph, 0, 3 + adding_threads_k * transactions_per_thread_k);
     return failures;
 }

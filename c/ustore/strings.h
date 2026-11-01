@@ -4,12 +4,14 @@
  *  @date September 16, 2026
  *  @brief The binary interface for collections mapping variable-length strings onto keys of other collections.
  *
- *  Strings live in collections created with @c ustore_modality_strings_k, which map every string onto exactly one
- *  @c ustore_key_t: names, paths and terms resolved into the keys every other modality uses. Each engine keys such a
- *  collection by the strings themselves, so a prefix walk is an ordered walk of its own keyspace; the other calls
- *  refuse such a collection, and these calls refuse every other one. Strings arrive as @c ustore_strings_view_t and
- *  their values as @c ustore_keys_view_t, so this header mirrors @c blobs.h with strings in place of keys and keys in
- *  place of values.
+ *  Strings live in collections created with @c ustore_modality_strings_k, which
+ *  map every string onto exactly one @c ustore_key_t: names, paths and terms
+ *  resolved into the keys every other modality uses. Each engine keys such a
+ *  collection by the strings themselves, so a prefix walk is an ordered walk of
+ *  its own keyspace; the other calls refuse such a collection, and these calls
+ *  refuse every other one. Strings arrive as @c ustore_strings_view_t and their
+ *  values as @c ustore_keys_view_t, so this header mirrors @c blobs.h with strings
+ *  in place of keys and keys in place of values.
  *
  *  Strings order by their bytes, unsigned, and a prefix walk hands them over in that order. Every value is one key,
  *  so a strings collection holds no empty values, and @c ustore_drop_values_k refuses it.
@@ -72,10 +74,9 @@ typedef struct ustore_strings_write_t {
  *    table is full, or a callback blocks on the executor running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections, @c strings or @c values are missing,
- *    the strings come in an unknown layout, the @c transaction belongs to another engine or is
- *    staged, a flushed write names a @c transaction on the RAM engine, or a collection holds another
- *    modality.
+ *  - @c ustore_status_invalid_argument_k The @c collections, @c strings or @c values are missing or
+ *    malformed, the @c transaction is foreign or staged, the @c durability or @c watch is unknown,
+ *    a flushed write names a @c transaction, or a collection holds another modality.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
@@ -128,10 +129,12 @@ typedef struct ustore_strings_remove_t {
  *    table is full, or a callback blocks on the executor running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections or @c strings are missing, the strings
- *    come in an unknown layout, the @c transaction belongs to another engine or is staged, a
- *    flushed remove names a @c transaction on the RAM engine, or a collection holds another
- *    modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections or @c strings are missing, the
+ *  strings come in an unknown layout, the @c transaction belongs to another engine or is staged,
+ *  the @c durability or @c watch is unknown, a flushed remove names a @c transaction, or a
+ *  collection holds another modality.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
@@ -274,12 +277,13 @@ typedef struct ustore_strings_scan_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
- *    prefixes or start strings come in an unknown layout, a pattern kind, a case sensitivity or a
- *    predicate cost is unknown, the @c mode is unknown under @c patterns or a predicate, the
- *    @c patterns do not compile, the @c view was made by neither view constructor or belongs to
- *    another engine, a watching scan goes through a staged transaction, or a collection holds
- *    another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is
+ *  missing, the prefixes or start strings come in an unknown layout, a pattern kind, a case
+ *  sensitivity or a predicate cost is unknown, the @c mode is unknown under @c patterns or a
+ *  predicate, the @c patterns do not compile, the @c view was made by neither view constructor or
+ *  belongs to another engine, a watching scan goes through a staged transaction, or a collection
+ *  holds a modality other than strings.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, or a callback blocks on the executor
@@ -401,8 +405,8 @@ typedef struct ustore_strings_cursor_next_t {
  *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or an output is @c NULL, the
  *    cursor walks another database, a watching pull goes through a staged transaction, or the
  *    collection holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes, or a cursor opened
- *    for a device is pulled on host threads.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
+ *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
  *    another call, the executor's deferred table is full, or a callback blocks on the executor
  *    running it.

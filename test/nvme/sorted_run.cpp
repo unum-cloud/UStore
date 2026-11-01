@@ -4,10 +4,11 @@
  *  @date September 19, 2026
  *  @brief The sorted run over the ring: what it writes, what it refuses to open, and how deep it reads.
  *
- *  The result this file exists for is @c truncated_index: a run whose index does not read whole is a
- *  truncated run and must answer @c malformed_k rather than attaching over a half-filled index, which
- *  is the failure a mapped index could never report. The rest holds the layout to a byte-for-byte
- *  round trip at both ends of the value sizes it admits, and every section of the blob to its page boundary.
+ *  The result this file exists for is @c truncated_index: a run whose index does not read whole is
+ *  a truncated run and must answer @c malformed_k rather than attaching over a half-filled index,
+ *  which is the failure a mapped index could never report. The rest holds the layout to a
+ *  byte-for-byte round trip at both ends of the value sizes it admits, and every section of the
+ *  blob to its page boundary.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -18,19 +19,21 @@
 #include <array>   // `std::array`
 #include <memory>  // `std::unique_ptr`
 #include <span>    // `std::span`
-#include <string>  // `std::string`, `std::to_string`
+#include <string>  // `std::string`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/nvme_channels.hpp" // `basic_read_pipeline`, `basic_write_pipeline`
 #include "ustore/blobs/nvme_key_slot.hpp"     // `key_slot`
 #include "ustore/blobs/nvme_sorted_run.hpp"   // `lsm_sorted_run`, `sorted_run_layout`
 #include "ustore/strings/nvme_store.hpp"      // `head_of`, `tail_of`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
+#include "nvme/fixture.hpp" // `run_on_transport`, `painted`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -82,16 +85,16 @@ struct run_types {
 #pragma region Builders
 
 /** One stamp per key slot of a run of @p count distinct keys, the commits that wrote them in key order. */
-inline st::basic_vector<std::uint64_t> ascending_stamps(std::size_t count) {
-    st::basic_vector<std::uint64_t> stamps;
+inline st::vector<std::uint64_t> ascending_stamps(std::size_t count) {
+    st::vector<std::uint64_t> stamps;
     [[maybe_unused]] st::status_t const sized = stamps.resize(count);
     for (std::size_t index = 0; index != stamps.size(); ++index) stamps[index] = index + 1;
     return stamps;
 }
 
 /** One kind per key slot of a run of @p count writes. */
-inline st::basic_vector<std::uint8_t> written_kinds(std::size_t count) {
-    st::basic_vector<std::uint8_t> kinds;
+inline st::vector<std::uint8_t> written_kinds(std::size_t count) {
+    st::vector<std::uint8_t> kinds;
     [[maybe_unused]] st::status_t const sized = kinds.resize(count);
     for (std::uint8_t& kind : kinds) kind = static_cast<std::uint8_t>(delta_kind_t::write_k);
     return kinds;
@@ -101,19 +104,19 @@ inline st::basic_vector<std::uint8_t> written_kinds(std::size_t count) {
 struct variable_data_t {
 
     /** Key slots in ascending order of their keys. */
-    st::basic_vector<variable_slot_t> key_slots;
+    st::vector<variable_slot_t> key_slots;
 
     /** The values back to back, in the order of their key slots. */
-    st::basic_vector<byte_t> values;
+    st::vector<byte_t> values;
 
     /** Where each value starts inside @c values and one past the last, as the run's value offsets column. */
-    st::basic_vector<stored_value_offset_t> offsets;
+    st::vector<stored_value_offset_t> offsets;
 
     /** Bytes the value of every key slot holds, which a read is checked against. */
-    st::basic_vector<std::uint64_t> sizes;
+    st::vector<std::uint64_t> sizes;
 
     /** The @c delta_kind_t of every key slot. */
-    st::basic_vector<std::uint8_t> kinds;
+    st::vector<std::uint8_t> kinds;
 };
 
 /**
@@ -160,9 +163,9 @@ template <typename run_type_>
                                                 variable_data_t const& data) {
     std::size_t failures = 0;
     std::size_t const count = data.sizes.size();
-    st::basic_vector<std::uint64_t> seen;
+    st::vector<std::uint64_t> seen;
     failures += expect(seen.resize(count) == st::status_t::success_k);
-    st::basic_vector<std::uint64_t> positions;
+    st::vector<std::uint64_t> positions;
     failures += expect(positions.resize(count) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count; ++index) {
@@ -264,13 +267,13 @@ std::size_t fixed_width_run_reads_back(mount_type_ const& mount) {
     failures += expect(volume.has_value());
     if (!volume) return failures;
 
-    st::basic_vector<fixed_slot_t> key_slots;
-    st::basic_vector<byte_t> values;
+    st::vector<fixed_slot_t> key_slots;
+    st::vector<byte_t> values;
     failures += expect(key_slots.resize(count_k) == st::status_t::success_k);
     failures += expect(values.resize(count_k * value_size_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     // Every seventh key is a removal, whose stride the run still spends and leaves zeroed.
-    st::basic_vector<std::uint8_t> kinds = written_kinds(count_k);
+    st::vector<std::uint8_t> kinds = written_kinds(count_k);
     for (std::size_t index = 0; index != count_k; ++index) {
         fixed_slot_t slot;
         slot.stored_key = key_of(index);
@@ -305,13 +308,13 @@ std::size_t fixed_width_run_reads_back(mount_type_ const& mount) {
         failures += expect_eq(window.bytes, std::uint32_t {value_size_k});
     }
 
-    st::basic_vector<std::uint64_t> positions;
+    st::vector<std::uint64_t> positions;
     failures += expect(positions.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) positions[index] = index;
 
     std::size_t mismatches = 0;
-    st::basic_vector<std::uint64_t> seen;
+    st::vector<std::uint64_t> seen;
     failures += expect(seen.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) seen[index] = 0;
@@ -349,7 +352,7 @@ std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
     failures += expect(volume.has_value());
     if (!volume) return failures;
 
-    st::basic_vector<inline_slot_t> key_slots;
+    st::vector<inline_slot_t> key_slots;
     failures += expect(key_slots.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) {
@@ -367,7 +370,7 @@ std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
     failures += expect(written.has_value());
     if (!written) return failures;
 
-    st::basic_vector<std::uint64_t> positions;
+    st::vector<std::uint64_t> positions;
     failures += expect(positions.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) positions[index] = index;
@@ -401,7 +404,7 @@ std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
 /** Reads @p length bytes from @p offset of @p blob into @p into, a page-aligned range a block at a time. */
 template <typename disk_type_>
 status_t read_raw(disk_type_& disk, io_channel_t& channel, volume_blob_t const& blob, std::uint64_t offset,
-                  std::uint64_t length, st::basic_vector<byte_t>& into) noexcept {
+                  std::uint64_t length, st::vector<byte_t>& into) noexcept {
     if (into.resize(static_cast<std::size_t>(length)) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "No room for the raw bytes"};
     std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
@@ -485,27 +488,27 @@ std::size_t sections_sit_on_page_boundaries(mount_type_ const& mount) {
         failures += expect_eq(trailer_section % portable_alignment_k, std::uint64_t {0});
 
         // The header, the offsets and the values read raw off the blob as the run was handed them.
-        st::basic_vector<byte_t> raw;
+        st::vector<byte_t> stored_bytes;
         failures += expect(
-            read_raw((*fixture)->disk, guard->channel(), run->blob(), 0, values_section, raw).succeeded());
+            read_raw((*fixture)->disk, guard->channel(), run->blob(), 0, values_section, stored_bytes).succeeded());
         if (failures != 0) return failures;
         sorted_run_header_t header {};
-        std::memcpy(&header, raw.data(), sizeof(header));
+        std::memcpy(&header, stored_bytes.data(), sizeof(header));
         failures += expect_eq(header.format_version, std::uint32_t {1});
         failures += expect_eq(header.key_slot_bytes, std::uint32_t {sizeof(variable_slot_t)});
         failures += expect_eq(header.stored_values_bytes, std::uint64_t {data.values.size()});
         std::size_t wrong_offsets = 0;
         for (std::size_t index = 0; index <= count; ++index) {
             stored_value_offset_t offset = 0;
-            std::memcpy(&offset, raw.data() + offsets_section + index * sizeof(offset), sizeof(offset));
+            std::memcpy(&offset, stored_bytes.data() + offsets_section + index * sizeof(offset), sizeof(offset));
             wrong_offsets += offset != data.offsets[index];
         }
         failures += expect_eq(wrong_offsets, std::size_t {0});
         if (!data.values.empty()) {
             failures += expect(read_raw((*fixture)->disk, guard->channel(), run->blob(), values_section,
-                                        round_up_to_multiple(data.values.size(), portable_alignment_k), raw)
+                                        round_up_to_multiple(data.values.size(), portable_alignment_k), stored_bytes)
                                    .succeeded());
-            failures += expect(same_bytes(std::span<byte_t const> {raw}.first(data.values.size()),
+            failures += expect(same_bytes(std::span<byte_t const> {stored_bytes}.first(data.values.size()),
                                           std::span<byte_t const> {data.values}));
         }
 
@@ -572,13 +575,13 @@ std::size_t split_write_matches_write(mount_type_ const& mount) {
         1025, [](std::size_t index) -> std::int64_t { return index % 11 == 5 ? -1 : std::int64_t(index * 37 % 300); },
         data);
     if (failures != 0) return failures;
-    st::basic_vector<std::uint64_t> const stamps = ascending_stamps(data.key_slots.size());
+    st::vector<std::uint64_t> const stamps = ascending_stamps(data.key_slots.size());
     std::span<variable_slot_t const> const key_slots {data.key_slots};
     std::span<byte_t const> const values {data.values};
     std::span<stored_value_offset_t const> const offsets {data.offsets};
     uuid_t const content_id = uuid_generator();
 
-    st::basic_vector<byte_t> whole_bytes;
+    st::vector<byte_t> whole_bytes;
     {
         expected<variable_run_t> whole = variable_run_t::write(
             *volume, guard->channel(), content_id, key_slots, std::span<std::uint64_t const> {stamps},
@@ -602,7 +605,7 @@ std::size_t split_write_matches_write(mount_type_ const& mount) {
     expected<variable_run_t> split = variable_run_t::seal_and_attach(*volume, guard->channel(), *reservation);
     failures += expect(split.has_value());
     if (!split) return failures;
-    st::basic_vector<byte_t> split_bytes;
+    st::vector<byte_t> split_bytes;
     failures += expect(
         read_raw((*fixture)->disk, guard->channel(), split->blob(), 0, split->blob().length, split_bytes).succeeded());
     failures += expect(same_bytes(std::span<byte_t const> {whole_bytes}, std::span<byte_t const> {split_bytes}));
@@ -845,22 +848,22 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
     variable_data_t alone;
     failures += build_variable(1, [](std::size_t) { return std::int64_t {7}; }, alone);
     if (failures != 0) return failures;
-    uuid_t const one_id = uuid_generator();
-    expected<variable_run_t> one = variable_run_t::write(
-        *volume, guard->channel(), one_id, std::span<variable_slot_t const> {alone.key_slots},
+    uuid_t const alone_id = uuid_generator();
+    expected<variable_run_t> alone_run = variable_run_t::write(
+        *volume, guard->channel(), alone_id, std::span<variable_slot_t const> {alone.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(alone.key_slots.size())},
         std::span<std::uint8_t const> {alone.kinds}, 0, std::span<byte_t const> {alone.values},
         std::span<stored_value_offset_t const> {alone.offsets}, 4096);
-    failures += expect(one.has_value());
-    if (!one) return failures;
-    failures += expect_eq(one->population_count(), std::uint64_t {1});
-    failures += expect_eq(one->lower_stored_key(), key_of(0));
-    failures += expect_eq(one->upper_stored_key(), key_of(0));
+    failures += expect(alone_run.has_value());
+    if (!alone_run) return failures;
+    failures += expect_eq(alone_run->population_count(), std::uint64_t {1});
+    failures += expect_eq(alone_run->lower_stored_key(), key_of(0));
+    failures += expect_eq(alone_run->upper_stored_key(), key_of(0));
     std::uint64_t position = 0;
-    failures += expect(one->find(key_of(0), position) == lookup_result_t::written_k);
+    failures += expect(alone_run->find(key_of(0), position) == lookup_result_t::written_k);
     failures += expect_eq(position, std::uint64_t {0});
-    failures += expect(one->find(key_of(1), position) == lookup_result_t::missing_k);
-    failures += check_variable_values(*one, guard->channel(), alone);
+    failures += expect(alone_run->find(key_of(1), position) == lookup_result_t::missing_k);
+    failures += check_variable_values(*alone_run, guard->channel(), alone);
 
     variable_data_t none;
     failures += build_variable(0, [](std::size_t) { return std::int64_t {0}; }, none);
@@ -884,8 +887,8 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
     failures += check_variable_values(*empty, guard->channel(), none);
 
     // Both survive a reopen, which is where a zero-length index would have been read anyway.
-    expected<variable_run_t> reopened_one = variable_run_t::open(*volume, guard->channel(), one_id);
-    failures += expect(reopened_one.has_value());
+    expected<variable_run_t> reopened_alone = variable_run_t::open(*volume, guard->channel(), alone_id);
+    failures += expect(reopened_alone.has_value());
     expected<variable_run_t> reopened_empty = variable_run_t::open(*volume, guard->channel(), empty_id);
     failures += expect(reopened_empty.has_value());
     if (reopened_empty) failures += expect_eq(reopened_empty->population_count(), std::uint64_t {0});
@@ -1090,7 +1093,7 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
 
     // The run's own batched read holds as many blocks as the queue pair has credit, counted in the pool
     // because the ring performs a channel's requests inside the poll that hands them to the sink.
-    st::basic_vector<std::uint64_t> positions;
+    st::vector<std::uint64_t> positions;
     failures += expect(positions.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) positions[index] = index;
@@ -1142,9 +1145,9 @@ std::size_t tails_read_back(mount_type_ const& mount) {
                                             "shared-prefix!!" + long_tail,
                                             "zz"};
     std::array<std::uint64_t, 9> const stamps {3, 4, 5, 9, 6, 7, 8, 10, 11};
-    st::basic_vector<tailed_slot_t> key_slots;
-    st::basic_vector<std::uint8_t> kinds;
-    st::basic_vector<std::uint32_t> tail_offsets;
+    st::vector<tailed_slot_t> key_slots;
+    st::vector<std::uint8_t> kinds;
+    st::vector<std::uint32_t> tail_offsets;
     std::string tails;
     failures += expect(key_slots.resize(texts.size()) == st::status_t::success_k);
     failures += expect(kinds.resize(texts.size()) == st::status_t::success_k);

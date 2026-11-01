@@ -2,30 +2,33 @@
  *  @file include/ustore/utilities/blocking_files.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
- *  @brief Whole-file mappings, directory queries and shared libraries opened by name, that block the calling thread.
+ *  @brief Whole-file mappings, paths joined into one buffer, directories created and removed, and
+ *      shared libraries opened by name, all blocking the calling thread.
  */
 
 #pragma once
 
-#include <cerrno>  // `errno`, `ENOENT`, `ENOTDIR`
+#include <cerrno>  // `errno`, `EEXIST`, `ENOENT`, `ENOTDIR`
 #include <cstddef> // `std::size_t`
+#include <cstring> // `std::memcpy`, `std::strlen`
 
 #if defined(_WIN32)
-#include <windows.h> // `CreateFileW`, `MapViewOfFile`, `GetFileAttributesW`
+#include <windows.h> // `CreateFileW`, `MapViewOfFile`, `GetFileAttributesW`, `CreateDirectoryA`, `DeleteFileA`
 #else
 #include <dlfcn.h>    // `dlopen`, `dlsym`
 #include <fcntl.h>    // `open`
 #include <sys/mman.h> // `mmap`, `madvise`, `munmap`
-#include <sys/stat.h> // `stat`, `fstat`, `S_ISDIR`
-#include <unistd.h>   // `close`
+#include <sys/stat.h> // `stat`, `fstat`, `S_ISDIR`, `mkdir`
+#include <unistd.h>   // `close`, `rmdir`, `unlink`
 #endif
 
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::exchange`, `std::swap`
 
-#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `byte_t`
+#include "ustore/utilities/types.hpp" // `status_t`, `expected`
 
 namespace unum::ustore::utilities {
 
@@ -47,6 +50,24 @@ inline int widen_path(char const* path, wide_path_t const& wide, std::size_t res
 }
 
 #endif
+
+/** Bytes a path of this engine may span, which bounds the one buffer a mount joins paths in. */
+inline constexpr std::size_t path_max_bytes_k = 4096;
+
+/** Writes the directory, a separator and the name into @p into, or refuses a path the buffer
+ *  will not hold. */
+inline status_t join_path(char const* directory, char const* name, std::span<char> into) noexcept {
+    std::size_t const directory_bytes = std::strlen(directory);
+    std::size_t const name_bytes = std::strlen(name);
+    if (directory_bytes + name_bytes + 2 > into.size())
+        return {status_code_t::invalid_argument_k, "A path of the database outgrew the platform's limit"};
+
+    std::memcpy(into.data(), directory, directory_bytes);
+    std::size_t written = directory_bytes;
+    if (written != 0 && into[written - 1] != '/' && into[written - 1] != '\\') into[written++] = '/';
+    std::memcpy(into.data() + written, name, name_bytes + 1);
+    return {};
+}
 
 #pragma endregion Paths
 
@@ -287,6 +308,71 @@ inline expected<bool> directory_exists(char const* path) noexcept {
 }
 
 #endif
+
+#if defined(_WIN32)
+
+/** Creates @p path alone, treating a directory that is already there as success. */
+inline status_t create_directory(char const* path) noexcept {
+    if (CreateDirectoryA(path, nullptr) != 0 || GetLastError() == ERROR_ALREADY_EXISTS) return {};
+    return {status_code_t::io_k, "A directory of the database would not be created"};
+}
+
+/** Removes the file @p path, treating one that is already gone as success. */
+inline status_t remove_file(char const* path) noexcept {
+    if (DeleteFileA(path) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND) return {};
+    return {status_code_t::io_k, "A file of the database would not be removed"};
+}
+
+/** Removes the empty directory @p path, treating one that is already gone as success. */
+inline status_t remove_directory(char const* path) noexcept {
+    if (RemoveDirectoryA(path) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND) return {};
+    return {status_code_t::io_k, "A directory of the database would not be removed"};
+}
+
+#else
+
+/** Creates @p path alone, treating a directory that is already there as success. */
+inline status_t create_directory(char const* path) noexcept {
+    if (::mkdir(path, 0755) == 0 || errno == EEXIST) return {};
+    return {status_code_t::io_k, "A directory of the database would not be created"};
+}
+
+/** Removes the file @p path, treating one that is already gone as success. */
+inline status_t remove_file(char const* path) noexcept {
+    if (::unlink(path) == 0 || errno == ENOENT) return {};
+    return {status_code_t::io_k, "A file of the database would not be removed"};
+}
+
+/** Removes the empty directory @p path, treating one that is already gone as success. */
+inline status_t remove_directory(char const* path) noexcept {
+    if (::rmdir(path) == 0 || errno == ENOENT) return {};
+    return {status_code_t::io_k, "A directory of the database would not be removed"};
+}
+
+#endif
+
+/**
+ *  @brief Creates @p path and every parent it needs, which a mount does before it opens
+ *      a volume there.
+ *
+ *  @note Only the last component has to be created; an intermediate that refuses, such as a Windows
+ *      drive letter, is passed over rather than reported.
+ */
+inline status_t create_directories(char const* path) noexcept {
+    char components[path_max_bytes_k];
+    std::size_t const length = std::strlen(path);
+    if (length == 0 || length >= sizeof(components))
+        return {status_code_t::invalid_argument_k, "A directory path is one byte to the platform's limit"};
+    std::memcpy(components, path, length + 1);
+
+    for (std::size_t index = 1; index != length; ++index) {
+        if (components[index] != '/' && components[index] != '\\') continue;
+        components[index] = '\0';
+        [[maybe_unused]] status_t const parent = create_directory(components);
+        components[index] = path[index];
+    }
+    return create_directory(components);
+}
 
 #pragma endregion Directories
 

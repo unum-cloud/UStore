@@ -959,16 +959,16 @@ static ustore_py_verb_t const ingest_verb = {sizeof(arrow_call_t), ingest_submit
  *      @p order is not NULL.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int arrow_keywords(ustore_py_context_t const* context, char const* verb, PyObject* const* args,
-                          Py_ssize_t positional_args_count, PyObject* args_names_tuple,
+static int arrow_keywords(ustore_py_context_t const* context, char const* verb, PyObject* const* arguments,
+                          Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
                           ustore_py_verb_options_t* options, ustore_ingest_order_t* order) {
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked(verb, positional_args_count,
-                                                                           args_names_tuple, 1);
-    if (args_names_count < 0) return -1;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(verb, positional_arguments_count,
+                                                                                 keyword_names_tuple, 1);
+    if (keyword_names_count < 0) return -1;
     ustore_py_verb_options_init(options);
-    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[positional_args_count + names_progress];
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
         if (order && PyUnicode_CompareWithASCIIString(name, "order") == 0) {
             Py_ssize_t length = 0;
             char const* const spelled = PyUnicode_Check(value) ? PyUnicode_AsUTF8AndSize(value, &length) : NULL;
@@ -1031,18 +1031,19 @@ char const doc_ingest_arrow[] =                                                 
     "  TypeError: The receiver is a transaction, which no ingest joins.\n"                      //
     "  UnsupportedError: The engine ingests no stream.";
 
-PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple) {
+PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0 ||
-        arrow_keywords(&context, "import_arrow", args, positional_args_count, args_names_tuple, &options, NULL) != 0)
+        arrow_keywords(&context, "import_arrow", arguments, positional_arguments_count, keyword_names_tuple, &options,
+                       NULL) != 0)
         return NULL;
     arrow_call_t stack;
     arrow_call_t* const call = ustore_py_call_open(&context, &import_verb, &stack);
     if (!call) return NULL;
     call->call.collection = options.collection;
-    if (stream_from_object(args[0], &call->stream, &call->single) != 0)
+    if (stream_from_object(arguments[0], &call->stream, &call->single) != 0)
         return ustore_py_call_discard(&context, &import_verb, call);
     import_loop_t loop = {
         .arrow = {.database = context.database_handle,
@@ -1057,13 +1058,14 @@ PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* args, Py_s
     return ustore_py_call_run(&context, &import_verb, call, &loop);
 }
 
-PyObject* ustore_py_api_ingest_arrow(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple) {
+PyObject* ustore_py_api_ingest_arrow(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     ustore_ingest_order_t order = ustore_ingest_sorted_k;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0 ||
-        arrow_keywords(&context, "ingest_arrow", args, positional_args_count, args_names_tuple, &options, &order) != 0)
+        arrow_keywords(&context, "ingest_arrow", arguments, positional_arguments_count, keyword_names_tuple, &options,
+                       &order) != 0)
         return NULL;
     if (context.transaction) {
         PyErr_SetString(PyExc_TypeError, "An ingest commits on its own and joins no transaction; call it on the head");
@@ -1073,7 +1075,7 @@ PyObject* ustore_py_api_ingest_arrow(PyObject* self, PyObject* const* args, Py_s
     arrow_call_t* const call = ustore_py_call_open(&context, &ingest_verb, &stack);
     if (!call) return NULL;
     call->call.collection = options.collection;
-    if (stream_from_object(args[0], &call->stream, &call->single) != 0)
+    if (stream_from_object(arguments[0], &call->stream, &call->single) != 0)
         return ustore_py_call_discard(&context, &ingest_verb, call);
     ingest_loop_t loop = {
         .arrow = {.database = context.database_handle,

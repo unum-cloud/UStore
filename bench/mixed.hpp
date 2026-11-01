@@ -43,7 +43,7 @@ template <typename nested_type_>
 
 /** Copies every element of the sequence of sequences @p outer into @p flat, answering false when it cannot grow. */
 template <typename nested_type_, typename element_type_>
-[[nodiscard]] bool flatten(nested_type_ const& outer, st::basic_vector<element_type_>& flat) noexcept {
+[[nodiscard]] bool flatten(nested_type_ const& outer, st::vector<element_type_>& flat) noexcept {
     if (st::failed(flat.reserve(pass_through_size(outer)))) return false;
     for (auto const& inner : outer)
         for (auto const& element : inner) {
@@ -72,12 +72,14 @@ struct upsert_scratch_t {
         return !failed();
     }
 
-    /** Commits the open transaction, answering false on a conflict or a failure. */
-    [[nodiscard]] bool commit(ustore_database_t database) noexcept {
+    /** Commits the open transaction as durable as @p durability asks, answering false on a conflict
+     *  or a failure. */
+    [[nodiscard]] bool commit(ustore_database_t database, ustore_durability_t durability) noexcept {
         ustore_transaction_commit_t commit {};
         commit.database = database;
         commit.outcome = &outcome;
         commit.transaction = transaction;
+        commit.durability = durability;
         ustore_transaction_commit(&commit);
         return !failed();
     }
@@ -90,9 +92,11 @@ struct upsert_scratch_t {
     }
 };
 
-/** Upserts @p batch into @p collection in one transaction, answering whether it committed. */
+/** Upserts @p batch into @p collection in one transaction committed as @p durability asks,
+ *  answering whether it committed. */
 [[nodiscard]] inline bool docs_upsert(ustore_database_t database, ustore_collection_id_t collection,
-                                      std::span<keyed_document_t const> batch, upsert_scratch_t& scratch) noexcept {
+                                      std::span<keyed_document_t const> batch, ustore_durability_t durability,
+                                      upsert_scratch_t& scratch) noexcept {
     if (!scratch.begin(database)) return false;
     strided_strings<std::string_view> const bodies {strided(batch).members(&keyed_document_t::body).begin()};
     ustore_docs_write_t write {};
@@ -106,7 +110,7 @@ struct upsert_scratch_t {
     write.keys = {&batch.front().key, sizeof(keyed_document_t)};
     write.values = bodies.view();
     ustore_docs_write(&write);
-    return !scratch.failed() && scratch.commit(database);
+    return !scratch.failed() && scratch.commit(database, durability);
 }
 
 /** Upserts @p batch into @p collection in one transaction, answering whether it committed. */
@@ -123,7 +127,7 @@ struct upsert_scratch_t {
     write.sources = {&batch.front().source, sizeof(edge_t)};
     write.targets = {&batch.front().target, sizeof(edge_t)};
     ustore_graph_write_edges(&write);
-    return !scratch.failed() && scratch.commit(database);
+    return !scratch.failed() && scratch.commit(database, ustore_durability_buffered_k);
 }
 
 } // namespace unum::ustore::bench

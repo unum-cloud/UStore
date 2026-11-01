@@ -1,4 +1,9 @@
-"""Snapshots over the C ABI: capturing a point in time and reading it back through every read verb."""
+"""Snapshots over the C ABI: capturing a point in time and reading it back through every read verb.
+
+File: test/snapshots.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import pytest
 from capabilities import NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, keys, open_engine
@@ -143,6 +148,17 @@ def test_a_cancelled_save_leaves_nothing_behind(database, blobs, engine: str, tm
         snapshot.save(directory)
     with open_engine(engine, directory) as reopened:
         assert reopened.get(255, collection=blobs) == b"v" * 256
+
+
+def test_a_snapshot_keeps_its_collections_from_a_drop(database, engine: str):
+    """A snapshot belongs to its holder, so the RAM and RocksDB engines drop no collection under it."""
+    people = database.collection_create("people", modality=ustore.Modality.BLOBS)
+    with database.snapshot():
+        if engine in ("ram", "rocksdb"):
+            with pytest.raises(ustore.InvalidArgumentError):
+                database.collection_drop(people)
+        else:
+            database.collection_drop(people)
 
 
 def test_save_needs_a_view_of_a_snapshot(database, tmp_path):

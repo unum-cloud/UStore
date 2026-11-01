@@ -211,13 +211,13 @@ static PyObject* arena_made(PyTypeObject* type, ustore_executor_t executor) {
 
 PyObject* ustore_py_arena_new(ustore_executor_t executor) { return arena_made(&ArenaType, executor); }
 
-static PyObject* Arena_tp_new(PyTypeObject* type, PyObject* args, PyObject* keywords) {
-    Py_ssize_t const positional_args_count = PyTuple_GET_SIZE(args);
-    if (positional_args_count > 1 || (keywords && PyDict_GET_SIZE(keywords) != 0)) {
+static PyObject* Arena_tp_new(PyTypeObject* type, PyObject* arguments, PyObject* keywords) {
+    Py_ssize_t const positional_arguments_count = PyTuple_GET_SIZE(arguments);
+    if (positional_arguments_count > 1 || (keywords && PyDict_GET_SIZE(keywords) != 0)) {
         PyErr_SetString(PyExc_TypeError, "Arena() takes one optional positional argument, the executor");
         return NULL;
     }
-    PyObject* const executor_object = positional_args_count ? PyTuple_GET_ITEM(args, 0) : Py_None;
+    PyObject* const executor_object = positional_arguments_count ? PyTuple_GET_ITEM(arguments, 0) : Py_None;
     if (executor_object == Py_None) return arena_made(type, NULL);
     if (!PyObject_TypeCheck(executor_object, &ExecutorType)) {
         PyErr_Format(PyExc_TypeError, "Expected an Executor or None, got %S", Py_TYPE(executor_object));
@@ -1088,12 +1088,13 @@ static char const doc_Values_arrow_c_array[] =                                  
     "Arrow releases it. A requested schema is ignored, and Arrow casts from the exported\n" //
     "type where it asked for another.";
 
-static PyObject* Values_arrow_c_array(Values* self, PyObject* const* Py_UNUSED(args), Py_ssize_t positional_args_count,
-                                      PyObject* args_names_tuple) {
-    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
-    int const named = args_names_count == 1 &&
-                      PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(args_names_tuple, 0), "requested_schema") == 0;
-    if (positional_args_count + args_names_count > 1 || (args_names_count && !named)) {
+static PyObject* Values_arrow_c_array(Values* self, PyObject* const* Py_UNUSED(arguments),
+                                      Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    int const named = keyword_names_count == 1 &&
+                      PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(keyword_names_tuple, 0), "requested_schema") ==
+                          0;
+    if (positional_arguments_count + keyword_names_count > 1 || (keyword_names_count && !named)) {
         PyErr_SetString(PyExc_TypeError, "__arrow_c_array__() takes at most the 'requested_schema' argument");
         return NULL;
     }
@@ -1344,31 +1345,31 @@ int ustore_py_size_from_object(PyObject* object, char const* field, size_t* valu
     return 0;
 }
 
-int ustore_py_optional_argument(char const* verb, PyObject* const* args, Py_ssize_t positional_args_count,
-                                PyObject* args_names_tuple, Py_ssize_t required_positional, char const* keyword,
+int ustore_py_optional_argument(char const* verb, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                PyObject* keyword_names_tuple, Py_ssize_t required_positional, char const* keyword,
                                 PyObject** argument) {
-    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
-    int const named = args_names_count == 1 &&
-                      PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(args_names_tuple, 0), keyword) == 0;
-    Py_ssize_t const given = positional_args_count + args_names_count;
-    if (positional_args_count < required_positional || given > required_positional + 1 ||
-        (args_names_count && !named)) {
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    int const named = keyword_names_count == 1 &&
+                      PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(keyword_names_tuple, 0), keyword) == 0;
+    Py_ssize_t const given = positional_arguments_count + keyword_names_count;
+    if (positional_arguments_count < required_positional || given > required_positional + 1 ||
+        (keyword_names_count && !named)) {
         PyErr_Format(PyExc_TypeError, "%s() takes %zd positional arguments and then '%s', received %zd arguments", verb,
                      required_positional, keyword, given);
         return -1;
     }
-    if (given > required_positional) *argument = args[required_positional];
+    if (given > required_positional) *argument = arguments[required_positional];
     return 0;
 }
 
-Py_ssize_t ustore_py_args_names_count_checked(char const* verb, Py_ssize_t positional_args_count,
-                                              PyObject* args_names_tuple, Py_ssize_t required_positional) {
-    if (positional_args_count != required_positional) {
+Py_ssize_t ustore_py_keyword_names_count_checked(char const* verb, Py_ssize_t positional_arguments_count,
+                                                 PyObject* keyword_names_tuple, Py_ssize_t required_positional) {
+    if (positional_arguments_count != required_positional) {
         PyErr_Format(PyExc_TypeError, "%s() takes %zd positional arguments, received %zd", verb, required_positional,
-                     positional_args_count);
+                     positional_arguments_count);
         return -1;
     }
-    return args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
+    return keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
 }
 
 /** Fills @p context with what @p origin, a @c Database, @c Transaction or @c Snapshot, addresses under @p watch. */
@@ -1585,15 +1586,15 @@ int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObj
     return 0;
 }
 
-int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyObject* const* args,
-                                         Py_ssize_t positional_args_count, PyObject* args_names_tuple,
+int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyObject* const* arguments,
+                                         Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
                                          ustore_py_verb_options_t* options) {
     ustore_py_verb_options_init(options);
-    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        int const consumed = ustore_py_verb_option_from_keyword(context, name, args[args_progress], options);
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        int const consumed = ustore_py_verb_option_from_keyword(context, name, arguments[arguments_progress], options);
         if (consumed < 0) return -1;
         if (consumed == 0) {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
@@ -1990,7 +1991,7 @@ static char const doc_Executor[] =                                              
     "\n"                                                                                       //
     "Used as a context manager, it waits for its calls and frees its threads on exit.";
 
-static PyObject* Executor_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
+static PyObject* Executor_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
     PyErr_SetString(PyExc_TypeError,
                     "An executor is built through Executor.for_ram(), .on_pool(), .for_nvme() or .for_vram()");
@@ -2004,26 +2005,26 @@ static PyObject* Executor_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNU
  *  @param[in] keyword The first of @p names that may come by name, so those before it come by position alone.
  *  @return 0 on success, -1 with a @c TypeError set for one too many, unknown or repeated.
  */
-static int factory_arguments(char const* factory, PyObject* const* args, Py_ssize_t positional_args_count,
-                             PyObject* args_names_tuple, char const* const* names, PyObject** values,
+static int factory_arguments(char const* factory, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                             PyObject* keyword_names_tuple, char const* const* names, PyObject** values,
                              Py_ssize_t names_count, Py_ssize_t positional, Py_ssize_t keyword) {
-    if (positional_args_count > positional) {
+    if (positional_arguments_count > positional) {
         PyErr_Format(PyExc_TypeError, "%s() takes at most %zd positional arguments, received %zd", factory, positional,
-                     positional_args_count);
+                     positional_arguments_count);
         return -1;
     }
     for (Py_ssize_t index = 0; index != names_count; ++index)
-        values[index] = index < positional_args_count ? args[index] : NULL;
-    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
-    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
+        values[index] = index < positional_arguments_count ? arguments[index] : NULL;
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
         Py_ssize_t index = keyword;
         while (index != names_count && PyUnicode_CompareWithASCIIString(name, names[index]) != 0) ++index;
         if (index == names_count || values[index]) {
             PyErr_Format(PyExc_TypeError, "%s() got an unexpected or repeated argument %R", factory, name);
             return -1;
         }
-        values[index] = args[positional_args_count + names_progress];
+        values[index] = arguments[positional_arguments_count + names_progress];
     }
     return 0;
 }
@@ -2102,13 +2103,14 @@ static char const doc_Executor_for_ram[] =                                      
     "Raises:\n"                                                                                  //
     "  InvalidArgumentError: A memory domain names no NUMA node.";
 
-static PyObject* Executor_for_ram(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple) {
+static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple) {
     static char const* const names[] = {"threads", "memory_domains", "deferred_limit"};
     PyObject* values[3];
     size_t threads = 0, deferred_limit = 0, memory_domains_count = 0;
     int32_t* memory_domains = NULL;
-    if (factory_arguments("for_ram", args, positional_args_count, args_names_tuple, names, values, 3, 1, 0) != 0 ||
+    if (factory_arguments("for_ram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 3, 1,
+                          0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
         (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0) ||
         identifiers_from_object(values[1], "memory_domains", &memory_domains, &memory_domains_count) != 0)
@@ -2150,12 +2152,13 @@ static char const doc_Executor_on_pool[] =                                      
     "Raises:\n"                                                                                 //
     "  InvalidArgumentError: The address is null, or a memory domain names no NUMA node.";
 
-static PyObject* Executor_on_pool(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple) {
+static PyObject* Executor_on_pool(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple) {
     static char const* const names[] = {"pool", "memory_domains", "deferred_limit"};
     PyObject* values[3];
     size_t deferred_limit = 0, memory_domains_count = 0;
-    if (factory_arguments("on_pool", args, positional_args_count, args_names_tuple, names, values, 3, 1, 1) != 0 ||
+    if (factory_arguments("on_pool", arguments, positional_arguments_count, keyword_names_tuple, names, values, 3, 1,
+                          1) != 0 ||
         (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0))
         return NULL;
     if (!values[0]) {
@@ -2209,8 +2212,8 @@ static char const doc_Executor_for_nvme[] =                                     
 static char const* const nvme_size_names[] = {"shared_io_channels",    "queue_depth",         "request_buffer_bytes",
                                               "request_buffers_count", "stream_buffer_bytes", "stream_buffers_count"};
 
-static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple) {
+static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple) {
     static char const* const names[] = {"threads",
                                         "transport",
                                         "deferred_limit",
@@ -2223,7 +2226,8 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* args, Py_ssi
     PyObject* values[9];
     size_t threads = 0, deferred_limit = 0, sizes[6] = {0};
     int transport = ustore_transport_automatic_k;
-    if (factory_arguments("for_nvme", args, positional_args_count, args_names_tuple, names, values, 9, 1, 0) != 0 ||
+    if (factory_arguments("for_nvme", arguments, positional_arguments_count, keyword_names_tuple, names, values, 9, 1,
+                          0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
         (values[1] &&
          ustore_py_enum_from_object(values[1], "transport", ustore_py_enum_transport_k, &transport) != 0) ||
@@ -2279,14 +2283,15 @@ static char const doc_Executor_for_vram[] =                                     
     "Raises:\n"                                                                                //
     "  DeviceError: No device carries the ordinal, or its driver refuses a stream.";
 
-static PyObject* Executor_for_vram(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple) {
+static PyObject* Executor_for_vram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple) {
     static char const* const names[] = {"device", "scratch_limit", "gds", "deferred_limit"};
     PyObject* values[4];
     size_t scratch_limit = 0, deferred_limit = 0;
     long device = 0;
     int gds = ustore_gds_automatic_k;
-    if (factory_arguments("for_vram", args, positional_args_count, args_names_tuple, names, values, 4, 1, 0) != 0 ||
+    if (factory_arguments("for_vram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 4, 1,
+                          0) != 0 ||
         (values[1] && ustore_py_size_from_object(values[1], "scratch_limit", &scratch_limit) != 0) ||
         (values[2] && ustore_py_enum_from_object(values[2], "gds", ustore_py_enum_gds_k, &gds) != 0) ||
         (values[3] && ustore_py_size_from_object(values[3], "deferred_limit", &deferred_limit) != 0))
@@ -2348,11 +2353,11 @@ static char const doc_Executor_drain[] =                                        
     "    `Mood.PARKED` pays a wake-up on the next call, `Mood.SPINNING` trades power for\n" //
     "    its latency.";
 
-static PyObject* Executor_drain(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                PyObject* args_names_tuple) {
+static PyObject* Executor_drain(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                PyObject* keyword_names_tuple) {
     PyObject* mood_object = NULL;
-    if (ustore_py_optional_argument("drain", args, positional_args_count, args_names_tuple, 0, "mood", &mood_object) !=
-        0)
+    if (ustore_py_optional_argument("drain", arguments, positional_arguments_count, keyword_names_tuple, 0, "mood",
+                                    &mood_object) != 0)
         return NULL;
     int mood = ustore_mood_parked_k;
     if (mood_object && ustore_py_enum_from_object(mood_object, "mood", ustore_py_enum_mood_k, &mood) != 0) return NULL;
@@ -2387,8 +2392,9 @@ static PyObject* Executor_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
 
 static PyObject* Executor_enter(PyObject* self, PyObject* Py_UNUSED(ignored)) { return Py_NewRef(self); }
 
-static PyObject* Executor_exit(PyObject* self, PyObject* const* Py_UNUSED(args),
-                               Py_ssize_t Py_UNUSED(positional_args_count), PyObject* Py_UNUSED(args_names_tuple)) {
+static PyObject* Executor_exit(PyObject* self, PyObject* const* Py_UNUSED(arguments),
+                               Py_ssize_t Py_UNUSED(positional_arguments_count),
+                               PyObject* Py_UNUSED(keyword_names_tuple)) {
     executor_close((Executor*)self);
     Py_RETURN_NONE;
 }

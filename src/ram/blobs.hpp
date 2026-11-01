@@ -10,7 +10,6 @@
 
 #include <cstddef> // `std::size_t`
 
-#include <limits>      // `std::numeric_limits`
 #include <type_traits> // `std::is_same_v`
 
 #include "ustore/blobs.h"
@@ -91,16 +90,6 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_blobs_sampl
     return sample_keys<value_pair_t>(state, arguments, view);
 }
 
-/** Records the exact measure of @p task into @p outputs. */
-inline void assign_measure(measure_outputs_t& outputs, std::size_t task, window_measure_t measured) noexcept {
-    outputs.min_cardinalities[task] = measured.cardinality;
-    outputs.max_cardinalities[task] = measured.cardinality;
-    outputs.min_value_bytes[task] = measured.value_bytes;
-    outputs.max_value_bytes[task] = measured.value_bytes;
-    outputs.min_space_usages[task] = measured.space_bytes;
-    outputs.max_space_usages[task] = std::numeric_limits<ustore_size_t>::max();
-}
-
 /** Implements @c ustore_blobs_measure, exact for entries and value bytes at the view it reads. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_blobs_measure_t const& arguments,
@@ -114,25 +103,25 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_blobs_measu
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(source, collections, arguments.count, outcome,
-                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                                using entry_t = entry_of<decltype(entries)>;
-                                if constexpr (!std::is_same_v<entry_t, value_pair_t>) return refused_modality(outcome);
-                                else {
-                                    auto store = source.view(entries);
-                                    if (!store) return store.status();
-                                    for (std::size_t task = first; task != end; ++task) {
-                                        window_measure_t measured;
-                                        ustore_key_t const lower = start_keys ? start_keys[task] : smallest_key_k;
-                                        ustore_key_t const last = end_keys ? end_keys[task] : largest_key_k;
-                                        store_status_t const measuring = measure_window<entry_t>(*store, lower, last,
-                                                                                                 measured);
-                                        if (st::failed(measuring)) return measuring;
-                                        assign_measure(outputs, task, measured);
-                                    }
-                                    return store_status_t::success_k;
-                                }
-                            });
+        return for_each_run(
+            source, collections, arguments.count, outcome,
+            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                using entry_t = entry_of<decltype(entries)>;
+                if constexpr (!std::is_same_v<entry_t, value_pair_t>) return refused_modality(outcome);
+                else {
+                    auto store = source.view(entries);
+                    if (!store) return store.status();
+                    for (std::size_t task = first; task != end; ++task) {
+                        window_measure_t measured;
+                        ustore_key_t const lower = start_keys ? start_keys[task] : smallest_key_k;
+                        ustore_key_t const last = end_keys ? end_keys[task] : largest_key_k;
+                        store_status_t const measuring = measure_window<entry_t>(*store, lower, last, measured);
+                        if (st::failed(measuring)) return measuring;
+                        outputs.assign(task, measured.cardinality, measured.value_bytes, measured.space_bytes);
+                    }
+                    return store_status_t::success_k;
+                }
+            });
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
     outputs.finish(arguments);

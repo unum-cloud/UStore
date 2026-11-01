@@ -15,16 +15,16 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <array>       // `std::array`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
-#include <utility>     // `std::move`
+#include <array>   // `std::array`
+#include <span>    // `std::span`
+#include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`
 
-#include "ustore/utilities/nvme_volume.hpp" // `catalog_t`, `crc32c`
+#include "ustore/utilities/nvme_catalog.hpp" // `catalog_t`, `crc32c`, `catalog_entry_t`, `catalog_slot_header_t`
+#include "ustore/utilities/nvme_volume.hpp"  // `extent_allocator_t`, `large_allocation_bytes_k`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
@@ -75,17 +75,17 @@ struct random_source_t {
 }
 
 /** A buffer of @p bytes, empty when the allocation refused. */
-[[nodiscard]] st::basic_vector<byte_t> make_image(std::size_t bytes) noexcept {
-    st::basic_vector<byte_t> image;
+[[nodiscard]] st::vector<byte_t> make_image(std::size_t bytes) noexcept {
+    st::vector<byte_t> image;
     [[maybe_unused]] st::status_t const resized = image.resize(bytes);
     return image;
 }
 
 /** The whole buffer as the span a save takes. */
-[[nodiscard]] std::span<byte_t> whole(st::basic_vector<byte_t>& image) noexcept { return std::span<byte_t> {image}; }
+[[nodiscard]] std::span<byte_t> whole(st::vector<byte_t>& image) noexcept { return std::span<byte_t> {image}; }
 
 /** The whole buffer as the span a load takes. */
-[[nodiscard]] std::span<byte_t const> viewed(st::basic_vector<byte_t> const& image) noexcept {
+[[nodiscard]] std::span<byte_t const> viewed(st::vector<byte_t> const& image) noexcept {
     return std::span<byte_t const> {image};
 }
 
@@ -160,15 +160,15 @@ std::size_t allocator_picks_the_smallest_fitting_range() {
     failures += expect(allocator.release(blocks[7]).succeeded());
     failures += expect(allocator.release(blocks[8]).succeeded());
 
-    expected<extent_t> const one = allocator.allocate(block_bytes_k);
-    failures += expect(one.has_value());
-    if (one) failures += expect_eq(one->offset, 5 * block_bytes_k);
-    expected<extent_t> const two = allocator.allocate(2 * block_bytes_k);
-    failures += expect(two.has_value());
-    if (two) failures += expect_eq(two->offset, 7 * block_bytes_k);
-    expected<extent_t> const three = allocator.allocate(3 * block_bytes_k);
-    failures += expect(three.has_value());
-    if (three) failures += expect_eq(three->offset, 1 * block_bytes_k);
+    expected<extent_t> const first_extent = allocator.allocate(block_bytes_k);
+    failures += expect(first_extent.has_value());
+    if (first_extent) failures += expect_eq(first_extent->offset, 5 * block_bytes_k);
+    expected<extent_t> const second_extent = allocator.allocate(2 * block_bytes_k);
+    failures += expect(second_extent.has_value());
+    if (second_extent) failures += expect_eq(second_extent->offset, 7 * block_bytes_k);
+    expected<extent_t> const third_extent = allocator.allocate(3 * block_bytes_k);
+    failures += expect(third_extent.has_value());
+    if (third_extent) failures += expect_eq(third_extent->offset, 1 * block_bytes_k);
     return failures;
 }
 
@@ -282,7 +282,7 @@ std::size_t allocator_returns_every_byte_of_a_mixed_run() {
     std::size_t failures = 0;
     extent_allocator_t allocator = make_allocator(wide_region_bytes_k);
     random_source_t source;
-    st::basic_vector<extent_t> live;
+    st::vector<extent_t> live;
 
     for (std::size_t cycle = 0; cycle != many_cycles_k; ++cycle) {
         expected<extent_t> const taken = allocator.allocate(1 + source.next() % 65536);
@@ -314,7 +314,7 @@ std::size_t catalog_round_trips_every_field() {
     failures += fill_catalog(catalog, many_entries_k);
     failures += expect_eq(catalog.size(), many_entries_k);
 
-    st::basic_vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
+    st::vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
     failures += expect_eq(image.size(), static_cast<std::size_t>(catalog.image_bytes()));
     if (image.empty()) return failures;
     expected<std::uint64_t> const saved = catalog.save(whole(image), 7);
@@ -344,7 +344,7 @@ std::size_t catalog_refuses_a_flipped_byte() {
     catalog_t catalog;
     failures += fill_catalog(catalog, 8);
 
-    st::basic_vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
+    st::vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
     if (image.empty()) return failures + 1;
     failures += expect(catalog.save(whole(image), 3).has_value());
 
@@ -361,7 +361,7 @@ std::size_t catalog_refuses_records_past_the_image() {
     catalog_t catalog;
     failures += fill_catalog(catalog, 8);
 
-    st::basic_vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
+    st::vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
     if (image.empty()) return failures + 1;
     failures += expect(catalog.save(whole(image), 3).has_value());
 
@@ -379,7 +379,7 @@ std::size_t catalog_refuses_a_record_past_the_records() {
     catalog_t catalog;
     failures += fill_catalog(catalog, 4);
 
-    st::basic_vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
+    st::vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
     if (image.empty()) return failures + 1;
     failures += expect(catalog.save(whole(image), 3).has_value());
 
@@ -414,7 +414,7 @@ std::size_t catalog_refuses_a_small_image() {
     catalog_t catalog;
     failures += fill_catalog(catalog, 8);
 
-    st::basic_vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
+    st::vector<byte_t> image = make_image(static_cast<std::size_t>(catalog.image_bytes()));
     if (image.empty()) return failures + 1;
     expected<std::uint64_t> const saved = catalog.save(whole(image).first(image.size() - 1), 3);
     failures += expect_status(saved, status_code_t::capacity_exhausted_k);

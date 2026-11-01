@@ -2,8 +2,8 @@
  *  @file include/ustore/utilities/folds.hpp
  *  @author Ash Vardanian
  *  @date October 16, 2026
- *  @brief The fold that turns a stored base and the newer deltas of one key into the value a read sees, and
- *      @c last_write_fold_t, where the newest delta wins.
+ *  @brief The fold that turns a stored base and the newer deltas of one key into the value a read
+ *      sees, and @c last_write_fold_t, where the newest delta wins.
  *
  *  A collection keeps a base per key and appends deltas newer than it. A read folds the base with the deltas, oldest
  *  first, and a compaction folds a chain of deltas without its base into one, so the fold of a modality decides what a
@@ -53,9 +53,9 @@ struct delta_view_t {
  *  older one matters, such as a removal or a full rewrite. A result may view the inputs, or bytes the fold wrote into
  *  the arena it is given.
  */
-template <typename fold_>
-concept fold_concept = requires(fold_ const& fold, std::span<byte_t const> base, std::span<delta_view_t const> deltas,
-                                arena_allocator<byte_t>& arena) {
+template <typename fold_type_>
+concept fold_concept = requires(fold_type_ const& fold, std::span<byte_t const> base,
+                                std::span<delta_view_t const> deltas, arena_allocator<byte_t>& arena) {
     { fold.apply(base, deltas, arena) } -> std::same_as<expected<std::span<byte_t const>>>;
     { fold.compose(deltas, arena) } -> std::same_as<expected<std::span<byte_t const>>>;
     { fold.closes(deltas.front()) } -> std::same_as<bool>;

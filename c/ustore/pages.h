@@ -39,19 +39,22 @@ extern "C" {
 /** Encoding a page or a fragment is imported from or rendered into. */
 typedef enum ustore_page_encoding_t {
 
-    /** HTML, parsed into elements and rendered back as markup. */
+    /** HTML, to be parsed into elements and rendered back as markup, not yet imported
+     *  or rendered, answering @c ustore_status_unsupported_k. */
     ustore_page_encoding_html_k = 0,
 
     /** XML, with every element and attribute kept as written. */
     ustore_page_encoding_xml_k = 1,
 
-    /** Markdown, parsed into headings, paragraphs, lists, tables and code, and rendered back. */
+    /** Markdown, to be parsed into headings, paragraphs, lists, tables and code, not yet imported
+     *  or rendered, answering @c ustore_status_unsupported_k. */
     ustore_page_encoding_markdown_k = 2,
 
     /** The text of every run in document order, with structure dropped. */
     ustore_page_encoding_text_k = 3,
 
-    /** The element tree as JSON: key, tag, attributes, text and children, for programmatic access. */
+    /** The element tree as JSON of key, tag, attributes, text and children, not yet imported
+     *  or rendered, answering @c ustore_status_unsupported_k. */
     ustore_page_encoding_json_k = 4,
 
 } ustore_page_encoding_t;
@@ -120,11 +123,13 @@ typedef struct ustore_pages_import_t {
  *    size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections, @c keys or @c values are missing, the
- *    values come in an unknown layout, the @c encoding is unknown, the @c transaction belongs to
- *    another engine or is staged, the @c durability or @c watch is unknown, a flushed import names a
- *    @c transaction, @c ustore_watch_none_k comes without one, one call imports past 4 Gi tasks, a
- *    markup or a page is past 4 GiB, or a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections, @c keys or @c values are
+ *  missing, the values come in an unknown layout, the @c encoding is unknown, the @c transaction
+ *  belongs to another engine or is staged, the @c durability or @c watch is unknown, a flushed
+ *  import names a @c transaction, @c ustore_watch_none_k comes without one, one call imports past
+ *  4 Gi tasks, a markup or a page is past 4 GiB, or a collection holds another modality.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device, the @c encoding is HTML,
  *    Markdown or JSON, or a DOCTYPE carries an internal subset.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
@@ -270,10 +275,14 @@ typedef struct ustore_pages_remove_t {
  *    size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections, @c keys or @c elements are missing, the
- *    @c transaction belongs to another engine or is staged, the @c durability or @c watch is
- *    unknown, a flushed edit names a @c transaction, @c ustore_watch_none_k comes without one, one
- *    call edits past 4 Gi tasks, a page is past 4 GiB, or a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections, @c keys
+ *  or @c elements are missing, the @c transaction belongs to another
+ *  engine or is staged, the @c durability or @c watch is unknown, a
+ *  flushed edit names a @c transaction, @c ustore_watch_none_k comes
+ *  without one, one call edits past 4 Gi tasks, a page is past 4 GiB, or a
+ *  collection holds a modality other than pages.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
  *    was dropped meanwhile.
@@ -340,10 +349,14 @@ typedef struct ustore_pages_move_t {
  *    size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections, @c keys or @c elements are missing, the
- *    @c transaction belongs to another engine or is staged, the @c durability or @c watch is
- *    unknown, a flushed edit names a @c transaction, @c ustore_watch_none_k comes without one, one
- *    call edits past 4 Gi tasks, a page is past 4 GiB, or a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections, @c keys
+ *  or @c elements are missing, the @c transaction belongs to another
+ *  engine or is staged, the @c durability or @c watch is unknown, a
+ *  flushed edit names a @c transaction, @c ustore_watch_none_k comes
+ *  without one, one call edits past 4 Gi tasks, a page is past 4 GiB, or a
+ *  collection holds a modality other than pages.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
  *    was dropped meanwhile.
@@ -413,11 +426,13 @@ typedef struct ustore_pages_splice_t {
  *    size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_invalid_argument_k The @c collections, @c keys or @c elements are missing, the
- *    values come in an unknown layout, the @c transaction belongs to another engine or is staged,
- *    the @c durability or @c watch is unknown, a flushed edit names a @c transaction,
- *    @c ustore_watch_none_k comes without one, one call edits past 4 Gi tasks, a page is past
- *    4 GiB, or a collection holds another modality.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c collections, @c keys or @c elements
+ *  are missing, the values come in an unknown layout, the @c transaction belongs to
+ *  another engine or is staged, the @c durability or @c watch is unknown, a flushed edit
+ *  names a @c transaction, @c ustore_watch_none_k comes without one, one call edits past 4
+ *  Gi tasks, a page is past 4 GiB, or a collection holds another modality.
+ *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
  *    was dropped meanwhile.
@@ -487,8 +502,8 @@ typedef struct ustore_pages_set_attributes_t {
  *  - @c ustore_status_invalid_argument_k The @c collections, @c keys, @c elements, @c fields or
  *    @c values are missing, the fields or values come in an unknown layout, the @c transaction
  *    belongs to another engine or is staged, the @c durability or @c watch is unknown, a flushed
- *    edit names a @c transaction, @c ustore_watch_none_k comes without one, one call edits past
- *    4 Gi tasks, a page is past 4 GiB, or a collection holds another modality.
+ *    edit names a @c transaction, @c ustore_watch_none_k comes without one, one call edits past 4
+ *    Gi tasks, a page is past 4 GiB, or a collection holds another modality.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
  *    was dropped meanwhile.
@@ -555,8 +570,8 @@ typedef struct ustore_pages_remove_attributes_t {
  *  - @c ustore_status_invalid_argument_k The @c collections, @c keys, @c elements or @c fields are
  *    missing, the fields come in an unknown layout, the @c transaction belongs to another engine or
  *    is staged, the @c durability or @c watch is unknown, a flushed edit names a @c transaction,
- *    @c ustore_watch_none_k comes without one, one call edits past 4 Gi tasks, a page is past
- *    4 GiB, or a collection holds another modality.
+ *    @c ustore_watch_none_k comes without one, one call edits past 4 Gi tasks, a page is past 4
+ *    GiB, or a collection holds another modality.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
  *    was dropped meanwhile.
@@ -627,10 +642,11 @@ typedef struct ustore_pages_read_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or @c keys are missing, the
- *    @c outputs_encoding is unknown, the @c view was made by neither view constructor or belongs to
- *    another engine, a watching read goes through a staged transaction, or a collection holds
- *    another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or @c keys are missing,
+ *  the @c outputs_encoding is unknown, the @c view was made by neither view constructor or belongs
+ *  to another engine, a watching read goes through a staged transaction, or a collection holds a
+ *  modality other than pages.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -712,10 +728,11 @@ typedef struct ustore_pages_scan_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing, the
- *    @c mode or a predicate cost is unknown, the @c filter does not compile, the @c view was made by
- *    neither view constructor or belongs to another engine, a watching scan goes through a staged
- *    transaction, or a collection holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is missing,
+ *  the @c mode or a predicate cost is unknown, the @c filter does not compile, the @c view was made
+ *  by neither view constructor or belongs to another engine, a watching scan goes through a staged
+ *  transaction, or a collection holds a modality other than pages.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
@@ -778,9 +795,9 @@ typedef struct ustore_pages_cursor_init_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made by
- *    neither view constructor or reads another database, a predicate cost is unknown, or the
- *    @c filter does not compile.
+ *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made
+ *    by neither view constructor or reads another database, a predicate cost is unknown, or
+ *    the @c filter does not compile.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k A device @c executor is given a @c filter.
  */
@@ -837,11 +854,11 @@ typedef struct ustore_pages_cursor_next_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output is
- *    @c NULL, the @c outputs_encoding is unknown, the cursor walks another database, a watching
- *    pull goes through a staged transaction, or the collection holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes, or a cursor opened
- *    for a device is pulled on host threads.
+ *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output
+ *    is @c NULL, the @c outputs_encoding is unknown, the cursor walks another database, a
+ *    watching pull goes through a staged transaction, or the collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
+ *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.

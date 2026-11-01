@@ -30,7 +30,7 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
     if (arguments.values && !verbs.read)
         return {status_code_t::unsupported_k, "The engine does not implement this call"};
     growing_strings<arena_allocator<byte_t>> survivors {arena_allocator<byte_t> {view.scratch}};
-    st::basic_vector<byte_t, arena_allocator<byte_t>> resume_bytes {arena_allocator<byte_t> {view.scratch}};
+    st::vector<byte_t, arena_allocator<byte_t>> resume_bytes {arena_allocator<byte_t> {view.scratch}};
     std::variant<ustore_bytes_view_t, exhausted_t> resume = exhausted_t {};
     if (sz::string_t const* const start = std::get_if<sz::string_t>(&cursor.position); start && arguments.wanted) {
         ustore_bytes_view_t const prefix = bytes_of(std::string_view {cursor.prefix});

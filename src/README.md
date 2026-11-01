@@ -3,8 +3,8 @@
 Every engine implements the C ABI of `c/ustore/*.h` over its own storage, and joins the router's sources in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
 `src/lib.hpp` is the router every exported call goes through, and each public header has one source implementing it: `types.cpp`, `db.cpp`, `blobs.cpp`, `strings.cpp`, `docs.cpp`, `graph.cpp` and `pages.cpp`.
 Those sources only route: each engine includes the layers it serves a modality through.
-`blobs_layers/docs.hpp` and `blobs_layers/graph.hpp` keep documents and graphs as read-modify-writes over the codecs of `include/ustore/docs/` and `include/ustore/graph/`, through the unchecked whole-value verbs of the one engine instantiating their `*_over_blobs` templates.
-`blobs_layers/pages.hpp` keeps pages the same way, each as one value under its page key: its current shape, the dense element tree of `include/ustore/pages/`.
+`docs_layer.hpp` and `graph_layer.hpp` keep documents and graphs as read-modify-writes over the codecs of `include/ustore/docs/` and `include/ustore/graph/`, through the unchecked whole-value verbs of the one engine instantiating their `*_over_blobs` templates.
+`pages_layer.hpp` keeps pages the same way, each as one value under its page key: its current shape, the dense element tree of `include/ustore/pages/`.
 The document and page paths take the reads and writes of an engine as an object, so `ram` runs them over its own stores.
 Every verb serves only collections of its own modality: each engine's resolver refuses any other with the one status of `collection_holds_another_modality`, and its public blobs verbs wrap the unchecked ones in that check.
 The reusable templates the engines instantiate live in `include/ustore/`, which [its own guide](../include/ustore/README.md) describes.
@@ -81,8 +81,8 @@ Every collection of the C ABI is one collection of the database under its UUID, 
 Its `_collections` system collection maps every collection onto its name, the database's own schema recording its modality, and a strings collection and the names live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole strings, whose writes and watches join a transaction as a share of it.
 A graph collection lives in the graph store of `include/ustore/graph/nvme_store.hpp`, one key per vertex folded from half-edge change deltas, and `src/nvme/graph.hpp` serves the graph calls of the table over it.
 A docs collection lives in the docs store of `include/ustore/docs/nvme_store.hpp`, whose field writes, patches and merges append `json_fold_t` change deltas through `src/nvme/docs.hpp`.
-A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold_t` change deltas that the `*_edits` calls of `src/blobs_layers/pages.hpp` encode and `src/nvme/pages.hpp` commits.
-Reads of documents and pages take the read paths of `src/blobs_layers/docs.hpp` and `src/blobs_layers/pages.hpp` over the engine's own reads of those stores, which fold the change deltas.
+A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold_t` change deltas that the `*_edits` calls of `src/pages_layer.hpp` encode and `src/nvme/pages.hpp` commits.
+Reads of documents and pages take the read paths of `src/docs_layer.hpp` and `src/pages_layer.hpp` over the engine's own reads of those stores, which fold the change deltas.
 `USTORE_WITH_NVME` is off by default, and the Python package turns it on; what follows is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.
@@ -151,8 +151,7 @@ A page shorter than `wanted`, or one ending at the largest key, sets the cursor'
 | RocksDB           | RocksDB engine            | Persistent LSM trees with two-phase transactions                  |
 | LevelDB           | LevelDB engine            | Persistent LSM tree with snapshots                                |
 | fmt               | RocksDB, LevelDB, NVMe    | Formatting responses, logs and file names                         |
-| Thrust            | NVMe                      | Sorting and merging key slots on the host                         |
-| CUDA and CUB      | NVMe, optional            | GPU compaction                                                    |
+| CUDA toolkit      | NVMe, optional            | Compiling the GPU compaction kernels into the NVIDIA bundle       |
 | GPUDirect Storage | NVMe, optional, v1 target | Reads and writes between NVMe drives and GPU memory               |
 | liburing          | RocksDB engine, on Linux  | Batched SST reads through io_uring, falling back to `pread`       |
 | SPDK              | NVMe, optional            | User-space NVMe access                                            |

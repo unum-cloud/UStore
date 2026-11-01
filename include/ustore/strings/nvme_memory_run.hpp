@@ -5,9 +5,10 @@
  *  @brief One commit's deltas for one strings collection, keyed by whole strings on a tape and searched by their
  *      16-byte heads, sealed and stamped into an immutable run, and the cursor that lists a view's strings in order.
  *
- *  A strings run is the twin of @c blobs::memory_run with a key tape in place of the fixed-width keys column. Deltas
- *  ascend by string in unsigned byte order, the versions of one string newest first, and every delta carries the
- *  @c head_of its string, so a search compares heads and reads the tape only between equal ones:
+ *  A strings run is the twin of @c blobs::memory_run with a key tape in place of the fixed-width
+ *  keys column. Deltas ascend by string in unsigned byte order, the versions of one string newest
+ *  first, and every delta carries the @c head_of its string, so a search compares heads and reads
+ *  the tape only between equal ones:
  *
  *  @code{.c}
  *  struct strings_run_columns_t {             // n deltas, ascending by string, versions newest first
@@ -37,7 +38,7 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
 
-#include <smashtable/basic_vector.hpp>           // `st::basic_vector`
+#include <smashtable/basic_vector.hpp>           // `st::vector`
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
 #include <smashtable/row_layout.hpp>             // `st::key128_t`
 #include <smashtable/shared.hpp>                 // `st::default_allocator`, `st::expected`
@@ -83,9 +84,9 @@ sz_strings_view_t strings_of(std::span<delta_type_ const> deltas) noexcept {
     strings.data.accessor.handle = deltas.data();
     strings.data.accessor.get = [](void const* handle, sz_size_t const* indices, sz_size_t count,
                                    sz_string_view_t* views) {
-        delta_type_ const* const all = static_cast<delta_type_ const*>(handle);
+        delta_type_ const* const deltas = static_cast<delta_type_ const*>(handle);
         for (sz_size_t index = 0; index != count; ++index) {
-            std::string_view const text = all[indices[index]].stored_key;
+            std::string_view const text = deltas[indices[index]].stored_key;
             // A caller's empty string may view no bytes at all, which a kernel's compare must still read safely.
             views[index] = sz_string_view_t {text.empty() ? "" : text.data(), text.size()};
         }
@@ -118,7 +119,7 @@ expected<std::size_t> sort_unique_strings(std::span<delta_type_> deltas, sz_kern
     using order_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<sz_size_t>;
     using deltas_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<delta_type_>;
     if (sort_order == nullptr) return status_t {status_code_t::invalid_argument_k, "No kernel sorts the strings"};
-    st::basic_vector<sz_size_t, order_allocator_t> order {order_allocator_t {allocator}};
+    st::vector<sz_size_t, order_allocator_t> order {order_allocator_t {allocator}};
     if (order.resize(deltas.size()) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "No room to order the strings"};
     sz_strings_view_t const strings = strings_of(std::span<delta_type_ const> {deltas});
@@ -139,7 +140,7 @@ expected<std::size_t> sort_unique_strings(std::span<delta_type_> deltas, sz_kern
         sz_size_t& survivor = order[kept - 1];
         survivor = keep == keep_t::first_k ? std::min(survivor, given) : std::max(survivor, given);
     }
-    st::basic_vector<delta_type_, deltas_allocator_t> survivors {deltas_allocator_t {allocator}};
+    st::vector<delta_type_, deltas_allocator_t> survivors {deltas_allocator_t {allocator}};
     if (survivors.resize(kept) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "No room to gather the kept deltas"};
     for (std::size_t index = 0; index != kept; ++index) survivors[index] = deltas[order[index]];
@@ -285,7 +286,7 @@ class sealed_deltas {
 
     template <typename value_type_>
     using column =
-        st::basic_vector<value_type_, typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>>;
+        st::vector<value_type_, typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>>;
 
     explicit sealed_deltas(allocator_t const& allocator) noexcept
         : heads_(typename column<st::key128_t>::allocator_t(allocator)),
@@ -523,8 +524,8 @@ class memory_run_cursor {
     memory_run_cursor& operator=(memory_run_cursor const&) = delete;
 
     /**
-     *  @brief A cursor over @p view at stamp @p at, listing the strings starting with @p prefix that are not below
-     *      @p start, where an empty prefix admits every string.
+     *  @brief A cursor over @p view at stamp @p at, listing the strings starting with @p prefix
+     *      that are not below @p start, where an empty prefix admits every string.
      *  @retval out_of_memory_k The positions in each run could not be allocated.
      */
     static expected<memory_run_cursor> over(view_t const& view, std::string_view prefix, std::string_view start,
@@ -581,7 +582,7 @@ class memory_run_cursor {
 
   private:
     using positions_t =
-        st::basic_vector<std::size_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<std::size_t>>;
+        st::vector<std::size_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<std::size_t>>;
 
     memory_run_cursor(view_t const& view, transaction_stamp_t at, allocator_t const& allocator) noexcept
         : view_(&view), at_(at), positions_(typename positions_t::allocator_t(allocator)),

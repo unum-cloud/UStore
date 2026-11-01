@@ -22,14 +22,16 @@
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/blobs/nvme_single_collection_database.hpp" // `basic_single_collection_database`
 #include "ustore/blobs/nvme_key_slot.hpp"                   // `key_slot`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
+#include "nvme/fixture.hpp" // `run_on_transport`, `expectation_t`, `painted`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -143,9 +145,9 @@ template <typename database_type_>
                                       std::span<expectation_t const> wanted) {
     std::size_t failures = 0;
     std::size_t const count = wanted.size();
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<lookup_result_t> results;
-    st::basic_vector<std::uint64_t> seen;
+    st::vector<stored_key_t> keys;
+    st::vector<lookup_result_t> results;
+    st::vector<std::uint64_t> seen;
     failures += expect(keys.resize(count) == st::status_t::success_k);
     failures += expect(results.resize(count) == st::status_t::success_k);
     failures += expect(seen.resize(count) == st::status_t::success_k);
@@ -210,7 +212,7 @@ template <typename key_slot_type_, typename mount_type_>
     if (!store) return failures;
     stored_value_size_t const widest = (*store)->value_max_size();
 
-    std::array<st::basic_vector<expectation_t>, worker_threads_k> models;
+    std::array<st::vector<expectation_t>, worker_threads_k> models;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) {
         failures += expect(models[worker].resize(keys_per_worker_k) == st::status_t::success_k);
         if (failures != 0) return failures;
@@ -219,7 +221,7 @@ template <typename key_slot_type_, typename mount_type_>
     }
 
     // Every key starts written and flushed, so the reads below reach the runs as well as the memory runs.
-    st::basic_vector<byte_t> first;
+    st::vector<byte_t> first;
     failures += expect(first.resize(widest) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
@@ -244,15 +246,15 @@ template <typename key_slot_type_, typename mount_type_>
             if (!guard) return;
 
             random_t random = random_t {seed_k}.fork(worker);
-            st::basic_vector<expectation_t>& model = models[worker];
-            st::basic_vector<byte_t> value;
+            st::vector<expectation_t>& model = models[worker];
+            st::vector<byte_t> value;
             worker_failures[worker] += expect(value.resize(widest) == st::status_t::success_k);
             if (worker_failures[worker] != 0) return;
 
             for (std::size_t operation = 0; operation != operations_per_worker_k; ++operation) {
                 std::uint64_t const choice = random.below(3);
-                std::size_t const own = static_cast<std::size_t>(random.below(keys_per_worker_k));
-                expectation_t& entry = model[own];
+                std::size_t const key_index = static_cast<std::size_t>(random.below(keys_per_worker_k));
+                expectation_t& entry = model[key_index];
 
                 if (choice == 0) {
                     // A key of another thread may change under the read, so only its status is checked.

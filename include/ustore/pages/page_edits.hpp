@@ -7,8 +7,8 @@
  *  An edit is one task of one call, stamped with its commit and its position inside it. It names
  *  its element, parent and anchor by key, and carries what it needs to apply without reading
  *  anything else: an import or an insertion carries its parsed fragment in the dense form of
- *  <tt>element_tree.hpp</tt>, keys already minted, so applying never parses markup and replaying
- *  always lands the same keys.
+ *  <tt>element_tree.hpp</tt>, keys already minted, so applying never parses markup and replaying always
+ *  lands the same keys.
  *
  *  A delta is a chain of edits back to back, oldest first, each little-endian. Every edit starts with a modification
  *  byte, the commit stamp, the task sequence and the element key. Insertions and moves add the parent and anchor keys,
@@ -177,7 +177,7 @@ inline edit_t remove_attribute_edit(placement_t placement, element_key_t element
     return edit;
 }
 
-#pragma endregion
+#pragma endregion Constructors
 
 #pragma region Serialized Form
 
@@ -326,6 +326,6 @@ status_t for_each_minted_key(edit_t const& edit, callback_type_&& callback) noex
     return {};
 }
 
-#pragma endregion
+#pragma endregion Serialized Form
 
 } // namespace unum::ustore::pages

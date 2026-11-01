@@ -11,26 +11,21 @@
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
-#include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`
-
-#include <array>   // `std::array`
-#include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
-
-#include "ustore/utilities/types.hpp" // `status_t`, `expected`
+#include "ustore/utilities/types.hpp" // `expected`
 
 #include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk_t`
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`
 #include "ustore/utilities/nvme_linux_spdk_disk.hpp"  // `linux_spdk_disk`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`
-#include "ustore/utilities/nvme_volume.hpp"           // `any_files_disk`
+#include "ustore/utilities/nvme_mounts.hpp"           // `any_files_disk`
 
 #include "nvme/ring_cases.hpp" // `ring_cases`, `ring_fails_a_misaligned_request`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 static_assert(ring_concept<linux_spdk_disk<atomic_reference, waiter_t>>,
               "The SPDK transport is a ring like every other");
@@ -40,6 +35,8 @@ static_assert(ring_concept<linux_aio_files_disk<atomic_reference, waiter_t>>,
               "The Linux AIO transport is a ring like every other");
 static_assert(ring_concept<any_files_disk<atomic_reference, waiter_t>>,
               "Any file transport is a ring like every other");
+
+#pragma region Transport Drivers
 
 /** Mounts the RAM transport and runs the suite on it, with and without demanded alignment. */
 void memory_transport(suite_totals_t& totals) {
@@ -106,7 +103,7 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
               });
 }
 
-#pragma endregion Drivers
+#pragma endregion Transport Drivers
 
 } // namespace unum::ustore::test
 

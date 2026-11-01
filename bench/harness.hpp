@@ -4,8 +4,8 @@
  *  @date September 30, 2026
  *  @brief Timed loops, latency histograms, result rows and the flags every benchmark shares.
  *
- *  A row runs one body on every thread of an @c executor_t, each thread iterating its own @c loop_t as
- *  `for (std::size_t call : loop)`, and folds the loops into one @c row_t. Setup above that `for` stays untimed.
+ *  A row runs one body on every thread of an @c executor_t, each thread iterating its own @c loop_t
+ *  in a range-for, and folds the loops into one @c row_t. Setup above the range-for stays untimed.
  *  Every call lands in its thread's latency histogram, so p50, p99 and p99.9 cost no shared writes.
  *
  *  Every benchmark takes these flags beside its own, and echoes them all as "- Name: value" before its rows:
@@ -21,7 +21,6 @@
 #include <cmath>   // `std::ceil`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
-#include <cstdio>  // `stderr`
 #include <cstdlib> // `std::exit`
 
 #include <algorithm>   // `std::max`
@@ -37,7 +36,7 @@
 
 #include <smashtable/basic_vector.hpp>
 
-#include "ustore/utilities/ram_device.hpp" // `executor_t`, `caller_exclusivity_t`
+#include "ustore/utilities/ram_device.hpp" // `executor_t`
 
 #include "arguments.hpp"
 
@@ -287,14 +286,14 @@ class loop_t {
 }
 
 /**
- *  @brief Samples @p body on every thread of @p executor: each warms up for @c --warmup, then runs for
- *      @c --time-limit, the deadlines shared by all threads.
+ *  @brief Samples @p body on every thread of @p executor: each warms up for @c --warmup, then runs
+ *      for @c --time-limit, the deadlines shared by all threads.
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
 [[nodiscard]] row_t run_threads(executor_t& executor, shared_settings_t const& settings, std::string_view name,
                                 body_type_&& body) noexcept {
-    st::basic_vector<loop_t> loops;
+    st::vector<loop_t> loops;
     if (st::failed(loops.resize(executor.threads_count()))) return {.name = name, .skipped = "no memory for loops"};
     time_point_t const warmup_until = steady_clock_t::now() + settings.warmup;
     for (loop_t& loop : loops) loop = loop_t {warmup_until, warmup_until + settings.time_limit};
@@ -304,14 +303,15 @@ template <typename body_type_>
 }
 
 /**
- *  @brief Runs @p body over the calls @b [0,count) once, thread @c t of @p executor taking the contiguous share
- *      @b [count*t/threads,count*(t+1)/threads), for input a row consumes, like building a collection.
+ *  @brief Runs @p body over the calls @b [0,count) once, thread @c t of @p executor taking the
+ *      contiguous share @b [count*t/threads,count*(t+1)/threads), for input a row consumes, like
+ *      building a collection.
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
 [[nodiscard]] row_t run_pass(executor_t& executor, std::string_view name, std::size_t count,
                              body_type_&& body) noexcept {
-    st::basic_vector<loop_t> loops;
+    st::vector<loop_t> loops;
     std::size_t const threads = executor.threads_count();
     if (st::failed(loops.resize(threads))) return {.name = name, .skipped = "no memory for loops"};
     for (std::size_t thread = 0; thread != threads; ++thread)

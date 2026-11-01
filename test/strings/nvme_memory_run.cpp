@@ -17,7 +17,7 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcmp`
 
-#include <algorithm>       // `std::max`, `std::min`, `std::sort`
+#include <algorithm>       // `std::max`, `std::min`
 #include <map>             // `std::map`
 #include <memory>          // `std::unique_ptr`
 #include <random>          // `std::mt19937_64`, `std::uniform_int_distribution`
@@ -439,7 +439,7 @@ static std::size_t merges_keep_visible_versions() {
             survival.pinned = pinned.data();
             survival.pinned_count = pinned.size();
             survival.horizon = stamp;
-            st::basic_vector<stamped_delta_t> versions;
+            st::vector<stamped_delta_t> versions;
             utilities::local_arena_t folded;
             utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
             failures += check(

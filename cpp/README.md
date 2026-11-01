@@ -165,7 +165,7 @@ status_t status = people[key_from_integer(1)].assign(R"({"person": "Alice", "age
 status = people[key_from_integer(2)].assign(R"({"person": "Bob", "age": "27", "weight": 2})");
 
 expected<owned_value_t> document = people[key_from_integer(1)].value();
-expected<owned_value_t> person = people[collection_key_field_t {key_from_integer(1), "/person"}].value(ustore_docs_field_type_str_k);
+expected<owned_value_t> person = people[collection_key_field_t {key_from_integer(1), "/person"}].value(ustore_docs_field_type_string_k);
 
 status = people[key_from_integer(1)].patch(R"([{"op": "replace", "path": "/age", "value": 28}])");
 status = people[key_from_integer(2)].merge(R"({"weight": null})");
@@ -200,8 +200,8 @@ A header whose column types are known only at runtime views an array of `field_t
 ```cpp
 field_type_t const columns[] = {
     {"age", ustore_docs_field_type_i32_k},
-    {"age", ustore_docs_field_type_str_k},
-    {"person", ustore_docs_field_type_str_k},
+    {"age", ustore_docs_field_type_string_k},
+    {"person", ustore_docs_field_type_string_k},
 };
 auto dynamic = people[keys].gather(make_table_header(columns), arena);
 auto names = dynamic->column(2).as<std::string_view>();
@@ -297,7 +297,7 @@ status = people.write(keys, std::move(documents.value), {}, ustore_docs_modify_m
 std::array<sz::string_view_t, 1> const columns {"person"};
 sz::expected<values_tape_t> fields = sz::strings_view_t(columns).gather();
 if (!fields) return;
-auto gathered = people.gather(keys, std::move(fields.value), std::array {ustore_docs_field_type_str_k}, arena).wait();
+auto gathered = people.gather(keys, std::move(fields.value), std::array {ustore_docs_field_type_string_k}, arena).wait();
 auto names = gathered->table.column(0).as<std::string_view>();
 ```
 
@@ -343,7 +343,7 @@ expected<database_t> opened = database_t::open_rocksdb({.directory = bytes_of("/
 Either way the database runs its own calls on the calling thread until a receiver names an executor.
 
 - __Deferred inputs are owned, arenas borrowed.__
-  Keys, vertices, edges and column types come as a `std::array` or an `st::basic_vector`, and values, strings and fields as a `values_tape_t`, StringZilla's `sz::strings_t` that `sz::strings_view_t::gather` fills, so a borrowed span or view does not compile.
+  Keys, vertices, edges and column types come as a `std::array` or an `st::vector`, and values, strings and fields as a `values_tape_t`, StringZilla's `sz::strings_t` that `sz::strings_view_t::gather` fills, so a borrowed span or view does not compile.
   The arena comes as an `arena_t&`, borrowed until the call is final, which is safe because freeing an arena waits for the deferred calls naming it, while a temporary arena does not compile.
 - __Submission copies the arguments.__
   A `deferred<verb>` keeps one heap block that never moves, holding the outcome, the owned inputs and the outputs the call writes through, while the C argument structure dies on the stack it was filled on.

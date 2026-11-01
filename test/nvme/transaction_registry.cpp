@@ -4,11 +4,12 @@
  *  @date September 19, 2026
  *  @brief What the optimistic transaction layer promises: the conflicts it catches, and that it invents none.
  *
- *  The results this file exists for are @c serializable_under_threads, @c write_write_one_winner and
- *  @c disjoint_transactions_never_conflict. A missed write turns two concurrent transactions into a lost update,
- *  which no single-threaded case can show, so the money-moving case drives real threads at overlapping keys and
- *  checks the one quantity a half-applied or lost commit cannot preserve - the total. An invented conflict is the
- *  opposite failure, so two transactions writing a thousand keys each must both land.
+ *  The results this file exists for are @c serializable_under_threads, @c write_write_one_winner
+ *  and @c disjoint_transactions_never_conflict. A missed write turns two concurrent transactions
+ *  into a lost update, which no single-threaded case can show, so the money-moving case drives real
+ *  threads at overlapping keys and checks the one quantity a half-applied or lost commit cannot
+ *  preserve - the total. An invented conflict is the opposite failure, so two transactions writing
+ *  a thousand keys each must both land.
  *
  *  Nothing here touches a disk. The registry reaches its store through a handful of calls, so the store is a
  *  table of words and stamps in memory and every case runs at memory speed under both sanitizers.
@@ -20,43 +21,28 @@
 #include <cstring> // `std::memcpy`
 
 #include <array>   // `std::array`
-#include <atomic>  // `std::memory_order`
 #include <memory>  // `std::make_shared`, `std::unique_ptr`
 #include <span>    // `std::span`
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 #include <vector>  // `std::vector`
 
-#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
-#include <forkunion/types.hpp>   // `fu::standard_yield_t`
+#include "ustore/blobs/nvme_transactions.hpp" // `transaction_registry`, `transaction_core`, `transaction_deltas`
 
-#include "ustore/blobs/nvme_database.hpp" // `database_transaction_registry`, `commit_ledger`
-
-#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
+#include "harness.hpp"      // `suite_exit_code`, `expect`, `expect_eq`
+#include "nvme/fixture.hpp" // `atomic_reference`, `waiter_t`, `commit_ledger_t`, `stamp_pin_t`, `resources_t`
 
 namespace unum::ustore {
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::test;
+using namespace unum::ustore::test::nvme;
 using namespace unum::ustore::utilities;
 
 #pragma region Shape
 
 /** The keys, and the values, every case of this suite moves. */
 using stored_key_t = std::uint64_t;
-
-/** The atomic reference the registry and the store are instantiated with: the portable one. */
-template <typename value_type_>
-using atomic_reference = fu::standard_atomic_ref<value_type_>;
-
-/** The waiter the registry and the store are instantiated with, yielding between attempts. */
-using waiter_t = fu::standard_yield_t;
-
-using commit_ledger_t = commit_ledger<atomic_reference, waiter_t>;
-using stamp_pin_t = stamp_pin<atomic_reference, waiter_t>;
-using resource_constraint_t = resource_constraint<atomic_reference>;
-using resources_t = shared_resources<atomic_reference, waiter_t>;
-using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiter_t>;
 
 /** The sole collection the multi-collection registry is driven over here. */
 constexpr collection_id_t collection_k {uuid_from_integer(7)};
@@ -142,7 +128,7 @@ class test_store_t {
             if (behaviour == store_behaviour_t::refusing_flushes_k)
                 return {status_code_t::device_k, "Refusing to flush"};
         }
-        st::basic_vector<keyed_delta<stored_key_t>> deltas;
+        st::vector<keyed_delta<stored_key_t>> deltas;
         written.for_each_delta(collection_id, [&](stored_key_t stored_key, delta_view_t delta) noexcept {
             [[maybe_unused]] st::status_t const kept = deltas.push_back(keyed_delta<stored_key_t> {stored_key, delta});
         });
@@ -247,7 +233,7 @@ class test_store_t {
     std::int32_t resumed_ = 0;
 };
 
-using registry_t = database_transaction_registry<stored_key_t, test_store_t, atomic_reference, waiter_t>;
+using registry_t = transaction_registry<stored_key_t, test_store_t, atomic_reference, waiter_t>;
 
 static_assert(transaction_store_concept<test_store_t, stored_key_t, atomic_reference, waiter_t>,
               "The store must serve the commit path");
@@ -257,56 +243,42 @@ static_assert(transaction_store_concept<test_store_t, stored_key_t, atomic_refer
 #pragma region Transaction
 
 /**
- *  @brief The front end the suite drives the registry through, holding one transaction's own state.
+ *  @brief The front end the suite drives the registry through: the shared core, and writes of
+ *      one word each.
  *
- *  Every call the registry expects from a front end appears here once, which is what the specialization
- *  is for: the contract is the list of members below, not a comment describing it.
+ *  Every call the registry expects from a front end lives in the core, so what is left here is what
+ *  a real front end adds: the collection a write files under, the widths it is checked against, and
+ *  the watch it takes beside it.
  */
-template <>
-class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, waiter_t> {
+class test_transaction_t {
   public:
-    using state_t = registry_t::transaction_state_t;
-    using transaction_deltas_t = registry_t::transaction_deltas_t;
+    using core_t = transaction_core<stored_key_t, registry_t, atomic_reference, waiter_t>;
+    using state_t = core_t::state_t;
+    using transaction_deltas_t = core_t::transaction_deltas_t;
 
     /** The widths the sole collection admits, which every write is checked against. */
     static constexpr transaction_deltas_t::value_widths_t widths_k {value_bytes_k, 0};
 
-    /** What the transaction is allowed to do next. */
-    enum class phase_t {
+    test_transaction_t(registry_t& registry, transaction_deltas_t&& deltas, resources_shared_ptr_t resources) noexcept
+        : core_(registry, std::move(deltas), resources) {}
 
-        /** Reading, writing and watching. */
-        started_k,
-
-        /** Staged, holding the ledger's leader word until it commits or rolls back. */
-        staged_k,
-    };
-
-    database_transaction(registry_t& registry, transaction_deltas_t&& deltas, resources_shared_ptr_t resources) noexcept
-        : registry_(&registry), data_(std::move(deltas), resources) {
-        start_stamp_ = registry_->request_start_(pin_);
-    }
-
-    database_transaction(database_transaction const&) = delete;
-    database_transaction& operator=(database_transaction const&) = delete;
-
-    ~database_transaction() noexcept {
-        if (phase_ == phase_t::staged_k) registry_->discard_(data_);
-    }
+    test_transaction_t(test_transaction_t const&) = delete;
+    test_transaction_t& operator=(test_transaction_t const&) = delete;
 
     /** The stamp the transaction started at, which scopes every @c on_commit_k watch it takes. */
-    transaction_stamp_t start_stamp() const noexcept { return start_stamp_; }
+    transaction_stamp_t start_stamp() const noexcept { return core_.start_stamp(); }
 
     /** The writes the transaction has not committed yet. */
-    state_t const& state() const noexcept { return data_; }
+    state_t const& state() const noexcept { return core_.state(); }
 
-    /** Watches @p stored_key on @p schedule for @p purpose, the way the real front end does. */
+    /** Watches @p stored_key on @p schedule for @p purpose, the way the real front ends do. */
     template <watch_schedule_t watch_schedule_>
     status_t watch(stored_key_t stored_key, watch_purpose_t purpose) noexcept {
         std::array<stored_key_t, 1> const only {stored_key};
-        status_t status = watch_now_or_prepare_for_later_<watch_schedule_>(only);
-        if (status.failed()) return status;
-        watch_later_<watch_schedule_>(only, watch_stamp_<watch_schedule_>(), purpose);
-        return status;
+        status_t const prepared = core_.watch_now_or_prepare<watch_schedule_>(collection_k, only);
+        if (prepared.failed()) return prepared;
+        core_.watch_later<watch_schedule_>(collection_k, only, core_.watch_stamp_for<watch_schedule_>(), purpose);
+        return {};
     }
 
     /** Writes @p word under @p stored_key, watching the key on @p watch_schedule_ beside the write. */
@@ -314,115 +286,44 @@ class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, 
     status_t insert(stored_key_t stored_key, std::uint64_t word) noexcept {
         std::byte payload[value_bytes_k];
         std::memcpy(payload, &word, value_bytes_k);
-        return data_.deltas.write(collection_k, widths_k, stored_key, stored_value_view_t {payload, value_bytes_k},
-                                  written_watch_<watch_schedule_>());
+        return core_.state().deltas.write(collection_k, widths_k, stored_key,
+                                          stored_value_view_t {payload, value_bytes_k},
+                                          core_.watch_stamp_for<watch_schedule_>());
     }
 
     /** Drops @p stored_key, watching the key on @p watch_schedule_ beside the write. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::on_commit_k>
     status_t remove(stored_key_t stored_key) noexcept {
-        return data_.deltas.remove(collection_k, widths_k, stored_key, written_watch_<watch_schedule_>());
+        return core_.state().deltas.remove(collection_k, widths_k, stored_key,
+                                           core_.watch_stamp_for<watch_schedule_>());
     }
 
     /** Checks the watched keys and makes room in the store, holding the write path once it answers. */
-    status_t stage() noexcept {
-        transaction_stamp_t staged_stamp = invalid_transaction_stamp_k;
-        status_t const status = registry_->stage_(data_, start_stamp_, staged_stamp);
-        if (status.succeeded()) phase_ = phase_t::staged_k;
-        return status;
-    }
+    status_t stage() noexcept { return core_.stage(); }
 
-    /** Stages unless already staged, then writes the changes into the store. */
-    status_t commit() noexcept {
-        if (phase_ != phase_t::staged_k)
-            if (status_t const staged = stage(); staged.failed()) return staged;
-        last_commit_stamp_ = registry_->commit_staged_(data_);
-        phase_ = phase_t::started_k;
-        data_.clear();
-        start_stamp_ = registry_->request_start_(pin_);
-        return {};
-    }
+    /** Lands the changes in the store, through the stage already holding the write path or
+     *  on its own. */
+    status_t commit() noexcept { return core_.commit(); }
 
     /** Drops every change and every watch, leaving the registry with no trace of the transaction. */
-    void rollback() noexcept {
-        if (phase_ == phase_t::staged_k) registry_->discard_(data_);
-        phase_ = phase_t::started_k;
-        data_.clear();
-        start_stamp_ = registry_->request_start_(pin_);
-    }
+    void rollback() noexcept { core_.rollback(); }
+
+    /** Hands the write path back after a stage, keeping the changes and the watches. */
+    void unstage() noexcept { core_.unstage(); }
 
     /** Starts over with the changes kept, which a caller retrying a conflict asks for. */
-    void renew() noexcept {
-        if (phase_ == phase_t::staged_k) registry_->discard_(data_);
-        phase_ = phase_t::started_k;
-        data_.read_set.clear();
-        start_stamp_ = registry_->request_start_(pin_);
-        data_.deltas.rescope_watches(start_stamp_);
-    }
+    status_t renew() noexcept { return core_.renew(); }
 
     /** The stamp of the last commit this transaction landed. */
-    transaction_stamp_t last_commit_stamp() const noexcept { return last_commit_stamp_; }
+    transaction_stamp_t last_commit_stamp() const noexcept { return core_.last_commit_stamp(); }
 
   private:
 
-    /** The stamp a watch on @p watch_schedule_ is scoped from. */
-    template <watch_schedule_t watch_schedule_>
-    transaction_stamp_t watch_stamp_() const noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            return registry_->current_stamp_();
-        else return start_stamp_;
-    }
-
-    /** The watch a write on @p watch_schedule_ keeps beside itself, none for a schedule that checks no later. */
-    template <watch_schedule_t watch_schedule_>
-    transaction_stamp_t written_watch_() const noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k ||
-                      watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            return watch_stamp_<watch_schedule_>();
-        else return invalid_transaction_stamp_k;
-    }
-
-    /** Checks @p stored_keys now, or makes room to check them at the commit. */
-    template <watch_schedule_t watch_schedule_>
-    status_t watch_now_or_prepare_for_later_(std::span<stored_key_t const> stored_keys) noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::now_k)
-            return registry_->watch_now_(start_stamp_, collection_k, stored_keys);
-        else if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k ||
-                           watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            return data_.read_set.reserve_more(collection_k, stored_keys.size());
-        else return status_t {};
-    }
-
-    /** Records @p stored_keys as watched from @p watch_stamp, in room the preparation took. */
-    template <watch_schedule_t watch_schedule_>
-    void watch_later_(std::span<stored_key_t const> stored_keys, transaction_stamp_t watch_stamp,
-                      watch_purpose_t purpose) noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k ||
-                      watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            for (stored_key_t const stored_key : stored_keys)
-                data_.read_set.add(collection_k, stored_key, watch_stamp, purpose, st::assume_reserved);
-    }
-
-    /** The registry every stage and every commit goes through. */
-    registry_t* registry_;
-
-    /** The writes and the watches the transaction carries. */
-    state_t data_;
-
-    /** The start stamp, pinned against the store's ledger. */
-    stamp_pin_t pin_;
-
-    /** The stamp the current attempt started at. */
-    transaction_stamp_t start_stamp_ = invalid_transaction_stamp_k;
-
-    /** The stamp the last commit landed at. */
-    transaction_stamp_t last_commit_stamp_ = invalid_transaction_stamp_k;
-
-    /** What the transaction is allowed to do next. */
-    phase_t phase_ = phase_t::started_k;
+    /** The writes, the watches and the stamps, which the registry drives. */
+    core_t core_;
 };
 
-using transaction_t = database_transaction<stored_key_t, test_store_t, atomic_reference, waiter_t>;
+using transaction_t = test_transaction_t;
 
 #pragma endregion Transaction
 
@@ -444,9 +345,9 @@ struct fixture_t {
         : resources(std::make_shared<resources_t>(1ull << 30, 0)), store(), registry(store, resources) {}
 
     /** A transaction, or nothing when the registry refuses it. */
-    expected<registry_t::transaction_unique_ptr_t> open() noexcept {
+    expected<std::unique_ptr<transaction_t>> open() noexcept {
         transaction_config_t const config {deltas_bytes_k, deltas_max_count_k};
-        return registry.create_transaction(config);
+        return registry.create_transaction<transaction_t>(config);
     }
 };
 
@@ -533,7 +434,7 @@ static std::size_t commit_stamps_are_distinct() {
     constexpr std::size_t threads_k = 8;
     constexpr std::size_t per_thread_k = 20000;
     std::vector<std::vector<transaction_stamp_t>> claimed(threads_k);
-    std::atomic<std::size_t> unpublished {0};
+    std::size_t unpublished {0};
     std::vector<std::thread> workers;
     workers.reserve(threads_k);
     for (std::size_t thread_index = 0; thread_index != threads_k; ++thread_index)
@@ -546,7 +447,8 @@ static std::size_t commit_stamps_are_distinct() {
                 expected<transaction_stamp_t> const stamp = ledger.submit(request);
                 if (stamp) claimed[thread_index].push_back(*stamp);
                 // The stamp is published on return, so the committer reads what it wrote.
-                if (!stamp || ledger.published() < *stamp) unpublished.fetch_add(1, std::memory_order_relaxed);
+                if (!stamp || ledger.published() < *stamp)
+                    atomic_reference<std::size_t> {unpublished}.fetch_add(1, std::memory_order_relaxed);
             }
         });
     for (std::thread& worker : workers) worker.join();
@@ -562,7 +464,7 @@ static std::size_t commit_stamps_are_distinct() {
         }
 
     failures += expect_eq(repeats, std::size_t {0});
-    failures += expect_eq(unpublished.load(), std::size_t {0});
+    failures += expect_eq(atomic_reference<std::size_t> {unpublished}.load(), std::size_t {0});
     failures += expect_eq(highest, transaction_stamp_t {threads_k * per_thread_k});
     failures += expect_eq(ledger.published(), highest);
     return failures;
@@ -611,7 +513,7 @@ static std::size_t pins_answer_the_ledger() {
     failures += expect(!reader.held() && moved.held());
     stamp_pin_t later;
     failures += expect_eq(ledger.pin_reader(later), transaction_stamp_t {42});
-    st::basic_vector<transaction_stamp_t> pinned;
+    st::vector<transaction_stamp_t> pinned;
     failures += expect(ledger.pinned_readers(pinned).succeeded());
     failures += expect_eq(pinned.size(), std::size_t {2});
     failures += expect(pinned.size() == 2 && pinned[0] == 41 && pinned[1] == 42);
@@ -846,7 +748,7 @@ static std::size_t failed_commit_keeps_changes() {
     reader->get()->rollback();
 
     // Retrying is what renewal is for: the changes stay and only the watches and the stamp restart.
-    transaction->get()->renew();
+    failures += expect(transaction->get()->renew().succeeded());
     failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {2});
 
     // A refused stage leaves them too, which is the other half of the same promise.
@@ -903,10 +805,12 @@ static std::size_t rollback_and_renew_leave_no_trace() {
         failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {0});
         failures += expect_eq(transaction->get()->state().read_set.count(), std::size_t {0});
 
-        // Renewal keeps the changes and drops only the watches.
+        // Renewal keeps the changes and drops only the watches, once the stage hands the
+        // write path back.
         failures += expect(transaction->get()->insert(3, 9).succeeded());
         failures += expect(transaction->get()->stage().succeeded());
-        transaction->get()->renew();
+        transaction->get()->unstage();
+        failures += expect(transaction->get()->renew().succeeded());
         failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {1});
         failures += expect_eq(transaction->get()->state().read_set.count(), std::size_t {0});
         failures += expect(transaction->get()->commit().succeeded());
@@ -1033,10 +937,11 @@ static std::size_t serializable_under_threads() {
 /**
  *  @brief A transaction starting while a commit is half applied orders before it, not after it.
  *
- *  This is the ordering the money-moving case can only catch by luck, so it is driven here by hand: a
- *  commit is held inside the store with its stamp drawn but its writes not yet landed, a reader starts in
- *  exactly that window and reads the stale balance, and the stage that follows has to refuse it. Starting the
- *  reader at the drawn stamp instead of the published one lets it through with a value that was never committed.
+ *  This is the ordering the money-moving case can only catch by luck, so it is driven here by hand:
+ *  a commit is held inside the store with its stamp drawn but its writes not yet landed, a reader
+ *  starts in exactly that window and reads the stale balance, and the stage that follows has to
+ *  refuse it. Starting the reader at the drawn stamp instead of the published one lets it through
+ *  with a value that was never committed.
  */
 static std::size_t start_during_apply_still_conflicts() {
     std::size_t failures = 0;

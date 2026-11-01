@@ -1,9 +1,10 @@
 /**
- *  @file include/ustore/graph/ram_graph.hpp
+ *  @file include/ustore/graph/ram_store.hpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
- *  @brief The graph algorithms over a store of half-edges: walking a vertex's edges, exporting degrees and edges,
- *      and staging edge and vertex inserts and removals into a transaction.
+ *  @brief The RAM store of a graph collection, every vertex once and every edge twice under each of
+ *      its vertices, and the graph algorithms over it: walking a vertex's edges, exporting degrees
+ *      and edges, and staging edge and vertex inserts and removals into a transaction.
  *
  *  Every template here takes the view or the transaction part of a @c half_edges_store, and the batch of tasks or
  *  edges in whatever form the caller keeps them, as long as indexing it answers a task with @c vertex_id and @c role,
@@ -16,10 +17,10 @@
 #include <cstdint> // `std::uint8_t`
 #include <cstring> // `std::memcpy`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/ram_store.hpp"       // `store_status_t`, `walk_control_t`, `translate`
-#include "ustore/graph/half_edges.hpp"      // `half_edge_t`, `half_edge_direction_t`
+#include "ustore/blobs/ram_store.hpp" // `ordered_store`, `isolation_t`, `store_status_t`, `walk_control_t`, `translate`
+#include "ustore/graph/half_edges.hpp" // `half_edge_t`, `half_edge_order_t`, `half_edge_hash_t`, `half_edge_direction_t`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 #include "ustore/utilities/types.hpp"       // `edge_t`, `status_t`
 
@@ -31,6 +32,12 @@ using blobs::walk_control_t;
 using utilities::arena_allocator;
 using utilities::edge_t;
 using utilities::status_t;
+
+/** A graph collection: every vertex once and every edge twice, under each of its vertices,
+ *  with no values. */
+template <blobs::isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
+using half_edges_store =
+    blobs::ordered_store<half_edge_t, half_edge_order_t, half_edge_hash_t, isolation_, atomic_reference_, waiter_type_>;
 
 /** Walks the entries of @p vertex in @p direction through @p view, handing @p visit every one. */
 template <typename view_type_, typename visit_type_>
@@ -44,10 +51,8 @@ store_status_t walk_direction(view_type_ const& view, ustore_key_t const& vertex
  *  source, target and edge triples when @p edges is given, watching what it walked when the view watches. */
 template <typename view_type_, typename tasks_type_, typename degrees_type_>
 store_status_t export_edges(view_type_ const& view, tasks_type_ const& tasks, std::size_t first, std::size_t end,
-                            degrees_type_& degrees,
-                            st::basic_vector<ustore_key_t, arena_allocator<ustore_key_t>>* edges,
-                            st::basic_vector<half_edge_t, arena_allocator<half_edge_t>>& walked,
-                            status_t& outcome) noexcept {
+                            degrees_type_& degrees, st::vector<ustore_key_t, arena_allocator<ustore_key_t>>* edges,
+                            st::vector<half_edge_t, arena_allocator<half_edge_t>>& walked, status_t& outcome) noexcept {
     std::size_t const walked_before = walked.size();
     for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
         auto const asked = tasks[task];
@@ -145,7 +150,7 @@ store_status_t stage_edges_removal(transaction_type_& part, edges_type_ const& e
  *  of its own. */
 template <typename transaction_type_>
 store_status_t stage_vertex_removal(transaction_type_& part, ustore_key_t const& vertex, ustore_vertex_role_t role,
-                                    st::basic_vector<half_edge_t, arena_allocator<half_edge_t>>& walked) noexcept {
+                                    st::vector<half_edge_t, arena_allocator<half_edge_t>>& walked) noexcept {
     std::size_t const first = walked.size();
     store_status_t collected = store_status_t::success_k;
     auto const collect = [&](half_edge_t const& entry) noexcept -> walk_control_t {

@@ -5,9 +5,9 @@
  *  @brief Shared checks for the C++ test suites: failure counting, results, the totals, bounded waits, flags and
  *      directories.
  *
- *  Every check returns its own failure count, a case returns a @c case_result_t, and @c report runs each case the
- *  @c --filter selects and rolls its result into the @c suite_totals_t the suite's @c main owns, so counts reach
- *  @c suite_exit_code without global mutable state.
+ *  Every check returns its own failure count, a case returns a @c case_result_t, and @c report
+ *  runs each case the @c --filter selects and rolls its result into the @c suite_totals_t the
+ *  suite's @c main owns, so counts reach @c suite_exit_code without global mutable state.
  */
 #pragma once
 
@@ -15,7 +15,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstdio>  // `stderr`
-#include <cstring> // `std::memcpy`, `std::strlen`
+#include <cstring> // `std::memcpy`
 
 #include <array>            // `std::array`
 #include <chrono>           // `std::chrono::steady_clock`
@@ -413,8 +413,8 @@ struct suite_options_t {
 constexpr std::size_t suite_flags_capacity_k = 16;
 
 /**
- *  @brief Parses the shared flags and @p suite_flags from @p argv into @p options, drawing a seed on @c --seed
- *      @c random, and echoes every flag.
+ *  @brief Parses the shared flags and @p suite_flags from @p argv into @p options, drawing a seed
+ *      on @c --seed @c random, and echoes every flag.
  *
  *  Prints the usage on @c --help and one failure line on failure. A suite flag named like a shared one
  *  shadows it, so a suite may give @c --threads its own meaning.

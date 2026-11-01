@@ -23,7 +23,7 @@
 #include "ustore/utilities/algorithm.hpp" // `reservoir_sample_iterator`
 
 #include "database.hpp"           // `database_t`, `transaction_t`, `refuse_collections`, `get_many`, `write_many`
-#include "utilities/batches.hpp"  // `strings_arg`, `validate_write`, `places_of`
+#include "utilities/batches.hpp"  // `validate_write`, `places_of`
 #include "utilities/outputs.hpp"  // `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 

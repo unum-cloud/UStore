@@ -17,17 +17,19 @@
 #include <new>       // `std::nothrow`
 #include <span>      // `std::span`
 #include <utility>   // `std::move`
-#include <variant>   // `std::visit`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_database.hpp"   // `basic_database`
-#include "ustore/strings/nvme_store.hpp"    // `strings::nvme_store`
-#include "ustore/utilities/nvme_volume.hpp" // `resources_t`
+#include "ustore/blobs/nvme_database.hpp"    // `basic_database`
+#include "ustore/strings/nvme_store.hpp"     // `strings::nvme_store`
+#include "ustore/utilities/nvme_catalog.hpp" // `blob_kind_t`, `blob_name_t`
+#include "ustore/utilities/nvme_volume.hpp"  // `basic_volume_router`, `volume_blob_t`, `volume_id_t`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`
+#include "nvme/fixture.hpp" // `run_on_transport`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -54,14 +56,15 @@ struct database_types {
     template <value_layout_t value_layout_>
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
                                       last_write_fold_t, no_device_fold_t>;
-    using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t>;
-    template <typename... stores_>
-    using database_of =
-        basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, layout_store_tags<stores_...>, stores_...>;
-    using database_t =
-        database_of<strings_store_t, blobs_store_of<value_layout_t::inline_12_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_44_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
-                    blobs_store_of<value_layout_t::variable_width_k>>;
+    using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+    using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t, strings_kit_t>;
+    template <typename... store_types_>
+    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t,
+                                             layout_store_tags<store_types_...>, store_types_...>;
+    using database_t = basic_database_of<strings_store_t, blobs_store_of<value_layout_t::inline_12_bytes_k>,
+                                         blobs_store_of<value_layout_t::inline_44_bytes_k>,
+                                         blobs_store_of<value_layout_t::fixed_width_k>,
+                                         blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
 
     /** A fixture, the router over its one volume, and the database mounted over the router. */
@@ -188,7 +191,7 @@ expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t
 /** Copies the whole medium of volume zero of @p fixture into @p image, block by block on @p channel, which is what a
  *  crash would leave on it at this moment. */
 template <typename fixture_type_>
-status_t capture_medium(fixture_type_& fixture, io_channel_t& channel, st::basic_vector<byte_t>& image) noexcept {
+status_t capture_medium(fixture_type_& fixture, io_channel_t& channel, st::vector<byte_t>& image) noexcept {
     std::uint64_t const capacity = fixture.config.volume_bytes;
     std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
     if (block == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
@@ -252,8 +255,8 @@ status_t remount_volume(stack_type_& stack) noexcept {
 
 /** The counters every row of a case carries, one per key, which outlive the rows viewing them. */
 struct counted_rows_t {
-    st::basic_vector<std::array<byte_t, 8>> values;
-    st::basic_vector<row_t> rows;
+    st::vector<std::array<byte_t, 8>> values;
+    st::vector<row_t> rows;
 };
 
 /** Rows writing @p value under every key of @p keys, in that order. */
@@ -270,8 +273,8 @@ struct counted_rows_t {
 }
 
 /** The keys from @p first up to @p last, excluded. */
-[[nodiscard]] st::basic_vector<stored_key_t> keys_between(stored_key_t first, stored_key_t last) noexcept {
-    st::basic_vector<stored_key_t> keys;
+[[nodiscard]] st::vector<stored_key_t> keys_between(stored_key_t first, stored_key_t last) noexcept {
+    st::vector<stored_key_t> keys;
     [[maybe_unused]] st::status_t const sized = keys.resize(static_cast<std::size_t>(last - first));
     for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = first + index;
     return keys;
@@ -285,9 +288,10 @@ expected<transaction_stamp_t> ingest_rows(database_type_& store, collection_id_t
     typename database_type_::ingest_t ingest;
     if (status_t const begun = store.begin_ingest(any_collection_id_t {collection}, ingest); begun.failed())
         return begun;
-    std::span<row_t const> const all {rows.rows};
-    for (std::size_t first = 0; first < all.size(); first += batch) {
-        status_t const written = store.write_ingest(ingest, all.subspan(first, std::min(batch, all.size() - first)));
+    std::span<row_t const> const rows_view {rows.rows};
+    for (std::size_t first = 0; first < rows_view.size(); first += batch) {
+        status_t const written = store.write_ingest(
+            ingest, rows_view.subspan(first, std::min(batch, rows_view.size() - first)));
         if (written.failed()) {
             store.drop_ingest(ingest);
             return written;
@@ -312,7 +316,7 @@ template <typename reader_type_>
 
 /** Runs every level of @p collection's tree holds, shallowest first, into @p into. */
 template <typename database_type_>
-status_t level_runs(database_type_& store, collection_id_t collection, st::basic_vector<std::size_t>& into) noexcept {
+status_t level_runs(database_type_& store, collection_id_t collection, st::vector<std::size_t>& into) noexcept {
     return store.visit_store(any_collection_id_t {collection},
                              [&]<typename held_type_>(held_type_ const& held) noexcept -> status_t {
                                  typename held_type_::level_set_t const& levels = held.tree().levels();
@@ -341,11 +345,11 @@ std::size_t empty_collection_lands_on_a_sorted_level(mount_type_ const& mount) {
     failures += expect(fresh.has_value());
     if (!fresh) return failures;
 
-    st::basic_vector<stored_key_t> const keys = keys_between(0, 300);
+    st::vector<stored_key_t> const keys = keys_between(0, 300);
     expected<transaction_stamp_t> const landed = ingest_rows(
         *(*stack)->store, *fresh, rows_of(std::span<stored_key_t const> {keys}, 9), ustore_durability_buffered_k);
     failures += expect(landed.has_value());
-    st::basic_vector<std::size_t> runs;
+    st::vector<std::size_t> runs;
     failures += expect(level_runs(*(*stack)->store, *fresh, runs).succeeded());
     failures += expect(runs.size() > 1);
     if (runs.size() <= 1) return failures;
@@ -370,7 +374,7 @@ std::size_t overlap_at_level_one_lands_on_level_zero(mount_type_ const& mount) {
     if (!deep) return failures;
 
     // Level zero is due at four runs, so four flushes and a merge leave every key on level one.
-    st::basic_vector<stored_key_t> const keys = keys_between(0, 100);
+    st::vector<stored_key_t> const keys = keys_between(0, 100);
     for (std::uint64_t round = 0; round != 4; ++round) {
         for (stored_key_t const key : keys) {
             std::array<byte_t, 8> const counter = counted(round);
@@ -380,7 +384,7 @@ std::size_t overlap_at_level_one_lands_on_level_zero(mount_type_ const& mount) {
         failures += expect(store.flush().succeeded());
     }
     failures += expect(store.compact().succeeded());
-    st::basic_vector<std::size_t> runs;
+    st::vector<std::size_t> runs;
     failures += expect(level_runs(store, *deep, runs).succeeded());
     failures += expect(runs.size() > 1 && runs[0] == 0 && runs[1] != 0);
 
@@ -406,7 +410,7 @@ std::size_t appends_share_one_run(mount_type_ const& mount) {
     failures += expect(coalesced.has_value());
     if (!coalesced) return failures;
 
-    st::basic_vector<stored_key_t> const keys = keys_between(0, 8000);
+    st::vector<stored_key_t> const keys = keys_between(0, 8000);
     failures += expect(ingest_rows(*(*stack)->store, *coalesced, rows_of(std::span<stored_key_t const> {keys}, 3),
                                    ustore_durability_buffered_k, 1000)
                            .has_value());
@@ -434,12 +438,12 @@ std::size_t crash_after_ingest(mount_type_ const& mount, ustore_durability_t dur
     expected<collection_id_t> const landed = create_named(*(*stack)->store, "landed", test_config(8, 0));
     failures += expect(landed.has_value());
     if (!landed) return failures;
-    st::basic_vector<stored_key_t> const keys = keys_between(0, 200);
+    st::vector<stored_key_t> const keys = keys_between(0, 200);
     failures += expect(
         ingest_rows(*(*stack)->store, *landed, rows_of(std::span<stored_key_t const> {keys}, 5), durability)
             .has_value());
 
-    st::basic_vector<byte_t> image;
+    st::vector<byte_t> image;
     {
         expected<guard_t> guard = (*stack)->fixture->channels.acquire();
         failures += expect(guard.has_value());
@@ -562,7 +566,7 @@ std::size_t descending_key_is_refused(mount_type_ const& mount) {
     failures += expect(refused.has_value());
     if (!refused) return failures;
 
-    st::basic_vector<stored_key_t> keys = keys_between(0, 20);
+    st::vector<stored_key_t> keys = keys_between(0, 20);
     keys[19] = 3;
     counted_rows_t const rows = rows_of(std::span<stored_key_t const> {keys}, 7);
     expected<transaction_stamp_t> const landed = ingest_rows(*(*stack)->store, *refused, rows,

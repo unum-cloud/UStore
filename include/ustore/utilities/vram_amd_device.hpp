@@ -64,6 +64,11 @@ inline constexpr unsigned hip_memory_type_device_k = 2;
 /** The @c hipMemAttachGlobal flag of managed allocations, which any stream on any device reaches. */
 inline constexpr unsigned hip_attach_global_k = 1;
 
+/** The @c HIP_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES of a kernel, the dynamic shared
+ *  memory its launches take, which @c hipFuncAttributeMaxDynamicSharedMemorySize sets under
+ *  the same value. */
+inline constexpr int hip_function_dynamic_shared_bytes_k = 8;
+
 #pragma endregion Runtime ABI
 
 /**
@@ -100,6 +105,8 @@ struct hip_api_t {
     hip_result_t (*module_load_data)(hip_module_handle_t*, void const*) = nullptr;
     hip_result_t (*module_unload)(hip_module_handle_t) = nullptr;
     hip_result_t (*module_get_function)(hip_function_handle_t*, hip_module_handle_t, char const*) = nullptr;
+    hip_result_t (*function_get_attribute)(int*, int, hip_function_handle_t) = nullptr;
+    hip_result_t (*function_set_attribute)(void const*, int, int) = nullptr;
     hip_result_t (*module_launch_kernel)(hip_function_handle_t, unsigned, unsigned, unsigned, unsigned, unsigned,
                                          unsigned, unsigned, hip_stream_handle_t, void**, void**) = nullptr;
 
@@ -144,6 +151,8 @@ struct hip_api_t {
             library.resolve("hipModuleLoadData", runtime.module_load_data) &&
             library.resolve("hipModuleUnload", runtime.module_unload) &&
             library.resolve("hipModuleGetFunction", runtime.module_get_function) &&
+            library.resolve("hipFuncGetAttribute", runtime.function_get_attribute) &&
+            library.resolve("hipFuncSetAttribute", runtime.function_set_attribute) &&
             library.resolve("hipModuleLaunchKernel", runtime.module_launch_kernel);
         return resolved ? runtime : hip_api_t {};
     }
@@ -231,6 +240,8 @@ class hip_event_t {
 /** One code object loaded onto one AMD device and unloaded with this owner; kernels are found by name. */
 class hip_module_t {
   public:
+    using function_t = hip_function_handle_t;
+
     hip_module_t() noexcept = default;
     hip_module_t(hip_module_t&& other) noexcept : api_(other.api_), handle_(std::exchange(other.handle_, nullptr)) {}
     hip_module_t& operator=(hip_module_t&& other) noexcept {
@@ -265,6 +276,9 @@ class hip_module_t {
     hip_module_handle_t handle_ = nullptr;
 };
 
+template <typename module_type_>
+struct kernel_table;
+
 /** The stream every call on one AMD device queues on, the event it waits on, the device's class, and the ceiling on
  *  the scratch those calls walk with. Work is queued, never waited on but by @c wait, so one host thread keeps the
  *  device fed. */
@@ -275,11 +289,17 @@ class hip_executor_t {
     /** The memory of the arenas made over this executor. */
     using arena_blocks_t = hip_blocks_t;
 
-    /** Binds HIP ordinal @p ordinal of class @p gpu_class, and queues on @p borrowed, a @c hipStream_t of the caller's
-     *  on that device which outlives the executor, or on one of its own for null; its scratch never grows past
-     *  @p scratch_limit bytes, zero for no limit. */
+    /** The kernels this executor launches. */
+    using function_t = hip_function_handle_t;
+
+    /** Binds HIP ordinal @p ordinal of class @p gpu_class, and queues on @p borrowed,
+     *  a @c hipStream_t of the caller's on that device which outlives the executor, or
+     *  on one of its own for null; its scratch never grows past @p scratch_limit
+     *  bytes, zero for no limit, and its launches find their kernels in @p kernels,
+     *  the device's table of the library's bundle, or none for null. */
     static expected<hip_executor_t> spawn(hip_api_t const& api, int ordinal, gpu_class_t gpu_class, void* borrowed,
-                                          std::size_t scratch_limit) noexcept {
+                                          std::size_t scratch_limit,
+                                          kernel_table<hip_module_t> const* kernels = nullptr) noexcept {
         if (!api || api.set_device(ordinal) != hip_success_k)
             return status_t {status_code_t::device_k, "The HIP runtime refused the device"};
         hip_executor_t executor;
@@ -287,6 +307,7 @@ class hip_executor_t {
         executor.device_ = ordinal;
         executor.gpu_class_ = gpu_class;
         executor.scratch_limit_ = scratch_limit;
+        executor.kernels_ = kernels;
         executor.stream_ = static_cast<hip_stream_handle_t>(borrowed);
         if (!borrowed) {
             if (api.stream_create_with_flags(&executor.owned_stream_, hip_stream_non_blocking_k) != hip_success_k)
@@ -341,6 +362,12 @@ class hip_executor_t {
 
     /** The stream every call queues on, owned or borrowed. */
     hip_stream_handle_t stream() const noexcept { return stream_; }
+
+    /** The runtime table every call goes through. */
+    hip_api_t const& api() const noexcept { return *api_; }
+
+    /** The kernels of the library's bundle on the device, or null when none loaded. */
+    kernel_table<hip_module_t> const* kernels() const noexcept { return kernels_; }
 
     /** Makes the device current on the calling thread, once per call, before any other entry below. */
     status_t bind() noexcept {
@@ -424,8 +451,8 @@ class hip_executor_t {
     void swap(hip_executor_t& other) noexcept {
         std::swap(api_, other.api_), std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);
         std::swap(event_, other.event_), std::swap(device_, other.device_), std::swap(gpu_class_, other.gpu_class_);
-        std::swap(scratch_limit_, other.scratch_limit_), std::swap(bounce_, other.bounce_);
-        std::swap(managed_, other.managed_);
+        std::swap(scratch_limit_, other.scratch_limit_), std::swap(kernels_, other.kernels_);
+        std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
     }
 
     hip_api_t const* api_ = nullptr;
@@ -438,6 +465,7 @@ class hip_executor_t {
     int device_ = 0;
     gpu_class_t gpu_class_ = gpu_class_t::unknown_k;
     std::size_t scratch_limit_ = 0;
+    kernel_table<hip_module_t> const* kernels_ = nullptr;
     pinned_bounce<hip_api_t> bounce_;
     managed_blocks_t managed_ {};
 };

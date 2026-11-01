@@ -8,13 +8,10 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`, `std::uintptr_t`
 
-#include <chrono> // `std::chrono::steady_clock`
-#include <limits> // `std::numeric_limits`
-#include <span>   // `std::span`
+#include <span> // `std::span`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/blobs.h"
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
@@ -22,7 +19,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`, `growth_status`
 
 #include "database.hpp"           // `database_state`, `call_access`, `resolve_runs`, `serve_write`, `walk`
-#include "utilities/batches.hpp"  // `places_of`, `validate_write`, `scan_batch_t`, `sample_batch_t`
+#include "utilities/batches.hpp"  // `places_of`, `validate_write`, `samples_of`, `sample_generator_t`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -131,7 +128,7 @@ status_t scan_values(ustore_blobs_scan_t const& arguments, view_t const& view) n
     if (outputs_status.failed()) return outputs_status;
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
     call_access<cpu_class_> const access = access_of(state, view);
-    st::basic_vector<stored_key_t, arena_allocator<stored_key_t>> found {{view.scratch}};
+    st::vector<stored_key_t, arena_allocator<stored_key_t>> found {{view.scratch}};
     for (std::size_t task = 0; task != scans.size(); ++task) {
         scan_task_t const scan = scans[task];
         outputs.open_task(task);
@@ -174,24 +171,6 @@ status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) no
     return scan_values<cpu_class_>(arguments, view);
 }
 
-/** A splitmix64 generator, drawing the positions a reservoir keeps. */
-struct sample_generator_t {
-    using result_type = std::uint64_t;
-
-    /** The state every draw advances. */
-    std::uint64_t state;
-
-    static constexpr result_type min() noexcept { return 0; }
-    static constexpr result_type max() noexcept { return std::numeric_limits<result_type>::max(); }
-
-    result_type operator()() noexcept {
-        std::uint64_t mixed = (state += 0x9E3779B97F4A7C15ull);
-        mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;
-        mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBull;
-        return mixed ^ (mixed >> 31);
-    }
-};
-
 /** Samples keys as a reservoir filled from a walk of the store of each collection, for a caller whose resolver
  *  checked the collections. */
 template <cpu_class_t cpu_class_>
@@ -199,15 +178,13 @@ status_t sample_values(ustore_blobs_sample_t const& arguments, view_t const& vie
     if (!arguments.count) return {};
     if (!arguments.offsets || !arguments.keys)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    sample_batch_t const samples {collections, arguments.wanted, arguments.count};
+    sample_batch_t const samples = samples_of(arguments);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
-    auto const now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-    sample_generator_t generator {now ^ reinterpret_cast<std::uintptr_t>(&outputs)};
+    sample_generator_t generator = sample_generator_t::seeded(&outputs);
     call_access<cpu_class_> const access = access_of(state, view);
-    st::basic_vector<stored_key_t, arena_allocator<stored_key_t>> kept {{view.scratch}};
+    st::vector<stored_key_t, arena_allocator<stored_key_t>> kept {{view.scratch}};
     for (std::size_t task = 0; task != samples.size(); ++task) {
         sample_task_t const sample = samples[task];
         outputs.open_task(task);
@@ -279,12 +256,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
         if (walked.failed()) return walked;
         if (status_t const watched = watch_range(access, collections[task], lower, last); watched.failed())
             return watched;
-        outputs.min_cardinalities[task] = cardinality;
-        outputs.max_cardinalities[task] = cardinality;
-        outputs.min_value_bytes[task] = value_bytes;
-        outputs.max_value_bytes[task] = value_bytes;
-        outputs.min_space_usages[task] = value_bytes + cardinality * sizeof(stored_key_t);
-        outputs.max_space_usages[task] = std::numeric_limits<ustore_size_t>::max();
+        outputs.assign(task, cardinality, value_bytes, value_bytes + cardinality * sizeof(stored_key_t));
     }
     outputs.finish(arguments);
     return {};

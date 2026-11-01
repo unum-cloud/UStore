@@ -8,11 +8,11 @@
 #pragma once
 
 #include <type_traits> // `std::conditional_t`, `std::decay_t`, `std::is_same_v`
-#include <utility>     // `std::forward`, `std::move`
+#include <utility>     // `std::forward`
 
 #include "ustore/ranges.hpp" // `values_view_t`, `lengths_view_t`, `bits_view_t`, `location_store`
 #include "ustore/status.hpp" // `status_t`, `expected`
-#include "ustore/types.hpp"  // `arena_t`, `one_off_t`, `in_one_off_arena`, `receiver_t`
+#include "ustore/types.hpp"  // `arena_t`, `one_off_answer_of`, `in_one_off_arena`, `receiver_t`
 #include "ustore/ustore.h"
 
 namespace unum::ustore {
@@ -59,7 +59,7 @@ class blobs_read_ref {
     }
 
     /** Reads the values into a one-off arena, which the answer owns. */
-    expected<one_off_t<value_t>> value(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+    expected<one_off_answer_of<value_t>> value(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
         return in_one_off_arena(receiver_.executor, [&](arena_t& arena) noexcept { return value(arena, watch); });
     }
 
@@ -69,7 +69,7 @@ class blobs_read_ref {
     }
 
     /** Reads the lengths of the values into a one-off arena. */
-    expected<one_off_t<length_t>> length(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+    expected<one_off_answer_of<length_t>> length(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
         return in_one_off_arena(receiver_.executor, [&](arena_t& arena) noexcept { return length(arena, watch); });
     }
 
@@ -79,7 +79,7 @@ class blobs_read_ref {
     }
 
     /** Checks which keys are present into a one-off arena. */
-    expected<one_off_t<present_t>> present(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+    expected<one_off_answer_of<present_t>> present(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
         return in_one_off_arena(receiver_.executor, [&](arena_t& arena) noexcept { return present(arena, watch); });
     }
 

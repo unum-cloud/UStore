@@ -2,19 +2,28 @@
  *  @file include/ustore/utilities/ram_buffers.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
- *  @brief Growing arenas behind @c ustore_arena_t and behind the scratch calls work in, whose host blocks ForkUnion
- *      places on a memory domain, the allocator SmashTable's containers take over them, and the column of strings
- *      grown there until it is exported.
+ *  @brief Growing arenas behind @c ustore_arena_t and behind the scratch calls work in, whose host
+ *      blocks ForkUnion places on a memory domain.
+ *
+ *  It holds the allocator SmashTable's containers take over those blocks, the aligned and budgeted
+ *  allocators of unbuffered I/O with the buffers they grow, and the column of strings grown there
+ *  until it is exported.
  */
 
 #pragma once
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int32_t`, `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
+#include <cstdlib> // `std::aligned_alloc`, `std::free`
 #include <cstring> // `std::memcpy`, `std::memset`
+
+#if defined(_WIN32)
+#include <malloc.h> // `_aligned_malloc`, `_aligned_free`
+#endif
 
 #include <algorithm>   // `std::max`
 #include <array>       // `std::array`
+#include <concepts>    // `std::convertible_to`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::allocator_traits`
 #include <new>         // placement `new`
@@ -23,11 +32,17 @@
 #include <utility>     // `std::exchange`
 #include <variant>     // `std::variant`, `std::get_if`
 
+#include <forkunion/atomics.hpp> // `std::memory_order_acquire`, `std::memory_order_release`
 #include <forkunion/forkunion.h>
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <stringzilla/capabilities.h>  // `sz_find_kernel_punned`, `sz_kernel_find_byteset_t`
-#include <stringzilla/strings.h>       // `sz_kernel_strings_unescape_t`
+#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <smashtable/shared.hpp>       // `st::default_allocator`
+#include <stringzilla/capabilities.h>  // `sz_capability_t`, `sz_cap_serial_k`
+#include <stringzilla/find.h>          // `sz_find_byteset_serial`
+#include <stringzilla/hash.h>          // `sz_hash_serial`
+#include <stringzilla/sort.h>          // `sz_sort_order_serial`
+#include <stringzilla/strings.h>       // `sz_strings_unescape_serial`, `sz_strings_escape_serial`
 #include <stringzilla/types.h>         // `sz_allocator_t`
+#include <stringzilla/utf8_runes.h>    // `sz_utf8_count_strings_serial`
 
 #include "ustore/utilities/ram_device.hpp" // `claim_t`
 #include "ustore/utilities/types.hpp"      // `expected`, `status_t`, `round_up_to_multiple`, `u32_tape`, `u64_tape`
@@ -105,7 +120,7 @@ struct ustore_arena_handle_t {
     /** Whether a call fills the arena, so a second call naming it finds it contended. */
     claim_t claim = claim_t::free_k;
 
-    /** Deferred calls naming the arena that are not final, through @c std::atomic_ref. */
+    /** Deferred calls naming the arena that are not final, through the floor class's reference. */
     std::uint32_t deferred_calls = 0;
 
     /** Arrow arrays reading the arena's outputs, with @c arena_freed_bit_k set once @c ustore_arena_free ran. */
@@ -408,6 +423,245 @@ struct arena_allocator {
     }
 };
 
+#pragma region Aligned Allocator
+
+/**
+ *  @brief Places every allocation on an @p alignment_ boundary, and rounds its size up to one.
+ *
+ *  Unbuffered reads and writes accept a buffer only when its address and its length are both
+ *  multiples of the device's block size, which is what this allocator guarantees for every count.
+ *  Exhaustion answers @c nullptr, as every allocator here does.
+ */
+template <typename value_type_, std::size_t alignment_>
+class aligned_allocator {
+  public:
+    using value_type = value_type_;
+    using propagate_on_container_move_assignment = std::true_type;
+    using is_always_equal = std::true_type;
+
+    /** The boundary every allocation starts on, and the multiple its size is rounded up to. */
+    static constexpr std::size_t alignment_k = alignment_;
+
+    static_assert(alignment_k != 0 && (alignment_k & (alignment_k - 1)) == 0,
+                  "An alignment is a power of two, as every block size is");
+
+    constexpr aligned_allocator() noexcept = default;
+
+    /** The rebinding conversion @c std::allocator_traits performs; the alignment is fixed. */
+    template <typename other_type_>
+    constexpr aligned_allocator(aligned_allocator<other_type_, alignment_> const&) noexcept {}
+
+    /** Allocates room for @p count values on an aligned boundary, or answers @c nullptr. */
+    [[nodiscard]] value_type_* allocate(std::size_t count) noexcept {
+        if (count == 0 || count > max_count_k) return nullptr;
+#if defined(_WIN32)
+        return static_cast<value_type_*>(::_aligned_malloc(aligned_bytes(count), alignment_k));
+#else
+        return static_cast<value_type_*>(std::aligned_alloc(alignment_k, aligned_bytes(count)));
+#endif
+    }
+
+    /** Releases @p pointer, which must come from @c allocate. */
+    void deallocate(value_type_* pointer, std::size_t) noexcept {
+#if defined(_WIN32)
+        ::_aligned_free(pointer);
+#else
+        std::free(pointer);
+#endif
+    }
+
+    /** The bytes @p count values occupy once rounded up to the alignment. */
+    static constexpr std::size_t aligned_bytes(std::size_t count) noexcept {
+        return (count * sizeof(value_type_) + alignment_k - 1) / alignment_k * alignment_k;
+    }
+
+    template <typename other_type_>
+    constexpr bool operator==(aligned_allocator<other_type_, alignment_> const&) const noexcept {
+        return true;
+    }
+
+  private:
+
+    /** The largest count whose aligned byte size still fits a @c std::size_t. */
+    static constexpr std::size_t max_count_k = (std::numeric_limits<std::size_t>::max() - alignment_k) /
+                                               sizeof(value_type_);
+};
+
+#pragma endregion Aligned Allocator
+
+#pragma region Constrained Allocator
+
+/** A budget with no limit, which every allocation fits inside. */
+inline constexpr std::size_t unlimited_resource_k = static_cast<std::size_t>(-1);
+
+/**
+ *  @brief The bytes one named part of the engine may hold, and the bytes it holds now.
+ *
+ *  A budget is acquired and released in bytes by however many threads share it, each acquisition
+ *  bounded so the budget can never be overdrawn and an exhausted one refuses instead of waiting.
+ *  Whoever owns the budget outlives every allocator charging it.
+ *
+ *  @tparam atomic_reference_ The reference the available bytes are owned through, for one operation
+ *      at a time.
+ */
+template <template <typename> typename atomic_reference_>
+class resource_constraint {
+  public:
+
+    /** A budget of @p capacity bytes, all of them available. */
+    explicit resource_constraint(std::size_t capacity = unlimited_resource_k) noexcept
+        : capacity_(capacity), available_(capacity) {}
+
+    resource_constraint(resource_constraint const&) = delete;
+    resource_constraint& operator=(resource_constraint const&) = delete;
+
+    /** The bytes the budget allows in total. */
+    std::size_t capacity() const noexcept { return capacity_; }
+
+    /** The bytes the budget still allows. */
+    std::size_t available() const noexcept {
+        return atomic_reference_<std::size_t const> {available_}.load(std::memory_order_acquire);
+    }
+
+    /** The bytes the budget currently holds. */
+    std::size_t used() const noexcept { return capacity_ - available(); }
+
+    /** Whether @p bytes fit now, which a later acquisition may change. */
+    bool has_more(std::size_t bytes) const noexcept { return bytes <= available(); }
+
+    /** Charges @p bytes to the budget, answering whether they fit. */
+    bool acquire(std::size_t bytes) noexcept {
+        atomic_reference_<std::size_t> const reference {available_};
+        std::size_t const observed = reference.fetch_sub_if_at_least(bytes, 0, std::memory_order_acquire);
+        return observed >= bytes;
+    }
+
+    /** Returns @p bytes to the budget, answering whether they had been charged to it. */
+    bool release(std::size_t bytes) noexcept {
+        atomic_reference_<std::size_t> const reference {available_};
+        std::size_t const observed = reference.fetch_add_if_at_most(bytes, capacity_, std::memory_order_release);
+        return observed + bytes <= capacity_;
+    }
+
+  private:
+
+    /** The bytes the budget allows in total, fixed when it is named. */
+    std::size_t capacity_;
+
+    /** The bytes the budget still allows, which every acquisition and release moves. */
+    std::size_t available_;
+};
+
+/**
+ *  @brief An allocator that charges a named budget, and refuses once the budget is spent.
+ *
+ *  Exhaustion answers @c nullptr, which is what every container here already checks, so a budget
+ *  reaches a caller as a status rather than as an exception. The budget is borrowed, never owned.
+ *
+ *  @tparam atomic_reference_ The reference the budget owns its word through.
+ */
+template <typename value_type_, template <typename> typename atomic_reference_,
+          typename base_allocator_type_ = st::default_allocator<value_type_>>
+class constrained_allocator {
+  public:
+    using value_type = value_type_;
+    using base_allocator_t = base_allocator_type_;
+
+    /** The budget every allocation is charged to. */
+    using constraint_t = resource_constraint<atomic_reference_>;
+
+    /** A moved container keeps charging the budget its allocator named. */
+    using propagate_on_container_move_assignment = std::true_type;
+
+    /** The same budget over values of @p other_type_, drawn from the base
+     *  allocator rebound alike. */
+    template <typename other_type_>
+    struct rebind {
+        using other =
+            constrained_allocator<other_type_, atomic_reference_,
+                                  typename std::allocator_traits<base_allocator_t>::template rebind_alloc<other_type_>>;
+    };
+
+    /** An allocator naming no budget, which refuses every allocation until a named
+     *  one replaces it. */
+    constrained_allocator() noexcept : base_(), constraint_(nullptr) {}
+
+    /** An allocator charging @p constraint, which must outlive it. */
+    explicit constrained_allocator(constraint_t& constraint, base_allocator_t base = {}) noexcept
+        : base_(base), constraint_(&constraint) {}
+
+    /** The rebinding conversion @c std::allocator_traits performs; the budget travels with it. */
+    template <typename other_type_, typename other_base_type_>
+    constrained_allocator(constrained_allocator<other_type_, atomic_reference_, other_base_type_> const& other) noexcept
+        : base_(), constraint_(other.constraint_pointer()) {}
+
+    /** Charges room for @p count values, or answers @c nullptr when the budget refuses them. */
+    [[nodiscard]] value_type_* allocate(std::size_t count) noexcept {
+        if (!constraint_ || !constraint_->acquire(count * sizeof(value_type_))) return nullptr;
+        value_type_* const memory = base_.allocate(count);
+        if (!memory) { [[maybe_unused]] bool const returned = constraint_->release(count * sizeof(value_type_)); }
+        return memory;
+    }
+
+    /** Releases @p pointer and returns its bytes to the budget. */
+    void deallocate(value_type_* pointer, std::size_t count) noexcept {
+        base_.deallocate(pointer, count);
+        if (constraint_) { [[maybe_unused]] bool const returned = constraint_->release(count * sizeof(value_type_)); }
+    }
+
+    /** The budget this allocator charges. */
+    constraint_t& constraint() const noexcept { return *constraint_; }
+
+    /** The budget this allocator charges, or null while it names none. */
+    constraint_t* constraint_pointer() const noexcept { return constraint_; }
+
+    template <typename other_type_, typename other_base_type_>
+    bool operator==(
+        constrained_allocator<other_type_, atomic_reference_, other_base_type_> const& other) const noexcept {
+        return constraint_ == other.constraint_pointer();
+    }
+
+  private:
+
+    /** The allocator the charged bytes actually come from. */
+    base_allocator_t base_;
+
+    /** The budget every allocation is charged to, owned by whoever named it. */
+    constraint_t* constraint_;
+};
+
+#pragma endregion Constrained Allocator
+
+#pragma region Buffers
+
+/** Alignment and size multiple of buffers used for direct I/O. */
+inline constexpr std::size_t buffer_alignment_k = 4096;
+
+/** The allocator every unbudgeted container reaches, which answers null instead of throwing. */
+template <typename value_type_>
+using heap_allocator = st::default_allocator<value_type_>;
+
+/** The allocator of buffers unbuffered reads and writes accept. */
+template <typename value_type_>
+using direct_io_allocator = aligned_allocator<value_type_, buffer_alignment_k>;
+
+/** Bytes charged to no budget, with no alignment beyond the heap's own. */
+using buffer_t = st::vector<std::byte>;
+
+/** Bytes of a buffer unbuffered I/O accepts, charged to no budget. */
+using aligned_buffer_t = st::vector<std::byte, direct_io_allocator<std::byte>>;
+
+/** Bytes charged to a named budget. */
+template <template <typename> typename atomic_reference_>
+using constrained_buffer = st::vector<std::byte, constrained_allocator<std::byte, atomic_reference_>>;
+
+/** Bytes of a buffer unbuffered I/O accepts, charged to a named budget. */
+template <template <typename> typename atomic_reference_>
+using constrained_aligned_buffer =
+    st::vector<std::byte, constrained_allocator<std::byte, atomic_reference_, direct_io_allocator<std::byte>>>;
+
+#pragma endregion Buffers
+
 /** An arena one call keeps on its own stack, on the calling thread's memory, freeing every block it grew when it
  *  dies, as a fold's scratch is. */
 class local_arena_t {
@@ -433,8 +687,9 @@ inline status_t growth_status(st::status_t status) noexcept {
 }
 
 /**
- *  @brief Copies the @p count strings @p strings answers by index, @p total bytes in all, into @p arena as the output
- *      @p tape: their offsets, then their bytes, as every ragged output is written.
+ *  @brief Copies the @p count strings @p strings answers by index, @p total bytes in all,
+ *      into @p arena as the output @p tape: their offsets, then their bytes, as every ragged
+ *      output is written.
  *
  *  The offsets take 32 bits while the bytes fit in 4 GiB and 64 bits beyond, so the common tape costs half the
  *  offsets. A tape of no strings stays zeroed, as an output with nothing to report does.
@@ -463,12 +718,16 @@ status_t export_strings(ustore_arena_t arena, std::size_t count, std::size_t tot
     return export_as(std::type_identity<std::uint64_t> {});
 }
 
+/** Whether an appended string ends where its bytes do, or after a null byte the string then spans
+ *  too. */
+enum class string_end_t : bool { bare_k, null_terminated_k };
+
 /** A column of strings that grows by appending, behind 64-bit offsets, until it is exported as a narrower tape. */
 template <typename allocator_type_>
 class growing_strings {
     using traits_t = std::allocator_traits<allocator_type_>;
-    st::basic_vector<ustore_length_t, typename traits_t::template rebind_alloc<ustore_length_t>> offsets_;
-    st::basic_vector<byte_t, typename traits_t::template rebind_alloc<byte_t>> bytes_;
+    st::vector<ustore_length_t, typename traits_t::template rebind_alloc<ustore_length_t>> offsets_;
+    st::vector<byte_t, typename traits_t::template rebind_alloc<byte_t>> bytes_;
 
   public:
     growing_strings() noexcept = default;
@@ -486,9 +745,10 @@ class growing_strings {
         return growth_status(offsets_.emplace_back(static_cast<ustore_length_t>(bytes_.size())));
     }
 
-    /** Appends a copy of @p string followed by a null byte when @p terminated, which the string then spans. */
-    status_t push_back(ustore_bytes_view_t string, bool terminated) noexcept {
-        if (status_t const status = push_back(string); status.failed() || !terminated) return status;
+    /** Appends a copy of @p string, followed by a null byte the string then spans when @p end
+     *  asks for one. */
+    status_t push_back(ustore_bytes_view_t string, string_end_t end) noexcept {
+        if (status_t const status = push_back(string); status.failed() || end == string_end_t::bare_k) return status;
         if (status_t const status = growth_status(bytes_.push_back(byte_t {0})); status.failed()) return status;
         offsets_[offsets_.size() - 1] = static_cast<ustore_length_t>(bytes_.size());
         return {};
@@ -538,14 +798,131 @@ inline sz_allocator_t stringzilla_allocator(ustore_arena_t arena) noexcept {
     return {stringzilla_allocate, stringzilla_reallocate, stringzilla_free, arena};
 }
 
-/** The StringZilla kernels a handle calls directly, looked up once at open, beside the capabilities its engines
- *  compile for. */
-struct stringzilla_kernels_t {
-    sz_capability_t capabilities = sz_cap_serial_k;
-    sz_kernel_sort_order_t sort_order = nullptr;
-    sz_kernel_utf8_count_strings_t utf8_count_strings = nullptr;
-    sz_kernel_find_byteset_t find_byteset = nullptr;
-    sz_kernel_strings_unescape_t strings_unescape = nullptr;
+/** The StringZilla host kernels one CPU tier calls; a tier this build left out is a stub of
+ *  @c capability_k and @c compiled_k. Each slot is the widest tier at or below the kit's
+ *  that StringZilla ships. */
+struct serial_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_serial_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto sort_order = sz_sort_order_serial;
+    static constexpr auto utf8_count_strings = sz_utf8_count_strings_serial;
+    static constexpr auto find_byteset = sz_find_byteset_serial;
+    static constexpr auto strings_unescape = sz_strings_unescape_serial;
+    static constexpr auto strings_escape = sz_strings_escape_serial;
+    static constexpr auto hash = sz_hash_serial;
+};
+
+#if STRINGZILLA_TARGET_HASWELL && STRINGZILLA_TARGET_WESTMERE
+struct haswell_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_haswell_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto sort_order = sz_sort_order_haswell;
+    static constexpr auto utf8_count_strings = sz_utf8_count_strings_serial;
+    static constexpr auto find_byteset = sz_find_byteset_haswell;
+    static constexpr auto strings_unescape = sz_strings_unescape_haswell;
+    static constexpr auto strings_escape = sz_strings_escape_haswell;
+    static constexpr auto hash = sz_hash_westmere;
+};
+#else
+struct haswell_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_haswell_k;
+    static constexpr bool compiled_k = false;
+};
+#endif
+
+#if STRINGZILLA_TARGET_SKYLAKE && STRINGZILLA_TARGET_HASWELL && STRINGZILLA_TARGET_WESTMERE
+struct skylake_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_skylake_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto sort_order = sz_sort_order_skylake;
+    static constexpr auto utf8_count_strings = sz_utf8_count_strings_serial;
+    static constexpr auto find_byteset = sz_find_byteset_haswell;
+    static constexpr auto strings_unescape = sz_strings_unescape_haswell;
+    static constexpr auto strings_escape = sz_strings_escape_haswell;
+    static constexpr auto hash = sz_hash_skylake;
+};
+#else
+struct skylake_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_skylake_k;
+    static constexpr bool compiled_k = false;
+};
+#endif
+
+#if STRINGZILLA_TARGET_ICELAKE && STRINGZILLA_TARGET_SKYLAKE
+struct icelake_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_icelake_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto sort_order = sz_sort_order_skylake;
+    static constexpr auto utf8_count_strings = sz_utf8_count_strings_icelake;
+    static constexpr auto find_byteset = sz_find_byteset_icelake;
+    static constexpr auto strings_unescape = sz_strings_unescape_icelake;
+    static constexpr auto strings_escape = sz_strings_escape_icelake;
+    static constexpr auto hash = sz_hash_icelake;
+};
+#else
+struct icelake_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_icelake_k;
+    static constexpr bool compiled_k = false;
+};
+#endif
+
+#if STRINGZILLA_TARGET_NEON && STRINGZILLA_TARGET_NEONAES
+struct neon_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_neon_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto sort_order = sz_sort_order_neon;
+    static constexpr auto utf8_count_strings = sz_utf8_count_strings_neon;
+    static constexpr auto find_byteset = sz_find_byteset_neon;
+    static constexpr auto strings_unescape = sz_strings_unescape_neon;
+    static constexpr auto strings_escape = sz_strings_escape_neon;
+    static constexpr auto hash = sz_hash_neonaes;
+};
+#else
+struct neon_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_neon_k;
+    static constexpr bool compiled_k = false;
+};
+#endif
+
+#if STRINGZILLA_TARGET_RVV
+struct rvv_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto sort_order = sz_sort_order_rvv;
+    static constexpr auto utf8_count_strings = sz_utf8_count_strings_serial;
+    static constexpr auto find_byteset = sz_find_byteset_rvv;
+    static constexpr auto strings_unescape = sz_strings_unescape_rvv;
+    static constexpr auto strings_escape = sz_strings_escape_rvv;
+    static constexpr auto hash = sz_hash_rvv;
+};
+#else
+struct rvv_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = false;
+};
+#endif
+
+/** Names the six slots every strings kit carries. */
+template <typename strings_kit_type_>
+concept strings_kit_concept = requires {
+    { strings_kit_type_::capability_k } -> std::convertible_to<sz_capability_t>;
+    strings_kit_type_::sort_order;
+    strings_kit_type_::utf8_count_strings;
+    strings_kit_type_::find_byteset;
+    strings_kit_type_::strings_unescape;
+    strings_kit_type_::strings_escape;
+    strings_kit_type_::hash;
+};
+
+/** The widest strings kit this build compiled in among the tiers @p capabilities_ admits, newest
+ *  first. */
+template <sz_capability_t capabilities_>
+    requires((capabilities_ & sz_cap_cpus_k) != 0)
+struct strings_ladder {
+    using strings_kit_t =
+        typename highest_strings_kit<capabilities_, serial_strings_kit_t, icelake_strings_kit_t, skylake_strings_kit_t,
+                                     haswell_strings_kit_t, neon_strings_kit_t, rvv_strings_kit_t>::type;
+    static constexpr sz_capability_t picked_k = strings_kit_t::capability_k;
 };
 
 } // namespace unum::ustore::utilities

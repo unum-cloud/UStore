@@ -26,18 +26,16 @@
 
 #include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
-#include <cstring> // `std::memcpy`, `std::memcmp`
+#include <cstring> // `std::memcpy`
 
 #include <algorithm>   // `std::sort`, `std::min`
 #include <compare>     // `std::strong_ordering`
 #include <memory>      // `std::allocator_traits`
-#include <new>         // placement `new`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::true_type`, `std::is_nothrow_move_constructible_v`
 #include <utility>     // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/ram_buffers.hpp" // `growth_status`
 #include "ustore/utilities/types.hpp"       // `byte_t`, `expected`, `status_t`, `status_code_t`
@@ -172,7 +170,7 @@ struct attribute_t {
     element_index_t next = no_element_k;
 };
 
-#pragma endregion
+#pragma endregion Vocabulary
 
 #pragma region Little Endian
 
@@ -210,7 +208,7 @@ inline element_key_t load_key(byte_t const* source) noexcept {
     return key;
 }
 
-#pragma endregion
+#pragma endregion Little Endian
 
 #pragma region Dense Form
 
@@ -372,7 +370,7 @@ class page_view_t {
     }
 };
 
-#pragma endregion
+#pragma endregion Dense Form
 
 #pragma region Element Tree
 
@@ -393,10 +391,10 @@ class element_tree {
     using rebound = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
 
     allocator_t allocator_;
-    st::basic_vector<element_t, rebound<element_t>> elements_;
-    st::basic_vector<attribute_t, rebound<attribute_t>> attributes_;
-    st::basic_vector<char, rebound<char>> strings_;
-    st::basic_vector<element_index_t, rebound<element_index_t>> slots_;
+    st::vector<element_t, rebound<element_t>> elements_;
+    st::vector<attribute_t, rebound<attribute_t>> attributes_;
+    st::vector<char, rebound<char>> strings_;
+    st::vector<element_index_t, rebound<element_index_t>> slots_;
     std::size_t indexed_ = 0;
     std::size_t live_ = 0;
 
@@ -419,7 +417,7 @@ class element_tree {
 
     status_t grow_index() noexcept {
         std::size_t capacity = slots_.size() ? slots_.size() * 2 : 16;
-        st::basic_vector<element_index_t, rebound<element_index_t>> old {rebound<element_index_t>(allocator_)};
+        st::vector<element_index_t, rebound<element_index_t>> old {rebound<element_index_t>(allocator_)};
         if (status_t status = growth_status(old.swap(slots_)); status.failed()) return status;
         if (status_t status = growth_status(slots_.resize(capacity, no_element_k)); status.failed()) return status;
         for (element_index_t index : old)
@@ -544,9 +542,9 @@ class element_tree {
      *  @brief Where an element placed at @p placement lands under @p parent after the anchor keyed @p anchor.
      *  @return The sibling to link after, or @c no_element_k for the front.
      *
-     *  A Nil, missing or foreign anchor stands for the front. From there the element skips every sibling placed
-     *  later than itself, as a replicated growable array does, so concurrent insertions after one anchor order newest
-     *  first whatever order they are applied in.
+     *  A Nil, missing or foreign anchor stands for the front. From there the element skips every
+     *  sibling placed later than itself, as a replicated growable array does, so concurrent
+     *  insertions after one anchor order newest first whatever order they are applied in.
      */
     element_index_t landing(element_index_t parent, element_key_t const& anchor, placement_t placement) const noexcept {
         element_index_t after = anchor.is_nil() ? no_element_k : find(anchor);
@@ -661,9 +659,9 @@ class element_tree {
     /** Whether any element of @p fragment besides its root holds a key live in this tree. */
     template <typename other_allocator_type_>
     bool collides(element_tree<other_allocator_type_> const& fragment) const noexcept {
-        element_index_t const top = fragment.root();
-        for (element_index_t at = fragment.next_in_preorder(top, top); at != no_element_k;
-             at = fragment.next_in_preorder(at, top))
+        element_index_t const root = fragment.root();
+        for (element_index_t at = fragment.next_in_preorder(root, root); at != no_element_k;
+             at = fragment.next_in_preorder(at, root))
             if (find(fragment[at].key) != no_element_k) return true;
         return false;
     }
@@ -678,20 +676,20 @@ class element_tree {
                    placement_t placement) noexcept {
         if (fragment.empty()) return {};
         if (collides(fragment)) return {status_code_t::already_exists_k, "A fragment key is taken"};
-        element_index_t const top = fragment.root();
+        element_index_t const root = fragment.root();
         // The copy of every fragment element's parent is the copy linked last at the depth above it
-        st::basic_vector<element_index_t, rebound<element_index_t>> copies {rebound<element_index_t>(allocator_)};
+        st::vector<element_index_t, rebound<element_index_t>> copies {rebound<element_index_t>(allocator_)};
         if (status_t status = growth_status(copies.resize(fragment.capacity(), no_element_k)); status.failed())
             return status;
-        copies[top] = parent;
-        for (element_index_t at = fragment.next_in_preorder(top, top); at != no_element_k;
-             at = fragment.next_in_preorder(at, top)) {
+        copies[root] = parent;
+        for (element_index_t at = fragment.next_in_preorder(root, root); at != no_element_k;
+             at = fragment.next_in_preorder(at, root)) {
             element_t const& source = fragment[at];
             element_index_t const holder = copies[source.parent];
-            element_index_t const previous = source.parent == top ? (source.previous_sibling == no_element_k
-                                                                         ? after
-                                                                         : copies[source.previous_sibling])
-                                                                  : elements_[holder].last_child;
+            element_index_t const previous = source.parent == root ? (source.previous_sibling == no_element_k
+                                                                          ? after
+                                                                          : copies[source.previous_sibling])
+                                                                   : elements_[holder].last_child;
             auto copy = link(holder, previous, source.key, source.kind, fragment.string(source.name),
                              fragment.string(source.text), placement);
             if (!copy) return copy.status();
@@ -712,8 +710,8 @@ class element_tree {
     /** Number of attributes and string bytes the dense form of the live tree takes. */
     void measure(std::uint32_t& count, std::uint32_t& attributes, std::uint64_t& strings) const noexcept {
         count = attributes = 0, strings = 0;
-        element_index_t const top = root();
-        for (element_index_t at = top; at != no_element_k; at = next_in_preorder(at, top)) {
+        element_index_t const root = this->root();
+        for (element_index_t at = root; at != no_element_k; at = next_in_preorder(at, root)) {
             ++count;
             strings += elements_[at].name.length + elements_[at].text.length;
             for (element_index_t attribute = elements_[at].first_attribute; attribute != no_element_k;
@@ -750,8 +748,8 @@ class element_tree {
             element_key_t key;
             std::uint32_t position;
         };
-        st::basic_vector<directed_t, rebound<directed_t>> entries {rebound<directed_t>(allocator_)};
-        st::basic_vector<std::uint32_t, rebound<std::uint32_t>> open {rebound<std::uint32_t>(allocator_)};
+        st::vector<directed_t, rebound<directed_t>> entries {rebound<directed_t>(allocator_)};
+        st::vector<std::uint32_t, rebound<std::uint32_t>> open {rebound<std::uint32_t>(allocator_)};
         if (status_t status = growth_status(entries.reserve(count)); status.failed()) return status;
         if (status_t status = growth_status(open.reserve(count)); status.failed()) return status;
 
@@ -761,8 +759,8 @@ class element_tree {
             store_u32(where, written), store_u32(where + 4, span.length);
             written += span.length;
         };
-        element_index_t const top = root();
-        element_index_t at = top;
+        element_index_t const root = this->root();
+        element_index_t at = root;
         for (;;) {
             element_t const& element = elements_[at];
             byte_t* const record = records + std::size_t(position) * page_record_bytes_k;
@@ -794,7 +792,7 @@ class element_tree {
                 std::uint32_t const closed = open.back();
                 open.pop_back();
                 store_u32(records + std::size_t(closed) * page_record_bytes_k + 32, position - closed);
-                if (at == top) break;
+                if (at == root) break;
                 if (elements_[at].next_sibling != no_element_k) {
                     at = elements_[at].next_sibling;
                     break;
@@ -837,19 +835,20 @@ class element_tree {
 
     /** Replaces the tree with what @p view holds. */
     status_t decode(page_view_t const& view) noexcept {
-        page_record_t const top = view.record(0);
-        if (status_t status = reset(top.key, top.placement); status.failed()) return status;
-        if (status_t status = store(view.string(top.name), elements_[0].name); status.failed()) return status;
-        if (status_t status = store(view.string(top.text), elements_[0].text); status.failed()) return status;
+        page_record_t const root_record = view.record(0);
+        if (status_t status = reset(root_record.key, root_record.placement); status.failed()) return status;
+        if (status_t status = store(view.string(root_record.name), elements_[0].name); status.failed()) return status;
+        if (status_t status = store(view.string(root_record.text), elements_[0].text); status.failed()) return status;
         if (status_t status = growth_status(elements_.reserve(view.size())); status.failed()) return status;
 
         struct open_t {
             element_index_t index;
             std::uint32_t end;
         };
-        st::basic_vector<open_t, rebound<open_t>> open {rebound<open_t>(allocator_)};
+        st::vector<open_t, rebound<open_t>> open {rebound<open_t>(allocator_)};
         if (status_t status = growth_status(open.reserve(view.size())); status.failed()) return status;
-        (void)open.push_back(st::assume_reserved, open_t {0, top.subtree_size});
+        [[maybe_unused]] auto const pushed_root = open.push_back(st::assume_reserved,
+                                                                 open_t {0, root_record.subtree_size});
         auto copy_attributes = [&](element_index_t index, page_record_t const& record) noexcept -> status_t {
             for (std::uint32_t at = 0; at != record.attributes_count; ++at) {
                 page_attribute_t const attribute = view.attribute(record.first_attribute + at);
@@ -861,7 +860,7 @@ class element_tree {
             }
             return {};
         };
-        if (status_t status = copy_attributes(0, top); status.failed()) return elements_.clear(), status;
+        if (status_t status = copy_attributes(0, root_record); status.failed()) return elements_.clear(), status;
         for (std::uint32_t position = 1; position != view.size(); ++position) {
             while (open.back().end <= position) open.pop_back();
             page_record_t const record = view.record(position);
@@ -878,13 +877,14 @@ class element_tree {
                            : status_t {status_code_t::malformed_k, "A page repeats or nils a key"};
             }
             if (status_t status = copy_attributes(*added, record); status.failed()) return elements_.clear(), status;
-            if (record.subtree_size > 1)
-                (void)open.push_back(st::assume_reserved, open_t {*added, position + record.subtree_size});
+            if (record.subtree_size > 1) [[maybe_unused]]
+                auto const pushed_child = open.push_back(st::assume_reserved,
+                                                         open_t {*added, position + record.subtree_size});
         }
         return {};
     }
 };
 
-#pragma endregion
+#pragma endregion Element Tree
 
 } // namespace unum::ustore::pages

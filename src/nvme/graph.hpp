@@ -10,11 +10,12 @@
  *  half-edges of <tt>include/ustore/graph/adjacency_fold.hpp</tt>, and every edge is a half-edge
  *  filed under each of its ends.
  *
- *  A write appends one change delta per touched vertex and reads nothing, so two transactions adding edges to one
- *  vertex both commit. What a write does depend on is watched, as a read is: a vertex an edge or a vertex write
- *  creates, which two transactions creating it conflict over, as the in-memory engine's do; a vertex a removal of edges
- *  changes, which must still be there; and the adjacency a vertex removal reads to find the other ends of its edges.
- *  A read batches the vertices of every run of tasks on one collection into one select, and merges the reading
+ *  A write appends one change delta per touched vertex and reads nothing, so two transactions
+ *  adding edges to one vertex both commit. What a write does depend on is watched, as a read is: a
+ *  vertex an edge or a vertex write creates, which two transactions creating it conflict over, as
+ *  the in-memory engine's do; a vertex a removal of edges changes, which must still be there; and
+ *  the adjacency a vertex removal reads to find the other ends of its edges. A read batches the
+ *  vertices of every run of tasks on one collection into one select, and merges the reading
  *  transaction's own changes into the committed values in place.
  */
 
@@ -23,10 +24,10 @@
 #include <cstddef> // `std::size_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::max`, `std::sort`
+#include <algorithm> // `std::sort`
 #include <span>      // `std::span`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/graph.h"    // `ustore_graph_read_edges_t`, `ustore_vertex_role_t`
 #include "ustore/ranges.hpp" // `strided`, `strided_iterator`
@@ -71,19 +72,6 @@ constexpr role_t mirrored_role(role_t role) noexcept {
     return role;
 }
 
-/** Refuses a graph write of @p durability, or one watching as @p watch, that the transaction or its absence rules
- *  out, as every write of the engine does. */
-inline status_t validate_graph_write(ustore_transaction_t transaction, ustore_durability_t durability,
-                                     ustore_watch_t watch) noexcept {
-    if (durability != ustore_durability_buffered_k && durability != ustore_durability_flushed_k)
-        return {status_code_t::invalid_argument_k, "Unknown durability"};
-    if (watch != ustore_watch_keys_k && watch != ustore_watch_none_k)
-        return {status_code_t::invalid_argument_k, "Unknown watch"};
-    if (transaction && durability == ustore_durability_flushed_k)
-        return {status_code_t::invalid_argument_k, "A transaction flushes at commit, not at a write"};
-    return {};
-}
-
 /** The schedule a graph write watches what it depends on with: a transaction's own, and conflicts retried at the
  *  head. */
 inline watch_schedule_t graph_write_schedule(view_t const& view) noexcept {
@@ -117,9 +105,9 @@ bool committed_vertex(call_access<cpu_class_> const& access, collection_id_t col
 /** Whether @p key of @p collection holds a vertex as @p access sees it, its own writes included. */
 template <cpu_class_t cpu_class_>
 bool visible_vertex(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t key) noexcept {
-    delta_view_t own;
-    if (access.transaction && access.transaction->uncommitted_delta(collection, key, own))
-        return own.kind != delta_kind_t::remove_k;
+    delta_view_t own_delta;
+    if (access.transaction && access.transaction->uncommitted_delta(collection, key, own_delta))
+        return own_delta.kind != delta_kind_t::remove_k;
     return committed_vertex(access, collection, key);
 }
 
@@ -133,10 +121,10 @@ bool visible_vertex(call_access<cpu_class_> const& access, collection_id_t colle
 template <cpu_class_t cpu_class_>
 status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t collection,
                        std::span<stored_key_t const> keys, std::span<vertex_read_t> reads) noexcept {
-    using value_t = st::basic_vector<byte_t, arena_allocator<byte_t>>;
+    using value_t = st::vector<byte_t, arena_allocator<byte_t>>;
     auto [results, results_status] = arena_allocate<lookup_result_t>(access.scratch, keys.size());
     if (results_status.failed()) return results_status;
-    st::basic_vector<value_t, arena_allocator<value_t>> values {{access.scratch}};
+    st::vector<value_t, arena_allocator<value_t>> values {{access.scratch}};
     if (status_t const room = growth_status(values.reserve(keys.size())); room.failed()) return room;
     for (std::size_t index = 0; index != keys.size(); ++index) {
         results[index] = lookup_result_t::missing_k;
@@ -165,13 +153,13 @@ status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t co
         read = vertex_read_t {};
         if (results[index] == lookup_result_t::written_k)
             read = vertex_read_t {true, std::span<byte_t const> {values[index].data(), values[index].size()}, {}};
-        delta_view_t own;
-        if (!access.transaction || !access.transaction->uncommitted_delta(collection, keys[index], own)) continue;
-        if (own.kind == delta_kind_t::remove_k) read = vertex_read_t {};
-        else if (own.kind == delta_kind_t::write_k) read = vertex_read_t {true, own.bytes, {}};
+        delta_view_t own_delta;
+        if (!access.transaction || !access.transaction->uncommitted_delta(collection, keys[index], own_delta)) continue;
+        if (own_delta.kind == delta_kind_t::remove_k) read = vertex_read_t {};
+        else if (own_delta.kind == delta_kind_t::write_k) read = vertex_read_t {true, own_delta.bytes, {}};
         else {
             read.present = true;
-            read.pending = own.bytes;
+            read.pending = own_delta.bytes;
         }
     }
     return watch_keys(access, collection, keys);
@@ -363,7 +351,7 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
  *  lacked, and watching the ends it creates. */
 template <cpu_class_t cpu_class_>
 status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t const& view) noexcept {
-    if (status_t const valid = validate_graph_write(view.transaction, arguments.durability, view.watch);
+    if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
         valid.failed() || !arguments.count)
         return valid;
     if (!arguments.sources.data || !arguments.targets.data)
@@ -375,7 +363,7 @@ status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t c
         return resolved;
     auto [deltas, deltas_status] = edge_deltas(arguments, half_edge_operation_t::insert_k, view.scratch);
     if (deltas_status.failed()) return deltas_status;
-    st::basic_vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{view.scratch}};
+    st::vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{view.scratch}};
     if (status_t const chained = chain_by_vertex(deltas, view.scratch, chains); chained.failed()) return chained;
 
     std::size_t const bytes = deltas.size() * graph::half_edge_delta_bytes_k;
@@ -398,7 +386,7 @@ status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t c
  *  vertices and skips the ends a graph lacks, watching the ends it changes. */
 template <cpu_class_t cpu_class_>
 status_t graph_remove_edges(ustore_graph_remove_edges_t const& arguments, view_t const& view) noexcept {
-    if (status_t const valid = validate_graph_write(view.transaction, arguments.durability, view.watch);
+    if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
         valid.failed() || !arguments.count)
         return valid;
     if (!arguments.sources.data || !arguments.targets.data)
@@ -410,7 +398,7 @@ status_t graph_remove_edges(ustore_graph_remove_edges_t const& arguments, view_t
         return resolved;
     auto [deltas, deltas_status] = edge_deltas(arguments, half_edge_operation_t::remove_k, view.scratch);
     if (deltas_status.failed()) return deltas_status;
-    st::basic_vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{view.scratch}};
+    st::vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{view.scratch}};
     if (status_t const chained = chain_by_vertex(deltas, view.scratch, chains); chained.failed()) return chained;
 
     std::size_t const bytes = deltas.size() * graph::half_edge_delta_bytes_k;
@@ -433,7 +421,7 @@ status_t graph_remove_edges(ustore_graph_remove_edges_t const& arguments, view_t
  *  the edges of those it holds, and watching the vertices it creates. */
 template <cpu_class_t cpu_class_>
 status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, view_t const& view) noexcept {
-    if (status_t const valid = validate_graph_write(view.transaction, arguments.durability, view.watch);
+    if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
         valid.failed() || !arguments.count)
         return valid;
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
@@ -465,7 +453,7 @@ status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, vi
  *  file of it, then of the vertex itself, watching the adjacency it read and the ends it changes. */
 template <cpu_class_t cpu_class_>
 status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, view_t const& view) noexcept {
-    if (status_t const valid = validate_graph_write(view.transaction, arguments.durability, view.watch);
+    if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
         valid.failed() || !arguments.count)
         return valid;
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
@@ -488,7 +476,7 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
         state, view, arguments.durability, count, count * graph::half_edge_delta_bytes_k, graph_write_schedule(view),
         [&](call_access<cpu_class_> const& access) noexcept -> status_t {
             if (status_t const read = read_task_vertices(access, collections, keys, reads); read.failed()) return read;
-            st::basic_vector<vertex_delta_t, arena_allocator<vertex_delta_t>> deltas {{access.scratch}};
+            st::vector<vertex_delta_t, arena_allocator<vertex_delta_t>> deltas {{access.scratch}};
             for (std::size_t index = 0; index != count; ++index) {
                 if (!reads[index].present) continue;
                 ustore_key_t const vertex = vertices[index];
@@ -506,7 +494,7 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
                         return kept;
                 }
             }
-            st::basic_vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{access.scratch}};
+            st::vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{access.scratch}};
             if (status_t const chained = chain_by_vertex(std::span<vertex_delta_t> {deltas}, access.scratch, chains);
                 chained.failed())
                 return chained;

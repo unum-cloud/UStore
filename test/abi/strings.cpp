@@ -1,5 +1,5 @@
 /**
- *  @file test/strings.cpp
+ *  @file test/abi/strings.cpp
  *  @author Ash Vardanian
  *  @date September 16, 2026
  *  @brief Unit tests of the strings modality, which maps variable-length strings onto keys of other collections.
@@ -568,8 +568,8 @@ std::size_t strings_one_head_two_writers(config_t const& config) {
     std::string const second_text = std::string {"shared-prefix!!"} + std::string(40, 'b');
     std::array<std::string_view, 1> const first {first_text};
     std::array<std::string_view, 1> const second {second_text};
-    std::array<ustore_key_t, 1> const one {key_from_integer(1)};
-    std::array<ustore_key_t, 1> const two {key_from_integer(2)};
+    std::array<ustore_key_t, 1> const first_keys {key_from_integer(1)};
+    std::array<ustore_key_t, 1> const second_keys {key_from_integer(2)};
 
     // Each transaction reads its string before writing it, so the read is watched as well as the write
     transaction_holder_t first_writer;
@@ -583,9 +583,9 @@ std::size_t strings_one_head_two_writers(config_t const& config) {
     failures += read_strings(fixture, second, results,
                              ustore_transaction_view(second_writer.transaction, ustore_watch_keys_k));
     failures += expect(!results.present(0));
-    ustore_outcome_t outcome = write_strings(fixture, first, one, first_writer.transaction);
+    ustore_outcome_t outcome = write_strings(fixture, first, first_keys, first_writer.transaction);
     failures += expect_success(outcome);
-    outcome = write_strings(fixture, second, two, second_writer.transaction);
+    outcome = write_strings(fixture, second, second_keys, second_writer.transaction);
     failures += expect_success(outcome);
     // A walk through a transaction lists its own writes, and nothing another transaction has not committed
     failures += expect_listed(fixture, "shared-prefix!!", first,
@@ -597,28 +597,28 @@ std::size_t strings_one_head_two_writers(config_t const& config) {
 
     std::array<std::string_view, 2> const both {first_text, second_text};
     failures += read_strings(fixture, both, results);
-    failures += expect(results.present(0) && results.value_of(0) == one[0]);
-    failures += expect(results.present(1) && results.value_of(1) == two[0]);
+    failures += expect(results.present(0) && results.value_of(0) == first_keys[0]);
+    failures += expect(results.present(1) && results.value_of(1) == second_keys[0]);
 
     transaction_holder_t earlier;
     transaction_holder_t later;
     failures += begin_transaction(fixture, earlier) + begin_transaction(fixture, later);
     if (failures != 0) return failures;
-    outcome = write_strings(fixture, first, two, later.transaction);
+    outcome = write_strings(fixture, first, second_keys, later.transaction);
     failures += expect_success(outcome);
-    outcome = write_strings(fixture, first, one, earlier.transaction);
+    outcome = write_strings(fixture, first, first_keys, earlier.transaction);
     failures += expect_success(outcome);
     outcome = commit_transaction(fixture, earlier.transaction);
     failures += expect_success(outcome);
     outcome = commit_transaction(fixture, later.transaction);
     failures += expect_failure(outcome);
     failures += read_strings(fixture, first, results);
-    failures += expect(results.present(0) && results.value_of(0) == one[0]);
+    failures += expect(results.present(0) && results.value_of(0) == first_keys[0]);
     return failures;
 }
 
-/** A string of 64 KiB is a key like any other, beside a shorter one of the same head: it reads back, a walk of a prefix
- *  lists it whole, and a removal takes it away. */
+/** A string of 64 KiB is a key like any other, beside a shorter one of the same head: it reads
+ *  back, a walk of a prefix lists it whole, and a removal takes it away. */
 std::size_t strings_long_string(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};

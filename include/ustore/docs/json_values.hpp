@@ -59,9 +59,9 @@ constexpr std::string_view true_k = "true";
 constexpr std::string_view false_k = "false";
 
 /** Parses the whole of @p text as a number or a boolean, answering whether every character was consumed. */
-template <typename scalar_>
-bool parse_entire_number(std::string_view text, scalar_& scalar) noexcept {
-    if constexpr (std::is_same_v<scalar_, bool>) {
+template <typename scalar_type_>
+bool parse_entire_number(std::string_view text, scalar_type_& scalar) noexcept {
+    if constexpr (std::is_same_v<scalar_type_, bool>) {
         if (text != true_k && text != false_k) return false;
         scalar = text == true_k;
         return true;
@@ -73,8 +73,8 @@ bool parse_entire_number(std::string_view text, scalar_& scalar) noexcept {
 }
 
 /** Prints @p scalar between @p begin and @p end with a null terminator, or an empty view when it does not fit. */
-template <typename scalar_>
-std::string_view print_number(char* begin, char* end, scalar_ scalar) noexcept {
+template <typename scalar_type_>
+std::string_view print_number(char* begin, char* end, scalar_type_ scalar) noexcept {
     std::size_t const capacity = static_cast<std::size_t>(end - begin);
     auto const [written_end, written_size] = fmt::format_to_n(begin, capacity - 1, "{}", scalar);
     if (written_size >= capacity) return {};
@@ -204,7 +204,7 @@ inline expected<value_view_t> json_dump(json_value_t value, ustore_arena_t arena
     if (!value) return value_view_t {};
 
     yyjson_alc const allocator = json_allocator(arena);
-    yyjson_write_flag const flags = YYJSON_WRITE_NOFLAG;
+    yyjson_write_flag const flags = YYJSON_WRITE_LOWERCASE_HEX;
     std::size_t length = 0;
     yyjson_write_err error {};
     char const* const text = value.mutable_handle
@@ -244,24 +244,26 @@ inline void record_conversion(conversion_t conversion, ustore_octet_t mask, usto
     valid = static_cast<ustore_octet_t>((valid & cleared) | (is_valid(conversion) ? mask : 0));
 }
 
-/** Whether @p real, with its fraction dropped, fits the range of @p scalar_, where NaN fits only a float. */
-template <typename scalar_>
+/** Whether @p real, with its fraction dropped, fits the range of @p scalar_type_, where NaN fits
+ *  only a float. */
+template <typename scalar_type_>
 bool real_fits(double real) noexcept {
-    if constexpr (std::is_same_v<scalar_, bool>) return true;
-    else if constexpr (std::is_floating_point_v<scalar_>)
-        return !std::isfinite(real) || std::abs(real) <= static_cast<double>(std::numeric_limits<scalar_>::max());
-    else if constexpr (std::is_signed_v<scalar_>) {
-        double const bound = std::ldexp(1.0, std::numeric_limits<scalar_>::digits);
+    if constexpr (std::is_same_v<scalar_type_, bool>) return true;
+    else if constexpr (std::is_floating_point_v<scalar_type_>)
+        return !std::isfinite(real) || std::abs(real) <= static_cast<double>(std::numeric_limits<scalar_type_>::max());
+    else if constexpr (std::is_signed_v<scalar_type_>) {
+        double const bound = std::ldexp(1.0, std::numeric_limits<scalar_type_>::digits);
         return real >= -bound && real < bound;
     }
-    else return real > -1.0 && real < std::ldexp(1.0, std::numeric_limits<scalar_>::digits);
+    else return real > -1.0 && real < std::ldexp(1.0, std::numeric_limits<scalar_type_>::digits);
 }
 
-/** Whether @p integer lies inside the range of @p scalar_, which a boolean or a float always covers. */
-template <typename scalar_, typename integer_>
-bool integer_fits(integer_ integer) noexcept {
-    if constexpr (std::is_same_v<scalar_, bool> || std::is_floating_point_v<scalar_>) return true;
-    else return std::in_range<scalar_>(integer);
+/** Whether @p integer lies inside the range of @p scalar_type_, which a boolean or a
+ *  float always covers. */
+template <typename scalar_type_, typename integer_type_>
+bool integer_fits(integer_type_ integer) noexcept {
+    if constexpr (std::is_same_v<scalar_type_, bool> || std::is_floating_point_v<scalar_type_>) return true;
+    else return std::in_range<scalar_type_>(integer);
 }
 
 /** What one field of one document holds, told by the first byte of its JSON token. */
@@ -349,38 +351,38 @@ inline json_cell_t json_classify(std::string_view token) noexcept {
 }
 
 /** Converts @p value into @p scalar, where a value outside the range of the scalar collides. */
-template <typename scalar_>
-conversion_t json_to_scalar(json_cell_t const& value, scalar_& scalar) noexcept {
+template <typename scalar_type_>
+conversion_t json_to_scalar(json_cell_t const& value, scalar_type_& scalar) noexcept {
     switch (value.token) {
     case json_token_t::missing_k:
     case json_token_t::null_k: return conversion_t::missing_k;
 
     case json_token_t::false_k:
     case json_token_t::true_k:
-        scalar = static_cast<scalar_>(value.token == json_token_t::true_k);
-        return std::is_same_v<scalar_, bool> ? conversion_t::exact_k : conversion_t::converted_k;
+        scalar = static_cast<scalar_type_>(value.token == json_token_t::true_k);
+        return std::is_same_v<scalar_type_, bool> ? conversion_t::exact_k : conversion_t::converted_k;
 
     case json_token_t::string_k:
         return parse_entire_number(value.bytes, scalar) ? conversion_t::converted_k : conversion_t::collides_k;
 
     case json_token_t::number_k:
         if (double const* const real = std::get_if<double>(&value.number)) {
-            if (!real_fits<scalar_>(*real)) return conversion_t::collides_k;
-            scalar = static_cast<scalar_>(*real);
-            return std::is_floating_point_v<scalar_> ? conversion_t::exact_k : conversion_t::converted_k;
+            if (!real_fits<scalar_type_>(*real)) return conversion_t::collides_k;
+            scalar = static_cast<scalar_type_>(*real);
+            return std::is_floating_point_v<scalar_type_> ? conversion_t::exact_k : conversion_t::converted_k;
         }
         if (std::int64_t const* const signed_integer = std::get_if<std::int64_t>(&value.number)) {
-            if (!integer_fits<scalar_>(*signed_integer)) return conversion_t::collides_k;
-            scalar = static_cast<scalar_>(*signed_integer);
-            return std::is_integral_v<scalar_> && std::is_signed_v<scalar_> ? conversion_t::exact_k
-                                                                            : conversion_t::converted_k;
+            if (!integer_fits<scalar_type_>(*signed_integer)) return conversion_t::collides_k;
+            scalar = static_cast<scalar_type_>(*signed_integer);
+            return std::is_integral_v<scalar_type_> && std::is_signed_v<scalar_type_> ? conversion_t::exact_k
+                                                                                      : conversion_t::converted_k;
         }
         {
             std::uint64_t const unsigned_integer = std::get<std::uint64_t>(value.number);
-            if (!integer_fits<scalar_>(unsigned_integer)) return conversion_t::collides_k;
-            scalar = static_cast<scalar_>(unsigned_integer);
-            return std::is_unsigned_v<scalar_> && !std::is_same_v<scalar_, bool> ? conversion_t::exact_k
-                                                                                 : conversion_t::converted_k;
+            if (!integer_fits<scalar_type_>(unsigned_integer)) return conversion_t::collides_k;
+            scalar = static_cast<scalar_type_>(unsigned_integer);
+            return std::is_unsigned_v<scalar_type_> && !std::is_same_v<scalar_type_, bool> ? conversion_t::exact_k
+                                                                                           : conversion_t::converted_k;
         }
 
     default: return conversion_t::collides_k;
@@ -415,15 +417,15 @@ inline conversion_t json_to_string(json_cell_t const& value, printed_number_buff
 }
 
 /** Wraps the fixed-width scalar stored in @p bytes into a mutable value, or returns @c nullptr for too few bytes. */
-template <typename scalar_>
+template <typename scalar_type_>
 yyjson_mut_val* mutable_scalar(yyjson_mut_doc* document, value_view_t bytes) noexcept {
-    if (bytes.size() < sizeof(scalar_)) return nullptr;
-    scalar_ scalar {};
-    std::memcpy(&scalar, bytes.data(), sizeof(scalar_));
+    if (bytes.size() < sizeof(scalar_type_)) return nullptr;
+    scalar_type_ scalar {};
+    std::memcpy(&scalar, bytes.data(), sizeof(scalar_type_));
 
-    if constexpr (std::is_same_v<scalar_, bool>) return yyjson_mut_bool(document, scalar);
-    else if constexpr (std::is_floating_point_v<scalar_>) return yyjson_mut_real(document, scalar);
-    else if constexpr (std::is_signed_v<scalar_>) return yyjson_mut_sint(document, scalar);
+    if constexpr (std::is_same_v<scalar_type_, bool>) return yyjson_mut_bool(document, scalar);
+    else if constexpr (std::is_floating_point_v<scalar_type_>) return yyjson_mut_real(document, scalar);
+    else if constexpr (std::is_signed_v<scalar_type_>) return yyjson_mut_sint(document, scalar);
     else return yyjson_mut_uint(document, scalar);
 }
 
@@ -452,7 +454,7 @@ inline expected<json_t> any_parse(value_view_t bytes, ustore_docs_field_type_t t
     case ustore_docs_field_type_u32_k: root = mutable_scalar<std::uint32_t>(handle, bytes); break;
     case ustore_docs_field_type_u16_k: root = mutable_scalar<std::uint16_t>(handle, bytes); break;
     case ustore_docs_field_type_u8_k: root = mutable_scalar<std::uint8_t>(handle, bytes); break;
-    case ustore_docs_field_type_str_k: root = yyjson_mut_strncpy(handle, bytes.c_str(), bytes.size()); break;
+    case ustore_docs_field_type_string_k: root = yyjson_mut_strncpy(handle, bytes.c_str(), bytes.size()); break;
     default: break;
     }
 
@@ -486,12 +488,12 @@ inline std::size_t field_size_bytes(ustore_docs_field_type_t type) noexcept {
 }
 
 /** Converts @p value into the scalar at @p index of @p column, zeroing a cell that holds no valid value. */
-template <typename scalar_>
+template <typename scalar_type_>
 conversion_t gather_scalar(json_cell_t const& value, ustore_byte_t* column, std::size_t index) noexcept {
-    scalar_ scalar {};
+    scalar_type_ scalar {};
     conversion_t const conversion = json_to_scalar(value, scalar);
     if (!is_valid(conversion)) scalar = {};
-    std::memcpy(column + index * sizeof(scalar_), &scalar, sizeof(scalar_));
+    std::memcpy(column + index * sizeof(scalar_type_), &scalar, sizeof(scalar_type_));
     return conversion;
 }
 

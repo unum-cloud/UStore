@@ -8,6 +8,10 @@ rather than reopening it on every widget change.
 
 Needs `streamlit`, `requests` and the `ustore` bindings.
 Run with `streamlit run examples/browser.py`.
+
+File: examples/browser.py
+Author: Ash Vardanian
+Date: September 16, 2026
 """
 
 import json
@@ -112,7 +116,7 @@ def open_store() -> Store:
 def landmark_names(store: Store, keys: list[int]) -> list[str]:
     """The name of every landmark, read as one batch out of the documents collection."""
     found = store.database.docs_read(
-        keys, ustore.Arena(), field="name", outputs_type=ustore.FieldType.STR, collection=store.documents
+        keys, ustore.Arena(), field="name", outputs_type=ustore.FieldType.STRING, collection=store.documents
     )
     return ["" if name is None else bytes(name).decode() for name in found]
 

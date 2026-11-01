@@ -114,22 +114,24 @@ PyObject* ustore_py_values_read(ustore_py_context_t const* context, ustore_py_ve
     return ustore_py_call_run(context, verb, call, &read);
 }
 
-PyObject* ustore_py_api_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                             PyObject* args_names_tuple) {
+PyObject* ustore_py_api_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                             PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("read", positional_args_count, args_names_tuple, 2) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("read", positional_arguments_count, keyword_names_tuple, 2) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     ustore_py_read_call_t stack;
     ustore_py_read_call_t* const call = ustore_py_call_open(&context, &ustore_py_read_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(args[0], &call->keys) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0)
         return ustore_py_call_discard(&context, &ustore_py_read_verb, call);
-    return ustore_py_values_read(&context, &options, &ustore_py_read_verb, call, args[1]);
+    return ustore_py_values_read(&context, &options, &ustore_py_read_verb, call, arguments[1]);
 }
 
 /**
@@ -174,18 +176,20 @@ static ustore_py_read_call_t* one_key_open(ustore_py_context_t const* context, u
     return call;
 }
 
-PyObject* ustore_py_api_get(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                            PyObject* args_names_tuple) {
+PyObject* ustore_py_api_get(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                            PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("get", positional_args_count, args_names_tuple, 1) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("get", positional_arguments_count, keyword_names_tuple, 1) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     ustore_key_t key = {0};
-    if (ustore_py_key_from_object(args[0], &key) != 0) return NULL;
+    if (ustore_py_key_from_object(arguments[0], &key) != 0) return NULL;
     ustore_py_read_call_t stack;
     ustore_py_read_call_t* const call = one_key_open(&context, &get_verb, &key, &stack);
     return call ? values_read_once(&context, &options, &get_verb, call) : NULL;
@@ -235,18 +239,20 @@ PyObject* ustore_py_value_contains(ustore_py_context_t const* context, ustore_py
     return ustore_py_call_run(context, &contains_verb, call, &read);
 }
 
-PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                 PyObject* args_names_tuple) {
+PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                 PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("contains", positional_args_count, args_names_tuple, 1) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("contains", positional_arguments_count, keyword_names_tuple, 1) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     ustore_key_t key = {0};
-    if (ustore_py_key_from_object(args[0], &key) != 0) return NULL;
+    if (ustore_py_key_from_object(arguments[0], &key) != 0) return NULL;
     return ustore_py_value_contains(&context, &options, &key);
 }
 
@@ -399,21 +405,23 @@ char const doc_write[] =                                                        
     "  TypeError: A value is None or exports no buffer.\n"                                   //
     "  Error: Whatever the engine reported.";
 
-PyObject* ustore_py_api_write(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                              PyObject* args_names_tuple) {
+PyObject* ustore_py_api_write(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                              PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("write", positional_args_count, args_names_tuple, 2) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("write", positional_arguments_count, keyword_names_tuple, 2) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     ustore_py_write_call_t stack;
     ustore_py_write_call_t* const call = ustore_py_call_open(&context, &ustore_py_write_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(args[0], &call->keys) != 0 ||
-        ustore_py_contents_from_object(args[1], call->keys.count, &call->contents) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
+        ustore_py_contents_from_object(arguments[1], call->keys.count, &call->contents) != 0)
         return ustore_py_call_discard(&context, &ustore_py_write_verb, call);
     return ustore_py_values_write(&context, &options, call);
 }
@@ -432,14 +440,16 @@ char const doc_set[] =                                                          
     "Raises:\n"                                                                            //
     "  TypeError: The value is None or exports no buffer.";
 
-PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                            PyObject* args_names_tuple) {
+PyObject* ustore_py_api_set(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                            PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("set", positional_args_count, args_names_tuple, 2) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("set", positional_arguments_count, keyword_names_tuple, 2) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     ustore_py_write_call_t stack;
@@ -447,9 +457,9 @@ PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t po
     if (!call) return NULL;
     call->keys.keys = call->keys.inline_keys;
     call->keys.count = 1;
-    if (ustore_py_key_from_object(args[0], &call->keys.inline_keys[0]) != 0 ||
+    if (ustore_py_key_from_object(arguments[0], &call->keys.inline_keys[0]) != 0 ||
         ustore_py_contents_reserve(&call->contents, 1, ustore_py_contents_per_task_k) != 0 ||
-        ustore_py_contents_borrow(args[1], &call->contents) != 0)
+        ustore_py_contents_borrow(arguments[1], &call->contents) != 0)
         return ustore_py_call_discard(&context, &ustore_py_write_verb, call);
     return ustore_py_values_write(&context, &options, call);
 }
@@ -466,20 +476,22 @@ char const doc_remove[] =                                                       
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n" //
     "    returning.";
 
-PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                               PyObject* args_names_tuple) {
+PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                               PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("remove", positional_args_count, args_names_tuple, 1) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("remove", positional_arguments_count, keyword_names_tuple, 1) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     ustore_py_remove_call_t stack;
     ustore_py_remove_call_t* const call = ustore_py_call_open(&context, &ustore_py_remove_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_subscript(args[0], &call->keys) < 0)
+    if (ustore_py_keys_from_subscript(arguments[0], &call->keys) < 0)
         return ustore_py_call_discard(&context, &ustore_py_remove_verb, call);
     return ustore_py_values_remove(&context, &options, ustore_modality_blobs_k, call);
 }
@@ -564,29 +576,30 @@ static int scan_match_admitted(scan_match_t const* match, ustore_modality_t moda
 
 /** Walks the keywords of a scan, which takes the order its keys come in, a progress callable and what it matches
  *  beside the shared ones. */
-static int scan_options_from_keywords(ustore_py_context_t const* context, PyObject* const* args,
-                                      Py_ssize_t positional_args_count, PyObject* args_names_tuple,
+static int scan_options_from_keywords(ustore_py_context_t const* context, PyObject* const* arguments,
+                                      Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
                                       ustore_py_verb_options_t* options, ustore_scan_mode_t* mode, PyObject** progress,
                                       scan_match_t* match) {
     ustore_py_verb_options_init(options);
     *progress = NULL;
     memset(match, 0, sizeof(*match));
     int chosen = ustore_scan_ordered_k;
-    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        int const consumed = ustore_py_verb_option_from_keyword(context, name, args[args_progress], options);
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        int const consumed = ustore_py_verb_option_from_keyword(context, name, arguments[arguments_progress], options);
         if (consumed < 0) return -1;
         if (consumed > 0) continue;
-        int const matched = scan_match_from_keyword(name, args[args_progress], match);
+        int const matched = scan_match_from_keyword(name, arguments[arguments_progress], match);
         if (matched < 0) return -1;
         if (matched > 0) continue;
         int read = -1;
         if (PyUnicode_CompareWithASCIIString(name, "mode") == 0)
-            read = ustore_py_enum_from_object(args[args_progress], "mode", ustore_py_enum_scan_mode_k, &chosen);
+            read = ustore_py_enum_from_object(arguments[arguments_progress], "mode", ustore_py_enum_scan_mode_k,
+                                              &chosen);
         else if (PyUnicode_CompareWithASCIIString(name, "progress") == 0)
-            read = ustore_py_progress_from_object(args[args_progress], progress);
+            read = ustore_py_progress_from_object(arguments[arguments_progress], progress);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) return -1;
     }
@@ -897,30 +910,32 @@ PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb
     return keys_scan_matched(context, options, modality, start, wanted, mode, progress, NULL, arena);
 }
 
-PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                PyObject* args_names_tuple, char const* name, ustore_modality_t modality) {
+PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked(name, positional_args_count, args_names_tuple, 3) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked(name, positional_arguments_count, keyword_names_tuple, 3) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
     ustore_scan_mode_t mode = ustore_scan_ordered_k;
     PyObject* progress = NULL;
     scan_match_t match;
-    if (scan_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options, &mode, &progress,
-                                   &match) != 0)
+    if (scan_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple, &options,
+                                   &mode, &progress, &match) != 0)
         return NULL;
 
     ustore_key_t start = {0};
     size_t wanted = 0;
-    if (ustore_py_key_from_object(args[0], &start) != 0) return NULL;
-    if (ustore_py_size_from_object(args[1], "wanted", &wanted) != 0) return NULL;
-    return keys_scan_matched(&context, &options, modality, &start, wanted, mode, progress, &match, args[2]);
+    if (ustore_py_key_from_object(arguments[0], &start) != 0) return NULL;
+    if (ustore_py_size_from_object(arguments[1], "wanted", &wanted) != 0) return NULL;
+    return keys_scan_matched(&context, &options, modality, &start, wanted, mode, progress, &match, arguments[2]);
 }
 
-PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                             PyObject* args_names_tuple) {
-    return ustore_py_api_scan_of(self, args, positional_args_count, args_names_tuple, "scan", ustore_modality_blobs_k);
+PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                             PyObject* keyword_names_tuple) {
+    return ustore_py_api_scan_of(self, arguments, positional_arguments_count, keyword_names_tuple, "scan",
+                                 ustore_modality_blobs_k);
 }
 
 char const doc_scan_batch[] =                                                                  //
@@ -946,28 +961,29 @@ char const doc_scan_batch[] =                                                   
     "Raises:\n"                                                                                //
     "  CancelledError: The progress callable stopped the scans.";
 
-PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple) {
+PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("scan_batch", positional_args_count, args_names_tuple, 3) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("scan_batch", positional_arguments_count, keyword_names_tuple, 3) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
     ustore_scan_mode_t mode = ustore_scan_ordered_k;
     PyObject* progress = NULL;
     scan_match_t match;
-    if (scan_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options, &mode, &progress,
-                                   &match) != 0)
+    if (scan_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple, &options,
+                                   &mode, &progress, &match) != 0)
         return NULL;
 
     size_t wanted = 0;
-    if (ustore_py_size_from_object(args[1], "wanted", &wanted) != 0) return NULL;
+    if (ustore_py_size_from_object(arguments[1], "wanted", &wanted) != 0) return NULL;
     keys_call_t stack;
     keys_call_t* const call = ustore_py_call_open(&context, &scan_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(args[0], &call->starts) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->starts) != 0)
         return ustore_py_call_discard(&context, &scan_verb, call);
-    return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, &match, call, args[2]);
+    return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, &match, call, arguments[2]);
 }
 
 /** Runs @p tasks samples of up to @p wanted keys each through the sample of @p modality, claiming @p arena for their
@@ -1031,24 +1047,26 @@ PyObject* ustore_py_keys_sample(ustore_py_context_t const* context, ustore_py_ve
     return keys_sample(context, options, modality, 1, wanted, arena);
 }
 
-PyObject* ustore_py_api_sample_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple, char const* name, ustore_modality_t modality) {
+PyObject* ustore_py_api_sample_of(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked(name, positional_args_count, args_names_tuple, 2) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked(name, positional_arguments_count, keyword_names_tuple, 2) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     size_t wanted = 0;
-    if (ustore_py_size_from_object(args[0], "wanted", &wanted) != 0) return NULL;
-    return keys_sample(&context, &options, modality, 1, wanted, args[1]);
+    if (ustore_py_size_from_object(arguments[0], "wanted", &wanted) != 0) return NULL;
+    return keys_sample(&context, &options, modality, 1, wanted, arguments[1]);
 }
 
-PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                               PyObject* args_names_tuple) {
-    return ustore_py_api_sample_of(self, args, positional_args_count, args_names_tuple, "sample",
+PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                               PyObject* keyword_names_tuple) {
+    return ustore_py_api_sample_of(self, arguments, positional_arguments_count, keyword_names_tuple, "sample",
                                    ustore_modality_blobs_k);
 }
 
@@ -1067,21 +1085,23 @@ char const doc_sample_batch[] =                                                 
     "Returns:\n"                                                                              //
     "  Keys: One run of keys per sample, in no particular order.";
 
-PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple) {
+PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("sample_batch", positional_args_count, args_names_tuple, 3) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("sample_batch", positional_arguments_count, keyword_names_tuple, 3) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     size_t tasks = 0;
     size_t wanted = 0;
-    if (ustore_py_size_from_object(args[0], "count", &tasks) != 0) return NULL;
-    if (ustore_py_size_from_object(args[1], "wanted", &wanted) != 0) return NULL;
-    return keys_sample(&context, &options, ustore_modality_blobs_k, tasks, wanted, args[2]);
+    if (ustore_py_size_from_object(arguments[0], "count", &tasks) != 0) return NULL;
+    if (ustore_py_size_from_object(arguments[1], "wanted", &wanted) != 0) return NULL;
+    return keys_sample(&context, &options, ustore_modality_blobs_k, tasks, wanted, arguments[2]);
 }
 
 char const doc_measure[] =                                                                   //
@@ -1133,25 +1153,27 @@ static void measure_release(void* call) { ustore_py_call_release(&((measure_call
 
 static ustore_py_verb_t const measure_verb = {sizeof(measure_call_t), measure_submit, measure_answer, measure_release};
 
-PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                PyObject* args_names_tuple) {
+PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("measure", positional_args_count, args_names_tuple, 3) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("measure", positional_arguments_count, keyword_names_tuple, 3) < 0)
+        return NULL;
 
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                             &options) != 0)
         return NULL;
 
     ustore_key_t start = {0};
     ustore_key_t end = {0};
-    if (ustore_py_key_from_object(args[0], &start) != 0) return NULL;
-    if (ustore_py_key_from_object(args[1], &end) != 0) return NULL;
+    if (ustore_py_key_from_object(arguments[0], &start) != 0) return NULL;
+    if (ustore_py_key_from_object(arguments[1], &end) != 0) return NULL;
 
     measure_call_t stack;
     measure_call_t* const call = ustore_py_call_open(&context, &measure_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_claim(args[2], &call->call.arena) != 0)
+    if (ustore_py_arena_claim(arguments[2], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &measure_verb, call);
     call->call.collection = options.collection;
     call->start = start;
@@ -1547,16 +1569,16 @@ static char const doc_Cursor_next[] =                                           
     "  CancelledError: The progress callable stopped the pull.\n"                               //
     "  UninitializedError: The cursor or its executor is closed.";
 
-static PyObject* Cursor_next(Cursor* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                             PyObject* args_names_tuple) {
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked("next", positional_args_count,
-                                                                           args_names_tuple, 2);
-    if (args_names_count < 0) return NULL;
+static PyObject* Cursor_next(Cursor* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                             PyObject* keyword_names_tuple) {
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked("next", positional_arguments_count,
+                                                                                 keyword_names_tuple, 2);
+    if (keyword_names_count < 0) return NULL;
     int values = 0;
     PyObject* progress = NULL;
-    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[positional_args_count + names_progress];
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
         int read = -1;
         if (PyUnicode_CompareWithASCIIString(name, "values") == 0) {
             values = PyObject_IsTrue(value);
@@ -1568,7 +1590,7 @@ static PyObject* Cursor_next(Cursor* self, PyObject* const* args, Py_ssize_t pos
         if (read != 0) return NULL;
     }
     size_t wanted = 0;
-    if (ustore_py_size_from_object(args[0], "wanted", &wanted) != 0) return NULL;
+    if (ustore_py_size_from_object(arguments[0], "wanted", &wanted) != 0) return NULL;
 
     void* const lent = (void*)&cursor_lent;
     void* handle = NULL;
@@ -1581,7 +1603,7 @@ static PyObject* Cursor_next(Cursor* self, PyObject* const* args, Py_ssize_t pos
                         handle ? "Another pull of this cursor is running" : "The cursor is closed");
         return NULL;
     }
-    PyObject* const page = cursor_pull(self, handle, wanted, args[1], values, progress);
+    PyObject* const page = cursor_pull(self, handle, wanted, arguments[1], values, progress);
     ustore_py_critical_section_begin_((PyObject*)self);
     self->handle = handle;
     ustore_py_critical_section_end_();
@@ -1601,8 +1623,9 @@ static PyObject* Cursor_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
 
 static PyObject* Cursor_enter(PyObject* self, PyObject* Py_UNUSED(ignored)) { return Py_NewRef(self); }
 
-static PyObject* Cursor_exit(PyObject* self, PyObject* const* Py_UNUSED(args),
-                             Py_ssize_t Py_UNUSED(positional_args_count), PyObject* Py_UNUSED(args_names_tuple)) {
+static PyObject* Cursor_exit(PyObject* self, PyObject* const* Py_UNUSED(arguments),
+                             Py_ssize_t Py_UNUSED(positional_arguments_count),
+                             PyObject* Py_UNUSED(keyword_names_tuple)) {
     return Cursor_close(self, NULL);
 }
 
@@ -1671,13 +1694,13 @@ char const doc_graph_vertices_cursor[] =                                        
     "keys alone. Calls `ustore_graph_vertices_cursor_init`.";
 
 /** Opens a walk of @p modality as the receiver @p self names, from the start and with the match its arguments give. */
-static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                             PyObject* args_names_tuple, char const* name, ustore_modality_t modality) {
+static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                             PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (positional_args_count > 1) {
+    if (positional_arguments_count > 1) {
         PyErr_Format(PyExc_TypeError, "%s() takes the start alone by position, received %zd arguments", name,
-                     positional_args_count);
+                     positional_arguments_count);
         return NULL;
     }
     ustore_py_verb_options_t options;
@@ -1685,10 +1708,10 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t p
     scan_match_t match;
     memset(&match, 0, sizeof(match));
     int outputs_encoding = ustore_page_encoding_xml_k;
-    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
-    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
-        PyObject* const keyword = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        PyObject* const value = args[positional_args_count + names_progress];
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const keyword = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
         int const consumed = ustore_py_verb_option_from_keyword(&context, keyword, value, &options);
         if (consumed < 0) return NULL;
         if (consumed > 0) continue;
@@ -1711,7 +1734,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t p
         return NULL;
     }
     ustore_key_t start = {0};
-    if (positional_args_count == 1 && ustore_py_key_from_object(args[0], &start) != 0) return NULL;
+    if (positional_arguments_count == 1 && ustore_py_key_from_object(arguments[0], &start) != 0) return NULL;
 
     Cursor* const cursor = PyObject_New(Cursor, &CursorType);
     if (!cursor) return NULL;
@@ -1805,24 +1828,27 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* args, Py_ssize_t p
     return NULL;
 }
 
-PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                               PyObject* args_names_tuple) {
-    return cursor_open(self, args, positional_args_count, args_names_tuple, "cursor", ustore_modality_blobs_k);
+PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                               PyObject* keyword_names_tuple) {
+    return cursor_open(self, arguments, positional_arguments_count, keyword_names_tuple, "cursor",
+                       ustore_modality_blobs_k);
 }
 
-PyObject* ustore_py_api_docs_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple) {
-    return cursor_open(self, args, positional_args_count, args_names_tuple, "docs_cursor", ustore_modality_docs_k);
+PyObject* ustore_py_api_docs_cursor(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple) {
+    return cursor_open(self, arguments, positional_arguments_count, keyword_names_tuple, "docs_cursor",
+                       ustore_modality_docs_k);
 }
 
-PyObject* ustore_py_api_pages_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple) {
-    return cursor_open(self, args, positional_args_count, args_names_tuple, "pages_cursor", ustore_modality_pages_k);
+PyObject* ustore_py_api_pages_cursor(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
+    return cursor_open(self, arguments, positional_arguments_count, keyword_names_tuple, "pages_cursor",
+                       ustore_modality_pages_k);
 }
 
-PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                              PyObject* args_names_tuple) {
-    return cursor_open(self, args, positional_args_count, args_names_tuple, "graph_vertices_cursor",
+PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* arguments,
+                                              Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    return cursor_open(self, arguments, positional_arguments_count, keyword_names_tuple, "graph_vertices_cursor",
                        ustore_modality_graph_k);
 }
 

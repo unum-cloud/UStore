@@ -8,10 +8,11 @@
 
 #pragma once
 
+#include <cerrno>  // `errno`, `ENOENT`
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint64_t`, `std::uintptr_t`
+#include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstdio>  // `std::FILE`, `std::fopen`, `std::fread`, `std::fwrite`, `std::rename`
-#include <cstring> // `std::memcmp`, `std::memcpy`
+#include <cstring> // `std::memcmp`
 
 #if defined(_WIN32)
 #include <io.h>      // `_commit`, `_fileno`
@@ -20,13 +21,8 @@
 #include <unistd.h> // `fsync`
 #endif
 
-#include <algorithm>   // `std::max`
 #include <array>       // `std::array`
-#include <atomic>      // `std::memory_order`
-#include <chrono>      // `std::chrono::steady_clock`
-#include <limits>      // `std::numeric_limits`
 #include <new>         // `std::nothrow`
-#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`, `std::remove_cvref_t`
 #include <utility>     // `std::exchange`, `std::move`
@@ -38,18 +34,21 @@
 
 #include "ustore/blobs.h"
 #include "ustore/db.h"
-#include "ustore/ranges.hpp" // `place_batch_t`, `edges_view_t`, `strided`
+#include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 #include "ustore/strings.h"
 
-#include "ustore/blobs/ram_store.hpp"          // `collection_store`, `collections_transaction`, `translate`
+#include "ustore/blobs/ram_store.hpp"          // `ordered_store`, `values_by_key_store`, `order_t`, `translate`
+#include "ustore/docs/ram_store.hpp"           // `docs::document_pair_t`, `documents_by_key_store`
 #include "ustore/graph/half_edges.hpp"         // `half_edge_t`, `half_edge_direction_t`
+#include "ustore/graph/ram_store.hpp"          // `half_edges_store`
+#include "ustore/pages/ram_store.hpp"          // `pages::page_pair_t`, `pages_by_key_store`
+#include "ustore/strings/ram_store.hpp"        // `string_pair_t`, `keys_by_string_store`, `string_key_from`
 #include "ustore/strings/string_keys.hpp"      // `string_key_t`, `blob_t`
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`
-#include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_copy`, `arena_allocator`
 
-#include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `state_of`, `view_t`
+#include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `state_of`, `view_t`, `strings_kit_of`
 #include "lib.hpp"                // `cpu_class_t`, `atomic_ref_for_cpu_class`, `atomic_ref_of`, `waiter_of`
-#include "utilities/batches.hpp"  // `scan_batch_t`, `strings_arg_t`, `edges_batch_t`, `places_of`, `edges_of`
+#include "utilities/batches.hpp"  // `scan_batch_t`, `strings_arg_t`, `places_of`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `strings_read_outputs_t`, `scan_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -61,47 +60,133 @@ using namespace unum::ustore::utilities;
 
 #pragma region Stores
 
+template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
+          strings_kit_concept strings_kit_type_>
+struct collection_store;
+
+/** What the collections system collection records of a collection: its name, and the store its
+ *  entries live in, whose kind says what it holds. */
+template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
+          strings_kit_concept strings_kit_type_>
+struct collection_entry {
+
+    /** The name of the collection, empty for one created without. */
+    blob_t name;
+
+    /** The store holding the collection's entries. */
+    collection_store<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>* store {nullptr};
+};
+
+/** A collection's UUID mapped onto what the collections system collection records of it. */
+template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
+          strings_kit_concept strings_kit_type_>
+using collections_pair = st::mapping<ustore_collection_id_t,
+                                     collection_entry<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>>;
+
+/** The collections system collection: every collection's UUID mapped onto its entry. */
+template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
+          strings_kit_concept strings_kit_type_>
+using collections_by_id_store =
+    ordered_store<collections_pair<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>, uuid_order_t,
+                  uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
+
+/** The store of one collection, of the kind its creator picked, which a drop retires
+ *  rather than frees. */
+template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
+          strings_kit_concept strings_kit_type_>
+struct collection_store {
+
+    /** The collection's entries. */
+    std::variant<values_by_key_store<isolation_, atomic_reference_, waiter_type_>,
+                 strings::keys_by_string_store<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>,
+                 graph::half_edges_store<isolation_, atomic_reference_, waiter_type_>,
+                 docs::documents_by_key_store<isolation_, atomic_reference_, waiter_type_>,
+                 pages::pages_by_key_store<isolation_, atomic_reference_, waiter_type_>>
+        entries;
+
+    /** The store retired before this one, while this one waits to be freed. */
+    collection_store* next_retired {nullptr};
+
+    /** The stamp the change that took this store out of the collections system
+     *  collection published under. */
+    generation_t retirement_stamp {0};
+
+    template <typename kind_type_>
+    collection_store(std::in_place_type_t<kind_type_> kind, order_t& order) noexcept : entries(kind, order) {}
+
+    /** Allocates the store of a collection keeping its entries in a @p kind_type_ store,
+     *  or answers null. */
+    template <typename kind_type_>
+    static collection_store* allocate(order_t& order) noexcept {
+        return new (std::nothrow) collection_store(std::in_place_type<kind_type_>, order);
+    }
+};
+
+/** A transaction over both system collections and every collection store it reaches, published
+ *  under one stamp. */
+template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
+          strings_kit_concept strings_kit_type_>
+using collections_transaction = st::dynamic_transaction_group<
+    collections_by_id_store<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>,
+    values_by_key_store<isolation_, atomic_reference_, waiter_type_>,
+    strings::keys_by_string_store<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>,
+    graph::half_edges_store<isolation_, atomic_reference_, waiter_type_>,
+    docs::documents_by_key_store<isolation_, atomic_reference_, waiter_type_>,
+    pages::pages_by_key_store<isolation_, atomic_reference_, waiter_type_>>;
+
 /** The store of one collection at @p isolation_, whose partition locks own their words through the
  *  atomic reference of @p cpu_class_ and wait through its waiter. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-using collection_store_of =
-    collection_store<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+using collection_store_of = collection_store<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type,
+                                             waiter_of<cpu_class_>, strings_kit_of<cpu_class_>>;
 
 /** What the collections system collection of @p cpu_class_ at @p isolation_ records of a collection. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-using collection_entry_of =
-    collection_entry<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+using collection_entry_of = collection_entry<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type,
+                                             waiter_of<cpu_class_>, strings_kit_of<cpu_class_>>;
 
 /** A collection's UUID mapped onto its entry, on @p cpu_class_ at @p isolation_. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-using collections_pair_of =
-    collections_pair<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+using collections_pair_of = collections_pair<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type,
+                                             waiter_of<cpu_class_>, strings_kit_of<cpu_class_>>;
 
 /** The collections system collection on @p cpu_class_ at @p isolation_. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 using collections_by_id_store_of =
-    collections_by_id_store<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+    collections_by_id_store<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
+                            strings_kit_of<cpu_class_>>;
 
 /** The names system collection on @p cpu_class_ at @p isolation_. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 using keys_by_string_store_of =
-    keys_by_string_store<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+    strings::keys_by_string_store<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type,
+                                  waiter_of<cpu_class_>, strings_kit_of<cpu_class_>>;
 
 /** A transaction over every store of a database on @p cpu_class_ at @p isolation_. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 using collections_transaction_of =
-    collections_transaction<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+    collections_transaction<isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
+                            strings_kit_of<cpu_class_>>;
 
 /** Allocates the store a collection holding @p modality keeps its entries in, or answers null. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 collection_store_of<cpu_class_, isolation_>* allocate_store(order_t& order, ustore_modality_t modality) noexcept {
     using store_t = collection_store_of<cpu_class_, isolation_>;
     switch (modality) {
-    case ustore_modality_strings_k: return store_t::template allocate<keys_by_string_store>(order);
-    case ustore_modality_graph_k: return store_t::template allocate<half_edges_store>(order);
-    case ustore_modality_docs_k: return store_t::template allocate<documents_by_key_store>(order);
-    case ustore_modality_pages_k: return store_t::template allocate<pages_by_key_store>(order);
-    default: return store_t::template allocate<values_by_key_store>(order);
+    case ustore_modality_strings_k:
+        return store_t::template allocate<keys_by_string_store_of<cpu_class_, isolation_>>(order);
+    case ustore_modality_graph_k:
+        return store_t::template allocate<graph::half_edges_store<
+            isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>>(order);
+    case ustore_modality_docs_k:
+        return store_t::template allocate<docs::documents_by_key_store<
+            isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>>(order);
+    case ustore_modality_pages_k:
+        return store_t::template allocate<pages::pages_by_key_store<
+            isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>>(order);
+    default:
+        return store_t::template allocate<values_by_key_store<
+            isolation_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>>(order);
     }
 }
 
@@ -113,8 +198,8 @@ ustore_modality_t modality_of(collection_store_type_ const& store) noexcept {
             using entry_t = typename kind_type_::value_t;
             if constexpr (std::is_same_v<entry_t, string_pair_t>) return ustore_modality_strings_k;
             else if constexpr (std::is_same_v<entry_t, half_edge_t>) return ustore_modality_graph_k;
-            else if constexpr (std::is_same_v<entry_t, document_pair_t>) return ustore_modality_docs_k;
-            else if constexpr (std::is_same_v<entry_t, page_pair_t>) return ustore_modality_pages_k;
+            else if constexpr (std::is_same_v<entry_t, docs::document_pair_t>) return ustore_modality_docs_k;
+            else if constexpr (std::is_same_v<entry_t, pages::page_pair_t>) return ustore_modality_pages_k;
             else return ustore_modality_blobs_k;
         },
         store.entries);
@@ -135,11 +220,14 @@ inline bool names_directory(char const* path) noexcept {
 #pragma region Handles
 
 /** The RAM engine of one CPU class and isolation level, whose stores own their words through the
- *  class's atomic reference and wait through its waiter. Each modality's table is defined beside the
- *  calls it names, and the database and engine tables in <tt>src/ram/variants.hpp</tt>, so the
+ *  class's atomic reference and wait through its waiter. Each modality's table is defined beside
+ *  the calls it names, and the database and engine tables in <tt>src/ram/variants.hpp</tt>, so the
  *  explicit instantiation in <tt>src/ram/variants_&lt;class&gt;.cpp</tt> compiles every call there. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct ram_variant {
+
+    /** The StringZilla kernels this class runs its string work through. */
+    using strings_kit_t = strings_kit_of<cpu_class_>;
 
     static_assert(collections_by_id_store_of<cpu_class_, isolation_>::isolation_k == isolation_,
                   "the partitions must keep the isolation of their stores");
@@ -501,10 +589,10 @@ store_status_t resolve(source_type_& source, ustore_collection_id_t const& colle
 /**
  *  @brief Hands @p action every run of tasks naming one collection, with the store of that collection.
  *
- *  Resolves each run once through @p source, refusing a collection the collections system
- *  collection does not list, and stops at the first failure @p action answers or reports. @p action
- *  is invoked as <tt>action(entries, first, end)</tt> with the concrete store and the tasks [
- *  @p first, @p end ) it serves.
+ *  Resolves each run once through @p source, refusing a collection the collections
+ *  system collection does not list, and stops at the first failure @p action answers or
+ *  reports. @p action is invoked as <tt>action(entries, first, end)</tt> with the concrete
+ *  store and the tasks [ @p first, @p end ) it serves.
  */
 template <typename source_type_, typename action_type_>
 store_status_t for_each_run(source_type_& source, strided_iterator<ustore_collection_id_t const> collections,
@@ -649,24 +737,6 @@ store_status_t scan_window(view_type_ const& view, scan_task_t scan, ustore_scan
     if (st::failed(walked) || outcome.failed()) return walked;
     return watch_keys<entry_type_>(view, outputs, first);
 }
-
-/** A splitmix64 generator, drawing the positions a reservoir keeps. */
-struct sample_generator_t {
-    using result_type = std::uint64_t;
-
-    /** The state every draw advances. */
-    std::uint64_t state;
-
-    static constexpr result_type min() noexcept { return 0; }
-    static constexpr result_type max() noexcept { return std::numeric_limits<result_type>::max(); }
-
-    result_type operator()() noexcept {
-        std::uint64_t mixed = (state += 0x9E3779B97F4A7C15ull);
-        mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;
-        mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBull;
-        return mixed ^ (mixed >> 31);
-    }
-};
 
 /** Appends a uniform reservoir of up to the limit of @p sample keys of a collection of
  *  @p entry_type_, halting with @p outcome when the scratch refuses. */
@@ -835,8 +905,8 @@ store_status_t stage_string_removals(transaction_type_& transaction, strings_arg
 }
 
 /**
- *  @brief Commits what @p stage_changes stages through a transaction of its own, retrying conflicts up to
- *      @c commit_attempts_k times.
+ *  @brief Commits what @p stage_changes stages through a transaction of its own, retrying conflicts
+ *      up to @c commit_attempts_k times.
  *  @param[out] commit_stamp Optional output for the stamp the commit published under.
  *
  *  @p stage_changes takes a @c transaction_source and may refuse the call through its outcome, answering a failure
@@ -918,9 +988,9 @@ status_t remove_keys(database_state<cpu_class_, isolation_>& state, arguments_ty
  *  @brief Serves a read-modify-write of documents or pages through @c serve_write, reading and writing in one
  *      transaction: the caller's, or one of the call's own, retried on conflicts.
  *
- *  @p modify is invoked as <tt>modify(source, failure)</tt> on every attempt and answers the status
- *  of the call, recording into @c failure the first failure of the stores, which a commit retries
- *  when it is a conflict.
+ *  @p modify is invoked as <tt>modify(source, failure)</tt> on every attempt and answers the status of the
+ *  call, recording into @c failure the first failure of the stores, which a commit retries when it
+ *  is a conflict.
  */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename modify_type_>
 status_t serve_read_modify_write(database_state<cpu_class_, isolation_>& state, ustore_durability_t durability,
@@ -952,7 +1022,7 @@ struct listed_collection {
 
 /** Every collection the collections system collection lists at some stamp. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-using listed_collections = st::basic_vector<listed_collection<cpu_class_, isolation_>>;
+using listed_collections = st::vector<listed_collection<cpu_class_, isolation_>>;
 
 /** Collects every collection the collections system collection lists through @p view. */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename view_type_>
@@ -977,10 +1047,10 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct collections_change {
 
     /** Stores the change installs, which nothing else reaches until it commits. */
-    st::basic_vector<collection_store_of<cpu_class_, isolation_>*> installed;
+    st::vector<collection_store_of<cpu_class_, isolation_>*> installed;
 
     /** Stores the change takes out of the collections system collection, retired at its stamp. */
-    st::basic_vector<collection_store_of<cpu_class_, isolation_>*> taken_out;
+    st::vector<collection_store_of<cpu_class_, isolation_>*> taken_out;
 
     /** Frees what a refused attempt installed and forgets what it took out, ahead of the next attempt. */
     void discard() noexcept {
@@ -1118,7 +1188,7 @@ store_status_t stage_emptied(transaction_source<cpu_class_, isolation_>& source,
 /** Stages emptying every blob, document or page of @p entry_type_ that @p transaction reaches, keeping every key. */
 template <typename entry_type_, typename transaction_type_>
 store_status_t stage_emptied_values(transaction_type_& transaction) noexcept {
-    st::basic_vector<ustore_key_t> keys;
+    st::vector<ustore_key_t> keys;
     store_status_t copied = store_status_t::success_k;
     store_status_t const walked = transaction.range_from(
         smallest_key_k, [&](entry_type_ const& pair) noexcept -> walk_control_t {
@@ -1139,9 +1209,9 @@ store_status_t stage_emptied_values(transaction_type_& transaction) noexcept {
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 store_status_t stage_values_emptied(transaction_source<cpu_class_, isolation_>& source,
                                     ustore_collection_id_t collection, status_t& outcome) noexcept {
-    strided_iterator<ustore_collection_id_t const> const one {&collection, sizeof(collection)};
+    strided_iterator<ustore_collection_id_t const> const collections {&collection, sizeof(collection)};
     return for_each_run(
-        source, one, 1, outcome, [&](auto& entries, std::size_t, std::size_t) noexcept -> store_status_t {
+        source, collections, 1, outcome, [&](auto& entries, std::size_t, std::size_t) noexcept -> store_status_t {
             using entry_t = entry_of<decltype(entries)>;
             if constexpr (std::is_same_v<entry_t, half_edge_t>) return store_status_t::success_k;
             else if constexpr (std::is_same_v<entry_t, string_pair_t>)
@@ -1154,7 +1224,7 @@ store_status_t stage_values_emptied(transaction_source<cpu_class_, isolation_>& 
         });
 }
 
-#pragma endregion Catalog
+#pragma endregion Collections
 
 #pragma region Image
 
@@ -1301,8 +1371,8 @@ store_status_t write_entries(std::FILE* file, store_type_ const& store, generati
 }
 
 /** Writes the image of every collection of @p state at @p read_stamp into @p directory, reporting
- *  the bytes of the keys and values written to @p progress after each collection, whose
- *  cancellation removes the partial image. */
+ *  the bytes of the keys and values written to @p progress after each collection, removing the
+ *  partial image when the save fails or is cancelled. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t write_image(database_state<cpu_class_, isolation_>& state, generation_t read_stamp, char const* directory,
                      ustore_progress_callback_t progress = nullptr, void* progress_state = nullptr) noexcept {
@@ -1329,6 +1399,11 @@ status_t write_image(database_state<cpu_class_, isolation_>& state, generation_t
     progress_t reporter {progress, progress_state, total};
     stream_t stream {std::fopen(partial_path.c_str(), "wb")};
     if (!stream.get()) return {status_code_t::io_k, "Failed to open the image for writing"};
+    auto abandon = [&](status_t status) noexcept {
+        if (stream.get()) { [[maybe_unused]] bool const closed = stream.close(); }
+        [[maybe_unused]] int const removed = std::remove(partial_path.c_str());
+        return status;
+    };
 
     bool written = std::fwrite(image_signature_k, sizeof(image_signature_k), 1, stream.get()) == 1;
     for (std::size_t index = 0; index != listed.size() && written; ++index) {
@@ -1343,19 +1418,15 @@ status_t write_image(database_state<cpu_class_, isolation_>& state, generation_t
                 return write_entries(stream.get(), entries, read_stamp, bytes, written);
             },
             collection.store->entries);
-        if (st::failed(walked)) return translate(walked);
-        if (written && !reporter.advance(bytes)) {
-            [[maybe_unused]] bool const closed = stream.close();
-            [[maybe_unused]] int const removed = std::remove(partial_path.c_str());
-            return progress_cancelled_k;
-        }
+        if (st::failed(walked)) return abandon(translate(walked));
+        if (written && !reporter.advance(bytes)) return abandon(progress_cancelled_k);
     }
 
     bool const synced = written && std::fflush(stream.get()) == 0 && sync_file(stream.get());
     bool const closed = stream.close();
-    if (!synced || !closed) return {status_code_t::io_k, "Failed to write the image"};
+    if (!synced || !closed) return abandon({status_code_t::io_k, "Failed to write the image"});
     if (!replace_file(partial_path.c_str(), final_path.c_str()))
-        return {status_code_t::io_k, "Failed to replace the image"};
+        return abandon({status_code_t::io_k, "Failed to replace the image"});
     return {};
 }
 
@@ -1452,7 +1523,8 @@ status_t read_image(database_state<cpu_class_, isolation_>& state) noexcept {
     if (!join_path(path, state.directory.c_str(), image_name_k))
         return {status_code_t::out_of_memory_k, "Failed to build the image path"};
     stream_t stream {std::fopen(path.c_str(), "rb")};
-    if (!stream.get()) return {};
+    if (!stream.get())
+        return errno == ENOENT ? status_t {} : status_t {status_code_t::io_k, "Failed to open the image"};
     char signature[sizeof(image_signature_k)];
     if (std::fread(signature, sizeof(signature), 1, stream.get()) != 1 ||
         std::memcmp(signature, image_signature_k, sizeof(signature)) != 0)
@@ -1558,22 +1630,6 @@ std::size_t image_bytes(database_state<cpu_class_, isolation_> const& state) noe
 }
 
 #pragma endregion Lifetime
-
-#pragma region Argument Views
-
-/** The tasks of a scan of any modality. */
-template <typename arguments_type_>
-scan_batch_t scans_of(arguments_type_ const& arguments) noexcept {
-    return {strided(arguments.collections), strided(arguments.start_keys), arguments.wanted, arguments.count};
-}
-
-/** The tasks of a sample of any modality. */
-template <typename arguments_type_>
-sample_batch_t samples_of(arguments_type_ const& arguments) noexcept {
-    return {strided(arguments.collections), arguments.wanted, arguments.count};
-}
-
-#pragma endregion Argument Views
 
 #pragma region Calls of Every Modality
 
@@ -1692,8 +1748,7 @@ status_t sample_keys(database_state<cpu_class_, isolation_>& state, arguments_ty
     sample_batch_t const samples = samples_of(arguments);
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
-    auto const now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-    sample_generator_t generator {now ^ reinterpret_cast<std::uintptr_t>(&outputs)};
+    sample_generator_t generator = sample_generator_t::seeded(&outputs);
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
@@ -1726,7 +1781,6 @@ status_t sample_keys(database_state<cpu_class_, isolation_>& state, arguments_ty
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_describe_t const& arguments,
                view_t const&) noexcept {
-    if (!arguments.description) return {status_code_t::invalid_argument_k, "Need an output for the description"};
     claim_t claim;
     reader_source<cpu_class_, isolation_> source {state, state.order.take_snapshot(claim)};
     listed_collections<cpu_class_, isolation_> listed;
@@ -1737,29 +1791,27 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_de
     std::size_t keys = 0;
     for (std::size_t index = 0; index != listed.size(); ++index)
         std::visit([&](auto const& entries) noexcept { keys += entries.size(); }, listed[index].store->entries);
-    *arguments.description = {
-        .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k),
-        .engine = ustore_engine_ram_k,
-        .isolation = isolation_ == isolation_t::snapshot_k ? ustore_isolation_snapshot_k
-                                                           : ustore_isolation_strict_serializable_k,
-        .keys = keys,
-        .disk_bytes = image_bytes(state),
-    };
-    return {};
+    return assign_describe(
+        arguments,
+        {
+            .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k),
+            .engine = ustore_engine_ram_k,
+            .isolation = isolation_ == isolation_t::snapshot_k ? ustore_isolation_snapshot_k
+                                                               : ustore_isolation_strict_serializable_k,
+            .keys = keys,
+            .disk_bytes = image_bytes(state),
+        });
 }
 
 /** Implements @c ustore_database_clear, persisting a change of the names as a drop of one collection does. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_clear_t const& arguments,
                view_t const&) noexcept {
-    switch (arguments.mode) {
-    case ustore_drop_pairs_k: return clear_pairs(state);
-    case ustore_drop_values_k: return clear_values(state);
-    case ustore_drop_collection_k:
-        if (status_t const status = reset_database(state); status.failed()) return status;
-        return persist(state);
-    default: return {status_code_t::invalid_argument_k, "Unknown drop mode"};
-    }
+    if (status_t const status = validate_drop_mode(arguments.mode); status.failed()) return status;
+    if (arguments.mode == ustore_drop_pairs_k) return clear_pairs(state);
+    if (arguments.mode == ustore_drop_values_k) return clear_values(state);
+    if (status_t const status = reset_database(state); status.failed()) return status;
+    return persist(state);
 }
 
 /** Implements @c ustore_database_compact, reclaiming unreachable versions of every store, freeing
@@ -1800,14 +1852,13 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_snapshot_init_t const& arguments,
                view_t const&) noexcept {
     if (!arguments.snapshot) return {status_code_t::invalid_argument_k, "Need an output for the snapshot"};
-    std::unique_ptr<ustore_snapshot_handle_t> handle {new (std::nothrow) ustore_snapshot_handle_t {}};
-    auto* const snapshot = handle ? new (std::nothrow) snapshot_state<cpu_class_, isolation_>(state) : nullptr;
-    if (!snapshot) return {status_code_t::out_of_memory_k, "Failed to allocate the snapshot"};
-    handle->engine = &ram_variant<cpu_class_, isolation_>::engine_k, handle->state = snapshot;
-    state.order.take_snapshot(snapshot->claim);
-    atomic_ref_of<cpu_class_, std::size_t>(state.open_snapshots).fetch_add(1, std::memory_order_release);
-    if (arguments.read_stamp) *arguments.read_stamp = snapshot->claim.snapshot();
-    *arguments.snapshot = handle.release();
+    auto [made, status] = make_handle<ustore_snapshot_handle_t, snapshot_state<cpu_class_, isolation_>>(
+        ram_variant<cpu_class_, isolation_>::engine_k, state);
+    if (status.failed()) return status;
+    state.order.take_snapshot(made.state->claim);
+    count_snapshot_opened<cpu_class_>(state.open_snapshots);
+    if (arguments.read_stamp) *arguments.read_stamp = made.state->claim.snapshot();
+    *arguments.snapshot = made.release();
     return {};
 }
 
@@ -1853,9 +1904,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_create_t const& arguments,
                view_t const&) noexcept {
-    if (!arguments.collection) return {status_code_t::invalid_argument_k, "Need an output for the collection"};
-    std::string_view const name = string_of(arguments.name);
-    if (arguments.name.data && name.empty()) return {status_code_t::invalid_argument_k, "A name is never empty"};
+    auto [name, name_status] = validate_collection_create(arguments);
+    if (name_status.failed()) return name_status;
     auto [created, status] = mint_collection_id();
     if (status.failed()) return status;
 
@@ -1880,28 +1930,26 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_
                view_t const&) noexcept {
     ustore_collection_id_t const collection = arguments.collection;
     ustore_drop_mode_t const mode = arguments.mode;
+    if (status_t const status = validate_drop_mode(mode); status.failed()) return status;
+    if (mode == ustore_drop_collection_k &&
+        atomic_ref_of<cpu_class_, std::size_t>(state.open_snapshots).load(std::memory_order_acquire) != 0)
+        return {status_code_t::invalid_argument_k, "A drop waits until every snapshot is freed"};
     status_t outcome;
     store_status_t dropped = store_status_t::success_k;
-    switch (mode) {
-    case ustore_drop_collection_k:
+    if (mode == ustore_drop_collection_k)
         dropped = commit_collections_change(state, [&](transaction_source<cpu_class_, isolation_>& source,
                                                        collections_change<cpu_class_, isolation_>& change) noexcept {
             return stage_forget(source, change, collection);
         });
-        break;
-    case ustore_drop_pairs_k:
+    else if (mode == ustore_drop_pairs_k)
         dropped = commit_collections_change(state, [&](transaction_source<cpu_class_, isolation_>& source,
                                                        collections_change<cpu_class_, isolation_>& change) noexcept {
             return stage_emptied(source, change, collection);
         });
-        break;
-    case ustore_drop_values_k:
+    else
         dropped = commit_group(state, [&](transaction_source<cpu_class_, isolation_>& source) noexcept {
             return stage_values_emptied(source, collection, outcome);
         });
-        break;
-    default: return {status_code_t::invalid_argument_k, "Unknown drop mode"};
-    }
     if (dropped == store_status_t::key_not_found_k && outcome.succeeded())
         return {status_code_t::not_found_k, "No collection has such identifier"};
     if (status_t const status = reported(dropped, outcome); status.failed()) return status;
@@ -1914,9 +1962,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_find_t const& arguments,
                strings_arg_t const& names, view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!names || !arguments.collections)
-        return {status_code_t::invalid_argument_k, "Need the names and an output for the identifiers"};
-    auto [outputs, outputs_status] = collection_find_outputs_t::make(arguments);
+    auto [outputs, outputs_status] = validate_collection_find(arguments, names);
     if (outputs_status.failed()) return outputs_status;
 
     status_t const resolved = translate(with_source(state, view, [&](auto& source) noexcept -> store_status_t {
@@ -1970,13 +2016,10 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_transaction
     }
     auto opened = collections_transaction_of<cpu_class_, isolation_>::make(state.order);
     if (!opened) return translate(opened.status());
-    std::unique_ptr<ustore_transaction_handle_t> handle {new (std::nothrow) ustore_transaction_handle_t {}};
-    auto* const transaction = handle ? new (std::nothrow)
-                                           transaction_state<cpu_class_, isolation_>(state, std::move(*opened))
-                                     : nullptr;
-    if (!transaction) return {status_code_t::out_of_memory_k, "Failed to allocate the transaction"};
-    handle->engine = &ram_variant<cpu_class_, isolation_>::engine_k, handle->state = transaction;
-    *arguments.transaction = handle.release();
+    auto [made, status] = make_handle<ustore_transaction_handle_t, transaction_state<cpu_class_, isolation_>>(
+        ram_variant<cpu_class_, isolation_>::engine_k, state, std::move(*opened));
+    if (status.failed()) return status;
+    *arguments.transaction = made.release();
     return {};
 }
 
@@ -1991,8 +2034,9 @@ store_status_t stage_once(collections_transaction_of<cpu_class_, isolation_>& tr
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>&, ustore_transaction_stage_t const& arguments,
                view_t const& view) noexcept {
-    if (!view.transaction) return {status_code_t::uninitialized_k, "Transaction is uninitialized"};
-    auto& transaction = state_of<transaction_state<cpu_class_, isolation_>>(view.transaction)->transaction;
+    auto [state, status] = transaction_state_of<transaction_state<cpu_class_, isolation_>>(view.transaction);
+    if (status.failed()) return status;
+    auto& transaction = state->transaction;
     if (store_status_t const staged = stage_once<cpu_class_, isolation_>(transaction); st::failed(staged))
         return translate(staged);
     if (arguments.read_stamp) *arguments.read_stamp = transaction.snapshot();
@@ -2020,8 +2064,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_transaction
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>&, ustore_transaction_rollback_t const&,
                view_t const& view) noexcept {
-    if (!view.transaction) return {status_code_t::uninitialized_k, "Transaction is uninitialized"};
-    auto& transaction = state_of<transaction_state<cpu_class_, isolation_>>(view.transaction)->transaction;
+    auto [state, status] = transaction_state_of<transaction_state<cpu_class_, isolation_>>(view.transaction);
+    if (status.failed()) return status;
+    auto& transaction = state->transaction;
     if (transaction.staging() != staging_t::staged_k) return {};
     return translate(transaction.rollback());
 }
@@ -2054,7 +2099,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 void snapshot_free(ustore_snapshot_t handle) noexcept {
     auto* const snapshot = state_of<snapshot_state<cpu_class_, isolation_>>(handle);
     database_state<cpu_class_, isolation_>& state = snapshot->state;
-    atomic_ref_of<cpu_class_, std::size_t>(state.open_snapshots).fetch_sub(1, std::memory_order_release);
+    [[maybe_unused]] bool const last = count_snapshot_closed<cpu_class_>(state.open_snapshots);
     delete snapshot;
     free_unreachable(state);
 }
@@ -2069,13 +2114,11 @@ void database_free(ustore_database_t database) noexcept {
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t ram_variant<cpu_class_, isolation_>::open(ustore_database_t* database, std::string_view directory) noexcept {
-    std::unique_ptr<ustore_database_handle_t> handle {new (std::nothrow) ustore_database_handle_t {}};
-    std::unique_ptr<database_state<cpu_class_, isolation_>> state {
-        handle ? new (std::nothrow) database_state<cpu_class_, isolation_>() : nullptr};
-    if (!state) return {status_code_t::out_of_memory_k, "Failed to allocate the database"};
-    if (status_t const status = open_database(*state, directory); status.failed()) return status;
-    handle->engine = &ram_variant<cpu_class_, isolation_>::engine_k, handle->state = state.release();
-    *database = handle.release();
+    auto [made, status] = make_handle<ustore_database_handle_t, database_state<cpu_class_, isolation_>>(
+        ram_variant<cpu_class_, isolation_>::engine_k);
+    if (status.failed()) return status;
+    if (status_t const opened = open_database(*made.state, directory); opened.failed()) return opened;
+    *database = made.release();
     return {};
 }
 

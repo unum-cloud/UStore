@@ -7,15 +7,16 @@ Every binary echoes its flags, then prints its progress and one line per row to 
 
 ## The Suite
 
-| Source                               | What it measures                                                    |
-| :----------------------------------- | :------------------------------------------------------------------ |
-| `twitter.cpp`                        | Building documents and a graph from tweets, then sampling them      |
-| `tabular_graph.cpp`                  | NDJSON or CSV imported as documents and a graph, then exported back |
-| `louvain.cpp`                        | Louvain communities over a graph collection and over memory         |
-| `docs_paths.cpp`                     | Document fields located by yyjson against StringZilla subdocuments  |
-| `nvme_single_collection_database.cu` | Inserts, lookups, scans and deletions, per value width              |
+| Source                                | What it measures                                                    |
+| :------------------------------------ | :------------------------------------------------------------------ |
+| `twitter.cpp`                         | Building documents and a graph from tweets, then sampling them      |
+| `tabular_graph.cpp`                   | NDJSON or CSV imported as documents and a graph, then exported back |
+| `louvain.cpp`                         | Louvain communities over a graph collection and over memory         |
+| `docs_paths.cpp`                      | Document fields located by yyjson against StringZilla subdocuments  |
+| `nvme_single_collection_database.cpp` | Inserts, finds, selects, scans and removals, per value layout       |
 
 The Twitter benchmark samples keys, parsed objects, one field, a four-column table and two-hop traversals.
+It also stores every tweet's body as a plain value, then reads those one key at a time and walks them in pages.
 `mixed.hpp` holds the transactional batch upserts of documents and graph edges that the Twitter benchmark issues.
 `harness.hpp` holds the timed loop, the latency histograms, the result rows and the flags every benchmark shares.
 The three engine benchmarks compile once each, as `ustore_bench_twitter`, `ustore_bench_tabular_graph` and `ustore_bench_louvain`, and open the engine their `--engine` names.
@@ -49,6 +50,7 @@ It echoes every flag as `- Name: value` before its rows, and a value that does n
 | `--engine`                            | `ram`                 | Engine to open: `ram`, `rocksdb`, `leveldb`, `nvme` |
 | `--isolation`                         | `strict-serializable` | Isolation of `ram` transactions, or `snapshot`      |
 | `--engine-transport`                  | `automatic`           | Transport of `nvme`, like `linux-uring`             |
+| `--directories`                       | None                  | Data directories `nvme` and `rocksdb` fill          |
 | `--directory`                         | Required              | Database directory; Louvain runs in memory without  |
 | `--dataset`                           | Generated             | Tweet dumps, input files or a SNAP edge list        |
 | `--threads`                           | Half the cores        | Threads per row; `1` for tables, one for Louvain    |
@@ -107,9 +109,21 @@ The imports divide the listed files into one contiguous share per thread, so `--
 
 ### NVMe Components
 
-`nvme_single_collection_database.cu` reads its workloads from `nvme_single_collection_database.json`, and writes its databases and its log under the required `--directory`, its only flag.
-No CMake target builds it yet.
-Each entry names one value width from 1 byte upward, switches on with `enabled`, and sizes the population, the cache, the memory runs and the LSM levels.
+`nvme_single_collection_database.cpp` opens no engine: it drives NVMe's single-collection database over volumes of its own, and builds as `ustore_bench_nvme_single_collection_database` when `USTORE_WITH_NVME` is on.
+It reads its workloads from a manifest like `nvme_single_collection_database.json`, whose every entry names one value layout — `12_bytes`, `44_bytes`, `fixed_width` or `variable_width` — switches on with `enabled`, and sizes the threads, the population, the cache, the memory runs and the LSM levels.
+Every enabled workload opens one database over a fresh volume under `--directory`, fills it in one pass, samples finds, single and batched selects and a scan, removes every key, and deletes the volume.
+
+| Flag            | Default     | Meaning                                                     |
+| :-------------- | :---------- | :---------------------------------------------------------- |
+| `--directory`   | Required    | Directory every workload's volume is created in             |
+| `--workloads`   | Required    | JSON manifest of the workloads                              |
+| `--transport`   | `automatic` | How the volumes are reached, or `memory` to skip the drives |
+| `--volume-size` | `4GB`       | Bytes every workload's volume spans                         |
+
+```sh
+build_release/build/bin/ustore_bench_nvme_single_collection_database \
+    --workloads bench/nvme_single_collection_database.json --directory /mnt/nvme/ustore-scdb
+```
 
 ### Louvain
 
@@ -129,6 +143,61 @@ build_release/build/bin/ustore_bench_louvain --engine ram --vertices 4096 --comm
 python bench/louvain.py --dataset data/snap-email/email-Eu-core.txt
 python bench/louvain.py --vertices 4096 --communities 16
 ```
+
+## Unit Economics
+
+Each scale gets two tables on one machine, a row per engine: the measured rates, then what they cost at each price.
+Prices are inputs, the rates come from the binaries above, and every dollar cell follows from the two.
+
+### Price Inputs
+
+The machine is an AWS `i8g.metal-24xl` in `us-west-2`: Graviton4, 96 cores, 768 GiB and six 3.75 TB NVMe drives.
+
+- __On-demand:__ $8.2368 per hour.
+- __1-year savings:__ $5.3405 per hour, an EC2 Instance Savings Plan with no upfront payment; a Compute Savings Plan costs $6.4078.
+- __Spot:__ $2.31 per hour in `us-west-2a`.
+
+With a price of p dollars per hour and a rate of r items or B bytes per second, both at 96 threads:
+
+- __Lookups:__ $/1M lookups = p · 10⁶ / (3600 · r).
+- __Writes:__ $/1B writes = p · 10⁹ / (3600 · r), once per durability.
+- __Scans:__ $/TB scanned = p · 10¹² / (3600 · B), where B is the printed MB/s times 2²⁰, as rows print binary units.
+
+### Workload Sources
+
+Every column comes from one row of `ustore_bench_twitter` at `--threads 96`, and the lookups again at `--threads 1` with `--filter '^(construct_blobs|blobs_read)'`.
+
+- __Lookups/s:__ `blobs_read/1`, one key's raw body per call.
+- __Writes/s buffered:__ `construct_docs/<batch>`, transactional upserts whose commits stay buffered.
+- __Writes/s flushed:__ `construct_docs_flushed/<batch>`, the same upserts committed with `ustore_durability_flushed_k` into a collection of their own.
+- __Scan MB/s:__ `blobs_scan/<batch>`, pages of `<batch>` keys with their values pulled through a cursor from a sampled key.
+- __Engines:__ `--engine ram`, `nvme`, `rocksdb` or `leveldb`, the NVMe one built with `USTORE_WITH_NVME=1` and given one mounted directory per drive through `--directories`.
+
+### Generated Tweets
+
+These tables measure the 1,000,000 tweets `ustore_bench_twitter` generates without a dataset.
+
+| Engine      | Machine        | Lookups/s at 1 | Lookups/s at 96 | Writes/s buffered | Writes/s flushed | Scan MB/s |
+| :---------- | :------------- | -------------: | --------------: | ----------------: | ---------------: | --------: |
+| UStore RAM  | i8g.metal-24xl |              … |               … |                 … |                … |         … |
+| UStore NVMe | i8g.metal-24xl |              … |               … |                 … |                … |         … |
+| RocksDB     | i8g.metal-24xl |              … |               … |                 … |                … |         … |
+| LevelDB     | i8g.metal-24xl |              … |               … |                 … |                … |         … |
+
+| Engine      | Pricing        |    $/h | $/1M lookups | $/1B buffered writes | $/1B flushed writes | $/TB scanned |
+| :---------- | :------------- | -----: | -----------: | -------------------: | ------------------: | -----------: |
+| UStore RAM  | On-demand      | 8.2368 |            … |                    … |                   … |            … |
+| UStore RAM  | 1-year savings | 5.3405 |            … |                    … |                   … |            … |
+| UStore RAM  | Spot           |   2.31 |            … |                    … |                   … |            … |
+| UStore NVMe | On-demand      | 8.2368 |            … |                    … |                   … |            … |
+| UStore NVMe | 1-year savings | 5.3405 |            … |                    … |                   … |            … |
+| UStore NVMe | Spot           |   2.31 |            … |                    … |                   … |            … |
+| RocksDB     | On-demand      | 8.2368 |            … |                    … |                   … |            … |
+| RocksDB     | 1-year savings | 5.3405 |            … |                    … |                   … |            … |
+| RocksDB     | Spot           |   2.31 |            … |                    … |                   … |            … |
+| LevelDB     | On-demand      | 8.2368 |            … |                    … |                   … |            … |
+| LevelDB     | 1-year savings | 5.3405 |            … |                    … |                   … |            … |
+| LevelDB     | Spot           |   2.31 |            … |                    … |                   … |            … |
 
 ## Datasets
 

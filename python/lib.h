@@ -97,9 +97,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include <stdarg.h> // `va_list`
 #include <stddef.h> // `size_t`
-#include <stdint.h> // `int64_t`
 
 #include <yyjson.h> // `yyjson_val`, `yyjson_mut_doc`
 
@@ -825,14 +823,14 @@ int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObj
 /**
  *  @brief Walks the keywords of a verb that takes none of its own.
  *  @param[in] context The database and view the verb runs against.
- *  @param[in] args The fast-call arguments, positional ones first.
- *  @param[in] positional_args_count Positional arguments the call carried.
- *  @param[in] args_names_tuple The keyword names, or NULL when none followed.
+ *  @param[in] arguments The fast-call arguments, positional ones first.
+ *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[out] options Where every recognized keyword lands.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyObject* const* args,
-                                         Py_ssize_t positional_args_count, PyObject* args_names_tuple,
+int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyObject* const* arguments,
+                                         Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
                                          ustore_py_verb_options_t* options);
 
 #pragma endregion Verb Options
@@ -1091,27 +1089,27 @@ int ustore_py_size_from_object(PyObject* object, char const* field, size_t* valu
 /**
  *  @brief Reads the one optional argument of a verb, given after its required ones by position or as @p keyword.
  *  @param[in] verb The method's name, as a failure should read it.
- *  @param[in] positional_args_count Positional arguments the call carried.
- *  @param[in] args_names_tuple The keyword names, or NULL when none followed.
+ *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[in] required_positional Positional arguments the verb fixes before the optional one.
  *  @param[in] keyword The name the optional argument goes by.
  *  @param[out] argument The argument, left untouched when the call carried none.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-int ustore_py_optional_argument(char const* verb, PyObject* const* args, Py_ssize_t positional_args_count,
-                                PyObject* args_names_tuple, Py_ssize_t required_positional, char const* keyword,
+int ustore_py_optional_argument(char const* verb, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                PyObject* keyword_names_tuple, Py_ssize_t required_positional, char const* keyword,
                                 PyObject** argument);
 
 /**
  *  @brief Checks a fast-call's shape and reports how many keywords followed.
  *  @param[in] verb The method's name, as a failure should read it.
- *  @param[in] positional_args_count Positional arguments the call carried.
- *  @param[in] args_names_tuple The keyword names, or NULL when none followed.
+ *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[in] required_positional Positional arguments the verb fixes.
  *  @return The keyword count, or -1 with an exception set when the shape is wrong.
  */
-Py_ssize_t ustore_py_args_names_count_checked(char const* verb, Py_ssize_t positional_args_count,
-                                              PyObject* args_names_tuple, Py_ssize_t required_positional);
+Py_ssize_t ustore_py_keyword_names_count_checked(char const* verb, Py_ssize_t positional_arguments_count,
+                                                 PyObject* keyword_names_tuple, Py_ssize_t required_positional);
 
 #pragma endregion Shared Helpers
 
@@ -1323,8 +1321,8 @@ PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb
 
 /** Parses the arguments of one scan, as @c scan takes them, and runs it through the scan of @p modality: the body of
  *  @c scan, @c docs_scan, @c pages_scan and @c graph_scan_vertices, whose name @p name spells. */
-PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                PyObject* args_names_tuple, char const* name, ustore_modality_t modality);
+PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality);
 
 /**
  *  @brief Draws up to @p wanted keys at random through the sample of @p modality: the core of `sample`,
@@ -1337,8 +1335,8 @@ PyObject* ustore_py_keys_sample(ustore_py_context_t const* context, ustore_py_ve
 
 /** Parses the arguments of one sample, as `sample` takes them, and runs it through the sample of @p modality: the
  *  body of `sample` and `docs_sample`, whose name @p name spells. */
-PyObject* ustore_py_api_sample_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple, char const* name, ustore_modality_t modality);
+PyObject* ustore_py_api_sample_of(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality);
 
 /** How a write takes its documents. */
 typedef enum ustore_py_documents_spelling_t {
@@ -1444,88 +1442,88 @@ extern char const doc_pages_cursor[];
 extern char const doc_import_arrow[];
 extern char const doc_ingest_arrow[];
 
-PyObject* ustore_py_api_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                             PyObject* args_names_tuple);
-PyObject* ustore_py_api_write(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                              PyObject* args_names_tuple);
-PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                             PyObject* args_names_tuple);
-PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple);
-PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                               PyObject* args_names_tuple);
-PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple);
-PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                PyObject* args_names_tuple);
-PyObject* ustore_py_api_docs_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                              PyObject* args_names_tuple);
-PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                               PyObject* args_names_tuple);
-PyObject* ustore_py_api_get(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                            PyObject* args_names_tuple);
-PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                            PyObject* args_names_tuple);
-PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                               PyObject* args_names_tuple);
-PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                 PyObject* args_names_tuple);
-PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple);
-PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple);
-PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple);
-PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple);
-PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple);
-PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                  PyObject* args_names_tuple);
-PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                    PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                         PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                      PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                       PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_write_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                          PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_remove_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                           PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                             PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                              PyObject* args_names_tuple);
-PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                            PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_import(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_move(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_splice(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_set_attributes(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                             PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_remove_attributes(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                                PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                   PyObject* args_names_tuple);
-PyObject* ustore_py_api_pages_cursor(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple);
-PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple);
-PyObject* ustore_py_api_ingest_arrow(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                     PyObject* args_names_tuple);
+PyObject* ustore_py_api_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                             PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_write(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                              PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                             PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                               PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_cursor(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* arguments,
+                                              Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                               PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_get(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                            PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_set(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                            PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                               PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                 PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                    PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* arguments,
+                                         Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                      PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* arguments,
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_write_edges(PyObject* self, PyObject* const* arguments,
+                                          Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_remove_edges(PyObject* self, PyObject* const* arguments,
+                                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* arguments,
+                                             Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* arguments,
+                                              Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* arguments,
+                                            Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_import(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_move(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_splice(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_set_attributes(PyObject* self, PyObject* const* arguments,
+                                             Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_remove_attributes(PyObject* self, PyObject* const* arguments,
+                                                Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_cursor(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_ingest_arrow(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
 
 /**
  *  @brief Exports @p collection through what @p context reads as an @c arrow_array_stream capsule, whose destructor

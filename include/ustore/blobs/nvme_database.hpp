@@ -2,761 +2,73 @@
  *  @file include/ustore/blobs/nvme_database.hpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief Databases of named collections, with their snapshots, their optimistic transactions, and the registries
- *      and read sets that order and check those transactions.
+ *  @brief Databases of named collections, with their snapshots and their optimistic transactions
+ *      over the registry, read sets and transaction core of @c nvme_transactions.hpp.
  *
- *  A database is a list of collections and nothing else: it resolves a name to a collection, hands that collection
- *  a channel, and persists the list as one named schema blob of a volume so a reopen finds the same names.
- *  Every byte of data belongs to the collection below it, and every conflict belongs to the registry
- *  beside it; what is left is placement, naming and the order the two are changed in. One claim guards every
- *  call that changes the collections, a tree or a blob, since flushes, compactions and schema saves are serialized by
- *  it; commits land through the ledger's sequencer and take it only to pay for the maintenance they made due. A read
- *  takes no claim: a collection publishes immutable views a reader walks inside its ledger's epochs, the entries are
- *  pinned on the heap, and the list of collections is one more immutable view published the same way and freed by
- *  whoever replaces it, once its readers left.
+ *  A database is a list of collections and nothing else: it resolves a name to a collection, hands
+ *  that collection a channel, and persists the list as one named schema blob of a volume so a
+ *  reopen finds the same names. Every byte of data belongs to the collection below it, and every
+ *  conflict belongs to the registry beside it; what is left is placement, naming and the order the
+ *  two are changed in. One claim guards every call that changes the collections, a tree or a blob,
+ *  since flushes, compactions and schema saves are serialized by it; commits land through the
+ *  ledger's sequencer and take it only to pay for the maintenance they made due. A read takes no
+ *  claim: a collection publishes immutable views a reader walks inside its ledger's epochs, the
+ *  entries are pinned on the heap, and the list of collections is one more immutable view published
+ *  the same way and freed by whoever replaces it, once its readers left.
  *
- *  A snapshot copies no run and moves no byte: it pins the stamp the ledger last published, which every merge
- *  keeps the versions of, and reads through whatever view each collection publishes. Every commit ordered at or
- *  before that stamp is inside the snapshot and every later one is not.
- *
- *  Transactions are optimistic. Writes go to deltas of the transaction's own and reach the collections
- *  only at the commit, so a rollback costs nothing and a failed stage leaves the changes where a caller can still
- *  log them. A transaction pins the stamp the ledger last published, and every watch is scoped from that stamp or
- *  later, never from one a commit drew before landing it. There is no table of conflicts: every write lands in a
- *  collection under its commit's stamp, so a stage asks each collection whether a commit newer than the watch
- *  wrote the key, and the collection answers from its memory runs and from the runs that carry the key. A written
- *  key's watch lives beside its write, @c read_set holds the keys read or tracked, and the one exclusion is the
- *  ledger's leader word, which a staged transaction holds from @c stage until @c commit. Every collection a commit
- *  writes is sealed into a memory run before its stamp is drawn, so a commit lands whole or not at all.
+ *  A snapshot copies no run and moves no byte: it pins the stamp the ledger last published, which
+ *  every merge keeps the versions of, and reads through whatever view each collection publishes.
+ *  Every commit ordered at or before that stamp is inside the snapshot and every later one is not.
+ *  A transaction's writes reach the collections only at the commit, which the registry lands whole
+ *  or not at all.
  */
 
 #pragma once
 
-#include <cassert> // `assert`
-#include <cstddef> // `std::byte`, `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::int32_t`, `std::uint16_t`, `std::uint64_t`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm>   // `std::copy`, `std::min`, `std::sort`, `std::binary_search`
+#include <algorithm>   // `std::copy`, `std::sort`, `std::binary_search`
 #include <array>       // `std::array`
-#include <atomic>      // `std::atomic_thread_fence`, `std::memory_order`
-#include <concepts>    // `std::same_as`
-#include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
-#include <new>         // `std::nothrow`, placement `new`
+#include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <type_traits> // `std::integral_constant`, `std::remove_reference_t`
-#include <utility>     // `std::exchange`, `std::forward`, `std::index_sequence_for`, `std::move`, `std::swap`
+#include <utility>     // `std::exchange`, `std::forward`, `std::index_sequence_for`, `std::move`
 #include <variant>     // `std::variant`, `std::variant_alternative_t`, `std::visit`, `std::get_if`
 
-#include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
-#include <smashtable/basic_vector.hpp>     // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_store.hpp"              // `nvme_store`, `nvme_store_cursor`, `keyed_delta`
-#include "ustore/blobs/nvme_key_slot.hpp"           // `key_slot`, `stored_value_size_t`, `collection_id_t`
-#include "ustore/blobs/nvme_transaction_deltas.hpp" // `transaction_deltas`
-#include "ustore/blobs/nvme_tree.hpp"               // `lsm_tree_run_record_t`, `database_config_t`
-#include "ustore/utilities/nvme_channels.hpp"       // `io_channel_t`, `basic_io_channel_pool`, `pooled_buffer_t`
-#include "ustore/utilities/nvme_ring.hpp"           // `extent_t`, `uuid_t`, `constrained_allocator`
-#include "ustore/utilities/nvme_volume.hpp"         // `basic_volume_router`, `resources_shared_ptr`
-#include "ustore/utilities/types.hpp"               // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/blobs/nvme_key_slot.hpp"       // `stored_value_size_t`, `collection_id_t`
+#include "ustore/blobs/nvme_published_runs.hpp" // `pinned_snapshot`, `maintenance_claim`, `commit_ledger`
+#include "ustore/blobs/nvme_store.hpp"          // `nvme_store_cursor`, `keyed_delta`
+#include "ustore/blobs/nvme_transactions.hpp"   // `transaction_registry`, `transaction_core`, `nvme_store_concept`
+#include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree_run_record_t`, `database_config_t`
+#include "ustore/utilities/nvme_catalog.hpp"    // `schema_copies`, `blob_kind_t`, `blob_name_t`, `blob_name_of`
+#include "ustore/utilities/nvme_channels.hpp"   // `io_channel_t`, `basic_io_channel_pool`
+#include "ustore/utilities/nvme_mounts.hpp"     // `resources_shared_ptr`
+#include "ustore/utilities/nvme_ring.hpp"       // `portable_alignment_k`
+#include "ustore/utilities/nvme_volume.hpp"     // `basic_volume_router`, `volume_blob_t`, `volume_id_t`
+#include "ustore/utilities/ram_buffers.hpp"     // `constrained_allocator`
+#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_t`, `bytes_span_t`, `save_fields`, `load_fields`
 
 namespace unum::ustore::blobs {
 
 using utilities::basic_io_channel_pool;
 using utilities::basic_volume_router;
+using utilities::blob_name_of;
+using utilities::schema_copies;
+using utilities::schema_copy_of;
+using utilities::schema_stamps_t;
 using utilities::volume_id_t;
-
-#pragma region Read Set
-
-#pragma region Watches
-
-/** When a transaction checks its watched keys for conflicts. */
-enum class watch_schedule_t : std::uint8_t {
-
-    /** Ignores key collisions. */
-    never_k,
-
-    /** Checks in place, at the moment of the call. */
-    now_k,
-
-    /** Checks between the transaction start and its commit. */
-    on_commit_k,
-
-    /** Checks between the operation and the commit. */
-    on_commit_since_operation_k,
-
-    /** Schedule used when none is specified. */
-    default_k = on_commit_k,
-};
-
-/** Why a transaction watches a key it did not write, which a second watch of the same key widens; a written key's
- *  watch lives beside its write instead. */
-enum class watch_purpose_t : std::uint8_t {
-
-    /** The transaction read the key. */
-    read_k = 0x01,
-
-    /** The transaction tracks the key without reading or writing it. */
-    track_k = 0x04,
-
-    /** Every purpose, which a count with no filter asks for. */
-    all_k = read_k | track_k,
-};
-
-/** The purposes of either watch. */
-constexpr watch_purpose_t operator|(watch_purpose_t first, watch_purpose_t second) noexcept {
-    return static_cast<watch_purpose_t>(static_cast<std::uint8_t>(first) | static_cast<std::uint8_t>(second));
-}
-
-/** The purposes both watches share. */
-constexpr watch_purpose_t operator&(watch_purpose_t first, watch_purpose_t second) noexcept {
-    return static_cast<watch_purpose_t>(static_cast<std::uint8_t>(first) & static_cast<std::uint8_t>(second));
-}
-
-/**
- *  @brief The keys one transaction reads or tracks, each with the stamp it was first watched from and why.
- *
- *  Watching the same key twice keeps the earlier stamp and widens the purpose.
- */
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
-class read_set {
-  public:
-    using stored_key_t = stored_key_;
-
-    /** From which stamp a key was watched, and why. */
-    struct watch_t {
-
-        /** The earliest stamp any watch of this key was scoped from. */
-        transaction_stamp_t watch_stamp;
-
-        /** Every purpose the watches of this key were taken for. */
-        watch_purpose_t purpose;
-    };
-
-    using stored_keys_t = st::hash_map<stored_key_t, watch_t, stored_key_hash_t, st::equal_to_t,
-                                       constrained_allocator<std::byte, atomic_reference_>>;
-
-    /** A set charging @p resources for the keys it holds. */
-    explicit read_set(resources_shared_ptr<atomic_reference_, waiter_type_> const& resources) noexcept
-        : stored_keys({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}) {}
-
-    /** Whether the transaction watches nothing. */
-    bool empty() const noexcept { return stored_keys.empty(); }
-
-    /** The watched keys taken for every purpose in @p purpose. */
-    std::size_t count(watch_purpose_t purpose = watch_purpose_t::all_k) const noexcept {
-        if (purpose == watch_purpose_t::all_k) return stored_keys.size();
-        std::size_t matching = 0;
-        [[maybe_unused]] st::status_t const walked = stored_keys.for_each(
-            [&](auto const& entry) noexcept { matching += (entry.value().purpose & purpose) == purpose; });
-        return matching;
-    }
-
-    /** Makes room for @p count more keys, so a following @c add takes no allocation. */
-    status_t reserve_more(std::size_t count) noexcept {
-        if (stored_keys.reserve_more(count) == stored_keys_t::reserve_result_t::failed_k)
-            return {status_code_t::out_of_memory_k, "No room for the keys a transaction watches"};
-        return {};
-    }
-
-    /**
-     *  @brief Watches @p stored_key from @p watch_stamp for @p purpose, in room @c reserve_more took.
-     *  @param[in] stored_key The key the transaction watches.
-     *  @param[in] watch_stamp The stamp this watch is scoped from, which only lowers a key's stamp.
-     *  @param[in] purpose Why this watch was taken, which only widens a key's purpose.
-     */
-    void add(stored_key_t stored_key, transaction_stamp_t watch_stamp, watch_purpose_t purpose,
-             st::assume_reserved_t) noexcept {
-        auto insert = [&](auto& unused_slot) noexcept {
-            new (&unused_slot.key_ref()) stored_key_t {stored_key};
-            new (&unused_slot.value_ref()) watch_t {watch_stamp, purpose};
-        };
-        auto update = [&](auto& equal_slot) noexcept {
-            watch_t& watch = equal_slot.value_ref();
-            watch.watch_stamp = std::min(watch_stamp, watch.watch_stamp);
-            watch.purpose = watch.purpose | purpose;
-        };
-        [[maybe_unused]] auto const stored = stored_keys.probe_to_upsert(stored_key, insert, update,
-                                                                         st::assume_reserved);
-    }
-
-    /** Drops every watch, for a transaction starting over. */
-    void clear() noexcept { stored_keys.clear(); }
-
-    /** The watched keys, charged to the budget the set was made with. */
-    stored_keys_t stored_keys;
-};
-
-#pragma endregion Watches
-
-#pragma endregion Read Set
-
-#pragma region Database Transaction State
-
-#pragma region Grouped Read Set
-
-/** The keys one transaction watches, kept apart per collection so two collections never collide. */
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
-class grouped_read_set {
-  public:
-    using stored_key_t = stored_key_;
-    using read_set_t = read_set<stored_key_t, atomic_reference_, waiter_type_>;
-    using groups_t = st::hash_map<collection_id_t, read_set_t, collection_id_hash_t, st::equal_to_t,
-                                  constrained_allocator<std::byte, atomic_reference_>>;
-
-    /** A set charging @p resources for the keys of every collection it watches. */
-    explicit grouped_read_set(resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : resources(resources),
-          groups({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}) {}
-
-    /** Whether the transaction watches nothing anywhere. */
-    bool empty() const noexcept { return count() == 0; }
-
-    /** The watched keys of every collection taken for every purpose in @p purpose. */
-    std::size_t count(watch_purpose_t purpose = watch_purpose_t::all_k) const noexcept {
-        std::size_t matching = 0;
-        [[maybe_unused]] st::status_t const walked = groups.for_each(
-            [&](auto const& entry) noexcept { matching += entry.value().count(purpose); });
-        return matching;
-    }
-
-    /** The watched keys of @p id taken for every purpose in @p purpose. */
-    std::size_t count(collection_id_t id, watch_purpose_t purpose = watch_purpose_t::all_k) const noexcept {
-        auto iterator = groups.find(id);
-        return iterator == groups.end() ? 0 : iterator.value().count(purpose);
-    }
-
-    /** Makes room for @p count more keys of @p id, so a following @c add takes no allocation. */
-    status_t reserve_more(collection_id_t id, std::size_t count) noexcept {
-        auto iterator = groups.find(id);
-        if (iterator == groups.end()) {
-            if (groups.reserve_more(1) == groups_t::reserve_result_t::failed_k)
-                return {status_code_t::out_of_memory_k, "No room for another watched collection"};
-            groups.emplace(id, read_set_t {resources}, st::assume_reserved);
-            iterator = groups.find(id);
-            if (iterator == groups.end())
-                return {status_code_t::out_of_memory_k, "No room for another watched collection"};
-        }
-        return iterator.value_ref().reserve_more(count);
-    }
-
-    /** Watches @p stored_key of @p id from @p watch_stamp, in room @c reserve_more took. */
-    void add(collection_id_t id, stored_key_t stored_key, transaction_stamp_t watch_stamp, watch_purpose_t purpose,
-             st::assume_reserved_t) noexcept {
-        auto iterator = groups.find(id);
-        if (iterator == groups.end()) return;
-        iterator.value_ref().add(stored_key, watch_stamp, purpose, st::assume_reserved);
-    }
-
-    /** Drops every watch of every collection, for a transaction starting over. */
-    void clear() noexcept { groups.clear(); }
-
-    /** The budget every watched collection's keys are charged to. */
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources;
-
-    /** One watched-key set per collection the transaction touched. */
-    groups_t groups;
-};
-
-#pragma endregion Grouped Read Set
-
-#pragma region Transaction State
-
-/**
- *  @brief What one transaction writes and watches in collections whose store keys them otherwise than the database,
- *      kept by that store's own code and joined to the transaction, which lands it with its own writes.
- *
- *  Its owner seals it on the committing thread before the transaction stages or commits. The thread holding the
- *  ledger's leader word then prepares it beside the transaction's own collections, and publishes it under the drawn
- *  stamp, or forgets what it prepared for a commit it refuses and for a stage let go.
- */
-struct transaction_share_t {
-
-    /** The share joined before this one, or null. */
-    transaction_share_t* next = nullptr;
-
-    /** What every step is handed, owned by whoever joined the share. */
-    void* context = nullptr;
-
-    /** Refuses the commit with @c write_conflict_k for a watch a commit since violated, or lays out every view the
-     *  share publishes, leaving none laid out when it refuses. */
-    status_t (*prepare)(void* context) noexcept = nullptr;
-
-    /** Publishes what @c prepare laid out under @p stamp. */
-    void (*publish)(void* context, transaction_stamp_t stamp) noexcept = nullptr;
-
-    /** Drops what @c prepare laid out. */
-    void (*forget)(void* context) noexcept = nullptr;
-};
-
-/** Everything one database transaction carries between its start and its commit. */
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
-struct database_transaction_state {
-    using stored_key_t = stored_key_;
-    using transaction_deltas_t = transaction_deltas<stored_key_t, atomic_reference_, waiter_type_>;
-    using read_set_t = grouped_read_set<stored_key_t, atomic_reference_, waiter_type_>;
-
-    /** One range of keys a transaction walked, which any commit landing inside it since @c watch_stamp conflicts
-     *  with, the keys it never found included. */
-    struct range_watch_t {
-        collection_id_t collection = collection_invalid_id_k;
-        stored_key_t lower = stored_key_t {};
-        stored_key_t upper = stored_key_t {};
-        transaction_stamp_t watch_stamp = invalid_transaction_stamp_k;
-    };
-
-    /** The ranges a transaction walked, in the order it walked them. */
-    using range_watches_t = st::basic_vector<range_watch_t, constrained_allocator<range_watch_t, atomic_reference_>>;
-
-    /** One written collection's deltas, sealed by the committer and landed by the leader. */
-    struct sealed_collection_t {
-
-        /** The collection written, which the leader looks up again. */
-        collection_id_t id = collection_invalid_id_k;
-
-        /** Its deltas and the run they become. */
-        sealed_commit<stored_key_t, atomic_reference_> commit;
-    };
-
-    /** Every written collection's sealed deltas, between a stage or a commit and its landing. */
-    using sealed_collections_t =
-        st::basic_vector<sealed_collection_t, constrained_allocator<sealed_collection_t, atomic_reference_>>;
-
-    inline database_transaction_state(transaction_deltas_t&& written,
-                                      resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : deltas(std::move(written)), read_set(resources),
-          ranges(constrained_allocator<range_watch_t, atomic_reference_> {resources->memory_constraint}),
-          sealed(constrained_allocator<sealed_collection_t, atomic_reference_> {resources->memory_constraint}) {}
-
-    /** Whether the transaction has neither written nor watched anything. */
-    inline bool empty() const noexcept { return deltas.empty() && read_set.empty() && ranges.empty(); }
-
-    /** Drops both the writes and the watches, for a rollback or a renewal. */
-    inline void clear() noexcept {
-        deltas.clear();
-        read_set.clear();
-        ranges.clear();
-        sealed.clear();
-    }
-
-    /** The deltas the transaction has not committed yet, filed under the collection each belongs to. */
-    transaction_deltas_t deltas;
-
-    /** The keys the transaction watches for conflicts. */
-    read_set_t read_set;
-
-    /** The ranges the transaction watches for conflicts, phantoms included. */
-    range_watches_t ranges;
-
-    /** The writes sealed per collection, filled by a stage or a commit and emptied once it lands or is refused. */
-    sealed_collections_t sealed;
-
-    /** The shares joined to the transaction, newest first, which outlive it and which nothing clears. */
-    transaction_share_t* shares = nullptr;
-};
-
-#pragma endregion Transaction State
-
-#pragma endregion Database Transaction State
-
-#pragma region Database Transaction Registry
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-class database_transaction;
-
-#pragma region Store Interface
-
-/**
- *  @brief What a registry needs from the store beneath it to stage and to commit.
- *
- *  A committer seals each written collection on its own thread, making room first when the collection's memory runs
- *  are past their bounds. The thread holding the ledger's leader word then prepares each one, publishes it under the
- *  drawn stamp, or forgets what it prepared for a commit it refuses. Once its commit lands, the committer maintains
- *  every collection it wrote. The conflict checks read published views. The
- *  read accessors a transaction reaches the store through forward from members that instantiate when a caller uses
- *  them, so a store serving reads of one shape alone still satisfies this.
- */
-template <typename store_type_, typename stored_key_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-concept transaction_store_concept = requires(
-    store_type_& store, collection_id_t collection_id, stored_key_type_ stored_key,
-    transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_> const& deltas,
-    sealed_commit<stored_key_type_, atomic_reference_>& sealed, transaction_stamp_t stamp) {
-    { store.ledger() } -> std::same_as<commit_ledger<atomic_reference_, waiter_type_>&>;
-    { store.written_since(collection_id, stored_key, stamp) } -> std::same_as<bool>;
-    { store.range_written_since(collection_id, stored_key, stored_key, stamp) } -> std::same_as<bool>;
-    { store.seal_collection(collection_id, deltas, sealed) } -> std::same_as<status_t>;
-    { store.prepare_collection(collection_id, sealed) } -> std::same_as<status_t>;
-    { store.publish_collection(collection_id, sealed, stamp) } -> std::same_as<void>;
-    { store.forget_collection(collection_id) } -> std::same_as<void>;
-    { store.maintain(collection_id) } -> std::same_as<status_t>;
-};
-
-#pragma endregion Store Interface
-
-/**
- *  @brief The transactions of one database, the stamps they commit under and the conflicts that stop them.
- *  @tparam stored_key_ The key every collection of the store is addressed by.
- *  @tparam store_type_ The store the commits land in, which must satisfy @c transaction_store_concept.
- *
- *  Nothing here is shared state of its own: the stamps come from the store's ledger, and a conflict is a key
- *  the store says was written since the watch, read from the memory runs and the runs that carry the key.
- */
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-class database_transaction_registry {
-  public:
-#pragma region Types
-
-    using stored_key_t = stored_key_;
-    using store_t = store_type_;
-    using transaction_t = database_transaction<stored_key_, store_type_, atomic_reference_, waiter_type_>;
-    using transaction_state_t = database_transaction_state<stored_key_t, atomic_reference_, waiter_type_>;
-    using transaction_deltas_t = typename transaction_state_t::transaction_deltas_t;
-    using collection_info_t = typename transaction_deltas_t::collection_info_t;
-    using transaction_unique_ptr_t = std::unique_ptr<transaction_t>;
-    using return_transaction_t = expected<transaction_unique_ptr_t>;
-
-#pragma endregion Types
-
-#pragma region Construction
-
-    /** A registry committing into @p store, which outlives it. */
-    inline database_transaction_registry(store_t& store,
-                                         resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : store_(&store), resources_(std::move(resources)) {}
-
-    inline database_transaction_registry(database_transaction_registry&&) = delete;
-    inline database_transaction_registry(database_transaction_registry const&) = delete;
-    inline database_transaction_registry& operator=(database_transaction_registry const&) = delete;
-    inline database_transaction_registry& operator=(database_transaction_registry&&) = delete;
-
-#pragma endregion Construction
-
-#pragma region Interface Methods
-
-    /** A transaction over every collection of the store, with the delta bounds of @p config. */
-    inline return_transaction_t create_transaction(transaction_config_t const& config) noexcept;
-
-#pragma endregion Interface Methods
-
-  private:
-#pragma region Transactions
-
-    friend store_t;
-    friend transaction_t;
-
-    /** One transaction's commit, as the sequencer hands it to its two steps. */
-    struct commit_t {
-
-        /** The registry committing. */
-        database_transaction_registry* owner = nullptr;
-
-        /** The transaction's writes, watches and sealed deltas. */
-        transaction_state_t* data = nullptr;
-
-        /** The stamp every watch of the transaction is scoped from or past. */
-        transaction_stamp_t start_stamp = invalid_transaction_stamp_k;
-    };
-
-    inline status_t stage_(transaction_state_t& data, transaction_stamp_t start_stamp,
-                           transaction_stamp_t& stage_stamp) noexcept;
-    inline transaction_stamp_t commit_staged_(transaction_state_t& data) noexcept;
-    inline expected<transaction_stamp_t> commit_(transaction_state_t& data, transaction_stamp_t start_stamp) noexcept;
-    inline void discard_(transaction_state_t& data) noexcept;
-
-    /** Pins @p pin at the newest published stamp, which a transaction starts at and reads from. */
-    inline transaction_stamp_t request_start_(stamp_pin<atomic_reference_, waiter_type_>& pin) noexcept {
-        return store_->ledger().pin_reader(pin);
-    }
-
-    /** The stamp a watch taken now is scoped from: every commit at or below it has landed. */
-    inline transaction_stamp_t current_stamp_() const noexcept { return store_->ledger().published(); }
-
-    inline status_t watch_now_(transaction_stamp_t start_stamp, collection_id_t group_id,
-                               std::span<stored_key_t const> stored_keys) noexcept;
-
-#pragma endregion Transactions
-
-#pragma region Helper Methods
-
-    inline bool conflicting_(transaction_state_t const& data) noexcept;
-    inline status_t seal_(transaction_state_t& data) noexcept;
-    inline status_t prepare_(transaction_state_t& data, transaction_stamp_t start_stamp) noexcept;
-    inline void forget_(transaction_state_t& data, std::size_t prepared) noexcept;
-    inline void maintain_(transaction_state_t& data) noexcept;
-    static inline status_t prepare_commit_(void* context) noexcept;
-    static inline void publish_commit_(void* context, transaction_stamp_t stamp) noexcept;
-
-#pragma endregion Helper Methods
-
-#pragma region Store Accessor Methods
-
-    inline bool has_collection_(auto const& id) noexcept { return store_->has_collection(id); }
-    inline auto list_collections_() noexcept { return store_->list_collections(); }
-    inline bool contains_(auto const& id, stored_key_t stored_key, transaction_stamp_t stamp,
-                          std::size_t thread_index) noexcept {
-        return store_->contains(id, stored_key, stamp, thread_index);
-    }
-    inline status_t stored_value_size_(auto const& id, stored_key_t stored_key, stored_value_size_t& size,
-                                       transaction_stamp_t stamp, std::size_t thread_index) noexcept {
-        return store_->stored_value_size(id, stored_key, size, stamp, thread_index);
-    }
-    inline stored_value_size_t buffer_size_for_any_stored_value_(auto const& id) noexcept {
-        return store_->buffer_size_for_any_stored_value(id);
-    }
-    inline status_t select_(auto const& id, stored_key_t stored_key, stored_value_span_t stored_value,
-                            stored_value_size_t& size, transaction_stamp_t stamp, std::size_t thread_index) noexcept {
-        return store_->select(id, stored_key, stored_value, size, stamp, thread_index);
-    }
-
-    /** Whether a commit since @p stamp landed in @p id from @p lower to @p upper, checked now against the published
-     *  view. */
-    [[nodiscard]] inline bool range_written_now_(collection_id_t id, stored_key_t lower, stored_key_t upper,
-                                                 transaction_stamp_t stamp) noexcept {
-        return store_->range_written_since(id, lower, upper, stamp);
-    }
-
-#pragma endregion Store Accessor Methods
-
-#pragma region Private Members
-
-    /** The store every commit of this registry lands in, owned by whoever named it. */
-    store_t* store_;
-
-    /** The budget every transaction's writes and watches are charged to. */
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources_;
-
-#pragma endregion Private Members
-};
-
-#pragma region Interface Methods
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline typename database_transaction_registry<stored_key_, store_type_, atomic_reference_,
-                                              waiter_type_>::return_transaction_t
-database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::create_transaction(
-    transaction_config_t const& config) noexcept {
-
-    transaction_deltas_t deltas(config.max_bytes, config.max_deltas, resources_);
-    transaction_unique_ptr_t transaction {new (std::nothrow) transaction_t {*this, std::move(deltas), resources_}};
-    if (!transaction) return status_t {status_code_t::out_of_memory_k, "No room for another transaction"};
-    return transaction;
-}
-
-#pragma endregion Interface Methods
-
-#pragma region Transactions
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::stage_(
-    transaction_state_t& data, transaction_stamp_t start_stamp, transaction_stamp_t& stage_stamp) noexcept {
-
-    // Sealed before the leader word is taken, so the sort, the copy and any flush hold up no other committer.
-    if (status_t const sealed = seal_(data); sealed.failed()) return sealed;
-    store_->ledger().lead();
-    stage_stamp = current_stamp_();
-    if (status_t const prepared = prepare_(data, start_stamp); prepared.failed()) {
-        store_->ledger().stop_leading();
-        data.sealed.clear();
-        return prepared;
-    }
-    return status_t {};
-}
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline transaction_stamp_t
-database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::commit_staged_(
-    transaction_state_t& data) noexcept {
-
-    // The stage prepared every collection's view, so from the stamp on nothing can fail.
-    commit_t committing {this, &data, invalid_transaction_stamp_k};
-    commit_request_t request;
-    request.context = &committing;
-    request.publish = &publish_commit_;
-    transaction_stamp_t const commit_stamp = store_->ledger().commit_leading(request);
-    maintain_(data);
-    data.sealed.clear();
-    return commit_stamp;
-}
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline expected<transaction_stamp_t>
-database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::commit_(
-    transaction_state_t& data, transaction_stamp_t start_stamp) noexcept {
-
-    if (status_t const sealed = seal_(data); sealed.failed()) return sealed;
-    // Even a commit that wrote nothing draws a stamp, so every commit has a place of its own in the order.
-    commit_t committing {this, &data, start_stamp};
-    commit_request_t request;
-    request.context = &committing;
-    request.prepare = &prepare_commit_;
-    request.publish = &publish_commit_;
-    expected<transaction_stamp_t> committed = store_->ledger().submit(request);
-    if (committed) maintain_(data);
-    data.sealed.clear();
-    return committed;
-}
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline void database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::discard_(
-    transaction_state_t& data) noexcept {
-    forget_(data, data.sealed.size());
-    for (transaction_share_t* share = data.shares; share != nullptr; share = share->next) share->forget(share->context);
-    store_->ledger().stop_leading();
-    data.sealed.clear();
-}
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::watch_now_(
-    transaction_stamp_t start_stamp, collection_id_t group_id, std::span<stored_key_t const> stored_keys) noexcept {
-
-    bool written = false;
-    for (std::size_t index = 0; index != stored_keys.size() && !written; ++index)
-        written = store_->written_since(group_id, stored_keys[index], start_stamp);
-    if (written) return status_t {status_code_t::write_conflict_k, "Keys conflict"};
-    return status_t {};
-}
-
-#pragma endregion Transactions
-
-#pragma region Helper Methods
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline bool database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::conflicting_(
-    transaction_state_t const& data) noexcept {
-
-    // First-committer-wins over the watched writes, then every key read or tracked.
-    bool conflict = false;
-    data.deltas.for_each_write(
-        [&](collection_id_t collection_id, stored_key_t const& stored_key, auto const& place) noexcept {
-            if (!conflict && place.watch_stamp != invalid_transaction_stamp_k)
-                conflict = store_->written_since(collection_id, stored_key, place.watch_stamp);
-        });
-    if (conflict) return true;
-    [[maybe_unused]] st::status_t const walked = data.read_set.groups.for_each(
-        [&](auto const& group) noexcept -> st::walk_control_t {
-            collection_id_t const group_id = group.key();
-            [[maybe_unused]] st::status_t const watched = group.value().stored_keys.for_each(
-                [&](auto const& watch) noexcept -> st::walk_control_t {
-                    conflict = store_->written_since(group_id, watch.key(), watch.value().watch_stamp);
-                    return conflict ? st::walk_control_t::halt_k : st::walk_control_t::resume_k;
-                });
-            return conflict ? st::walk_control_t::halt_k : st::walk_control_t::resume_k;
-        });
-    if (conflict) return true;
-    for (auto const& range : data.ranges)
-        if (store_->range_written_since(range.collection, range.lower, range.upper, range.watch_stamp)) return true;
-    return false;
-}
-
-/** Seals every written collection's deltas on the committing thread, one sealed entry per collection. */
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::seal_(
-    transaction_state_t& data) noexcept {
-    data.sealed.clear();
-    if (data.sealed.reserve(data.deltas.collections_by_id.size()) != st::status_t::success_k)
-        return status_t {status_code_t::out_of_memory_k, "No room to seal a commit"};
-    status_t status = status_t {};
-    data.deltas.for_each_collection([&](collection_info_t const& collection) noexcept {
-        if (status.failed()) return;
-        typename transaction_state_t::sealed_collection_t sealed;
-        sealed.id = collection.id;
-        status = store_->seal_collection(collection.id, data.deltas, sealed.commit);
-        if (status.succeeded()) [[maybe_unused]]
-            st::status_t const kept = data.sealed.push_back(st::assume_reserved, std::move(sealed));
-    });
-    if (status.failed()) data.sealed.clear();
-    return status;
-}
-
-/** Checks the watches against the views published so far and lays out every written collection's view, on the
- *  thread holding the leader word; a refusal forgets every view it laid out. */
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::prepare_(
-    transaction_state_t& data, transaction_stamp_t start_stamp) noexcept {
-
-    // Every watch is scoped from the start or later, so nothing published since the start leaves nothing to check.
-    if (current_stamp_() != start_stamp && conflicting_(data))
-        return status_t {status_code_t::write_conflict_k, "Keys conflict"};
-    for (std::size_t index = 0; index != data.sealed.size(); ++index)
-        if (status_t const prepared = store_->prepare_collection(data.sealed[index].id, data.sealed[index].commit);
-            prepared.failed()) {
-            forget_(data, index);
-            return prepared;
-        }
-    // A share checks its own watches, as only its store reads its keys, and forgets nothing once it refuses.
-    for (transaction_share_t* share = data.shares; share != nullptr; share = share->next)
-        if (status_t const prepared = share->prepare(share->context); prepared.failed()) {
-            forget_(data, data.sealed.size());
-            for (transaction_share_t* undone = data.shares; undone != share; undone = undone->next)
-                undone->forget(undone->context);
-            return prepared;
-        }
-    return status_t {};
-}
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline void database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::forget_(
-    transaction_state_t& data, std::size_t prepared) noexcept {
-    for (std::size_t index = 0; index != prepared; ++index) store_->forget_collection(data.sealed[index].id);
-}
-
-/** Merges, flushes and compacts whatever the landed commit left due in the collections it wrote; a failure there
- *  leaves the commit landed, and the next commit making room meets it again. */
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline void database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::maintain_(
-    transaction_state_t& data) noexcept {
-    for (auto const& sealed : data.sealed) [[maybe_unused]]
-        status_t const maintained = store_->maintain(sealed.id);
-}
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t database_transaction_registry<stored_key_, store_type_, atomic_reference_,
-                                              waiter_type_>::prepare_commit_(void* context) noexcept {
-    commit_t const& committing = *static_cast<commit_t const*>(context);
-    return committing.owner->prepare_(*committing.data, committing.start_stamp);
-}
-
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline void database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::publish_commit_(
-    void* context, transaction_stamp_t stamp) noexcept {
-    commit_t const& committing = *static_cast<commit_t const*>(context);
-    for (auto& sealed : committing.data->sealed)
-        committing.owner->store_->publish_collection(sealed.id, sealed.commit, stamp);
-    for (transaction_share_t* share = committing.data->shares; share != nullptr; share = share->next)
-        share->publish(share->context, stamp);
-}
-
-#pragma endregion Helper Methods
-
-#pragma endregion Database Transaction Registry
 
 #pragma region Database Snapshot
 
-#pragma region Snapshot
-
 /**
- *  @brief One moment of a database: a stamp pinned in its ledger, which every read through the snapshot answers at.
+ *  @brief One moment of a database: a stamp pinned in its ledger, which every read through the
+ *      snapshot answers at, naming any collection of the database by its ID or its name.
  *  @tparam store_type_ The database read, which must outlive the snapshot.
- *
- *  A snapshot holds no view and no level set, so it never delays a publication: every merge keeps the versions a
- *  pinned stamp reads, and every read re-enters the collection it names through the view published then.
  */
 template <typename store_type_>
 class database_snapshot {
@@ -780,60 +92,49 @@ class database_snapshot {
     /** The newest stamp @p store published, pinned in its ledger until the snapshot dies. */
     [[nodiscard]] static database_snapshot of(store_t& store) noexcept {
         database_snapshot taken;
-        taken.store_ = &store;
-        taken.stamp_ = store.ledger().pin_reader(taken.pin_);
+        taken.pinned_ = pinned_snapshot<store_t>::of(store);
         return taken;
     }
 
     /** The stamp every read through this snapshot answers at. */
-    [[nodiscard]] transaction_stamp_t stamp() const noexcept { return stamp_; }
+    [[nodiscard]] transaction_stamp_t stamp() const noexcept { return pinned_.stamp(); }
 
     /** Whether @p id names a collection of the database now. */
-    [[nodiscard]] bool contains(any_collection_id_t const& id) noexcept { return store_->has_collection(id); }
+    [[nodiscard]] bool contains(any_collection_id_t const& id) noexcept { return pinned_.store().has_collection(id); }
 
     /** What @p id held for @p stored_key at the snapshot's stamp, and how many bytes its value took. */
     [[nodiscard]] lookup_result_t find(any_collection_id_t const& id, stored_key_t stored_key,
                                        stored_value_size_t& size) noexcept {
-        return store_->find(id, stored_key, size, stamp_);
+        return pinned_.store().find(id, stored_key, size, pinned_.stamp());
     }
 
     /** Copies the value @p id held for @p stored_key at the snapshot's stamp into @p into, filing it in the value
      *  cache when it paid I/O for it. */
     status_t select(any_collection_id_t const& id, stored_key_t stored_key, std::span<byte_t> into,
                     stored_value_size_t& size) noexcept {
-        return store_->select(id, stored_key, into, size, stamp_);
+        return pinned_.store().select(id, stored_key, into, size, pinned_.stamp());
     }
 
   private:
 
-    /** The database read, borrowed and outliving the snapshot. */
-    store_t* store_ = nullptr;
-
-    /** The pin that keeps every version at the stamp. */
-    typename store_t::pin_t pin_;
-
-    /** The stamp pinned. */
-    transaction_stamp_t stamp_ = unwritten_stamp_k;
+    /** The database read and the stamp pinned in its ledger. */
+    pinned_snapshot<store_t> pinned_;
 };
-
-#pragma endregion Snapshot
 
 #pragma endregion Database Snapshot
 
 #pragma region Database Transaction
 
-#pragma region Transaction
-
 /**
  *  @brief A group of writes and reads over several collections that succeed or fail together.
- *  @tparam stored_key_ The key every collection of the store is addressed by.
+ *  @tparam stored_key_type_ The key every collection of the store is addressed by.
  *  @tparam store_type_ The store the writes land in, which must satisfy @c transaction_store_concept.
  *
- *  Nothing here throws: a mutation that outgrows the transaction's deltas answers @c capacity_exhausted_k, and
- *  the caller may commit what it has and start over. The object is reusable after @c commit, after
- *  @c rollback and after @c renew.
+ *  The core carries the writes, the watches, the stamps and the two-phase lifecycle; what is here
+ *  resolves a collection's name to its ID and widths once per run of calls, and reads through the
+ *  store at the right stamp.
  */
-template <typename stored_key_, typename store_type_, template <typename> typename atomic_reference_,
+template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
           typename waiter_type_>
 class database_transaction {
   public:
@@ -841,16 +142,20 @@ class database_transaction {
 #pragma region Types
 
     /** The key every collection of the store is addressed by. */
-    using stored_key_t = stored_key_;
+    using stored_key_t = stored_key_type_;
 
     /** The store every committed write of this transaction lands in. */
     using store_t = store_type_;
 
     /** The registry that orders this transaction against every other of the same store. */
-    using registry_t = database_transaction_registry<stored_key_t, store_t, atomic_reference_, waiter_type_>;
+    using registry_t = transaction_registry<stored_key_t, store_t, atomic_reference_, waiter_type_>;
+
+    /** The writes, the watches, the stamps and the lifecycle this transaction shares with
+     *  every other kind. */
+    using core_t = transaction_core<stored_key_t, registry_t, atomic_reference_, waiter_type_>;
 
     /** The uncommitted writes and the watched keys this transaction carries. */
-    using state_t = database_transaction_state<stored_key_t, atomic_reference_, waiter_type_>;
+    using state_t = typename core_t::state_t;
 
     /** The uncommitted deltas alone, filed under the collection they belong to. */
     using transaction_deltas_t = typename state_t::transaction_deltas_t;
@@ -875,98 +180,33 @@ class database_transaction {
      */
     database_transaction(registry_t& manager, transaction_deltas_t&& deltas,
                          resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : manager_(manager), data_(std::move(deltas), std::move(resources)) {
-        start_stamp_ = manager_.request_start_(pin_);
-    }
-
-    /** Hands the leader word back when a stage still holds it, then gives the start stamp back. */
-    ~database_transaction() noexcept {
-        if (phase_ == phase_t::staged_k) manager_.discard_(data_);
-    }
+        : core_(manager, std::move(deltas), std::move(resources)) {}
 
 #pragma endregion Construction
 
 #pragma region Lifecycle
 
-    /**
-     *  @brief Seals every write, takes the ledger's leader word, checks every watched key and lays out every view
-     *      the commit publishes, without applying anything, which reserves this commit's place in the next batch.
-     *
-     *  A failure keeps the changes, so a caller can still log what it could not stage, and a success holds the
-     *  leader word until @c commit or @c rollback hands it back; readers never wait for it, later committers do.
-     */
-    status_t stage() noexcept {
-        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        transaction_stamp_t staged_stamp = invalid_transaction_stamp_k;
-        status_t const staged = manager_.stage_(data_, start_stamp_, staged_stamp);
-        if (staged.succeeded()) {
-            last_stage_stamp_ = staged_stamp;
-            phase_ = phase_t::staged_k;
-        }
-        return staged;
-    }
+    /** Seals every write, takes the ledger's leader word and lays out every view the
+     *  commit publishes, as @c transaction_core::stage does. */
+    status_t stage() noexcept { return core_.stage(); }
 
-    /**
-     *  @brief Lands every write of this transaction, through the ledger's sequencer unless a stage already holds the
-     *      leader word, and returns once its stamp is published.
-     *
-     *  @note Nothing is held on return, and only a success clears the changes and the watches and starts the
-     *      transaction again.
-     */
-    status_t commit() noexcept {
-        if (phase_ == phase_t::staged_k) last_try_to_commit_stamp_ = manager_.commit_staged_(data_);
-        else {
-            auto [committed, commit_status] = manager_.commit_(data_, start_stamp_);
-            if (commit_status.failed()) {
-                last_try_to_commit_stamp_ = manager_.current_stamp_();
-                return commit_status;
-            }
-            last_try_to_commit_stamp_ = committed;
-        }
-        restart_();
-        return {};
-    }
+    /** Lands every write of this transaction and starts it again,
+     *  as @c transaction_core::commit does. */
+    status_t commit() noexcept { return core_.commit(); }
 
     /** Drops every write and every watch, and starts the transaction over from this moment. */
-    void rollback() noexcept {
-        if (phase_ == phase_t::staged_k) manager_.discard_(data_);
-        phase_ = phase_t::started_k;
-        data_.clear();
-        start_stamp_ = manager_.request_start_(pin_);
-    }
+    void rollback() noexcept { core_.rollback(); }
 
-    /**
-     *  @brief Hands back the leader word a stage took, keeping every write and every watch, so the next stage or
-     *      commit checks them all again.
-     *
-     *  @note A staged transaction holds the ledger's leader word, which every other committer of the ledger waits
-     *      for, so a caller that only wants a stage's verdict lets it go at once.
-     */
-    void unstage() noexcept {
-        if (phase_ == phase_t::staged_k) manager_.discard_(data_);
-        phase_ = phase_t::started_k;
-    }
+    /** Hands back the leader word a stage took, keeping every write and every watch. */
+    void unstage() noexcept { core_.unstage(); }
 
-    /**
-     *  @brief Starts over from this moment while keeping the writes, whose watches move to the new start, which only
-     *      a transaction that read nothing may.
-     *  @return @c invalid_argument_k when the transaction has read anything, whose watches cannot move.
-     */
-    status_t renew() noexcept {
-        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        if (data_.read_set.count(watch_purpose_t::read_k) != 0)
-            return {status_code_t::invalid_argument_k, "That transaction has read something"};
-        start_stamp_ = manager_.request_start_(pin_);
-        data_.deltas.rescope_watches(start_stamp_);
-        return {};
-    }
+    /** Starts over from this moment while keeping the writes, which only a transaction that
+     *  read nothing may. */
+    status_t renew() noexcept { return core_.renew(); }
 
     /** Joins @p share, which every stage and commit from now on lays out and lands with this transaction's own writes,
      *  and which must outlive the transaction. */
-    void join(transaction_share_t& share) noexcept {
-        share.next = data_.shares;
-        data_.shares = &share;
-    }
+    void join(transaction_share_t& share) noexcept { core_.join(share); }
 
     /**
      *  @brief Watches @p stored_keys of @p id for conflicts, without reading or writing any of them.
@@ -975,39 +215,20 @@ class database_transaction {
      */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t watch_more(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys) noexcept {
-        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         collection_id_t const collection_id = resolve_(id).id;
         if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-
-        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(collection_id, stored_keys);
-            prepared.failed())
-            return prepared;
-        watch_later_<watch_schedule_>(collection_id, stored_keys, watch_stamp_for_<watch_schedule_>(),
-                                      watch_purpose_t::track_k);
-        return {};
+        return core_.template watch_more<watch_schedule_>(collection_id, stored_keys);
     }
 
     /** Watches every key of @p id from @p lower to @p upper inclusive, the absent ones too, which a scan this
      *  transaction ran over them does so a commit inserting into the range conflicts. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t watch_range(any_collection_id_t const& id, stored_key_t lower, stored_key_t upper) noexcept {
-        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        if constexpr (watch_schedule_ == watch_schedule_t::never_k) return {};
         collection_id_t const collection_id = resolve_(id).id;
         if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-        if constexpr (watch_schedule_ == watch_schedule_t::now_k) {
-            if (manager_.range_written_now_(collection_id, lower, upper, start_stamp_))
-                return {status_code_t::write_conflict_k, "A commit landed in that range since the start"};
-            return {};
-        }
-        else {
-            if (data_.ranges.push_back(typename state_t::range_watch_t {
-                    collection_id, lower, upper, watch_stamp_for_<watch_schedule_>()}) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A transaction could not watch another range"};
-            return {};
-        }
+        return core_.template watch_range<watch_schedule_>(collection_id, lower, upper);
     }
 
 #pragma endregion Lifecycle
@@ -1016,31 +237,31 @@ class database_transaction {
 
     /** Whether the store names the collection @p id. */
     [[nodiscard]] bool has_collection(any_collection_id_t const& id) noexcept {
-        if (!idle_()) return false;
-        return manager_.has_collection_(id);
+        if (!core_.started()) return false;
+        return core_.store().has_collection(id);
     }
 
     /** The ID @p id resolves to, or @c collection_invalid_id_k when it names nothing. */
     [[nodiscard]] collection_id_t collection_id(any_collection_id_t const& id) noexcept {
-        if (!idle_()) return collection_invalid_id_k;
+        if (!core_.started()) return collection_invalid_id_k;
         return resolve_(id).id;
     }
 
     /** The name and the number of every collection of the store. */
-    [[nodiscard]] st::basic_vector<collection_ids_t> list_collections() noexcept {
-        if (!idle_()) return {};
-        return manager_.list_collections_();
+    [[nodiscard]] st::vector<collection_ids_t> list_collections() noexcept {
+        if (!core_.started()) return {};
+        return core_.store().list_collections();
     }
 
     /** Bytes the largest value @p id admits takes, which is what a caller sizes a read buffer by. */
     [[nodiscard]] stored_value_size_t buffer_size_for_any_stored_value(any_collection_id_t const& id) noexcept {
-        if (!idle_()) return 0;
-        return manager_.buffer_size_for_any_stored_value_(id);
+        if (!core_.started()) return 0;
+        return core_.store().buffer_size_for_any_stored_value(id);
     }
 
     /** Whether @p count more writes of @p bytes still fit in this transaction's own deltas. */
     [[nodiscard]] bool has_available_space_for(std::size_t count, std::size_t bytes) const noexcept {
-        return data_.deltas.can_fit(count, bytes);
+        return core_.state().deltas.can_fit(count, bytes);
     }
 
 #pragma endregion Catalog
@@ -1051,28 +272,29 @@ class database_transaction {
      *  another commit writing it as @p watch_schedule_ says. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t insert(any_collection_id_t const& id, stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
-        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         resolved_collection_t const named = resolve_(id);
-        collection_id_t const collection_id = named.id;
-        if (collection_id == collection_invalid_id_k)
+        if (named.id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-        if (status_t const checked = check_write_now_<watch_schedule_>(collection_id, stored_key); checked.failed())
+        if (status_t const checked = core_.template check_write_now<watch_schedule_>(named.id, stored_key);
+            checked.failed())
             return checked;
-        return data_.deltas.write(collection_id, named.widths, stored_key, stored_value,
-                                  watch_stamp_for_<watch_schedule_>());
+        return core_.state().deltas.write(named.id, named.widths, stored_key, stored_value,
+                                          core_.template watch_stamp_for<watch_schedule_>());
     }
 
     /** Writes a removal of @p stored_key of @p id into this transaction's own deltas, watched as @c insert is. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t remove(any_collection_id_t const& id, stored_key_t stored_key) noexcept {
-        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         resolved_collection_t const named = resolve_(id);
-        collection_id_t const collection_id = named.id;
-        if (collection_id == collection_invalid_id_k)
+        if (named.id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-        if (status_t const checked = check_write_now_<watch_schedule_>(collection_id, stored_key); checked.failed())
+        if (status_t const checked = core_.template check_write_now<watch_schedule_>(named.id, stored_key);
+            checked.failed())
             return checked;
-        return data_.deltas.remove(collection_id, named.widths, stored_key, watch_stamp_for_<watch_schedule_>());
+        return core_.state().deltas.remove(named.id, named.widths, stored_key,
+                                           core_.template watch_stamp_for<watch_schedule_>());
     }
 
     /**
@@ -1085,11 +307,11 @@ class database_transaction {
     template <utilities::fold_concept fold_type_>
     status_t change(any_collection_id_t const& id, stored_key_t stored_key, stored_value_view_t delta,
                     fold_type_ const& fold) noexcept {
-        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         resolved_collection_t const named = resolve_(id);
         if (named.id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-        return data_.deltas.change(named.id, named.widths, stored_key, delta, fold);
+        return core_.state().deltas.change(named.id, named.widths, stored_key, delta, fold);
     }
 
 #pragma endregion Writes
@@ -1106,8 +328,8 @@ class database_transaction {
     /** Bytes the value of @p stored_key takes, as this transaction would see it. */
     status_t stored_value_size(any_collection_id_t const& id, stored_key_t stored_key, stored_value_size_t& size,
                                std::size_t thread_index = outside_executor_k) noexcept {
-        status_t const own = stored_value_size_uncommitted(id, stored_key, size);
-        if (own.succeeded() || !(own == status_code_t::not_found_k)) return own;
+        status_t const own_status = stored_value_size_uncommitted(id, stored_key, size);
+        if (own_status.succeeded() || !(own_status == status_code_t::not_found_k)) return own_status;
         return stored_value_size_committed(id, stored_key, size, thread_index);
     }
 
@@ -1115,22 +337,22 @@ class database_transaction {
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t select(any_collection_id_t const& id, stored_key_t stored_key, stored_value_span_t into,
                     stored_value_size_t& size, std::size_t thread_index = outside_executor_k) noexcept {
-        status_t const own = select_uncommitted(id, stored_key, into, size);
-        if (own.succeeded()) return own;
+        status_t const own_status = select_uncommitted(id, stored_key, into, size);
+        if (own_status.succeeded()) return own_status;
         return select_committed<watch_schedule_>(id, stored_key, into, size, thread_index);
     }
 
     /** What this transaction's own deltas did to @p stored_key of @p id: wrote it, removed it, or neither. */
     [[nodiscard]] lookup_result_t lookup_uncommitted(collection_id_t collection_id,
                                                      stored_key_t stored_key) const noexcept {
-        return data_.deltas.lookup(collection_id, stored_key);
+        return core_.state().deltas.lookup(collection_id, stored_key);
     }
 
     /** Fills @p held with what this transaction's own deltas did to @p stored_key of @p collection_id, a write, a
      *  removal or a change, answering whether they did anything. */
     [[nodiscard]] bool uncommitted_delta(collection_id_t collection_id, stored_key_t stored_key,
                                          delta_view_t& held) const noexcept {
-        return data_.deltas.delta(collection_id, stored_key, held);
+        return core_.state().deltas.delta(collection_id, stored_key, held);
     }
 
     /** Hands @p callback every key this transaction wrote into @p collection_id, in no order, as
@@ -1138,52 +360,52 @@ class database_transaction {
      *  folds over the committed value. */
     template <typename callback_type_>
     void for_each_uncommitted(collection_id_t collection_id, callback_type_&& callback) const noexcept {
-        data_.deltas.for_each_delta(collection_id, [&](stored_key_t stored_key, delta_view_t delta) noexcept {
+        core_.state().deltas.for_each_delta(collection_id, [&](stored_key_t stored_key, delta_view_t delta) noexcept {
             callback(stored_key, delta.kind, static_cast<stored_value_size_t>(delta.bytes.size()));
         });
     }
 
     /** Whether this transaction's own deltas carry @p stored_key of @p id. */
     [[nodiscard]] bool contains_uncommitted(any_collection_id_t const& id, stored_key_t stored_key) noexcept {
-        if (!idle_()) return false;
+        if (!core_.started()) return false;
         collection_id_t const collection_id = resolve_(id).id;
         if (collection_id == collection_invalid_id_k) return false;
-        return data_.deltas.lookup(collection_id, stored_key) == lookup_result_t::written_k;
+        return core_.state().deltas.lookup(collection_id, stored_key) == lookup_result_t::written_k;
     }
 
     /** Bytes the value this transaction wrote for @p stored_key takes. */
     status_t stored_value_size_uncommitted(any_collection_id_t const& id, stored_key_t stored_key,
                                            stored_value_size_t& size) noexcept {
-        if (!idle_()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         collection_id_t const collection_id = resolve_(id).id;
         if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-        return data_.deltas.stored_value_size(collection_id, stored_key, size);
+        return core_.state().deltas.stored_value_size(collection_id, stored_key, size);
     }
 
     /** Copies the value this transaction wrote for @p stored_key into @p into. */
     status_t select_uncommitted(any_collection_id_t const& id, stored_key_t stored_key, stored_value_span_t into,
                                 stored_value_size_t& size) noexcept {
-        if (!idle_()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         collection_id_t const collection_id = resolve_(id).id;
         if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-        return data_.deltas.select(collection_id, stored_key, into, size);
+        return core_.state().deltas.select(collection_id, stored_key, into, size);
     }
 
     /** Whether the store carries @p stored_key of @p id, ignoring what this transaction wrote. */
     [[nodiscard]] bool contains_committed(any_collection_id_t const& id, stored_key_t stored_key,
                                           std::size_t thread_index = outside_executor_k) noexcept {
-        if (!idle_()) return false;
-        return manager_.contains_(id, stored_key, start_stamp_, thread_index);
+        if (!core_.started()) return false;
+        return core_.store().contains(id, stored_key, core_.start_stamp(), thread_index);
     }
 
     /** Bytes the store held for @p stored_key of @p id when this transaction started, ignoring what it wrote. */
     status_t stored_value_size_committed(any_collection_id_t const& id, stored_key_t stored_key,
                                          stored_value_size_t& size,
                                          std::size_t thread_index = outside_executor_k) noexcept {
-        if (!idle_()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        return manager_.stored_value_size_(id, stored_key, size, start_stamp_, thread_index);
+        if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        return core_.store().stored_value_size(id, stored_key, size, core_.start_stamp(), thread_index);
     }
 
     /**
@@ -1199,23 +421,23 @@ class database_transaction {
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t select_committed(any_collection_id_t const& id, stored_key_t stored_key, stored_value_span_t into,
                               stored_value_size_t& size, std::size_t thread_index = outside_executor_k) noexcept {
-        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         collection_id_t const collection_id = resolve_(id).id;
         if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
 
-        transaction_stamp_t const from = watch_stamp_for_<watch_schedule_>();
-        transaction_stamp_t const at = read_stamp_for_<watch_schedule_>();
-        if (status_t const read = manager_.select_(collection_id, stored_key, into, size, at, thread_index);
+        transaction_stamp_t const at = core_.template read_stamp_for<watch_schedule_>();
+        transaction_stamp_t const from = core_.template watch_stamp_for<watch_schedule_>();
+        if (status_t const read = core_.store().select(collection_id, stored_key, into, size, at, thread_index);
             read.failed())
             return read;
 
         std::array<stored_key_t, 1> const alone {stored_key};
         std::span<stored_key_t const> const watched {alone};
-        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(collection_id, watched);
+        if (status_t const prepared = core_.template watch_now_or_prepare<watch_schedule_>(collection_id, watched);
             prepared.failed())
             return prepared;
-        watch_later_<watch_schedule_>(collection_id, watched, from, watch_purpose_t::read_k);
+        core_.template watch_later<watch_schedule_>(collection_id, watched, from, watch_purpose_t::read_k);
         return {};
     }
 
@@ -1224,32 +446,24 @@ class database_transaction {
 #pragma region Stamps
 
     /** The stamp this transaction was started or restarted at, which scopes every watch it takes. */
-    [[nodiscard]] transaction_stamp_t start_stamp() const noexcept { return start_stamp_; }
+    [[nodiscard]] transaction_stamp_t start_stamp() const noexcept { return core_.start_stamp(); }
 
     /** The stamp this transaction last staged at, or @c invalid_transaction_stamp_k while it never has. */
-    [[nodiscard]] transaction_stamp_t last_stage_stamp() const noexcept { return last_stage_stamp_; }
+    [[nodiscard]] transaction_stamp_t last_stage_stamp() const noexcept { return core_.last_stage_stamp(); }
 
     /** The stamp this transaction last committed at, or @c invalid_transaction_stamp_k while it never has. */
-    [[nodiscard]] transaction_stamp_t last_commit_stamp() const noexcept { return last_commit_stamp_; }
+    [[nodiscard]] transaction_stamp_t last_commit_stamp() const noexcept { return core_.last_commit_stamp(); }
 
     /** The stamp this transaction last tried to commit at, whether or not that commit landed. */
-    [[nodiscard]] transaction_stamp_t last_try_to_commit_stamp() const noexcept { return last_try_to_commit_stamp_; }
+    [[nodiscard]] transaction_stamp_t last_try_to_commit_stamp() const noexcept {
+        return core_.last_try_to_commit_stamp();
+    }
 
 #pragma endregion Stamps
 
   private:
 
 #pragma region Private Types
-
-    /** Whether this transaction is filling its deltas or holding the ledger's leader word. */
-    enum class phase_t : std::uint8_t {
-
-        /** The transaction takes reads and writes, and holds nothing of the store. */
-        started_k,
-
-        /** The transaction has checked its watches, laid out its views and holds the ledger's leader word. */
-        staged_k,
-    };
 
     /** The value widths one collection admits, which every write of it is checked against. */
     using value_widths_t = typename transaction_deltas_t::value_widths_t;
@@ -1271,12 +485,6 @@ class database_transaction {
 
 #pragma region Private Methods
 
-    /** Whether this transaction is filling its deltas rather than holding the ledger's leader word. */
-    [[nodiscard]] bool idle_() const noexcept { return phase_ == phase_t::started_k; }
-
-    /** The store this transaction reads and commits into, which the registry beside it names. */
-    [[nodiscard]] store_t& store_() const noexcept { return *manager_.store_; }
-
     /**
      *  @brief What @p id resolves to, taken from the last answer while the collections have not moved.
      *  @param[in] id The collection to resolve, named by its ID or by its name.
@@ -1286,7 +494,7 @@ class database_transaction {
      *      rather than one per key; a create or a drop moves the version and the next call reads again.
      */
     [[nodiscard]] resolved_collection_t resolve_(any_collection_id_t const& id) noexcept {
-        std::uint64_t const version = store_().collections_version();
+        std::uint64_t const version = core_.store().collections_version();
         collection_id_t const* const identified = std::get_if<collection_id_t>(&id);
         if (identified != nullptr && resolved_.id != collection_invalid_id_k && *identified == resolved_.id &&
             version == resolved_.collections_version)
@@ -1294,7 +502,7 @@ class database_transaction {
 
         collection_id_t collection_id = collection_invalid_id_k;
         collection_config_t shape;
-        if (store_().resolve_collection(id, collection_id, shape).failed()) return resolved_collection_t {};
+        if (core_.store().resolve_collection(id, collection_id, shape).failed()) return resolved_collection_t {};
         resolved_.id = collection_id;
         resolved_.widths = value_widths_t {shape.lsm_tree.lsm_level_0.sorted_run.value_size,
                                            shape.lsm_tree.lsm_level_0.sorted_run.value_max_size};
@@ -1302,98 +510,18 @@ class database_transaction {
         return resolved_;
     }
 
-    /** The stamp a watch taken now is scoped from, which the schedule alone decides. */
-    template <watch_schedule_t watch_schedule_>
-    [[nodiscard]] transaction_stamp_t watch_stamp_for_() const noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k) return start_stamp_;
-        else if constexpr (watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            return manager_.current_stamp_();
-        else return invalid_transaction_stamp_k;
-    }
-
-    /** The stamp a read under @p watch_schedule_ answers at: the start, but for a watch scoped from the read itself. */
-    template <watch_schedule_t watch_schedule_>
-    [[nodiscard]] transaction_stamp_t read_stamp_for_() const noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            return manager_.current_stamp_();
-        else return start_stamp_;
-    }
-
-    /** Checks @p stored_keys right away, or makes the room a later watch of them needs. */
-    template <watch_schedule_t watch_schedule_>
-    status_t watch_now_or_prepare_for_later_(collection_id_t collection_id,
-                                             std::span<stored_key_t const> stored_keys) noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::now_k)
-            return manager_.watch_now_(start_stamp_, collection_id, stored_keys);
-        else if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k ||
-                           watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            return data_.read_set.reserve_more(collection_id, stored_keys.size());
-        else return {};
-    }
-
-    /** Records every key of @p stored_keys as watched from @p from, in room the step above took. */
-    template <watch_schedule_t watch_schedule_>
-    void watch_later_(collection_id_t collection_id, std::span<stored_key_t const> stored_keys,
-                      transaction_stamp_t from, watch_purpose_t purpose) noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k ||
-                      watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            for (stored_key_t const& stored_key : stored_keys)
-                data_.read_set.add(collection_id, stored_key, from, purpose, st::assume_reserved);
-    }
-
-    /** Refuses a write of @p stored_key right away when @p watch_schedule_ checks in place and a commit since the
-     *  start wrote it; every other schedule leaves the check to the stage. */
-    template <watch_schedule_t watch_schedule_>
-    status_t check_write_now_(collection_id_t collection_id, stored_key_t stored_key) noexcept {
-        if constexpr (watch_schedule_ == watch_schedule_t::now_k)
-            return manager_.watch_now_(start_stamp_, collection_id, std::span<stored_key_t const> {&stored_key, 1});
-        else return {};
-    }
-
-    /** Clears what a landed commit carried and starts again at the stamp it published. */
-    void restart_() noexcept {
-        phase_ = phase_t::started_k;
-        last_stage_stamp_ = last_try_to_commit_stamp_;
-        last_commit_stamp_ = last_try_to_commit_stamp_;
-        data_.clear();
-        start_stamp_ = manager_.request_start_(pin_);
-    }
-
 #pragma endregion Private Methods
 
 #pragma region Private Members
 
-    /** The registry that orders this transaction and checks its watches, outliving it. */
-    registry_t& manager_;
-
-    /** The writes and the watches this transaction carries, which a read of it also fills. */
-    state_t data_;
+    /** The writes, the watches, the stamps and the lifecycle, which the registry drives. */
+    core_t core_;
 
     /** The collection the last lookup answered, which the next lookup of the same one reuses. */
     resolved_collection_t resolved_;
 
-    /** The start stamp, pinned so the history this transaction reads at stays kept. */
-    stamp_pin<atomic_reference_, waiter_type_> pin_;
-
-    /** The stamp this transaction was started or restarted at. */
-    transaction_stamp_t start_stamp_ = invalid_transaction_stamp_k;
-
-    /** The stamp this transaction last staged at. */
-    transaction_stamp_t last_stage_stamp_ = invalid_transaction_stamp_k;
-
-    /** The stamp this transaction last committed at. */
-    transaction_stamp_t last_commit_stamp_ = invalid_transaction_stamp_k;
-
-    /** The stamp this transaction last tried to commit at. */
-    transaction_stamp_t last_try_to_commit_stamp_ = invalid_transaction_stamp_k;
-
-    /** Whether this transaction is filling its deltas or holding the ledger's leader word. */
-    phase_t phase_ = phase_t::started_k;
-
 #pragma endregion Private Members
 };
-
-#pragma endregion Transaction
 
 #pragma endregion Database Transaction
 
@@ -1403,31 +531,6 @@ class database_transaction {
 
 /** The layout the schema blob follows: collections and stamps, then the stamps ingests assigned their runs. */
 inline constexpr std::uint64_t database_schema_version_k = 1;
-
-/** @p text as the bytes a volume names a blob by, without its terminator. */
-template <std::size_t length_>
-[[nodiscard]] inline blob_name_t blob_name_of(char const (&text)[length_]) noexcept {
-    return blob_name_t {reinterpret_cast<byte_t const*>(text), length_ - 1};
-}
-
-/**
- *  @brief What every copy of a schema carries besides its collections: which copy is newer and what it promises.
- *
- *  A schema is saved to its two copies in turn, so replacing one never leaves a mount without the other.
- */
-struct schema_stamps_t {
-
-    /** How many times the schema has been saved, of which the higher copy is the one a mount reads. */
-    std::uint64_t generation = 0;
-
-    /** Every commit at or below this is wholly in the runs the copy names, and a mount drops every one above. */
-    transaction_stamp_t durable = unwritten_stamp_k;
-};
-
-/** Which of the two copies of a schema the save of @p generation replaces. */
-[[nodiscard]] constexpr std::size_t schema_copy_of(std::uint64_t generation) noexcept {
-    return static_cast<std::size_t>(generation % 2);
-}
 
 /** The name copy @p copy of the schema of a database is stored under, on whichever volume placement gave it. */
 [[nodiscard]] inline blob_name_t database_schema_name(std::size_t copy) noexcept {
@@ -1505,137 +608,27 @@ struct collection_record_t {
 #pragma region Database
 
 /**
- *  @brief The claim a database's maintenance, schema and blob writes run under, which callers park on rather than
- *      spin on, so a caller parked on one holder wakes once that holder lets it go, whoever takes it next.
- *
- *  The claim is one word kept as the epoch clock of ForkUnion's @c flat_pool: @b odd while held and @b even while
- *  free, stepped only by the take that finds it even and by its holder's release, so every epoch advances it by two.
- *  A take sets the held bit, which leaves an odd word as it was, and answers by the parity it read; a release adds
- *  one.
- *
- *  A committer finding it held returns at once rather than waiting, and every holder looks at the views again after
- *  it lets go. The fence after each release pairs with the fence before each attempt, so either the committer takes
- *  the claim, or the holder that refused it reads the views the committer published.
- *
- *  @tparam atomic_reference_ The reference the claim's word is owned through.
- *  @tparam waiter_type_ What a caller finding the claim held does between attempts, before it parks.
- */
-template <template <typename> typename atomic_reference_, typename waiter_type_>
-class maintenance_claim {
-  public:
-
-    /** Spins through @p waiter_type_, then parks on the claim's word. */
-    using waiting_policy_t = st::standard_waiting_policy<waiter_type_>;
-
-    /** Takes the claim, parked on each epoch it finds held until that holder lets it go. */
-    void take() noexcept {
-        atomic_reference_<std::uint32_t> const epoch {epoch_};
-        // Only the held bit of the old word is tested, so x86 sets it with `lock bts` and reloads the word to park on.
-        while (epoch.fetch_or(1, std::memory_order_acquire) % 2 != 0) {
-            std::uint32_t const seen = epoch.load(std::memory_order_relaxed);
-            if (seen % 2 != 0) waiting_policy_t {}.wait_until_changed(&epoch_, seen);
-        }
-    }
-
-    /** Takes the claim if no caller holds it, and answers whether it did. */
-    [[nodiscard]] bool take_if_free() noexcept {
-        // Pairs with the fence after a release: either this reads the release, or that holder reads what came before.
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        return atomic_reference_<std::uint32_t> {epoch_}.fetch_or(1, std::memory_order_acquire) % 2 == 0;
-    }
-
-    /** Parks until the caller holding the claim now lets it go, or returns at once while nobody holds it. */
-    void wait_until_released() noexcept {
-        atomic_reference_<std::uint32_t> const epoch {epoch_};
-        std::uint32_t const seen = epoch.load(std::memory_order_acquire);
-        if (seen % 2 == 0) return;
-        // The wait reloads relaxed; this reload acquires, so a woken caller reads what the holder wrote at once.
-        do waiting_policy_t {}.wait_until_changed(&epoch_, seen);
-        while (epoch.load(std::memory_order_acquire) == seen);
-    }
-
-    /** Hands the claim back, which only its holder does, and wakes every caller parked on it; the holder looks at the
-     *  views again only after this. */
-    void release() noexcept {
-        atomic_reference_<std::uint32_t> {epoch_}.add(1, std::memory_order_release);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        waiting_policy_t {}.notify_waiters(&epoch_);
-    }
-
-  private:
-
-    /** The claim's epoch: odd while held, even while free, stepped by whoever takes or lets it go. */
-    alignas(fu::default_alignment_k) std::uint32_t epoch_ = 0;
-};
-
-/**
- *  @brief What a database asks of the store one collection lives in: which collections it keeps, its mount, its
- *      reads, the steps of a commit, its maintenance and the runs a schema names.
- *
- *  A scan walks the store through the @c nvme_store_cursor its key slot and fold name.
- */
-template <typename store_type_>
-concept nvme_store_concept = requires(
-    store_type_& store, store_type_ const& viewed, typename store_type_::volume_t& volume,
-    collection_config_t const& config, typename store_type_::constraint_t& constraint,
-    typename store_type_::ledger_t& ledger, io_channel_t& channel, lsm_tree_publication_hook_t const& published,
-    compactor_ref_t const& compactor, std::span<lsm_tree_run_record_t const> runs,
-    std::span<lsm_tree_run_stamp_t const> stamps, st::basic_vector<lsm_tree_run_record_t>& listed,
-    st::basic_vector<lsm_tree_run_stamp_t>& listed_stamps, typename store_type_::ingest_runs_t& ingest_runs,
-    typename store_type_::stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size,
-    typename store_type_::sealed_commit_t& sealed, transaction_stamp_t stamp, std::size_t thread_index) {
-    typename store_type_::key_slot_t;
-    typename store_type_::fold_t;
-    { store_type_::mount(volume, config, constraint, ledger) } noexcept -> std::same_as<expected<store_type_>>;
-    { store.restore(channel, runs, stamps) } noexcept -> std::same_as<status_t>;
-    { store.truncate_above(channel, channel, stamp, published) } noexcept -> std::same_as<status_t>;
-    { store.destroy(channel) } noexcept -> std::same_as<status_t>;
-    { record_lsm_tree_runs(viewed.tree(), listed) } noexcept -> std::same_as<status_t>;
-    { record_lsm_tree_run_stamps(viewed.tree(), listed_stamps) } noexcept -> std::same_as<status_t>;
-    { viewed.population_count() } noexcept -> std::same_as<std::uint64_t>;
-    { viewed.size_bytes() } noexcept -> std::same_as<std::uint64_t>;
-    { viewed.value_max_size() } noexcept -> std::same_as<stored_value_size_t>;
-    { viewed.find(stored_key, size, stamp, thread_index) } noexcept -> std::same_as<lookup_result_t>;
-    { store.select(channel, stored_key, into, size, stamp, thread_index) } noexcept -> std::same_as<status_t>;
-    { viewed.written_since(stored_key, stamp) } noexcept -> std::same_as<bool>;
-    { viewed.range_written_since(stored_key, stored_key, stamp) } noexcept -> std::same_as<bool>;
-    { viewed.memory_pressure(sealed) } noexcept -> std::same_as<memory_pressure_t>;
-    { store.prepare(sealed) } noexcept -> std::same_as<status_t>;
-    { store.publish(sealed, stamp) } noexcept;
-    { store.forget_prepared() } noexcept;
-    { viewed.memory_shape() } noexcept -> std::same_as<memory_shape_t>;
-    { viewed.maintenance_due() } noexcept -> std::same_as<bool>;
-    { store.merge_memory_runs() } noexcept -> std::same_as<status_t>;
-    { viewed.flush_due() } noexcept -> std::same_as<bool>;
-    { store.flush(channel) } noexcept -> std::same_as<status_t>;
-    { viewed.needs_compaction() } noexcept -> std::same_as<bool>;
-    { store.compact(channel, channel, compactor, published) } noexcept -> std::same_as<expected<compaction_outcome_t>>;
-    { store.begin_ingest() } noexcept -> std::same_as<typename store_type_::ingest_runs_t>;
-    { store.publish_ingest(channel, ingest_runs) } noexcept -> std::same_as<expected<transaction_stamp_t>>;
-    { store.drop_ingest(channel, ingest_runs) } noexcept;
-};
-
-/**
  *  @brief Named collections of one database, the schema that resolves them and the transactions they share.
- *  @tparam stored_key_ The key every collection of this database is addressed by.
+ *  @tparam stored_key_type_ The key every collection of this database is addressed by.
  *  @tparam volume_type_ The volume every run of every collection lives on.
- *  @tparam store_tags_ Where among @p stores_ the store a tag names sits, through a static @c index_of answering
- *      the count of @p stores_ for a tag naming none.
- *  @tparam stores_ The stores a collection may live in, of which a create and a mount take the one its tag names.
+ *  @tparam store_tags_type_ Where among @p store_types_ the store a tag names sits, through a
+ *      static @c index_of answering the count of @p store_types_ for a tag naming none.
+ *  @tparam store_types_ The stores a collection may live in, of which a create and a mount take the
+ *      one its tag names.
  *
  *  The router and the channels are borrowed and must outlive the database, and so must the budget the
  *  collections charge their memory to. A database is pinned rather than movable, because its registry
  *  and every live transaction name it.
  */
-template <typename stored_key_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, typename store_tags_, nvme_store_concept... stores_>
+template <typename stored_key_type_, typename volume_type_, template <typename> typename atomic_reference_,
+          typename waiter_type_, typename store_tags_type_, nvme_store_concept... store_types_>
 class basic_database {
   public:
 
 #pragma region Types
 
     /** The key every collection of this database is addressed by. */
-    using stored_key_t = stored_key_;
+    using stored_key_t = stored_key_type_;
 
     /** The volume every run of every collection lives on. */
     using volume_t = volume_type_;
@@ -1656,7 +649,7 @@ class basic_database {
     using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeric_id_t>;
 
     /** The transactions of this database, the order they commit in and the conflicts that stop them. */
-    using registry_t = database_transaction_registry<stored_key_t, basic_database, atomic_reference_, waiter_type_>;
+    using registry_t = transaction_registry<stored_key_t, basic_database, atomic_reference_, waiter_type_>;
 
     /** One transaction over the collections of this database. */
     using transaction_t = database_transaction<stored_key_t, basic_database, atomic_reference_, waiter_type_>;
@@ -1671,7 +664,7 @@ class basic_database {
     using pin_t = stamp_pin<atomic_reference_, waiter_type_>;
 
     /** One collection, held by the store its tag names. */
-    using any_collection_t = std::variant<stores_...>;
+    using any_collection_t = std::variant<store_types_...>;
 
     /** One entry of the schema: what a collection is called, how it is shaped, and the collection itself. */
     struct collection_entry_t {
@@ -1759,7 +752,7 @@ class basic_database {
             }
             // The entries outlive the publication that stops naming them, which waits out every reader of the
             // collections it replaced.
-            st::basic_vector<entry_pointer_t> released = std::move(collections_);
+            st::vector<entry_pointer_t> released = std::move(collections_);
             [[maybe_unused]] status_t const emptied = publish_collections_();
         }
         router_ = nullptr;
@@ -1834,7 +827,7 @@ class basic_database {
     }
 
     /** How many times the schema has been saved, whose @c schema_copy_of names the copy a mount reads. */
-    [[nodiscard]] std::uint64_t schema_generation() const noexcept { return generation_; }
+    [[nodiscard]] std::uint64_t schema_generation() const noexcept { return schema_.generation(); }
 
     /** How many times the collections have been published, which a memo of a lookup is checked against. */
     [[nodiscard]] std::uint64_t collections_version() const noexcept {
@@ -1842,10 +835,10 @@ class basic_database {
     }
 
     /** The name and the number of every collection, which is short of the full list only when memory runs out. */
-    [[nodiscard]] st::basic_vector<collection_ids_t> list_collections() noexcept {
+    [[nodiscard]] st::vector<collection_ids_t> list_collections() noexcept {
         reader_t const inside = ledger_.epochs().enter();
         std::span<collection_entry_t* const> const entries = collection_entries_();
-        st::basic_vector<collection_ids_t> listed;
+        st::vector<collection_ids_t> listed;
         if (listed.reserve(entries.size()) != st::status_t::success_k) return listed;
         for (collection_entry_t const* entry : entries) {
             collection_ids_t named;
@@ -1860,7 +853,8 @@ class basic_database {
      *  @brief Catalogs a new collection @p name under @p collection_id, shaped by @p config.
      *  @param[in] collection_id The UUID the caller minted, which addresses the collection for as long as it lives.
      *  @param[in] name The name callers reach the collection by, which no other collection may hold.
-     *  @param[in] store_tag The tag of the store the collection lives in, which @c store_tags_ places.
+     *  @param[in] store_tag The tag of the store the collection lives in,
+     *      which @c store_tags_type_ places.
      *  @param[in] config The memory-run bounds, the cache bound and the shape of the tree below.
      *
      *  @note @p store_tag names a store whose value layout fits @c config's value size, so a width of eight bytes is
@@ -1873,7 +867,7 @@ class basic_database {
             return status_t {status_code_t::invalid_argument_k, "A collection name is shorter than that"};
         if (collection_id == collection_invalid_id_k)
             return status_t {status_code_t::invalid_argument_k, "That ID names no collection"};
-        if (store_tags_::index_of(store_tag) >= sizeof...(stores_))
+        if (store_tags_type_::index_of(store_tag) >= sizeof...(store_types_))
             return status_t {status_code_t::invalid_argument_k, "That tag names no store this database keeps"};
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
@@ -2154,9 +1148,9 @@ class basic_database {
     }
 
     /**
-     *  @brief Hands @p visitor the newest version at or below @p stamp of every key from @p from up in the run at
-     *      @p run_index of @p counted, as @c runs_count counted the runs of @p id, consulting no other run, so a key
-     *      another run removed or repeats is still handed out.
+     *  @brief Hands @p visitor the newest version at or below @p stamp of every key from @p from up
+     *      in the run at @p run_index of @p counted, as @c runs_count counted the runs of @p id,
+     *      consulting no other run, so a key another run removed or repeats is still handed out.
      *  @param[in] id The collection whose run is walked.
      *  @param[in] counted The runs as @c runs_count counted them, which the index names one of.
      *  @param[in] run_index Which of the counted runs to walk.
@@ -2259,7 +1253,7 @@ class basic_database {
         };
         [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
             (rung(std::integral_constant<std::size_t, indices_> {}), ...);
-        }(std::index_sequence_for<stores_...> {});
+        }(std::index_sequence_for<store_types_...> {});
         return {};
     }
 
@@ -2395,7 +1389,7 @@ class basic_database {
 
     /** A transaction over every collection, with the delta bounds of @p config. */
     expected<transaction_unique_ptr_t> create_transaction(transaction_config_t const& config) noexcept {
-        return transactions_.create_transaction(config);
+        return transactions_.template create_transaction<transaction_t>(config);
     }
 
     /** A transaction with the delta bounds this database was mounted with. */
@@ -2449,7 +1443,7 @@ class basic_database {
     status_t seal_collection(collection_id_t collection_id,
                              transaction_deltas<stored_key_t, atomic_reference_, waiter_type_> const& written,
                              sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
-        st::basic_vector<keyed_delta<stored_key_t>, constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_>>
+        st::vector<keyed_delta<stored_key_t>, constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_>>
             deltas {
                 constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_> {resources_->memory_constraint}};
         if (deltas.reserve(written.count(collection_id)) != st::status_t::success_k)
@@ -2500,9 +1494,10 @@ class basic_database {
             std::visit([](auto& collection) noexcept { collection.forget_prepared(); }, found->held);
     }
 
-    /** Calls @p visitor with the store @p id's collection lives in, inside the ledger's epochs, which keep the store
-     *  alive until it returns, and answers what it answers, or @c not_found_k for a collection the database names not;
-     *  @p visitor takes every store this database holds and answers a status. */
+    /** Calls @p visitor with the store @p id's collection lives in, inside the ledger's epochs,
+     *  which keep the store alive until it returns, and answers what it answers, or @c not_found_k
+     *  for a collection the database names not; @p visitor takes every store this database holds
+     *  and answers a status. */
     template <typename visitor_type_>
     status_t visit_store(any_collection_id_t const& id, visitor_type_&& visitor,
                          std::size_t thread_index = outside_executor_k) noexcept {
@@ -2529,30 +1524,34 @@ class basic_database {
 
     /** Bytes the caller's own blob takes, which is zero when it has saved none. */
     [[nodiscard]] std::uint64_t user_data_size_bytes() noexcept {
-        [[maybe_unused]] claim_guard_t const held {*this};
-        expected<volume_blob_t> const found = router_->find(database_user_data_name());
-        return found ? found->length : 0;
+        expected<claimed_channel_t> claimed = claim_channel_();
+        if (!claimed) return 0;
+        named_blobs_t blobs {this, &claimed->channel()};
+        return schema_.user_data_size_bytes(blobs);
     }
 
     /** Replaces the caller's own blob with @p bytes, which the engine never reads. */
     status_t save_user_data(bytes_view_t bytes) noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        return write_blob_(claimed->channel(), database_user_data_name(), blob_kind_t::user_data_k, bytes);
+        named_blobs_t blobs {this, &claimed->channel()};
+        return schema_.save_user_data(blobs, bytes);
     }
 
     /** Reads the caller's own blob into @p into, which must hold @c user_data_size_bytes of it. */
     status_t load_user_data(bytes_span_t into) noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        return read_blob_(claimed->channel(), database_user_data_name(), into);
+        named_blobs_t blobs {this, &claimed->channel()};
+        return schema_.load_user_data(blobs, into);
     }
 
     /** Forgets the caller's own blob and returns its bytes to the volume that held it. */
     status_t clear_user_data() noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        return router_->drop(claimed->channel(), database_user_data_name());
+        named_blobs_t blobs {this, &claimed->channel()};
+        return schema_.clear_user_data(blobs);
     }
 
 #pragma endregion User Data
@@ -2574,7 +1573,7 @@ class basic_database {
     struct published_collections_t {
 
         /** The entries, in the order @c collections_ held them. */
-        st::basic_vector<collection_entry_t*> entries;
+        st::vector<collection_entry_t*> entries;
 
         /** Its room in the ledger's list of what the leader unpublished, once a publication replaces it. */
         unpublished_t unpublished;
@@ -2583,53 +1582,41 @@ class basic_database {
     /** One reader inside the ledger's epochs, announced until it dies. */
     using reader_t = typename epoch_domain<atomic_reference_, waiter_type_>::reader_t;
 
-    /**
-     *  @brief The database's one claim, held for the life of the guard.
-     *
-     *  It orders whatever rewrites the schema, a tree or a blob: creates, drops, the maintenance commits pay for, the
-     *  explicit flushes and compactions, and the caller's own blob. No read takes it. A commit takes it once it landed,
-     *  or returns at once when another caller has it, since every holder looks at the views again after it lets go.
-     */
-    class claim_guard_t {
-      public:
+    /** The database's one claim, held for the life of the guard: it orders whatever rewrites the
+     *  schema, a tree or a blob, no read takes it, and a commit takes it once it landed or returns
+     *  at once when another caller has it. */
+    using claim_guard_t = typename maintenance_claim<atomic_reference_, waiter_type_>::template guard<basic_database>;
 
-        claim_guard_t() noexcept = default;
-        claim_guard_t(claim_guard_t const&) = delete;
-        claim_guard_t& operator=(claim_guard_t const&) = delete;
+    friend claim_guard_t;
 
-        /** Takes @p owner's claim, parked while another caller holds it. */
-        explicit claim_guard_t(basic_database& owner) noexcept : owner_(&owner) { owner.claim_.take(); }
+    /** The named blobs of this database, on whichever volume placement gave each, read and written
+     *  on one channel. */
+    struct named_blobs_t {
 
-        /** Takes @p owner's claim if no caller holds it, or answers a guard holding nothing. */
-        [[nodiscard]] static claim_guard_t taken_if_free(basic_database& owner) noexcept {
-            claim_guard_t guard;
-            if (owner.claim_.take_if_free()) guard.owner_ = &owner;
-            return guard;
+        /** The database whose router places the blobs. */
+        basic_database* store = nullptr;
+
+        /** The channel every read and write is queued and flushed on, held by
+         *  the calling thread. */
+        io_channel_t* channel = nullptr;
+
+        /** Bytes the blob @p name holds, or @c not_found_k for a name no volume holds. */
+        expected<std::uint64_t> length(blob_name_t name) noexcept {
+            auto [found, find_status] = store->router_->find(name);
+            if (find_status.failed()) return find_status;
+            return found.length;
         }
 
-        claim_guard_t(claim_guard_t&& other) noexcept : owner_(std::exchange(other.owner_, nullptr)) {}
-
-        claim_guard_t& operator=(claim_guard_t&& other) noexcept {
-            if (this == &other) return *this;
-            release_();
-            owner_ = std::exchange(other.owner_, nullptr);
-            return *this;
+        /** Replaces the blob @p name with @p bytes of @p kind. */
+        status_t write(blob_name_t name, blob_kind_t kind, bytes_view_t bytes) noexcept {
+            return store->write_blob_(*channel, name, kind, bytes);
         }
 
-        ~claim_guard_t() noexcept { release_(); }
+        /** Reads the whole blob @p name into @p into. */
+        status_t read(blob_name_t name, bytes_span_t into) noexcept { return store->read_blob_(*channel, name, into); }
 
-        /** Whether this guard holds the claim. */
-        [[nodiscard]] bool holding() const noexcept { return owner_ != nullptr; }
-
-      private:
-
-        /** Hands the claim back, then maintains whatever a commit left due meanwhile. */
-        void release_() noexcept {
-            if (owner_) std::exchange(owner_, nullptr)->release_claim_();
-        }
-
-        /** The database whose claim this guard holds, null once moved from or never taken. */
-        basic_database* owner_ = nullptr;
+        /** Forgets the blob @p name and returns its bytes to the volume that held it. */
+        status_t drop(blob_name_t name) noexcept { return store->router_->drop(*channel, name); }
     };
 
     /** The claim and the channel one call of this database runs under, released in that order. */
@@ -2671,7 +1658,7 @@ class basic_database {
         std::size_t position_ = 0;
 
         /** The rows laid out and the runs written so far, of the store the collection is held in. */
-        std::variant<typename stores_::ingest_runs_t...> runs_;
+        std::variant<typename store_types_::ingest_runs_t...> runs_;
     };
 
   private:
@@ -2922,13 +1909,14 @@ class basic_database {
      *      still free, takes it back to maintain them, so a commit that found the claim held left its maintenance to
      *      this caller.
      *
-     *  A caller that finds the claim taken again stops, since the new holder looks once more after it lets go, and a
-     *  failed maintenance is met again by the next commit.
+     *  A caller that finds the claim taken again, or a caller parked on it, stops, since
+     *  that holder looks once more after it lets go, and a failed maintenance is met again
+     *  by the next commit.
      */
     void release_claim_() noexcept {
         claim_.release();
         // One look covers a commit that found the claim held; work due after it waits for its collection's next commit.
-        if (!maintenance_due_() || !claim_.take_if_free()) return;
+        if (!maintenance_due_() || claim_.anyone_parked() || !claim_.take_if_free()) return;
         [[maybe_unused]] status_t const maintained = maintain_due_();
         claim_.release();
     }
@@ -2978,14 +1966,15 @@ class basic_database {
         };
         [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
             (rung(std::integral_constant<std::size_t, indices_> {}), ...);
-        }(std::index_sequence_for<stores_...> {});
+        }(std::index_sequence_for<store_types_...> {});
         return result;
     }
 
-    /** Mounts @p entry's collection on its volume in the one of @c stores_ its tag names, which the caller checked. */
+    /** Mounts @p entry's collection on its volume in the one of @c store_types_ its tag names,
+     *  which the caller checked. */
     status_t mount_collection_(collection_entry_t& entry) noexcept {
         status_t mounted;
-        std::size_t const picked = store_tags_::index_of(entry.store_tag);
+        std::size_t const picked = store_tags_type_::index_of(entry.store_tag);
         auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
             if (picked != index_) return;
             using store_t = std::variant_alternative_t<index_, any_collection_t>;
@@ -2996,7 +1985,7 @@ class basic_database {
         };
         [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
             (rung(std::integral_constant<std::size_t, indices_> {}), ...);
-        }(std::index_sequence_for<stores_...> {});
+        }(std::index_sequence_for<store_types_...> {});
         return mounted;
     }
 
@@ -3058,19 +2047,21 @@ class basic_database {
         return carried;
     }
 
-    /**
-     *  @brief Writes the schema out over its older copy, which every change to it does.
-     *
-     *  The durable stamp is read before the runs are listed: every commit at or below it is in some run already, and
-     *  a run a flush adds in between only holds commits above it, which a mount of this copy drops.
-     */
+    /** Writes the schema out over its older copy, which every change to it does. */
     status_t save_schema_(io_channel_t& channel) noexcept {
-        schema_stamps_t stamps;
-        stamps.durable = ledger_.durable_stamp();
-        stamps.generation = generation_ + 1;
-        st::basic_vector<collection_record_t> records;
-        st::basic_vector<lsm_tree_run_record_t> runs;
-        st::basic_vector<lsm_tree_run_stamp_t> ingested;
+        named_blobs_t blobs {this, &channel};
+        return schema_.save(blobs, ledger_.durable_stamp(),
+                            [&](schema_stamps_t const& stamps, st::vector<byte_t>& image) noexcept {
+                                return lay_out_schema_(stamps, image);
+                            });
+    }
+
+    /** Lays every collection, its runs and the stamps ingests assigned them out into @p image
+     *  under @p stamps. */
+    status_t lay_out_schema_(schema_stamps_t const& stamps, st::vector<byte_t>& image) noexcept {
+        st::vector<collection_record_t> records;
+        st::vector<lsm_tree_run_record_t> runs;
+        st::vector<lsm_tree_run_stamp_t> ingested;
         if (records.reserve(collections_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
         for (std::size_t index = 0; index != collections_.size(); ++index) {
@@ -3104,48 +2095,29 @@ class basic_database {
         }
 
         std::uint64_t const version = database_schema_version_k;
-        st::basic_vector<byte_t> image;
         if (image.resize(fields_storage_requirements(version, stamps, records, runs, ingested)) !=
             st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
-        if (status_t const laid = save_fields(bytes_span_t {image}, version, stamps, records, runs, ingested);
-            laid.failed())
-            return laid;
-        if (status_t const written = write_blob_(channel, database_schema_name(schema_copy_of(stamps.generation)),
-                                                 blob_kind_t::schema_k, std::span<byte_t const> {image});
-            written.failed())
-            return written;
-        generation_ = stamps.generation;
-        return {};
+        return save_fields(bytes_span_t {image}, version, stamps, records, runs, ingested);
     }
 
-    /** Reads copy @p copy of the schema into its fields, or leaves @p stamps at generation zero when it is absent; a
-     *  copy of version 2 carries no ingested runs. */
-    status_t read_schema_copy_(io_channel_t& channel, std::size_t copy, schema_stamps_t& stamps,
-                               st::basic_vector<collection_record_t>& records,
-                               st::basic_vector<lsm_tree_run_record_t>& runs,
-                               st::basic_vector<lsm_tree_run_stamp_t>& ingested) const noexcept {
-        auto [found, find_status] = router_->find(database_schema_name(copy));
-        if (find_status.failed()) return find_status == status_code_t::not_found_k ? status_t {} : find_status;
-
-        st::basic_vector<byte_t> image;
-        if (image.resize(static_cast<std::size_t>(found.length)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to read the schema into"};
-        if (status_t const read = read_blob_(channel, database_schema_name(copy), std::span<byte_t> {image});
-            read.failed())
-            return read;
-
+    /** Parses one copy of the schema out of @p image into its fields, answering the stamps it
+     *  carries; a copy of version 2 carries no ingested runs. */
+    static expected<schema_stamps_t> parse_schema_(bytes_view_t image, st::vector<collection_record_t>& records,
+                                                   st::vector<lsm_tree_run_record_t>& runs,
+                                                   st::vector<lsm_tree_run_stamp_t>& ingested) noexcept {
         std::uint64_t version = 0;
-        if (status_t const parsed = load_fields(bytes_view_t {image}, version, stamps, records, runs); parsed.failed())
-            return parsed;
+        schema_stamps_t stamps;
+        if (status_t const parsed = load_fields(image, version, stamps, records, runs); parsed.failed()) return parsed;
         if (version != database_schema_version_k)
-            return {status_code_t::unsupported_k, "The schema follows another version"};
+            return status_t {status_code_t::unsupported_k, "The schema follows another version"};
         if (status_t const parsed = load_fields(
-                bytes_view_t {image}.subspan(fields_storage_requirements(version, stamps, records, runs)), ingested);
+                image.subspan(fields_storage_requirements(version, stamps, records, runs)), ingested);
             parsed.failed())
             return parsed;
-        if (stamps.generation == 0) return {status_code_t::malformed_k, "A saved schema counts at least one save"};
-        return {};
+        if (stamps.generation == 0)
+            return status_t {status_code_t::malformed_k, "A saved schema counts at least one save"};
+        return stamps;
     }
 
     /** Opens every collection the schema names, drops the versions a crash tore and publishes the collections, which a
@@ -3162,7 +2134,7 @@ class basic_database {
 
         // The stamps continue above the durable stamp, and every version above it is a commit a crash tore, which
         // is dropped before anything draws a stamp; resuming first is what lets the truncation's schema promise it.
-        if (status_t const resumed = ledger_.resume(loaded_durable_); resumed.failed()) return resumed;
+        if (status_t const resumed = ledger_.resume(schema_.loaded_durable()); resumed.failed()) return resumed;
         auto [writing, acquire_status] = channels_->acquire();
         if (acquire_status.failed()) return acquire_status;
         schema_write_t recording {this, &claimed->channel()};
@@ -3172,7 +2144,8 @@ class basic_database {
         for (std::size_t index = 0; index != collections_.size(); ++index)
             if (status_t const truncated = std::visit(
                     [&](auto& held) noexcept {
-                        return held.truncate_above(claimed->channel(), writing.channel(), loaded_durable_, published);
+                        return held.truncate_above(claimed->channel(), writing.channel(), schema_.loaded_durable(),
+                                                   published);
                     },
                     collections_[index]->held);
                 truncated.failed())
@@ -3182,40 +2155,39 @@ class basic_database {
 
     /** Opens every collection the schema blob names, which is what a mount of an older database does. */
     status_t load_schema_(io_channel_t& channel) noexcept {
-        // A copy is sealed only once durable, so whichever copies a crash left are whole, and the newer one wins.
-        std::array<schema_stamps_t, 2> stamps {};
-        std::array<st::basic_vector<collection_record_t>, 2> records;
-        std::array<st::basic_vector<lsm_tree_run_record_t>, 2> runs_of;
-        std::array<st::basic_vector<lsm_tree_run_stamp_t>, 2> ingested_of;
-        for (std::size_t copy = 0; copy != 2; ++copy)
-            if (status_t const read = read_schema_copy_(channel, copy, stamps[copy], records[copy], runs_of[copy],
-                                                        ingested_of[copy]);
-                read.failed())
-                return read;
-        std::size_t const newer = stamps[1].generation > stamps[0].generation ? 1 : 0;
-        if (stamps[newer].generation == 0) return {};
-        generation_ = stamps[newer].generation;
-        loaded_durable_ = stamps[newer].durable;
+        std::array<st::vector<collection_record_t>, 2> records;
+        std::array<st::vector<lsm_tree_run_record_t>, 2> runs_of;
+        std::array<st::vector<lsm_tree_run_stamp_t>, 2> ingested_of;
+        named_blobs_t blobs {this, &channel};
+        if (status_t const loaded = schema_.load(blobs,
+                                                 [&](std::size_t copy, st::vector<byte_t>& image) noexcept {
+                                                     return parse_schema_(bytes_view_t {image}, records[copy],
+                                                                          runs_of[copy], ingested_of[copy]);
+                                                 });
+            loaded.failed())
+            return loaded;
+        if (schema_.generation() == 0) return {};
+        std::size_t const newer = schema_copy_of(schema_.generation());
         return adopt_all_(channel, records[newer], runs_of[newer], ingested_of[newer]);
     }
 
     /** Drops every sorted run the volumes hold that no collection names, which a crash between a flush's seal and the
      *  schema save naming its run leaves behind, before anything else of the mount writes. */
     status_t sweep_unnamed_runs_(io_channel_t& channel) noexcept {
-        st::basic_vector<lsm_tree_run_record_t> runs;
+        st::vector<lsm_tree_run_record_t> runs;
         for (std::size_t index = 0; index != collections_.size(); ++index)
             if (status_t const listed = std::visit(
                     [&](auto const& held) noexcept { return record_lsm_tree_runs(held.tree(), runs); },
                     collections_[index]->held);
                 listed.failed())
                 return listed;
-        st::basic_vector<uuid_t> named;
+        st::vector<uuid_t> named;
         if (named.resize(runs.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to list the runs the schema names"};
         for (std::size_t index = 0; index != runs.size(); ++index) named[index] = runs[index].content_id;
         std::sort(named.begin(), named.end());
 
-        st::basic_vector<uuid_t> unnamed;
+        st::vector<uuid_t> unnamed;
         status_t listed;
         router_->for_each(blob_kind_t::sorted_run_k, [&](blob_name_t name, volume_blob_t const&) noexcept {
             if (listed.failed() || name.size() != uuid_t::size_bytes_k) return;
@@ -3237,9 +2209,9 @@ class basic_database {
 
     /** Opens every collection @p records names over the runs @p runs carries for them, in order, with the
      *  @p stamps ingests assigned. */
-    status_t adopt_all_(io_channel_t& channel, st::basic_vector<collection_record_t> const& records,
-                        st::basic_vector<lsm_tree_run_record_t> const& runs,
-                        st::basic_vector<lsm_tree_run_stamp_t> const& stamps) noexcept {
+    status_t adopt_all_(io_channel_t& channel, st::vector<collection_record_t> const& records,
+                        st::vector<lsm_tree_run_record_t> const& runs,
+                        st::vector<lsm_tree_run_stamp_t> const& stamps) noexcept {
         if (collections_.reserve(records.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room for the collections the schema names"};
         std::size_t named = 0;
@@ -3265,7 +2237,7 @@ class basic_database {
                     std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
         if (static_cast<std::size_t>(record.volume) >= router_->size())
             return {status_code_t::malformed_k, "The schema names a volume this mount did not open"};
-        if (store_tags_::index_of(record.store_tag) >= sizeof...(stores_))
+        if (store_tags_type_::index_of(record.store_tag) >= sizeof...(store_types_))
             return {status_code_t::malformed_k, "The schema names a store this database does not keep"};
 
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
@@ -3319,11 +2291,8 @@ class basic_database {
     /** The transactions of this database, which names this store for as long as it lives. */
     registry_t transactions_;
 
-    /** How many times the schema has been saved, which names the copy the next save replaces. */
-    std::uint64_t generation_ = 0;
-
-    /** The durable stamp of the schema the mount read, above which it dropped every version. */
-    transaction_stamp_t loaded_durable_ = unwritten_stamp_k;
+    /** The two copies of the schema and the caller's own blob, and which copy is newer. */
+    schema_copies<named_blobs_t> schema_ {database_schema_name(0), database_schema_name(1), database_user_data_name()};
 
     /** The volumes every run lands on, null until the database is mounted. */
     router_t* router_ = nullptr;
@@ -3335,7 +2304,7 @@ class basic_database {
     database_config_t config_ {};
 
     /** Every collection the schema names, pinned so a snapshot may point into one. */
-    st::basic_vector<entry_pointer_t> collections_;
+    st::vector<entry_pointer_t> collections_;
 
     /** The collections readers load, which @c latest_collections_ owns. */
     published_view<published_collections_t, atomic_reference_> published_collections_;

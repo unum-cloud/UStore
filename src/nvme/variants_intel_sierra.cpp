@@ -2,8 +2,8 @@
  *  @file src/nvme/variants_intel_sierra.cpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief The intel_sierra unit of the NVMe variants: its store waits with @c TPAUSE and adds conditionally with
- *      @c CMPCCXADD.
+ *  @brief The intel_sierra unit of the NVMe variants: its store waits with @c TPAUSE and adds
+ *      conditionally with @c CMPCCXADD.
  */
 #include "variants.hpp"
 

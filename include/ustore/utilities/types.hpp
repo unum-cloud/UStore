@@ -2,8 +2,9 @@
  *  @file include/ustore/utilities/types.hpp
  *  @author Ash Vardanian
  *  @date July 4, 2022
- *  @brief The vocabulary every template here speaks: statuses and the expected wrapper, UUIDs, keys and collection
- *      IDs with their orders, hashes and spellings, edges, value views, integer rounding, and the waiter.
+ *  @brief The vocabulary every template here speaks: statuses and the expected wrapper, UUIDs, keys
+ *      and collection IDs with their orders, hashes and spellings, edges, value views, byte views
+ *      and the serialization over them, owned text, integer rounding, and the waiter.
  *
  *  The statuses and @c expected are re-exported into @c unum::ustore here, and
  *  <tt>cpp/ustore/types.hpp</tt> re-exports the rest, so the C++ SDK and these templates name one
@@ -13,8 +14,15 @@
 #pragma once
 
 #include <cstddef> // `std::byte`, `std::size_t`
-#include <cstdint> // `SIZE_MAX`, `std::int64_t`, `std::uint64_t`
+#include <cstdint> // `SIZE_MAX`, `std::int64_t`, `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::strlen`
+
+#if defined(_WIN32)
+#include <windows.h> // NTSTATUS, which <bcrypt.h> needs
+#include <bcrypt.h>  // `BCryptGenRandom`
+#else
+#include <sys/random.h> // `getentropy`
+#endif
 
 #include <algorithm>   // `std::ranges::equal`, `std::lexicographical_compare_three_way`
 #include <bit>         // `std::bit_floor`
@@ -26,10 +34,13 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <tuple>       // `std::tuple_size`, `std::tuple_element`
-#include <type_traits> // `std::is_nothrow_move_constructible_v`, `std::remove_cvref_t`, `std::type_identity`
-#include <utility>     // `std::cmp_equal`, `std::move`
+#include <type_traits> // `std::is_nothrow_move_constructible_v`, `std::is_trivially_copyable_v`, `std::remove_cvref_t`, `std::type_identity`
+#include <utility> // `std::cmp_equal`, `std::move`
 
-#include <smashtable/shared.hpp> // `st::hash`
+#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <smashtable/shared.hpp>       // `st::hash`, `st::status_t`
+#include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`, `sz::failed`
+#include <stringzilla/types.h>         // `sz_string_view_t`, `sz_strings_span_t`, `sz_status_t`
 
 #include "ustore/ustore.h"
 
@@ -288,6 +299,32 @@ constexpr bool operator==(expected<value_type_> const& result, comparable_type_ 
 
 #pragma endregion Statuses
 
+#pragma region SmashTable Status
+
+/** The status reporting a SmashTable container's @p failure, which every
+ *  fallible member answers. */
+constexpr status_t to_status(st::status_t failure) noexcept {
+    switch (failure) {
+    case st::status_t::success_k: return {};
+    case st::status_t::out_of_memory_heap_k: return {status_code_t::out_of_memory_k, "Out of memory"};
+    case st::status_t::consistency_k: return {status_code_t::internal_k, "A container invariant did not hold"};
+    case st::status_t::operation_not_permitted_k:
+        return {status_code_t::invalid_argument_k, "The object does not admit the call"};
+    case st::status_t::operation_would_block_k: return {status_code_t::internal_k, "A bounded retry gave up"};
+    case st::status_t::invalid_argument_k: return {status_code_t::invalid_argument_k, "Invalid argument"};
+    case st::status_t::capacity_exhausted_k: return {status_code_t::capacity_exhausted_k, "Capacity exhausted"};
+    case st::status_t::input_output_k: return {status_code_t::io_k, "Input or output failed"};
+    case st::status_t::key_already_exists_k: return {status_code_t::already_exists_k, "Key already exists"};
+    case st::status_t::key_not_found_k: return {status_code_t::not_found_k, "Key not found"};
+    case st::status_t::write_conflict_k: return {status_code_t::write_conflict_k, "Write conflict"};
+    case st::status_t::read_conflict_k: return {status_code_t::read_conflict_k, "Read conflict"};
+    case st::status_t::phantom_conflict_k: return {status_code_t::phantom_conflict_k, "Phantom conflict"};
+    default: return {status_code_t::internal_k, "A container failed for an unknown reason"};
+    }
+}
+
+#pragma endregion SmashTable Status
+
 #pragma region Identifier Arithmetic
 
 /** The UUID spelling @p integer big-endian in its last eight bytes, so UUIDs made from integers
@@ -402,6 +439,175 @@ inline expected<ustore_uuid_t> uuid_from_text(std::string_view text) noexcept {
 }
 
 #pragma endregion Identifier Text
+
+#pragma region UUID
+
+/** The bit pattern of octet 8, which says whose layout the remaining bytes follow. */
+enum class uuid_variant_t : std::uint8_t {
+
+    /** The @c 0xxx pattern of the Apollo Network Computing System. */
+    network_computing_system_k,
+
+    /** The @c 10xx pattern of RFC 4122, which every identifier this engine mints carries. */
+    rfc_k,
+
+    /** The @c 110x pattern of the Component Object Model. */
+    microsoft_k,
+
+    /** The @c 111x pattern, which no specification claims. */
+    reserved_k,
+};
+
+/**
+ *  @brief A 128-bit identifier held as sixteen bytes, printed as the canonical 36 characters.
+ *
+ *  A zero identifier names nothing, which is what a default-constructed one holds and
+ *  what @c is_valid reports; every minted identifier is version 4, so all but six of its
+ *  bits are random.
+ */
+struct uuid_t {
+
+    /** Bytes the identifier occupies in memory and on disk. */
+    static constexpr std::size_t size_bytes_k = 16;
+
+    /** Characters the canonical @c 8-4-4-4-12 text form occupies, dashes included. */
+    static constexpr std::size_t printed_length_k = 36;
+
+    /** The sixteen bytes, in the order they are printed and stored. */
+    std::uint8_t bytes[size_bytes_k] = {};
+
+    uuid_t() = default;
+
+    /** Reads an identifier from the sixteen bytes at @p source. */
+    explicit uuid_t(std::span<std::uint8_t const, size_bytes_k> source) noexcept {
+        std::memcpy(bytes, source.data(), size_bytes_k);
+    }
+
+    /** Whose layout the remaining bytes follow, read off octet 8. */
+    constexpr uuid_variant_t variant() const noexcept {
+        if ((bytes[8] & 0x80) == 0x00) return uuid_variant_t::network_computing_system_k;
+        if ((bytes[8] & 0xC0) == 0x80) return uuid_variant_t::rfc_k;
+        if ((bytes[8] & 0xE0) == 0xC0) return uuid_variant_t::microsoft_k;
+        return uuid_variant_t::reserved_k;
+    }
+
+    /** Whether the identifier names anything, which a zero one does not. */
+    constexpr bool is_valid() const noexcept {
+        std::uint8_t any = 0;
+        for (std::size_t index = 0; index != size_bytes_k; ++index) any |= bytes[index];
+        return any != 0;
+    }
+
+    /** The first eight bytes read as a big-endian word, ordering identifiers as @c memcmp does. */
+    constexpr std::uint64_t high_word() const noexcept { return word_(0); }
+
+    /** The last eight bytes read as a big-endian word. */
+    constexpr std::uint64_t low_word() const noexcept { return word_(8); }
+
+    friend constexpr bool operator==(uuid_t const&, uuid_t const&) = default;
+
+    friend constexpr std::strong_ordering operator<=>(uuid_t const& first, uuid_t const& second) noexcept {
+        if (std::strong_ordering const high = first.high_word() <=> second.high_word(); high != 0) return high;
+        return first.low_word() <=> second.low_word();
+    }
+
+    /** Writes the canonical @c 8-4-4-4-12 text form into @p destination, without a terminator. */
+    constexpr void print(std::span<char, printed_length_k> destination) const noexcept {
+        std::size_t written = 0;
+        for (std::size_t index = 0; index != size_bytes_k; ++index) {
+            if (index == 4 || index == 6 || index == 8 || index == 10) destination[written++] = '-';
+            destination[written++] = digits_k[bytes[index] >> 4];
+            destination[written++] = digits_k[bytes[index] & 0x0F];
+        }
+    }
+
+    /** Whether @p text is 36 characters of the canonical form, so @c parse would read it whole. */
+    static constexpr bool parses(std::span<char const, printed_length_k> text) noexcept {
+        std::size_t read = 0;
+        for (std::size_t index = 0; index != size_bytes_k; ++index) {
+            if (index == 4 || index == 6 || index == 8 || index == 10)
+                if (text[read++] != '-') return false;
+            if (value_of_(text[read++]) == invalid_digit_k) return false;
+            if (value_of_(text[read++]) == invalid_digit_k) return false;
+        }
+        return true;
+    }
+
+    /** Reads the canonical form out of @p text, which @c parses has already accepted. */
+    static constexpr uuid_t parse(std::span<char const, printed_length_k> text) noexcept {
+        uuid_t identifier;
+        std::size_t read = 0;
+        for (std::size_t index = 0; index != size_bytes_k; ++index) {
+            if (index == 4 || index == 6 || index == 8 || index == 10) ++read;
+            std::uint8_t const high = value_of_(text[read++]);
+            std::uint8_t const low = value_of_(text[read++]);
+            identifier.bytes[index] = static_cast<std::uint8_t>((high << 4) | low);
+        }
+        return identifier;
+    }
+
+  private:
+
+    /** The lowercase hexadecimal alphabet the text form prints. */
+    static constexpr char digits_k[17] = "0123456789abcdef";
+
+    /** What @c value_of_ answers for a character that is no hexadecimal digit. */
+    static constexpr std::uint8_t invalid_digit_k = 0xFF;
+
+    /** The value of one hexadecimal digit, in either case. */
+    static constexpr std::uint8_t value_of_(char digit) noexcept {
+        if (digit >= '0' && digit <= '9') return static_cast<std::uint8_t>(digit - '0');
+        if (digit >= 'a' && digit <= 'f') return static_cast<std::uint8_t>(digit - 'a' + 10);
+        if (digit >= 'A' && digit <= 'F') return static_cast<std::uint8_t>(digit - 'A' + 10);
+        return invalid_digit_k;
+    }
+
+    /** The eight bytes at @p offset read as one big-endian word. */
+    constexpr std::uint64_t word_(std::size_t offset) const noexcept {
+        std::uint64_t word = 0;
+        for (std::size_t index = 0; index != 8; ++index) word = (word << 8) | bytes[offset + index];
+        return word;
+    }
+};
+
+static_assert(sizeof(uuid_t) == uuid_t::size_bytes_k, "An identifier is its sixteen bytes and nothing else");
+
+/** Fills @p destination with bytes from the operating system, answering whether it could. */
+inline bool fill_with_entropy(std::span<std::uint8_t> destination) noexcept {
+#if defined(_WIN32)
+    return ::BCryptGenRandom(nullptr, destination.data(), static_cast<ULONG>(destination.size()),
+                             BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+#else
+    return ::getentropy(destination.data(), destination.size()) == 0;
+#endif
+}
+
+/**
+ *  @brief Mints a version 4 identifier from the entropy the operating system hands out.
+ *
+ *  Answers a zero identifier, which @c is_valid rejects, when the system refuses entropy; the
+ *  caller learns of that through the identifier rather than through a status, since every source
+ *  of a fresh identifier already validates it before recording it.
+ */
+inline uuid_t uuid_generator() noexcept {
+    uuid_t identifier;
+    if (!fill_with_entropy(identifier.bytes)) return {};
+    identifier.bytes[6] = static_cast<std::uint8_t>((identifier.bytes[6] & 0x0F) | 0x40);
+    identifier.bytes[8] = static_cast<std::uint8_t>((identifier.bytes[8] & 0x3F) | 0x80);
+    return identifier;
+}
+
+/** The identifier folded onto one word, for a table keyed by a number rather than by the bytes. */
+constexpr std::uint64_t uuid_to_u64(uuid_t const& identifier) noexcept {
+    std::uint64_t mixed = identifier.high_word() ^ (identifier.low_word() * 0x9E3779B97F4A7C15ull);
+    mixed ^= mixed >> 30;
+    mixed *= 0xBF58476D1CE4E5B9ull;
+    mixed ^= mixed >> 27;
+    mixed *= 0x94D049BB133111EBull;
+    return mixed ^ (mixed >> 31);
+}
+
+#pragma endregion UUID
 
 #pragma region Locations
 
@@ -566,6 +772,240 @@ inline ustore_strings_view_t u64_tape(void const* data, std::uint64_t const* off
 
 #pragma endregion Variable Length Views
 
+#pragma region Byte Views
+
+/** Bytes a caller may write into. */
+using bytes_span_t = std::span<std::byte>;
+
+/** Bytes a caller may only read. */
+using bytes_view_t = std::span<std::byte const>;
+
+/** A value, or the bytes of a string, owned so it outlives the call that wrote it. */
+using blob_t = st::vector<ustore_byte_t>;
+
+/** The bytes of @p buffer, which a caller may only read. */
+template <typename allocator_type_>
+inline bytes_view_t as_bytes_view(st::vector<std::byte, allocator_type_> const& buffer) noexcept {
+    return bytes_view_t {buffer};
+}
+
+#pragma endregion Byte Views
+
+#pragma region Serialization
+
+/** A value that measures, saves and loads its own bytes, where a successful load consumes its
+ *  storage requirements. */
+template <typename value_type_>
+concept serializable_concept = requires(value_type_ const& constant, value_type_& value, bytes_span_t destination,
+                                        bytes_view_t source) {
+    { constant.storage_requirements() } noexcept -> std::same_as<std::size_t>;
+    { constant.save(destination) } noexcept -> std::same_as<status_t>;
+    { value.load(source) } noexcept -> std::same_as<status_t>;
+};
+
+/** A value stored as its object representation, having no serialization of its own. */
+template <typename value_type_>
+concept trivially_serializable_concept = std::is_trivially_copyable_v<value_type_> &&
+                                         !serializable_concept<value_type_>;
+
+/** The bytes of a trivially serializable value. */
+template <trivially_serializable_concept value_type_>
+std::size_t storage_requirements(value_type_ const&) noexcept {
+    return sizeof(value_type_);
+}
+
+/** Copies the object representation of @p value into @p destination. */
+template <trivially_serializable_concept value_type_>
+status_t save(value_type_ const& value, bytes_span_t destination) noexcept {
+    if (destination.size() < sizeof(value_type_))
+        return status_t {status_code_t::invalid_argument_k, "Buffer is too small"};
+    std::memcpy(destination.data(), &value, sizeof(value_type_));
+    return {};
+}
+
+/** Copies the object representation of @p value out of @p source. */
+template <trivially_serializable_concept value_type_>
+status_t load(value_type_& value, bytes_view_t source) noexcept {
+    if (source.size() < sizeof(value_type_)) return status_t {status_code_t::malformed_k, "Corrupted data"};
+    std::memcpy(&value, source.data(), sizeof(value_type_));
+    return {};
+}
+
+/** The bytes a serializable value reports. */
+template <serializable_concept value_type_>
+std::size_t storage_requirements(value_type_ const& value) noexcept {
+    return value.storage_requirements();
+}
+
+/** Saves a serializable value through its own member. */
+template <serializable_concept value_type_>
+status_t save(value_type_ const& value, bytes_span_t destination) noexcept {
+    return value.save(destination);
+}
+
+/** Loads a serializable value through its own member. */
+template <serializable_concept value_type_>
+status_t load(value_type_& value, bytes_view_t source) noexcept {
+    return value.load(source);
+}
+
+/** The bytes of an array: its 64-bit count, then every element. */
+template <typename element_type_, typename allocator_type_>
+std::size_t storage_requirements(st::vector<element_type_, allocator_type_> const& elements) noexcept {
+    std::size_t bytes = sizeof(std::uint64_t);
+    for (element_type_ const& element : elements) bytes += storage_requirements(element);
+    return bytes;
+}
+
+/** Saves the 64-bit count of @p elements, then every element back to back. */
+template <typename element_type_, typename allocator_type_>
+status_t save(st::vector<element_type_, allocator_type_> const& elements, bytes_span_t destination) noexcept {
+    std::uint64_t const count = elements.size();
+    if (status_t const status = save(count, destination); status.failed()) return status;
+    std::size_t offset = sizeof(count);
+    for (element_type_ const& element : elements) {
+        if (status_t const status = save(element, destination.subspan(offset)); status.failed()) return status;
+        offset += storage_requirements(element);
+    }
+    return {};
+}
+
+/** Loads an array saved as its 64-bit count, then every element back to back. */
+template <typename element_type_, typename allocator_type_>
+status_t load(st::vector<element_type_, allocator_type_>& elements, bytes_view_t source) noexcept {
+    std::uint64_t count = 0;
+    if (status_t const status = load(count, source); status.failed()) return status;
+    std::size_t offset = sizeof(count);
+    // Every element takes at least one byte, so a larger count is corrupt.
+    if (count > source.size() - offset) return status_t {status_code_t::malformed_k, "Corrupted data"};
+    if (st::status_t const status = elements.resize(count); status != st::status_t::success_k) return to_status(status);
+    for (element_type_& element : elements) {
+        if (status_t const status = load(element, source.subspan(offset)); status.failed()) return status;
+        offset += storage_requirements(element);
+    }
+    return {};
+}
+
+/** The bytes of @p fields stored back to back. */
+template <typename... field_types_>
+std::size_t fields_storage_requirements(field_types_ const&... fields) noexcept {
+    return (std::size_t {0} + ... + storage_requirements(fields));
+}
+
+/** Saves no fields. */
+inline status_t save_fields(bytes_span_t) noexcept { return {}; }
+
+/** Saves @p field, then @p fields, back to back into @p destination. */
+template <typename field_type_, typename... field_types_>
+status_t save_fields(bytes_span_t destination, field_type_ const& field, field_types_ const&... fields) noexcept {
+    if (status_t const status = save(field, destination); status.failed()) return status;
+    return save_fields(destination.subspan(storage_requirements(field)), fields...);
+}
+
+/** Loads no fields. */
+inline status_t load_fields(bytes_view_t) noexcept { return {}; }
+
+/** Loads @p field, then @p fields, stored back to back in @p source. */
+template <typename field_type_, typename... field_types_>
+status_t load_fields(bytes_view_t source, field_type_& field, field_types_&... fields) noexcept {
+    if (status_t const status = load(field, source); status.failed()) return status;
+    return load_fields(source.subspan(storage_requirements(field)), fields...);
+}
+
+#pragma endregion Serialization
+
+#pragma region Text
+
+/** Text the engine owns, grown through the fallible members that never throw. */
+using string_t = sz::string_t;
+
+/** A view of text the engine does not own. */
+using string_view_t = sz::string_view_t;
+
+/** The bytes of a string: its 16-bit length, then its characters. */
+inline std::size_t storage_requirements(string_t const& text) noexcept { return sizeof(std::uint16_t) + text.size(); }
+
+/** Saves the 16-bit length of @p text, then its characters. */
+inline status_t save(string_t const& text, bytes_span_t destination) noexcept {
+    if (text.size() > std::numeric_limits<std::uint16_t>::max())
+        return status_t {status_code_t::capacity_exhausted_k, "Data is too big"};
+    if (destination.size() < storage_requirements(text))
+        return status_t {status_code_t::invalid_argument_k, "Buffer is too small"};
+    std::uint16_t const length = static_cast<std::uint16_t>(text.size());
+    std::memcpy(destination.data(), &length, sizeof(length));
+    std::memcpy(destination.data() + sizeof(length), text.data(), length);
+    return {};
+}
+
+/** Loads a string saved as its 16-bit length, then its characters. */
+inline status_t load(string_t& text, bytes_view_t source) noexcept {
+    std::uint16_t length = 0;
+    if (status_t const status = load(length, source); status.failed()) return status;
+    if (source.size() - sizeof(length) < length) return status_t {status_code_t::malformed_k, "Corrupted data"};
+    char const* const characters = reinterpret_cast<char const*>(source.data() + sizeof(length));
+    if (sz::failed(text.assign(string_view_t {characters, length})))
+        return status_t {status_code_t::out_of_memory_k, "No room for a loaded string"};
+    return {};
+}
+
+#pragma endregion Text
+
+#pragma region Kits and StringZilla Bridges
+
+/**
+ *  @brief Picks the first of @p strings_kit_types_ this build compiled and @p capabilities_ runs,
+ *      else @p floor_type_, in one closing @c >::type and no nested @c std::conditional_t pile.
+ *
+ *  Every kit states its own needs: @c capability_k, the capability it runs under,
+ *  and @c compiled_k, whether this build carries its body. A kit whose target this
+ *  build cannot carry is a stub of those two members alone, so naming it in a
+ *  ladder never needs its body. @p capabilities_ is the capability set the kits
+ *  state theirs in.
+ */
+template <auto capabilities_, typename floor_type_, typename... strings_kit_types_>
+struct highest_strings_kit {
+    using type = floor_type_;
+};
+
+template <auto capabilities_, typename floor_type_, typename head_type_, typename... tail_types_>
+struct highest_strings_kit<capabilities_, floor_type_, head_type_, tail_types_...> {
+    using type =
+        std::conditional_t<head_type_::compiled_k && (capabilities_ & head_type_::capability_k) != 0, head_type_,
+                           typename highest_strings_kit<capabilities_, floor_type_, tail_types_...>::type>;
+};
+
+/** Views @p text as StringZilla's pointer and length. */
+inline sz_string_view_t stringzilla_view(std::string_view text) noexcept {
+    sz_string_view_t view;
+    view.start = text.data();
+    view.length = text.size();
+    return view;
+}
+
+/** The bytes of string @p index of @p tape, which a StringZilla kernel wrote. */
+inline std::string_view tape_string(sz_strings_span_t const& tape, std::size_t index) noexcept {
+    if (tape.layout == sz_strings_u64_tape_k) {
+        sz_u64_t const* const offsets = tape.data.u64_tape.offsets;
+        return {tape.data.u64_tape.data + offsets[index],
+                static_cast<std::size_t>(offsets[index + 1] - offsets[index])};
+    }
+    sz_u32_t const* const offsets = tape.data.u32_tape.offsets;
+    return {tape.data.u32_tape.data + offsets[index], static_cast<std::size_t>(offsets[index + 1] - offsets[index])};
+}
+
+/** The status of a failed StringZilla call: a resource or kernel failure as such, any other as
+ *  @p refused, which the caller picks by whose bytes the call read, with @p message saying what
+ *  it was doing. */
+inline status_t stringzilla_refusal(sz_status_t status, status_code_t refused, char const* message) noexcept {
+    switch (status) {
+    case sz_bad_alloc_k: return {status_code_t::out_of_memory_k, message};
+    case sz_missing_kernel_k: return {status_code_t::unsupported_k, message};
+    default: return {refused, message};
+    }
+}
+
+#pragma endregion Kits and StringZilla Bridges
+
 #pragma region Arithmetic and Hashing
 
 constexpr std::size_t bits_in_byte_k = 8;
@@ -575,32 +1015,35 @@ inline std::size_t next_power_of_two(std::size_t value) noexcept { return std::b
 
 /** @p value divided by @p divisor and rounded up, without the overflow <tt>value + divisor - 1</tt>
  *  risks near the limit. */
-template <std::unsigned_integral integer_>
-constexpr integer_ divide_round_up(integer_ value, std::type_identity_t<integer_> divisor) noexcept {
-    return static_cast<integer_>(value / divisor + (value % divisor != 0));
+template <std::unsigned_integral integer_type_>
+constexpr integer_type_ divide_round_up(integer_type_ value, std::type_identity_t<integer_type_> divisor) noexcept {
+    return static_cast<integer_type_>(value / divisor + (value % divisor != 0));
 }
 
 /** The greatest multiple of @p multiple at or below @p value. */
-template <std::unsigned_integral integer_>
-constexpr integer_ round_down_to_multiple(integer_ value, std::type_identity_t<integer_> multiple) noexcept {
-    return static_cast<integer_>(value - value % multiple);
+template <std::unsigned_integral integer_type_>
+constexpr integer_type_ round_down_to_multiple(integer_type_ value,
+                                               std::type_identity_t<integer_type_> multiple) noexcept {
+    return static_cast<integer_type_>(value - value % multiple);
 }
 
-/** The least multiple of @p multiple at or above @p value, saturating at the greatest multiple @p integer_ holds. */
-template <std::unsigned_integral integer_>
-constexpr integer_ round_up_to_multiple(integer_ value, std::type_identity_t<integer_> multiple) noexcept {
-    integer_ const below = round_down_to_multiple(value, multiple);
-    if (below == value || below > std::numeric_limits<integer_>::max() - multiple) return below;
-    return static_cast<integer_>(below + multiple);
+/** The least multiple of @p multiple at or above @p value, saturating at the greatest
+ *  multiple @p integer_type_ holds. */
+template <std::unsigned_integral integer_type_>
+constexpr integer_type_ round_up_to_multiple(integer_type_ value,
+                                             std::type_identity_t<integer_type_> multiple) noexcept {
+    integer_type_ const below = round_down_to_multiple(value, multiple);
+    if (below == value || below > std::numeric_limits<integer_type_>::max() - multiple) return below;
+    return static_cast<integer_type_>(below + multiple);
 }
 
 /**
  *  Mixes the hash of @p value into @p seed.
  *  @see https://www.boost.org/doc/libs/1_37_0/doc/html/hash/reference.html#boost.hash_combine
  */
-template <typename hashable_>
-void hash_combine(std::size_t& seed, hashable_ const& value) noexcept {
-    std::hash<hashable_> hasher;
+template <typename hashable_type_>
+void hash_combine(std::size_t& seed, hashable_type_ const& value) noexcept {
+    std::hash<hashable_type_> hasher;
     seed ^= hasher(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
 }
 

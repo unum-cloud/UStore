@@ -9,8 +9,7 @@
  *  points UStore calls into one table, which stays empty where the driver is absent, so NVIDIA then lists no devices
  *  and the binary still loads. The few driver types, constants and prototypes UStore calls are spelled here, copied
  *  from the driver's stable ABI, so any host compiler builds it. Kernels reach a device as fatbins compiled ahead of
- *  time and embedded in the library, loaded by @c cuda_module_t and launched by name. The runtime helpers the graph's
- *  device fold still calls live apart, in @c vram_nvidia_runtime.cuh.
+ *  time and embedded in the library, loaded by @c cuda_module_t and launched by name.
  */
 
 #pragma once
@@ -68,6 +67,10 @@ inline constexpr unsigned cuda_memory_type_device_k = 2;
 /** The @c CU_MEM_ATTACH_GLOBAL flag of managed allocations, which any stream on any device reaches. */
 inline constexpr unsigned cuda_attach_global_k = 1;
 
+/** The @c CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES of a kernel, the dynamic shared memory
+ *  its launches take. */
+inline constexpr int cuda_function_dynamic_shared_bytes_k = 8;
+
 #pragma endregion Driver ABI
 
 /**
@@ -108,6 +111,8 @@ struct cuda_api_t {
     cuda_result_t (*module_load_data)(cuda_module_handle_t*, void const*) = nullptr;
     cuda_result_t (*module_unload)(cuda_module_handle_t) = nullptr;
     cuda_result_t (*module_get_function)(cuda_function_handle_t*, cuda_module_handle_t, char const*) = nullptr;
+    cuda_result_t (*function_get_attribute)(int*, int, cuda_function_handle_t) = nullptr;
+    cuda_result_t (*function_set_attribute)(cuda_function_handle_t, int, int) = nullptr;
     cuda_result_t (*launch_kernel)(cuda_function_handle_t, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                    unsigned, cuda_stream_handle_t, void**, void**) = nullptr;
 
@@ -150,6 +155,8 @@ struct cuda_api_t {
             library.resolve("cuModuleLoadData", api.module_load_data) &&
             library.resolve("cuModuleUnload", api.module_unload) &&
             library.resolve("cuModuleGetFunction", api.module_get_function) &&
+            library.resolve("cuFuncGetAttribute", api.function_get_attribute) &&
+            library.resolve("cuFuncSetAttribute", api.function_set_attribute) &&
             library.resolve("cuLaunchKernel", api.launch_kernel);
         // A driver without a usable GPU fails its initialization, which lists no devices either
         if (resolved && api.init(0) == cuda_success_k) return api;
@@ -242,6 +249,8 @@ class cuda_event_t {
 /** One fatbin loaded into one device's primary context and unloaded with this owner; kernels are found by name. */
 class cuda_module_t {
   public:
+    using function_t = cuda_function_handle_t;
+
     cuda_module_t() noexcept = default;
     cuda_module_t(cuda_module_t&& other) noexcept
         : api_(other.api_), context_(other.context_), handle_(std::exchange(other.handle_, nullptr)) {}
@@ -280,6 +289,9 @@ class cuda_module_t {
     cuda_module_handle_t handle_ = nullptr;
 };
 
+template <typename module_type_>
+struct kernel_table;
+
 #pragma region Executors
 
 /** The stream every call on one NVIDIA device queues on, the event it waits on, the device's class, and the ceiling
@@ -292,13 +304,19 @@ class cuda_executor_t {
     /** The memory of the arenas made over this executor. */
     using arena_blocks_t = cuda_blocks_t;
 
-    /** Binds CUDA ordinal @p ordinal through @p context, its retained primary context, as of class @p gpu_class, and
-     *  queues on @p borrowed, a @c cudaStream_t of the caller's on that device which outlives the executor, or on one
-     *  of its own for null; its scratch never grows past @p scratch_limit bytes, zero for no limit, and bytes move
-     *  between the drives and the device as @p gds asks. */
+    /** The kernels this executor launches. */
+    using function_t = cuda_function_handle_t;
+
+    /** Binds CUDA ordinal @p ordinal through @p context, its retained primary context, as of
+     *  class @p gpu_class, and queues on @p borrowed, a @c cudaStream_t of the caller's on that
+     *  device which outlives the executor, or on one of its own for null; its scratch never grows
+     *  past @p scratch_limit bytes, zero for no limit, bytes move between the drives and the
+     *  device as @p gds asks, and its launches find their kernels in @p kernels, the device's
+     *  table of the library's bundle, or none for null. */
     static expected<cuda_executor_t> spawn(cuda_api_t const& api, cuda_context_handle_t context, int ordinal,
                                            gpu_class_t gpu_class, void* borrowed, std::size_t scratch_limit,
-                                           ustore_gds_t gds) noexcept {
+                                           ustore_gds_t gds,
+                                           kernel_table<cuda_module_t> const* kernels = nullptr) noexcept {
         if (!api || !context || api.set_current_context(context) != cuda_success_k)
             return status_t {status_code_t::device_k, "The CUDA driver refused the device"};
         cuda_executor_t executor;
@@ -308,6 +326,7 @@ class cuda_executor_t {
         executor.gpu_class_ = gpu_class;
         executor.scratch_limit_ = scratch_limit;
         executor.gds_ = gds;
+        executor.kernels_ = kernels;
         executor.stream_ = static_cast<cuda_stream_handle_t>(borrowed);
         if (!borrowed) {
             if (api.stream_create(&executor.owned_stream_, cuda_stream_non_blocking_k) != cuda_success_k)
@@ -374,6 +393,12 @@ class cuda_executor_t {
 
     /** The stream every call queues on, owned or borrowed. */
     cuda_stream_handle_t stream() const noexcept { return stream_; }
+
+    /** The driver table every call goes through. */
+    cuda_api_t const& api() const noexcept { return *api_; }
+
+    /** The kernels of the library's bundle on the device, or null when none loaded. */
+    kernel_table<cuda_module_t> const* kernels() const noexcept { return kernels_; }
 
     /** Makes the device's context current on the calling thread, once per call, before any other entry below. */
     status_t bind() noexcept {
@@ -454,7 +479,8 @@ class cuda_executor_t {
         std::swap(api_, other.api_), std::swap(context_, other.context_);
         std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);
         std::swap(event_, other.event_), std::swap(device_, other.device_), std::swap(gpu_class_, other.gpu_class_);
-        std::swap(scratch_limit_, other.scratch_limit_), std::swap(gds_, other.gds_);
+        std::swap(scratch_limit_, other.scratch_limit_), std::swap(gds_, other.gds_),
+            std::swap(kernels_, other.kernels_);
         std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
     }
 
@@ -472,6 +498,7 @@ class cuda_executor_t {
     gpu_class_t gpu_class_ = gpu_class_t::unknown_k;
     std::size_t scratch_limit_ = 0;
     ustore_gds_t gds_ = ustore_gds_automatic_k;
+    kernel_table<cuda_module_t> const* kernels_ = nullptr;
     pinned_bounce<cuda_api_t> bounce_;
     managed_blocks_t managed_ {};
 };

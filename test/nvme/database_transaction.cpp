@@ -23,14 +23,17 @@
 #include <utility>     // `std::move`
 #include <variant>     // `std::variant`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_database.hpp"   // `basic_database`, `database_transaction`, `watch_schedule_t`
-#include "ustore/utilities/nvme_volume.hpp" // `basic_volume_router`
+#include "ustore/blobs/nvme_database.hpp"     // `basic_database`
+#include "ustore/blobs/nvme_transactions.hpp" // `watch_schedule_t`
+#include "ustore/utilities/nvme_volume.hpp"   // `basic_volume_router`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
+#include "nvme/fixture.hpp" // `run_on_transport`, `painted`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -66,13 +69,12 @@ struct database_types {
     template <value_layout_t value_layout_>
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
                                       last_write_fold_t, no_device_fold_t>;
-    template <typename... stores_>
-    using database_of =
-        basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, layout_store_tags<stores_...>, stores_...>;
-    using database_t =
-        database_of<blobs_store_of<value_layout_t::inline_12_bytes_k>,
-                    blobs_store_of<value_layout_t::inline_44_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
-                    blobs_store_of<value_layout_t::variable_width_k>>;
+    template <typename... store_types_>
+    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t,
+                                             layout_store_tags<store_types_...>, store_types_...>;
+    using database_t = basic_database_of<
+        blobs_store_of<value_layout_t::inline_12_bytes_k>, blobs_store_of<value_layout_t::inline_44_bytes_k>,
+        blobs_store_of<value_layout_t::fixed_width_k>, blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
     using transaction_unique_ptr_t = typename database_t::transaction_unique_ptr_t;
 
@@ -275,9 +277,9 @@ template <typename database_type_>
     }
 
     // One batch answers the same as the keys one at a time.
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<lookup_result_t> results;
-    st::basic_vector<std::size_t> arrived;
+    st::vector<stored_key_t> keys;
+    st::vector<lookup_result_t> results;
+    st::vector<std::size_t> arrived;
     failures += expect(keys.resize(population_k) == st::status_t::success_k);
     failures += expect(results.resize(population_k) == st::status_t::success_k);
     failures += expect(arrived.resize(population_k) == st::status_t::success_k);
@@ -811,6 +813,27 @@ std::size_t watch_transactions(mount_type_ const& mount) {
                                named[shape_t::variable_k], std::span<stored_key_t const> {zero})
                            .succeeded());
     failures += expect(second.commit().succeeded());
+
+    // A read scoped from the operation pins the stamp it read at past a flush, and a later commit
+    // of the key refuses.
+    failures += expect(
+        store.insert(named[shape_t::variable_k], stored_key_t {0}, value_of(shape_t::variable_k, 1, buffer))
+            .succeeded());
+    stored_value_size_t size = 0;
+    failures += expect(second
+                           .template select<watch_schedule_t::on_commit_since_operation_k>(
+                               named[shape_t::variable_k], stored_key_t {0}, stored_value_span_t {buffer}, size)
+                           .succeeded());
+    failures += expect_eq(mismatches_in(shape_t::variable_k, 1, 0, std::span<byte_t const> {buffer.data(), size}),
+                          std::size_t {0});
+    transaction_stamp_t const pinned_stamp = store.ledger().published();
+    failures += expect_eq(store.ledger().newest_reader(), pinned_stamp);
+    failures += expect(
+        store.insert(named[shape_t::variable_k], stored_key_t {0}, value_of(shape_t::variable_k, 0, buffer))
+            .succeeded());
+    failures += expect(store.flush().succeeded());
+    failures += expect_eq(store.ledger().newest_reader(), pinned_stamp);
+    failures += expect_status(second.commit(), status_code_t::write_conflict_k);
     return failures;
 }
 

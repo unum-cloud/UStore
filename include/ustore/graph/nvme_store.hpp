@@ -29,8 +29,9 @@ namespace unum::ustore::graph {
  *  @tparam volume_type_ The volume every run of the graph lives on.
  *  @tparam atomic_reference_ The reference the published view, the cache and the budget own their words through.
  *  @tparam waiter_type_ What a core waiting on a read or the ledger does between attempts, before it parks.
- *  @tparam device_fold_type_ What composes the changes of a merge on a device, such as
- *      @c vram_nvidia_adjacency_fold_t, or @c blobs::no_device_fold_t where nothing does.
+ *  @tparam device_fold_type_ What composes the changes of a merge on a device,
+ *      such as @c vram_nvidia_adjacency_fold_t, or @c blobs::no_device_fold_t
+ *      where nothing does.
  */
 template <typename stored_key_type_, typename volume_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, typename device_fold_type_>

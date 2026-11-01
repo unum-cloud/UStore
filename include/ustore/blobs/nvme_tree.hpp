@@ -7,40 +7,41 @@
  *
  *  Configurations and on-disk schemas are kept as JSON through yyjson and validated against @c storage_limits_t.
  *
- *  Level zero takes one run per flush of the memory runs, so its runs overlap and only their age tells which
- *  version of a key is current: a lookup walks them newest first and a scan merges them by smallest key.
- *  Every deeper level is written by a merge, so its runs are disjoint and ascending and a lookup is a
- *  binary search over their bounds. Both shapes carry remove deltas; only the bottom level may forget one,
- *  which is a property of the merge that writes it rather than of the level that holds it.
+ *  Level zero takes one run per flush of the memory runs, so its runs overlap and only their age
+ *  tells which version of a key is current: a lookup walks them newest first and a scan merges them
+ *  by smallest key. Every deeper level is written by a merge, so its runs are disjoint and
+ *  ascending and a lookup is a binary search over their bounds. Both shapes carry remove deltas;
+ *  only the bottom level may forget one, which is a property of the merge that writes it rather
+ *  than of the level that holds it.
  *
  *  A level holds its runs through pointers that never move, so the level set a compaction publishes can
  *  name the same runs the set it replaces named. Ownership follows one rule and no other: a level frees
  *  its runs unless it has been told to @c relinquish them, which only a level set being retired is.
  *
- *  The merge itself is arithmetic over key slots and belongs to @c nvme_compaction.hpp, which decides who
- *  survives, cuts the survivors into runs that fit their bounds and plans where every value moves. What
- *  is left to the merger is the I/O: pointing the compactor at each source run's index, then writing the planned
- *  runs out of the plan it answered. Reads and writes ride separate channels because a channel is one queue pair
- *  with one completion queue, so a read pipeline polling on the channel a write pipeline submits on would swallow
- *  the writes' completions.
+ *  The merge itself is arithmetic over key slots and belongs to @c nvme_compaction.hpp, which
+ *  decides who survives, cuts the survivors into runs that fit their bounds and plans where every
+ *  value moves. What is left to the merger is the I/O: pointing the compactor at each source run's
+ *  index, then writing the planned runs out of the plan it answered. Reads and writes ride separate
+ *  channels because a channel is one queue pair with one completion queue, so a read pipeline
+ *  polling on the channel a write pipeline submits on would swallow the writes' completions.
  *
- *  A flush writes one run and a compaction writes a whole level, and both publish by building the next
- *  level set beside the current one, which no one changes once a reader may hold it. The tree hands the
- *  new set to the publication hook its caller names, which publishes it to readers and returns only once
- *  no reader is left in the set it replaced; that set is freed then, which is the whole of the
- *  reclamation, and readers never wait on a writer. A batched read refills the ring as
- *  completions retire rather than submitting a batch and waiting on it, so the depth a read reaches is the
- *  queue pair's and not the batch's.
+ *  A flush writes one run and a compaction writes a whole level, and both publish by building the
+ *  next level set beside the current one, which no one changes once a reader may hold it. The tree
+ *  hands the new set to the publication hook its caller names, which publishes it to readers and
+ *  returns only once no reader is left in the set it replaced; that set is freed then, which is the
+ *  whole of the reclamation, and readers never wait on a writer. A batched read refills the ring as
+ *  completions retire rather than submitting a batch and waiting on it, so the depth a read reaches
+ *  is the queue pair's and not the batch's.
  */
 
 #pragma once
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::int64_t`, `std::uint32_t`, `std::uint64_t`
+#include <cstdint> // `std::uint8_t`, `std::int32_t`, `std::int64_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`, `std::memmove`, `std::memset`
 
-#include <algorithm>   // `std::clamp`, `std::max`, `std::min`
-#include <atomic>      // `std::memory_order_acquire`, `std::memory_order_release`
+#include <algorithm>   // `std::max`, `std::min`
+#include <chrono>      // `std::chrono::system_clock`
 #include <concepts>    // `std::invocable`, `std::same_as`, `std::unsigned_integral`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
@@ -52,25 +53,26 @@
 #include <fmt/format.h>
 #include <yyjson.h>
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <forkunion/atomics.hpp>       // `std::memory_order_acquire`, `std::memory_order_release`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_compaction.hpp"   // `host_compactor_t`, `compaction_output`, `compaction_kind_t`
-#include "ustore/blobs/nvme_key_slot.hpp"     // `storage_limits_t`, `stored_value_size_t`, `value_layout_t`
-#include "ustore/blobs/nvme_sorted_run.hpp"   // `lsm_sorted_run`, `sorted_run_header_t`, `sorted_run_layout`
-#include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`, `io_channel_config_t`, `basic_read_pipeline`
-#include "ustore/utilities/nvme_ring.hpp"     // `extent_t`, `uuid_t`, `uuid_generator`
-#include "ustore/utilities/nvme_volume.hpp"   // `resources_config_t`, `blob_kind_t`
-#include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compaction_output`, `compaction_kind_t`
+#include "ustore/blobs/nvme_key_slot.hpp"          // `storage_limits_t`, `stored_value_size_t`, `value_layout_t`
+#include "ustore/blobs/nvme_sorted_run.hpp"        // `lsm_sorted_run`, `sorted_run_header_t`, `sorted_run_layout`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
+#include "ustore/utilities/nvme_catalog.hpp"       // `blob_kind_t`
+#include "ustore/utilities/nvme_mounts.hpp"        // `resources_config_t`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`, `portable_alignment_k`
+#include "ustore/utilities/nvme_volume.hpp"        // `volume_blob_t`, `volume_id_t`
+#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `byte_t`, `uuid_t`, `uuid_generator`, `save_fields`, `load_fields`
 
 namespace unum::ustore::blobs {
 
-using utilities::cancellation_state_t;
-using utilities::compaction_state_t;
 using utilities::fields_storage_requirements;
 using utilities::load;
 using utilities::load_fields;
 using utilities::pooled_buffer_t;
-using utilities::readers_count_t;
 using utilities::resources_config_t;
 using utilities::ring_concept;
 using utilities::save;
@@ -79,11 +81,36 @@ using utilities::serializable_concept;
 using utilities::storage_requirements;
 using utilities::string_t;
 using utilities::string_view_t;
-using utilities::time_point_t;
 using utilities::uuid_from_text;
 using utilities::uuid_generator;
 using utilities::uuid_text_length_k;
 using utilities::uuid_to_text;
+
+#pragma region Background States
+
+/** The clock every timestamp of the engine is taken from. */
+using clock_t = std::chrono::system_clock;
+
+/** One instant on that clock, as a snapshot, a transaction and a watch record it. */
+using time_point_t = clock_t::time_point;
+
+/** Readers still inside a retired slot, which a publisher waits on before freeing it. */
+using readers_count_t = std::int32_t;
+
+/** Whether the owner of a background job or a merge still wants it, moved by compare-exchange
+ *  on a word. */
+enum class cancellation_state_t : std::int32_t {
+    wanted_k = 0,
+    cancelled_k = 1,
+};
+
+/** Whether a thread holds the right to compact a tree, moved by compare-exchange on a word. */
+enum class compaction_state_t : std::int32_t {
+    idle_k = 0,
+    compacting_k = 1,
+};
+
+#pragma endregion Background States
 
 #pragma region Names
 
@@ -222,14 +249,14 @@ struct sorted_run_schema_t {
 
 /** The sorted run files of one LSM level. */
 struct lsm_level_schema_t {
-    using sorted_runs_t = st::basic_vector<sorted_run_schema_t>;
+    using sorted_runs_t = st::vector<sorted_run_schema_t>;
 
     sorted_runs_t sorted_runs;
 };
 
 /** The levels of one LSM tree. */
 struct lsm_tree_schema_t {
-    using lsm_levels_t = st::basic_vector<lsm_level_schema_t>;
+    using lsm_levels_t = st::vector<lsm_level_schema_t>;
 
     lsm_levels_t lsm_levels;
 };
@@ -256,7 +283,7 @@ struct single_collection_database_schema_t {
         snapshot_id_t id = invalid_snapshot_id_k;
         time_point_t time_stamp = time_point_t::max();
     };
-    using snapshots_t = st::basic_vector<snapshot_t>;
+    using snapshots_t = st::vector<snapshot_t>;
 
     single_collection_database_id_t id;
     collection_schema_t collection;
@@ -288,15 +315,15 @@ struct database_schema_t {
             snapshot_id_t id = invalid_snapshot_id_k;
             collection_snapshot_schema_t collection;
         };
-        using collection_snapshots_schema_t = st::basic_vector<collection_t>;
+        using collection_snapshots_schema_t = st::vector<collection_t>;
 
         snapshot_id_t id = invalid_snapshot_id_k;
         time_point_t time_stamp = time_point_t::max();
         collection_snapshots_schema_t collections;
     };
 
-    using collections_t = st::basic_vector<collection_t>;
-    using snapshots_t = st::basic_vector<snapshot_t>;
+    using collections_t = st::vector<collection_t>;
+    using snapshots_t = st::vector<snapshot_t>;
 
     database_id_t id;
     collections_t collections;
@@ -304,15 +331,15 @@ struct database_schema_t {
 };
 
 /** A schema saved as a document of its own. */
-template <typename schema_>
-concept database_schema_concept = std::same_as<schema_, single_collection_database_schema_t> ||
-                                  std::same_as<schema_, database_schema_t>;
+template <typename schema_type_>
+concept database_schema_concept = std::same_as<schema_type_, single_collection_database_schema_t> ||
+                                  std::same_as<schema_type_, database_schema_t>;
 
 /** A schema saved as bytes behind a signed and versioned header, as backups are. */
-template <typename schema_>
-concept binary_schema_concept = serializable_concept<schema_> && requires {
-    { schema_::schema_kind_k } -> std::convertible_to<schema_kind_t>;
-    { schema_::database_kind_k } -> std::convertible_to<database_kind_t>;
+template <typename schema_type_>
+concept binary_schema_concept = serializable_concept<schema_type_> && requires {
+    { schema_type_::schema_kind_k } -> std::convertible_to<schema_kind_t>;
+    { schema_type_::database_kind_k } -> std::convertible_to<database_kind_t>;
 };
 
 /** The 12 bytes every binary schema file opens with. */
@@ -327,29 +354,29 @@ struct binary_schema_header_t {
 static_assert(sizeof(binary_schema_header_t) == 12);
 
 /** The bytes of @p schema behind its header. */
-template <binary_schema_concept schema_>
-std::size_t binary_schema_storage_requirements(schema_ const& schema) noexcept {
+template <binary_schema_concept schema_type_>
+std::size_t binary_schema_storage_requirements(schema_type_ const& schema) noexcept {
     return sizeof(binary_schema_header_t) + schema.storage_requirements();
 }
 
 /** Saves the header of @p schema, then the schema itself. */
-template <binary_schema_concept schema_>
-status_t save_binary_schema(schema_ const& schema, bytes_span_t destination) noexcept {
+template <binary_schema_concept schema_type_>
+status_t save_binary_schema(schema_type_ const& schema, bytes_span_t destination) noexcept {
     binary_schema_header_t header;
-    header.schema_kind = schema_::schema_kind_k;
-    header.database_kind = schema_::database_kind_k;
+    header.schema_kind = schema_type_::schema_kind_k;
+    header.database_kind = schema_type_::database_kind_k;
     return save_fields(destination, header, schema);
 }
 
 /** Loads a schema behind its header, rejecting another signature, kind or version. */
-template <binary_schema_concept schema_>
-status_t load_binary_schema(schema_& schema, bytes_view_t source) noexcept {
+template <binary_schema_concept schema_type_>
+status_t load_binary_schema(schema_type_& schema, bytes_view_t source) noexcept {
     binary_schema_header_t header;
     if (status_t const status = load(header, source); status.failed()) return status;
     binary_schema_header_t const current;
     if (std::memcmp(header.signature, current.signature, sizeof(current.signature)) != 0)
         return status_t {status_code_t::malformed_k, "Invalid signature"};
-    if (header.schema_kind != schema_::schema_kind_k || header.database_kind != schema_::database_kind_k)
+    if (header.schema_kind != schema_type_::schema_kind_k || header.database_kind != schema_type_::database_kind_k)
         return status_t {status_code_t::malformed_k, "Invalid schema"};
     if (header.major_version != current.major_version || header.minor_version != current.minor_version)
         return status_t {status_code_t::unsupported_k, "Version not supported"};
@@ -365,11 +392,11 @@ inline std::string_view json_string_view(yyjson_val* value) noexcept {
     return yyjson_is_str(value) ? std::string_view {yyjson_get_str(value), yyjson_get_len(value)} : std::string_view {};
 }
 
-/** Reads an unsigned number that fits @p value_. */
-template <std::unsigned_integral value_>
-[[nodiscard]] bool read_json(yyjson_val* value, value_& number) noexcept {
-    if (!yyjson_is_uint(value) || yyjson_get_uint(value) > std::numeric_limits<value_>::max()) return false;
-    number = static_cast<value_>(yyjson_get_uint(value));
+/** Reads an unsigned number that fits @p value_type_. */
+template <std::unsigned_integral value_type_>
+[[nodiscard]] bool read_json(yyjson_val* value, value_type_& number) noexcept {
+    if (!yyjson_is_uint(value) || yyjson_get_uint(value) > std::numeric_limits<value_type_>::max()) return false;
+    number = static_cast<value_type_>(yyjson_get_uint(value));
     return true;
 }
 
@@ -416,15 +443,16 @@ template <std::unsigned_integral value_>
 }
 
 /** Reads an array, replacing the elements of @p elements. */
-template <typename element_, template <typename> typename allocator_>
-[[nodiscard]] bool read_json(yyjson_val* array, st::basic_vector<element_, allocator_<element_>>& elements) noexcept {
+template <typename element_type_, template <typename> typename allocator_>
+[[nodiscard]] bool read_json(yyjson_val* array,
+                             st::vector<element_type_, allocator_<element_type_>>& elements) noexcept {
     if (!yyjson_is_arr(array)) return false;
     elements.clear();
     if (elements.reserve(yyjson_arr_size(array)) != st::status_t::success_k) return false;
     yyjson_arr_iter iterator;
     yyjson_arr_iter_init(array, &iterator);
     while (yyjson_val* const item = yyjson_arr_iter_next(&iterator)) {
-        element_ element;
+        element_type_ element;
         if (!read_json(item, element)) return false;
         if (elements.push_back(std::move(element)) != st::status_t::success_k) return false;
     }
@@ -551,8 +579,8 @@ inline status_t load_schema_header(char const* file_path, schema_header_t& heade
 }
 
 /** Reads the schema document at @p file_path, rejecting one of another kind. */
-template <database_schema_concept schema_>
-status_t load_schema(char const* file_path, schema_& schema) noexcept {
+template <database_schema_concept schema_type_>
+status_t load_schema(char const* file_path, schema_type_& schema) noexcept {
     yyjson_read_err error;
     yyjson_doc* const document = yyjson_read_file(file_path, YYJSON_READ_NOFLAG, nullptr, &error);
     if (!document && error.code == YYJSON_READ_ERROR_FILE_OPEN)
@@ -562,7 +590,8 @@ status_t load_schema(char const* file_path, schema_& schema) noexcept {
     yyjson_val* const root = yyjson_doc_get_root(document);
     schema_header_t header;
     status_t status = read_schema_header(root, header);
-    if (status && (header.schema_kind != schema_::schema_kind_k || header.database_kind != schema_::database_kind_k))
+    if (status &&
+        (header.schema_kind != schema_type_::schema_kind_k || header.database_kind != schema_type_::database_kind_k))
         status = status_t {status_code_t::malformed_k, "Invalid schema"};
     if (status && !read_json(yyjson_obj_get(root, "schema"), schema))
         status = status_t {status_code_t::malformed_k, "Invalid schema"};
@@ -580,8 +609,8 @@ status_t load_schema(char const* file_path, schema_& schema) noexcept {
     return object && value && yyjson_mut_obj_add(object, yyjson_mut_str(document, key), value);
 }
 
-template <std::unsigned_integral value_>
-[[nodiscard]] yyjson_mut_val* write_json(yyjson_mut_doc* document, value_ number) noexcept {
+template <std::unsigned_integral value_type_>
+[[nodiscard]] yyjson_mut_val* write_json(yyjson_mut_doc* document, value_type_ number) noexcept {
     return yyjson_mut_uint(document, number);
 }
 
@@ -609,12 +638,12 @@ template <std::unsigned_integral value_>
     return yyjson_mut_uint(document, static_cast<std::uint16_t>(value_layout));
 }
 
-template <typename element_, template <typename> typename allocator_>
-[[nodiscard]] yyjson_mut_val* write_json(yyjson_mut_doc* document,
-                                         st::basic_vector<element_, allocator_<element_>> const& elements) noexcept {
+template <typename element_type_, template <typename> typename allocator_>
+[[nodiscard]] yyjson_mut_val* write_json(
+    yyjson_mut_doc* document, st::vector<element_type_, allocator_<element_type_>> const& elements) noexcept {
     yyjson_mut_val* const array = yyjson_mut_arr(document);
     if (!array) return nullptr;
-    for (element_ const& element : elements)
+    for (element_type_ const& element : elements)
         if (!yyjson_mut_arr_append(array, write_json(document, element))) return nullptr;
     return array;
 }
@@ -741,8 +770,8 @@ template <typename element_, template <typename> typename allocator_>
 }
 
 /** Writes @p schema as an indented document at @p file_path, replacing any file there. */
-template <database_schema_concept schema_>
-status_t save_schema(char const* file_path, schema_ const& schema) noexcept {
+template <database_schema_concept schema_type_>
+status_t save_schema(char const* file_path, schema_type_ const& schema) noexcept {
     yyjson_mut_doc* const document = yyjson_mut_doc_new(nullptr);
     if (!document) return status_t {status_code_t::out_of_memory_k, "Failed to allocate memory"};
 
@@ -750,9 +779,9 @@ status_t save_schema(char const* file_path, schema_ const& schema) noexcept {
     bool const written =
         add_json_member(document, root, "version", yyjson_mut_str(document, format_version_k)) &&
         add_json_member(document, root, "schema_kind",
-                        yyjson_mut_uint(document, static_cast<std::uint8_t>(schema_::schema_kind_k))) &&
+                        yyjson_mut_uint(document, static_cast<std::uint8_t>(schema_type_::schema_kind_k))) &&
         add_json_member(document, root, "database_kind",
-                        yyjson_mut_uint(document, static_cast<std::uint8_t>(schema_::database_kind_k))) &&
+                        yyjson_mut_uint(document, static_cast<std::uint8_t>(schema_type_::database_kind_k))) &&
         add_json_member(document, root, "schema", write_json(document, schema));
     if (written) yyjson_mut_doc_set_root(document, root);
     bool const saved = written && yyjson_mut_write_file(file_path, document, YYJSON_WRITE_PRETTY, nullptr, nullptr);
@@ -774,22 +803,23 @@ enum class issue_kind_t : std::uint8_t {
 };
 
 /** A callable validation hands every issue to, with a message that lives only during the call. */
-template <typename sink_>
-concept issue_sink_concept = std::invocable<sink_&, issue_kind_t, std::string_view>;
+template <typename sink_type_>
+concept issue_sink_concept = std::invocable<sink_type_&, issue_kind_t, std::string_view>;
 
 /** Formats an issue on the stack and hands it to @p sink, answering whether it was only a warning. */
-template <issue_sink_concept sink_, typename... arguments_>
-bool report_issue(sink_& sink, issue_kind_t kind, fmt::format_string<arguments_...> format,
-                  arguments_&&... arguments) noexcept {
+template <issue_sink_concept sink_type_, typename... argument_types_>
+bool report_issue(sink_type_& sink, issue_kind_t kind, fmt::format_string<argument_types_...> format,
+                  argument_types_&&... arguments) noexcept {
     char message[256];
-    auto const formatted = fmt::format_to_n(message, sizeof(message), format, std::forward<arguments_>(arguments)...);
+    auto const formatted = fmt::format_to_n(message, sizeof(message), format,
+                                            std::forward<argument_types_>(arguments)...);
     sink(kind, std::string_view(message, formatted.out - message));
     return kind == issue_kind_t::warning_k;
 }
 
 /** Checks resources on their own, answering whether no error was reported. */
-template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(resources_config_t const& config, sink_&& sink) noexcept {
+template <issue_sink_concept sink_type_>
+[[nodiscard]] bool validate(resources_config_t const& config, sink_type_&& sink) noexcept {
     if (config.memory_limit == 0) return report_issue(sink, issue_kind_t::error_k, "Memory limit is not set");
     if (config.gpu_devices.empty() && config.gpu_memory_limit > 0)
         return report_issue(sink, issue_kind_t::error_k, "GPU memory limit is set but no GPU device is selected");
@@ -814,8 +844,9 @@ template <issue_sink_concept sink_>
 }
 
 /** Checks resources, then an explicit thread count against @c executor_t::logical_cores_count. */
-template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(resources_config_t const& config, std::size_t logical_cores_count, sink_&& sink) noexcept {
+template <issue_sink_concept sink_type_>
+[[nodiscard]] bool validate(resources_config_t const& config, std::size_t logical_cores_count,
+                            sink_type_&& sink) noexcept {
     if (!validate(config, sink)) return false;
     if (config.threads > logical_cores_count)
         return report_issue(sink, issue_kind_t::error_k, "{} threads exceed the {} logical cores", config.threads,
@@ -826,8 +857,8 @@ template <issue_sink_concept sink_>
 }
 
 /** Checks the delta limits of one transaction against the storage limits. */
-template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(transaction_config_t const& config, sink_&& sink) noexcept {
+template <issue_sink_concept sink_type_>
+[[nodiscard]] bool validate(transaction_config_t const& config, sink_type_&& sink) noexcept {
     if (config.max_deltas < storage_limits_t::transaction_min_deltas_k ||
         config.max_deltas > storage_limits_t::transaction_max_deltas_k)
         return report_issue(sink, issue_kind_t::error_k, "Transaction deltas must be within [{}, {}]",
@@ -840,9 +871,9 @@ template <issue_sink_concept sink_>
 }
 
 /** Checks the limits of one collection holding values of @p value_layout against the storage limits. */
-template <issue_sink_concept sink_>
+template <issue_sink_concept sink_type_>
 [[nodiscard]] bool validate(user_collection_config_t const& config, value_layout_t value_layout,
-                            sink_&& sink) noexcept {
+                            sink_type_&& sink) noexcept {
     if ((config.value_size == 0) == (config.value_max_size == 0))
         return report_issue(sink, issue_kind_t::error_k, "Exactly one of value_size and value_max_size must be set");
 
@@ -899,9 +930,9 @@ template <issue_sink_concept sink_>
 }
 
 /** Checks resources and the limits of a database within them. */
-template <issue_sink_concept sink_>
+template <issue_sink_concept sink_type_>
 [[nodiscard]] bool validate(resources_config_t const& resources, database_config_t const& config,
-                            sink_&& sink) noexcept {
+                            sink_type_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config.default_transaction, sink)) return false;
     if (resources.memory_limit < config.default_transaction.max_bytes)
         return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold one transaction");
@@ -909,9 +940,9 @@ template <issue_sink_concept sink_>
 }
 
 /** Checks resources and the limits of a single-collection database within them. */
-template <issue_sink_concept sink_>
+template <issue_sink_concept sink_type_>
 [[nodiscard]] bool validate(resources_config_t const& resources, user_single_collection_database_config_t const& config,
-                            sink_&& sink) noexcept {
+                            sink_type_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config.default_transaction, sink)) return false;
     if (config.default_transaction.max_deltas > config.collection.memory_runs_max_deltas ||
         config.default_transaction.max_bytes > config.collection.memory_runs_max_bytes)
@@ -924,9 +955,9 @@ template <issue_sink_concept sink_>
 }
 
 /** Checks resources and the limits of a collection within them. */
-template <issue_sink_concept sink_>
+template <issue_sink_concept sink_type_>
 [[nodiscard]] bool validate(resources_config_t const& resources, user_collection_config_t const& config,
-                            sink_&& sink) noexcept {
+                            sink_type_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config, resolve_value_layout(config.value_size), sink)) return false;
     if (resources.memory_limit < config.memory_runs_max_bytes)
         return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold the memory runs");
@@ -1216,7 +1247,7 @@ class lsm_level {
             return {};
         }
 
-        st::basic_vector<std::uint64_t> cursors;
+        st::vector<std::uint64_t> cursors;
         if (cursors.resize(runs_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A level could not track a cursor per run"};
         for (std::size_t index = 0; index != runs_.size(); ++index) cursors[index] = 0;
@@ -1269,7 +1300,7 @@ class lsm_level {
 #pragma region Private Members
 
     /** The runs of the level, oldest first when they overlap and ascending when they do not. */
-    st::basic_vector<sorted_run_t*> runs_;
+    st::vector<sorted_run_t*> runs_;
 
     /** Where this level sits in its tree. */
     std::uint32_t number_ = 0;
@@ -1508,8 +1539,8 @@ class lsm_level_merger {
      *  @param[in,out] reading_channel The channel the source values are gathered on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the new runs are written on, which must not be @p reading_channel.
      *  @param[in] request Which levels merge, what the new runs may grow to, and where the compaction runs.
-     *  @param[in] fold How the collection's changes compose and apply, which reads their values on
-     *      @p reading_channel before any is gathered.
+     *  @param[in] fold How the collection's changes compose and apply, which reads their values
+     *      on @p reading_channel before any is gathered.
      *  @param[in] device_fold How a device composes the collection's changes, or @c no_device_fold_t where none does.
      *  @return The new level, or the status that stopped the merge with every new run already dropped.
      */
@@ -1522,8 +1553,8 @@ class lsm_level_merger {
         if (&reading_channel == &writing_channel)
             return status_t {status_code_t::invalid_argument_k, "A merge reads and writes on two channels"};
 
-        st::basic_vector<sorted_run_t const*> sources;
-        st::basic_vector<sorted_run_index_view<key_slot_t>> views;
+        st::vector<sorted_run_t const*> sources;
+        st::vector<sorted_run_index_view<key_slot_t>> views;
         if (status_t const pointed = point_views_(*request.upper, request.lower, sources, views); pointed.failed())
             return pointed;
 
@@ -1540,12 +1571,12 @@ class lsm_level_merger {
         };
 
         std::size_t const upper_runs = request.upper->size();
-        std::span<sorted_run_index_view<key_slot_t> const> const all {views};
+        std::span<sorted_run_index_view<key_slot_t> const> const level_views {views};
         compaction_output_t output;
         if (status_t const compacted = run_compaction_(
-                kind_of_(request.upper->order(), request.depth), all.first(upper_runs), all.subspan(upper_runs),
-                std::span<sorted_run_t const* const> {sources}, bounds_of_(request), request.stamps, request.placement,
-                request.compactor, fold, device_fold, read_value, output);
+                kind_of_(request.upper->order(), request.depth), level_views.first(upper_runs),
+                level_views.subspan(upper_runs), std::span<sorted_run_t const* const> {sources}, bounds_of_(request),
+                request.stamps, request.placement, request.compactor, fold, device_fold, read_value, output);
             compacted.failed())
             return compacted;
 
@@ -1650,9 +1681,8 @@ class lsm_level_merger {
     }
 
     /** Points a view of @p views at every source run's own cells, which the compactor reads in place. */
-    static status_t point_views_(level_t const& upper, level_t const* lower,
-                                 st::basic_vector<sorted_run_t const*>& sources,
-                                 st::basic_vector<sorted_run_index_view<key_slot_t>>& views) noexcept {
+    static status_t point_views_(level_t const& upper, level_t const* lower, st::vector<sorted_run_t const*>& sources,
+                                 st::vector<sorted_run_index_view<key_slot_t>>& views) noexcept {
         std::size_t const lower_runs = lower != nullptr ? lower->size() : 0;
         std::size_t const runs = upper.size() + lower_runs;
         if (sources.resize(runs) != st::status_t::success_k || views.resize(runs) != st::status_t::success_k)
@@ -1727,7 +1757,7 @@ class lsm_level_merger {
             // No device compaction is compiled for key slots carrying tails.
             if constexpr (!tailed_key_slot_concept<key_slot_t>) {
                 constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
-                st::basic_vector<sorted_run_extents_t> extents;
+                st::vector<sorted_run_extents_t> extents;
                 if (extents.resize(sources.size()) != st::status_t::success_k)
                     return {status_code_t::out_of_memory_k, "A merge could not track where its runs sit"};
                 for (std::size_t index = 0; index != sources.size(); ++index)
@@ -1808,7 +1838,7 @@ class lsm_level_merger {
         header.kinds_bytes = kinds.saved_bytes();
 
         // The run's own value offsets from its first key slot on, none but for a variable width.
-        st::basic_vector<stored_value_offset_t> value_offsets;
+        st::vector<stored_value_offset_t> value_offsets;
         if (!output.value_offsets.empty()) {
             std::uint64_t const begin = output.value_offsets[planned.first_key_slot];
             if (value_offsets.resize(static_cast<std::size_t>(planned.key_slots_count + 1)) != st::status_t::success_k)
@@ -1819,7 +1849,7 @@ class lsm_level_merger {
         }
 
         // The run's own tails and their offsets from its first key slot on, none for a run of whole keys.
-        st::basic_vector<std::uint32_t> tail_offsets;
+        st::vector<std::uint32_t> tail_offsets;
         std::span<byte_t const> tails;
         if (!output.tail_offsets.empty()) {
             std::uint64_t const begin = output.tail_offsets[planned.first_key_slot];
@@ -1954,10 +1984,10 @@ class lsm_level_merger {
                 return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
             std::size_t const depth = reading_channel.queue_pair().depth();
-            st::basic_vector<pending_piece_t> pending;
+            st::vector<pending_piece_t> pending;
             if (pending.resize(depth) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A merge could not track its reads in flight"};
-            st::basic_vector<byte_t> scratch;
+            st::vector<byte_t> scratch;
             if (scratch.resize(static_cast<std::size_t>(block_bytes + read_block)) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A merge could not hold the values it gathers"};
 
@@ -2234,7 +2264,7 @@ class lsm_tree {
         friend class lsm_tree;
 
         /** The levels, which own their runs unless the set relinquishes them to its successor. */
-        st::basic_vector<level_t> levels_;
+        st::vector<level_t> levels_;
     };
 
 #pragma endregion Types
@@ -2348,7 +2378,7 @@ class lsm_tree {
                 return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
             std::size_t const depth = channel.queue_pair().depth();
-            st::basic_vector<pending_read_t> pending;
+            st::vector<pending_read_t> pending;
             if (pending.resize(depth) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A tree could not track its reads in flight"};
 
@@ -2495,8 +2525,9 @@ class lsm_tree {
     }
 
     /**
-     *  @brief A new set naming every run of the current one, and @p runs, sorted and disjoint, on the level
-     *      @c ingest_level_ picks for them, which grows empty sorted levels until it exists.
+     *  @brief A new set naming every run of the current one, and @p runs, sorted and
+     *      disjoint, on the level @c ingest_level_ picks for them, which grows empty sorted
+     *      levels until it exists.
      *  @param[in,out] channel The channel a failed set's runs are dropped on, held by the calling thread.
      *  @param[in,out] runs The runs an ingest wrote, in ascending order of their keys, each moved into the set.
      *  @return The set, or the status that stopped it, with every run it took dropped and the rest left attached.
@@ -2669,23 +2700,24 @@ class lsm_tree {
         for (std::size_t number = 0; number != set.levels_.size(); ++number) set.levels_[number].relinquish();
     }
 
-    /** Drops and frees every run of @p set the current set does not name, and forgets the rest. */
-    void abandon_(level_set_t& set, io_channel_t& channel) noexcept {
-        for (std::size_t number = 0; number != set.levels_.size(); ++number)
-            for (std::size_t index = 0; index != set.level(number).size(); ++index) {
-                sorted_run_t const* const run = &set.level(number).run(index);
+    /** Drops and frees every run of @p levels the current level set does not name, and forgets the
+     *  rest. */
+    void abandon_(level_set_t& levels, io_channel_t& channel) noexcept {
+        for (std::size_t number = 0; number != levels.levels_.size(); ++number)
+            for (std::size_t index = 0; index != levels.level(number).size(); ++index) {
+                sorted_run_t const* const run = &levels.level(number).run(index);
                 if (names_(*levels_, run)) continue;
                 [[maybe_unused]] status_t const dropped = sorted_run_t::drop(*volume_, channel, run->content_id());
                 delete run;
             }
-        relinquish_(set);
+        relinquish_(levels);
     }
 
-    /** Whether @p set names @p run. */
-    [[nodiscard]] static bool names_(level_set_t const& set, sorted_run_t const* run) noexcept {
-        for (std::size_t number = 0; number != set.size(); ++number)
-            for (std::size_t index = 0; index != set.level(number).size(); ++index)
-                if (&set.level(number).run(index) == run) return true;
+    /** Whether @p levels names @p run. */
+    [[nodiscard]] static bool names_(level_set_t const& levels, sorted_run_t const* run) noexcept {
+        for (std::size_t number = 0; number != levels.size(); ++number)
+            for (std::size_t index = 0; index != levels.level(number).size(); ++index)
+                if (&levels.level(number).run(index) == run) return true;
         return false;
     }
 
@@ -2812,7 +2844,7 @@ class lsm_tree {
         bool const grows = lower == source.size();
         std::size_t const last_consumed = grows ? upper : lower;
 
-        st::basic_vector<sorted_run_t const*> consumed;
+        st::vector<sorted_run_t const*> consumed;
         if (status_t const recorded = record_consumed_(source, upper, last_consumed, consumed); recorded.failed())
             return recorded;
 
@@ -2859,7 +2891,7 @@ class lsm_tree {
 
     /** Collects every run of levels @p first through @p last, which the merge has already rewritten. */
     static status_t record_consumed_(level_set_t const& source, std::size_t first, std::size_t last,
-                                     st::basic_vector<sorted_run_t const*>& consumed) noexcept {
+                                     st::vector<sorted_run_t const*>& consumed) noexcept {
         std::size_t runs = 0;
         for (std::size_t number = first; number <= last && number != source.size(); ++number)
             runs += source.level(number).size();
@@ -2901,7 +2933,7 @@ class lsm_tree {
 
 /** Appends a record for every run of @p tree to @p into, level by level and oldest first inside a level. */
 template <typename tree_type_>
-status_t record_lsm_tree_runs(tree_type_ const& tree, st::basic_vector<lsm_tree_run_record_t>& into) noexcept {
+status_t record_lsm_tree_runs(tree_type_ const& tree, st::vector<lsm_tree_run_record_t>& into) noexcept {
     typename tree_type_::level_set_t const& taken = tree.levels();
     std::size_t counted = 0;
     for (std::size_t number = 0; number != taken.size(); ++number) counted += taken.level(number).size();
@@ -2922,7 +2954,7 @@ status_t record_lsm_tree_runs(tree_type_ const& tree, st::basic_vector<lsm_tree_
 
 /** Appends the stamp of every run of @p tree an ingest assigned to @p into, which a schema saves beside the runs. */
 template <typename tree_type_>
-status_t record_lsm_tree_run_stamps(tree_type_ const& tree, st::basic_vector<lsm_tree_run_stamp_t>& into) noexcept {
+status_t record_lsm_tree_run_stamps(tree_type_ const& tree, st::vector<lsm_tree_run_stamp_t>& into) noexcept {
     typename tree_type_::level_set_t const& taken = tree.levels();
     for (std::size_t number = 0; number != taken.size(); ++number) {
         typename tree_type_::level_t const& level = taken.level(number);

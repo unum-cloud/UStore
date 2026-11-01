@@ -1691,7 +1691,7 @@ pub enum Gds {
     /// Direct transfers, refused with [`Status::Device`] where the driver is absent.
     Direct = 1,
     /// cuFile's compatibility mode, which bounces through host pages it manages.
-    Compat = 2,
+    Compatibility = 2,
 }
 
 impl Gds {
@@ -1699,7 +1699,7 @@ impl Gds {
         match raw {
             0 => Some(Gds::Automatic),
             1 => Some(Gds::Direct),
-            2 => Some(Gds::Compat),
+            2 => Some(Gds::Compatibility),
             _ => None,
         }
     }
@@ -3091,7 +3091,7 @@ impl<'matching> Matched<'matching> {
             return ffi::ustore_patterns_t::default();
         }
         ffi::ustore_patterns_t {
-            patterns: ffi::ustore_strings_view_t::accessor(str_views, patterns.as_ptr().cast()),
+            patterns: ffi::ustore_strings_view_t::accessor(string_views, patterns.as_ptr().cast()),
             count: patterns.len() as ffi::ustore_size_t,
             kind: self.matching.pattern_kind as ffi::ustore_enum_t,
             sensitivity: self.matching.sensitivity as ffi::ustore_enum_t,
@@ -3141,7 +3141,7 @@ impl fmt::Debug for Matched<'_> {
 }
 
 /// Writes the view of every `&str` that `indices` names out of the slice `handle` addresses.
-unsafe extern "C" fn str_views(
+unsafe extern "C" fn string_views(
     handle: *const c_void,
     indices: *const ffi::ustore_size_t,
     count: ffi::ustore_size_t,

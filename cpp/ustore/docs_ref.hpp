@@ -10,13 +10,13 @@
 #include <cstddef> // `std::ptrdiff_t`
 
 #include <type_traits> // `std::conditional_t`, `std::decay_t`, `std::is_same_v`
-#include <utility>     // `std::forward`, `std::move`
+#include <utility>     // `std::forward`
 
 #include "ustore/docs.h"
 #include "ustore/docs_table.hpp" // `docs_table`, `table_header`, `table_header_view_t`
 #include "ustore/ranges.hpp"     // `values_view_t`, `lengths_view_t`, `bits_view_t`, `strings_of`, `location_store`
 #include "ustore/status.hpp"     // `status_t`, `expected`
-#include "ustore/types.hpp"      // `arena_t`, `one_off_t`, `in_one_off_arena`, `receiver_t`
+#include "ustore/types.hpp"      // `arena_t`, `one_off_answer_of`, `in_one_off_arena`, `receiver_t`
 
 namespace unum::ustore {
 
@@ -66,13 +66,13 @@ class docs_read_ref {
     }
 
     /** Reads the documents or fields into a one-off arena, which the answer owns, in the format of the proxy. */
-    expected<one_off_t<value_t>> value(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+    expected<one_off_answer_of<value_t>> value(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
         return value(type_, watch);
     }
 
     /** Reads the documents or fields into a one-off arena, which the answer owns, in the format @p type. */
-    expected<one_off_t<value_t>> value(ustore_docs_field_type_t type,
-                                       ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+    expected<one_off_answer_of<value_t>> value(ustore_docs_field_type_t type,
+                                               ustore_watch_t watch = ustore_watch_keys_k) noexcept {
         return in_one_off_arena(receiver_.executor,
                                 [&](arena_t& arena) noexcept { return read_<value_t>(arena, type, watch); });
     }
@@ -83,7 +83,7 @@ class docs_read_ref {
     }
 
     /** Reads the lengths of the documents or fields into a one-off arena. */
-    expected<one_off_t<length_t>> length(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+    expected<one_off_answer_of<length_t>> length(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
         return in_one_off_arena(receiver_.executor, [&](arena_t& arena) noexcept { return length(arena, watch); });
     }
 
@@ -93,7 +93,7 @@ class docs_read_ref {
     }
 
     /** Checks which locations hold a value, which may be empty, into a one-off arena. */
-    expected<one_off_t<present_t>> present(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+    expected<one_off_answer_of<present_t>> present(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
         return in_one_off_arena(receiver_.executor, [&](arena_t& arena) noexcept { return present(arena, watch); });
     }
 
@@ -188,8 +188,8 @@ class docs_read_ref {
         }
     }
 
-    template <typename table_, typename header_>
-    expected<table_> gather_(header_ const& header, arena_t& arena, ustore_watch_t watch) noexcept {
+    template <typename table_type_, typename header_type_>
+    expected<table_type_> gather_(header_type_ const& header, arena_t& arena, ustore_watch_t watch) noexcept {
         decltype(auto) places = locations_store_.ref();
         ustore_size_t const count = keys_extractor_t {}.count(places);
         strided_iterator<ustore_collection_id_t const> const collections = keys_extractor_t {}.collections(places);
@@ -199,7 +199,7 @@ class docs_read_ref {
         strided_strings<std::string_view> const field_names {fields.begin()};
 
         // The C ABI reads one type per field back to back, so a header striding over its columns lends a copy
-        st::basic_vector<ustore_docs_field_type_t> packed;
+        st::vector<ustore_docs_field_type_t> packed;
         ustore_docs_field_type_t const* packed_types = types.data();
         if (types.size() > 1 && types.stride() != sizeof(ustore_docs_field_type_t)) {
             if (st::failed(packed.resize(types.size())))
@@ -226,7 +226,7 @@ class docs_read_ref {
 
         ustore_docs_gather(&docs_gather);
         if (status_t const status {outcome}; status.failed()) return status;
-        return table_ {count, fields.size(), collections, keys, fields.begin(), types.begin(), columns};
+        return table_type_ {count, fields.size(), collections, keys, fields.begin(), types.begin(), columns};
     }
 };
 

@@ -41,15 +41,14 @@
 #endif
 
 #include <array>   // `std::array`
-#include <atomic>  // `std::atomic_ref`
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/nvme_disks.hpp" // `native_file_t`, `open_native_file`, `native_file_capacity`
-#include "ustore/utilities/nvme_ring.hpp"  // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
-#include "ustore/utilities/types.hpp"      // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
+#include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -167,8 +166,8 @@ struct direct_alignment_t {
  *  A defect the ring can see before the kernel does - a stale registered memory, an extent past its
  *  range, a length past one transfer, an alignment the filesystem refuses - never fails the batch.
  *  It becomes that one request's completion and leaves its neighbours alone, which is what a chain
- *  of submission entries would do anyway. Only a token that is not this queue pair's fails the whole
- *  @c submit, since a misrouted completion is unrecoverable.
+ *  of submission entries would do anyway. Only a token that is not this queue pair's fails the
+ *  whole @c submit, since a misrouted completion is unrecoverable.
  *
  *  @tparam atomic_reference_ The reference the claim, epoch and in-flight words are owned through.
  *  @tparam waiter_type_ What a draining core does after a poll that moved nothing.
@@ -506,7 +505,7 @@ class linux_uring_files_disk {
 
         std::uint32_t const base = window_of_(queue_pair.id());
         std::size_t const credit = slot->depth - (slot->flights_count + slot->locals_count);
-        unsigned const consumed = std::atomic_ref<unsigned> {*ring.submission_head}.load(std::memory_order_acquire);
+        unsigned const consumed = atomic_reference_<unsigned> {*ring.submission_head}.load(std::memory_order_acquire);
         unsigned const published = *ring.submission_tail;
         std::size_t const seats = ring.submission_entries_count - (published - consumed);
         std::size_t const room = credit < seats ? credit : seats;
@@ -514,20 +513,20 @@ class linux_uring_files_disk {
 
         io_uring_sqe* linked = nullptr;
         std::size_t queued = 0;
-        bool cut = false;
+        bool chain_broken = false;
         for (std::size_t index = 0; index != taking; ++index) {
             request_t const& request = requests[index];
-            if (cut) {
+            if (chain_broken) {
                 unlink_(linked);
                 push_local_(*slot, base, cancelled_completion_(request.token));
-                cut = chains_next_(request);
+                chain_broken = chains_next_(request);
                 continue;
             }
             status_t const defect = inspect_(request);
             if (defect.failed()) {
                 unlink_(linked);
                 push_local_(*slot, base, failed_completion_(request.token, defect));
-                cut = chains_next_(request);
+                chain_broken = chains_next_(request);
                 continue;
             }
             io_uring_sqe& entry = ring.submission_entries[(published + queued) & ring.submission_mask];
@@ -536,13 +535,13 @@ class linux_uring_files_disk {
             track_(*slot, base, request);
             linked = chains_next_(request) ? &entry : nullptr;
             ++queued;
-            cut = false;
+            chain_broken = false;
         }
         unlink_(linked);
 
         if (queued != 0) {
-            std::atomic_ref<unsigned> {*ring.submission_tail}.store(static_cast<unsigned>(published + queued),
-                                                                    std::memory_order_release);
+            atomic_reference_<unsigned> {*ring.submission_tail}.store(static_cast<unsigned>(published + queued),
+                                                                      std::memory_order_release);
             std::size_t accepted = 0;
             while (accepted != queued) {
                 long const entered = ::syscall(__NR_io_uring_enter, ring.file, static_cast<unsigned>(queued - accepted),
@@ -598,7 +597,7 @@ class linux_uring_files_disk {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot || slot->flights_count == 0) return;
         ring_t& ring = rings_[static_cast<std::size_t>(queue_pair.id())];
-        unsigned const consumed = std::atomic_ref<unsigned> {*ring.submission_head}.load(std::memory_order_acquire);
+        unsigned const consumed = atomic_reference_<unsigned> {*ring.submission_head}.load(std::memory_order_acquire);
         unsigned const published = *ring.submission_tail;
         if (published - consumed >= ring.submission_entries_count) return;
 
@@ -607,7 +606,7 @@ class linux_uring_files_disk {
         entry.opcode = IORING_OP_ASYNC_CANCEL;
         entry.cancel_flags = IORING_ASYNC_CANCEL_ANY;
         entry.user_data = cancel_marker_k;
-        std::atomic_ref<unsigned> {*ring.submission_tail}.store(published + 1, std::memory_order_release);
+        atomic_reference_<unsigned> {*ring.submission_tail}.store(published + 1, std::memory_order_release);
         [[maybe_unused]] long const entered = ::syscall(__NR_io_uring_enter, ring.file, 1u, 0u, 0u, nullptr, 0);
     }
 
@@ -815,7 +814,7 @@ class linux_uring_files_disk {
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
-    static status_t size_(st::basic_vector<element_type_>& elements, std::size_t count) noexcept {
+    static status_t size_(st::vector<element_type_>& elements, std::size_t count) noexcept {
         if (elements.resize(count) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A ring could not allocate its slots"};
         return {};
@@ -1000,7 +999,7 @@ class linux_uring_files_disk {
 
     /** Whether the kernel is holding completions back because the queue had no room for them. */
     [[nodiscard]] static bool overflowed_(ring_t const& ring) noexcept {
-        unsigned const flags = std::atomic_ref<unsigned> {*ring.submission_flags}.load(std::memory_order_acquire);
+        unsigned const flags = atomic_reference_<unsigned> {*ring.submission_flags}.load(std::memory_order_acquire);
         return (flags & IORING_SQ_CQ_OVERFLOW) != 0;
     }
 
@@ -1198,7 +1197,7 @@ class linux_uring_files_disk {
     /** Takes @p count entries the kernel would not accept back out of the queue and fails them. */
     void refuse_tail_(queue_pair_slot_t& slot, std::uint32_t base, ring_t& ring, unsigned tail,
                       std::size_t count) noexcept {
-        std::atomic_ref<unsigned> {*ring.submission_tail}.store(tail, std::memory_order_release);
+        atomic_reference_<unsigned> {*ring.submission_tail}.store(tail, std::memory_order_release);
         status_t const refused {status_code_t::io_k, "The kernel would not accept this request"};
         for (std::size_t index = 0; index != count; ++index) {
             flight_t const& flight = flights_[base + slot.flights_count - 1];
@@ -1234,7 +1233,7 @@ class linux_uring_files_disk {
                                   std::span<completion_t> into) noexcept {
         unsigned const taken = *ring.completion_head;
         unsigned head = taken;
-        unsigned const posted = std::atomic_ref<unsigned> {*ring.completion_tail}.load(std::memory_order_acquire);
+        unsigned const posted = atomic_reference_<unsigned> {*ring.completion_tail}.load(std::memory_order_acquire);
         std::size_t moved = 0;
         while (head != posted && moved != into.size()) {
             io_uring_cqe const& entry = ring.completion_entries[head & ring.completion_mask];
@@ -1245,35 +1244,35 @@ class linux_uring_files_disk {
             restore_(*flight);
             ++moved;
         }
-        if (head != taken) std::atomic_ref<unsigned> {*ring.completion_head}.store(head, std::memory_order_release);
+        if (head != taken) atomic_reference_<unsigned> {*ring.completion_head}.store(head, std::memory_order_release);
         return moved;
     }
 
 #pragma endregion Requests
 
     /** One slot per queue pair the disk hands out. */
-    st::basic_vector<queue_pair_slot_t> queue_pairs_;
+    st::vector<queue_pair_slot_t> queue_pairs_;
 
     /** One ring per queue pair, since a deferred single-bound thread ring belongs to exactly one thread. */
-    st::basic_vector<ring_t> rings_;
+    st::vector<ring_t> rings_;
 
     /** One slot per memory range the disk records. */
-    st::basic_vector<registered_memory_slot_t> registered_memories_;
+    st::vector<registered_memory_slot_t> registered_memories_;
 
     /** One slot per medium the disk opens. */
-    st::basic_vector<registered_medium_slot_t> media_;
+    st::vector<registered_medium_slot_t> media_;
 
     /** Every queue pair's outstanding requests, in windows of @c depth_limit_. */
-    st::basic_vector<flight_t> flights_;
+    st::vector<flight_t> flights_;
 
     /** Every queue pair's own completions, in windows of @c depth_limit_ read as a circle. */
-    st::basic_vector<completion_t> locals_;
+    st::vector<completion_t> locals_;
 
     /** One buffer table per ring, written by that ring's own thread. */
-    st::basic_vector<::iovec> vectors_;
+    st::vector<::iovec> vectors_;
 
     /** One file table per ring, written by that ring's own thread. */
-    st::basic_vector<int> registered_media_;
+    st::vector<int> registered_media_;
 
     /** Raised whenever a range is recorded or given back, so a ring knows its table is behind. */
     epoch_t registered_memories_epoch_ = 1;

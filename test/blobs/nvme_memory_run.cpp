@@ -15,7 +15,6 @@
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
 #include <algorithm>       // `std::upper_bound`
-#include <atomic>          // `std::atomic`
 #include <map>             // `std::map`
 #include <random>          // `std::mt19937_64`, `std::uniform_int_distribution`
 #include <source_location> // `std::source_location`
@@ -43,12 +42,16 @@ using sealed_t = sealed_deltas<stored_key_t>;
 using run_t = memory_run<stored_key_t>;
 using view_t = collection_view<run_t>;
 
-/** The atomic reference the views and the epochs are instantiated with: the portable one. */
+/** The atomic reference every suite instantiates the engine's templates with: the portable one, as
+ *  no suite picks a CPU class. */
 template <typename value_type_>
 using atomic_reference = fu::standard_atomic_ref<value_type_>;
 
-/** The epochs every case announces its readers in, waiting out readers by yielding. */
-using epoch_domain_t = epoch_domain<atomic_reference, fu::standard_yield_t>;
+/** The waiter every suite instantiates the engine's templates with, yielding between attempts. */
+using waiter_t = fu::standard_yield_t;
+
+/** The epochs every case announces its readers in. */
+using epoch_domain_t = epoch_domain<atomic_reference, waiter_t>;
 using bytes_t = std::vector<byte_t>;
 
 #pragma region Harness and Model
@@ -117,8 +120,8 @@ static std::size_t refusals() {
     std::vector<keyed_delta_t> loaded_removal {{3, {delta_kind_t::remove_k, payload}}};
     failures += check(sealed_t::seal(loaded_removal).code() == status_code_t::invalid_argument_k);
 
-    std::vector<keyed_delta_t> one {{3, {delta_kind_t::write_k, payload}}};
-    expected<sealed_t> sealed = sealed_t::seal(one);
+    std::vector<keyed_delta_t> deltas {{3, {delta_kind_t::write_k, payload}}};
+    expected<sealed_t> sealed = sealed_t::seal(deltas);
     if (check(sealed.has_value())) return failures + 1;
     failures += check(run_t::stamped(std::move(*sealed), unwritten_stamp_k).code() ==
                       status_code_t::invalid_argument_k);
@@ -240,8 +243,8 @@ static std::size_t random_streams_match_model() {
 /** A view a publisher allocated and frees once replaced, counting itself out when freed. */
 struct held_view_t {
     view_t view;
-    std::atomic<std::size_t>* alive = nullptr;
-    ~held_view_t() noexcept { alive->fetch_sub(1, std::memory_order_relaxed); }
+    std::size_t* alive = nullptr;
+    ~held_view_t() noexcept { atomic_reference<std::size_t> {*alive}.fetch_sub(1, std::memory_order_relaxed); }
 };
 
 /**
@@ -269,11 +272,11 @@ static std::size_t readers_against_one_publisher() {
     st::commit_order_t order;
     epoch_domain_t epochs;
     std::size_t failures = check(epochs.reserve_threads(1).succeeded());
-    std::atomic<std::size_t> alive {0};
+    std::size_t alive {0};
     auto held = [&]() noexcept {
         held_view_t* const made = new held_view_t {};
         made->alive = &alive;
-        alive.fetch_add(1, std::memory_order_relaxed);
+        atomic_reference<std::size_t> {alive}.fetch_add(1, std::memory_order_relaxed);
         return made;
     };
 
@@ -328,7 +331,7 @@ static std::size_t readers_against_one_publisher() {
             delete std::exchange(first_current, first_next);
             delete std::exchange(second_current, second_next);
             // Nothing replaced outlives the commit that replaced it.
-            publisher_failures += check(alive.load(std::memory_order_relaxed) == 2);
+            publisher_failures += check(atomic_reference<std::size_t> {alive}.load(std::memory_order_relaxed) == 2);
         }
     };
 
@@ -377,7 +380,7 @@ static std::size_t readers_against_one_publisher() {
     failures += publisher_failures;
     delete first_current;
     delete second_current;
-    failures += check(alive.load() == 0);
+    failures += check(atomic_reference<std::size_t> {alive}.load() == 0);
     std::size_t reads = 0;
     for (std::size_t reader = 0; reader != readers_count_k; ++reader) {
         failures += reader_failures[reader];

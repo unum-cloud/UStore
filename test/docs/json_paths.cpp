@@ -26,11 +26,11 @@
 #include <fmt/format.h> // `fmt::println`
 #include <yyjson.h>     // `yyjson_val`
 
-#include <stringzilla/capabilities.h> // `sz_capabilities_enabled_cpu`
+#include <stringzilla/capabilities.h> // `sz_capabilities_compiled_cpu_mask`, `sz_capabilities_enabled_cpu`
 
 #include "ustore/docs/json_paths.hpp"       // `extract_fields`, `json_path_of`, `json_text_of`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `json_lookup`, `gather_scalar`, `json_to_string`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_free`, `arena_allocator`, `stringzilla_kernels_t`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_free`, `arena_allocator`, `strings_ladder`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`, `random_t`
 
@@ -40,6 +40,17 @@ using namespace unum::ustore::docs;
 using namespace unum::ustore::utilities;
 
 namespace unum::ustore::test {
+
+/** The widest StringZilla kernels this build compiled. */
+using strings_kit_t = strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+
+/** The StringZilla capabilities this machine runs among those the build compiled, which the engines
+ *  compile for, while @c strings_kit_t keeps to a tier the build's own flags guarantee. */
+sz_capability_t strings_capabilities() noexcept {
+    sz_capability_t capabilities = sz_cap_serial_k;
+    if (sz_capabilities_enabled_cpu(&capabilities) != sz_success_k) capabilities = sz_cap_serial_k;
+    return capabilities;
+}
 
 /** An arena freed with every block it grew when the test ends. */
 class scoped_arena_t {
@@ -78,10 +89,15 @@ struct documents_batch_t {
 
 #pragma region Random Documents
 
-/** Writes random lenient JSON: nested containers, duplicate and escaped keys, numbers of every shape and strings. */
+/** Which JSON a writer spells: strict RFC 8259, or lenient with comments and the non-finite numbers
+ *  yyjson admits. */
+enum class json_dialect_t : bool { strict_k, lenient_k };
+
+/** Writes random JSON of a dialect: nested containers, duplicate and escaped keys, numbers of every
+ *  shape and strings. */
 class document_writer_t {
     random_t& random_;
-    bool lenient_;
+    json_dialect_t dialect_;
 
     static constexpr std::string_view keys_k[] = {
         "a", "b", "c", "0", "1", "01", "-", "a/b", "t~x", "it's", "q\\\"uote", "\\\\back", "\xC3\xA9", "", "\\u0061",
@@ -143,76 +159,77 @@ class document_writer_t {
 
     std::string_view pick(std::span<std::string_view const> pool) noexcept { return pool[random_.below(pool.size())]; }
 
-    void blank(std::string& out) {
+    void blank(std::string& text) {
         constexpr std::string_view blanks_k[] = {"", "", " ", "\n", "\t ", "\r\n  "};
-        out += pick(blanks_k);
-        if (lenient_ && random_.below(16) == 0) out += random_.below(2) ? "/* {\"a\": [ */" : "// ] } \"\n";
+        text += pick(blanks_k);
+        if (dialect_ == json_dialect_t::lenient_k && random_.below(16) == 0)
+            text += random_.below(2) ? "/* {\"a\": [ */" : "// ] } \"\n";
     }
 
-    void scalar(std::string& out) {
-        switch (random_.below(lenient_ ? 7 : 6)) {
-        case 0: out += pick(numbers_k); break;
-        case 1: out += pick(numbers_k); break;
+    void scalar(std::string& text) {
+        switch (random_.below(dialect_ == json_dialect_t::lenient_k ? 7 : 6)) {
+        case 0: text += pick(numbers_k); break;
+        case 1: text += pick(numbers_k); break;
         case 2:
-        case 3: out += pick(strings_k); break;
-        case 4: out += random_.below(2) ? "true" : "false"; break;
-        case 5: out += "null"; break;
-        default: out += pick(lenient_k); break;
+        case 3: text += pick(strings_k); break;
+        case 4: text += random_.below(2) ? "true" : "false"; break;
+        case 5: text += "null"; break;
+        default: text += pick(lenient_k); break;
         }
     }
 
   public:
-    document_writer_t(random_t& random, bool lenient) noexcept : random_(random), lenient_(lenient) {}
+    document_writer_t(random_t& random, json_dialect_t dialect) noexcept : random_(random), dialect_(dialect) {}
 
-    void value(std::string& out, std::size_t depth) {
+    void value(std::string& text, std::size_t depth) {
         std::uint64_t const kind = depth >= 3 ? 2 : random_.below(4);
         if (kind == 0) {
-            out += '{';
+            text += '{';
             std::size_t const members = random_.below(5);
             for (std::size_t member = 0; member != members; ++member) {
-                if (member) out += ',';
-                blank(out);
-                out += '"', out += pick(keys_k), out += '"';
-                blank(out);
-                out += ':';
-                blank(out);
-                value(out, depth + 1);
-                blank(out);
+                if (member) text += ',';
+                blank(text);
+                text += '"', text += pick(keys_k), text += '"';
+                blank(text);
+                text += ':';
+                blank(text);
+                value(text, depth + 1);
+                blank(text);
             }
-            out += '}';
+            text += '}';
         }
         else if (kind == 1) {
-            out += '[';
+            text += '[';
             std::size_t const elements = random_.below(4);
             for (std::size_t element = 0; element != elements; ++element) {
-                if (element) out += ',';
-                blank(out);
-                value(out, depth + 1);
-                blank(out);
+                if (element) text += ',';
+                blank(text);
+                value(text, depth + 1);
+                blank(text);
             }
-            out += ']';
+            text += ']';
         }
-        else scalar(out);
+        else scalar(text);
     }
 
     /** A whole document, an object at its root most of the time. */
     std::string document() {
-        std::string out;
-        blank(out);
+        std::string text;
+        blank(text);
         if (random_.below(8)) {
-            out += '{';
+            text += '{';
             std::size_t const members = 1 + random_.below(6);
             for (std::size_t member = 0; member != members; ++member) {
-                if (member) out += ',';
-                out += '"', out += pick(keys_k), out += "\":";
-                blank(out);
-                value(out, 1);
+                if (member) text += ',';
+                text += '"', text += pick(keys_k), text += "\":";
+                blank(text);
+                value(text, 1);
             }
-            out += '}';
+            text += '}';
         }
-        else value(out, 0);
-        blank(out);
-        return out;
+        else value(text, 0);
+        blank(text);
+        return text;
     }
 };
 
@@ -268,7 +285,7 @@ std::size_t compare_values(yyjson_val* oracle, json_cell_t const& candidate, ust
 
     // A container prints with its strings and numbers as written, so yyjson reads it back before the texts compare
     auto [oracle_text, oracle_status] = json_dump({oracle, nullptr}, arena);
-    auto [candidate_text, candidate_status] = json_text_of(candidate, arena);
+    auto [candidate_text, candidate_status] = json_text_of<strings_kit_t>(candidate, arena);
     if (candidate_status.succeeded() && yyjson_is_ctn(oracle)) {
         auto [reparsed, reparsed_status] = json_parse(candidate_text, arena);
         if (reparsed_status.failed()) report_difference("minified container");
@@ -315,8 +332,7 @@ std::size_t compare_values(yyjson_val* oracle, json_cell_t const& candidate, ust
 
 /** Extracts every field of @p fields over @p batch and compares it with yyjson's lookup, answering the status of the
  *  extraction in @p status, which a batch of lenient documents may leave malformed. */
-std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view const> fields,
-                          stringzilla_kernels_t const& kernels, status_t& status) {
+std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view const> fields, status_t& status) {
     std::size_t failures = 0;
     scoped_arena_t arena;
     json_documents_t const documents = batch.view();
@@ -325,7 +341,8 @@ std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view c
         return field_cell_t {cell % documents.count, cell / documents.count};
     };
     json_cells_t cells;
-    status = extract_fields(documents, fields, cells_count, cell_of, kernels, arena, cells);
+    status = extract_fields<strings_kit_t>(documents, fields, cells_count, cell_of, strings_capabilities(), arena,
+                                           cells);
     if (status.failed()) return failures;
     for (std::size_t document_index = 0; document_index != documents.count; ++document_index) {
         std::string_view const document = documents[document_index];
@@ -373,7 +390,7 @@ std::size_t json_paths_translation() {
         {"/a~", ""},
     };
     for (translation_t const& translation : translations) {
-        st::basic_vector<char, arena_allocator<char>> path {{ustore_arena_t {arena}}};
+        st::vector<char, arena_allocator<char>> path {{ustore_arena_t {arena}}};
         auto [valid, status] = json_path_of(translation.field, path);
         failures += expect(status.succeeded());
         failures += expect_eq(valid, !translation.path.empty());
@@ -384,7 +401,7 @@ std::size_t json_paths_translation() {
 
 /** Slashes inside strings extract as written, while a comment anywhere, even inside a container no path enters, makes
  *  the document malformed, as a write refuses it too. */
-std::size_t json_paths_comments(stringzilla_kernels_t const& kernels) {
+std::size_t json_paths_comments() {
     std::size_t failures = 0;
     std::string_view const fields[] = {"a", "/a", "/x/y", ""};
     documents_batch_t strict;
@@ -398,7 +415,7 @@ std::size_t json_paths_comments(stringzilla_kernels_t const& kernels) {
     };
     strict.present.assign(strict.texts.size(), true);
     status_t status;
-    failures += compare_batch(strict, fields, kernels, status);
+    failures += compare_batch(strict, fields, status);
     failures += expect(status.succeeded());
 
     scoped_arena_t arena;
@@ -417,14 +434,14 @@ std::size_t json_paths_comments(stringzilla_kernels_t const& kernels) {
         documents_batch_t batch;
         batch.texts = {R"({"a": 4})", std::string(text)};
         batch.present = {true, true};
-        failures += compare_batch(batch, fields, kernels, status);
+        failures += compare_batch(batch, fields, status);
         failures += expect(status == status_code_t::malformed_k);
     }
     return failures;
 }
 
 /** Duplicate keys resolve through the first member, as yyjson's lookup does, at every depth. */
-std::size_t json_paths_duplicates(stringzilla_kernels_t const& kernels) {
+std::size_t json_paths_duplicates() {
     std::size_t failures = 0;
     documents_batch_t batch;
     batch.texts = {
@@ -435,27 +452,27 @@ std::size_t json_paths_duplicates(stringzilla_kernels_t const& kernels) {
     batch.present.assign(batch.texts.size(), true);
     std::string_view const fields[] = {"a", "/a", "/a/b", "/a/0", "/a/x", "/0/a", "/1/a", ""};
     status_t status;
-    failures += compare_batch(batch, fields, kernels, status);
+    failures += compare_batch(batch, fields, status);
     failures += expect(status.succeeded());
     return failures;
 }
 
 /** Missing and empty documents hold no field, not even the root. */
-std::size_t json_paths_missing(stringzilla_kernels_t const& kernels) {
+std::size_t json_paths_missing() {
     std::size_t failures = 0;
     documents_batch_t batch;
     batch.texts = {R"({"a": 1})", "", R"({"a": 2})", R"({"a": 3})"};
     batch.present = {true, true, false, true};
     std::string_view const fields[] = {"", "a", "/a"};
     status_t status;
-    failures += compare_batch(batch, fields, kernels, status);
+    failures += compare_batch(batch, fields, status);
     failures += expect(status.succeeded());
     return failures;
 }
 
 /** A selected value yyjson would refuse, and NaN, which only lenient JSON spells, read as malformed, while a selected
  *  container reads as written. */
-std::size_t json_paths_refusals(stringzilla_kernels_t const& kernels) {
+std::size_t json_paths_refusals() {
     std::size_t failures = 0;
     std::string_view const refused[] = {
         "{\"a\": \"raw\x01control\"}",
@@ -471,7 +488,7 @@ std::size_t json_paths_refusals(stringzilla_kernels_t const& kernels) {
         batch.texts = {std::string(text)};
         batch.present = {true};
         status_t status;
-        failures += compare_batch(batch, fields, kernels, status);
+        failures += compare_batch(batch, fields, status);
         failures += expect(status == status_code_t::malformed_k);
     }
 
@@ -482,13 +499,15 @@ std::size_t json_paths_refusals(stringzilla_kernels_t const& kernels) {
     scoped_arena_t arena;
     json_cells_t cells;
     auto const first_cell = [](std::size_t) noexcept { return field_cell_t {0, 0}; };
-    failures += expect(extract_fields(lazy.view(), fields, 1, first_cell, kernels, arena, cells).succeeded());
+    failures += expect(
+        extract_fields<strings_kit_t>(lazy.view(), fields, 1, first_cell, strings_capabilities(), arena, cells)
+            .succeeded());
     failures += expect(cells[0].token == json_token_t::array_k);
     return failures;
 }
 
 /** Big numbers, reals at the edges of plain notation and escapes print as yyjson prints them at the top level. */
-std::size_t json_paths_printing(stringzilla_kernels_t const& kernels) {
+std::size_t json_paths_printing() {
     std::size_t failures = 0;
     documents_batch_t batch;
     batch.texts = {
@@ -509,18 +528,18 @@ std::size_t json_paths_printing(stringzilla_kernels_t const& kernels) {
     batch.present.assign(batch.texts.size(), true);
     std::string_view const fields[] = {"a"};
     status_t status;
-    failures += compare_batch(batch, fields, kernels, status);
+    failures += compare_batch(batch, fields, status);
     failures += expect(status.succeeded());
     return failures;
 }
 
 /** Random batches of documents a write takes extract and convert exactly as yyjson resolves them; the lenient writer's
  *  comments and non-finite literals never pass the strict parse a write makes, so its documents that do are strict. */
-std::size_t json_paths_random(stringzilla_kernels_t const& kernels, std::uint64_t seed) {
+std::size_t json_paths_random(std::uint64_t seed) {
     std::size_t failures = 0;
     random_t random {seed};
     for (std::size_t round = 0; round != 400; ++round) {
-        document_writer_t writer {random, round % 4 == 3};
+        document_writer_t writer {random, round % 4 == 3 ? json_dialect_t::lenient_k : json_dialect_t::strict_k};
         documents_batch_t batch;
         std::size_t const count = 1 + random.below(24);
         scoped_arena_t probe;
@@ -532,7 +551,7 @@ std::size_t json_paths_random(stringzilla_kernels_t const& kernels, std::uint64_
             batch.present.push_back(random.below(10) != 0);
         }
         status_t status;
-        failures += compare_batch(batch, fields_k, kernels, status);
+        failures += compare_batch(batch, fields_k, status);
         failures += expect(status.succeeded());
     }
     return failures;
@@ -548,29 +567,13 @@ int main(int argc, char** argv) {
         status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
-    sz_capability_t capabilities = sz_cap_serial_k;
-    if (sz_capabilities_enabled_cpu(&capabilities) != sz_success_k) capabilities = sz_cap_serial_k;
-    sz_kernel_punned_t count_strings = nullptr, find_byteset = nullptr, unescape = nullptr;
-    sz_capability_t picked = 0;
-    if (sz_find_kernel_punned(sz_kernel_utf8_count_strings_k, capabilities, &count_strings, &picked) != sz_success_k ||
-        sz_find_kernel_punned(sz_kernel_find_byteset_k, capabilities, &find_byteset, &picked) != sz_success_k ||
-        sz_find_kernel_punned(sz_kernel_strings_unescape_k, capabilities, &unescape, &picked) != sz_success_k) {
-        fmt::println(stderr, "No StringZilla kernel for capabilities {:#x}", capabilities);
-        return 1;
-    }
-    stringzilla_kernels_t kernels;
-    kernels.capabilities = capabilities;
-    kernels.utf8_count_strings = reinterpret_cast<sz_kernel_utf8_count_strings_t>(count_strings);
-    kernels.find_byteset = reinterpret_cast<sz_kernel_find_byteset_t>(find_byteset);
-    kernels.strings_unescape = reinterpret_cast<sz_kernel_strings_unescape_t>(unescape);
-
     report(totals, "json_paths.translation", json_paths_translation);
-    report(totals, "json_paths.comments", json_paths_comments, kernels);
-    report(totals, "json_paths.duplicates", json_paths_duplicates, kernels);
-    report(totals, "json_paths.missing", json_paths_missing, kernels);
-    report(totals, "json_paths.refusals", json_paths_refusals, kernels);
-    report(totals, "json_paths.printing", json_paths_printing, kernels);
-    report(totals, "json_paths.random", json_paths_random, kernels, std::uint64_t {options.seed.value});
+    report(totals, "json_paths.comments", json_paths_comments);
+    report(totals, "json_paths.duplicates", json_paths_duplicates);
+    report(totals, "json_paths.missing", json_paths_missing);
+    report(totals, "json_paths.refusals", json_paths_refusals);
+    report(totals, "json_paths.printing", json_paths_printing);
+    report(totals, "json_paths.random", json_paths_random, std::uint64_t {options.seed.value});
 
     return suite_exit_code(totals);
 }

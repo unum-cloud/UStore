@@ -4,22 +4,24 @@
  *  @date July 10, 2023
  *  @brief Compaction of LSM levels into new sorted runs on the host, and the device compactor every compiler sees.
  *
- *  A compaction reads the sorted run indexes of an upper LSM level and of the lower sorted runs it overlaps, keeps the
- *  newest key slot of every stored key, drops removals when it writes the bottom LSM level, and lays the survivors
- *  into sorted runs that fit their bounds, planning the coalesced ranges every stored value moves in and the value
- *  offsets of every new run. Both compactors share the rules below. The device one composes chains of changes only
- *  through a device fold the caller passes, and folds on the host every chain reaching a write or a base, so without a
- *  device fold a merge of runs holding a change runs on the host. Every compiler sees the device compactor, which
- *  allocates and copies through its executor: its kernels in @c vram_nvidia_compaction.cuh compile under nvcc alone,
- *  and @c compaction.cu instantiates its compaction for the engine's key slots, so a host TU calls it, while a build
- *  without a CUDA compiler links @c compaction_absent.cpp, which makes no device compactor.
+ *  A compaction reads the sorted run indexes of an upper LSM level and of the lower sorted runs
+ *  it overlaps, keeps the newest key slot of every stored key, drops removals when it writes the
+ *  bottom LSM level, and lays the survivors into sorted runs that fit their bounds, planning the
+ *  coalesced ranges every stored value moves in and the value offsets of every new run. Both
+ *  compactors share the rules below. The device one composes chains of changes only through a
+ *  device fold the caller passes, and folds on the host every chain reaching a write or a base,
+ *  so without a device fold a merge of runs holding a change runs on the host. Every compiler
+ *  sees the device compactor, which carves, copies and launches through its executor: its kernels
+ *  in @c vram_nvidia_compaction.cuh compile into the library's bundles, and @c compaction.cpp
+ *  instantiates its compaction for the engine's key slots, so a host TU calls it, and a device
+ *  whose bundle carries no kernels makes no device compactor.
  */
 
 #pragma once
 
 #include <cassert> // `assert`
-#include <cstddef> // `std::byte`, `std::size_t`
-#include <cstdint> // `std::int64_t`, `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
 #include <array>       // `std::array`
@@ -28,20 +30,19 @@
 #include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`, `std::type_identity_t`
-#include <utility>     // `std::exchange`, `std::move`, `std::swap`
+#include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`
+#include <utility>     // `std::move`, `std::swap`
 #include <variant>     // `std::variant`
 
-#include <smashtable/basic_vector.hpp>           // `st::basic_vector`
+#include <smashtable/basic_vector.hpp>           // `st::vector`
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
 #include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`
 
-#include "ustore/blobs/nvme_key_slot.hpp"          // `limit`, `stored_key_concept`, `sorted_run_index_layout_t`
-#include "ustore/utilities/folds.hpp"              // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
-#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
-#include "ustore/utilities/ram_buffers.hpp"        // `local_arena_t`, `arena_allocator`
-#include "ustore/utilities/types.hpp"              // `round_up_to_multiple`, `expected`
-#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_executor_t`
+#include "ustore/blobs/nvme_key_slot.hpp"   // `limit`, `stored_key_concept`, `sorted_run_index_layout_t`
+#include "ustore/utilities/folds.hpp"       // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
+#include "ustore/utilities/nvme_ring.hpp"   // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
+#include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`, `arena_allocator`
+#include "ustore/utilities/types.hpp"       // `round_up_to_multiple`, `expected`
 
 namespace unum::ustore::blobs {
 
@@ -258,8 +259,7 @@ static_assert(sizeof(value_copy_range_t) == 16, "A value copy range is four word
 /** A SmashTable vector of @p element_type_ on the allocator @p allocator_type_ rebinds to it. */
 template <typename element_type_, typename allocator_type_>
 using rebound_vector =
-    st::basic_vector<element_type_,
-                     typename std::allocator_traits<allocator_type_>::template rebind_alloc<element_type_>>;
+    st::vector<element_type_, typename std::allocator_traits<allocator_type_>::template rebind_alloc<element_type_>>;
 
 /** What one compaction writes, kept between compactions so their buffers are reused. */
 template <typename key_slot_type_, typename allocator_type_ = st::default_allocator<key_slot_type_>>
@@ -439,9 +439,10 @@ constexpr std::uint64_t reader_interval(compaction_stamps_t const& stamps, std::
  *  @brief Whether a version stamped @p current, following one stamped @p previous of the same key in newest-first
  *      order, is still read by someone.
  *
- *  A version is read by the readers pinned at or above it and below the version before it, so it survives when
- *  the two fall in different reader intervals. Above the durable horizon every version survives, since a mount may
- *  drop any version above whatever horizon the schema it finds promises, and needs the one beneath.
+ *  A version is read by the readers pinned at or above it and below the version before it, so it
+ *  survives when the two fall in different reader intervals. Above the durable horizon every
+ *  version survives, since a mount may drop any version above whatever horizon the schema it finds
+ *  promises, and needs the one beneath.
  */
 constexpr bool keeps_older_version(compaction_stamps_t const& stamps, std::uint64_t previous,
                                    std::uint64_t current) noexcept {
@@ -728,19 +729,19 @@ st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t
             if (status != status_t::success_k) return status;
         }
         if (shared) {
-            std::uint64_t cut = first + taken;
-            while (shared && cut != first + 1) {
-                status = shares_key(--cut, shared);
+            std::uint64_t boundary = first + taken;
+            while (shared && boundary != first + 1) {
+                status = shares_key(--boundary, shared);
                 if (status != status_t::success_k) return status;
             }
             // Every survivor of the run so far carries one key, so the run takes that key whole however long it is.
             if (shared)
-                for (cut = first + taken + 1; cut != key_slots_count; ++cut) {
-                    status = shares_key(cut, shared);
+                for (boundary = first + taken + 1; boundary != key_slots_count; ++boundary) {
+                    status = shares_key(boundary, shared);
                     if (status != status_t::success_k) return status;
                     if (!shared) break;
                 }
-            taken = cut - first;
+            taken = boundary - first;
             status = read_prefix(first + taken, taken_bytes);
             if (status != status_t::success_k) return status;
         }
@@ -833,8 +834,8 @@ constexpr folded_versions_t folded_versions(compaction_kind_t kind, compaction_s
  *  @param[in] merged The merged records, in key order with the versions of a key newest first.
  *  @param[in] head The index in @p merged of the surviving change.
  *  @param[in] versions The versions to fold, as @c folded_versions found them.
- *  @param[in] value_of Called as @c value_of(record, bytes) to view the value of a merged record, answering an
- *      @c st::status_t, with any bytes it reads allocated from @p arena.
+ *  @param[in] value_of Called as <tt>value_of(record, bytes)</tt> to view the value of a merged
+ *      record, answering an @c st::status_t, with any bytes it reads allocated from @p arena.
  *  @param[in,out] arena Where the bytes the fold reads and writes are allocated.
  *  @param[out] folded What the change folds to, a write, a removal or a change, its bytes in @p arena or a record.
  */
@@ -895,8 +896,8 @@ struct host_compactor_t {
                          sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, fold_type_ const& fold,
                          value_reader_type_&& read_value,
                          compaction_output<key_slot_type_, allocator_type_>& output) const noexcept {
-        using st::basic_vector;
         using st::status_t;
+        using st::vector;
         constexpr bool tailed_k = tailed_key_slot_concept<key_slot_type_>;
         using record_t =
             std::conditional_t<tailed_k, located_tailed_key_slot<key_slot_type_>, located_key_slot<key_slot_type_>>;
@@ -912,15 +913,15 @@ struct host_compactor_t {
         std::uint64_t merged_count = upper_key_slots;
         for (std::size_t index = 0; index != lower.size(); ++index) merged_count += lower[index].key_slots_count;
 
-        basic_vector<record_t> records;
-        basic_vector<record_t> scratch;
+        vector<record_t> records;
+        vector<record_t> scratch;
         status_t status = records.resize(merged_count);
         if (status != status_t::success_k) return status;
         status = scratch.resize(merged_count);
         if (status != status_t::success_k) return status;
 
         // Every sorted run's cells land at their sorted positions, in one run per sorted run
-        basic_vector<std::uint64_t> run_starts;
+        vector<std::uint64_t> run_starts;
         status = run_starts.resize(upper.size() + 1);
         if (status != status_t::success_k) return status;
         std::uint64_t run_offset = 0;
@@ -985,7 +986,7 @@ struct host_compactor_t {
         merge_ranges(records.data(), 0, upper_key_slots, merged_count, scratch.data(), order);
 
         // Survival settles before any fold, so a fold sees every version dropped behind its change
-        basic_vector<std::uint8_t> kept;
+        vector<std::uint8_t> kept;
         status = kept.resize(merged_count);
         if (status != status_t::success_k) return status;
         for (std::uint64_t index = 0; index != merged_count; ++index)
@@ -996,7 +997,7 @@ struct host_compactor_t {
             std::uint64_t survivor = 0;
             std::span<byte_t const> bytes;
         };
-        basic_vector<folded_t> folds;
+        vector<folded_t> folds;
         utilities::local_arena_t arena;
         utilities::arena_allocator<byte_t> arena_bytes = arena.allocator();
         auto const value_of = [&](record_t const& record, std::span<byte_t const>& bytes) noexcept {
@@ -1030,7 +1031,7 @@ struct host_compactor_t {
             if (status != status_t::success_k) return status;
         }
 
-        basic_vector<std::uint64_t> prefix;
+        vector<std::uint64_t> prefix;
         if constexpr (locates_stored_values_concept<key_slot_type_>) {
             status = prefix.resize(survivors + 1);
             if (status != status_t::success_k) return status;
@@ -1039,7 +1040,7 @@ struct host_compactor_t {
                 prefix[index + 1] = prefix[index] + located_of(records[index]).size;
         }
         // Tails take room in a run file beside the values, so the plan bounds both together.
-        basic_vector<std::uint64_t> planned;
+        vector<std::uint64_t> planned;
         if constexpr (tailed_k) {
             status = planned.resize(survivors + 1);
             if (status != status_t::success_k) return status;
@@ -1048,7 +1049,7 @@ struct host_compactor_t {
                 planned[index + 1] = planned[index] + (prefix.size() != 0 ? prefix[index + 1] - prefix[index] : 0) +
                                      records[index].tail.size();
         }
-        basic_vector<std::uint64_t> const& bounded = tailed_k ? planned : prefix;
+        vector<std::uint64_t> const& bounded = tailed_k ? planned : prefix;
         auto const read_prefix = [&bounded](std::uint64_t index, std::uint64_t& bytes) noexcept {
             bytes = bounded.size() != 0 ? bounded[index] : 0;
             return status_t::success_k;
@@ -1361,7 +1362,7 @@ class ring_sections_reader {
     disk_type_ disk_;
 
     /** The medium of every volume, by volume. */
-    st::basic_vector<utilities::registered_medium_t> media_;
+    st::vector<utilities::registered_medium_t> media_;
 
     /** The queue pair every batch goes through. */
     utilities::queue_pair_t queue_pair_;
@@ -1383,89 +1384,7 @@ struct sorted_run_placement_t {
     sorted_run_index_layout_t layout;
 };
 
-/**
- *  @brief The device compactor a database's merges run on, made once at open over a CUDA executor the database owns.
- *
- *  Every merge queues on the executor's stream and carves one context out of device scratch the compactor allocates
- *  through the executor, grown once to the largest merge it served, while the host buffers its copies leave from and
- *  land in are carved out of the executor's pinned bounce, rewound per merge, so a warm compactor allocates nothing.
- *  Run sections read by extent through its sections reader where one reaches the volumes, and upload from the runs'
- *  memory otherwise. Its kernels are only launched where nvcc compiles, in @c vram_nvidia_compaction.cuh, so no host
- *  unit names a CUDA runtime type.
- */
-class cuda_compactor_t {
-  public:
-
-    /** Binds a compactor to @p executor, which outlives it, reading run sections through @p sections; refused with
-     *  @c unsupported_k in a build without a CUDA compiler. */
-    static expected<cuda_compactor_t> make(utilities::cuda_executor_t& executor,
-                                           device_sections_reader_t sections = {}) noexcept;
-
-    cuda_compactor_t(cuda_compactor_t&& other) noexcept
-        : executor_(other.executor_), sections_(other.sections_), scratch_(std::exchange(other.scratch_, nullptr)),
-          scratch_bytes_(std::exchange(other.scratch_bytes_, 0)),
-          device_allocations_(std::exchange(other.device_allocations_, 0)), reads_(std::move(other.reads_)) {}
-    cuda_compactor_t& operator=(cuda_compactor_t&& other) noexcept {
-        std::swap(executor_, other.executor_), std::swap(sections_, other.sections_);
-        std::swap(scratch_, other.scratch_), std::swap(scratch_bytes_, other.scratch_bytes_);
-        std::swap(device_allocations_, other.device_allocations_), std::swap(reads_, other.reads_);
-        return *this;
-    }
-    cuda_compactor_t(cuda_compactor_t const&) = delete;
-    cuda_compactor_t& operator=(cuda_compactor_t const&) = delete;
-    ~cuda_compactor_t() noexcept;
-
-    /**
-     *  @brief Does what @c host_compactor_t::compact does with identical output, composing the chains of changes alone
-     *      through @p device_fold and applying on the host, through @p fold, every chain that reaches a write, a
-     *      removal or the bottom level's empty base.
-     *
-     *  The @p extents of every run, @p upper ones first, say where its sections sit on its volume and which stamp an
-     *  ingest gave it. With @c no_device_fold_t it refuses runs holding a change with @c invalid_argument_k, and with
-     *  no change to fold the folds and @p read_value go unused. A merge whose scratch would pass the executor's limit,
-     *  or whose planned runs outgrow what the merge leaves free, refuses with @c out_of_memory_heap_k, so the tree
-     *  merges on the host.
-     */
-    template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-              typename allocator_type_>
-        requires compactable_key_slot_concept<key_slot_type_>
-    st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
-                         std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                         std::span<sorted_run_extents_t const> extents, sorted_run_bounds_t const& bounds,
-                         compaction_stamps_t const& stamps, fold_type_ const& fold,
-                         device_fold_type_ const& device_fold,
-                         std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
-                         compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
-
-    /** Device allocations the compactor made, which stop once its scratch holds the largest merge it serves. */
-    std::uint64_t device_allocations() const noexcept { return device_allocations_; }
-
-  private:
-    cuda_compactor_t(utilities::cuda_executor_t& executor, device_sections_reader_t sections) noexcept
-        : executor_(&executor), sections_(sections) {}
-
-    /** Grows the scratch to hold @p bytes, carrying over its first @p kept_bytes past the page it starts on, and
-     *  freeing the smaller one in stream order after its reader forgot it. */
-    st::status_t reserve_(std::size_t bytes, std::size_t kept_bytes) noexcept;
-
-    /** The executor every merge queues on and allocates through, borrowed. */
-    utilities::cuda_executor_t* executor_ = nullptr;
-
-    /** The transport run sections read through, empty where every run uploads from its memory. */
-    device_sections_reader_t sections_;
-
-    /** The device scratch every merge carves its context from, owned. */
-    byte_t* scratch_ = nullptr;
-
-    /** Bytes the scratch holds. */
-    std::size_t scratch_bytes_ = 0;
-
-    /** Device allocations the scratch made. */
-    std::uint64_t device_allocations_ = 0;
-
-    /** The sections the merge reads through @c sections_. */
-    st::basic_vector<device_section_read_t> reads_;
-};
+class cuda_compactor_t;
 
 /** The compactor a database's merges run on, picked once at mount by whoever opens it: the calling thread, or a warm
  *  device compactor that opener owns. */

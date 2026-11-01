@@ -10,10 +10,11 @@
 
 #include <cstddef> // `std::size_t`
 
+#include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/ranges.hpp" // `bits_span_t`, `bytes_of`
 #include "ustore/status.hpp" // `expected`, `status_t`
@@ -134,7 +135,7 @@ class strings_read_outputs_t {
  *  and are copied in once their count is known. */
 class scan_outputs_t {
     std::span<ustore_length_t> offsets_ {};
-    st::basic_vector<ustore_key_t, arena_allocator<ustore_key_t>> keys_ {};
+    st::vector<ustore_key_t, arena_allocator<ustore_key_t>> keys_ {};
 
   public:
 
@@ -145,7 +146,7 @@ class scan_outputs_t {
         if (status.failed()) return status;
         scan_outputs_t outputs;
         outputs.offsets_ = offsets;
-        outputs.keys_ = st::basic_vector<ustore_key_t, arena_allocator<ustore_key_t>> {{scratch}};
+        outputs.keys_ = st::vector<ustore_key_t, arena_allocator<ustore_key_t>> {{scratch}};
         return outputs;
     }
 
@@ -218,8 +219,8 @@ class strings_scan_outputs_t {
 /** The columns of a collection listing, which grow in scratch while the collections system collection is walked and
  *  are copied into the arena of the call once: identifiers, modalities, and names end to end after their offsets. */
 class collection_list_outputs_t {
-    st::basic_vector<ustore_collection_id_t, arena_allocator<ustore_collection_id_t>> ids_;
-    st::basic_vector<ustore_modality_t, arena_allocator<ustore_modality_t>> modalities_;
+    st::vector<ustore_collection_id_t, arena_allocator<ustore_collection_id_t>> ids_;
+    st::vector<ustore_modality_t, arena_allocator<ustore_modality_t>> modalities_;
     growing_strings<arena_allocator<byte_t>> names_;
 
   public:
@@ -273,6 +274,18 @@ struct measure_outputs_t {
             first, first + stride, first + 2 * stride, first + 3 * stride, first + 4 * stride, first + 5 * stride};
     }
 
+    /** Records the exact measure of range @p task: @p cardinality entries holding @p value_bytes in
+     *  @p space_bytes of the store, which only a compaction could lower. */
+    void assign(std::size_t task, ustore_size_t cardinality, ustore_size_t value_bytes,
+                ustore_size_t space_bytes) noexcept {
+        min_cardinalities[task] = cardinality;
+        max_cardinalities[task] = cardinality;
+        min_value_bytes[task] = value_bytes;
+        max_value_bytes[task] = value_bytes;
+        min_space_usages[task] = space_bytes;
+        max_space_usages[task] = std::numeric_limits<ustore_size_t>::max();
+    }
+
     /** Exports every column @p arguments ask for. */
     void finish(ustore_blobs_measure_t const& arguments) const noexcept {
         if (arguments.min_cardinalities) *arguments.min_cardinalities = min_cardinalities;
@@ -283,6 +296,15 @@ struct measure_outputs_t {
         if (arguments.max_space_usages) *arguments.max_space_usages = max_space_usages;
     }
 };
+
+/** Fills the description @p arguments ask for with @p description, refusing a call that
+ *  asks for none. */
+inline status_t assign_describe(ustore_database_describe_t const& arguments,
+                                ustore_database_description_t const& description) noexcept {
+    if (!arguments.description) return {status_code_t::invalid_argument_k, "Need an output for the description"};
+    *arguments.description = description;
+    return {};
+}
 
 /** The columns of a batch of collection names resolved in its arena: presences, identifiers and modalities. */
 struct collection_find_outputs_t {

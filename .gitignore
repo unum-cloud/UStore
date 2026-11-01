@@ -29,6 +29,7 @@ doxygen_docs/
 # Python SDK
 __pycache__
 .pytest_cache/
+.ruff_cache/
 *.egg-info
 dist/
 wheelhouse/
@@ -39,6 +40,7 @@ uv.lock
 # Rust SDK
 Cargo.lock
 target/
+/.cargo/config.toml
 
 # Prerequisites
 *.d
@@ -74,3 +76,7 @@ target/
 
 # Editors, assistants, language servers and tool caches
 .mypy_cache/
+
+# JavaScript tooling
+node_modules/
+prebuilds/

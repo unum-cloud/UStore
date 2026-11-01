@@ -1,5 +1,5 @@
 /**
- *  @file src/blobs_layers/graph.hpp
+ *  @file src/graph_layer.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
  *  @brief The graph verbs of an engine keeping every vertex as one value of its degrees and sorted neighborships, as

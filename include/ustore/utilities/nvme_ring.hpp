@@ -2,266 +2,41 @@
  *  @file include/ustore/utilities/nvme_ring.hpp
  *  @author Ash Vardanian
  *  @date May 23, 2021
- *  @brief The submission and completion ring every NVMe transport exposes, and the vocabulary beneath it: aligned
- *      and budgeted allocators, completion counters, 128-bit identifiers, extents and serialization.
+ *  @brief The submission and completion ring every NVMe transport exposes, and the vocabulary
+ *      beneath it: completion counters, disk and file identifiers, alignment and extents.
  *
- *  Nothing here reaches StringZilla, so a CUDA translation unit can include the ring and the key slots above it;
- *  text and its serialization start at @c nvme_volume.hpp.
+ *  Nothing here reaches StringZilla, so a CUDA translation unit can include the ring and the key
+ *  slots above it; the allocators live in @c ram_buffers.hpp and the identifiers, byte views and
+ *  serialization in @c types.hpp.
  *
  *  The ring is exposed rather than hidden behind a blocking read, because a blocking read reaches
- *  the depth of one thread and an NVMe namespace wants thousands of commands outstanding. An queue pair
- *  submits a batch, does other work, and polls its own completions; nothing here ever blocks, so no
- *  fiber is needed to park a caller that ran out of credit.
+ *  the depth of one thread and an NVMe namespace wants thousands of commands outstanding. An queue
+ *  pair submits a batch, does other work, and polls its own completions; nothing here ever blocks,
+ *  so no fiber is needed to park a caller that ran out of credit.
  *
- *  The shape is what the three real transports allow rather than what is convenient. io_uring with
- *  @c SINGLE_ISSUER and @c DEFER_TASKRUN answers @c -EEXIST when a thread other than the submitter
- *  polls, and an SPDK queue pair silently corrupts its tracker list in the same case, so a queue pair is
- *  a single-threaded queue pair rather than a label. Both address a buffer by a registered memory slot plus an
- *  offset - @c IORING_OP_READ_FIXED and @c cuFileRead alike - so a request names a registered memory and
- *  not a pointer. Neither reports a misaligned request at submission time, so every per-request
- *  defect arrives as a failed completion and @c submit refuses only what would corrupt bookkeeping.
+ *  The shape is what the three real transports allow rather than what is convenient. io_uring
+ *  with @c SINGLE_ISSUER and @c DEFER_TASKRUN answers @c -EEXIST when a thread other than the
+ *  submitter polls, and an SPDK queue pair silently corrupts its tracker list in the same case,
+ *  so a queue pair is a single-threaded queue pair rather than a label. Both address a buffer by
+ *  a registered memory slot plus an offset - @c IORING_OP_READ_FIXED and @c cuFileRead alike - so
+ *  a request names a registered memory and not a pointer. Neither reports a misaligned request at
+ *  submission time, so every per-request defect arrives as a failed completion and @c submit
+ *  refuses only what would corrupt bookkeeping.
  */
 
 #pragma once
 
 #include <cassert> // `assert`
-#include <cstddef> // `std::byte`, `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`, `std::uintptr_t`
-#include <cstdlib> // `std::aligned_alloc`, `std::free`
-#include <cstring> // `std::memcpy`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::int32_t`, `std::uint8_t`, `std::uint16_t`, `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 
-#if defined(_WIN32)
-#include <malloc.h>  // `_aligned_malloc`, `_aligned_free`
-#include <windows.h> // `NTSTATUS`, which <bcrypt.h> needs
-#include <bcrypt.h>  // `BCryptGenRandom`
-#else
-#include <sys/random.h> // `getentropy`
-#endif
-
-#include <atomic>      // `std::memory_order`
-#include <chrono>      // `std::chrono::system_clock`
-#include <compare>     // `std::strong_ordering`
-#include <concepts>    // `std::same_as`
-#include <functional>  // `std::hash`
-#include <limits>      // `std::numeric_limits`
-#include <memory>      // `std::allocator_traits`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
-#include <type_traits> // `std::true_type`, `std::is_trivially_copyable_v`
-#include <utility>     // `std::exchange`, `std::move`
-
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::status_t`, `st::default_allocator`
+#include <concepts> // `std::same_as`
+#include <span>     // `std::span`
+#include <utility>  // `std::exchange`
 
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
-
-#pragma region Aligned Allocator
-
-/**
- *  @brief Places every allocation on an @p alignment_ boundary, and rounds its size up to one.
- *
- *  Unbuffered reads and writes accept a buffer only when its address and its length are both
- *  multiples of the device's block size, which is what this allocator guarantees for every count.
- *  Exhaustion answers @c nullptr, as every allocator here does.
- */
-template <typename value_type_, std::size_t alignment_>
-class aligned_allocator {
-  public:
-    using value_type = value_type_;
-    using propagate_on_container_move_assignment = std::true_type;
-    using is_always_equal = std::true_type;
-
-    /** The boundary every allocation starts on, and the multiple its size is rounded up to. */
-    static constexpr std::size_t alignment_k = alignment_;
-
-    static_assert(alignment_k != 0 && (alignment_k & (alignment_k - 1)) == 0,
-                  "An alignment is a power of two, as every block size is");
-
-    constexpr aligned_allocator() noexcept = default;
-
-    /** The rebinding conversion @c std::allocator_traits performs; the alignment is fixed. */
-    template <typename other_type_>
-    constexpr aligned_allocator(aligned_allocator<other_type_, alignment_> const&) noexcept {}
-
-    /** Allocates room for @p count values on an aligned boundary, or answers @c nullptr. */
-    [[nodiscard]] value_type_* allocate(std::size_t count) noexcept {
-        if (count == 0 || count > max_count_k) return nullptr;
-#if defined(_WIN32)
-        return static_cast<value_type_*>(::_aligned_malloc(aligned_bytes(count), alignment_k));
-#else
-        return static_cast<value_type_*>(std::aligned_alloc(alignment_k, aligned_bytes(count)));
-#endif
-    }
-
-    /** Releases @p pointer, which must come from @c allocate. */
-    void deallocate(value_type_* pointer, std::size_t) noexcept {
-#if defined(_WIN32)
-        ::_aligned_free(pointer);
-#else
-        std::free(pointer);
-#endif
-    }
-
-    /** The bytes @p count values occupy once rounded up to the alignment. */
-    static constexpr std::size_t aligned_bytes(std::size_t count) noexcept {
-        return (count * sizeof(value_type_) + alignment_k - 1) / alignment_k * alignment_k;
-    }
-
-    template <typename other_type_>
-    constexpr bool operator==(aligned_allocator<other_type_, alignment_> const&) const noexcept {
-        return true;
-    }
-
-  private:
-
-    /** The largest count whose aligned byte size still fits a @c std::size_t. */
-    static constexpr std::size_t max_count_k = (std::numeric_limits<std::size_t>::max() - alignment_k) /
-                                               sizeof(value_type_);
-};
-
-#pragma endregion Aligned Allocator
-
-#pragma region Constrained Allocator
-
-/** A budget with no limit, which every allocation fits inside. */
-inline constexpr std::size_t unlimited_resource_k = static_cast<std::size_t>(-1);
-
-/**
- *  @brief The bytes one named part of the engine may hold, and the bytes it holds now.
- *
- *  A budget is acquired and released in bytes by however many threads share it, each acquisition
- *  bounded so the budget can never be overdrawn and an exhausted one refuses instead of waiting.
- *  Whoever owns the budget outlives every allocator charging it.
- *
- *  @tparam atomic_reference_ The reference the available bytes are owned through, for one operation at a time.
- */
-template <template <typename> typename atomic_reference_>
-class resource_constraint {
-  public:
-
-    /** A budget of @p capacity bytes, all of them available. */
-    explicit resource_constraint(std::size_t capacity = unlimited_resource_k) noexcept
-        : capacity_(capacity), available_(capacity) {}
-
-    resource_constraint(resource_constraint const&) = delete;
-    resource_constraint& operator=(resource_constraint const&) = delete;
-
-    /** The bytes the budget allows in total. */
-    std::size_t capacity() const noexcept { return capacity_; }
-
-    /** The bytes the budget still allows. */
-    std::size_t available() const noexcept {
-        return atomic_reference_<std::size_t const> {available_}.load(std::memory_order_acquire);
-    }
-
-    /** The bytes the budget currently holds. */
-    std::size_t used() const noexcept { return capacity_ - available(); }
-
-    /** Whether @p bytes would still fit, which a later acquisition may no longer find true. */
-    bool has_more(std::size_t bytes) const noexcept { return bytes <= available(); }
-
-    /** Charges @p bytes to the budget, answering whether they fit. */
-    bool acquire(std::size_t bytes) noexcept {
-        atomic_reference_<std::size_t> const reference {available_};
-        std::size_t const observed = reference.fetch_sub_if_at_least(bytes, 0, std::memory_order_acquire);
-        return observed >= bytes;
-    }
-
-    /** Returns @p bytes to the budget, answering whether they had been charged to it. */
-    bool release(std::size_t bytes) noexcept {
-        atomic_reference_<std::size_t> const reference {available_};
-        std::size_t const observed = reference.fetch_add_if_at_most(bytes, capacity_, std::memory_order_release);
-        return observed + bytes <= capacity_;
-    }
-
-  private:
-
-    /** The bytes the budget allows in total, fixed when it is named. */
-    std::size_t capacity_;
-
-    /** The bytes the budget still allows, which every acquisition and release moves. */
-    std::size_t available_;
-};
-
-/**
- *  @brief An allocator that charges a named budget, and refuses once the budget is spent.
- *
- *  Exhaustion answers @c nullptr, which is what every container here already checks, so a budget
- *  reaches a caller as a status rather than as an exception. The budget is borrowed, never owned.
- *
- *  @tparam atomic_reference_ The reference the budget owns its word through.
- */
-template <typename value_type_, template <typename> typename atomic_reference_,
-          typename base_allocator_type_ = st::default_allocator<value_type_>>
-class constrained_allocator {
-  public:
-    using value_type = value_type_;
-    using base_allocator_t = base_allocator_type_;
-
-    /** The budget every allocation is charged to. */
-    using constraint_t = resource_constraint<atomic_reference_>;
-
-    /** A moved container keeps charging the budget its allocator named. */
-    using propagate_on_container_move_assignment = std::true_type;
-
-    /** The same budget over values of @p other_type_, drawn from the base allocator rebound alike. */
-    template <typename other_type_>
-    struct rebind {
-        using other =
-            constrained_allocator<other_type_, atomic_reference_,
-                                  typename std::allocator_traits<base_allocator_t>::template rebind_alloc<other_type_>>;
-    };
-
-    /** An allocator naming no budget, which refuses every allocation until a named one replaces it. */
-    constrained_allocator() noexcept : base_(), constraint_(nullptr) {}
-
-    /** An allocator charging @p constraint, which must outlive it. */
-    explicit constrained_allocator(constraint_t& constraint, base_allocator_t base = {}) noexcept
-        : base_(base), constraint_(&constraint) {}
-
-    /** The rebinding conversion @c std::allocator_traits performs; the budget travels with it. */
-    template <typename other_type_, typename other_base_type_>
-    constrained_allocator(constrained_allocator<other_type_, atomic_reference_, other_base_type_> const& other) noexcept
-        : base_(), constraint_(other.constraint_pointer()) {}
-
-    /** Charges room for @p count values, or answers @c nullptr when the budget refuses them. */
-    [[nodiscard]] value_type_* allocate(std::size_t count) noexcept {
-        if (!constraint_ || !constraint_->acquire(count * sizeof(value_type_))) return nullptr;
-        value_type_* const memory = base_.allocate(count);
-        if (!memory) { [[maybe_unused]] bool const returned = constraint_->release(count * sizeof(value_type_)); }
-        return memory;
-    }
-
-    /** Releases @p pointer and returns its bytes to the budget. */
-    void deallocate(value_type_* pointer, std::size_t count) noexcept {
-        base_.deallocate(pointer, count);
-        if (constraint_) { [[maybe_unused]] bool const returned = constraint_->release(count * sizeof(value_type_)); }
-    }
-
-    /** The budget this allocator charges. */
-    constraint_t& constraint() const noexcept { return *constraint_; }
-
-    /** The budget this allocator charges, or null while it names none. */
-    constraint_t* constraint_pointer() const noexcept { return constraint_; }
-
-    template <typename other_type_, typename other_base_type_>
-    bool operator==(
-        constrained_allocator<other_type_, atomic_reference_, other_base_type_> const& other) const noexcept {
-        return constraint_ == other.constraint_pointer();
-    }
-
-  private:
-
-    /** The allocator the charged bytes actually come from. */
-    base_allocator_t base_;
-
-    /** The budget every allocation is charged to, owned by whoever named it. */
-    constraint_t* constraint_;
-};
-
-#pragma endregion Constrained Allocator
 
 #pragma region Countdown
 
@@ -420,449 +195,6 @@ class notifier {
 
 #pragma endregion Countdown
 
-#pragma region UUID
-
-/** The bit pattern of octet 8, which says whose layout the remaining bytes follow. */
-enum class uuid_variant_t : std::uint8_t {
-
-    /** The @c 0xxx pattern of the Apollo Network Computing System. */
-    network_computing_system_k,
-
-    /** The @c 10xx pattern of RFC 4122, which every identifier this engine mints carries. */
-    rfc_k,
-
-    /** The @c 110x pattern of the Component Object Model. */
-    microsoft_k,
-
-    /** The @c 111x pattern, which no specification claims. */
-    reserved_k,
-};
-
-/**
- *  @brief A 128-bit identifier held as sixteen bytes, printed as the canonical 36 characters.
- *
- *  A zero identifier names nothing, which is what a default-constructed one holds and what
- *  @c is_valid reports; every minted identifier is version 4, so all but six of its bits are random.
- */
-struct uuid_t {
-
-    /** Bytes the identifier occupies in memory and on disk. */
-    static constexpr std::size_t size_bytes_k = 16;
-
-    /** Characters the canonical @c 8-4-4-4-12 text form occupies, dashes included. */
-    static constexpr std::size_t printed_length_k = 36;
-
-    /** The sixteen bytes, in the order they are printed and stored. */
-    std::uint8_t bytes[size_bytes_k] = {};
-
-    uuid_t() = default;
-
-    /** Reads an identifier from the sixteen bytes at @p source. */
-    explicit uuid_t(std::span<std::uint8_t const, size_bytes_k> source) noexcept {
-        std::memcpy(bytes, source.data(), size_bytes_k);
-    }
-
-    /** Whose layout the remaining bytes follow, read off octet 8. */
-    constexpr uuid_variant_t variant() const noexcept {
-        if ((bytes[8] & 0x80) == 0x00) return uuid_variant_t::network_computing_system_k;
-        if ((bytes[8] & 0xC0) == 0x80) return uuid_variant_t::rfc_k;
-        if ((bytes[8] & 0xE0) == 0xC0) return uuid_variant_t::microsoft_k;
-        return uuid_variant_t::reserved_k;
-    }
-
-    /** Whether the identifier names anything, which a zero one does not. */
-    constexpr bool is_valid() const noexcept {
-        std::uint8_t any = 0;
-        for (std::size_t index = 0; index != size_bytes_k; ++index) any |= bytes[index];
-        return any != 0;
-    }
-
-    /** The first eight bytes read as a big-endian word, which orders identifiers as @c memcmp does. */
-    constexpr std::uint64_t high_word() const noexcept { return word_(0); }
-
-    /** The last eight bytes read as a big-endian word. */
-    constexpr std::uint64_t low_word() const noexcept { return word_(8); }
-
-    friend constexpr bool operator==(uuid_t const&, uuid_t const&) = default;
-
-    friend constexpr std::strong_ordering operator<=>(uuid_t const& first, uuid_t const& second) noexcept {
-        if (std::strong_ordering const high = first.high_word() <=> second.high_word(); high != 0) return high;
-        return first.low_word() <=> second.low_word();
-    }
-
-    /** Writes the canonical @c 8-4-4-4-12 text form into @p destination, without a terminator. */
-    constexpr void print(std::span<char, printed_length_k> destination) const noexcept {
-        std::size_t written = 0;
-        for (std::size_t index = 0; index != size_bytes_k; ++index) {
-            if (index == 4 || index == 6 || index == 8 || index == 10) destination[written++] = '-';
-            destination[written++] = digits_k[bytes[index] >> 4];
-            destination[written++] = digits_k[bytes[index] & 0x0F];
-        }
-    }
-
-    /** Whether @p text is 36 characters of the canonical form, so @c parse would read it whole. */
-    static constexpr bool parses(std::span<char const, printed_length_k> text) noexcept {
-        std::size_t read = 0;
-        for (std::size_t index = 0; index != size_bytes_k; ++index) {
-            if (index == 4 || index == 6 || index == 8 || index == 10)
-                if (text[read++] != '-') return false;
-            if (value_of_(text[read++]) == invalid_digit_k) return false;
-            if (value_of_(text[read++]) == invalid_digit_k) return false;
-        }
-        return true;
-    }
-
-    /** Reads the canonical form out of @p text, which @c parses has already accepted. */
-    static constexpr uuid_t parse(std::span<char const, printed_length_k> text) noexcept {
-        uuid_t identifier;
-        std::size_t read = 0;
-        for (std::size_t index = 0; index != size_bytes_k; ++index) {
-            if (index == 4 || index == 6 || index == 8 || index == 10) ++read;
-            std::uint8_t const high = value_of_(text[read++]);
-            std::uint8_t const low = value_of_(text[read++]);
-            identifier.bytes[index] = static_cast<std::uint8_t>((high << 4) | low);
-        }
-        return identifier;
-    }
-
-  private:
-
-    /** The lowercase hexadecimal alphabet the text form prints. */
-    static constexpr char digits_k[17] = "0123456789abcdef";
-
-    /** What @c value_of_ answers for a character that is no hexadecimal digit. */
-    static constexpr std::uint8_t invalid_digit_k = 0xFF;
-
-    /** The value of one hexadecimal digit, in either case. */
-    static constexpr std::uint8_t value_of_(char digit) noexcept {
-        if (digit >= '0' && digit <= '9') return static_cast<std::uint8_t>(digit - '0');
-        if (digit >= 'a' && digit <= 'f') return static_cast<std::uint8_t>(digit - 'a' + 10);
-        if (digit >= 'A' && digit <= 'F') return static_cast<std::uint8_t>(digit - 'A' + 10);
-        return invalid_digit_k;
-    }
-
-    /** The eight bytes at @p offset read as one big-endian word. */
-    constexpr std::uint64_t word_(std::size_t offset) const noexcept {
-        std::uint64_t word = 0;
-        for (std::size_t index = 0; index != 8; ++index) word = (word << 8) | bytes[offset + index];
-        return word;
-    }
-};
-
-static_assert(sizeof(uuid_t) == uuid_t::size_bytes_k, "An identifier is its sixteen bytes and nothing else");
-
-/** Fills @p destination with bytes from the operating system, answering whether it could. */
-inline bool fill_with_entropy(std::span<std::uint8_t> destination) noexcept {
-#if defined(_WIN32)
-    return ::BCryptGenRandom(nullptr, destination.data(), static_cast<ULONG>(destination.size()),
-                             BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
-#else
-    return ::getentropy(destination.data(), destination.size()) == 0;
-#endif
-}
-
-/**
- *  @brief Mints a version 4 identifier from the entropy the operating system hands out.
- *
- *  Answers a zero identifier, which @c is_valid rejects, when the system refuses entropy; the
- *  caller learns of that through the identifier rather than through a status, since every source
- *  of a fresh identifier already validates it before recording it.
- */
-inline uuid_t uuid_generator() noexcept {
-    uuid_t identifier;
-    if (!fill_with_entropy(identifier.bytes)) return {};
-    identifier.bytes[6] = static_cast<std::uint8_t>((identifier.bytes[6] & 0x0F) | 0x40);
-    identifier.bytes[8] = static_cast<std::uint8_t>((identifier.bytes[8] & 0x3F) | 0x80);
-    return identifier;
-}
-
-/** The identifier folded onto one word, for a table keyed by a number rather than by the bytes. */
-constexpr std::uint64_t uuid_to_u64(uuid_t const& identifier) noexcept {
-    std::uint64_t mixed = identifier.high_word() ^ (identifier.low_word() * 0x9E3779B97F4A7C15ull);
-    mixed ^= mixed >> 30;
-    mixed *= 0xBF58476D1CE4E5B9ull;
-    mixed ^= mixed >> 27;
-    mixed *= 0x94D049BB133111EBull;
-    return mixed ^ (mixed >> 31);
-}
-
-#pragma endregion UUID
-
-#pragma region Shared Vocabulary
-
-/** Alignment and size multiple of buffers used for direct I/O. */
-inline constexpr std::size_t buffer_alignment_k = 4096;
-
-/** Attempts of a disk read before it fails. */
-inline constexpr std::size_t disk_read_attempts_on_failure_k = 2;
-
-/** Attempts of a disk write before it fails. */
-inline constexpr std::size_t disk_write_attempts_on_failure_k = 4;
-
-#pragma region Vocabulary
-
-/** Bytes a caller may write into. */
-using bytes_span_t = std::span<std::byte>;
-
-/** Bytes a caller may only read. */
-using bytes_view_t = std::span<std::byte const>;
-
-/** The allocator every unbudgeted container reaches, which answers null instead of throwing. */
-template <typename value_type_>
-using heap_allocator = st::default_allocator<value_type_>;
-
-/** The allocator of buffers unbuffered reads and writes accept. */
-template <typename value_type_>
-using direct_io_allocator = aligned_allocator<value_type_, buffer_alignment_k>;
-
-/** Bytes charged to no budget, with no alignment beyond the heap's own. */
-using buffer_t = st::basic_vector<std::byte>;
-
-/** Bytes of a buffer unbuffered I/O accepts, charged to no budget. */
-using aligned_buffer_t = st::basic_vector<std::byte, direct_io_allocator<std::byte>>;
-
-/** Bytes charged to a named budget. */
-template <template <typename> typename atomic_reference_>
-using constrained_buffer = st::basic_vector<std::byte, constrained_allocator<std::byte, atomic_reference_>>;
-
-/** Bytes of a buffer unbuffered I/O accepts, charged to a named budget. */
-template <template <typename> typename atomic_reference_>
-using constrained_aligned_buffer =
-    st::basic_vector<std::byte, constrained_allocator<std::byte, atomic_reference_, direct_io_allocator<std::byte>>>;
-
-#pragma endregion Vocabulary
-
-#pragma region Time
-
-/** The clock every timestamp of the engine is taken from. */
-using clock_t = std::chrono::system_clock;
-
-/** One instant on that clock, as a snapshot, a transaction and a watch record it. */
-using time_point_t = clock_t::time_point;
-
-/** The instant this call happens at. */
-inline time_point_t timestamp() noexcept { return clock_t::now(); }
-
-/** Hashes an instant by the count of its epoch offset, for a table keyed by one. */
-struct time_point_hasher_t {
-
-    std::size_t operator()(time_point_t const& instant) const noexcept {
-        return std::hash<i64_t> {}(static_cast<i64_t>(instant.time_since_epoch().count()));
-    }
-};
-
-#pragma endregion Time
-
-#pragma region Failures
-
-/** The status reporting a SmashTable container's @p failure, which every fallible member answers. */
-constexpr status_t to_status(st::status_t failure) noexcept {
-    switch (failure) {
-    case st::status_t::success_k: return {};
-    case st::status_t::out_of_memory_heap_k: return {status_code_t::out_of_memory_k, "Out of memory"};
-    case st::status_t::consistency_k: return {status_code_t::internal_k, "A container invariant did not hold"};
-    case st::status_t::operation_not_permitted_k:
-        return {status_code_t::invalid_argument_k, "The object does not admit the call"};
-    case st::status_t::operation_would_block_k: return {status_code_t::internal_k, "A bounded retry gave up"};
-    case st::status_t::invalid_argument_k: return {status_code_t::invalid_argument_k, "Invalid argument"};
-    case st::status_t::capacity_exhausted_k: return {status_code_t::capacity_exhausted_k, "Capacity exhausted"};
-    case st::status_t::input_output_k: return {status_code_t::io_k, "Input or output failed"};
-    case st::status_t::key_already_exists_k: return {status_code_t::already_exists_k, "Key already exists"};
-    case st::status_t::key_not_found_k: return {status_code_t::not_found_k, "Key not found"};
-    case st::status_t::write_conflict_k: return {status_code_t::write_conflict_k, "Write conflict"};
-    case st::status_t::read_conflict_k: return {status_code_t::read_conflict_k, "Read conflict"};
-    case st::status_t::phantom_conflict_k: return {status_code_t::phantom_conflict_k, "Phantom conflict"};
-    default: return {status_code_t::internal_k, "A container failed for an unknown reason"};
-    }
-}
-
-#pragma endregion Failures
-
-#pragma region Measurements
-
-/** Memory and disk space one component takes. */
-struct storage_info_t {
-
-    /** Bytes mapped into memory. */
-    std::size_t mapped_bytes = 0;
-
-    /** Bytes taken on disk. */
-    std::size_t disk_bytes = 0;
-};
-
-#pragma endregion Measurements
-
-#pragma region Atomic Words
-
-/** A word one thread claims by compare-exchange: readers count upward from zero, the writer holds @c writer_claim_k. */
-using claim_word_t = std::int32_t;
-
-/** What a claim word holds while one writer has it, so no reader can add to it. */
-constexpr claim_word_t writer_claim_k = -1;
-
-/** Readers still inside a retired slot, which a publisher waits on before freeing it. */
-using readers_count_t = std::int32_t;
-
-/** Whether the owner of a background job or a merge still wants it, moved by compare-exchange on a word. */
-enum class cancellation_state_t : std::int32_t {
-    wanted_k = 0,
-    cancelled_k = 1,
-};
-
-/** Whether a thread holds the right to compact a tree, moved by compare-exchange on a word. */
-enum class compaction_state_t : std::int32_t {
-    idle_k = 0,
-    compacting_k = 1,
-};
-
-#pragma endregion Atomic Words
-
-#pragma region Byte Views
-
-/** Whether both the address and the size of @p buffer are multiples of @c buffer_alignment_k. */
-inline bool is_buffer_aligned(bytes_view_t buffer) noexcept {
-    auto const address = reinterpret_cast<std::uintptr_t>(buffer.data());
-    return address % buffer_alignment_k == 0 && buffer.size() % buffer_alignment_k == 0;
-}
-
-/** The bytes of @p buffer, which a caller may only read. */
-template <typename allocator_type_>
-inline bytes_view_t as_bytes_view(st::basic_vector<std::byte, allocator_type_> const& buffer) noexcept {
-    return bytes_view_t {buffer};
-}
-
-/** The bytes of @p buffer, which a caller may write into. */
-template <typename allocator_type_>
-inline bytes_span_t as_bytes_span(st::basic_vector<std::byte, allocator_type_>& buffer) noexcept {
-    return bytes_span_t {buffer};
-}
-
-#pragma endregion Byte Views
-
-#pragma region Serialization
-
-/** A value that measures, saves and loads its own bytes, where a successful load consumes its storage requirements. */
-template <typename value_type_>
-concept serializable_concept = requires(value_type_ const& constant, value_type_& value, bytes_span_t destination,
-                                        bytes_view_t source) {
-    { constant.storage_requirements() } noexcept -> std::same_as<std::size_t>;
-    { constant.save(destination) } noexcept -> std::same_as<status_t>;
-    { value.load(source) } noexcept -> std::same_as<status_t>;
-};
-
-/** A value stored as its object representation, having no serialization of its own. */
-template <typename value_type_>
-concept trivially_serializable_concept = std::is_trivially_copyable_v<value_type_> &&
-                                         !serializable_concept<value_type_>;
-
-/** The bytes of a trivially serializable value. */
-template <trivially_serializable_concept value_type_>
-std::size_t storage_requirements(value_type_ const&) noexcept {
-    return sizeof(value_type_);
-}
-
-/** Copies the object representation of @p value into @p destination. */
-template <trivially_serializable_concept value_type_>
-status_t save(value_type_ const& value, bytes_span_t destination) noexcept {
-    if (destination.size() < sizeof(value_type_))
-        return status_t {status_code_t::invalid_argument_k, "Buffer is too small"};
-    std::memcpy(destination.data(), &value, sizeof(value_type_));
-    return {};
-}
-
-/** Copies the object representation of @p value out of @p source. */
-template <trivially_serializable_concept value_type_>
-status_t load(value_type_& value, bytes_view_t source) noexcept {
-    if (source.size() < sizeof(value_type_)) return status_t {status_code_t::malformed_k, "Corrupted data"};
-    std::memcpy(&value, source.data(), sizeof(value_type_));
-    return {};
-}
-
-/** The bytes a serializable value reports. */
-template <serializable_concept value_type_>
-std::size_t storage_requirements(value_type_ const& value) noexcept {
-    return value.storage_requirements();
-}
-
-/** Saves a serializable value through its own member. */
-template <serializable_concept value_type_>
-status_t save(value_type_ const& value, bytes_span_t destination) noexcept {
-    return value.save(destination);
-}
-
-/** Loads a serializable value through its own member. */
-template <serializable_concept value_type_>
-status_t load(value_type_& value, bytes_view_t source) noexcept {
-    return value.load(source);
-}
-
-/** The bytes of an array: its 64-bit count, then every element. */
-template <typename element_type_, typename allocator_type_>
-std::size_t storage_requirements(st::basic_vector<element_type_, allocator_type_> const& elements) noexcept {
-    std::size_t bytes = sizeof(std::uint64_t);
-    for (element_type_ const& element : elements) bytes += storage_requirements(element);
-    return bytes;
-}
-
-/** Saves the 64-bit count of @p elements, then every element back to back. */
-template <typename element_type_, typename allocator_type_>
-status_t save(st::basic_vector<element_type_, allocator_type_> const& elements, bytes_span_t destination) noexcept {
-    std::uint64_t const count = elements.size();
-    if (status_t const status = save(count, destination); status.failed()) return status;
-    std::size_t offset = sizeof(count);
-    for (element_type_ const& element : elements) {
-        if (status_t const status = save(element, destination.subspan(offset)); status.failed()) return status;
-        offset += storage_requirements(element);
-    }
-    return {};
-}
-
-/** Loads an array saved as its 64-bit count, then every element back to back. */
-template <typename element_type_, typename allocator_type_>
-status_t load(st::basic_vector<element_type_, allocator_type_>& elements, bytes_view_t source) noexcept {
-    std::uint64_t count = 0;
-    if (status_t const status = load(count, source); status.failed()) return status;
-    std::size_t offset = sizeof(count);
-    // Every element takes at least one byte, so a larger count is corrupt.
-    if (count > source.size() - offset) return status_t {status_code_t::malformed_k, "Corrupted data"};
-    if (st::status_t const status = elements.resize(count); status != st::status_t::success_k) return to_status(status);
-    for (element_type_& element : elements) {
-        if (status_t const status = load(element, source.subspan(offset)); status.failed()) return status;
-        offset += storage_requirements(element);
-    }
-    return {};
-}
-
-/** The bytes of @p fields stored back to back. */
-template <typename... field_types_>
-std::size_t fields_storage_requirements(field_types_ const&... fields) noexcept {
-    return (std::size_t {0} + ... + storage_requirements(fields));
-}
-
-/** Saves no fields. */
-inline status_t save_fields(bytes_span_t) noexcept { return {}; }
-
-/** Saves @p field, then @p fields, back to back into @p destination. */
-template <typename field_type_, typename... field_types_>
-status_t save_fields(bytes_span_t destination, field_type_ const& field, field_types_ const&... fields) noexcept {
-    if (status_t const status = save(field, destination); status.failed()) return status;
-    return save_fields(destination.subspan(storage_requirements(field)), fields...);
-}
-
-/** Loads no fields. */
-inline status_t load_fields(bytes_view_t) noexcept { return {}; }
-
-/** Loads @p field, then @p fields, stored back to back in @p source. */
-template <typename field_type_, typename... field_types_>
-status_t load_fields(bytes_view_t source, field_type_& field, field_types_&... fields) noexcept {
-    if (status_t const status = load(field, source); status.failed()) return status;
-    return load_fields(source.subspan(storage_requirements(field)), fields...);
-}
-
-#pragma endregion Serialization
-
-#pragma endregion Shared Vocabulary
-
 #pragma region IO Types
 
 /** One mounted disk of a data directory, where every stored value names the disk it sits on. */
@@ -875,15 +207,7 @@ enum class file_id_t : int {
     invalid_k = -1,
 };
 
-/** Whether a file operation blocks the caller or completes through @c io_uring. */
-enum class execution_policy_t {
-    sync_k,
-    async_k,
-};
-
 #pragma endregion IO Types
-
-#pragma region Extent
 
 #pragma region Alignment
 
@@ -964,8 +288,6 @@ struct extent_t {
 
 #pragma endregion Extent
 
-#pragma endregion Extent
-
 #pragma region Ring
 
 #pragma region Vocabulary
@@ -1036,10 +358,11 @@ enum class completion_state_t : std::uint8_t {
 /**
  *  @brief Where a registered buffer lives, which is a property of the registered memory and never of a request.
  *
- *  A compaction read into device memory and a compaction read into host memory are one request
- *  shape; only the registered memory call differs - @c cuFileBufRegister against
- *  @c IORING_REGISTER_BUFFERS against @c spdk_mem_register - so a disk that cannot reach device
- *  memory refuses at registered memory, where the caller can still choose another buffer.
+ *  A compaction read into device memory and a compaction read into host memory are one
+ *  request shape; only the registered memory call differs - @c cuFileBufRegister
+ *  against @c IORING_REGISTER_BUFFERS against @c spdk_mem_register - so a disk that
+ *  cannot reach device memory refuses at registered memory, where the caller can still
+ *  choose another buffer.
  */
 enum class memory_space_t : std::uint8_t {
 
@@ -1081,9 +404,9 @@ enum class medium_access_t : std::uint8_t {
 /**
  *  @brief What a caller asks a transport to register as a medium.
  *
- *  One shape serves all three transports because each reads only what it can: a file disk opens
- *  @c name as a path, a RAM disk keeps a buffer of @c length under that label, and a namespace
- *  ignores both, since the medium it registers is the namespace it was mounted on.
+ *  One shape serves all three transports because each reads only what it can: a file disk
+ *  opens @c name as a path, a RAM disk keeps a buffer of @c length under that label, and a
+ *  namespace ignores both, since the medium it registers is the namespace it was mounted on.
  */
 struct medium_options_t {
 
@@ -1152,8 +475,8 @@ struct request_token_t {
  *
  *  A bare pointer cannot be submitted: io_uring's fixed forms want a slot index plus an offset,
  *  cuFile wants the registered base plus an offset, and SPDK needs the range in its memory map
- *  before @c spdk_vtophys can translate it. Naming the registered memory also makes the borrow visible,
- *  so a disk can refuse to deregister memory that is still a live DMA medium.
+ *  before @c spdk_vtophys can translate it. Naming the registered memory also makes the borrow
+ *  visible, so a disk can refuse to deregister memory that is still a live DMA medium.
  */
 struct memory_reference_t {
 
@@ -1270,12 +593,13 @@ struct completion_t {
 /**
  *  @brief One queue pair on a share of the ring's depth, held by exactly one thread at a time.
  *
- *  The queue pair is the queue pair identity the transports demand, not a convenience: an io_uring ring set up
- *  with @c SINGLE_ISSUER refuses a foreign reaper, and an SPDK queue pair corrupts itself silently
- *  under one. Moving a queue pair hands it to another thread, which is the only legal handoff when a
- *  controller offers fewer queue pairs than the executor has threads; a queue pair is never shared. The
- *  receiving thread announces itself with the disk's @c adopt, since a ring cannot observe a move and
- *  an unannounced one is indistinguishable from two threads sharing a queue pair.
+ *  The queue pair is the queue pair identity the transports demand, not a convenience: an io_uring
+ *  ring set up with @c SINGLE_ISSUER refuses a foreign reaper, and an SPDK queue pair corrupts
+ *  itself silently under one. Moving a queue pair hands it to another thread, which is the only
+ *  legal handoff when a controller offers fewer queue pairs than the executor has threads; a queue
+ *  pair is never shared. The receiving thread announces itself with the disk's @c adopt, since a
+ *  ring cannot observe a move and an unannounced one is indistinguishable from two threads sharing
+ *  a queue pair.
  *
  *  @note Return the queue pair with the disk's @c release before the handle dies, since the handle cannot
  *      drain the device on its own.
@@ -1434,10 +758,10 @@ class registered_memory_t {
 /**
  *  @brief One registered medium, which a request addresses by slot rather than by name.
  *
- *  A medium is registered for the same reason a buffer is: @c IORING_REGISTER_FILES addresses a file
- *  by table index and skips the registered medium lookup every request would otherwise repeat, and an SPDK
- *  namespace has no name to pass at all. Registering it also makes the borrow visible, so a disk can
- *  refuse to close a medium that requests are still in flight against.
+ *  A medium is registered for the same reason a buffer is: @c IORING_REGISTER_FILES addresses a
+ *  file by table index and skips the registered medium lookup every request would otherwise repeat,
+ *  and an SPDK namespace has no name to pass at all. Registering it also makes the borrow visible,
+ *  so a disk can refuse to close a medium that requests are still in flight against.
  */
 class registered_medium_t {
   public:

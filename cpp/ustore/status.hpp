@@ -8,14 +8,12 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
-
 #include <new>     // `std::nothrow`
 #include <tuple>   // `std::apply`, `std::tuple`
 #include <utility> // `std::exchange`, `std::move`, `std::swap`
 
 #include "ustore/types.h"             // `ustore_outcome_t`, `ustore_outcome_wait`
-#include "ustore/utilities/types.hpp" // `expected`, `status_code_t`, `status_t`, re-exported into `unum::ustore`
+#include "ustore/utilities/types.hpp" // `status_code_t`, `status_t`, re-exported into `unum::ustore`
 
 namespace unum::ustore {
 
@@ -29,9 +27,9 @@ namespace unum::ustore {
  *  nothing the call reads goes away under it, and a block that could not be allocated reads as a call that finished
  *  with @c status_code_t::out_of_memory_k.
  *
- *  @tparam verb_type_ What one verb keeps beside its inputs: the outputs the call writes through, its C
- *      @c arguments_t, the static @c submit that hands them to the library, and @c finish, which turns the outputs of
- *      a successful call into its @c answer_t.
+ *  @tparam verb_type_ What one verb keeps beside its inputs: the outputs the call writes through,
+ *      its C @c arguments_t, the static @c submit that hands them to the library, and @c finish,
+ *      which turns the outputs of a successful call into its @c answer_t.
  */
 template <typename verb_type_>
 class [[nodiscard]] deferred {

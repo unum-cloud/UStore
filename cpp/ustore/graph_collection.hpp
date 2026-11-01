@@ -13,14 +13,14 @@
 #include <algorithm>   // `std::ranges::equal_range`
 #include <span>        // `std::span`
 #include <type_traits> // `std::is_same_v`
-#include <utility>     // `std::forward`, `std::move`, `std::swap`
+#include <utility>     // `std::move`, `std::swap`
 
 #include "ustore/blobs_range.hpp" // `blobs_range_t`, `keys_range_t`, `keys_stream_t`
 #include "ustore/graph.h"
 #include "ustore/graph_stream.hpp" // `graph_stream_t`
 #include "ustore/ranges.hpp"       // `range`, `strided`, `exported_edges`, `bits_view_t`, `owned_array_concept`
 #include "ustore/status.hpp"       // `status_t`, `expected`, `deferred`
-#include "ustore/types.hpp"        // `arena_t`, `in_one_off_arena`, `receiver_t`, `collection_key_field_t`, `edge_t`
+#include "ustore/types.hpp"        // `arena_t`, `in_one_off_arena`, `receiver_t`, `edge_t`
 
 namespace unum::ustore {
 
@@ -175,14 +175,14 @@ class graph_read_collection_t {
     /** Reads the edges from @p source to @p target into @p arena. */
     expected<edges_view_t> edges_between(ustore_key_t source, ustore_key_t target, arena_t& arena,
                                          ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        auto [all, read_edges_status] = read_edges(source, arena, ustore_vertex_role_source_k, watch);
+        auto [outgoing, read_edges_status] = read_edges(source, arena, ustore_vertex_role_source_k, watch);
         if (read_edges_status.failed()) return read_edges_status;
 
-        auto const matches = std::ranges::equal_range(all.targets.begin(), all.targets.end(), target);
-        std::size_t const offset = static_cast<std::size_t>(matches.begin() - all.targets.begin());
+        auto const matches = std::ranges::equal_range(outgoing.targets.begin(), outgoing.targets.end(), target);
+        std::size_t const offset = static_cast<std::size_t>(matches.begin() - outgoing.targets.begin());
         std::size_t const count = static_cast<std::size_t>(matches.end() - matches.begin());
-        return edges_view_t {all.sources.subspan(offset, count), all.targets.subspan(offset, count),
-                             all.ids.subspan(offset, count)};
+        return edges_view_t {outgoing.sources.subspan(offset, count), outgoing.targets.subspan(offset, count),
+                             outgoing.ids.subspan(offset, count)};
     }
 
     /** Reads every edge that has any of @p vertices in an allowed role into @p arena, split by vertex through the

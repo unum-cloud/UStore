@@ -4,10 +4,11 @@
  *  @date September 19, 2026
  *  @brief One collection with transactions over the ring: what a commit shows, what a conflict keeps.
  *
- *  The results this file exists for are @c commit_lands_all_or_nothing and
- *  @c transactions_serialize_under_threads. A reader passing over every key while a commit lands must
- *  see the whole of that commit or none of it, and several threads racing over overlapping keys must
- *  end at a count no lost update could produce.
+ *  The results this file exists for are @c commit_lands_all_or_nothing
+ *  and @c transactions_serialize_under_threads. A reader passing over
+ *  every key while a commit lands must see the whole of that commit or
+ *  none of it, and several threads racing over overlapping keys must end
+ *  at a count no lost update could produce.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -22,15 +23,17 @@
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/blobs/nvme_store.hpp"                      // `nvme_store`, `nvme_store_cursor`
 #include "ustore/blobs/nvme_key_slot.hpp"                   // `key_slot`
 #include "ustore/blobs/nvme_single_collection_database.hpp" // `basic_single_collection_database`
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
+#include "nvme/fixture.hpp" // `run_on_transport`, `expectation_t`, `painted`
 
 namespace unum::ustore::test {
+
+using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
@@ -175,7 +178,7 @@ expected<typename database_type_::database_unique_ptr_t> open_over(
 template <typename database_type_>
 [[nodiscard]] std::size_t write_model(database_type_& store, std::span<expectation_t const> wanted) {
     std::size_t failures = 0;
-    st::basic_vector<byte_t> value;
+    st::vector<byte_t> value;
     for (std::size_t index = 0; index != wanted.size(); ++index) {
         expectation_t const& entry = wanted[index];
         if (entry.state == lookup_result_t::removed_k) {
@@ -196,9 +199,9 @@ template <typename readable_type_>
                                       std::span<expectation_t const> wanted) {
     std::size_t failures = 0;
     std::size_t const count = wanted.size();
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<lookup_result_t> results;
-    st::basic_vector<std::uint64_t> seen;
+    st::vector<stored_key_t> keys;
+    st::vector<lookup_result_t> results;
+    st::vector<std::uint64_t> seen;
     failures += expect(keys.resize(count) == st::status_t::success_k);
     failures += expect(results.resize(count) == st::status_t::success_k);
     failures += expect(seen.resize(count) == st::status_t::success_k);
@@ -254,7 +257,7 @@ template <typename key_slot_type_, typename mount_type_>
     if (!store) return failures;
 
     stored_value_size_t const widest = (*store)->value_max_size();
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count_k; ++index) {
@@ -345,7 +348,7 @@ template <typename key_slot_type_, typename mount_type_>
     // The smallest factor makes level zero due at two flushed runs, so two rounds give the tree depth.
     single_collection_database_config_t config = test_config(value_size, value_max_size);
     config.collection.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
 
@@ -383,7 +386,7 @@ template <typename key_slot_type_, typename mount_type_>
         // Two overlapping rounds go back onto level zero, so age alone decides which run answers a key,
         // and the keys neither round names can only be answered from the level the merge wrote.
         for (std::uint64_t again = 0; again != 2; ++again) {
-            st::basic_vector<expectation_t> batch;
+            st::vector<expectation_t> batch;
             std::size_t const stride = again == 0 ? 3 : 6;
             for (std::size_t index = 0; index < count_k; index += stride) {
                 expectation_t entry = model[index];
@@ -455,7 +458,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
                 **stack, config);
             failures += expect(store.has_value());
             if (!store) return failures;
-            st::basic_vector<byte_t> value;
+            st::vector<byte_t> value;
             failures += expect(value.resize(200) == st::status_t::success_k);
             for (std::size_t index = 0; index != value.size(); ++index) value[index] = painted(5, index);
             for (stored_key_t key = 0; key != 64; ++key)
@@ -487,12 +490,12 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect_eq(run_bytes_of(*(*stack)->volume), wasted);
 
         // The volume is still a volume: a write over it flushes and answers.
-        st::basic_vector<byte_t> value;
+        st::vector<byte_t> value;
         failures += expect(value.resize(64) == st::status_t::success_k);
         for (std::size_t index = 0; index != value.size(); ++index) value[index] = painted(9, index);
         failures += expect((*store)->insert(stored_key_t {1000}, std::span<byte_t const> {value}).succeeded());
         failures += expect((*store)->flush().succeeded());
-        st::basic_vector<byte_t> back;
+        st::vector<byte_t> back;
         failures += expect(back.resize(value.size()) == st::status_t::success_k);
         stored_value_size_t size = 0;
         failures += expect(
@@ -511,7 +514,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
                 **stack, config);
             failures += expect(store.has_value());
             if (!store) return failures;
-            st::basic_vector<byte_t> value;
+            st::vector<byte_t> value;
             failures += expect(value.resize(200) == st::status_t::success_k);
             for (std::size_t index = 0; index != value.size(); ++index) value[index] = painted(5, index);
             for (stored_key_t round = 0; round != 2; ++round) {
@@ -558,7 +561,7 @@ std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
     if (!stack) return failures;
 
     single_collection_database_config_t const config = test_config(0, value_max_size_k);
-    st::basic_vector<byte_t> owner_bytes;
+    st::vector<byte_t> owner_bytes;
     failures += expect(owner_bytes.resize(3000) == st::status_t::success_k);
     for (std::size_t index = 0; index != owner_bytes.size(); ++index) owner_bytes[index] = painted(77, index);
 
@@ -568,7 +571,7 @@ std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
         failures += expect(store.has_value());
         if (!store) return failures;
 
-        st::basic_vector<byte_t> value;
+        st::vector<byte_t> value;
         failures += expect(value.resize(200) == st::status_t::success_k);
         for (std::size_t index = 0; index != value.size(); ++index) value[index] = painted(5, index);
         for (stored_key_t key = 0; key != 64; ++key)
@@ -589,7 +592,7 @@ std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
         if (!store) return failures;
 
         failures += expect_eq((*store)->user_data_size_bytes(), std::uint64_t {owner_bytes.size()});
-        st::basic_vector<byte_t> back;
+        st::vector<byte_t> back;
         failures += expect(back.resize(owner_bytes.size()) == st::status_t::success_k);
         failures += expect((*store)->load_user_data((*stack)->channel(), std::span<byte_t> {back}).succeeded());
         failures += expect_eq(std::memcmp(back.data(), owner_bytes.data(), owner_bytes.size()), 0);
@@ -641,7 +644,7 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
     failures += expect(store.has_value());
     if (!store) return failures;
 
-    st::basic_vector<byte_t> value;
+    st::vector<byte_t> value;
     failures += expect(value.resize(value_bytes_k) == st::status_t::success_k);
     for (std::size_t index = 0; index != value_bytes_k; ++index) value[index] = painted(1, index);
     for (stored_key_t key = 0; key != keys_k; ++key)
@@ -659,7 +662,7 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
         writer_failures += expect(changing.has_value());
         if (!changing) return;
 
-        st::basic_vector<byte_t> painted_value;
+        st::vector<byte_t> painted_value;
         writer_failures += expect(painted_value.resize(value_bytes_k) == st::status_t::success_k);
         for (std::size_t round = 0; round != commits_k; ++round) {
             std::uint64_t const version = 1 + round % 2;
@@ -674,9 +677,9 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
     std::size_t torn = 0;
     std::size_t unknown = 0;
     std::size_t passes = 0;
-    st::basic_vector<stored_key_t> keys;
-    st::basic_vector<lookup_result_t> results;
-    st::basic_vector<byte_t> carried;
+    st::vector<stored_key_t> keys;
+    st::vector<lookup_result_t> results;
+    st::vector<byte_t> carried;
     failures += expect(keys.resize(keys_k) == st::status_t::success_k);
     failures += expect(results.resize(keys_k) == st::status_t::success_k);
     failures += expect(carried.resize(keys_k * value_bytes_k) == st::status_t::success_k);
@@ -978,8 +981,8 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
     failures += expect(store.has_value());
     if (!store) return failures;
 
-    st::basic_vector<byte_t> older;
-    st::basic_vector<byte_t> newer;
+    st::vector<byte_t> older;
+    st::vector<byte_t> newer;
     failures += expect(older.resize(bytes_k) == st::status_t::success_k);
     failures += expect(newer.resize(bytes_k) == st::status_t::success_k);
     for (std::size_t index = 0; index != bytes_k; ++index) older[index] = painted(11, index);
@@ -1006,7 +1009,7 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
         writer_failures += expect((*store)->flush().succeeded());
     }};
 
-    st::basic_vector<byte_t> into;
+    st::vector<byte_t> into;
     failures += expect(into.resize(bytes_k) == st::status_t::success_k);
     for (stored_key_t key = 0; key != 8; ++key) {
         stored_value_size_t size = 0;
@@ -1057,7 +1060,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     failures += expect(store.has_value());
     if (!store) return failures;
 
-    st::basic_vector<expectation_t> model;
+    st::vector<expectation_t> model;
     failures += expect(model.resize(keys_k) == st::status_t::success_k);
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys_k; ++index) model[index].stored_key = static_cast<stored_key_t>(index);
@@ -1068,7 +1071,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     };
 
     for (std::size_t round = 0; round != rounds_k; ++round) {
-        st::basic_vector<expectation_t> batch;
+        st::vector<expectation_t> batch;
         for (std::size_t index = round; index < keys_k; index += rounds_k) {
             expectation_t entry;
             entry.stored_key = static_cast<stored_key_t>(index);
@@ -1092,7 +1095,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
 
     // What stays in memory runs is what the scan must merge in front of every run.
     {
-        st::basic_vector<expectation_t> batch;
+        st::vector<expectation_t> batch;
         for (std::size_t index = 0; index < keys_k; index += 25) {
             expectation_t entry;
             entry.stored_key = static_cast<stored_key_t>(index);

@@ -8,7 +8,7 @@
  *  A tape is the offsets of its strings, one more than their count and the first zero, then their bytes back to back,
  *  as Apache Arrow's @c binary and @c large_binary lay them. On a device one block scans the lengths into the offsets
  *  and cuts the strings into segments, and one block per segment copies its strings; on the host @c assemble_tape does
- *  both in one pass.
+ *  both in one pass, and its device twin in @c vram_device.hpp queues both launches.
  */
 
 #pragma once
@@ -48,6 +48,13 @@ struct tape_segment_t {
 };
 
 static_assert(sizeof(tape_segment_t) == 16, "A tape segment is two counts and an offset");
+
+/** Threads of every tape kernel's block, eight 32-lane NVIDIA warps or four
+ *  64-lane AMD wavefronts. */
+inline constexpr unsigned tape_block_threads_k = 256;
+
+/** Sources each block of a device gather copies. */
+inline constexpr std::uint32_t tape_sources_per_segment_k = 64;
 
 /**
  *  @brief Lays @p count strings out as a tape, which the device's offsets and gather kernels write between them.

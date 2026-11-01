@@ -3,7 +3,12 @@
  *  @author Ash Vardanian
  *  @date September 27, 2026
  *  @brief The verb tables every engine fills, which the router of <tt>src/lib.hpp</tt> routes each
- *      handle through, and the handles of databases, transactions, snapshots and executors.
+ *      handle through, the handles of databases, transactions, snapshots and executors, and
+ *      the CPU classes.
+ *
+ *  A CPU class pairs a strings kit, an atomic reference and a waiter, which an engine instantiates
+ *  its templates with per class; an open picks the newest class the running CPU admits, and
+ *  class-free words go through the floor class's reference and the picked class's verbs.
  */
 
 #pragma once
@@ -11,17 +16,21 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 
-#include <array>   // `std::array`
-#include <new>     // `std::bad_alloc`
-#include <thread>  // `std::thread::id`
-#include <variant> // `std::variant`, `std::monostate`
+#include <array>       // `std::array`
+#include <memory>      // `std::unique_ptr`
+#include <new>         // `std::bad_alloc`, `std::nothrow`
+#include <thread>      // `std::thread::id`
+#include <type_traits> // `std::is_same_v`
+#include <utility>     // `std::forward`
+#include <variant>     // `std::variant`, `std::monostate`
 
-#include <forkunion/capabilities.hpp>  // `fu::capabilities_t`
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref` & kin - the classes' atomic references
+#include <forkunion/capabilities.hpp>  // `fu::capabilities_t`, `fu::x86_pause_t` & waiter kin, `fu::cpu_capabilities`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 #include <stringzilla/capabilities.h>  // `sz_capability_t`, `sz_cap_serial_k`
 
 #include "ustore/blobs.h"   // `ustore_blobs_read_t`, `ustore_blobs_write_t` and the other binary calls
-#include "ustore/db.h"      // `ustore_database_t`, `ustore_transaction_t`, `ustore_view_t` and the calls on them
+#include "ustore/db.h"      // `ustore_database_t`, `ustore_transaction_t` and the calls on them
 #include "ustore/docs.h"    // `ustore_docs_write_t`, `ustore_docs_read_t` and the other document calls
 #include "ustore/graph.h"   // `ustore_graph_read_edges_t`, `ustore_graph_write_edges_t` and the other graph calls
 #include "ustore/pages.h"   // `ustore_pages_import_t`, `ustore_pages_read_t` and the other page calls
@@ -45,7 +54,6 @@ using utilities::hip_executor_t;
 using utilities::host_blocks_t;
 using utilities::lent_pool_t;
 using utilities::strings_arg_t;
-using utilities::stringzilla_kernels_t;
 
 /** What a call reads through, decoded once by the router from its view, or from the transaction a write carries, and
  *  the scratch and the executor thread it works on. */
@@ -381,6 +389,46 @@ engine_t const& engine_of(handle_type_* handle) noexcept {
     return *handle->engine;
 }
 
+/** The transaction state of @p state_type_ behind @p transaction, or @c uninitialized_k for a
+ *  call naming none. */
+template <typename state_type_>
+expected<state_type_*> transaction_state_of(ustore_transaction_t transaction) noexcept {
+    if (!transaction) return status_t {status_code_t::uninitialized_k, "Transaction is uninitialized"};
+    return state_of<state_type_>(transaction);
+}
+
+/** A handle of @p handle_type_ stamped with its engine and the state of @p state_type_ it is
+ *  about to own, kept apart until @c release publishes them, so an open or a pin failing
+ *  between frees both. */
+template <typename handle_type_, typename state_type_>
+struct made_handle {
+
+    /** The handle, its engine stamped and its state still null. */
+    std::unique_ptr<handle_type_> handle;
+
+    /** The engine's own state, which @c release hands to the handle. */
+    std::unique_ptr<state_type_> state;
+
+    /** Hands the state to the handle and the handle to the caller, which owns it from here on. */
+    [[nodiscard]] handle_type_* release() noexcept {
+        handle->state = state.release();
+        return handle.release();
+    }
+};
+
+/** A handle of @p handle_type_ stamped with @p engine over a state of @p state_type_ made from
+ *  @p arguments, or @c out_of_memory_k. */
+template <typename handle_type_, typename state_type_, typename... arguments_types_>
+expected<made_handle<handle_type_, state_type_>> make_handle(engine_t const& engine,
+                                                             arguments_types_&&... arguments) noexcept {
+    made_handle<handle_type_, state_type_> made;
+    made.handle.reset(new (std::nothrow) handle_type_ {});
+    if (made.handle) made.state.reset(new (std::nothrow) state_type_(std::forward<arguments_types_>(arguments)...));
+    if (!made.state) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the handle and its state"};
+    made.handle->engine = &engine;
+    return made;
+}
+
 /** The database a call addresses: the one it names, or the one its snapshot holds open. */
 template <typename arguments_type_>
 ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
@@ -619,14 +667,14 @@ enum class driver_state_t : std::uint32_t {
 /** What one handle may use: the masks this machine runs when nothing is pinned, the pinned class's masks when it runs
  *  them, as @c pick_cpu_ceiling picks them once at open. */
 struct cpu_ceiling_t {
-    sz_capability_t compute = sz_cap_serial_k;
+    sz_capability_t strings = sz_cap_serial_k;
     fu::capabilities_t sync = fu::capabilities_unknown_k;
 };
 
 /** Where an executor runs calls: one pool thread, or the calling thread of a blocking call. */
 struct runner_t {
 
-    /** The thread running a call here, empty while idle, through @c std::atomic_ref. */
+    /** The thread running a call here, empty while idle, through the floor class's reference. */
     std::thread::id thread;
 
     /** The scratch every call run here works in, freed with the executor. */
@@ -634,6 +682,467 @@ struct runner_t {
 };
 
 #pragma endregion Executors
+
+#pragma region CPU Classes
+
+/** The CPU families UStore ships variants for, named as USearch names them. Each class bundles the
+ *  wait instruction and the atomics its silicon generation guarantees, and the StringZilla kernels
+ *  its calls dispatch to; only a class whose strings kit, waiter or atomic reference differs from
+ *  its parent's carries a variant. */
+enum class cpu_class_t : std::uint32_t {
+
+    /** The zero value, which names no class. */
+    unknown_k = 0,
+
+    /** The portable floor: standard atomics, spinning on the hint every core of its architecture
+     *  carries, @c PAUSE or @c YIELD, and yielding to the scheduler elsewhere. */
+    serial_k,
+
+    /** Haswell-class x86: the @c serial_k waits and atomics, and AVX2 string kernels. */
+    intel_haswell_k,
+
+    /** Sierra Forest-class x86 - the E-core Xeons, and Diamond Rapids after them: @c TPAUSE waits
+     *  and @c CMPCCXADD conditional adds. */
+    intel_sierra_k,
+
+    /** Skylake-class x86 servers: AVX-512 string kernels over the @c intel_haswell_k
+     *  waits and atomics. */
+    intel_skylake_k,
+
+    /** Ice Lake-class x86 servers: the @c intel_skylake_k kernels widened by VBMI2 and SHA-NI. */
+    intel_icelake_k,
+
+    /** Graviton2-class Arm - Neoverse N1: the @c serial_k waits and atomics, and
+     *  NEON string kernels. */
+    aws_g2_k,
+
+    /** Armv8.3+ Arm, named for Apple M2: single-instruction LSE read-modify-writes under
+     *  RCpc acquiring loads. */
+    apple_m2_k,
+
+    /** Graviton3-class Arm and newer: the @c apple_m2_k atomics with @c WFE waits. */
+    aws_g5_k,
+
+    /** RVA23-class RISC-V, named for Alibaba's C930: @c WRS waits, Zacas compare-and-swaps and
+     *  RVV string kernels. */
+    alibaba_c930_k,
+
+    /** The one class of a monoversioned build: the waiter, atomic reference and
+     *  string kernels @c USTORE_MARCH implies or a preset vouches for, as the
+     *  libraries compiled them. */
+    monoversioned_k,
+};
+
+/** The class a refused rung degrades to - the next one down its own lineage, which is the class a
+ *  variant must be distinct from to earn instantiation. */
+constexpr cpu_class_t parent_class_of(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+    case cpu_class_t::intel_icelake_k: return cpu_class_t::intel_skylake_k;
+    case cpu_class_t::intel_skylake_k: return cpu_class_t::intel_haswell_k;
+    case cpu_class_t::intel_sierra_k: return cpu_class_t::intel_haswell_k;
+    case cpu_class_t::apple_m2_k: return cpu_class_t::aws_g2_k;
+    case cpu_class_t::aws_g5_k: return cpu_class_t::apple_m2_k;
+    default: return cpu_class_t::serial_k;
+    }
+}
+
+/** The wait instruction one CPU class pairs: the serial floor spins @c PAUSE on x86 and @c YIELD on
+ *  Arm, the WAITPKG Xeons arm @c TPAUSE, the Graviton5 class sleeps in @c WFE on uncapped waits,
+ *  everything else yields - as does any class whose @c FORKUNION_TARGET_<BIT> is off in the probe
+ *  list. The timed @c WFET only a monoversioned build reaches, where a preset vouches for it. */
+template <cpu_class_t cpu_class_>
+struct waiter_for_cpu_class {
+    using type = fu::standard_yield_t;
+};
+#if FORKUNION_TARGET_X86_PAUSE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::serial_k> {
+    using type = fu::x86_pause_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_haswell_k> {
+    using type = fu::x86_pause_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_skylake_k> {
+    using type = fu::x86_pause_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_icelake_k> {
+    using type = fu::x86_pause_t;
+};
+#endif
+#if FORKUNION_TARGET_X86_TPAUSE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_sierra_k> {
+    using type = fu::x86_tpause_t;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_YIELD
+template <>
+struct waiter_for_cpu_class<cpu_class_t::serial_k> {
+    using type = fu::arm64_yield_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::aws_g2_k> {
+    using type = fu::arm64_yield_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::apple_m2_k> {
+    using type = fu::arm64_yield_t;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_WFE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
+    using type = fu::arm64_wfe_t;
+};
+#endif
+#if FORKUNION_TARGET_RISCV64_WRS
+template <>
+struct waiter_for_cpu_class<cpu_class_t::alibaba_c930_k> {
+    using type = fu::riscv64_wrs_t;
+};
+#endif
+#if USTORE_TARGET_MONOVERSIONED
+template <>
+struct waiter_for_cpu_class<cpu_class_t::monoversioned_k> {
+    using type = fu::preferred_yield_t;
+};
+#endif
+
+/** The waiter a CPU class pairs, spelled short for the variants. */
+template <cpu_class_t cpu_class_>
+using waiter_of = typename waiter_for_cpu_class<cpu_class_>::type;
+
+/** The atomic reference one CPU class pairs: single-instruction LSE read-modify-writes under RCpc
+ *  acquiring loads on the Armv8.3+ classes and conditional adds on the CMPCCXADD Xeons - the
+ *  floors, the older classes, and any class whose @c FORKUNION_TARGET_<BIT> is off in the probe
+ *  list take the standard one. */
+template <cpu_class_t cpu_class_>
+struct atomic_ref_for_cpu_class {
+    template <typename value_type_>
+    using type = fu::standard_atomic_ref<value_type_>;
+};
+#if FORKUNION_TARGET_X86_CMPCCXADD
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::intel_sierra_k> {
+    template <typename value_type_>
+    using type = fu::x86_cmpccxadd_atomic_ref<value_type_>;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_RCPC
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {
+    template <typename value_type_>
+    using type = fu::arm64_rcpc_atomic_ref<value_type_>;
+};
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
+    template <typename value_type_>
+    using type = fu::arm64_rcpc_atomic_ref<value_type_>;
+};
+#elif FORKUNION_TARGET_ARM64_LSE
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {
+    template <typename value_type_>
+    using type = fu::arm64_lse_atomic_ref<value_type_>;
+};
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
+    template <typename value_type_>
+    using type = fu::arm64_lse_atomic_ref<value_type_>;
+};
+#endif
+#if FORKUNION_TARGET_RISCV64_ZACAS
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::alibaba_c930_k> {
+    template <typename value_type_>
+    using type = fu::riscv64_zacas_atomic_ref<value_type_>;
+};
+#endif
+#if USTORE_TARGET_MONOVERSIONED
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::monoversioned_k> {
+    template <typename value_type_>
+    using type = fu::preferred_atomic_ref<value_type_>;
+};
+#endif
+
+/** The reference a CPU class owns one word of @p value_type_ through, spelled short for the
+ *  engines' own words. */
+template <cpu_class_t cpu_class_, typename value_type_>
+using atomic_ref_of = typename atomic_ref_for_cpu_class<cpu_class_>::template type<value_type_>;
+
+/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause: the runtime
+ *  confirms nothing about them. */
+inline constexpr fu::capabilities_t baseline_hints_k = fu::capability_x86_pause_k | fu::capability_arm64_yield_k |
+                                                       fu::capability_riscv64_pause_k;
+
+/** Lowers one CPU class onto ForkUnion's mask - the bits the runtime must confirm before the
+ *  class's waiter and atomic reference are trusted, read off the two types themselves. */
+template <cpu_class_t cpu_class_>
+constexpr fu::capabilities_t forkunion_capabilities_of() noexcept {
+    constexpr fu::capabilities_t waits_k = waiter_of<cpu_class_>::capability_k;
+    constexpr fu::capabilities_t atomics_k = atomic_ref_of<cpu_class_, std::uint32_t>::capabilities_k;
+    return static_cast<fu::capabilities_t>((waits_k | atomics_k) & ~baseline_hints_k);
+}
+
+/** Whether the build compiled the variants of @p cpu_class, as CMake decided and told every unit
+ *  through @c USTORE_TARGET_<CLASS>; a ladder never picks a class without one. */
+constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+#if USTORE_TARGET_SERIAL
+    case cpu_class_t::serial_k: return true;
+#endif
+#if USTORE_TARGET_INTEL_HASWELL
+    case cpu_class_t::intel_haswell_k: return true;
+#endif
+#if USTORE_TARGET_INTEL_SKYLAKE
+    case cpu_class_t::intel_skylake_k: return true;
+#endif
+#if USTORE_TARGET_INTEL_ICELAKE
+    case cpu_class_t::intel_icelake_k: return true;
+#endif
+#if USTORE_TARGET_INTEL_SIERRA
+    case cpu_class_t::intel_sierra_k: return true;
+#endif
+#if USTORE_TARGET_AWS_G2
+    case cpu_class_t::aws_g2_k: return true;
+#endif
+#if USTORE_TARGET_APPLE_M2
+    case cpu_class_t::apple_m2_k: return true;
+#endif
+#if USTORE_TARGET_AWS_G5
+    case cpu_class_t::aws_g5_k: return true;
+#endif
+#if USTORE_TARGET_ALIBABA_C930
+    case cpu_class_t::alibaba_c930_k: return true;
+#endif
+#if USTORE_TARGET_MONOVERSIONED
+    case cpu_class_t::monoversioned_k: return true;
+#endif
+    default: return false;
+    }
+}
+
+/** ForkUnion's mask for a class named at run time; Haswell, Skylake and Ice Lake wait
+ *  and synchronize alike. */
+constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+    case cpu_class_t::intel_haswell_k:
+    case cpu_class_t::intel_skylake_k:
+    case cpu_class_t::intel_icelake_k: return forkunion_capabilities_of<cpu_class_t::intel_haswell_k>();
+    case cpu_class_t::intel_sierra_k: return forkunion_capabilities_of<cpu_class_t::intel_sierra_k>();
+    case cpu_class_t::aws_g2_k: return forkunion_capabilities_of<cpu_class_t::aws_g2_k>();
+    case cpu_class_t::apple_m2_k: return forkunion_capabilities_of<cpu_class_t::apple_m2_k>();
+    case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
+    case cpu_class_t::alibaba_c930_k: return forkunion_capabilities_of<cpu_class_t::alibaba_c930_k>();
+    case cpu_class_t::monoversioned_k: return forkunion_capabilities_of<cpu_class_t::monoversioned_k>();
+    default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
+    }
+}
+
+/** The StringZilla capabilities one CPU class dispatches its string kernels on, as UCall's
+ *  classes name them. */
+constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+    case cpu_class_t::intel_haswell_k: return sz_cap_serial_k | sz_cap_haswell_k | sz_cap_westmere_k;
+    case cpu_class_t::intel_skylake_k:
+        return stringzilla_capabilities_of(cpu_class_t::intel_haswell_k) | sz_cap_skylake_k;
+    case cpu_class_t::intel_icelake_k:
+        return stringzilla_capabilities_of(cpu_class_t::intel_skylake_k) | sz_cap_icelake_k | sz_cap_goldmont_k;
+    case cpu_class_t::intel_sierra_k:
+        return stringzilla_capabilities_of(cpu_class_t::intel_haswell_k) | sz_cap_goldmont_k;
+    case cpu_class_t::aws_g2_k:
+    case cpu_class_t::apple_m2_k:
+    case cpu_class_t::aws_g5_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
+    case cpu_class_t::alibaba_c930_k: return sz_cap_serial_k | sz_cap_rvv_k;
+    case cpu_class_t::monoversioned_k: return sz_capabilities_compiled_cpu_mask();
+    default: return sz_cap_serial_k;
+    }
+}
+
+/** The StringZilla kernels the stores and calls of @p cpu_class_ run their string work through. */
+template <cpu_class_t cpu_class_>
+using strings_kit_of = typename utilities::strings_ladder<stringzilla_capabilities_of(cpu_class_)>::strings_kit_t;
+
+/** Whether one compiled class is distinct from the class it degrades to: another strings kit,
+ *  waiter or atomic reference, the one fact justifying its variant. */
+template <cpu_class_t cpu_class_>
+consteval bool rung_advances() noexcept {
+    constexpr cpu_class_t parent_k = parent_class_of(cpu_class_);
+    return cpu_class_compiled(cpu_class_) &&
+           (!std::is_same_v<strings_kit_of<cpu_class_>, strings_kit_of<parent_k>> ||
+            !std::is_same_v<waiter_of<cpu_class_>, waiter_of<parent_k>> ||
+            !std::is_same_v<atomic_ref_of<cpu_class_, std::uint32_t>, atomic_ref_of<parent_k, std::uint32_t>>);
+}
+
+/** The C enum's class as the engines name it; @c ustore_cpu_class_unknown_k derives nothing, so it
+ *  names the serial floor. */
+constexpr cpu_class_t cpu_class_of(ustore_cpu_class_t cpu_class) noexcept {
+    if (cpu_class == ustore_cpu_class_unknown_k || cpu_class > ustore_cpu_class_monoversioned_k)
+        return cpu_class_t::serial_k;
+    return static_cast<cpu_class_t>(cpu_class);
+}
+
+static_assert(static_cast<std::uint32_t>(cpu_class_t::monoversioned_k) == ustore_cpu_class_monoversioned_k);
+
+/** Whether @p rung fits under @p ceiling: its waiter, atomics and string kernels need nothing
+ *  the ceiling lacks. */
+constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
+    return (stringzilla_capabilities_of(rung) & ~ceiling.strings) == 0 &&
+           (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
+}
+
+/** The mask a pool of an executor under @p ceiling is allowed: every placement bit, and the
+ *  instructions the ceiling keeps. */
+constexpr fu_capabilities_t forkunion_allowed_of(cpu_ceiling_t ceiling) noexcept {
+    return static_cast<fu_capabilities_t>((fu_capabilities_all_k & ~fu_capability_any_instruction_k) | ceiling.sync |
+                                          baseline_hints_k);
+}
+
+/** CPU classes newest first, the order a ladder tries them in. */
+template <cpu_class_t... classes_>
+struct cpu_ladder {};
+
+/** The classes carrying variants, each lineage newest first and the serial floor last, or the
+ *  one class of a monoversioned build; a rung the build left out is skipped by the walk, never
+ *  by the list. */
+#if USTORE_TARGET_MONOVERSIONED
+using cpu_ladder_t = cpu_ladder<cpu_class_t::monoversioned_k>;
+inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::monoversioned_k;
+#else
+using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_sierra_k,
+                                cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::apple_m2_k,
+                                cpu_class_t::aws_g2_k, cpu_class_t::alibaba_c930_k, cpu_class_t::serial_k>;
+inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::serial_k;
+#endif
+
+/** What a handle may use: the masks this machine runs when nothing is pinned, the pinned class's
+ *  masks when it runs them, refusing an unknown class, one this machine does not run, or a ceiling
+ *  the build compiled no class under, as a monoversioned build on an older CPU or under a pin below
+ *  its one class. The one caller of StringZilla's and ForkUnion's detection. */
+inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t pinned) noexcept {
+    cpu_ceiling_t ceiling;
+    if (sz_capabilities_detected_cpu(&ceiling.strings) != sz_success_k) ceiling.strings = sz_cap_serial_k;
+    ceiling.sync = fu::cpu_capabilities();
+    if (pinned > ustore_cpu_class_monoversioned_k)
+        return status_t {status_code_t::invalid_argument_k, "Unknown CPU class"};
+    if (pinned != ustore_cpu_class_unknown_k) {
+        cpu_class_t const pinned_class = cpu_class_of(pinned);
+        cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
+        if ((ceiling.strings & wanted.strings) != wanted.strings || (ceiling.sync & wanted.sync) != wanted.sync)
+            return status_t {status_code_t::unsupported_k, "The CPU does not run the pinned class"};
+        ceiling = wanted;
+    }
+    bool const compiled = []<cpu_class_t... classes_>(cpu_ladder<classes_...>, cpu_ceiling_t under) noexcept {
+        return ((cpu_class_compiled(classes_) && cpu_rung_fits(classes_, under)) || ...);
+    }(cpu_ladder_t {}, ceiling);
+    if (!compiled) return status_t {status_code_t::unsupported_k, "The build compiled no class the CPU runs"};
+    return ceiling;
+}
+
+/** Opens through @p open on the newest rung of @p ladder the build compiled and @p ceiling fits,
+ *  the serial floor last, calling it as <tt>open.template operator()<class>()</tt>; a class picking its
+ *  parent's waiter and atomics is skipped without instantiating its variant. */
+template <cpu_class_t... classes_, typename open_type_>
+status_t open_fitting_rung(cpu_ladder<classes_...>, cpu_ceiling_t ceiling, open_type_&& open) noexcept {
+    status_t opened;
+    bool picked = false;
+    auto rung = [&]<cpu_class_t class_>() noexcept {
+        constexpr bool floor_k = class_ == cpu_class_t::serial_k || class_ == cpu_class_t::monoversioned_k;
+        if constexpr ((floor_k && cpu_class_compiled(class_)) || rung_advances<class_>()) {
+            if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, opened = open.template operator()<class_>();
+        }
+        else static_assert(!cpu_class_compiled(class_), "A compiled class no longer advances past the one below");
+    };
+    (rung.template operator()<classes_>(), ...);
+    return opened;
+}
+
+/** The verbs over the words a call's waiters and claims touch, lowered onto one CPU class's
+ *  reference and waiter; the release store is the same instruction on every class, the wait and the
+ *  exchange are what differ. */
+struct class_verbs_t {
+    void (*publish)(ustore_outcome_t*, ustore_status_t, std::memory_order) noexcept;
+    ustore_status_t (*load)(ustore_outcome_t const*) noexcept;
+    ustore_status_t (*wait)(ustore_outcome_t const*) noexcept;
+    bool (*take)(claim_t*) noexcept;
+    void (*release)(claim_t*) noexcept;
+
+    /** Waits until the word stops reading the value seen, watching its address, so
+     *  no store notifies. */
+    void (*await_change)(std::uint32_t const*, std::uint32_t) noexcept;
+};
+
+template <cpu_class_t cpu_class_>
+class_verbs_t class_verbs_of() noexcept {
+    using status_ref_t = atomic_ref_of<cpu_class_, ustore_status_t>;
+    using status_reader_t = atomic_ref_of<cpu_class_, ustore_status_t const>;
+    using claim_ref_t = atomic_ref_of<cpu_class_, claim_t>;
+    using word_reader_t = atomic_ref_of<cpu_class_, std::uint32_t const>;
+    using waiter_t = waiter_of<cpu_class_>;
+    return {
+        [](ustore_outcome_t* outcome, ustore_status_t status, std::memory_order order) noexcept {
+            status_ref_t(outcome->status).store(status, order);
+        },
+        [](ustore_outcome_t const* outcome) noexcept {
+            return status_reader_t(outcome->status).load(std::memory_order_acquire);
+        },
+        [](ustore_outcome_t const* outcome) noexcept {
+            status_reader_t const status {outcome->status};
+            ustore_status_t seen = status.load(std::memory_order_acquire);
+            for (; seen == ustore_status_deferred_k; seen = status.load(std::memory_order_acquire))
+                waiter_t {}(&outcome->status, seen, 0u, fu::wait_capped_t {});
+            return seen;
+        },
+        [](claim_t* word) noexcept {
+            return claim_ref_t(*word).exchange(claim_t::held_k, std::memory_order_seq_cst) == claim_t::free_k;
+        },
+        [](claim_t* word) noexcept { claim_ref_t(*word).store(claim_t::free_k, std::memory_order_release); },
+        [](std::uint32_t const* word, std::uint32_t seen) noexcept {
+            word_reader_t const watched {*word};
+            while (watched.load(std::memory_order_acquire) == seen) waiter_t {}(word, seen, 0u, fu::wait_uncapped_k);
+        },
+    };
+}
+
+/** The row of the newest compiled class this machine admits, picked once by the ladder walk. */
+inline class_verbs_t const& host_verbs() noexcept {
+    static class_verbs_t const picked = []<cpu_class_t... classes_>(cpu_ladder<classes_...>) noexcept {
+        expected<cpu_ceiling_t> const ceiling = pick_cpu_ceiling(ustore_cpu_class_unknown_k);
+        class_verbs_t row = class_verbs_of<cpu_ladder_floor_k>();
+        bool found = false;
+        auto rung = [&]<cpu_class_t class_>() noexcept {
+            if (!found && ceiling && cpu_class_compiled(class_) && cpu_rung_fits(class_, *ceiling))
+                row = class_verbs_of<class_>(), found = true;
+        };
+        (rung.template operator()<classes_>(), ...);
+        return row;
+    }(cpu_ladder_t {});
+    return picked;
+}
+
+/** The reference class-free host words share, the floor's, which every machine this build
+ *  runs on admits. */
+template <typename value_type_>
+using floor_atomic_ref = atomic_ref_of<cpu_ladder_floor_k, value_type_>;
+
+/** Counts one more open snapshot on @p open_snapshots, through the reference of @p cpu_class_. */
+template <cpu_class_t cpu_class_>
+void count_snapshot_opened(std::size_t& open_snapshots) noexcept {
+    atomic_ref_of<cpu_class_, std::size_t> {open_snapshots}.fetch_add(1, std::memory_order_release);
+}
+
+/** Counts one snapshot closed on @p open_snapshots, answering whether it was the last one open,
+ *  after which whatever the open snapshots kept alive may go. */
+template <cpu_class_t cpu_class_>
+[[nodiscard]] bool count_snapshot_closed(std::size_t& open_snapshots) noexcept {
+    return atomic_ref_of<cpu_class_, std::size_t> {open_snapshots}.fetch_sub(1, std::memory_order_acq_rel) == 1;
+}
+
+#pragma endregion CPU Classes
 
 } // namespace unum::ustore
 
@@ -651,14 +1160,12 @@ struct ustore_database_handle_t {
     /** The kernels and waits every call on the database may use, picked once at open. */
     cpu_ceiling_t ceiling;
 
-    /** The StringZilla kernels calls on the database run directly, looked up under @c ceiling at open. */
-    stringzilla_kernels_t kernels;
-
-    /** Deferred calls naming the database that have not finished, through @c std::atomic_ref. */
+    /** Deferred calls naming the database that have not finished, through the
+     *  floor class's reference. */
     std::uint32_t deferred_calls = 0;
 
-    /** The caller's hold plus one per transaction, snapshot or cursor keeping the database open, through
-     *  @c std::atomic_ref. */
+    /** The caller's hold plus one per transaction, snapshot or cursor keeping the database open,
+     *  through the floor class's reference. */
     std::uint32_t holds = 1;
 };
 
@@ -670,10 +1177,12 @@ struct ustore_transaction_handle_t {
     ustore_database_t database = nullptr;
     claim_t claim = claim_t::free_k;
 
-    /** Deferred calls naming the transaction that have not finished, through @c std::atomic_ref. */
+    /** Deferred calls naming the transaction that have not finished, through the
+     *  floor class's reference. */
     std::uint32_t deferred_calls = 0;
 
-    /** The caller's hold plus one per cursor reading through the transaction, through @c std::atomic_ref. */
+    /** The caller's hold plus one per cursor reading through the transaction, through the
+     *  floor class's reference. */
     std::uint32_t holds = 1;
 };
 
@@ -692,10 +1201,12 @@ struct ustore_snapshot_handle_t {
     void* state = nullptr;
     ustore_database_t database = nullptr;
 
-    /** Deferred calls naming the snapshot that have not finished, through @c std::atomic_ref. */
+    /** Deferred calls naming the snapshot that have not finished, through the
+     *  floor class's reference. */
     std::uint32_t deferred_calls = 0;
 
-    /** The caller's hold plus one per cursor reading through the snapshot, through @c std::atomic_ref. */
+    /** The caller's hold plus one per cursor reading through the snapshot, through the
+     *  floor class's reference. */
     std::uint32_t holds = 1;
 };
 
@@ -710,13 +1221,13 @@ struct ustore_executor_handle_t {
     executor_t driver;
 
     /** A ring of power-of-two slots, of which @c deferred_limit hold calls at once. */
-    st::basic_vector<deferred_slot_t> deferred;
+    st::vector<deferred_slot_t> deferred;
 
     /** One result per call of the batch the driver serves, read after the batch's table positions are free. */
-    st::basic_vector<deferred_result_t> results;
+    st::vector<deferred_result_t> results;
 
     /** One runner per pool thread, plus one for a blocking call and a batch the driver runs itself. */
-    st::basic_vector<runner_t> runners;
+    st::vector<runner_t> runners;
 
     /** Tickets taken in the low half and table positions taken in the high half. */
     std::uint64_t submitted = 0;

@@ -5,14 +5,14 @@
  *  @brief The page edits of the C ABI over the pages stores of
  *      <tt>include/ustore/pages/nvme_store.hpp</tt>, for the NVMe engine's table.
  *
- *  These calls build on the writes and the collection lookups of <tt>src/nvme/database.hpp</tt>. An
- *  edit call addressing any collection but a pages one is refused. The @c *_edits calls of
- *  <tt>src/blobs_layers/pages.hpp</tt> read the pages unwatched through the engine's own reads,
- *  check and apply the edits, and answer the edits of every page as one chain, which
- *  @c commit_page_edits lands. A chain that imports or removes the page decides it whole, so the
- *  page it leaves is written, or removed, and any other chain is appended as one @c page_fold_t
- *  change delta, watching nothing, so two commits editing one page both land. Reads take
- *  @c pages_read_over_blobs over the engine's own reads of the pages store, which fold the deltas.
+ *  These calls build on the writes and the collection lookups of <tt>src/nvme/database.hpp</tt>. An edit
+ *  call addressing any collection but a pages one is refused. The @c *_edits calls of
+ *  <tt>src/pages_layer.hpp</tt> read the pages unwatched through the engine's own reads, check and apply
+ *  the edits, and answer the edits of every page as one chain, which @c commit_page_edits lands. A
+ *  chain that imports or removes the page decides it whole, so the page it leaves is written, or
+ *  removed, and any other chain is appended as one @c page_fold_t change delta, watching nothing,
+ *  so two commits editing one page both land. Reads take @c pages_read_over_blobs over the engine's
+ *  own reads of the pages store, which fold the deltas.
  */
 
 #pragma once
@@ -26,7 +26,7 @@
 #include "ustore/pages/page_fold.hpp"       // `page_fold_t`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 
-#include "blobs_layers/pages.hpp" // `page_edits_t`, `pages_import_edits`, `pages_insert_edits`
+#include "pages_layer.hpp" // `page_edits_t`, `pages_import_edits`, `pages_insert_edits`
 
 #include "database.hpp" // `call_access`, `resolve_runs`, `write_value`, `serve_write`
 
@@ -80,7 +80,8 @@ template <cpu_class_t cpu_class_>
 status_t pages_import(ustore_pages_import_t const& arguments, strings_arg_t const& values,
                       view_t const& view) noexcept {
     return commit_page_edits<cpu_class_>(arguments, view, [&]() noexcept {
-        return pages_import_edits(nvme_variant<cpu_class_>::values_verbs_k, arguments, values, view);
+        return pages_import_edits<typename nvme_variant<cpu_class_>::strings_kit_t>(
+            nvme_variant<cpu_class_>::values_verbs_k, arguments, values, view);
     });
 }
 
@@ -89,7 +90,8 @@ template <cpu_class_t cpu_class_>
 status_t pages_insert(ustore_pages_insert_t const& arguments, strings_arg_t const& values,
                       view_t const& view) noexcept {
     return commit_page_edits<cpu_class_>(arguments, view, [&]() noexcept {
-        return pages_insert_edits(nvme_variant<cpu_class_>::values_verbs_k, arguments, values, view);
+        return pages_insert_edits<typename nvme_variant<cpu_class_>::strings_kit_t>(
+            nvme_variant<cpu_class_>::values_verbs_k, arguments, values, view);
     });
 }
 

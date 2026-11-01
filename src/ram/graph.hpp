@@ -12,13 +12,13 @@
 
 #include <type_traits> // `std::is_same_v`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/graph.h"
 #include "ustore/ranges.hpp" // `edges_view_t`, `strided`
 
 #include "ustore/graph/half_edges.hpp"      // `half_edge_t`
-#include "ustore/graph/ram_graph.hpp"       // `export_edges`, `stage_edges`, `stage_vertex_removal`
+#include "ustore/graph/ram_store.hpp"       // `export_edges`, `stage_edges`, `stage_vertex_removal`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_copy`, `arena_allocator`
 
 #include "database.hpp"          // `database_state`, `with_source`, `stage_runs_of`, `serve_write`, `scan_keys`
@@ -41,8 +41,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_read_
     edges_batch_t const tasks {collections, strided(arguments.vertices), strided(arguments.roles), arguments.count};
     auto [degrees, degrees_status] = arena_allocate<ustore_vertex_degree_t>(arguments.arena, arguments.count);
     if (degrees_status.failed()) return degrees_status;
-    st::basic_vector<ustore_key_t, arena_allocator<ustore_key_t>> edges {{view.scratch}};
-    st::basic_vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
+    st::vector<ustore_key_t, arena_allocator<ustore_key_t>> edges {{view.scratch}};
+    st::vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
 
     status_t outcome;
     store_status_t const exported = with_source(state, view, [&](auto& source) noexcept {
@@ -140,7 +140,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_remov
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
     strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
-    st::basic_vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
+    st::vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_runs_of<half_edge_t>(
             source, collections, arguments.count, outcome,

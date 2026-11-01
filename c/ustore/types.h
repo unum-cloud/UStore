@@ -11,14 +11,16 @@
  *
  *  @section types_verbs Verbs
  *
- *  Every verb that takes options, outputs, or callbacks takes one argument structure named after it, as
- *  @c ustore_blobs_read takes a @c ustore_blobs_read_t, so optional arguments are skipped by name and their order
- *  never matters. Name lookups, views, outcome polls and the @c _free family stay positional. Every structure
- *  opens in the same order: the handle, @c executor, @c outcome, then @c completion. The rest reads in the
- *  order the call works: what it reads, led by the view of a read or the transaction of a write, then the
- *  outputs and the @c written count of a listing right before the @c arena they land in, then the knobs that
- *  shape the work, such as @c wanted, a conversion of the outputs such as @c outputs_type, and @c mode, and last
- *  @c progress and @c progress_state. A verb that creates a handle names that output first.
+ *  Every verb that takes options, outputs, or callbacks takes one argument structure named
+ *  after it, as @c ustore_blobs_read takes a @c ustore_blobs_read_t, so optional arguments
+ *  are skipped by name and their order never matters. Name lookups, views, outcome polls
+ *  and the @c _free family stay positional. Every structure opens in the same order: the
+ *  handle, @c executor, @c outcome, then @c completion. The rest reads in the order the
+ *  call works: what it reads, led by the view of a read or the transaction of a write, then
+ *  the outputs and the @c written count of a listing right before the @c arena they land
+ *  in, then the knobs that shape the work, such as @c wanted, a conversion of the outputs
+ *  such as @c outputs_type, and @c mode, and last @c progress and @c progress_state. A verb
+ *  that creates a handle names that output first.
  *
  *  Structures carry no size or version field, so they grow source-compatibly only: initialize them
  *  by designator, which zeroes every field left out, and expect the major version to change whenever
@@ -29,13 +31,13 @@
  *
  *  Synchronous and asynchronous calls share one shape, so no verb has an asynchronous twin. The
  *  argument structure is the whole request and the outcome is all the caller observes until it
- *  finishes, which lets a thread pool, a GPU stream, or a remote client serving the same header over the
- *  network sit behind the same verbs without changing a call site. Every call names its completion: a
- *  blocking call, the default, returns with its final status stored and every output
- *  readable, and a call whose @c completion is @c ustore_completion_deferred_k returns once submitted, as
- *  an io_uring entry does. A call with a @c NULL executor runs on the calling thread and is final when
- *  it returns, whatever its @c completion. Submission copies the structure; everything it points to
- *  stays borrowed until final.
+ *  finishes, which lets a thread pool, a GPU stream, or a remote client serving the same header
+ *  over the network sit behind the same verbs without changing a call site. Every call names its
+ *  completion: a blocking call, the default, returns with its final status stored and every output
+ *  readable, and a call whose @c completion is @c ustore_completion_deferred_k returns once
+ *  submitted, as an io_uring entry does. A call with a @c NULL executor runs on the calling thread
+ *  and is final when it returns, whatever its @c completion. Submission copies the structure;
+ *  everything it points to stays borrowed until final.
  *
  *  The outcome's status reads @c ustore_status_deferred_k until final, even for a call refused at
  *  submission. The message, then the final status, are stored with release ordering and a wake, and the
@@ -44,17 +46,17 @@
  *  Device work stores the final status from a host callback that still fires after a device fault, so an
  *  outcome may live in any host memory.
  *
- *  Scheduling is bounded on both sides. Calls on one executor start in submission order, and a blocking
- *  call runs alone: after every call submitted before it finishes, and before any submitted after it
- *  starts. Executors own their threads and streams, so verbs take no stream and no event, and a caller
- *  orders dependent deferred calls itself, by waiting on the first before submitting the second. Each
- *  executor holds a fixed number of deferred calls in its deferred table, sized by
- *  @c deferred_limit, so a deferred submission that finds the table full finishes at once with
- *  @c ustore_status_contended_k instead of allocating or blocking, while blocking calls take no slot. An
- *  arena and a transaction each serve one call at a time, and a second call naming one finishes
- *  @c ustore_status_contended_k. A call stops early only when its progress
- *  callback returns @c ustore_cancel_k, so @c ustore_status_deferred_k is the only status an unfinished
- *  call shows.
+ *  Scheduling is bounded on both sides. Calls on one executor start in submission order, and a
+ *  blocking call runs alone: after every call submitted before it finishes, and before any
+ *  submitted after it starts. Executors own their threads and streams, so verbs take no stream and
+ *  no event, and a caller orders dependent deferred calls itself, by waiting on the first before
+ *  submitting the second. Each executor holds a fixed number of deferred calls in its deferred
+ *  table, sized by @c deferred_limit, so a deferred submission that finds the table full finishes
+ *  at once with @c ustore_status_contended_k instead of allocating or blocking, while blocking
+ *  calls take no slot. An arena and a transaction each serve one call at a time, and a second call
+ *  naming one finishes @c ustore_status_contended_k. A call stops early only when its progress
+ *  callback returns @c ustore_cancel_k, so @c ustore_status_deferred_k is the only status an
+ *  unfinished call shows.
  *
  *  @code{.c}
  *  ustore_outcome_t outcomes[4] = {0};
@@ -73,22 +75,25 @@
  *  every binding stays one verb per operation rather than a twin per output style. Every byte has
  *  one owner, and each owner picks where its bytes live once, when it is created.
  *
- *  Callers lend memory, never a way to allocate it: no allocator callback crosses the interface, and
- *  every pointer a caller passes is an input, classified through the driver once per call. Payload
- *  belongs to the handle, placed by its constructor, as @c ustore_database_open_nvme
- *  places it on its drives. Scratch and staging belong to the executor, placed at its creation and
- *  grown to a high-water mark. Every output whose length scales with the call lands in an arena:
+ *  Callers lend memory, never a way to allocate it: no allocator callback crosses the interface,
+ *  and every pointer a caller passes is an input, classified through the driver once per call.
+ *  Payload belongs to the handle, placed by its constructor, as @c ustore_database_open_nvme places
+ *  it on its drives. Scratch and staging belong to the executor, placed at its creation and grown
+ *  to a high-water mark. Every output whose length scales with the call lands in an arena:
  *  values, presences, offsets, keys, identifiers, degrees, edges, bounds and columns alike. Only
- *  fixed-size reports, such as descriptions, stamps, the @c written count of a listing and created handles,
- *  stay caller fields, and a call that fails zeroes the scalars among them and leaves the handles @c NULL.
+ *  fixed-size reports, such as descriptions, stamps, the @c written count of a listing and created
+ *  handles, stay caller fields, and a call that fails zeroes the scalars among them and leaves the
+ *  handles @c NULL.
  *
- *  Executors make arenas. @c ustore_arena_init places one where its executor computes, decided once,
- *  and a @c NULL executor makes host pages for calls on the calling thread. A call rewinds the arena it
- *  is given, invalidating the previous call's outputs, and writes views into it, and any verb may reuse
- *  any arena its executor made, one call at a time. Blocking calls borrow the arena; deferred calls hold
- *  it until final. Shorthand with no place for an arena, such as @c db[key] or @c key @c in @c db, makes a
- *  one-off arena through @c ustore_arena_init and frees it with its result: slower than reuse, and
- *  stateless.
+ *  Executors make arenas. @c ustore_arena_init places one where its executor
+ *  computes, decided once, and a @c NULL executor makes host pages for calls on
+ *  the calling thread. A call rewinds the arena it is given, invalidating the
+ *  previous call's outputs, and writes views into it, and any verb may reuse
+ *  any arena its executor made, one call at a time. Blocking calls borrow the
+ *  arena; deferred calls hold it until final. Shorthand with no place for an
+ *  arena, such as @c db[key] or @c key @c in @c db, makes a one-off arena
+ *  through @c ustore_arena_init and frees it with its result: slower than
+ *  reuse, and stateless.
  *
  *  Outputs are views the call writes, so none carries a capacity or a stride for the caller to
  *  pick, and an arena keeps its high-water mark, so a steady loop allocates once. The library
@@ -116,17 +121,17 @@
  *  as an Apache Arrow tape of 32-bit or 64-bit offsets, or through an accessor over any other shape, so a tape read
  *  back is written again as it is. A zeroed view of any shape stands for the input's default.
  *
- *  Outputs take three shapes too, written packed into the arena, so none carries a capacity or a stride. Fixed-width
- *  outputs are arrays, such as presence bits, keys, identifiers, degrees and bounds. Ragged bytes are a
- *  @c ustore_strings_view_t the call writes as a tape, with 32-bit offsets while its bytes fit in 4 GiB and 64-bit
- *  beyond. Ragged keys are packed, split by task through @c count + 1 offsets, as every offset array holds one more
- *  entry than the runs it splits.
+ *  Outputs take three shapes too, written packed into the arena, so none carries a capacity or
+ *  a stride. Fixed-width outputs are arrays, such as presence bits, keys, identifiers, degrees
+ *  and bounds. Ragged bytes are a @c ustore_strings_view_t the call writes as a tape, with
+ *  32-bit offsets while its bytes fit in 4 GiB and 64-bit beyond. Ragged keys are packed, split
+ *  by task through @c count + 1 offsets, as every offset array holds one more entry than the
+ *  runs it splits.
  */
 
 #ifndef UNUM_USTORE_TYPES_H
 #define UNUM_USTORE_TYPES_H
 
-#include <stddef.h> // `size_t`
 #include <stdint.h> // `uint8_t`, `uint32_t`, `uint64_t`
 
 /**
@@ -181,8 +186,7 @@ typedef struct ustore_bytes_view_t {
 } ustore_bytes_view_t;
 
 /** Writes the view of every string <tt>indices[i]</tt> into <tt>views[i]</tt>, for strings no tape holds, and accepts
- *  any
- *  @p count. */
+ *  any @p count. */
 typedef void (*ustore_strings_get_t)(void const* handle, ustore_size_t const* indices, ustore_size_t count,
                                      ustore_bytes_view_t* views);
 
@@ -251,18 +255,15 @@ typedef struct ustore_strings_view_t {
 
 } ustore_strings_view_t;
 
-/** What went wrong, in one vocabulary shared by every engine and binding. Shared statuses carry USearch's numbers,
- *  leaving 3, 4, 5, 11 and 13 unused, and UStore's own follow from 18.
+/**
+ *  @brief What went wrong, in one vocabulary shared by every engine and binding.
  *
- *  Statuses fall into five categories. Resources: @c ustore_status_out_of_memory_k, @c ustore_status_io_k and
- *  @c ustore_status_device_k. Input: @c ustore_status_invalid_argument_k and @c ustore_status_malformed_k. State:
- *  @c ustore_status_uninitialized_k, @c ustore_status_read_only_k, @c ustore_status_unsupported_k,
- *  @c ustore_status_not_found_k, @c ustore_status_already_exists_k, @c ustore_status_write_conflict_k,
- *  @c ustore_status_read_conflict_k, @c ustore_status_phantom_conflict_k, @c ustore_status_capacity_exhausted_k and
- *  @c ustore_status_contended_k. Interruptions: @c ustore_status_cancelled_k and @c ustore_status_deferred_k.
- *  Defects: @c ustore_status_internal_k. Any verb that allocates, binds a device or touches a file may also return a
- *  Resources status; any verb taking a progress callback may return @c ustore_status_cancelled_k. A verb's own block
- *  lists only what its contract adds. */
+ *  Shared statuses carry USearch's numbers, leaving 3, 4, 5, 11 and 13 unused, and UStore's own
+ *  start at 18. Statuses fall into five categories: resources, input, state, interruptions and
+ *  defects. Any verb that allocates, binds a device or touches a file may also return a resources
+ *  status; any verb taking a progress callback may return an interruption. A verb's own block lists
+ *  only what its contract adds.
+ */
 typedef enum ustore_status_t {
 
     /** The call succeeded; @c message carries nothing. */
@@ -401,11 +402,11 @@ typedef enum ustore_continuation_t {
 /**
  *  @brief Periodic report of a long call's advance, and the caller's only way to stop it.
  *
- *  Counts are in the units the verb consumes: tasks for a scan, one pull for a cursor, bytes of keys and values for a
- *  save, and bytes or collections for a compaction. The callback never runs concurrently with itself, however many
- *  threads do the work, and never after the call stores its final status. Its arguments are the units finished so
- *  far, never decreasing within one call, the units the call finishes if it runs to the end, and the
- *  @c progress_state registered beside it.
+ *  Counts are in the units the verb consumes: tasks for a scan, one pull for a cursor, bytes of
+ *  keys and values for a save, and bytes or collections for a compaction. The callback never runs
+ *  concurrently with itself, however many threads do the work, and never after the call stores its
+ *  final status. Its arguments are the units finished so far, never decreasing within one call, the
+ *  units the call finishes if it runs to the end, and the @c progress_state registered beside it.
  */
 typedef ustore_continuation_t (*ustore_progress_callback_t)(ustore_size_t finished, ustore_size_t total, void* state);
 
@@ -447,8 +448,8 @@ USTORE_EXPORT ustore_case_sensitivity_t ustore_case_sensitivity_from_name(ustore
  *  @brief Patterns a scan keeps the values or strings matching, shared by every task of the call and compiled once per
  *      call or once per cursor.
  *
- *  A zeroed structure matches everything. Patterns that fail to compile refuse the call with
- *  @c ustore_status_invalid_argument_k, carrying StringZilla's message.
+ *  A zeroed structure matches everything. Patterns that fail to compile refuse the call
+ *  with @c ustore_status_invalid_argument_k, carrying StringZilla's message.
  */
 typedef struct ustore_patterns_t {
 
@@ -472,15 +473,17 @@ typedef struct ustore_patterns_t {
 /**
  *  @brief An opaque handle to the threads or I/O rings that run calls, shared by any number of databases.
  *
- *  Its kind picks where calls compute: host threads for every engine, or one device for the reads and scans an engine
- *  computes there, where a change, the control plane and every call no device tower serves yet answer
- *  @c ustore_status_unsupported_k, and an arena or cursor of another kind of executor @c ustore_status_device_k.
- *  Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted
- *  before it finishes, and before any submitted after it starts. Databases stay freely concurrent. A blocking call
- *  runs on the calling thread, while one driver thread hands deferred calls in batches to the executor's threads.
- *  In a build without OS threads, an executor runs every call at submission, before returning. It owns the scratch
- *  and staging its calls need, placed where it computes and grown to a high-water mark, so a steady workload
- *  allocates once: a RAM executor keeps the scratch of each thread on the memory domain local to it.
+ *  Its kind picks where calls compute: host threads for every engine, or one device for the reads
+ *  and scans an engine computes there, where a change, the control plane and every call no device
+ *  tower serves yet answer @c ustore_status_unsupported_k, and an arena or cursor of another kind
+ *  of executor @c ustore_status_device_k. Calls on one executor start in submission order, and a
+ *  blocking call runs alone: after every call submitted before it finishes, and before any
+ *  submitted after it starts. Databases stay freely concurrent. A blocking call runs on the calling
+ *  thread, while one driver thread hands deferred calls in batches to the executor's threads. In a
+ *  build without OS threads, an executor runs every call at submission, before returning. It owns
+ *  the scratch and staging its calls need, placed where it computes and grown to a high-water mark,
+ *  so a steady workload allocates once: a RAM executor keeps the scratch of each thread on the
+ *  memory domain local to it.
  *
  *  An executor holds its deferred calls in a deferred table sized at creation by @c deferred_limit, so submitting
  *  never allocates, and a deferred submission that finds the table full stores @c ustore_status_contended_k as its
@@ -771,12 +774,12 @@ typedef enum ustore_gds_t {
     ustore_gds_direct_k = 1,
 
     /** cuFile's compatibility mode, which bounces through host pages it manages. */
-    ustore_gds_compat_k = 2,
+    ustore_gds_compatibility_k = 2,
 
 } ustore_gds_t;
 
-/** The canonical spelling of a GPUDirect Storage mode, as @c ustore_gds_compat_k spells "compat", or
- *  "unrecognized". */
+/** The canonical spelling of a GPUDirect Storage mode, as @c ustore_gds_compatibility_k spells
+ *  "compatibility", or "unrecognized". */
 USTORE_EXPORT char const* ustore_gds_name(ustore_gds_t gds);
 
 /** Reads a GPUDirect Storage mode back from its canonical spelling; @c ustore_gds_automatic_k when unrecognized. */
@@ -978,22 +981,24 @@ USTORE_EXPORT void ustore_executor_drain(ustore_executor_drain_t* arguments);
 USTORE_EXPORT void ustore_executor_free(ustore_executor_t executor);
 
 /**
- *  @brief Memory the library writes every output whose length scales with a call into, reused across calls.
- *      @ref types_memory
+ *  @brief Memory the library writes every output whose length scales with a call into, reused
+ *      across calls. @ref types_memory
  *
- *  Made by @c ustore_arena_init where its executor computes, and an executor whose device runs out of memory reports
- *  @c ustore_status_out_of_memory_k rather than falling back to the host. Each call given the arena rewinds it, which
- *  invalidates every output of the previous call, and refills it, growing only when the new outputs outsize
- *  everything it held, so a steady loop allocates once. Every output starts aligned to 64 bytes, as Arrow buffers
- *  do, so typed columns read in place. To keep one call's outputs alive past the next call, pass the next call
- *  another arena.
+ *  Made by @c ustore_arena_init where its executor computes, and an executor whose device runs
+ *  out of memory reports @c ustore_status_out_of_memory_k rather than falling back to the host.
+ *  Each call given the arena rewinds it, which invalidates every output of the previous call,
+ *  and refills it, growing only when the new outputs outsize everything it held, so a steady
+ *  loop allocates once. Every output starts aligned to 64 bytes, as Arrow buffers do, so typed
+ *  columns read in place. To keep one call's outputs alive past the next call, pass the next
+ *  call another arena.
  *
- *  A @c NULL arena is refused with @c ustore_status_invalid_argument_k, and so is a call whose inputs point into the
- *  arena it is about to rewind. An arena serves one call at a time, so a second call naming it finishes
- *  @c ustore_status_contended_k, and a deferred one does so at submission. A call whose executor computes on host
- *  threads given an arena on a device, or on another device than the arena's, reports @c ustore_status_device_k.
- *  A blocking call borrows the arena until it returns, and a deferred one holds it until final. A call that fails,
- *  is cancelled, or has nothing to report leaves its outputs @c NULL.
+ *  A @c NULL arena is refused with @c ustore_status_invalid_argument_k, and so is a call whose
+ *  inputs point into the arena it is about to rewind. An arena serves one call at a time, so a
+ *  second call naming it finishes @c ustore_status_contended_k, and a deferred one does so at
+ *  submission. A call whose executor computes on host threads given an arena on a device, or on
+ *  another device than the arena's, reports @c ustore_status_device_k. A blocking call borrows the
+ *  arena until it returns, and a deferred one holds it until final. A call that fails, is
+ *  cancelled, or has nothing to report leaves its outputs @c NULL.
  */
 typedef struct ustore_arena_handle_t* ustore_arena_t;
 

@@ -4,10 +4,11 @@
  *  @date September 15, 2026
  *  @brief Command-line flags for every UStore binary: one table parses the arguments, echoes them and prints the usage.
  *
- *  Flags are long kebab-case words whose value follows as the next argument or after @c =. Sizes carry binary
- *  suffixes of any case, durations carry @c ms or @c s, counts are positive integers, and lists are comma-separated.
- *  A text value views the tail of its @c argv entry, so it is null-terminated; list items are not.
- *  A value that does not parse prints @c --flag="value" @c does @c not @c parse, @c expected @c <grammar>.
+ *  Flags are long kebab-case words whose value follows as the next argument or after @c =. Sizes
+ *  carry binary suffixes of any case, durations carry @c ms or @c s, counts are positive integers,
+ *  and lists are comma-separated. A text value views the tail of its @c argv entry, so it is
+ *  null-terminated; list items are not. A value that does not parse prints @c --flag="value"
+ *  @c does @c not @c parse, @c expected @c <grammar>.
  *
  *  @code{.cpp}
  *  bytes_t memory_limit {64 << 20};
@@ -101,15 +102,15 @@ struct count_t {
 };
 
 /** Comma-separated counts like @c 16,256,4096, each within @b [minimum,maximum].
- *  Between @c minimum_size and @c maximum_size of them are accepted. */
+ *  Between @c min_size and @c max_size of them are accepted. */
 struct counts_t {
     static constexpr std::size_t capacity_k = 16;
     std::array<std::size_t, capacity_k> values {};
     std::size_t size = 0;
     std::size_t minimum = 1;
     std::size_t maximum = std::numeric_limits<std::size_t>::max();
-    std::size_t minimum_size = 1;
-    std::size_t maximum_size = capacity_k;
+    std::size_t min_size = 1;
+    std::size_t max_size = capacity_k;
 
     [[nodiscard]] std::span<std::size_t const> view() const noexcept { return {values.data(), size}; }
 };
@@ -268,12 +269,11 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
 
 /** Parses comma-separated counts within the bounds @p counts carries, replacing the items it held. */
 [[nodiscard]] inline argument_status_t parse_counts(std::string_view text, counts_t& counts) noexcept {
-    std::size_t const maximum_size = counts.maximum_size < counts_t::capacity_k ? counts.maximum_size
-                                                                                : counts_t::capacity_k;
+    std::size_t const max_size = counts.max_size < counts_t::capacity_k ? counts.max_size : counts_t::capacity_k;
     counts.size = 0;
     while (true) {
         std::size_t const comma = text.find(',');
-        if (counts.size == maximum_size) return argument_status_t::too_many_items_k;
+        if (counts.size == max_size) return argument_status_t::too_many_items_k;
         argument_status_t const status = parse_bounded_(text.substr(0, comma), counts.minimum, counts.maximum,
                                                         counts.values[counts.size]);
         if (status != argument_status_t::parsed_k) return status;
@@ -281,7 +281,7 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
     }
-    return counts.size < counts.minimum_size ? argument_status_t::too_few_items_k : argument_status_t::parsed_k;
+    return counts.size < counts.min_size ? argument_status_t::too_few_items_k : argument_status_t::parsed_k;
 }
 
 /** Splits comma-separated text into @p texts, rejecting empty items. */
@@ -479,8 +479,8 @@ inline std::string spell_size(std::size_t bytes) {
         return minimum == 1 ? "a positive count" : fmt::format("a count of at least {}", minimum);
     }
     if (auto const* counts = std::get_if<counts_t*>(&flag.destination))
-        return (*counts)->minimum_size == (*counts)->maximum_size
-                   ? fmt::format("{} positive counts like 32,64,128", (*counts)->minimum_size)
+        return (*counts)->min_size == (*counts)->max_size
+                   ? fmt::format("{} positive counts like 32,64,128", (*counts)->min_size)
                    : "positive counts like 64,128";
     if (std::holds_alternative<bytes_t*>(flag.destination)) return "a size like 4096, 64KB or 1GB";
     if (std::holds_alternative<std::chrono::nanoseconds*>(flag.destination)) return "a duration like 200ms or 10s";
@@ -559,6 +559,10 @@ struct engine_options_t {
 
     /** How @c nvme moves bytes between its files and memory. */
     choice_t transport {transport_names_k};
+
+    /** Directories the volumes of @c nvme or the table files of @c rocksdb fill, one per drive;
+     *  none keeps them in @c directory. */
+    texts_t directories;
 };
 
 /** Opens the engine @p options name into @p database, running the open on @p executor with @p completion as every
@@ -570,6 +574,16 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
     ustore_bytes_view_t const directory {reinterpret_cast<ustore_byte_t const*>(options.directory),
                                          options.directory ? std::strlen(options.directory) : 0};
     ustore_isolation_t const isolation = static_cast<ustore_isolation_t>(options.isolation.selected);
+    std::array<ustore_data_directory_t, texts_t::capacity_k> data_directories {};
+    for (std::size_t index = 0; index != options.directories.size; ++index) {
+        std::string_view const path = options.directories.values[index];
+        data_directories[index].path = {reinterpret_cast<ustore_byte_t const*>(path.data()), path.size()};
+    }
+    ustore_data_directory_t const* const listed = options.directories.size ? data_directories.data() : nullptr;
+    if (listed && options.name != "nvme" && options.name != "rocksdb") {
+        *outcome = {ustore_status_invalid_argument_k, "Only nvme and rocksdb fill data directories"};
+        return;
+    }
     if (options.name == "ram" && !directory.length) {
         ustore_database_init_ram_t init {.database = database,
                                          .executor = executor,
@@ -592,7 +606,9 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                              .executor = executor,
                                              .outcome = outcome,
                                              .completion = completion,
-                                             .directory = directory};
+                                             .directory = directory,
+                                             .data_directories = listed,
+                                             .data_directories_count = options.directories.size};
         return ustore_database_open_rocksdb(&open);
     }
     if (options.name == "leveldb") {
@@ -608,7 +624,9 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                           .executor = executor,
                                           .outcome = outcome,
                                           .completion = completion,
-                                          .directory = directory};
+                                          .directory = directory,
+                                          .data_directories = listed,
+                                          .data_directories_count = options.directories.size};
         auto const transport = static_cast<ustore_transport_t>(options.transport.selected);
         if (executor || transport == ustore_transport_automatic_k) return ustore_database_open_nvme(&open);
 

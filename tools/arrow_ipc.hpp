@@ -5,15 +5,16 @@
  *  @brief A codec of Apache Arrow IPC streams and files with no Arrow library and no @c flatc, over hand-numbered
  *      FlatBuffers tables for byte strings, fixed-width values, numbers, lists and structs, with C Data adapters.
  *
- *  The codec neither allocates nor does I/O, since every buffer is the caller's. Readers name how many bytes the next
- *  step needs, so a pipe reads exactly that much, and writers answer @c ipc_status_t::too_small_k with the bytes they
- *  need, so an empty output measures. Bodies are never copied: a writer answers them as gathers for @c writev, and a
- *  reader answers spans into the body it was lent. Every scalar crosses the wire little-endian, through
- *  @c ipc_load_little and @c ipc_store_little, whatever the host.
+ *  The codec neither allocates nor does I/O, since every buffer is the caller's. Readers
+ *  name how many bytes the next step needs, so a pipe reads exactly that much, and writers
+ *  answer @c ipc_status_t::too_small_k with the bytes they need, so an empty output
+ *  measures. Bodies are never copied: a writer answers them as gathers for @c writev, and a
+ *  reader answers spans into the body it was lent. Every scalar crosses the wire
+ *  little-endian, through @c ipc_load_little and @c ipc_store_little, whatever the host.
  *
  *  The slots follow <tt>Schema.fbs</tt>, <tt>Message.fbs</tt> and <tt>File.fbs</tt> of Apache Arrow's <tt>format/</tt>
- *  directory. The names carry no type of the project they ship in, so another project copies the file with only its
- *  namespace changed.
+ *  directory. The names carry no type of the project they ship in, so another project copies the
+ *  file with only its namespace changed.
  */
 #pragma once
 
@@ -517,8 +518,8 @@ struct ipc_flatbuffer_slot_t {
 };
 
 /**
- *  @brief Lays a FlatBuffer out front to back, each vtable before its table and each child after its parent, so every
- *  @c uoffset points forward as the format requires.
+ *  @brief Lays a FlatBuffer out front to back, each vtable before its table and each child after
+ *      its parent, so every @c uoffset points forward as the format requires.
  *
  *  Writes past the end of the output are dropped while the size still grows, so one pass both writes and measures.
  *  Everything claimed is zeroed first, padding included.
@@ -831,9 +832,9 @@ struct ipc_message_t {
 };
 
 /**
- *  @brief Reads the prefix of a message from the first bytes of @p bytes: the <tt>0xFFFFFFFF</tt> continuation marker
- *      and an
- *  @c int32 length, or the bare length that writers before format 0.15 emit.
+ *  @brief Reads the prefix of a message from the first bytes of @p bytes: the <tt>0xFFFFFFFF</tt>
+ *      continuation marker and an @c int32 length, or the bare length that writers before
+ *      format 0.15 emit.
  *
  *  @p prefix_bytes always names the bytes the prefix needs, 4 and then 8 once a marker shows, so a pipe reader that
  *  gets @c ipc_status_t::truncated_k reads up to that many and calls again. @p metadata_bytes is zero at the end of the
@@ -1232,9 +1233,10 @@ inline ipc_status_t ipc_write_schema(ipc_schema_t const& schema, ipc_options_t o
  *  @brief Writes the metadata of a record batch message for absolute file @p position into @p metadata, and its body as
  *      one gather per buffer into @p body, without copying a byte of it.
  *
- *  The metadata ends on the alignment, so the body starts aligned at its absolute file position, and every buffer is
- *  padded to the alignment after it. A short @p metadata or @p body answers @c ipc_status_t::too_small_k with
- *  @p metadata_written still naming the metadata bytes needed, while the body needs one gather per buffer.
+ *  The metadata ends on the alignment, so the body starts aligned at its absolute file
+ *  position, and every buffer is padded to the alignment after it. A short @p metadata
+ *  or @p body answers @c ipc_status_t::too_small_k with @p metadata_written still naming
+ *  the metadata bytes needed, while the body needs one gather per buffer.
  */
 inline ipc_status_t ipc_write_batch(ipc_schema_t const& schema, ipc_batch_t const& batch, ipc_options_t options,
                                     std::uint64_t position, std::span<std::byte> metadata,
@@ -1298,8 +1300,8 @@ inline ipc_status_t ipc_write_end_of_stream(std::span<std::byte> output, std::si
  *  @brief Writes what ends a file after its end-of-stream marker: the @c Footer with the schema and the @p blocks of
  *      every batch, its @c int32 length, and the magic.
  *
- *  A file is @c ipc_file_magic_k, the stream, then this, so writing it never seeks and a pipe takes it. A short
- *  @p output answers @c ipc_status_t::too_small_k with the bytes needed in @p written.
+ *  A file is @c ipc_file_magic_k, the stream, then this, so writing it never seeks and a pipe takes
+ *  it. A short @p output answers @c ipc_status_t::too_small_k with the bytes needed in @p written.
  */
 inline ipc_status_t ipc_write_footer(ipc_schema_t const& schema, std::span<ipc_block_t const> blocks,
                                      std::span<std::byte> output, std::size_t& written) noexcept {
@@ -1470,11 +1472,11 @@ inline void ipc_export_schemas(std::span<ipc_field_t const> fields, std::size_t 
                                ipc_arrow_storage_t& storage, char*& cursor) noexcept {
     for (std::size_t index = 0; index != fields.size(); ++index) {
         ipc_field_t const& field = fields[index];
-        ArrowSchema& out = storage.schema_children[first + index];
-        out = {};
-        storage.schema_pointers[first + index] = &out;
+        ArrowSchema& child = storage.schema_children[first + index];
+        child = {};
+        storage.schema_pointers[first + index] = &child;
         std::string_view const format = ipc_arrow_format_of(field);
-        out.format = cursor;
+        child.format = cursor;
         ipc_append_text(cursor, format.data(), format.size());
         if (ipc_arrow_format_has_width(field)) {
             std::uint32_t value = static_cast<std::uint32_t>(field.width);
@@ -1484,15 +1486,15 @@ inline void ipc_export_schemas(std::span<ipc_field_t const> fields, std::size_t 
             cursor += digits;
         }
         *cursor++ = 0;
-        out.name = ipc_append_string(cursor, field.name);
-        out.metadata = ipc_append_metadata(cursor, field.metadata);
-        out.flags = field.nullability == ipc_nullability_t::nullable_k ? ARROW_FLAG_NULLABLE : 0;
-        out.release = &ipc_release_schema;
+        child.name = ipc_append_string(cursor, field.name);
+        child.metadata = ipc_append_metadata(cursor, field.metadata);
+        child.flags = field.nullability == ipc_nullability_t::nullable_k ? ARROW_FLAG_NULLABLE : 0;
+        child.release = &ipc_release_schema;
         if (field.children.empty()) continue;
         std::size_t const children = next;
         next += field.children.size();
-        out.n_children = static_cast<std::int64_t>(field.children.size());
-        out.children = storage.schema_pointers + children;
+        child.n_children = static_cast<std::int64_t>(field.children.size());
+        child.children = storage.schema_pointers + children;
         ipc_export_schemas(field.children, children, next, storage, cursor);
     }
 }
@@ -1523,16 +1525,16 @@ inline ipc_status_t ipc_export_arrays(std::span<ipc_field_t const> fields, ipc_b
                                       ipc_arrow_storage_t& storage) noexcept {
     for (std::size_t index = 0; index != fields.size(); ++index) {
         ipc_field_t const& field = fields[index];
-        ArrowArray& out = storage.array_children[first + index];
+        ArrowArray& child = storage.array_children[first + index];
         void const** const pointers = storage.child_buffers[first + index];
         ipc_node_t const& node = batch.nodes[cursor.node++];
         if (node.null_count != 0) return ipc_status_t::unsupported_k;
         std::size_t const buffer = cursor.buffer + 1;
         cursor.buffer += ipc_buffers_of(field.type);
-        out = {};
-        storage.array_pointers[first + index] = &out;
-        out.length = node.length;
-        out.n_buffers = static_cast<std::int64_t>(ipc_buffers_of(field.type));
+        child = {};
+        storage.array_pointers[first + index] = &child;
+        child.length = node.length;
+        child.n_buffers = static_cast<std::int64_t>(ipc_buffers_of(field.type));
         pointers[0] = nullptr;
         if (ipc_type_is_variable(field.type) || ipc_type_is_list(field.type)) {
             std::span<std::byte const> const offsets = batch.buffers[buffer];
@@ -1540,13 +1542,13 @@ inline ipc_status_t ipc_export_arrays(std::span<ipc_field_t const> fields, ipc_b
         }
         else if (ipc_type_is_fixed(field.type)) pointers[1] = batch.buffers[buffer].data();
         if (ipc_type_is_variable(field.type)) pointers[2] = batch.buffers[buffer + 1].data();
-        out.buffers = pointers;
-        out.release = &ipc_release_array;
+        child.buffers = pointers;
+        child.release = &ipc_release_array;
         if (field.children.empty()) continue;
         std::size_t const children = next;
         next += field.children.size();
-        out.n_children = static_cast<std::int64_t>(field.children.size());
-        out.children = storage.array_pointers + children;
+        child.n_children = static_cast<std::int64_t>(field.children.size());
+        child.children = storage.array_pointers + children;
         if (ipc_status_t const status = ipc_export_arrays(field.children, batch, cursor, children, next, storage);
             status != ipc_status_t::success_k)
             return status;

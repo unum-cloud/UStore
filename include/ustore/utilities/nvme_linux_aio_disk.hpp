@@ -38,12 +38,12 @@
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/nvme_disks.hpp"            // `native_file_t`, `open_native_file`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `direct_alignment_of`, `direct_alignment_t`
-#include "ustore/utilities/nvme_ring.hpp"             // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
-#include "ustore/utilities/types.hpp"                 // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
+#include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -52,9 +52,9 @@ namespace unum::ustore::utilities {
 /**
  *  @brief What a mount fixes about a Linux AIO disk before any queue pair takes a share of it.
  *
- *  Depth is the number worth tuning, as it is for io_uring: one thread at a depth of 256 reads
- *  4 KB blocks about thirty times faster than @c pread on the same thread, since the queue rather
- *  than the thread keeps a drive busy.
+ *  Depth is the number worth tuning, as it is for io_uring: one thread at a depth of 256 reads 4 KB
+ *  blocks about thirty times faster than @c pread on the same thread, since the queue rather than
+ *  the thread keeps a drive busy.
  */
 struct linux_aio_disk_config_t {
 
@@ -93,11 +93,12 @@ enum class linux_aio_probe_t : std::uint8_t {
 /**
  *  @brief Linux AIO over @c O_DIRECT files registered as media, one context per queue pair.
  *
- *  As with the io_uring disk, the queue is the kernel's and only the bookkeeping is the disk's
- *  own: @c submit builds one control block per request and hands the batch over in one
- *  @c io_submit, and @c poll_completions asks @c io_getevents for whatever landed with a minimum
- *  of zero, so neither waits on a completion. @c io_submit itself may still block where the
- *  filesystem allocates blocks for a write into a hole, or where the device queue is full.
+ *  As with the io_uring disk, the queue is the kernel's and only the bookkeeping is the
+ *  disk's own: @c submit builds one control block per request and hands the batch over in
+ *  one @c io_submit, and @c poll_completions asks @c io_getevents for whatever landed with
+ *  a minimum of zero, so neither waits on a completion. @c io_submit itself may still
+ *  block where the filesystem allocates blocks for a write into a hole, or where the
+ *  device queue is full.
  *
  *  A defect the disk can see before the kernel does fails that one request's completion and leaves
  *  its neighbours alone, and so does a control block @c io_submit refuses on its own, such as a
@@ -404,19 +405,19 @@ class linux_aio_files_disk {
         std::size_t const credit = slot->depth - outstanding_(*slot);
         std::size_t const taking = requests.size() < credit ? requests.size() : credit;
         std::uint32_t linked = no_seat_k;
-        bool cut = false;
+        bool chain_broken = false;
         for (std::size_t index = 0; index != taking; ++index) {
             request_t const& request = requests[index];
-            if (cut) {
+            if (chain_broken) {
                 push_local_(*slot, base, cancelled_completion_(request.token));
-                cut = chains_next_(request);
+                chain_broken = chains_next_(request);
                 continue;
             }
             status_t const defect = inspect_(request);
             if (defect.failed()) {
                 push_local_(*slot, base, failed_completion_(request.token, defect));
                 linked = no_seat_k;
-                cut = chains_next_(request);
+                chain_broken = chains_next_(request);
                 continue;
             }
             std::uint32_t const seat = take_seat_(*slot, base);
@@ -623,7 +624,7 @@ class linux_aio_files_disk {
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
-    static status_t size_(st::basic_vector<element_type_>& elements, std::size_t count) noexcept {
+    static status_t size_(st::vector<element_type_>& elements, std::size_t count) noexcept {
         if (elements.resize(count) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A disk could not allocate its slots"};
         return {};
@@ -904,28 +905,28 @@ class linux_aio_files_disk {
 #pragma endregion Requests
 
     /** One slot per queue pair the disk hands out, each with its own context. */
-    st::basic_vector<queue_pair_slot_t> queue_pairs_;
+    st::vector<queue_pair_slot_t> queue_pairs_;
 
     /** One slot per memory range the disk records. */
-    st::basic_vector<registered_memory_slot_t> registered_memories_;
+    st::vector<registered_memory_slot_t> registered_memories_;
 
     /** One slot per medium the disk opens. */
-    st::basic_vector<registered_medium_slot_t> media_;
+    st::vector<registered_medium_slot_t> media_;
 
     /** Every queue pair's seats, in windows of @c depth_limit_, whose control blocks never move once built. */
-    st::basic_vector<flight_t> flights_;
+    st::vector<flight_t> flights_;
 
     /** Every queue pair's free seats, stacked in windows of @c depth_limit_. */
-    st::basic_vector<std::uint32_t> seats_;
+    st::vector<std::uint32_t> seats_;
 
     /** Every queue pair's control blocks awaiting @c io_submit, in windows of @c depth_limit_. */
-    st::basic_vector<::iocb*> staged_;
+    st::vector<::iocb*> staged_;
 
     /** Every queue pair's room for the events one @c io_getevents copies out, in windows of @c depth_limit_. */
-    st::basic_vector<::io_event> events_;
+    st::vector<::io_event> events_;
 
     /** Every queue pair's own completions, in windows of @c depth_limit_ read as a circle. */
-    st::basic_vector<completion_t> locals_;
+    st::vector<completion_t> locals_;
 
     /** Requests one queue pair may keep in flight, the depth of every context, and the stride of every window. */
     queue_depth_t depth_limit_ = 0;

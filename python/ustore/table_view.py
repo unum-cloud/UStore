@@ -44,7 +44,7 @@ WRITE_TYPES = {
     "bool": FieldType.BOOL,
 }
 
-GATHER_TYPES = {**WRITE_TYPES, "str": FieldType.STR, "bytes": FieldType.BIN}
+GATHER_TYPES = {**WRITE_TYPES, "str": FieldType.STRING, "bytes": FieldType.BINARY}
 
 NULLABLE_DTYPES = {
     "float64": "Float64",
@@ -123,9 +123,9 @@ def column_values(gathered: Columns, position: int, dtype: str) -> Any:
         np.frombuffer(gathered.validities(position), dtype=np.uint8), count=rows, bitorder="little"
     ).astype(bool)
     kind = gathered.types[position]
-    if kind is FieldType.STR:
+    if kind is FieldType.STRING:
         return pandas.array(gathered[position], dtype="str")
-    if kind is FieldType.BIN:
+    if kind is FieldType.BINARY:
         return np.array(gathered[position], dtype=object)
     values = np.asarray(gathered[position])
     if valid.all():

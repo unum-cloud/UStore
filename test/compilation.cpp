@@ -12,7 +12,7 @@
 #include <array>       // `std::array`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::is_same_v`, `std::is_convertible_v`
+#include <type_traits> // `std::is_convertible_v`
 #include <utility>     // `std::declval`, `std::forward`, `std::move`
 
 #include <fmt/format.h>
@@ -104,11 +104,11 @@ static_assert(assigns_through_concept<transaction_t>);
 // A deferred verb owns its plain inputs, so borrowed keys never reach it, and borrows the arena handle, so a temporary
 // arena, which would die before the call is final, never does either
 static_assert(reads_deferred_concept<std::array<ustore_key_t, 2>, arena_t&>);
-static_assert(reads_deferred_concept<st::basic_vector<ustore_key_t>, arena_t&>);
+static_assert(reads_deferred_concept<st::vector<ustore_key_t>, arena_t&>);
 static_assert(!reads_deferred_concept<std::array<ustore_key_t, 2>, arena_t>);
 static_assert(!reads_deferred_concept<std::span<ustore_key_t const>, arena_t&>);
 static_assert(!reads_deferred_concept<keys_view_t, arena_t&>);
-static_assert(!reads_deferred_concept<st::basic_vector<ustore_key_t>&, arena_t&>);
+static_assert(!reads_deferred_concept<st::vector<ustore_key_t>&, arena_t&>);
 
 // Nor do borrowed documents, fields or column types
 static_assert(reads_documents_deferred_concept<std::array<ustore_key_t, 2>, arena_t&>);
@@ -123,12 +123,12 @@ static_assert(gathers_deferred_concept<std::array<ustore_docs_field_type_t, 1>>)
 static_assert(!gathers_deferred_concept<std::span<ustore_docs_field_type_t const>>);
 
 // Nor borrowed vertices or edges
-static_assert(reads_edges_deferred_concept<st::basic_vector<ustore_key_t>, arena_t&>);
+static_assert(reads_edges_deferred_concept<st::vector<ustore_key_t>, arena_t&>);
 static_assert(!reads_edges_deferred_concept<std::array<ustore_key_t, 2>, arena_t>);
 static_assert(!reads_edges_deferred_concept<std::span<ustore_key_t const>, arena_t&>);
 static_assert(writes_edges_deferred_concept<std::array<edge_t, 2>>);
-static_assert(writes_edges_deferred_concept<st::basic_vector<edge_t>>);
-static_assert(!writes_edges_deferred_concept<st::basic_vector<edge_t>&>);
+static_assert(writes_edges_deferred_concept<st::vector<edge_t>>);
+static_assert(!writes_edges_deferred_concept<st::vector<edge_t>&>);
 static_assert(!writes_edges_deferred_concept<edges_view_t>);
 
 // Nor borrowed strings or values
@@ -280,7 +280,7 @@ std::size_t wrappers_compile(config_t const& config) {
     values_tape_t hello;
     failures += fill_tape(hello, {"hello"});
     [[maybe_unused]] expected<docs_gather_t::finished_t> const gathered =
-        deferred_documents.gather(owned_keys, std::move(hello), std::array {ustore_docs_field_type_str_k}, arena)
+        deferred_documents.gather(owned_keys, std::move(hello), std::array {ustore_docs_field_type_string_k}, arena)
             .wait();
     failures += expect(deferred_documents.remove(owned_keys).wait().succeeded());
     failures += expect(database.create<graph_collection_t>("graph").has_value());
