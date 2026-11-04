@@ -30,12 +30,12 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memset`
 
-#if defined(__linux__)
-#include <fcntl.h>          // `AT_EMPTY_PATH`
+#include "ustore/types.h" // `USTORE_OS_LINUX_`
+
+#if USTORE_OS_LINUX_
 #include <linux/io_uring.h> // `io_uring_sqe`, `io_uring_cqe`, `IORING_SETUP_R_DISABLED`
-#include <linux/stat.h>     // `struct statx`, `STATX_DIOALIGN`
 #include <sys/mman.h>       // `mmap`, `munmap`, `MAP_SHARED`
-#include <sys/syscall.h>    // `__NR_io_uring_setup`, `__NR_io_uring_enter`, `__NR_statx`
+#include <sys/syscall.h>    // `__NR_io_uring_setup`, `__NR_io_uring_enter`
 #include <sys/uio.h>        // `iovec`
 #include <unistd.h>         // `syscall`, `close`, `gettid`
 #endif
@@ -46,7 +46,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_disks.hpp" // `native_file_t`, `open_native_file`, `native_file_capacity`
+#include "ustore/utilities/nvme_disks.hpp" // `open_native_file`, `direct_alignment_of`, `deallocate_native_file`
 #include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -104,7 +104,7 @@ enum class range_pinning_t : std::uint8_t {
 
 #pragma endregion Configuration
 
-#if defined(__linux__)
+#if USTORE_OS_LINUX_
 
 #pragma region Kernel
 
@@ -121,34 +121,6 @@ enum class range_pinning_t : std::uint8_t {
 #endif
 #if !defined(IORING_SQ_CQ_OVERFLOW)
 #define IORING_SQ_CQ_OVERFLOW (1U << 1)
-#endif
-
-/** The two alignments unbuffered access demands, which every filesystem answers differently. */
-struct direct_alignment_t {
-
-    /** Alignment the first byte of a registered buffer must meet. */
-    std::uint64_t memory = portable_alignment_k;
-
-    /** Alignment an extent's offset and its length must both meet. */
-    std::uint64_t offset = portable_alignment_k;
-};
-
-#if defined(STATX_DIOALIGN)
-
-/** Asks @p file's filesystem what unbuffered access demands, falling back to the portable numbers. */
-[[nodiscard]] inline direct_alignment_t direct_alignment_of(native_file_t file) noexcept {
-    struct statx description {};
-    if (::syscall(__NR_statx, file, "", AT_EMPTY_PATH, STATX_DIOALIGN, &description) != 0) return {};
-    if ((description.stx_mask & STATX_DIOALIGN) == 0) return {};
-    if (description.stx_dio_mem_align == 0 || description.stx_dio_offset_align == 0) return {};
-    return direct_alignment_t {description.stx_dio_mem_align, description.stx_dio_offset_align};
-}
-
-#else
-
-/** Answers the portable numbers, since the build headers cannot ask for the filesystem's own. */
-[[nodiscard]] inline direct_alignment_t direct_alignment_of(native_file_t) noexcept { return {}; }
-
 #endif
 
 #pragma endregion Kernel
@@ -326,7 +298,7 @@ class linux_uring_files_disk {
             slot.locals_first = 0;
             slot.locals_count = 0;
             slot.bound_thread = identity;
-            return queue_pair_t::leased(static_cast<queue_pair_id_t>(index), slot.generation, depth);
+            return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, depth};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
     }
@@ -400,8 +372,8 @@ class linux_uring_files_disk {
             slot.length = memory.size();
             slot.space = space;
             epoch_(registered_memories_epoch_).add(1, std::memory_order_release);
-            return registered_memory_t::registered(static_cast<registered_memory_id_t>(index), slot.generation, memory,
-                                                   space);
+            return registered_memory_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, memory,
+                                        space};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every registered_memory slot of this ring is taken"};
     }
@@ -448,16 +420,17 @@ class linux_uring_files_disk {
                     claim_(slot.registered).store(0, std::memory_order_release);
                     return sized;
                 }
+            direct_alignment_t const direct = direct_alignment_of(file);
             direct_alignment_t const alignment = buffering_ == file_buffering_t::unbuffered_k
-                                                     ? direct_alignment_of(file)
+                                                     ? direct
                                                      : direct_alignment_t {1, 1};
             slot.file = file;
             slot.capacity = native_file_capacity(file);
             slot.memory_alignment = alignment.memory;
             slot.offset_alignment = alignment.offset;
             epoch_(media_epoch_).add(1, std::memory_order_release);
-            return registered_medium_t::registered(static_cast<registered_medium_id_t>(index), slot.generation,
-                                                   slot.capacity);
+            return registered_medium_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation},
+                                        slot.capacity, direct.offset};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every medium slot of this ring is taken"};
     }
@@ -527,6 +500,18 @@ class linux_uring_files_disk {
                 unlink_(linked);
                 push_local_(*slot, base, failed_completion_(request.token, defect));
                 chain_broken = chains_next_(request);
+                continue;
+            }
+            if (request.kind == request_kind_t::deallocate_k) {
+                bool const chained_into = linked != nullptr;
+                unlink_(linked);
+                status_t const deallocated = chained_into
+                                                 ? status_t {status_code_t::invalid_argument_k,
+                                                             "A deallocation runs at submission, outside chains"}
+                                                 : deallocate_native_file(resolve_(request.medium)->file,
+                                                                          request.extent);
+                push_local_(*slot, base, deallocated_completion_(request.token, deallocated));
+                chain_broken = chains_next_(request) && deallocated.failed();
                 continue;
             }
             io_uring_sqe& entry = ring.submission_entries[(published + queued) & ring.submission_mask];
@@ -1137,6 +1122,15 @@ class linux_uring_files_disk {
         return completion;
     }
 
+    /** The completion of a deallocation the disk ran itself at submission, failed for @p outcome's
+     *  reason if any. */
+    [[nodiscard]] static completion_t deallocated_completion_(request_token_t token, status_t outcome) noexcept {
+        if (outcome.failed()) return failed_completion_(token, outcome);
+        completion_t completion;
+        completion.token = token;
+        return completion;
+    }
+
     /** Whether the request that follows @p request in its batch waits for this one to transfer in full. */
     [[nodiscard]] static bool chains_next_(request_t const& request) noexcept {
         return request.chaining == request_chaining_t::chained_k;
@@ -1146,7 +1140,7 @@ class linux_uring_files_disk {
     status_t inspect_(request_t const& request) noexcept {
         registered_medium_slot_t const* const medium = resolve_(request.medium);
         if (!medium) return {status_code_t::invalid_argument_k, "The request names no registered medium"};
-        if (request.kind == request_kind_t::flush_k) return {};
+        if (request.kind == request_kind_t::flush_k || request.kind == request_kind_t::deallocate_k) return {};
         registered_memory_slot_t const* const memory = resolve_(request.buffer);
         if (!memory) return {status_code_t::invalid_argument_k, "The request names no registered range"};
         if (request.buffer.offset > memory->length || request.extent.length > memory->length - request.buffer.offset)

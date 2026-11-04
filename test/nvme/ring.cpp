@@ -40,6 +40,7 @@ static_assert(ring_concept<any_files_disk<atomic_reference, waiter_t>>,
 
 /** Mounts the RAM transport and runs the suite on it, with and without demanded alignment. */
 void memory_transport(suite_totals_t& totals) {
+    resource_constraint_t budget {unlimited_resource_k};
     disk_config_t config;
     config.queue_pairs_limit = 4;
     config.depth_limit = queue_pair_depth_k;
@@ -48,7 +49,7 @@ void memory_transport(suite_totals_t& totals) {
 
     auto [device, make_device_status] = memory_device_t::make();
     expected<memory_disk_t> disk = make_device_status.failed() ? make_device_status
-                                                               : memory_disk_t::make(std::move(device), config);
+                                                               : memory_disk_t::make(std::move(device), config, budget);
     if (report(totals, "memory.mount", expect(disk.has_value())) != 0) return;
     on_medium(totals, "memory.volume", *disk, volume_request("memory"),
               [&](medium_reference_t medium) { ring_cases(totals, "memory", *disk, medium); });
@@ -58,7 +59,7 @@ void memory_transport(suite_totals_t& totals) {
     auto [strict_device, make_strict_device_status] = memory_device_t::make(portable_alignment_k);
     expected<memory_disk_t> strict_disk = make_strict_device_status.failed()
                                               ? make_strict_device_status
-                                              : memory_disk_t::make(std::move(strict_device), config);
+                                              : memory_disk_t::make(std::move(strict_device), config, budget);
     if (report(totals, "memory_strict.mount", expect(strict_disk.has_value())) != 0) return;
     on_medium(totals, "memory_strict.volume", *strict_disk, volume_request("memory_strict"),
               [&](medium_reference_t medium) {
@@ -69,6 +70,7 @@ void memory_transport(suite_totals_t& totals) {
 
 /** Mounts the blocking file transport on a preallocated volume and runs the suite on it. */
 void blocking_files_transport(suite_totals_t& totals, char const* directory) {
+    resource_constraint_t budget {unlimited_resource_k};
     disk_config_t config;
     config.queue_pairs_limit = 4;
     config.depth_limit = queue_pair_depth_k;
@@ -78,7 +80,7 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
     auto [device, make_device_status] = blocking_files_device_t::make(file_buffering_t::buffered_k);
     expected<blocking_files_disk_t> disk = make_device_status.failed()
                                                ? make_device_status
-                                               : blocking_files_disk_t::make(std::move(device), config);
+                                               : blocking_files_disk_t::make(std::move(device), config, budget);
     if (report(totals, "blocking.mount", expect(disk.has_value())) != 0) return;
     path_t const path {directory, "volume.bin"};
     on_medium(totals, "blocking.volume", *disk, volume_request(path.c_str()),
@@ -89,11 +91,15 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
     path_t const durable_path {directory, "volume_durable.bin"};
     report(totals, "blocking.keeps_what_it_flushed", ring_keeps_what_it_flushed<blocking_files_disk_t>, *disk,
            volume_request(durable_path.c_str()));
+    path_t const deallocated_path {directory, "volume_deallocated.bin"};
+    report(totals, "blocking.deallocates_a_file_extent", ring_deallocates_a_file_extent<blocking_files_disk_t>, *disk,
+           volume_request(deallocated_path.c_str()));
 
     auto [strict_device, make_strict_device_status] = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
     expected<blocking_files_disk_t> strict_disk = make_strict_device_status.failed()
                                                       ? make_strict_device_status
-                                                      : blocking_files_disk_t::make(std::move(strict_device), config);
+                                                      : blocking_files_disk_t::make(std::move(strict_device), config,
+                                                                                    budget);
     if (report(totals, "blocking_unbuffered.mount", expect(strict_disk.has_value())) != 0) return;
     path_t const strict_path {directory, "volume_unbuffered.bin"};
     on_medium(totals, "blocking_unbuffered.volume", *strict_disk, volume_request(strict_path.c_str()),
@@ -101,6 +107,9 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
                   report(totals, "blocking.misaligned_request", ring_fails_a_misaligned_request<blocking_files_disk_t>,
                          *strict_disk, medium);
               });
+    path_t const logical_block_path {directory, "volume_logical_block.bin"};
+    report(totals, "blocking.logical_block", ring_reports_a_logical_block<blocking_files_disk_t>, *strict_disk,
+           volume_request(logical_block_path.c_str()));
 }
 
 #pragma endregion Transport Drivers

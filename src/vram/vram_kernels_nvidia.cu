@@ -69,10 +69,10 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
 /** Writes every cell of the new runs of a merge of inline 12 key slots. */
 extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge_place_inline_12(
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_12_bytes_k>> const* survivors,
-    sorted_run_placement_t const* placements, std::uint64_t placements_count, std::uint64_t cells_count,
-    std::uint64_t floor, key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_12_bytes_k>* cells,
-    std::uint64_t* stamps, std::uint8_t* kinds) {
-    merge_place(survivors, placements, placements_count, cells_count, floor, cells, stamps, kinds);
+    std::uint64_t survivors_count, std::uint64_t floor,
+    key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_12_bytes_k>* cells, std::uint64_t* stamps,
+    std::uint8_t* kinds) {
+    merge_place(survivors, survivors_count, floor, cells, stamps, kinds);
 }
 
 /** Ranks every record of the merge of @p runs of inline 44 key slots into @p merged with
@@ -104,10 +104,10 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
 /** Writes every cell of the new runs of a merge of inline 44 key slots. */
 extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge_place_inline_44(
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_44_bytes_k>> const* survivors,
-    sorted_run_placement_t const* placements, std::uint64_t placements_count, std::uint64_t cells_count,
-    std::uint64_t floor, key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_44_bytes_k>* cells,
-    std::uint64_t* stamps, std::uint8_t* kinds) {
-    merge_place(survivors, placements, placements_count, cells_count, floor, cells, stamps, kinds);
+    std::uint64_t survivors_count, std::uint64_t floor,
+    key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_44_bytes_k>* cells, std::uint64_t* stamps,
+    std::uint8_t* kinds) {
+    merge_place(survivors, survivors_count, floor, cells, stamps, kinds);
 }
 
 /** Ranks every record of the merge of @p runs of fixed width key slots into @p merged with
@@ -138,10 +138,10 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
 /** Writes every cell of the new runs of a merge of fixed width key slots. */
 extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge_place_fixed_width(
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>> const* survivors,
-    sorted_run_placement_t const* placements, std::uint64_t placements_count, std::uint64_t cells_count,
-    std::uint64_t floor, key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>* cells,
-    std::uint64_t* stamps, std::uint8_t* kinds) {
-    merge_place(survivors, placements, placements_count, cells_count, floor, cells, stamps, kinds);
+    std::uint64_t survivors_count, std::uint64_t floor,
+    key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>* cells, std::uint64_t* stamps,
+    std::uint8_t* kinds) {
+    merge_place(survivors, survivors_count, floor, cells, stamps, kinds);
 }
 
 /** Ranks every record of the merge of @p runs of variable width key slots into @p merged with
@@ -173,10 +173,10 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
 /** Writes every cell of the new runs of a merge of variable width key slots. */
 extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge_place_variable_width(
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>> const* survivors,
-    sorted_run_placement_t const* placements, std::uint64_t placements_count, std::uint64_t cells_count,
-    std::uint64_t floor, key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>* cells,
-    std::uint64_t* stamps, std::uint8_t* kinds) {
-    merge_place(survivors, placements, placements_count, cells_count, floor, cells, stamps, kinds);
+    std::uint64_t survivors_count, std::uint64_t floor,
+    key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>* cells, std::uint64_t* stamps,
+    std::uint8_t* kinds) {
+    merge_place(survivors, survivors_count, floor, cells, stamps, kinds);
 }
 
 #pragma endregion Merge Kernels

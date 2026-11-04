@@ -2,90 +2,104 @@
  *  @file verification/durability.pml
  *  @author Ash Vardanian
  *  @date September 18, 2026
- *  @brief Spin model of the write, flush, record and catalog order, with a crash at every step.
+ *  @brief Spin model of the two-flush manifest commit of both volumes, with a crash at every step.
  *
- *  An extent is written, flushed, recorded in the catalog, and the catalog synced, so an extent
- *  missing from the catalog is free after a crash. Both volumes publish the catalog atomically:
- *  `directory_volume_t` by rename, `extent_volume_t` by a checksummed slot swap. One writer takes
- *  `extents` extents through five stages while a power process may cut the run at any step.
- *  It assumes the catalog rename is atomic and that a write is whole blocks, and checks neither.
+ *  Every publication writes one new run and a manifest copy naming every run so far, flushes both,
+ *  then commits the copy and flushes the commit. A directory volume writes the copy as
+ *  <tt><database>.ustore.json.tmp</tt>, flushes it with the run files, renames it over the manifest and
+ *  syncs the directory. A slotted volume writes the copy into the idle JSON region of the manifest
+ *  slot, flushes every medium, then rewrites the slot's owner block to point at that region and
+ *  flushes again. Either commit is one atomic step: a rename, or one logical block. The model
+ *  assumes both and checks neither; a crash keeps exactly what was durable.
  *
- *  - `catalog_entry_has_durable_bytes`: no catalog entry points at bytes that never landed.
- *  - `acknowledged_extent_survives`: no acknowledged extent is lost.
+ *  - @c manifest_names_durable_bytes: the manifest in force is whole, and every run it
+ *    names is durable.
+ *  - @c acknowledged_run_survives: every acknowledged run is named by the manifest in force.
  *
  *  @verify pass sc
- *  @verify pass sc extents=3
- *  @verify fail sc flush_before_sync=false: a crash between sync and flush records missing bytes
- *  @verify fail sc catalog_sync=false: an acknowledged extent stays in the page cache and is lost
- *  @verify fail sc catalog_checksum=false: a torn image reads as a whole catalog
+ *  @verify pass sc runs=3
+ *  @verify fail sc commit_before_flush=true: a crash after the commit and before the flush
+ *      names missing bytes
+ *  @verify fail sc multi_block_commit=true: a commit torn across two blocks points at a copy it
+ *      does not measure
  */
 
-#ifndef extents
-#define extents 2
+#ifndef runs
+#define runs 2
 #endif
 
-#ifndef flush_before_sync
-#define flush_before_sync true
+#ifndef commit_before_flush
+#define commit_before_flush false
 #endif
 
-#ifndef catalog_sync
-#define catalog_sync true
+#ifndef multi_block_commit
+#define multi_block_commit false
 #endif
 
-#ifndef catalog_checksum
-#define catalog_checksum true
-#endif
+#define last_stage 5
 
-#define write_stage 0
-#define acknowledge_stage 4
+/** The bytes of a run: cached once written, durable once flushed. */
+bit bytes_cached[runs];
+bit bytes_durable[runs];
 
-// The bytes of an extent: cached once written, durable once flushed.
-bit bytes_cached[extents];
-bit bytes_durable[extents];
+/** The two manifest copies, the temporary file and the manifest or the two JSON regions, by the
+ *  runs each names. */
+byte copy_cached[2];
+byte copy_durable[2];
 
-// The extent's catalog record: cached once written into the replacement catalog, durable once
-// that catalog has been synced and renamed into place.
-bit catalog_cached[extents];
-bit catalog_durable[extents];
+/** The commit: which copy is in force and how many runs it measures, cached and durable. One
+ *  logical block carries both, so they land together unless the commit spans two blocks. */
+byte pointer_cached = 0;
+byte pointer_durable = 0;
+byte length_cached = 0;
+byte length_durable = 0;
 
-// The extent the writer has promised its caller is committed.
-bit acknowledged[extents];
+/** The runs the writer has promised its caller are published. */
+bit acknowledged[runs];
 
 bit crashed = 0;
 bit writer_finished = 0;
 bit power_finished = 0;
 
-// A rename, or a slot swap behind an image checksum, publishes the whole catalog at once.
-inline sync_catalog() {
+inline flush_publication(published, idle) {
+    bytes_durable[published] = bytes_cached[published];
+    copy_durable[idle] = copy_cached[idle]
+}
+
+inline commit(idle, published) {
+    pointer_cached = idle;
+    length_cached = published + 1
+}
+
+inline flush_commit() {
     if
-    :: !catalog_sync -> skip
-    :: catalog_sync && !catalog_checksum ->
-        // A torn image publishes a prefix: each record lands durable or it does not.
-        for (record : 0 .. extents - 1) {
-            if
-            :: catalog_durable[record] = catalog_cached[record]
-            :: skip
-            fi
+    :: multi_block_commit -> pointer_durable = pointer_cached
+    :: else ->
+        atomic {
+            pointer_durable = pointer_cached;
+            length_durable = length_cached
         }
-    :: atomic {
-        catalog_sync && catalog_checksum ->
-            for (record : 0 .. extents - 1) {
-                catalog_durable[record] = catalog_cached[record]
-            }
-       }
     fi
 }
 
-inline durable_step(stage, extent) {
+/** The second block of a torn commit lands on a step of its own, which a crash may come before. */
+inline flush_second_block() {
     if
-    :: stage == write_stage -> bytes_cached[extent] = 1
-    :: stage == 1 && flush_before_sync -> bytes_durable[extent] = bytes_cached[extent]
-    :: stage == 2 && flush_before_sync -> catalog_cached[extent] = 1
-    :: stage == 3 && flush_before_sync -> sync_catalog()
-    :: stage == 1 && !flush_before_sync -> catalog_cached[extent] = 1
-    :: stage == 2 && !flush_before_sync -> sync_catalog()
-    :: stage == 3 && !flush_before_sync -> bytes_durable[extent] = bytes_cached[extent]
-    :: stage == acknowledge_stage -> acknowledged[extent] = 1
+    :: multi_block_commit -> length_durable = length_cached
+    :: else -> skip
+    fi
+}
+
+inline publication_step(stage, published, idle) {
+    if
+    :: stage == 0 -> bytes_cached[published] = 1
+    :: stage == 1 -> copy_cached[idle] = published + 1
+    :: stage == 2 && !commit_before_flush -> flush_publication(published, idle)
+    :: stage == 3 && !commit_before_flush -> commit(idle, published); flush_commit()
+    :: stage == 2 && commit_before_flush -> commit(idle, published); flush_commit()
+    :: stage == 3 && commit_before_flush -> flush_publication(published, idle)
+    :: stage == 4 -> flush_second_block()
+    :: stage == last_stage -> acknowledged[published] = 1
     fi
 }
 
@@ -100,18 +114,18 @@ active proctype power() {
 }
 
 active proctype writer() {
-    byte record;
-    byte extent = 0;
-    byte stage = write_stage;
+    byte published = 0;
+    byte stage = 0;
+    byte idle = 1;
     do
     :: crashed -> break
     :: else ->
         if
-        :: extent == extents -> break
+        :: published == runs -> break
         :: else ->
-            durable_step(stage, extent);
+            publication_step(stage, published, idle);
             if
-            :: stage == acknowledge_stage -> stage = write_stage; extent++
+            :: stage == last_stage -> stage = 0; published++; idle = 1 - idle
             :: else -> stage++
             fi
         fi
@@ -120,15 +134,23 @@ active proctype writer() {
 }
 
 init {
-    byte extent;
-    bit catalog_entry_has_durable_bytes;
-    bit acknowledged_extent_survives;
+    byte published;
+    byte named;
+    bit manifest_names_durable_bytes;
+    bit acknowledged_run_survives;
     (writer_finished && power_finished);
-    for (extent : 0 .. extents - 1) {
-        catalog_entry_has_durable_bytes = (!catalog_durable[extent] || bytes_durable[extent]);
-        assert(catalog_entry_has_durable_bytes);
-        acknowledged_extent_survives =
-            (!acknowledged[extent] || (catalog_durable[extent] && bytes_durable[extent]));
-        assert(acknowledged_extent_survives)
+    // A mount reads the copy the commit points at, and a copy shorter than the commit measures
+    // does not parse.
+    if
+    :: copy_durable[pointer_durable] == length_durable -> named = length_durable
+    :: else -> named = 0
+    fi;
+    manifest_names_durable_bytes = (copy_durable[pointer_durable] == length_durable);
+    assert(manifest_names_durable_bytes);
+    for (published : 0 .. runs - 1) {
+        manifest_names_durable_bytes = (published >= named || bytes_durable[published]);
+        assert(manifest_names_durable_bytes);
+        acknowledged_run_survives = (!acknowledged[published] || published < named);
+        assert(acknowledged_run_survives)
     }
 }

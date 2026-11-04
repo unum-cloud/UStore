@@ -1377,7 +1377,8 @@ mod tests {
     fn arrow_ingest_lands_every_row_on_ram_and_nvme() {
         ingests_every_row(&Database::init_ram(&RAMOptions::default()).unwrap());
         let directory = temporary_directory("arrow_ingest_nvme");
-        match Database::open_nvme(&NVMEOptions::at(directory.path())) {
+        let manifest = format!("{}/ustore.ustore.json", directory.path());
+        match Database::open_nvme(&NVMEOptions::at(&manifest)) {
             Ok(database) => ingests_every_row(&database),
             Err(failure) => assert_eq!((failure.status, cfg!(feature = "nvme")), (Status::Unsupported, false)),
         }

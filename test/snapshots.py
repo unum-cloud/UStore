@@ -6,7 +6,7 @@ Date: September 18, 2026
 """
 
 import pytest
-from capabilities import NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, keys, open_engine
+from capabilities import NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, keys, location, open_engine
 
 import ustore
 
@@ -113,7 +113,7 @@ def test_save_writes_a_database_that_opens(database, blobs, engine: str, tmp_pat
 
     with database.snapshot() as snapshot:
         try:
-            snapshot.save(directory)
+            snapshot.save(location(engine, directory))
         except ustore.UnsupportedError:
             pytest.skip("The engine saves no snapshots")
 
@@ -127,7 +127,9 @@ def test_a_deferred_save_writes_a_database_that_opens(database, blobs, engine: s
     directory.mkdir()
 
     with database.snapshot() as snapshot, ustore.Executor.for_ram(1) as executor:
-        saving = snapshot.deferred(executor).save(directory, progress=lambda finished, total: finished <= total)
+        saving = snapshot.deferred(executor).save(
+            location(engine, directory), progress=lambda finished, total: finished <= total
+        )
         try:
             assert saving.wait() is None
         except ustore.UnsupportedError:
@@ -144,8 +146,8 @@ def test_a_cancelled_save_leaves_nothing_behind(database, blobs, engine: str, tm
     directory.mkdir()
     with database.snapshot() as snapshot:
         with pytest.raises(ustore.CancelledError):
-            snapshot.save(directory, progress=lambda finished, total: False)
-        snapshot.save(directory)
+            snapshot.save(location(engine, directory), progress=lambda finished, total: False)
+        snapshot.save(location(engine, directory))
     with open_engine(engine, directory) as reopened:
         assert reopened.get(255, collection=blobs) == b"v" * 256
 

@@ -72,7 +72,8 @@ void paint(std::span<byte_t> buffer, std::uint64_t seed) noexcept {
 
 #pragma region Arena and Pool Cases
 
-/** An arena charges its budget once and returns every byte when it dies. */
+/** An arena charges its budget once, beside the disk's own pools, and the mount returns every byte
+ *  when it dies. */
 template <typename mount_type_>
 std::size_t arena_charges_its_budget_once(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
@@ -84,8 +85,7 @@ std::size_t arena_charges_its_budget_once(mount_type_ const& mount) {
 
     resources_shared_ptr_t const resources = (*fixture)->resources;
     std::size_t const charged = resources->memory_constraint.used();
-    failures += expect(charged != 0);
-    failures += expect_eq(charged, static_cast<std::size_t>((*fixture)->arena.size()));
+    failures += expect(charged >= static_cast<std::size_t>((*fixture)->arena.size()));
 
     // Nothing below the arena is charged again, so its death returns every byte the mount paid for.
     (*fixture).reset();

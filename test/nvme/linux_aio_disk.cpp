@@ -416,6 +416,12 @@ void aio_transport(suite_totals_t& totals, char const* directory) {
     path_t const durable_path {directory, "volume_durable.bin"};
     report(totals, "linux-aio.keeps_what_it_flushed", ring_keeps_what_it_flushed<linux_aio_files_disk_t>, *disk,
            volume_request(durable_path.c_str()));
+    path_t const deallocated_path {directory, "volume_deallocated.bin"};
+    report(totals, "linux-aio.deallocates_a_file_extent", ring_deallocates_a_file_extent<linux_aio_files_disk_t>, *disk,
+           volume_request(deallocated_path.c_str()));
+    path_t const logical_block_path {directory, "volume_logical_block.bin"};
+    report(totals, "linux-aio.logical_block", ring_reports_a_logical_block<linux_aio_files_disk_t>, *disk,
+           volume_request(logical_block_path.c_str()));
     report(totals, "linux-aio.synchronous_flush", aio_flushes_synchronously_where_the_kernel_refuses);
 }
 

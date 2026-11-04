@@ -2056,9 +2056,10 @@ impl FromStr for Engine {
 /// A directory the data files may occupy, with the bytes they may take there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub struct DataDirectory<'path> {
-    /// The directory, which must exist.
+    /// The directory, which must exist; on NVMe also a raw device from a base, like
+    /// `/dev/nvme0n1@64GiB`.
     pub path: &'path str,
-    /// Bytes the files may take there: zero is unlimited on RocksDB and the default volume size on NVMe.
+    /// Bytes the files may take there: zero is unlimited on RocksDB and the whole medium on NVMe.
     pub max_bytes: u64,
 }
 
@@ -2117,9 +2118,10 @@ impl<'options> LevelDBOptions<'options> {
 /// What [`Database::open_nvme`] opens, where every zero size or count keeps the engine's default.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NVMEOptions<'path> {
-    /// The directory of the database's own files.
-    pub directory: &'path str,
-    /// Directories the volumes fill, or none for one volume inside `directory`.
+    /// The manifest, `<database>.ustore.json` in an existing directory, or the raw address of
+    /// the first slot.
+    pub manifest: &'path str,
+    /// Further data directories the runs land on, the one with the most free bytes taking each.
     pub data_directories: &'path [DataDirectory<'path>],
     /// The executor the open runs on, after the calls submitted there before it; `None` opens on the calling thread.
     /// The database moves bytes as one of [`Executor::for_nvme`] says, read once at the open, and with that call's
@@ -2154,10 +2156,10 @@ pub struct NVMEOptions<'path> {
 }
 
 impl<'path> NVMEOptions<'path> {
-    /// A database in a directory, with every default.
-    pub fn at(directory: &'path str) -> Self {
+    /// The database a manifest names, with every default.
+    pub fn at(manifest: &'path str) -> Self {
         NVMEOptions {
-            directory,
+            manifest,
             ..NVMEOptions::default()
         }
     }
@@ -2384,8 +2386,8 @@ impl Database {
         database.opened()
     }
 
-    /// Serves a directory in place through the NVMe engine, or fails with [`Status::Unsupported`] in a build without
-    /// it.
+    /// Serves the database a manifest names through the NVMe engine, or fails with
+    /// [`Status::Unsupported`] in a build without it.
     ///
     /// Calls `ustore_database_open_nvme`.
     pub fn open_nvme(options: &NVMEOptions<'_>) -> Result<Self> {
@@ -2399,7 +2401,7 @@ impl Database {
             executor: executor_handle(options.executor),
             outcome: &mut outcome,
             completion: ffi::ustore_completion_t::Blocking,
-            directory: options.directory.as_bytes().into(),
+            directory: options.manifest.as_bytes().into(),
             data_directories: data_directories.as_ptr(),
             data_directories_count: data_directories.len() as ffi::ustore_size_t,
             compactions: executor_handle(options.compactions),
@@ -4141,6 +4143,7 @@ mod tests {
         let rocksdb = temporary_directory("database_rocksdb");
         let leveldb = temporary_directory("database_leveldb");
         let nvme = temporary_directory("database_nvme");
+        let nvme_manifest = format!("{}/ustore.ustore.json", nvme.path());
         let opened = [
             (Database::open_ram(ram.path(), &RAMOptions::default()), true),
             (
@@ -4152,7 +4155,7 @@ mod tests {
                 cfg!(feature = "leveldb"),
             ),
             (
-                Database::open_nvme(&NVMEOptions::at(nvme.path())),
+                Database::open_nvme(&NVMEOptions::at(&nvme_manifest)),
                 cfg!(feature = "nvme"),
             ),
         ];

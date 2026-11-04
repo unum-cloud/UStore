@@ -1304,6 +1304,155 @@ struct arrow_read_t {
 
 #pragma endregion Arrow
 
+#pragma region Manifests
+
+/** The run files a manifest at @p path names, as sorted "path offset bytes level" lines, empty when
+ *  it does not parse. */
+[[nodiscard]] std::vector<std::string> manifest_files(char const* path) {
+    std::vector<std::string> files;
+    yyjson_doc* const document = yyjson_read_file(path, YYJSON_READ_NOFLAG, nullptr, nullptr);
+    yyjson_val* const listed = yyjson_obj_get(yyjson_doc_get_root(document), "files");
+    std::size_t index = 0, count = 0;
+    yyjson_val* file = nullptr;
+    yyjson_arr_foreach(listed, index, count, file) {
+        char const* const name = yyjson_get_str(yyjson_obj_get(file, "path"));
+        files.push_back(fmt::format("{} {} {} {}", name ? name : "", yyjson_get_uint(yyjson_obj_get(file, "offset")),
+                                    yyjson_get_uint(yyjson_obj_get(file, "bytes")),
+                                    yyjson_get_uint(yyjson_obj_get(file, "level"))));
+    }
+    yyjson_doc_free(document);
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+/** The collections a manifest at @p path records, as sorted "name store value_size
+ *  value_max_size" lines. */
+[[nodiscard]] std::vector<std::string> manifest_collections(char const* path) {
+    std::vector<std::string> collections;
+    yyjson_doc* const document = yyjson_read_file(path, YYJSON_READ_NOFLAG, nullptr, nullptr);
+    yyjson_val* const listed = yyjson_obj_get(yyjson_doc_get_root(document), "collections");
+    std::size_t index = 0, count = 0;
+    yyjson_val* collection = nullptr;
+    yyjson_arr_foreach(listed, index, count, collection) {
+        char const* const name = yyjson_get_str(yyjson_obj_get(collection, "name"));
+        collections.push_back(fmt::format("{} {} {} {}", name ? name : "",
+                                          yyjson_get_uint(yyjson_obj_get(collection, "store")),
+                                          yyjson_get_uint(yyjson_obj_get(collection, "value_size")),
+                                          yyjson_get_uint(yyjson_obj_get(collection, "value_max_size"))));
+    }
+    yyjson_doc_free(document);
+    std::sort(collections.begin(), collections.end());
+    return collections;
+}
+
+/** The manifest command prints the manifest a database opens by, and recover rebuilds one naming
+ *  the same run files from the runs alone, every one on level 0, and the same collections from the
+ *  collections system collection. */
+[[nodiscard]] case_result_t manifest_print_and_recover(fixture_paths_t const& paths, char const* executable) {
+    std::size_t failures = 0;
+    path_t const directory {paths.files.c_str(), "recovered"};
+    std::array<char, nvme_manifest_capacity_k> manifest_buffer {};
+    std::string_view const manifest_view = nvme_manifest_in(directory.c_str(), manifest_buffer);
+    std::string const manifest {manifest_view};
+    std::string const database {nvme_database_name_k};
+    path_t const printed {paths.files.c_str(), "recovered.printed.json"};
+    path_t const original {paths.files.c_str(), "recovered.original.json"};
+    std::error_code error;
+    std::filesystem::remove_all(directory.c_str(), error);
+    std::filesystem::create_directories(directory.c_str(), error);
+    // The NVMe engine opens only where the build has it, which a listing of an
+    // empty directory probes
+    if (run_command(executable, "--engine", "nvme", "--directory", directory.c_str(), "collection", "list", ">",
+                    printed.c_str(), "2>&1") != 0)
+        return case_result_t::skipped("needs the nvme engine");
+    failures += expect_eq(run_command(executable, "--engine", "nvme", "--directory", directory.c_str(), "collection",
+                                      "create", "--collection", "people", "--modality", "blobs", "2>", printed.c_str()),
+                          0);
+
+    failures += expect_eq(run_command(executable, "manifest", manifest.c_str(), ">", printed.c_str()), 0);
+    failures += expect_eq(
+        run_command(executable, "manifest", directory.c_str(), "--database", database.c_str(), ">", original.c_str()),
+        0);
+    failures += expect(manifest_files(original.c_str()) == manifest_files(manifest.c_str()));
+    std::vector<std::string> const before = manifest_files(manifest.c_str());
+    failures += expect(!before.empty());
+    failures += expect(manifest_files(printed.c_str()) == before);
+    failures += expect(run_command(executable, "recover", directory.c_str(), "--database", database.c_str(), "2>",
+                                   printed.c_str()) != 0);
+
+    std::filesystem::rename(manifest.c_str(), original.c_str(), error);
+    failures += expect(!error);
+    failures += expect_eq(
+        run_command(executable, "recover", directory.c_str(), "--database", database.c_str(), "2>", printed.c_str()),
+        0);
+    std::vector<std::string> expected_files;
+    for (std::string const& line : before) expected_files.push_back(line.substr(0, line.rfind(' ')) + " 0");
+    failures += expect(manifest_files(manifest.c_str()) == expected_files);
+    // A system collection without runs is left for the next open to reserve again
+    std::vector<std::string> const collections = manifest_collections(original.c_str());
+    std::vector<std::string> const recovered = manifest_collections(manifest.c_str());
+    failures += expect(std::includes(collections.begin(), collections.end(), recovered.begin(), recovered.end()));
+    for (std::string const& line : collections)
+        if (line.front() != '_') failures += expect(std::binary_search(recovered.begin(), recovered.end(), line));
+    failures += expect(std::any_of(recovered.begin(), recovered.end(),
+                                   [](std::string const& line) { return line.starts_with("_collections "); }));
+    failures += expect_eq(run_command(executable, "--engine", "nvme", "--directory", directory.c_str(), "collection",
+                                      "list", ">", printed.c_str()),
+                          0);
+    sz::string_t listing;
+    failures += expect(read_file(printed.c_str(), listing) &&
+                       std::string_view {listing}.find("people") != std::string_view::npos);
+    std::filesystem::remove_all(directory.c_str(), error);
+    return failures;
+}
+
+/** Recover walks the slots of a raw medium and sizes every run, strings ones too, from its header
+ *  alone, which must match the bytes the manifest named it by. */
+[[nodiscard]] case_result_t raw_recover_sizes_strings_runs(fixture_paths_t const& paths, char const* executable) {
+    std::size_t failures = 0;
+    constexpr std::uint64_t slot_bytes = std::uint64_t {1} << 30;
+    constexpr std::uint64_t slots = 8;
+    path_t const device {paths.files.c_str(), "recovered.raw"};
+    path_t const input {paths.files.c_str(), "recovered.strings.arrows"};
+    path_t const printed {paths.files.c_str(), "recovered.raw.printed.json"};
+    path_t const original {paths.files.c_str(), "recovered.raw.original.json"};
+    std::string const address = std::string(device.c_str()) + "@0";
+    std::string const database {nvme_database_name_k};
+    std::error_code error;
+    std::filesystem::remove(device.c_str(), error);
+    if (std::FILE* const created = std::fopen(device.c_str(), "wb")) std::fclose(created);
+    std::filesystem::resize_file(device.c_str(), slots * slot_bytes, error);
+    if (error) return case_result_t::skipped("needs a sparse stand-in medium");
+    // The NVMe engine opens only where the build has it, which a listing of an empty medium probes
+    if (run_command(executable, "--engine", "nvme", "--directory", address.c_str(), "collection", "list", ">",
+                    printed.c_str(), "2>&1") != 0) {
+        std::filesystem::remove(device.c_str(), error);
+        return case_result_t::skipped("needs the nvme engine");
+    }
+    if (!write_arrow_stream(input.c_str(), modality_table(ustore_modality_strings_k)))
+        return expect(!"the Arrow input is written");
+    failures += expect_eq(run_command(executable, "--engine", "nvme", "--directory", address.c_str(), "collection",
+                                      "import", "--collection", "words", "--input", input.c_str()),
+                          0);
+
+    failures += expect_eq(
+        run_command(executable, "manifest", address.c_str(), "--database", database.c_str(), ">", original.c_str()), 0);
+    std::vector<std::string> const before = manifest_files(original.c_str());
+    failures += expect(!before.empty());
+    failures += expect_eq(
+        run_command(executable, "recover", address.c_str(), "--database", database.c_str(), "2>", printed.c_str()), 0);
+    failures += expect_eq(
+        run_command(executable, "manifest", address.c_str(), "--database", database.c_str(), ">", printed.c_str()), 0);
+    std::vector<std::string> expected_files;
+    for (std::string const& line : before) expected_files.push_back(line.substr(0, line.rfind(' ')) + " 0");
+    failures += expect(manifest_files(printed.c_str()) == expected_files);
+    std::filesystem::remove(device.c_str(), error);
+    std::filesystem::remove(input.c_str(), error);
+    return failures;
+}
+
+#pragma endregion Manifests
+
 /** Runs every case against the fixtures written under the directory of @p config, and the CLI at
  *  @p executable unless it is empty. */
 void run_cases(suite_totals_t& totals, config_t const& config, std::string_view executable) noexcept {
@@ -1369,12 +1518,16 @@ void run_cases(suite_totals_t& totals, config_t const& config, std::string_view 
         report(totals, "arrow.file_direct_alignment", case_result_t::skipped("needs --cli"));
         report(totals, "arrow.bulk_lands_or_refuses", case_result_t::skipped("needs --cli"));
         report(totals, "snapshot.export_import", case_result_t::skipped("needs --cli"));
+        report(totals, "cli.manifest_and_recover", case_result_t::skipped("needs --cli"));
+        report(totals, "cli.raw_recover_sizes_strings_runs", case_result_t::skipped("needs --cli"));
     }
     else {
         report(totals, "arrow.stdout_only_arrow", arrow_stdout_only_arrow, paths, config, executable.data());
         report(totals, "arrow.file_direct_alignment", arrow_file_direct_alignment, paths, config, executable.data());
         report(totals, "arrow.bulk_lands_or_refuses", arrow_bulk_lands_or_refuses, paths, config, executable.data());
         report(totals, "snapshot.export_import", snapshot_export_import, paths, config, executable.data());
+        report(totals, "cli.manifest_and_recover", manifest_print_and_recover, paths, executable.data());
+        report(totals, "cli.raw_recover_sizes_strings_runs", raw_recover_sizes_strings_runs, paths, executable.data());
     }
 }
 

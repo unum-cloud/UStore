@@ -3,7 +3,7 @@
 UStore's engines publish shared state through atomics rather than locks, and its storage layer publishes bytes through syscalls whose order is the only thing standing between a crash and a corrupt database.
 Both are checked here rather than argued about in review: Spin checks a Promela model of a protocol, and GenMC checks the C++ against the real header.
 
-- `durability.pml`: the write, flush, record and catalog order, with a crash injected at every step.
+- `durability.pml`: the two-flush manifest commit of both volumes, rename and owner block, with a crash injected at every step.
 - `nvme_ring.pml`: an owner's credit against a bounded completion queue and the overflow list behind it.
 - `nvme_ring_ownership.pml`: one issuing thread per ring, and the queue pairs that move between them.
 - `reader_gates.cpp`: the two-slot reader gate of `lsm_tree` and the catalog under GenMC, which finds the freed slot once its fences are dropped.

@@ -23,8 +23,9 @@
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
-#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
-#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <forkunion/capabilities.hpp>     // `fu::preferred_yield_t`
+#include <smashtable/basic_vector.hpp>    // `st::vector`
+#include <smashtable/reference_store.hpp> // `st::reference_store`
 
 #include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`
 #include "ustore/blobs/nvme_tree.hpp"              // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
@@ -139,8 +140,12 @@ using namespace unum::ustore::utilities;
 /** The numbers every case mounts with, which are the defaults: channels enough for a compaction to hold two at once. */
 constexpr fixture_config_t lsm_config_k {};
 
-/** The bytes of memory runs one flush writes, kept small so a few flushes fill level zero. */
-constexpr std::size_t memory_runs_bytes_k = 64ull * 1024ull;
+/** The slot every case sizes its levels and runs by, kept small so a few flushes
+ *  fill level zero. */
+constexpr std::uint64_t slot_bytes_k = 64ull * 1024ull;
+
+/** Run records every case's pool holds, far more than any case keeps at once. */
+constexpr std::size_t run_records_k = 4096;
 
 /** The largest value the collection under test admits. */
 constexpr stored_value_size_t value_max_size_k = 128ull * 1024ull;
@@ -160,7 +165,9 @@ struct lsm_types {
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     using sorted_run_t = lsm_sorted_run<variable_slot_t, volume_t, waiter_t>;
-    using level_t = lsm_level<variable_slot_t, volume_t, waiter_t>;
+    using level_t = lsm_level<variable_slot_t, volume_t, atomic_reference, waiter_t>;
+    using run_pool_t = typename level_t::run_pool_t;
+    using run_handle_t = typename level_t::run_handle_t;
     using merger_t = lsm_level_merger<variable_slot_t, volume_t, atomic_reference, waiter_t>;
     using tree_t = lsm_tree<variable_slot_t, volume_t, atomic_reference, waiter_t>;
 };
@@ -330,24 +337,48 @@ template <typename level_type_>
     return failures;
 }
 
-/** Writes @p wanted as one run of @p volume and takes it into @p level, which is how a case builds a level. */
+/** Writes @p wanted as one run of @p volume, takes it into @p runs and names it in @p level, which
+ *  is how a case builds a level. */
 template <typename level_type_, typename volume_type_>
-[[nodiscard]] std::size_t adopt_batch(level_type_& level, volume_type_& volume, io_channel_t& channel,
-                                      std::span<expectation_t const> wanted) {
-    using sorted_run_t = lsm_sorted_run<variable_slot_t, volume_type_, waiter_t>;
+[[nodiscard]] std::size_t adopt_batch(level_type_& level, typename level_type_::run_pool_t& runs, volume_type_& volume,
+                                      io_channel_t& channel, std::span<expectation_t const> wanted) {
+    using sorted_run_t = typename level_type_::sorted_run_t;
     std::size_t failures = 0;
     batch_t batch;
     failures += build_batch(wanted, batch);
     if (failures != 0) return failures;
     expected<sorted_run_t> written = sorted_run_t::write(
-        volume, channel, uuid_generator(), std::span<variable_slot_t const> {batch.key_slots},
+        volume, channel, uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {batch.key_slots},
         std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())},
         std::span<std::uint8_t const> {batch.kinds}, 0, std::span<byte_t const> {batch.values},
         std::span<stored_value_offset_t const> {batch.offsets}, value_max_size_k);
     failures += expect(written.has_value());
     if (!written) return failures;
-    failures += expect(level.insert_run(std::move(*written)).succeeded());
+    auto [handle, take_status] = runs.take(std::move(*written));
+    failures += expect(take_status.succeeded());
+    if (take_status.failed()) return failures;
+    failures += expect(level.insert_run(handle).succeeded());
     return failures;
+}
+
+/** The runs @p level names, in its order, as a merge request takes them. */
+template <typename level_type_>
+[[nodiscard]] st::vector<typename level_type_::sorted_run_t const*> runs_of(level_type_ const& level) {
+    st::vector<typename level_type_::sorted_run_t const*> runs;
+    for (std::size_t index = 0; index != level.size(); ++index) [[maybe_unused]]
+        st::status_t const placed = runs.push_back(&level.run(index));
+    return runs;
+}
+
+/** A sorted level numbered @p number naming the runs a merge wrote, which is how a case
+ *  reads them back. */
+template <typename level_type_>
+[[nodiscard]] level_type_ level_of(typename level_type_::run_pool_t& runs, std::uint32_t number,
+                                   std::span<typename level_type_::run_handle_t const> merged) {
+    level_type_ level = level_type_::of(runs, number, lsm_level_order_t::sorted_k);
+    for (typename level_type_::run_handle_t const handle : merged) [[maybe_unused]]
+        status_t const placed = level.insert_run(handle);
+    return level;
 }
 
 #pragma endregion Model
@@ -362,6 +393,7 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 600;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
@@ -374,7 +406,10 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), memory_runs_bytes_k);
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -426,6 +461,7 @@ std::size_t restore_assigns_ingested_stamps(mount_type_ const& mount) {
     using volume_t = typename types_t::volume_t;
     using sorted_run_t = typename types_t::sorted_run_t;
     using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 64;
     constexpr std::uint64_t assigned_k = 7;
@@ -438,7 +474,10 @@ std::size_t restore_assigns_ingested_stamps(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), memory_runs_bytes_k);
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -461,7 +500,7 @@ std::size_t restore_assigns_ingested_stamps(mount_type_ const& mount) {
     if (failures != 0) return failures;
     uuid_t const content_id = uuid_generator();
     expected<sorted_run_t> const written = sorted_run_t::write(
-        *volume, guard->channel(), content_id, std::span<variable_slot_t const> {batch.key_slots},
+        *volume, guard->channel(), uuid_t {}, content_id, std::span<variable_slot_t const> {batch.key_slots},
         std::span<std::uint64_t const> {zeros}, std::span<std::uint8_t const> {batch.kinds}, 0,
         std::span<byte_t const> {batch.values}, std::span<stored_value_offset_t const> {batch.offsets},
         value_max_size_k);
@@ -471,12 +510,10 @@ std::size_t restore_assigns_ingested_stamps(mount_type_ const& mount) {
 
     lsm_tree_run_record_t record;
     record.content_id = content_id;
-    lsm_tree_run_stamp_t ingested;
-    ingested.content_id = content_id;
-    ingested.stamp = assigned_k;
-    failures += expect(tree->restore(guard->channel(), std::span<lsm_tree_run_record_t const> {&record, 1},
-                                     std::span<lsm_tree_run_stamp_t const> {&ingested, 1})
-                           .succeeded());
+    record.extent = written->extent();
+    record.stamp = assigned_k;
+    failures += expect(
+        tree->restore(guard->channel(), std::span<lsm_tree_run_record_t const> {&record, 1}).succeeded());
     typename tree_t::level_set_t const& taken = tree->levels();
     failures += expect_eq(taken.level(0).run(0).assigned_stamp(), assigned_k);
     std::size_t misread = 0;
@@ -497,6 +534,7 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
     std::size_t failures = 0;
     constexpr std::size_t keys_k = 400;
     constexpr std::size_t flushes_k = 5;
@@ -510,7 +548,10 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), memory_runs_bytes_k);
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -579,6 +620,7 @@ std::size_t compaction_drops_remove_deltas_at_the_bottom(mount_type_ const& moun
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
     std::size_t failures = 0;
     constexpr std::size_t keys_k = 900;
     constexpr std::size_t flushes_k = 4;
@@ -594,7 +636,10 @@ std::size_t compaction_drops_remove_deltas_at_the_bottom(mount_type_ const& moun
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), memory_runs_bytes_k);
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -660,7 +705,10 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using level_t = typename types_t::level_t;
+    using run_pool_t = typename types_t::run_pool_t;
+    using run_handle_t = typename types_t::run_handle_t;
     using merger_t = typename types_t::merger_t;
+    using sorted_run_t = typename types_t::sorted_run_t;
     std::size_t failures = 0;
     constexpr std::size_t keys_k = 240;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
@@ -696,48 +744,55 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     for (std::size_t index = 0; index != keys_k; ++index)
         if (index % 3 == 0) ++removed_keys;
 
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+
     // One level of two overlapping runs, merged twice with nothing changed but the depth.
-    level_t upper = level_t::of(0, lsm_level_order_t::overlapping_k);
-    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {older});
-    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {newer});
+    level_t upper = level_t::of(*runs, 0, lsm_level_order_t::overlapping_k);
+    failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {older});
+    failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
+    st::vector<sorted_run_t const*> const sources = runs_of(upper);
 
     typename merger_t::merge_request_t request;
-    request.upper = &upper;
-    request.lower = nullptr;
-    request.number = 1;
+    request.upper = sources;
+    request.upper_order = lsm_level_order_t::overlapping_k;
     request.value_max_size = value_max_size_k;
     request.placement = compaction_placement_t::host_k;
 
     request.depth = lsm_level_depth_t::intermediate_k;
-    expected<level_t> kept = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                             last_write_fold_t {}, no_device_fold_t {});
-    failures += expect_status(kept, status_code_t::success_k);
-    if (!kept) return failures;
-    failures += expect_eq(kept->population_count(), static_cast<std::uint64_t>(keys_k));
+    expected<st::vector<run_handle_t>> kept_runs = merger_t::merge(
+        *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+    failures += expect_status(kept_runs, status_code_t::success_k);
+    if (!kept_runs) return failures;
+    level_t const kept = level_of<level_t>(*runs, 1, *kept_runs);
+    failures += expect_eq(kept.population_count(), static_cast<std::uint64_t>(keys_k));
 
     request.depth = lsm_level_depth_t::bottom_k;
-    expected<level_t> dropped = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                                last_write_fold_t {}, no_device_fold_t {});
-    failures += expect(dropped.has_value());
-    if (!dropped) return failures;
-    failures += expect_eq(dropped->population_count(), static_cast<std::uint64_t>(keys_k - removed_keys));
+    expected<st::vector<run_handle_t>> dropped_runs = merger_t::merge(
+        *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+    failures += expect(dropped_runs.has_value());
+    if (!dropped_runs) return failures;
+    level_t const dropped = level_of<level_t>(*runs, 1, *dropped_runs);
+    failures += expect_eq(dropped.population_count(), static_cast<std::uint64_t>(keys_k - removed_keys));
 
     // The intermediate level answers a removed key as a key it carries, and the bottom one as a miss.
     for (std::size_t index = 0; index < keys_k; index += 3) {
         lsm_level_position_t position;
-        failures += expect(kept->find(key_of(index), position) == lookup_result_t::removed_k);
-        failures += expect(dropped->find(key_of(index), position) == lookup_result_t::missing_k);
+        failures += expect(kept.find(key_of(index), position) == lookup_result_t::removed_k);
+        failures += expect(dropped.find(key_of(index), position) == lookup_result_t::missing_k);
     }
     for (std::size_t index = 1; index < keys_k; index += 3) {
         lsm_level_position_t position;
-        failures += expect(kept->find(key_of(index), position) == lookup_result_t::written_k);
-        failures += expect(dropped->find(key_of(index), position) == lookup_result_t::written_k);
+        failures += expect(kept.find(key_of(index), position) == lookup_result_t::written_k);
+        failures += expect(dropped.find(key_of(index), position) == lookup_result_t::written_k);
     }
 
-    failures += expect(kept->drop(*volume, writing->channel()).succeeded());
-    failures += expect(dropped->drop(*volume, writing->channel()).succeeded());
-    failures += expect(upper.drop(*volume, writing->channel()).succeeded());
+    runs->discard(*volume, *kept_runs);
+    runs->discard(*volume, *dropped_runs);
+    runs->discard(*volume, upper.runs());
+    failures += expect_eq(runs->size(), std::size_t {0});
     return failures;
 }
 
@@ -749,6 +804,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
     std::size_t failures = 0;
     constexpr std::size_t keys_k = 700;
     constexpr std::size_t flushes_k = 4;
@@ -764,7 +820,10 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), memory_runs_bytes_k);
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -788,9 +847,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     }
     failures += expect(tree->needs_compaction(tree->levels()));
 
-    std::uint64_t const free_before = volume->free_bytes();
-    std::size_t const reserved_before = volume->reservations();
-    std::size_t const blobs_before = volume->size();
+    std::size_t const records_before = runs->size();
     std::uint32_t const requests_before = reading->channel().requests().available_buffers();
     std::uint32_t const streams_before = writing->channel().streams().available_buffers();
     std::uint64_t population_before = 0;
@@ -809,13 +866,11 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     failures += expect(!outcome.has_value());
     failures += expect_status(outcome, status_code_t::uninitialized_k);
 
-    // Nothing the merge took is still out: no queue pair, no block and no reservation.
+    // Nothing the merge took is still out: no queue pair, no block and no run record.
     failures += expect_eq(reading->channel().requests().available_buffers(), requests_before);
     failures += expect_eq(writing->channel().streams().available_buffers(), streams_before);
     failures += expect_eq(writing->channel().requests().available_buffers(), lsm_config_k.request_buffers);
-    failures += expect_eq(volume->free_bytes(), free_before);
-    failures += expect_eq(volume->reservations(), reserved_before);
-    failures += expect_eq(volume->size(), blobs_before);
+    failures += expect_eq(runs->size(), records_before);
     failures += expect_eq((*fixture)->disk.outstanding(reading->channel().queue_pair()), std::size_t {0});
     failures += expect_eq((*fixture)->disk.outstanding(writing->channel().queue_pair()), std::size_t {0});
 
@@ -845,6 +900,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
     std::size_t failures = 0;
     constexpr std::size_t keys_k = 800;
     constexpr std::size_t flushes_k = 4;
@@ -860,7 +916,10 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), memory_runs_bytes_k);
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -883,8 +942,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
         if (failures != 0) return failures;
     }
 
-    std::uint64_t const free_before = volume->free_bytes();
-    std::size_t const blobs_before = volume->size();
+    std::size_t const records_before = runs->size();
     std::uint64_t population_before = 0;
     {
         typename tree_t::level_set_t const& taken = tree->levels();
@@ -903,15 +961,13 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
 
     failures += expect_eq(writing->channel().streams().available_buffers(), lsm_config_k.stream_buffers);
     failures += expect_eq(reading->channel().requests().available_buffers(), lsm_config_k.request_buffers);
-    failures += expect_eq(volume->reservations(), std::size_t {0});
     failures += expect_eq((*fixture)->disk.outstanding(writing->channel().queue_pair()), std::size_t {0});
 
     typename tree_t::level_set_t const& taken = tree->levels();
     failures += expect_eq(taken.population_count(), population_before);
     if (!outcome) {
         failures += expect_status(outcome, status_code_t::uninitialized_k);
-        failures += expect_eq(volume->free_bytes(), free_before);
-        failures += expect_eq(volume->size(), blobs_before);
+        failures += expect_eq(runs->size(), records_before);
         failures += expect_eq(taken.size(), std::size_t {1});
     }
     else {
@@ -920,6 +976,269 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
         failures += expect(taken.level(0).empty());
     }
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
+    return failures;
+}
+
+/** Checks every key below @p keys_count of @p tree against @p reference: missing and written ones
+ *  by a batched read, removed ones by a lookup that finds the remove delta or, once a merge at the
+ *  bottom dropped it, nothing. */
+template <typename tree_type_, typename reference_type_>
+[[nodiscard]] std::size_t check_reference(tree_type_ const& tree, io_channel_t& channel,
+                                          reference_type_ const& reference, std::uint64_t keys_count) {
+    std::size_t mismatched = 0;
+    st::vector<expectation_t> answered;
+    typename tree_type_::level_set_t const& taken = tree.levels();
+    for (std::uint64_t key = 0; key != keys_count; ++key) {
+        expectation_t wanted;
+        wanted.stored_key = key;
+        [[maybe_unused]] st::status_t const found = reference.find(
+            key, [&](st::mapping<std::uint64_t, expectation_t> const& stored) noexcept { wanted = stored.mapped; });
+        if (wanted.state != lookup_result_t::removed_k) {
+            mismatched += answered.push_back(expectation_t {wanted}) != st::status_t::success_k;
+            continue;
+        }
+        lsm_tree_position_t position;
+        lookup_result_t const result = tree.find(taken, key_of(key), position);
+        mismatched += result != lookup_result_t::removed_k && result != lookup_result_t::missing_k;
+    }
+    return expect_eq(mismatched, std::size_t {0}) +
+           check_model(tree, channel, std::span<expectation_t const> {answered});
+}
+
+/** A run alone on level zero past one slot, which overlaps nothing below, moves down by
+ *  its handle untouched. */
+template <typename mount_type_>
+std::size_t trivial_move_writes_nothing(mount_type_ const& mount) {
+    using types_t = lsm_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename types_t::fixture_t;
+    using guard_t = typename types_t::guard_t;
+    using volume_t = typename types_t::volume_t;
+    using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
+    using sorted_run_t = typename types_t::sorted_run_t;
+    std::size_t failures = 0;
+    constexpr std::size_t keys_k = 200;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
+    failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
+    if (!guard || !reading || !writing) return failures;
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
+    failures += expect(volume.has_value());
+    if (!volume) return failures;
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes_k);
+    failures += expect(tree.has_value());
+    if (!tree) return failures;
+
+    st::vector<expectation_t> model;
+    failures += expect(model.resize(keys_k) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    for (std::size_t index = 0; index != keys_k; ++index) {
+        expectation_t entry;
+        entry.stored_key = static_cast<std::uint64_t>(index);
+        entry.state = index % 9 == 0 ? lookup_result_t::removed_k : lookup_result_t::written_k;
+        entry.bytes = entry.state == lookup_result_t::written_k ? 400 + index % 401 : 0;
+        entry.seed = index + 17;
+        model[index] = entry;
+    }
+    failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {model});
+    if (failures != 0) return failures;
+
+    sorted_run_t const* const flushed = &tree->levels().level(0).run(0);
+    uuid_t const content_id = flushed->content_id();
+    failures += expect(flushed->size_bytes() >= slot_bytes_k);
+    failures += expect(tree->needs_compaction(tree->levels()));
+    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
+                                                                 compaction_placement_t::host_k, {}, nullptr,
+                                                                 last_write_fold_t {}, no_device_fold_t {});
+    failures += expect(outcome.has_value());
+    if (!outcome) return failures;
+    failures += expect(*outcome == compaction_outcome_t::published_k);
+
+    // The run below is the very record level zero named, so no byte was read or written and no
+    // run was minted.
+    typename tree_t::level_set_t const& taken = tree->levels();
+    failures += expect_eq(taken.size(), std::size_t {2});
+    failures += expect(taken.level(0).empty());
+    failures += expect_eq(taken.level(1).size(), std::size_t {1});
+    if (taken.level(1).size() == 1) {
+        failures += expect(&taken.level(1).run(0) == flushed);
+        failures += expect(taken.level(1).run(0).content_id() == content_id);
+    }
+    failures += expect_eq(runs->size(), std::size_t {1});
+    failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
+    return failures;
+}
+
+/** A run handle kept past its record's vacate resolves to nothing, even once another run
+ *  takes the record. */
+template <typename mount_type_>
+std::size_t stale_run_handle_resolves_to_nothing(mount_type_ const& mount) {
+    using types_t = lsm_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename types_t::fixture_t;
+    using run_pool_t = typename types_t::run_pool_t;
+    using sorted_run_t = typename types_t::sorted_run_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+    expected<run_pool_t> runs = run_pool_t::make(1, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+
+    auto [first, take_status] = runs->take(sorted_run_t {});
+    failures += expect(take_status.succeeded());
+    failures += expect(runs->at(first) != nullptr);
+    // The one record is taken, so another take is refused rather than handed a live run.
+    failures += expect_status(runs->take(sorted_run_t {}), status_code_t::capacity_exhausted_k);
+    runs->vacate(first);
+    failures += expect(runs->at(first) == nullptr);
+    failures += expect_eq(runs->size(), std::size_t {0});
+
+    auto [second, retake_status] = runs->take(sorted_run_t {});
+    failures += expect(retake_status.succeeded());
+    failures += expect_eq(second.index, first.index);
+    failures += expect(runs->at(second) != nullptr);
+    failures += expect(runs->at(first) == nullptr);
+    runs->vacate(second);
+    // Vacating a stale handle again changes nothing.
+    runs->vacate(first);
+    failures += expect_eq(runs->size(), std::size_t {0});
+    return failures;
+}
+
+/** Many small flushes, each followed by the compactions a commit runs, answer every key as a
+ *  reference store does, while no step writes more than F + 3 slots and a step writing several runs
+ *  fills each halfway. */
+template <typename mount_type_>
+std::size_t compaction_history_matches_reference(mount_type_ const& mount) {
+    using types_t = lsm_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename types_t::fixture_t;
+    using guard_t = typename types_t::guard_t;
+    using volume_t = typename types_t::volume_t;
+    using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
+    using sorted_run_t = typename types_t::sorted_run_t;
+    using reference_t = st::reference_store<st::mapping<std::uint64_t, expectation_t>>;
+    std::size_t failures = 0;
+    constexpr std::uint64_t slot_bytes = 256ull * 1024ull;
+    constexpr std::size_t keys_k = 12000;
+    constexpr std::size_t flushes_k = 200;
+    constexpr std::size_t flushed_keys_k = 160;
+    constexpr std::uint64_t value_bytes_max_k = 700;
+    constexpr std::size_t steps_per_commit_max_k = 64;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
+    failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
+    if (!guard || !reading || !writing) return failures;
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
+    failures += expect(volume.has_value());
+    if (!volume) return failures;
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes);
+    failures += expect(tree.has_value());
+    if (!tree) return failures;
+    st::expected<reference_t> reference = reference_t::make();
+    failures += expect(reference.has_value());
+    if (!reference) return failures;
+
+    // A step reads at most a slot of level zero or one run, and what it overlaps below, F + 2
+    // slots at most.
+    std::uint64_t const headroom_bytes = (test_tree_config().level_enlarge_factor + 3) * slot_bytes;
+    // The merger cuts at the slot less its owner block, leaving the trailer a stamp and a kind per
+    // key slot and a page, and lands within a row of cells, a value and the alignment of four
+    // sections of its aim.
+    std::uint64_t const run_bytes_limit = (slot_bytes - 2 * portable_alignment_k) /
+                                          (sizeof(variable_slot_t) + sizeof(std::uint64_t) + 1) *
+                                          sizeof(variable_slot_t);
+    std::uint64_t const cut_slack_bytes = 4 * portable_alignment_k + 16 * sizeof(variable_slot_t) + value_bytes_max_k;
+
+    random_t random {0x7EEC0FFEEull};
+    std::size_t steps = 0;
+    std::size_t multi_run_steps = 0;
+    std::size_t overspent = 0;
+    std::size_t mislengthed = 0;
+    std::size_t underfilled = 0;
+    st::vector<uuid_t> before;
+    for (std::size_t flush = 0; flush != flushes_k && failures == 0; ++flush) {
+        st::vector<expectation_t> batch;
+        for (std::uint64_t key = 0; key != keys_k; ++key) {
+            if (random.below(keys_k) >= flushed_keys_k) continue;
+            expectation_t entry;
+            entry.stored_key = key;
+            entry.state = random.below(8) == 0 ? lookup_result_t::removed_k : lookup_result_t::written_k;
+            entry.bytes = entry.state == lookup_result_t::written_k ? 1 + random.below(value_bytes_max_k) : 0;
+            entry.seed = random.next();
+            failures += expect(batch.push_back(expectation_t {entry}) == st::status_t::success_k);
+            failures += expect(reference->upsert(st::mapping<std::uint64_t, expectation_t> {key, entry}) ==
+                               st::status_t::success_k);
+        }
+        if (batch.empty()) continue;
+        failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
+
+        for (std::size_t step = 0; step != steps_per_commit_max_k && tree->needs_compaction(tree->levels()); ++step) {
+            before.clear();
+            typename tree_t::level_set_t const& source = tree->levels();
+            for (std::size_t number = 0; number != source.size(); ++number)
+                for (std::size_t index = 0; index != source.level(number).size(); ++index)
+                    failures += expect(before.push_back(source.level(number).run(index).content_id()) ==
+                                       st::status_t::success_k);
+            expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
+                                                                         compaction_placement_t::host_k, {}, nullptr,
+                                                                         last_write_fold_t {}, no_device_fold_t {});
+            failures += expect(outcome.has_value() && *outcome == compaction_outcome_t::published_k);
+            if (!outcome) break;
+            ++steps;
+
+            st::vector<sorted_run_t const*> written;
+            typename tree_t::level_set_t const& merged = tree->levels();
+            for (std::size_t number = 0; number != merged.size(); ++number)
+                for (std::size_t index = 0; index != merged.level(number).size(); ++index) {
+                    sorted_run_t const& run = merged.level(number).run(index);
+                    bool known = false;
+                    for (uuid_t const& id : before) known |= id == run.content_id();
+                    if (!known) failures += expect(written.push_back(&run) == st::status_t::success_k);
+                }
+            std::uint64_t written_bytes = 0;
+            for (sorted_run_t const* run : written) {
+                written_bytes += run->size_bytes();
+                mislengthed += run->size_bytes() != sorted_run_layout<variable_slot_t>::blob_bytes(run->header());
+            }
+            overspent += written_bytes > headroom_bytes;
+            if (written.size() < 2) continue;
+            ++multi_run_steps;
+            for (sorted_run_t const* run : written)
+                underfilled += 2 * (run->size_bytes() + cut_slack_bytes) < run_bytes_limit;
+        }
+        failures += expect(!tree->needs_compaction(tree->levels()));
+        if (flush % 25 == 24) failures += check_reference(*tree, guard->channel(), *reference, keys_k);
+    }
+    failures += check_reference(*tree, guard->channel(), *reference, keys_k);
+    failures += expect(tree->levels().size() >= 3);
+    failures += expect(steps != 0 && multi_run_steps != 0);
+    failures += expect_eq(overspent, std::size_t {0});
+    failures += expect_eq(mislengthed, std::size_t {0});
+    failures += expect_eq(underfilled, std::size_t {0});
+    // Every record the pool holds is a run the current set names, so every consumed run
+    // was given back.
+    std::size_t named = 0;
+    for (std::size_t number = 0; number != tree->levels().size(); ++number)
+        named += tree->levels().level(number).size();
+    failures += expect_eq(runs->size(), named);
     return failures;
 }
 
@@ -956,6 +1275,8 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using level_t = typename types_t::level_t;
+    using run_pool_t = typename types_t::run_pool_t;
+    using run_handle_t = typename types_t::run_handle_t;
     using merger_t = typename types_t::merger_t;
     using sorted_run_t = typename types_t::sorted_run_t;
     std::size_t failures = 0;
@@ -989,22 +1310,27 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     }
     if (failures != 0) return failures;
 
-    level_t upper = level_t::of(0, lsm_level_order_t::overlapping_k);
-    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {older});
-    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {newer});
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    level_t upper = level_t::of(*runs, 0, lsm_level_order_t::overlapping_k);
+    failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {older});
+    failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
+    st::vector<sorted_run_t const*> const sources = runs_of(upper);
 
     typename merger_t::merge_request_t request;
-    request.upper = &upper;
-    request.number = 1;
+    request.upper = sources;
+    request.upper_order = lsm_level_order_t::overlapping_k;
     request.depth = lsm_level_depth_t::intermediate_k;
     request.value_max_size = value_max_size_k;
 
     request.placement = compaction_placement_t::host_k;
-    expected<level_t> host = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                             last_write_fold_t {}, no_device_fold_t {});
-    failures += expect(host.has_value());
-    if (!host) return failures;
+    expected<st::vector<run_handle_t>> host_runs = merger_t::merge(
+        *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+    failures += expect(host_runs.has_value());
+    if (!host_runs) return failures;
+    level_t const host = level_of<level_t>(*runs, 1, *host_runs);
 
     // The device side runs on a compactor made once, as an engine makes its own at open, and a build without one
     // refuses.
@@ -1019,22 +1345,23 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     expected<cuda_compactor_t> compactor = executor ? cuda_compactor_t::make(*executor)
                                                     : expected<cuda_compactor_t> {executor.status()};
     if (compactor) request.compactor = std::addressof(*compactor);
-    expected<level_t> device = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                               last_write_fold_t {}, no_device_fold_t {});
-    if (!device) {
-        bool const no_compactor = device == status_code_t::unsupported_k || device == status_code_t::device_k;
-        if (!no_compactor) failures += expect_status(device, status_code_t::unsupported_k);
-        failures += expect(host->drop(*volume, writing->channel()).succeeded());
-        failures += expect(upper.drop(*volume, writing->channel()).succeeded());
+    expected<st::vector<run_handle_t>> device_runs = merger_t::merge(
+        *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+    if (!device_runs) {
+        bool const no_compactor = device_runs == status_code_t::unsupported_k || device_runs == status_code_t::device_k;
+        if (!no_compactor) failures += expect_status(device_runs, status_code_t::unsupported_k);
+        runs->discard(*volume, *host_runs);
+        runs->discard(*volume, upper.runs());
         return no_compactor ? case_result_t::skipped("no device compactor", failures) : case_result_t {failures};
     }
+    level_t const device = level_of<level_t>(*runs, 1, *device_runs);
 
-    failures += expect_eq(device->size(), host->size());
-    failures += expect_eq(device->population_count(), host->population_count());
+    failures += expect_eq(device.size(), host.size());
+    failures += expect_eq(device.population_count(), host.population_count());
     std::size_t differing = 0;
-    for (std::size_t run = 0; run != host->size() && run != device->size(); ++run) {
-        sorted_run_t const& left = host->run(run);
-        sorted_run_t const& right = device->run(run);
+    for (std::size_t run = 0; run != host.size() && run != device.size(); ++run) {
+        sorted_run_t const& left = host.run(run);
+        sorted_run_t const& right = device.run(run);
         if (left.population_count() != right.population_count()) {
             ++differing;
             continue;
@@ -1051,14 +1378,14 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     // Identical cells are not identical runs until the bytes they locate come back the same too.
     st::vector<byte_t> host_values;
     st::vector<byte_t> device_values;
-    failures += collect_level_values(*host, guard->channel(), host_values);
-    failures += collect_level_values(*device, guard->channel(), device_values);
+    failures += collect_level_values(host, guard->channel(), host_values);
+    failures += collect_level_values(device, guard->channel(), device_values);
     failures += expect_eq(device_values.size(), host_values.size());
     if (device_values.size() == host_values.size())
         failures += expect_eq(std::memcmp(host_values.data(), device_values.data(), host_values.size()), 0);
-    failures += expect(host->drop(*volume, writing->channel()).succeeded());
-    failures += expect(device->drop(*volume, writing->channel()).succeeded());
-    failures += expect(upper.drop(*volume, writing->channel()).succeeded());
+    runs->discard(*volume, *host_runs);
+    runs->discard(*volume, *device_runs);
+    runs->discard(*volume, upper.runs());
     return failures;
 }
 
@@ -1079,7 +1406,10 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using level_t = typename types_t::level_t;
+    using run_pool_t = typename types_t::run_pool_t;
+    using run_handle_t = typename types_t::run_handle_t;
     using merger_t = typename types_t::merger_t;
+    using sorted_run_t = typename types_t::sorted_run_t;
     std::size_t failures = 0;
     constexpr std::size_t older_keys_k = 1000;
     constexpr std::size_t newer_keys_k = 300;
@@ -1117,10 +1447,14 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     }
     if (failures != 0) return failures;
 
-    level_t upper = level_t::of(0, lsm_level_order_t::overlapping_k);
-    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {older});
-    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {newer});
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    level_t upper = level_t::of(*runs, 0, lsm_level_order_t::overlapping_k);
+    failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {older});
+    failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
+    st::vector<sorted_run_t const*> const sources = runs_of(upper);
 
     // The sizes a copy of one source index, or of both back to back, would be requested at.
     allocation_watch_t& watch = allocation_watch_g;
@@ -1134,22 +1468,23 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     watch.sizes[watch.count++] = all_indexes;
 
     typename merger_t::merge_request_t request;
-    request.upper = &upper;
-    request.number = 1;
+    request.upper = sources;
+    request.upper_order = lsm_level_order_t::overlapping_k;
     request.depth = lsm_level_depth_t::intermediate_k;
     request.value_max_size = value_max_size_k;
     request.placement = compaction_placement_t::host_k;
-    expected<level_t> merged = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                               last_write_fold_t {}, no_device_fold_t {});
+    expected<st::vector<run_handle_t>> merged_runs = merger_t::merge(
+        *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
     allocation_watch_t const seen = watch;
     watch = allocation_watch_t {};
-    failures += expect_status(merged, status_code_t::success_k);
-    if (!merged) return failures;
+    failures += expect_status(merged_runs, status_code_t::success_k);
+    if (!merged_runs) return failures;
 
-    failures += expect_eq(merged->population_count(), std::uint64_t {older_keys_k + newer_keys_k / 2});
+    level_t const merged = level_of<level_t>(*runs, 1, *merged_runs);
+    failures += expect_eq(merged.population_count(), std::uint64_t {older_keys_k + newer_keys_k / 2});
     for (std::size_t index = 0; index != seen.count; ++index) failures += expect_eq(seen.hits[index], std::size_t {0});
-    failures += expect(merged->drop(*volume, writing->channel()).succeeded());
-    failures += expect(upper.drop(*volume, writing->channel()).succeeded());
+    runs->discard(*volume, *merged_runs);
+    runs->discard(*volume, upper.runs());
     return failures;
 }
 
@@ -1170,6 +1505,7 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using tree_t = typename types_t::tree_t;
+    using run_pool_t = typename types_t::run_pool_t;
     std::size_t failures = 0;
     constexpr std::size_t keys_k = 1024;
     constexpr std::size_t flushes_k = 4;
@@ -1183,7 +1519,10 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), memory_runs_bytes_k);
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), *runs, slot_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -1238,6 +1577,279 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
 
 #pragma endregion Depth Cases
 
+#pragma region Strings Merges
+
+/** Run types over strings, whose keys the heads hold first and a tape holds whole. */
+template <typename fixture_type_>
+struct strings_types {
+    using volume_t = typename fixture_type_::volume_t;
+    using key_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>;
+    using sorted_run_t = lsm_sorted_run<key_slot_t, volume_t, waiter_t>;
+    using merger_t = lsm_level_merger<key_slot_t, volume_t, atomic_reference, waiter_t>;
+    using run_pool_t = typename merger_t::run_pool_t;
+    using run_handle_t = typename merger_t::run_handle_t;
+};
+
+/** Sections and items of the URL corpus, whose URLs share 36 bytes and tie on their
+ *  heads three deep. */
+constexpr std::size_t url_sections_k = 40;
+constexpr std::size_t url_items_k = 150;
+constexpr std::size_t urls_k = url_sections_k * url_items_k;
+
+/** The URL at @p index of the corpus, which ascends with its index, written into @p buffer. */
+[[nodiscard]] std::string_view url_of(std::size_t index, std::span<char, 64> buffer) noexcept {
+    auto const written = fmt::format_to_n(buffer.data(), buffer.size(),
+                                          "https://example.org/catalog/section-{:03}/item-{:05}", index / url_items_k,
+                                          index % url_items_k);
+    return std::string_view {buffer.data(), static_cast<std::size_t>(written.out - buffer.data())};
+}
+
+/** One version a source run carries for the URL at @c index. */
+struct url_version_t {
+    std::size_t index = 0;
+    std::uint64_t stamp = 0;
+    delta_kind_t kind = delta_kind_t::write_k;
+};
+
+/** Writes @p versions, ascending by URL, as one run of strings taken into @p runs, its values
+ *  painted by stamp. */
+template <typename types_type_>
+[[nodiscard]] std::size_t write_url_run(typename types_type_::run_pool_t& runs, typename types_type_::volume_t& volume,
+                                        io_channel_t& channel, std::span<url_version_t const> versions,
+                                        st::vector<typename types_type_::run_handle_t>& into) {
+    using key_slot_t = typename types_type_::key_slot_t;
+    using sorted_run_t = typename types_type_::sorted_run_t;
+    std::size_t failures = 0;
+    std::size_t const count = versions.size();
+    st::vector<key_slot_t> key_slots;
+    st::vector<std::uint64_t> stamps;
+    st::vector<std::uint8_t> kinds;
+    st::vector<std::uint32_t> tail_offsets;
+    st::vector<byte_t> tails;
+    failures += expect(key_slots.resize(count) == st::status_t::success_k);
+    failures += expect(stamps.resize(count) == st::status_t::success_k);
+    failures += expect(kinds.resize(count) == st::status_t::success_k);
+    failures += expect(tail_offsets.resize(count + 1) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    std::uint32_t tails_bytes = 0;
+    for (std::size_t position = 0; position != count; ++position) {
+        char buffer[64];
+        std::string_view const text = url_of(versions[position].index, buffer);
+        key_slot_t slot;
+        slot.stored_key = strings::head_of(text);
+        for (std::size_t byte = 0; byte != key_slot_t::size; ++byte)
+            slot.data[byte] = painted(versions[position].stamp, byte);
+        key_slots[position] = slot;
+        stamps[position] = versions[position].stamp;
+        kinds[position] = static_cast<std::uint8_t>(versions[position].kind);
+        tail_offsets[position] = tails_bytes;
+        std::string_view const tail = strings::tail_of(text);
+        failures += expect(tails.resize(tails_bytes + tail.size()) == st::status_t::success_k);
+        if (failures != 0) return failures;
+        std::memcpy(tails.data() + tails_bytes, tail.data(), tail.size());
+        tails_bytes += static_cast<std::uint32_t>(tail.size());
+    }
+    tail_offsets[count] = tails_bytes;
+    expected<sorted_run_t> run = sorted_run_t::write(
+        volume, channel, uuid_t {}, uuid_generator(), std::span<key_slot_t const> {key_slots},
+        std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, {}, {}, key_slot_t::size,
+        key_tails_column_t {std::span<std::uint32_t const> {tail_offsets}, std::span<byte_t const> {tails}});
+    failures += expect(run.has_value());
+    if (!run) return failures;
+    auto [taken, take_status] = runs.take(std::move(*run));
+    failures += expect(take_status.succeeded());
+    if (take_status.failed()) return failures;
+    failures += expect(into.push_back(std::move(taken)) == st::status_t::success_k);
+    return failures;
+}
+
+/** Compares the runs @p merged, in order, with @p wanted, ascending by URL and newest first within
+ *  one, and checks every run stays under @p run_bytes_limit and orders wholly before the next. */
+template <typename types_type_>
+[[nodiscard]] std::size_t check_url_runs(typename types_type_::run_pool_t const& runs,
+                                         std::span<typename types_type_::run_handle_t const> merged,
+                                         std::span<url_version_t const> wanted, std::uint64_t run_bytes_limit) {
+    using sorted_run_t = typename types_type_::sorted_run_t;
+    std::size_t failures = 0;
+    std::size_t at = 0;
+    std::size_t mismatches = 0;
+    sorted_run_t const* previous = nullptr;
+    for (auto const& handle : merged) {
+        sorted_run_t const& run = *runs.at(handle);
+        failures += expect(run.size_bytes() <= run_bytes_limit);
+        failures += expect_eq(run.size_bytes(), sorted_run_t::strings_layout_t::blob_bytes(run.header()));
+        if (previous != nullptr) failures += expect(previous->precedes(run));
+        previous = &run;
+        for (std::uint64_t position = 0; position != run.population_count(); ++position, ++at) {
+            if (at == wanted.size()) return failures + expect(false);
+            char buffer[64];
+            std::string_view const text = url_of(wanted[at].index, buffer);
+            std::span<byte_t const> const value = run.value(position);
+            mismatches += run.key(position) != text || run.stamp(position) != wanted[at].stamp ||
+                          run.kind(position) != wanted[at].kind || value[3] != painted(wanted[at].stamp, 3);
+        }
+    }
+    failures += expect_eq(at, wanted.size());
+    failures += expect_eq(mismatches, std::size_t {0});
+    return failures;
+}
+
+/**
+ *  @brief Strings merges over URLs with long shared prefixes keep the versions a reference keeps,
+ *      in one merge or two, cut into runs under their limit that order wholly one after another.
+ *
+ *  Three overlapping upper runs, the newest removing some URLs, fold into two lower runs. With
+ *  a reader pinned between the lower and the upper stamps, a URL both carry keeps two
+ *  versions, newest first.
+ */
+template <typename mount_type_>
+std::size_t strings_merges_match_reference(mount_type_ const& mount) {
+    using types_t = strings_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename mount_type_::fixture_t;
+    using guard_t = typename fixture_t::guard_t;
+    using volume_t = typename types_t::volume_t;
+    using merger_t = typename types_t::merger_t;
+    using run_pool_t = typename types_t::run_pool_t;
+    using run_handle_t = typename types_t::run_handle_t;
+    using sorted_run_t = typename types_t::sorted_run_t;
+    constexpr std::size_t upper_runs_k = 3;
+    constexpr std::uint64_t lower_stamps_k = 100000;
+    constexpr std::uint64_t run_bytes_limit_k = 64ull * 1024ull;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
+    failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
+    if (!guard || !reading || !writing) return failures;
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
+    failures += expect(volume.has_value());
+    if (!volume) return failures;
+    expected<run_pool_t> runs = run_pool_t::make(run_records_k, (*fixture)->resources->memory_constraint);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+
+    // Lower runs hold the even URLs in two halves; upper run u holds every (u + 3)-th URL, stamped
+    // newer per run.
+    auto upper_stamp = [](std::size_t run, std::size_t index) noexcept { return lower_stamps_k * (run + 2) + index; };
+    st::vector<run_handle_t> lower;
+    st::vector<run_handle_t> upper;
+    for (std::size_t half = 0; half != 2; ++half) {
+        st::vector<url_version_t> versions;
+        for (std::size_t index = half * urls_k / 2; index != (half + 1) * urls_k / 2; index += 2)
+            failures += expect(versions.push_back(url_version_t {index, 1 + index}) == st::status_t::success_k);
+        failures += write_url_run<types_t>(*runs, *volume, guard->channel(), versions, lower);
+    }
+    for (std::size_t run = 0; run != upper_runs_k; ++run) {
+        st::vector<url_version_t> versions;
+        for (std::size_t index = 0; index < urls_k; index += run + 3) {
+            delta_kind_t const kind = run + 1 == upper_runs_k && index % 7 == 0 ? delta_kind_t::remove_k
+                                                                                : delta_kind_t::write_k;
+            failures += expect(versions.push_back(url_version_t {index, upper_stamp(run, index), kind}) ==
+                               st::status_t::success_k);
+        }
+        failures += write_url_run<types_t>(*runs, *volume, guard->channel(), versions, upper);
+    }
+    if (failures != 0) return failures;
+
+    // The reference for a merge shaped as @p merged: every URL's newest version, and under a pin,
+    // its newest lower one too where an upper exists.
+    auto reference = [&](typename merger_t::merge_request_t const& merged, st::vector<url_version_t>& wanted) {
+        bool const bottom = merged.depth == lsm_level_depth_t::bottom_k;
+        bool const pinned = merged.stamps.pinned_count != 0;
+        for (std::size_t index = 0; index != urls_k; ++index) {
+            bool upper_found = false;
+            url_version_t newest;
+            for (std::size_t run = upper_runs_k; run-- != 0 && !upper_found;)
+                if (index % (run + 3) == 0) {
+                    bool const removes = run + 1 == upper_runs_k && index % 7 == 0;
+                    newest = url_version_t {index, upper_stamp(run, index),
+                                            removes ? delta_kind_t::remove_k : delta_kind_t::write_k};
+                    upper_found = true;
+                }
+            bool const lower_found = index % 2 == 0;
+            if (upper_found && !(bottom && newest.kind == delta_kind_t::remove_k)) [[maybe_unused]]
+                st::status_t const kept = wanted.push_back(url_version_t {newest});
+            if (lower_found && (!upper_found || pinned)) [[maybe_unused]]
+                st::status_t const kept = wanted.push_back(url_version_t {index, 1 + index});
+        }
+    };
+    st::vector<sorted_run_t const*> upper_sources;
+    st::vector<sorted_run_t const*> lower_sources;
+    for (run_handle_t const& handle : upper)
+        failures += expect(upper_sources.push_back(runs->at(handle)) == st::status_t::success_k);
+    for (run_handle_t const& handle : lower)
+        failures += expect(lower_sources.push_back(runs->at(handle)) == st::status_t::success_k);
+
+    typename merger_t::merge_request_t request;
+    request.upper = upper_sources;
+    request.upper_order = lsm_level_order_t::overlapping_k;
+    request.lower = lower_sources;
+    request.value_max_size = types_t::key_slot_t::size;
+    request.run_bytes_limit = run_bytes_limit_k;
+    request.placement = compaction_placement_t::host_k;
+
+    // One merge at the bottom drops the removals and every shadowed lower version.
+    request.depth = lsm_level_depth_t::bottom_k;
+    expected<st::vector<run_handle_t>> once = merger_t::merge(*volume, *runs, reading->channel(), writing->channel(),
+                                                              request, last_write_fold_t {}, no_device_fold_t {});
+    failures += expect_status(once, status_code_t::success_k);
+    if (!once) return failures;
+    failures += expect(once->size() > 1);
+    st::vector<url_version_t> wanted;
+    reference(request, wanted);
+    failures += check_url_runs<types_t>(*runs, *once, wanted, run_bytes_limit_k);
+
+    // The upper runs merged first and then into the lower ones end in the very same versions.
+    request.lower = {};
+    request.depth = lsm_level_depth_t::intermediate_k;
+    expected<st::vector<run_handle_t>> folded = merger_t::merge(*volume, *runs, reading->channel(), writing->channel(),
+                                                                request, last_write_fold_t {}, no_device_fold_t {});
+    failures += expect_status(folded, status_code_t::success_k);
+    if (!folded) return failures;
+    st::vector<sorted_run_t const*> folded_sources;
+    for (run_handle_t const& handle : *folded)
+        failures += expect(folded_sources.push_back(runs->at(handle)) == st::status_t::success_k);
+    request.upper = folded_sources;
+    request.upper_order = lsm_level_order_t::sorted_k;
+    request.lower = lower_sources;
+    request.depth = lsm_level_depth_t::bottom_k;
+    expected<st::vector<run_handle_t>> twice = merger_t::merge(*volume, *runs, reading->channel(), writing->channel(),
+                                                               request, last_write_fold_t {}, no_device_fold_t {});
+    failures += expect_status(twice, status_code_t::success_k);
+    if (!twice) return failures;
+    failures += check_url_runs<types_t>(*runs, *twice, wanted, run_bytes_limit_k);
+
+    // A reader pinned between the lower and the upper stamps keeps both versions of a
+    // URL, newest first.
+    std::uint64_t const pins[] {lower_stamps_k};
+    request.upper = upper_sources;
+    request.upper_order = lsm_level_order_t::overlapping_k;
+    request.depth = lsm_level_depth_t::intermediate_k;
+    request.stamps.pinned = pins;
+    request.stamps.pinned_count = 1;
+    expected<st::vector<run_handle_t>> pinned = merger_t::merge(*volume, *runs, reading->channel(), writing->channel(),
+                                                                request, last_write_fold_t {}, no_device_fold_t {});
+    failures += expect_status(pinned, status_code_t::success_k);
+    if (!pinned) return failures;
+    st::vector<url_version_t> wanted_pinned;
+    reference(request, wanted_pinned);
+    failures += check_url_runs<types_t>(*runs, *pinned, wanted_pinned, run_bytes_limit_k);
+
+    runs->discard(*volume, *once);
+    runs->discard(*volume, *folded);
+    runs->discard(*volume, *twice);
+    runs->discard(*volume, *pinned);
+    runs->discard(*volume, upper);
+    runs->discard(*volume, lower);
+    failures += expect_eq(runs->size(), std::size_t {0});
+    return failures;
+}
+
+#pragma endregion Strings Merges
+
 } // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
@@ -1266,9 +1878,13 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "intermediate_keeps_remove_deltas", intermediate_merge_keeps_remove_deltas);
         report(totals, mount, "cancelled_leaves_nothing", cancelled_compaction_leaves_nothing);
         report(totals, mount, "raced_cancellation", raced_cancellation_is_all_or_nothing);
+        report(totals, mount, "trivial_move_writes_nothing", trivial_move_writes_nothing);
+        report(totals, mount, "stale_run_handle", stale_run_handle_resolves_to_nothing);
+        report(totals, mount, "history_matches_reference", compaction_history_matches_reference);
         report(totals, mount, "compactors_agree", both_compactors_agree);
         report(totals, mount, "merge_charges_no_index_copy", merge_charges_no_index_copy);
         report(totals, mount, "holds_its_depth", batched_read_holds_its_depth);
+        report(totals, mount, "strings_merges_match_reference", strings_merges_match_reference);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, lsm_config_k, 1, "lsm", cases);

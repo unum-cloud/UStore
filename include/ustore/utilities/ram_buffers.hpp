@@ -17,7 +17,9 @@
 #include <cstdlib> // `std::aligned_alloc`, `std::free`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#if defined(_WIN32)
+#include "ustore/types.h" // `USTORE_OS_WINDOWS_`
+
+#if USTORE_OS_WINDOWS_
 #include <malloc.h> // `_aligned_malloc`, `_aligned_free`
 #endif
 
@@ -454,7 +456,7 @@ class aligned_allocator {
     /** Allocates room for @p count values on an aligned boundary, or answers @c nullptr. */
     [[nodiscard]] value_type_* allocate(std::size_t count) noexcept {
         if (count == 0 || count > max_count_k) return nullptr;
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
         return static_cast<value_type_*>(::_aligned_malloc(aligned_bytes(count), alignment_k));
 #else
         return static_cast<value_type_*>(std::aligned_alloc(alignment_k, aligned_bytes(count)));
@@ -463,7 +465,7 @@ class aligned_allocator {
 
     /** Releases @p pointer, which must come from @c allocate. */
     void deallocate(value_type_* pointer, std::size_t) noexcept {
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
         ::_aligned_free(pointer);
 #else
         std::free(pointer);
@@ -593,13 +595,17 @@ class constrained_allocator {
     /** The rebinding conversion @c std::allocator_traits performs; the budget travels with it. */
     template <typename other_type_, typename other_base_type_>
     constrained_allocator(constrained_allocator<other_type_, atomic_reference_, other_base_type_> const& other) noexcept
-        : base_(), constraint_(other.constraint_pointer()) {}
+        : base_(other.base()), constraint_(other.constraint_pointer()) {}
 
     /** Charges room for @p count values, or answers @c nullptr when the budget refuses them. */
     [[nodiscard]] value_type_* allocate(std::size_t count) noexcept {
-        if (!constraint_ || !constraint_->acquire(count * sizeof(value_type_))) return nullptr;
+        // A count whose byte size wraps would charge the budget for a small block that
+        // reads as valid.
+        if (count > std::numeric_limits<std::size_t>::max() / sizeof(value_type_)) return nullptr;
+        std::size_t const bytes = count * sizeof(value_type_);
+        if (!constraint_ || !constraint_->acquire(bytes)) return nullptr;
         value_type_* const memory = base_.allocate(count);
-        if (!memory) { [[maybe_unused]] bool const returned = constraint_->release(count * sizeof(value_type_)); }
+        if (!memory) { [[maybe_unused]] bool const returned = constraint_->release(bytes); }
         return memory;
     }
 
@@ -614,6 +620,9 @@ class constrained_allocator {
 
     /** The budget this allocator charges, or null while it names none. */
     constraint_t* constraint_pointer() const noexcept { return constraint_; }
+
+    /** The allocator the charged bytes come from, which a rebinding conversion carries over. */
+    base_allocator_t const& base() const noexcept { return base_; }
 
     template <typename other_type_, typename other_base_type_>
     bool operator==(

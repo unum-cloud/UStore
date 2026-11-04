@@ -39,9 +39,10 @@
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`
 
-#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <smashtable/basic_slot_pool.hpp> // `st::basic_slot_pool`
+#include <smashtable/basic_vector.hpp>    // `st::vector`
 
-#include "ustore/utilities/nvme_ring.hpp" // `registered_memory_t`, `ring_concept`, `read_request`, `write_request`, `flush_request`
+#include "ustore/utilities/nvme_ring.hpp"   // `ring_concept`, `read_request`, `write_request`, `deallocate_request`
 #include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`, `resource_constraint`
 #include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -278,19 +279,18 @@ class buffer_pool_t {
         pool.range_ = &range;
         pool.region_offset_ = region_offset;
         pool.buffer_bytes_ = config.buffer_bytes;
-        if (pool.free_indices_.resize(config.buffers_count) != st::status_t::success_k)
+        auto [buffers, make_buffers_status] = buffers_t::make(config.buffers_count);
+        if (make_buffers_status != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "A pool could not track its blocks"};
-        for (std::uint32_t index = 0; index != config.buffers_count; ++index)
-            pool.free_indices_[index] = config.buffers_count - 1 - index;
-        pool.free_count_ = config.buffers_count;
+        pool.buffers_ = std::move(buffers);
         return pool;
     }
 
     /** Takes one block, or answers @c capacity_exhausted_k when every block of this channel is out. */
     expected<pooled_buffer_t> acquire() noexcept {
-        if (free_count_ == 0)
+        std::uint32_t const index = buffers_.take();
+        if (index == buffers_t::absent_k)
             return status_t {status_code_t::capacity_exhausted_k, "Every block of this channel is out"};
-        std::uint32_t const index = free_indices_[--free_count_];
         pooled_buffer_t buffer;
         buffer.pool_ = this;
         buffer.index_ = index;
@@ -300,11 +300,13 @@ class buffer_pool_t {
     }
 
     /** Blocks nobody holds, which a submit loop reads to decide how much more to offer. */
-    [[nodiscard]] std::uint32_t available_buffers() const noexcept { return free_count_; }
+    [[nodiscard]] std::uint32_t available_buffers() const noexcept {
+        return static_cast<std::uint32_t>(buffers_.capacity() - buffers_.size());
+    }
 
     /** Blocks the pool was carved with. */
     [[nodiscard]] std::uint32_t total_buffers() const noexcept {
-        return static_cast<std::uint32_t>(free_indices_.size());
+        return static_cast<std::uint32_t>(buffers_.capacity());
     }
 
     /** Bytes of one block, which is the unit every transfer is split into. */
@@ -317,10 +319,18 @@ class buffer_pool_t {
 
     friend class pooled_buffer_t;
 
+    /** One block's record, which needs nothing past its generation since its bytes follow
+     *  from its index. */
+    struct buffer_record_t {
+
+        /** Stepped every time the block comes back, zeroed by the pool's value-initialization. */
+        std::uint32_t generation;
+    };
+
+    using buffers_t = st::basic_slot_pool<buffer_record_t>;
+
     /** Takes @p index back, which only a queue pair's own release calls. */
-    void recycle_(std::uint32_t index) noexcept {
-        if (free_count_ < free_indices_.size()) free_indices_[free_count_++] = index;
-    }
+    void recycle_(std::uint32_t index) noexcept { buffers_.vacate(index); }
 
     /** The place of the block at @p index, @p offset bytes in. */
     [[nodiscard]] memory_reference_t place_(std::uint32_t index, std::uint64_t offset) const noexcept {
@@ -336,11 +346,8 @@ class buffer_pool_t {
     /** Bytes of one block. */
     std::uint64_t buffer_bytes_ = 0;
 
-    /** Indices of the blocks nobody holds, read and written as a stack by the owning channel alone. */
-    st::vector<std::uint32_t> free_indices_;
-
-    /** Entries of @c free_indices_ that are live, which is the stack's height. */
-    std::uint32_t free_count_ = 0;
+    /** One record per block, taken and vacated by the owning channel alone. */
+    buffers_t buffers_;
 };
 
 inline pooled_buffer_t& pooled_buffer_t::operator=(pooled_buffer_t&& other) noexcept {
@@ -755,8 +762,13 @@ class basic_read_pipeline {
         return channel_.requests().available_buffers() != 0 && entries_.size() < channel_.queue_pair().depth();
     }
 
-    /** Queues a read of @p extent under @p tag, or answers @c capacity_exhausted_k when out of room. */
-    status_t enqueue_read(extent_t extent, request_tag_t tag) noexcept {
+    /** Queues a read of @p extent of the pipeline's medium under @p tag, as the
+     *  three-argument form does. */
+    status_t enqueue_read(extent_t extent, request_tag_t tag) noexcept { return enqueue_read(medium_, extent, tag); }
+
+    /** Queues a read of @p extent of @p medium under @p tag, or answers @c capacity_exhausted_k
+     *  when out of room. */
+    status_t enqueue_read(medium_reference_t medium, extent_t extent, request_tag_t tag) noexcept {
         if (!can_enqueue()) return {status_code_t::capacity_exhausted_k, "This channel has no block or credit left"};
         auto [block, acquire_status] = channel_.requests().acquire();
         if (acquire_status.failed()) return acquire_status;
@@ -764,7 +776,7 @@ class basic_read_pipeline {
         entry.block = std::move(block);
         entry.tag = tag;
         entry.requested_bytes = extent.length;
-        request_t const request = read_request(medium_, extent, entry.block.reference(), channel_.token(next_slot_));
+        request_t const request = read_request(medium, extent, entry.block.reference(), channel_.token(next_slot_));
         if (staged_.push_back(request_t {request}) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A pipeline could not stage another request"};
         if (entries_.push_back(std::move(entry)) != st::status_t::success_k) {
@@ -957,18 +969,16 @@ class basic_write_pipeline {
      *  @param[in] extent Where on the medium the bytes land, whose length is what is written.
      */
     status_t enqueue_write(pooled_buffer_t&& block, extent_t extent) noexcept {
-        request_t const request = write_request(medium_, extent, block.reference(), channel_.token(next_slot_));
-        if (staged_.push_back(request_t {request}) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A pipeline could not stage another write"};
-        entry_t entry;
-        entry.block = std::move(block);
-        entry.requested_bytes = extent.length;
-        if (entries_.push_back(std::move(entry)) != st::status_t::success_k) {
-            staged_.pop_back();
-            return {status_code_t::out_of_memory_k, "A pipeline could not track another write"};
-        }
-        ++next_slot_;
-        return {};
+        return stage_(write_request(medium_, extent, block.reference(), channel_.token(next_slot_)), std::move(block));
+    }
+
+    /**
+     *  @brief Queues giving @p extent back to the medium, which reads as anything afterwards,
+     *      holding no block.
+     *  @param[in] extent The range the medium may stop keeping, retired like a write.
+     */
+    status_t enqueue_deallocate(extent_t extent) noexcept {
+        return stage_(deallocate_request(medium_, extent, channel_.token(next_slot_)), pooled_buffer_t {});
     }
 
     /** Submits what is staged, keeping whatever the ring would not take for the next call. */
@@ -1018,6 +1028,16 @@ class basic_write_pipeline {
                                       : status_t {};
     }
 
+    /** Submits and reaps every write, so each has reached the device, without the flush that
+     *  makes them durable. */
+    status_t poll_all_completions() noexcept {
+        while (outstanding() != 0) {
+            if (status_t const flushed = submit(); flushed.failed()) return flushed;
+            if (status_t const polled = poll_one_completion(); polled.failed()) return polled;
+        }
+        return {};
+    }
+
     /**
      *  @brief Reaps every write, then flushes the device and polls that, which is the barrier.
      *
@@ -1025,11 +1045,7 @@ class basic_write_pipeline {
      *      what its queue pair has already completed.
      */
     status_t make_durable() noexcept {
-        while (outstanding() != 0) {
-            if (status_t const flushed = submit(); flushed.failed()) return flushed;
-            if (status_t const polled = poll_one_completion(); polled.failed()) return polled;
-        }
-
+        if (status_t const polled = poll_all_completions(); polled.failed()) return polled;
         std::array<request_t, 1> barrier {flush_request(medium_, channel_.token(next_slot_++))};
         auto [taken, submit_status] = disk_.submit(channel_.queue_pair(), std::span<request_t const> {barrier});
         if (submit_status.failed()) return submit_status;
@@ -1056,6 +1072,21 @@ class basic_write_pipeline {
         /** Whether this entry still awaits its completion. */
         bool live = true;
     };
+
+    /** Stages @p request and tracks @p block, which it holds until the request retires. */
+    status_t stage_(request_t const& request, pooled_buffer_t&& block) noexcept {
+        if (staged_.push_back(request_t {request}) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A pipeline could not stage another write"};
+        entry_t entry;
+        entry.block = std::move(block);
+        entry.requested_bytes = request.extent.length;
+        if (entries_.push_back(std::move(entry)) != st::status_t::success_k) {
+            staged_.pop_back();
+            return {status_code_t::out_of_memory_k, "A pipeline could not track another write"};
+        }
+        ++next_slot_;
+        return {};
+    }
 
     /** What a write that moved less than it asked for means, which is never a retry. */
     static status_t short_write_status_(completion_t const& completion) noexcept {

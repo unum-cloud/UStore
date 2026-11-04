@@ -6,13 +6,13 @@
  *      over the registry, read sets and transaction core of @c nvme_transactions.hpp.
  *
  *  A database is a list of collections and nothing else: it resolves a name to a collection, hands
- *  that collection a channel, and persists the list as one named schema blob of a volume so a
- *  reopen finds the same names. Every byte of data belongs to the collection below it, and every
- *  conflict belongs to the registry beside it; what is left is placement, naming and the order the
- *  two are changed in. One claim guards every call that changes the collections, a tree or a blob,
- *  since flushes, compactions and schema saves are serialized by it; commits land through the
- *  ledger's sequencer and take it only to pay for the maintenance they made due. A read takes no
- *  claim: a collection publishes immutable views a reader walks inside its ledger's epochs, the
+ *  that collection a channel, and persists the list in the manifest its volume commits, so a reopen
+ *  finds the same names. Every byte of data belongs to the collection below it, and every conflict
+ *  belongs to the registry beside it; what is left is placement, naming and the order the two are
+ *  changed in. One claim guards every call that changes the collections, a tree or the user data,
+ *  since flushes, compactions and manifest publications are serialized by it; commits land through
+ *  the ledger's sequencer and take it only to pay for the maintenance they made due. A read takes
+ *  no claim: a collection publishes immutable views a reader walks inside its ledger's epochs, the
  *  entries are pinned on the heap, and the list of collections is one more immutable view published
  *  the same way and freed by whoever replaces it, once its readers left.
  *
@@ -29,8 +29,9 @@
 #include <cstdint> // `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm>   // `std::copy`, `std::sort`, `std::binary_search`
+#include <algorithm>   // `std::copy`, `std::sort`, `std::lower_bound`
 #include <array>       // `std::array`
+#include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -45,23 +46,24 @@
 #include "ustore/blobs/nvme_store.hpp"          // `nvme_store_cursor`, `keyed_delta`
 #include "ustore/blobs/nvme_transactions.hpp"   // `transaction_registry`, `transaction_core`, `nvme_store_concept`
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree_run_record_t`, `database_config_t`
-#include "ustore/utilities/nvme_catalog.hpp"    // `schema_copies`, `blob_kind_t`, `blob_name_t`, `blob_name_of`
+#include "ustore/utilities/nvme_manifest.hpp"   // `manifest_t`, `manifest_collection_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_channels.hpp"   // `io_channel_t`, `basic_io_channel_pool`
 #include "ustore/utilities/nvme_mounts.hpp"     // `resources_shared_ptr`
 #include "ustore/utilities/nvme_ring.hpp"       // `portable_alignment_k`
-#include "ustore/utilities/nvme_volume.hpp"     // `basic_volume_router`, `volume_blob_t`, `volume_id_t`
+#include "ustore/utilities/nvme_volume.hpp"     // `medium_extent_t`, `volume_config_t`
 #include "ustore/utilities/ram_buffers.hpp"     // `constrained_allocator`
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_t`, `bytes_span_t`, `save_fields`, `load_fields`
 
 namespace unum::ustore::blobs {
 
 using utilities::basic_io_channel_pool;
-using utilities::basic_volume_router;
-using utilities::blob_name_of;
-using utilities::schema_copies;
-using utilities::schema_copy_of;
-using utilities::schema_stamps_t;
-using utilities::volume_id_t;
+using utilities::manifest_collection_t;
+using utilities::manifest_file_t;
+using utilities::manifest_no_collection_k;
+using utilities::manifest_t;
+using utilities::medium_extent_t;
+using utilities::path_max_bytes_k;
+using utilities::volume_config_t;
 
 #pragma region Database Snapshot
 
@@ -527,88 +529,31 @@ class database_transaction {
 
 #pragma region Database
 
-#pragma region Schema
+#pragma region Manifest Collections
 
-/** The layout the schema blob follows: collections and stamps, then the stamps ingests assigned their runs. */
-inline constexpr std::uint64_t database_schema_version_k = 1;
-
-/** The name copy @p copy of the schema of a database is stored under, on whichever volume placement gave it. */
-[[nodiscard]] inline blob_name_t database_schema_name(std::size_t copy) noexcept {
-    return copy == 0 ? blob_name_of("ustore.database.schema.0") : blob_name_of("ustore.database.schema.1");
-}
-
-/** The name the caller's own bytes are stored under, which the engine never reads. */
-[[nodiscard]] inline blob_name_t database_user_data_name() noexcept { return blob_name_of("ustore.database.user"); }
-
-/** Bytes the longest collection name takes, which a record holds inline rather than pointing at. */
+/** Bytes the longest collection name takes. */
 inline constexpr std::size_t collection_name_max_bytes_k = 64;
 
-/**
- *  @brief One collection as the schema blob names it, which is all a mount needs to open it again.
- *
- *  Every field is stored as it lies, so the image is the object representation and no field of it is
- *  ever read through a pointer the layout did not align.
- */
-struct collection_record_t {
+/** The bounds of the collection @p record describes, as the collection layer takes them. */
+[[nodiscard]] inline collection_config_t config_of(manifest_collection_t const& record) noexcept {
+    collection_config_t config;
+    config.cache_limit = static_cast<std::size_t>(record.cache_limit);
+    config.memory_runs_max_bytes = static_cast<std::size_t>(record.memory_runs_max_bytes);
+    config.memory_runs_max_deltas = static_cast<std::size_t>(record.memory_runs_max_deltas);
+    config.lsm_tree.level_enlarge_factor = static_cast<std::size_t>(record.level_enlarge_factor);
+    config.lsm_tree.lsm_level_0.sorted_run.value_size = static_cast<stored_value_size_t>(record.value_size);
+    config.lsm_tree.lsm_level_0.sorted_run.value_max_size = static_cast<stored_value_size_t>(record.value_max_size);
+    std::memcpy(config.lsm_tree.collection.bytes, record.id.bytes, sizeof(record.id.bytes));
+    return config;
+}
 
-    /** The UUID the schema, every commit and the C ABI address the collection by. */
-    collection_id_t id = collection_invalid_id_k;
-
-    /** How fast the bytes a level admits grow with its number. */
-    std::uint64_t level_enlarge_factor = 0;
-
-    /** Bytes the value cache of the collection holds. */
-    std::uint64_t cache_limit = 0;
-
-    /** Bytes the memory runs of the collection hold before a flush is due. */
-    std::uint64_t memory_runs_max_bytes = 0;
-
-    /** Deltas the memory runs of the collection hold before a flush is due. */
-    std::uint64_t memory_runs_max_deltas = 0;
-
-    /** Runs of this collection in the image's run list, which follow those of the records before it. */
-    std::uint64_t run_count = 0;
-
-    /** Bytes every value takes, zero for a layout whose values differ in width. */
-    std::uint32_t value_size = 0;
-
-    /** Bytes the largest value takes, zero for a fixed-width layout. */
-    std::uint32_t value_max_size = 0;
-
-    /** The volume the collection's runs live on, which a reopen binds it to again. */
-    std::uint16_t volume = 0;
-
-    /** Bytes of @c name_storage the name occupies. */
-    std::uint16_t name_bytes = 0;
-
-    /** The tag of the store a mount opens the collection in, which its creator picked and the database never reads. */
-    std::uint16_t store_tag = 0;
-
-    /** The name a caller reaches the collection by, held inline and never terminated. */
-    std::array<char, collection_name_max_bytes_k> name_storage {};
-
-    /** The name this record carries, as a view into its own bytes. */
-    [[nodiscard]] string_view_t name() const noexcept { return string_view_t {name_storage.data(), name_bytes}; }
-
-    /** The collection this record describes, as the collection layer takes its bounds. */
-    [[nodiscard]] collection_config_t config() const noexcept {
-        collection_config_t config;
-        config.cache_limit = static_cast<std::size_t>(cache_limit);
-        config.memory_runs_max_bytes = static_cast<std::size_t>(memory_runs_max_bytes);
-        config.memory_runs_max_deltas = static_cast<std::size_t>(memory_runs_max_deltas);
-        config.lsm_tree.level_enlarge_factor = static_cast<std::size_t>(level_enlarge_factor);
-        config.lsm_tree.lsm_level_0.sorted_run.value_size = static_cast<stored_value_size_t>(value_size);
-        config.lsm_tree.lsm_level_0.sorted_run.value_max_size = static_cast<stored_value_size_t>(value_max_size);
-        return config;
-    }
-};
-
-#pragma endregion Schema
+#pragma endregion Manifest Collections
 
 #pragma region Database
 
 /**
- *  @brief Named collections of one database, the schema that resolves them and the transactions they share.
+ *  @brief Named collections of one database, the manifest that names them and the
+ *      transactions they share.
  *  @tparam stored_key_type_ The key every collection of this database is addressed by.
  *  @tparam volume_type_ The volume every run of every collection lives on.
  *  @tparam store_tags_type_ Where among @p store_types_ the store a tag names sits, through a
@@ -616,9 +561,9 @@ struct collection_record_t {
  *  @tparam store_types_ The stores a collection may live in, of which a create and a mount take the
  *      one its tag names.
  *
- *  The router and the channels are borrowed and must outlive the database, and so must the budget the
- *  collections charge their memory to. A database is pinned rather than movable, because its registry
- *  and every live transaction name it.
+ *  The volume and the channels are borrowed and must outlive the database, and so must the budget
+ *  the collections charge their memory to. A database is pinned rather than movable, because its
+ *  registry and every live transaction name it.
  */
 template <typename stored_key_type_, typename volume_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, typename store_tags_type_, nvme_store_concept... store_types_>
@@ -635,9 +580,6 @@ class basic_database {
 
     /** The transport those volumes move bytes through. */
     using disk_t = std::remove_reference_t<decltype(std::declval<volume_t&>().disk())>;
-
-    /** The volumes of this database and the placement that spreads collections over them. */
-    using router_t = basic_volume_router<volume_t>;
 
     /** The queue pairs every call that moves bytes borrows one of. */
     using channel_pool_t = basic_io_channel_pool<disk_t, atomic_reference_>;
@@ -666,10 +608,19 @@ class basic_database {
     /** One collection, held by the store its tag names. */
     using any_collection_t = std::variant<store_types_...>;
 
-    /** One entry of the schema: what a collection is called, how it is shaped, and the collection itself. */
+    /** The runs of every collection held by one store, of which the database keeps one pool per
+     *  store, made at that store's first collection. */
+    using any_run_pool_t = std::variant<std::monostate, typename store_types_::run_pool_t...>;
+
+    /** Runs one store's pool may grow to hold, the most a pool indexed by
+     *  @c std::uint16_t admits. */
+    static constexpr std::size_t run_pool_capacity_k = std::numeric_limits<std::uint16_t>::max() - 1;
+
+    /** One collection of the database: what a collection is called, how it is shaped, and
+     *  the collection itself. */
     struct collection_entry_t {
 
-        /** The UUID the schema, every commit and the C ABI address this collection by. */
+        /** The UUID the manifest, every commit and the C ABI address this collection by. */
         collection_id_t id = collection_invalid_id_k;
 
         /** The name a caller reaches this collection by. */
@@ -680,9 +631,6 @@ class basic_database {
 
         /** The bounds this collection was mounted with. */
         collection_config_t config {};
-
-        /** The volume this collection's runs live on. */
-        volume_id_t volume = volume_id_t::unmounted_k;
 
         /** The collection itself, pinned here so a snapshot may name it. */
         any_collection_t held;
@@ -704,38 +652,42 @@ class basic_database {
     ~basic_database() noexcept { [[maybe_unused]] status_t const closed = unmount(); }
 
     /**
-     *  @brief Opens every collection @p router already names, or starts an empty schema.
-     *  @param[in,out] router The volumes every run lands on, borrowed and outliving the database.
+     *  @brief Opens every collection the manifest @p volume read names, or starts
+     *      an empty database.
+     *  @param[in,out] volume The volume every run lands on, borrowed and outliving the database.
      *  @param[in,out] channels The queue pairs every call borrows one of, borrowed and outliving the database.
      *  @param[in] config The delta bounds a transaction takes when its caller names none.
      *  @param[in] compactor What every merge runs on: the calling thread, or a device compactor the caller owns, which
      *      outlives the database.
      */
-    status_t mount(router_t& router, channel_pool_t& channels, database_config_t const& config,
+    status_t mount(volume_t& volume, channel_pool_t& channels, database_config_t const& config,
                    compactor_ref_t compactor = {}) noexcept {
-        if (router_ != nullptr) return {status_code_t::already_exists_k, "This database has already mounted"};
-        router_ = &router;
+        if (volume_ != nullptr) return {status_code_t::already_exists_k, "This database has already mounted"};
+        volume_ = &volume;
         channels_ = &channels;
         config_ = config;
         compactor_ = compactor;
-        status_t const opened = open_schema_();
+        status_t const opened = open_manifest_();
         if (opened.failed()) {
-            // A schema this database could not open stays as it lies, never saved again without what it missed.
+            // A manifest this database could not open stays as it lies, never published again
+            // without what it missed.
             collections_.clear();
-            router_ = nullptr;
+            run_pools_.clear();
+            user_data_bytes_ = 0;
+            volume_ = nullptr;
             channels_ = nullptr;
         }
         return opened;
     }
 
     /**
-     *  @brief Flushes every collection, rewrites the schema and lets every collection go.
+     *  @brief Flushes every collection, publishes the manifest and lets every collection go.
      *
-     *  @note The router and the channels are still needed here, so this runs before the mount underneath
-     *      is torn down; the destructor calls it for a caller that did not.
+     *  @note The volume and the channels are still needed here, so this runs before the mount
+     *      underneath is torn down; the destructor calls it for a caller that did not.
      */
     status_t unmount() noexcept {
-        if (router_ == nullptr) return {};
+        if (volume_ == nullptr) return {};
         status_t first;
         {
             expected<claimed_channel_t> claimed = claim_channel_();
@@ -747,7 +699,7 @@ class basic_database {
                             collections_[index]->held);
                         flushed.failed() && first.succeeded())
                         first = flushed;
-                if (status_t const saved = save_schema_(claimed->channel()); saved.failed() && first.succeeded())
+                if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed() && first.succeeded())
                     first = saved;
             }
             // The entries outlive the publication that stops naming them, which waits out every reader of the
@@ -755,7 +707,9 @@ class basic_database {
             st::vector<entry_pointer_t> released = std::move(collections_);
             [[maybe_unused]] status_t const emptied = publish_collections_();
         }
-        router_ = nullptr;
+        run_pools_.clear();
+        user_data_bytes_ = 0;
+        volume_ = nullptr;
         channels_ = nullptr;
         return first;
     }
@@ -826,8 +780,8 @@ class basic_database {
         return {};
     }
 
-    /** How many times the schema has been saved, whose @c schema_copy_of names the copy a mount reads. */
-    [[nodiscard]] std::uint64_t schema_generation() const noexcept { return schema_.generation(); }
+    /** How many manifests this database has published, the one a mount read included. */
+    [[nodiscard]] std::uint64_t manifest_generation() const noexcept { return volume_->generation(); }
 
     /** How many times the collections have been published, which a memo of a lookup is checked against. */
     [[nodiscard]] std::uint64_t collections_version() const noexcept {
@@ -856,12 +810,16 @@ class basic_database {
      *  @param[in] store_tag The tag of the store the collection lives in,
      *      which @c store_tags_type_ places.
      *  @param[in] config The memory-run bounds, the cache bound and the shape of the tree below.
+     *  @param[in] flushed_with A collection whose memory runs the manifest naming the new one
+     *      names too, as the caller wrote its own record of the collection there; an invalid
+     *      ID flushes nothing.
      *
      *  @note @p store_tag names a store whose value layout fits @c config's value size, so a width of eight bytes is
      *      stored inside the key slots and a width of none is a collection of values that differ.
      */
     status_t create_collection(collection_id_t collection_id, string_view_t name, std::uint16_t store_tag,
-                               collection_config_t const& config) noexcept {
+                               collection_config_t const& config,
+                               collection_id_t flushed_with = collection_invalid_id_k) noexcept {
         if (name.empty()) return status_t {status_code_t::invalid_argument_k, "A collection is named by a byte"};
         if (name.size() > collection_name_max_bytes_k)
             return status_t {status_code_t::invalid_argument_k, "A collection name is shorter than that"};
@@ -875,9 +833,6 @@ class basic_database {
             entry_with_id_in_(collection_entries_(), collection_id) != nullptr)
             return status_t {status_code_t::already_exists_k, "The database already names that collection"};
 
-        auto [placed, optimal_volume_status] = router_->optimal_volume(1);
-        if (optimal_volume_status.failed()) return optimal_volume_status;
-
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
         if (!entry) return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
         entry->id = collection_id;
@@ -885,12 +840,17 @@ class basic_database {
             return status_t {status_code_t::out_of_memory_k, "No room for a collection's name"};
         entry->store_tag = store_tag;
         entry->config = config;
-        entry->volume = placed;
+        std::memcpy(entry->config.lsm_tree.collection.bytes, collection_id.uuid.bytes,
+                    sizeof(collection_id.uuid.bytes));
         if (status_t const mounted = mount_collection_(*entry); mounted.failed()) return mounted;
 
         if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
-        if (status_t const saved = save_schema_(claimed->channel()); saved.failed()) {
+        if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed()) {
+            collections_.erase(collections_.size() - 1);
+            return flushed;
+        }
+        if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) {
             collections_.erase(collections_.size() - 1);
             return saved;
         }
@@ -901,17 +861,23 @@ class basic_database {
         return {};
     }
 
-    /** Returns every run of @p id to its volume and forgets the name, which destroys the data. */
-    status_t drop_collection(any_collection_id_t const& id) noexcept {
+    /** Returns every run of @p id to its volume and forgets the name, which destroys the
+     *  data; @p flushed_with names a collection whose memory runs the same manifest names, as
+     *  the create does. */
+    status_t drop_collection(any_collection_id_t const& id,
+                             collection_id_t flushed_with = collection_invalid_id_k) noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         std::size_t const position = position_at_(id);
         if (position == collections_.size())
             return {status_code_t::not_found_k, "The database names no such collection"};
+        if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed())
+            return flushed;
 
-        // The schema stops naming the runs before a single one of them is handed back. The publication takes the
-        // leader word, which keeps a staged or combining commit from publishing into the collection meanwhile, and a
-        // request still pending finds it gone; it returns once no reader is left in a view of the collection.
+        // The manifest stops naming the runs before a single one of them is handed back. The
+        // publication takes the leader word, which keeps a staged or combining commit from
+        // publishing into the collection meanwhile, and a request still pending finds it gone; it
+        // returns once no reader is left in a view of the collection.
         entry_pointer_t doomed = std::move(collections_[position]);
         collections_.erase(position);
         status_t const publication = publish_collections_();
@@ -919,12 +885,13 @@ class basic_database {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             return publication;
         }
-        if (status_t const saved = save_schema_(claimed->channel()); saved.failed()) {
+        if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             [[maybe_unused]] status_t const restored = publish_collections_();
             return saved;
         }
-        return std::visit([&](auto& held) noexcept { return held.destroy(claimed->channel()); }, doomed->held);
+        std::visit([](auto& held) noexcept { held.destroy(); }, doomed->held);
+        return {};
     }
 
 #pragma endregion Catalog
@@ -1280,8 +1247,9 @@ class basic_database {
     /**
      *  @brief Publishes every run of @p ingest as one commit of its own above every level holding their keys, and
      *      answers its stamp.
-     *  @param[in] durability Flushed for an ingest durable on return, flushing every collection and saving the schema,
-     *      or buffered for one the next save names and a crash before it drops whole.
+     *  @param[in] durability Flushed for an ingest durable on return, flushing every collection and
+     *      publishing the manifest, or buffered for one the next manifest names and a crash before
+     *      it drops whole.
      *  @return The stamp, or the status that stopped it with every run dropped, either way with the claim given back.
      */
     expected<transaction_stamp_t> publish_ingest(ingest_t& ingest, ustore_durability_t durability) noexcept {
@@ -1307,11 +1275,9 @@ class basic_database {
     void drop_ingest(ingest_t& ingest) noexcept {
         if (std::visit([](auto const& ingested) noexcept { return ingested.runs.empty(); }, ingest.runs_)) return;
         if (!ingest.claim_.holding()) ingest.claim_ = claim_guard_t {*this};
-        auto [guard, acquire_status] = channels_->acquire();
-        if (acquire_status.failed()) return;
         [[maybe_unused]] status_t const dropped = with_ingest_<status_t>(
             ingest, [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
-                held.drop_ingest(guard.channel(), ingested);
+                held.drop_ingest(ingested);
                 return status_t {};
             });
     }
@@ -1332,9 +1298,9 @@ class basic_database {
         auto [writing, acquire_status] = channels_->acquire();
         if (acquire_status.failed()) return acquire_status;
 
-        schema_write_t recording {this, &reading->channel()};
+        manifest_write_t recording {this, &reading->channel()};
         lsm_tree_publication_hook_t published;
-        published.notify = &record_schema_;
+        published.notify = &record_manifest_;
         published.context = &recording;
 
         status_t first;
@@ -1518,49 +1484,192 @@ class basic_database {
      *  included. */
     [[nodiscard]] channel_pool_t& channels() noexcept { return *channels_; }
 
+    /** Flushes @p collection_id's memory runs under the claim, answering whether that gave
+     *  memory-run records back, which a commit refused a record waits on before it resubmits. */
+    [[nodiscard]] bool flushed_records(collection_id_t collection_id) noexcept {
+        std::size_t const held = memory_shape(any_collection_id_t {collection_id}).runs;
+        {
+            claim_guard_t const claimed {*this};
+            std::size_t const position = position_at_(any_collection_id_t {collection_id});
+            if (position == collections_.size()) return false;
+            if (std::visit([&](auto& collection) noexcept { return flush_and_compact_(collection); },
+                           collections_[position]->held)
+                    .failed())
+                return false;
+        }
+        return memory_shape(any_collection_id_t {collection_id}).runs < held;
+    }
+
 #pragma endregion Write Path
 
 #pragma region User Data
 
-    /** Bytes the caller's own blob takes, which is zero when it has saved none. */
+    /** Bytes the caller's own data takes, which is zero when it has saved none. */
     [[nodiscard]] std::uint64_t user_data_size_bytes() noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return 0;
-        named_blobs_t blobs {this, &claimed->channel()};
-        return schema_.user_data_size_bytes(blobs);
+        claim_guard_t const claim {*this};
+        return user_data_bytes_;
     }
 
-    /** Replaces the caller's own blob with @p bytes, which the engine never reads. */
+    /** Replaces the caller's own data with @p bytes, which the engine never reads, as a manifest
+     *  entry of no collection; none clears it. */
     status_t save_user_data(bytes_view_t bytes) noexcept {
+        if (bytes.empty()) return clear_user_data();
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        named_blobs_t blobs {this, &claimed->channel()};
-        return schema_.save_user_data(blobs, bytes);
+        uuid_t const run = uuid_generator();
+        auto [written, allocate_status] = volume_->allocate(run, bytes.size());
+        if (allocate_status.failed()) return allocate_status;
+        if (status_t const filled = write_extent<disk_t, waiter_type_>(volume_->disk(), claimed->channel(), written,
+                                                                       bytes);
+            filled.failed()) {
+            volume_->deallocate(written);
+            return filled;
+        }
+        return replace_user_data_(claimed->channel(), run, written, bytes.size());
     }
 
-    /** Reads the caller's own blob into @p into, which must hold @c user_data_size_bytes of it. */
+    /** Reads the caller's own data into @p into, which must hold @c user_data_size_bytes of it. */
     status_t load_user_data(bytes_span_t into) noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        named_blobs_t blobs {this, &claimed->channel()};
-        return schema_.load_user_data(blobs, into);
+        if (user_data_bytes_ == 0) return {status_code_t::not_found_k, "The database holds no user data"};
+        if (into.size() < user_data_bytes_)
+            return {status_code_t::invalid_argument_k, "A buffer shorter than the data"};
+        return read_extent<disk_t>(volume_->disk(), claimed->channel(), user_data_,
+                                   into.first(static_cast<std::size_t>(user_data_bytes_)));
     }
 
-    /** Forgets the caller's own blob and returns its bytes to the volume that held it. */
+    /** Forgets the caller's own data and returns its bytes to the volume once the manifest
+     *  stops naming it. */
     status_t clear_user_data() noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        named_blobs_t blobs {this, &claimed->channel()};
-        return schema_.clear_user_data(blobs);
+        if (user_data_bytes_ == 0) return {status_code_t::not_found_k, "The database holds no user data"};
+        return replace_user_data_(claimed->channel(), uuid_t {}, medium_extent_t {}, 0);
     }
 
 #pragma endregion User Data
+
+#pragma region Archive
+
+    /** What one save placed in its target, run by run. */
+    struct archive_report_t {
+
+        /** Runs the target already held at the same length, kept as they lie. */
+        std::size_t kept = 0;
+
+        /** Runs hard-linked or copied whole as files, from one filesystem to another. */
+        std::size_t linked = 0;
+
+        /** Runs read through a channel into fresh files or slots of the target. */
+        std::size_t written = 0;
+    };
+
+    /**
+     *  @brief Saves every collection as of @p stamp into the database @p target names, a manifest
+     *      path or a raw address, writing the target's manifest last with @p stamp as its durable
+     *      stamp, so a mount of it drops every version above.
+     *  @param[in] target The target's data directories, its first holding the manifest, all
+     *      of one kind.
+     *  @param[in] stamp A stamp a pinned snapshot holds, whose versions every merge keeps.
+     *  @param[in] progress Called as <tt>progress(placed_bytes, total_bytes)</tt> after every run;
+     *      @c false cancels the save, which gives back every run it placed and publishes nothing.
+     *  @return What the save placed, or @c cancelled_k, or the status that stopped it, with the
+     *      target as it was.
+     *
+     *  Runs the target holds already under the same ID and length are kept, so a second save of a
+     *  database writes only the runs written since; runs the target's previous manifest named and
+     *  this one does not are given back after it.
+     */
+    template <typename progress_type_>
+    expected<archive_report_t> save(volume_config_t const& target, transaction_stamp_t stamp,
+                                    progress_type_&& progress) noexcept {
+        expected<claimed_channel_t> claimed = claim_channel_();
+        if (!claimed) return claimed.status();
+        io_channel_t& channel = claimed->channel();
+        auto [writing, acquire_status] = channels_->acquire();
+        if (acquire_status.failed()) return acquire_status;
+        // Memory runs reach the runs first, so the files below hold every version at or
+        // below the stamp.
+        if (status_t const flushed = flush_holding_(channel); flushed.failed()) return flushed;
+        st::vector<placed_file_t> sources;
+        if (status_t const gathered = gather_files_(sources); gathered.failed()) return gathered;
+
+        volume_config_t config = target;
+        config.runs_capacity = volume_->runs_capacity();
+        if (config.database.empty()) config.database = volume_->manifest().database.view();
+        auto [into, mount_status] = volume_t::mount(
+            volume_->disk(), channel, config,
+            constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint});
+        if (mount_status.failed()) return mount_status;
+        manifest_t const& held = into.manifest();
+        st::vector<manifest_file_t const*> held_by_run;
+        if (held_by_run.reserve(held.files.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room to index the target's runs"};
+        for (manifest_file_t const& file : held.files) [[maybe_unused]]
+            st::status_t const indexed = held_by_run.push_back(st::assume_reserved, &file);
+        std::sort(
+            held_by_run.begin(), held_by_run.end(),
+            [](manifest_file_t const* left, manifest_file_t const* right) noexcept { return left->run < right->run; });
+
+        manifest_t manifest;
+        if (status_t const laid = lay_out_collections_(held, manifest); laid.failed()) return laid;
+        manifest.generation = into.generation() + 1;
+        manifest.durable_stamp = stamp;
+        manifest.placement = into.placement();
+        st::vector<medium_extent_t> placed;
+        if (manifest.files.reserve(sources.size()) != st::status_t::success_k ||
+            placed.reserve(sources.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room to lay the target's manifest out"};
+
+        std::uint64_t total_bytes = 0, placed_bytes = 0;
+        for (placed_file_t const& source : sources) total_bytes += source.extent.extent.length;
+        archive_report_t report;
+        status_t failure;
+        for (placed_file_t const& source : sources) {
+            auto [extent, place_status] = place_run_(into, channel, writing.channel(), source, held_by_run, report,
+                                                     placed);
+            if (place_status.failed()) {
+                failure = place_status;
+                break;
+            }
+            manifest_file_t file = source.file;
+            file.offset = extent.extent.offset;
+            file.medium = extent.data_directory;
+            [[maybe_unused]] st::status_t const named = manifest.files.push_back(st::assume_reserved, std::move(file));
+            placed_bytes += source.extent.extent.length;
+            if (!progress(placed_bytes, total_bytes)) {
+                failure = {status_code_t::cancelled_k, "The progress callback cancelled the save"};
+                break;
+            }
+        }
+        st::vector<char> json;
+        if (failure.succeeded())
+            failure = manifest.print(constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint},
+                                     json);
+        if (failure.succeeded()) failure = into.publish_manifest(channel, std::span<char const> {json});
+        if (failure.failed()) {
+            for (medium_extent_t const& extent : placed) into.deallocate(extent);
+            return failure;
+        }
+
+        // The target gives back every run the previous manifest named and this one does not.
+        for (manifest_file_t const& old : held.files) {
+            bool kept = false;
+            for (manifest_file_t const& file : manifest.files) kept = kept || file.run == old.run;
+            if (kept) continue;
+            if (auto [extent, open_status] = into.open(old); open_status.succeeded()) into.deallocate(extent);
+        }
+        return report;
+    }
+
+#pragma endregion Archive
 
   private:
 
 #pragma region Private Types
 
-    /** One schema entry, heap-pinned so a snapshot and a live transaction may name it. */
+    /** One collection entry, heap-pinned so a snapshot and a live transaction may name it. */
     using entry_pointer_t = std::unique_ptr<collection_entry_t>;
 
     /**
@@ -1583,41 +1692,11 @@ class basic_database {
     using reader_t = typename epoch_domain<atomic_reference_, waiter_type_>::reader_t;
 
     /** The database's one claim, held for the life of the guard: it orders whatever rewrites the
-     *  schema, a tree or a blob, no read takes it, and a commit takes it once it landed or returns
-     *  at once when another caller has it. */
+     *  manifest, a tree or the user data, no read takes it, and a commit takes it once it landed or
+     *  returns at once when another caller has it. */
     using claim_guard_t = typename maintenance_claim<atomic_reference_, waiter_type_>::template guard<basic_database>;
 
     friend claim_guard_t;
-
-    /** The named blobs of this database, on whichever volume placement gave each, read and written
-     *  on one channel. */
-    struct named_blobs_t {
-
-        /** The database whose router places the blobs. */
-        basic_database* store = nullptr;
-
-        /** The channel every read and write is queued and flushed on, held by
-         *  the calling thread. */
-        io_channel_t* channel = nullptr;
-
-        /** Bytes the blob @p name holds, or @c not_found_k for a name no volume holds. */
-        expected<std::uint64_t> length(blob_name_t name) noexcept {
-            auto [found, find_status] = store->router_->find(name);
-            if (find_status.failed()) return find_status;
-            return found.length;
-        }
-
-        /** Replaces the blob @p name with @p bytes of @p kind. */
-        status_t write(blob_name_t name, blob_kind_t kind, bytes_view_t bytes) noexcept {
-            return store->write_blob_(*channel, name, kind, bytes);
-        }
-
-        /** Reads the whole blob @p name into @p into. */
-        status_t read(blob_name_t name, bytes_span_t into) noexcept { return store->read_blob_(*channel, name, into); }
-
-        /** Forgets the blob @p name and returns its bytes to the volume that held it. */
-        status_t drop(blob_name_t name) noexcept { return store->router_->drop(*channel, name); }
-    };
 
     /** The claim and the channel one call of this database runs under, released in that order. */
     class claimed_channel_t {
@@ -1654,7 +1733,8 @@ class basic_database {
         /** The database's claim, held from @c begin_ingest until this is destroyed. */
         claim_guard_t claim_;
 
-        /** Where the collection sits in the schema, which no create or drop moves while the claim is held. */
+        /** Where the collection sits among the collections, which no create or drop moves while the
+         *  claim is held. */
         std::size_t position_ = 0;
 
         /** The rows laid out and the runs written so far, of the store the collection is held in. */
@@ -1774,12 +1854,18 @@ class basic_database {
             head.id = found->id;
         }
         if (status_t const sealed = seal_into_(head.id, head.sealed, sealer); sealed.failed()) return sealed;
-        if (!head.sealed.run) return {};
+        if (head.sealed.empty()) return {};
         commit_request_t request;
         request.context = &head;
         request.prepare = &prepare_head_;
         request.publish = &publish_head_;
-        if (status_t const committed = ledger_.submit(request).status(); committed.failed()) return committed;
+        for (;;) {
+            status_t const committed = ledger_.submit(request).status();
+            if (committed.succeeded()) break;
+            // A commit refused a memory-run record resubmits only once a flush gave records back,
+            // so it never spins.
+            if (committed != status_code_t::capacity_exhausted_k || !flushed_records(head.id)) return committed;
+        }
         // The commit has landed, so a failure to maintain is met again by the next commit making room.
         [[maybe_unused]] status_t const maintained = maintain(head.id);
         return {};
@@ -1818,7 +1904,7 @@ class basic_database {
      */
     template <typename sealed_type_>
     status_t make_room_(collection_id_t collection_id, sealed_type_ const& sealed) noexcept {
-        if (!sealed.run) return {};
+        if (sealed.empty()) return {};
         for (;;) {
             {
                 reader_t const inside = ledger_.epochs().enter();
@@ -1850,20 +1936,20 @@ class basic_database {
         }
     }
 
-    /** Flushes @p collection's memory runs, saves the schema naming the run, and compacts the tree for as long as the
-     *  flush left a level over its bounds, holding the claim. */
+    /** Flushes @p collection's memory runs, publishes the manifest naming the run, and compacts the
+     *  tree for as long as the flush left a level over its bounds, holding the claim. */
     template <typename collection_type_>
     status_t flush_and_compact_(collection_type_& collection) noexcept {
         auto [reading, reading_status] = channels_->acquire();
         if (reading_status.failed()) return reading_status;
         if (status_t const flushed = collection.flush(reading.channel()); flushed.failed()) return flushed;
-        if (status_t const saved = save_schema_(reading.channel()); saved.failed()) return saved;
+        if (status_t const saved = publish_manifest_(reading.channel()); saved.failed()) return saved;
         if (!collection.needs_compaction()) return {};
         auto [writing, writing_status] = channels_->acquire();
         if (writing_status.failed()) return writing_status;
-        schema_write_t recording {this, &reading.channel()};
+        manifest_write_t recording {this, &reading.channel()};
         lsm_tree_publication_hook_t published;
-        published.notify = &record_schema_;
+        published.notify = &record_manifest_;
         published.context = &recording;
         while (collection.needs_compaction()) {
             auto [outcome, compact_status] = collection.compact(reading.channel(), writing.channel(), compactor_,
@@ -1895,7 +1981,8 @@ class basic_database {
         return first;
     }
 
-    /** Whether any collection the schema names is due for a merge or a flush, read from the published views. */
+    /** Whether any collection the database names is due for a merge or a flush, read from
+     *  the published views. */
     [[nodiscard]] bool maintenance_due_() noexcept {
         reader_t const inside = ledger_.epochs().enter();
         for (collection_entry_t const* entry : collection_entries_())
@@ -1905,24 +1992,27 @@ class basic_database {
     }
 
     /**
-     *  @brief Hands the claim back, then looks once more at every collection and, if one is due and the claim is
-     *      still free, takes it back to maintain them, so a commit that found the claim held left its maintenance to
-     *      this caller.
+     *  @brief Hands the claim back, then looks again at every collection after each release and, if
+     *      one is due and the claim is still free, takes it back to maintain them, so a commit that
+     *      found the claim held left its maintenance to this caller.
      *
      *  A caller that finds the claim taken again, or a caller parked on it, stops, since
      *  that holder looks once more after it lets go, and a failed maintenance is met again
      *  by the next commit.
      */
     void release_claim_() noexcept {
-        claim_.release();
-        // One look covers a commit that found the claim held; work due after it waits for its collection's next commit.
-        if (!maintenance_due_() || claim_.anyone_parked() || !claim_.take_if_free()) return;
-        [[maybe_unused]] status_t const maintained = maintain_due_();
+        // Every release looks again, so a commit that found the claim held during a maintenance is
+        // met after it.
+        for (;;) {
+            claim_.release();
+            if (!maintenance_due_() || claim_.anyone_parked() || !claim_.take_if_free()) return;
+            if (maintain_due_().failed()) break;
+        }
         claim_.release();
     }
 
-    /** Flushes every collection and saves the schema naming the runs, holding the claim; answers the first failure,
-     *  after trying every collection. */
+    /** Flushes every collection and publishes the manifest naming the runs, holding the claim;
+     *  answers the first failure, after trying every collection. */
     status_t flush_holding_(io_channel_t& channel) noexcept {
         status_t first;
         for (std::size_t index = 0; index != collections_.size(); ++index)
@@ -1930,8 +2020,9 @@ class basic_database {
                                                     collections_[index]->held);
                 flushed.failed() && first.succeeded())
                 first = flushed;
-        // Every run the flushes wrote is sealed by now, so the schema may name them.
-        if (status_t const saved = save_schema_(channel); saved.failed() && first.succeeded()) first = saved;
+        // Every run the flushes wrote is drained by now, and the publication flushes it
+        // before naming it.
+        if (status_t const saved = publish_manifest_(channel); saved.failed() && first.succeeded()) first = saved;
         return first;
     }
 
@@ -1943,7 +2034,7 @@ class basic_database {
         return claimed_channel_t {std::move(claim), std::move(guard)};
     }
 
-    /** Where @p id sits in the schema, or the schema's size when it names nothing. */
+    /** Where @p id sits among the collections, or their count when it names nothing. */
     [[nodiscard]] std::size_t position_at_(any_collection_id_t const& id) const noexcept {
         if (collection_id_t const* const identified = std::get_if<collection_id_t>(&id)) {
             for (std::size_t index = 0; index != collections_.size(); ++index)
@@ -1978,8 +2069,20 @@ class basic_database {
         auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
             if (picked != index_) return;
             using store_t = std::variant_alternative_t<index_, any_collection_t>;
-            auto [store, mount_status] = store_t::mount(router_->volume(entry.volume), entry.config,
-                                                        resources_->memory_constraint, ledger_);
+            any_run_pool_t& pool = run_pools_[index_];
+            if (std::holds_alternative<std::monostate>(pool)) {
+                std::size_t const capacity = volume_->runs_capacity() < run_pool_capacity_k ? volume_->runs_capacity()
+                                                                                            : run_pool_capacity_k;
+                // The records grow in chunks that never move, from one record up to the capacity.
+                auto [made, make_status] = store_t::run_pool_t::make(1, capacity, resources_->memory_constraint);
+                if (make_status.failed()) {
+                    mounted = make_status;
+                    return;
+                }
+                pool.template emplace<index_ + 1>(std::move(made));
+            }
+            auto [store, mount_status] = store_t::mount(*volume_, entry.config, resources_->memory_constraint, ledger_,
+                                                        std::get<index_ + 1>(pool));
             mounted = mount_status;
             if (mount_status.succeeded()) entry.held.template emplace<index_>(std::move(store));
         };
@@ -1989,163 +2092,267 @@ class basic_database {
         return mounted;
     }
 
-    /**
-     *  @brief Replaces the blob @p name with @p bytes, sealing it only once they are durable.
-     *  @param[in,out] channel The channel the bytes are queued and flushed on, held by the calling thread.
-     *  @param[in] name The bytes the blob is named by, which no other blob of this database holds.
-     *  @param[in] kind What the blob is, which is how a later mount enumerates it.
-     *  @param[in] bytes The whole image, which must fit in one block of @p channel.
-     */
-    status_t write_blob_(io_channel_t& channel, blob_name_t name, blob_kind_t kind,
-                         std::span<byte_t const> bytes) noexcept {
-        if (bytes.empty()) return {status_code_t::invalid_argument_k, "A named blob carries at least one byte"};
-        std::uint64_t const written = round_up_to_multiple(bytes.size(), portable_alignment_k);
-        if (written > channel.requests().buffer_bytes())
-            return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a channel"};
-
-        [[maybe_unused]] status_t const forgotten = router_->drop(channel, name);
-        auto [reserved, create_status] = router_->create(name, kind, bytes.size());
-        if (create_status.failed()) return create_status;
-        if (reserved.extent.length < written)
-            return {status_code_t::capacity_exhausted_k, "A volume reserved less than one page for that blob"};
-
-        volume_t& volume = router_->volume(reserved.volume);
-        basic_write_pipeline<disk_t, waiter_type_> writer {volume.disk(), channel, reserved.medium};
-        auto [block, acquire_buffer_status] = writer.acquire_buffer();
-        if (acquire_buffer_status.failed()) return acquire_buffer_status;
-        std::span<byte_t> const room = block.bytes();
-        std::memset(room.data(), 0, static_cast<std::size_t>(written));
-        std::memcpy(room.data(), bytes.data(), bytes.size());
-        if (status_t const queued = writer.enqueue_write(std::move(block), reserved.slice(0, written)); queued.failed())
-            return queued;
-        if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
-        return volume.seal(channel, reserved);
+    /** Writes the memory runs of @p collection_id out as runs without publishing a manifest, so
+     *  the publication that follows names them together with the change that wrote them; an
+     *  invalid ID flushes nothing. */
+    status_t flush_into_publication_(io_channel_t& channel, collection_id_t collection_id) noexcept {
+        if (collection_id == collection_invalid_id_k) return {};
+        std::size_t const position = position_at_(any_collection_id_t {collection_id});
+        if (position == collections_.size())
+            return {status_code_t::not_found_k, "The database names no such collection"};
+        return std::visit([&](auto& held) noexcept { return held.flush(channel); }, collections_[position]->held);
     }
 
-    /** Reads the whole blob @p name into @p into, which must hold its content length. */
-    status_t read_blob_(io_channel_t& channel, blob_name_t name, std::span<byte_t> into) const noexcept {
-        auto [found, find_status] = router_->find(name);
-        if (find_status.failed()) return find_status;
-        if (into.size() < found.length) return {status_code_t::invalid_argument_k, "A buffer shorter than the blob"};
-        std::uint64_t const read = round_up_to_multiple(found.length, portable_alignment_k);
-        if (read > channel.requests().buffer_bytes())
-            return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a channel"};
+    /** Reserves room for one run pool per store, each made at its store's first collection
+     *  and never moved. */
+    status_t make_run_pools_() noexcept {
+        run_pools_.clear();
+        if (run_pools_.resize(sizeof...(store_types_)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room for the run pools"};
+        return {};
+    }
 
-        volume_t& volume = router_->volume(found.volume);
-        basic_read_pipeline<disk_t> reader {volume.disk(), channel, found.medium};
-        if (status_t const offered = reader.enqueue_read(found.slice(0, read), 0); offered.failed()) return offered;
-        if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
+    /** Publishes @p written of @p bytes as the caller's own data, and gives the data it replaces
+     *  back once the manifest naming the new one is durable; a refused publication keeps the old
+     *  data and drops the new. */
+    status_t replace_user_data_(io_channel_t& channel, uuid_t const& run, medium_extent_t const& written,
+                                std::uint64_t bytes) noexcept {
+        uuid_t const replaced_run = std::exchange(user_data_run_, run);
+        medium_extent_t const replaced = std::exchange(user_data_, written);
+        std::uint64_t const replaced_bytes = std::exchange(user_data_bytes_, bytes);
+        if (status_t const published = publish_manifest_(channel); published.failed()) {
+            user_data_run_ = replaced_run;
+            user_data_ = replaced;
+            user_data_bytes_ = replaced_bytes;
+            if (bytes != 0) volume_->deallocate(written);
+            return published;
+        }
+        if (replaced_bytes != 0) volume_->deallocate(replaced);
+        return {};
+    }
+
+    /** Prints the manifest naming every collection, its runs and the user data, and publishes it
+     *  through the volume, which flushes every run written since the last one before it commits. */
+    status_t publish_manifest_(io_channel_t& channel) noexcept {
+        st::vector<char> json;
+        if (status_t const printed = print_manifest_(ledger_.durable_stamp(), json); printed.failed()) return printed;
+        return volume_->publish_manifest(channel, std::span<char const> {json});
+    }
+
+    /** One file a manifest names and where it lies on this database's volume. */
+    struct placed_file_t {
+        manifest_file_t file;
+        medium_extent_t extent;
+    };
+
+    /**
+     *  @brief Places the run @p source names in @p into: keeps one the target holds at the same
+     *      length, links its file from one filesystem to another, or reads it through @p channel
+     *      into a fresh file or slot.
+     *  @param[in,out] placed Every extent this save placed, which a cancelled or failed
+     *      save gives back.
+     */
+    expected<medium_extent_t> place_run_(volume_t& into, io_channel_t& reading, io_channel_t& writing,
+                                         placed_file_t const& source,
+                                         st::vector<manifest_file_t const*> const& held_by_run,
+                                         archive_report_t& report, st::vector<medium_extent_t>& placed) noexcept {
+        manifest_file_t const* const* const found = std::lower_bound(
+            held_by_run.begin(), held_by_run.end(), source.file.run,
+            [](manifest_file_t const* file, uuid_t const& run) noexcept { return file->run < run; });
+        if (found != held_by_run.end() && (*found)->run == source.file.run && (*found)->bytes == source.file.bytes) {
+            ++report.kept;
+            return into.open(**found);
+        }
+        char from[path_max_bytes_k], to[path_max_bytes_k];
+        if (volume_->file_path(source.extent.data_directory, source.file.run, from).succeeded() &&
+            into.file_path(0, source.file.run, to).succeeded()) {
+            auto [landing, landing_status] = utilities::link_or_copy_file(from, to);
+            if (landing_status.failed()) return landing_status;
+            manifest_file_t linked = source.file;
+            linked.medium = 0;
+            auto [extent, open_status] = into.open(linked);
+            if (open_status.failed()) return open_status;
+            [[maybe_unused]] st::status_t const tracked = placed.push_back(st::assume_reserved,
+                                                                           medium_extent_t {extent});
+            ++report.linked;
+            return extent;
+        }
+        auto [extent, allocate_status] = into.allocate(source.file.run, source.extent.extent.length);
+        if (allocate_status.failed()) return allocate_status;
+        [[maybe_unused]] st::status_t const tracked = placed.push_back(st::assume_reserved, medium_extent_t {extent});
+        if (status_t const copied = copy_extent_(reading, writing, source.extent, extent); copied.failed())
+            return copied;
+        ++report.written;
+        return extent;
+    }
+
+    /** Reads @p from on @p reading into @p into on @p writing, a block per request, each pipeline
+     *  at its channel's full depth; two channels, since a pipeline polling a shared queue pair
+     *  would reap the other's completions. */
+    status_t copy_extent_(io_channel_t& reading, io_channel_t& writing, medium_extent_t const& from,
+                          medium_extent_t const& into) noexcept {
+        disk_t& disk = volume_->disk();
+        basic_read_pipeline<disk_t> reader {disk, reading, from.medium};
+        basic_write_pipeline<disk_t, waiter_type_> writer {disk, writing, into.medium};
+        std::uint64_t const reading_bytes = reading.requests().buffer_bytes();
+        std::uint64_t const writing_bytes = writing.requests().buffer_bytes();
+        std::uint64_t const block_bytes = round_down_to_multiple<std::uint64_t>(
+            reading_bytes < writing_bytes ? reading_bytes : writing_bytes, portable_alignment_k);
+        if (block_bytes == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
+        std::uint64_t const blocks = divide_round_up(from.extent.length, block_bytes);
+
         status_t carried;
-        auto sink = [&](completed_buffer_t const& completed) noexcept {
-            if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
+        auto sink = [&](utilities::completed_buffer_t const& completed) noexcept {
+            if (carried.failed()) return;
+            if (status_t const whole = utilities::require_completed_in_full(completed); whole.failed()) {
                 carried = whole;
                 return;
             }
-            std::memcpy(into.data(), completed.bytes.data(), static_cast<std::size_t>(found.length));
+            auto [block, acquire_status] = writer.acquire_buffer_or_poll();
+            if (acquire_status.failed()) {
+                carried = acquire_status;
+                return;
+            }
+            std::memcpy(block.bytes().data(), completed.bytes.data(), completed.bytes.size());
+            std::uint64_t const offset = std::uint64_t {completed.tag} * block_bytes;
+            if (status_t const queued = writer.enqueue_write(std::move(block),
+                                                             into.slice(offset, completed.bytes.size()));
+                queued.failed())
+                carried = queued;
+            else if (status_t const submitted = writer.submit(); submitted.failed()) carried = submitted;
         };
+        for (std::uint64_t next = 0; next != blocks && carried.succeeded();) {
+            while (next != blocks && reader.can_enqueue()) {
+                std::uint64_t const offset = next * block_bytes;
+                std::uint64_t const chunk = from.extent.length - offset < block_bytes ? from.extent.length - offset
+                                                                                      : block_bytes;
+                if (status_t const queued = reader.enqueue_read(from.slice(offset, chunk),
+                                                                static_cast<request_tag_t>(next));
+                    queued.failed())
+                    return queued;
+                ++next;
+            }
+            if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
+            if (status_t const polled = reader.poll_one_completion(sink); polled.failed()) return polled;
+        }
         if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
-        return carried;
+        if (carried.failed()) return carried;
+        return writer.poll_all_completions();
     }
 
-    /** Writes the schema out over its older copy, which every change to it does. */
-    status_t save_schema_(io_channel_t& channel) noexcept {
-        named_blobs_t blobs {this, &channel};
-        return schema_.save(blobs, ledger_.durable_stamp(),
-                            [&](schema_stamps_t const& stamps, st::vector<byte_t>& image) noexcept {
-                                return lay_out_schema_(stamps, image);
-                            });
+    /** Lays the manifest out as JSON into @p json, promising every commit at or
+     *  below @p durable_stamp. */
+    status_t print_manifest_(std::uint64_t durable_stamp, st::vector<char>& json) noexcept {
+        manifest_t manifest;
+        if (status_t const laid = lay_out_collections_(volume_->manifest(), manifest); laid.failed()) return laid;
+        manifest.generation = volume_->generation() + 1;
+        manifest.durable_stamp = durable_stamp;
+        manifest.placement = volume_->placement();
+        st::vector<placed_file_t> placed;
+        if (status_t const gathered = gather_files_(placed); gathered.failed()) return gathered;
+        if (manifest.files.reserve(placed.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+        for (placed_file_t const& entry : placed) [[maybe_unused]]
+            st::status_t const named = manifest.files.push_back(st::assume_reserved, manifest_file_t {entry.file});
+        return manifest.print(constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint}, json);
     }
 
-    /** Lays every collection, its runs and the stamps ingests assigned them out into @p image
-     *  under @p stamps. */
-    status_t lay_out_schema_(schema_stamps_t const& stamps, st::vector<byte_t>& image) noexcept {
-        st::vector<collection_record_t> records;
-        st::vector<lsm_tree_run_record_t> runs;
-        st::vector<lsm_tree_run_stamp_t> ingested;
-        if (records.reserve(collections_.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
-        for (std::size_t index = 0; index != collections_.size(); ++index) {
-            collection_entry_t const& entry = *collections_[index];
-            collection_record_t record;
-            record.id = entry.id;
-            std::size_t const named_before = runs.size();
-            if (status_t const named = std::visit(
-                    [&](auto const& held) noexcept {
-                        status_t const listed = record_lsm_tree_runs(held.tree(), runs);
-                        return listed.failed() ? listed : record_lsm_tree_run_stamps(held.tree(), ingested);
-                    },
-                    entry.held);
-                named.failed())
-                return named;
-            record.run_count = runs.size() - named_before;
-            if (entry.name.size() > collection_name_max_bytes_k)
-                return {status_code_t::capacity_exhausted_k, "A collection name outgrew the schema's record"};
-            std::memcpy(record.name_storage.data(), entry.name.data(), entry.name.size());
-            record.name_bytes = static_cast<std::uint16_t>(entry.name.size());
-            record.volume = static_cast<std::uint16_t>(entry.volume);
-            record.store_tag = entry.store_tag;
+    /** Names @p manifest after @p identity and lists every collection of this database in it. */
+    status_t lay_out_collections_(manifest_t const& identity, manifest_t& manifest) noexcept {
+        if (sz::failed(manifest.database.assign(identity.database.view())))
+            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+        manifest.id = identity.id;
+        if (manifest.collections.reserve(collections_.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+        for (entry_pointer_t const& held : collections_) {
+            collection_entry_t const& entry = *held;
+            manifest_collection_t record;
+            std::memcpy(record.id.bytes, entry.id.uuid.bytes, sizeof(record.id.bytes));
+            if (sz::failed(record.name.assign(entry.name.view())))
+                return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+            record.store = entry.store_tag;
             record.value_size = entry.config.lsm_tree.lsm_level_0.sorted_run.value_size;
             record.value_max_size = entry.config.lsm_tree.lsm_level_0.sorted_run.value_max_size;
             record.level_enlarge_factor = entry.config.lsm_tree.level_enlarge_factor;
             record.cache_limit = entry.config.cache_limit;
             record.memory_runs_max_bytes = entry.config.memory_runs_max_bytes;
             record.memory_runs_max_deltas = entry.config.memory_runs_max_deltas;
-            if (records.push_back(std::move(record)) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
+            [[maybe_unused]] st::status_t const placed = manifest.collections.push_back(st::assume_reserved,
+                                                                                        std::move(record));
         }
-
-        std::uint64_t const version = database_schema_version_k;
-        if (image.resize(fields_storage_requirements(version, stamps, records, runs, ingested)) !=
-            st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
-        return save_fields(bytes_span_t {image}, version, stamps, records, runs, ingested);
+        return {};
     }
 
-    /** Parses one copy of the schema out of @p image into its fields, answering the stamps it
-     *  carries; a copy of version 2 carries no ingested runs. */
-    static expected<schema_stamps_t> parse_schema_(bytes_view_t image, st::vector<collection_record_t>& records,
-                                                   st::vector<lsm_tree_run_record_t>& runs,
-                                                   st::vector<lsm_tree_run_stamp_t>& ingested) noexcept {
-        std::uint64_t version = 0;
-        schema_stamps_t stamps;
-        if (status_t const parsed = load_fields(image, version, stamps, records, runs); parsed.failed()) return parsed;
-        if (version != database_schema_version_k)
-            return status_t {status_code_t::unsupported_k, "The schema follows another version"};
-        if (status_t const parsed = load_fields(
-                image.subspan(fields_storage_requirements(version, stamps, records, runs)), ingested);
-            parsed.failed())
-            return parsed;
-        if (stamps.generation == 0)
-            return status_t {status_code_t::malformed_k, "A saved schema counts at least one save"};
-        return stamps;
+    /** Lists every run of every collection, level by level, and the caller's own data, as the
+     *  manifest names them. */
+    status_t gather_files_(st::vector<placed_file_t>& into) noexcept {
+        st::vector<lsm_tree_run_record_t> runs;
+        for (std::size_t index = 0; index != collections_.size(); ++index) {
+            runs.clear();
+            if (status_t const listed = std::visit(
+                    [&](auto const& held) noexcept { return record_lsm_tree_runs(held.tree(), runs); },
+                    collections_[index]->held);
+                listed.failed())
+                return listed;
+            for (lsm_tree_run_record_t const& run : runs) {
+                placed_file_t entry {file_of_(run.extent, run.content_id, run.extent.extent.length,
+                                              static_cast<std::uint32_t>(index), run.level_number, run.stamp),
+                                     run.extent};
+                if (into.push_back(std::move(entry)) != st::status_t::success_k)
+                    return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+            }
+        }
+        if (user_data_bytes_ == 0) return {};
+        placed_file_t entry {file_of_(user_data_, user_data_run_, user_data_bytes_, manifest_no_collection_k, 0, 0),
+                             user_data_};
+        if (into.push_back(std::move(entry)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+        return {};
     }
 
-    /** Opens every collection the schema names, drops the versions a crash tore and publishes the collections, which a
-     *  mount does once, leaving nothing published when it fails. */
-    status_t open_schema_() noexcept {
+    /** The manifest entry of @p extent, run @p run of @p bytes, owned by
+     *  collection @p collection. */
+    [[nodiscard]] static manifest_file_t file_of_(medium_extent_t const& extent, uuid_t const& run, std::uint64_t bytes,
+                                                  std::uint32_t collection, std::uint32_t level,
+                                                  std::uint64_t stamp) noexcept {
+        manifest_file_t file;
+        file.run = run;
+        file.offset = extent.extent.offset;
+        file.bytes = bytes;
+        file.stamp = stamp;
+        file.collection = collection;
+        file.level = level;
+        file.medium = extent.data_directory;
+        return file;
+    }
+
+    /** Opens every collection the manifest names, drops the versions a crash tore and publishes the
+     *  collections, which a mount does once, leaving nothing published when it fails. */
+    status_t open_manifest_() noexcept {
         // Every executor thread with a channel of its own reads on an epoch slot of its own too.
         if (status_t const reserved = ledger_.epochs().reserve_threads(channels_->executor_channels());
             reserved.failed())
             return reserved;
+        if (status_t const made = make_run_pools_(); made.failed()) return made;
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        if (status_t const loaded = load_schema_(claimed->channel()); loaded.failed()) return loaded;
-        if (status_t const swept = sweep_unnamed_runs_(claimed->channel()); swept.failed()) return swept;
+        std::uint64_t const durable_stamp = volume_->manifest().durable_stamp;
+        if (status_t const adopted = adopt_manifest_(claimed->channel()); adopted.failed()) return adopted;
 
-        // The stamps continue above the durable stamp, and every version above it is a commit a crash tore, which
-        // is dropped before anything draws a stamp; resuming first is what lets the truncation's schema promise it.
-        if (status_t const resumed = ledger_.resume(schema_.loaded_durable()); resumed.failed()) return resumed;
+        // The stamps continue above the durable stamp, and every version above it is a commit a
+        // crash tore, which is dropped before anything draws a stamp; resuming first is what lets
+        // the truncation's manifest promise it.
+        if (status_t const resumed = ledger_.resume(durable_stamp); resumed.failed()) return resumed;
         auto [writing, acquire_status] = channels_->acquire();
         if (acquire_status.failed()) return acquire_status;
-        schema_write_t recording {this, &claimed->channel()};
+        manifest_write_t recording {this, &claimed->channel()};
         lsm_tree_publication_hook_t published;
-        published.notify = &record_schema_;
+        published.notify = &record_manifest_;
         published.context = &recording;
         for (std::size_t index = 0; index != collections_.size(); ++index)
             if (status_t const truncated = std::visit(
                     [&](auto& held) noexcept {
-                        return held.truncate_above(claimed->channel(), writing.channel(), schema_.loaded_durable(),
-                                                   published);
+                        return held.truncate_above(claimed->channel(), writing.channel(), durable_stamp, published);
                     },
                     collections_[index]->held);
                 truncated.failed())
@@ -2153,104 +2360,78 @@ class basic_database {
         return publish_collections_();
     }
 
-    /** Opens every collection the schema blob names, which is what a mount of an older database does. */
-    status_t load_schema_(io_channel_t& channel) noexcept {
-        std::array<st::vector<collection_record_t>, 2> records;
-        std::array<st::vector<lsm_tree_run_record_t>, 2> runs_of;
-        std::array<st::vector<lsm_tree_run_stamp_t>, 2> ingested_of;
-        named_blobs_t blobs {this, &channel};
-        if (status_t const loaded = schema_.load(blobs,
-                                                 [&](std::size_t copy, st::vector<byte_t>& image) noexcept {
-                                                     return parse_schema_(bytes_view_t {image}, records[copy],
-                                                                          runs_of[copy], ingested_of[copy]);
-                                                 });
-            loaded.failed())
-            return loaded;
-        if (schema_.generation() == 0) return {};
-        std::size_t const newer = schema_copy_of(schema_.generation());
-        return adopt_all_(channel, records[newer], runs_of[newer], ingested_of[newer]);
-    }
-
-    /** Drops every sorted run the volumes hold that no collection names, which a crash between a flush's seal and the
-     *  schema save naming its run leaves behind, before anything else of the mount writes. */
-    status_t sweep_unnamed_runs_(io_channel_t& channel) noexcept {
+    /** Opens every collection and the user data the manifest the volume read names, each collection
+     *  over its runs in the order the manifest lists them. */
+    status_t adopt_manifest_(io_channel_t& channel) noexcept {
+        manifest_t const& loaded = volume_->manifest();
+        std::size_t const collections = loaded.collections.size();
+        // A counting sort by collection keeps every collection's runs in the manifest's order.
+        st::vector<std::size_t> starts;
         st::vector<lsm_tree_run_record_t> runs;
-        for (std::size_t index = 0; index != collections_.size(); ++index)
-            if (status_t const listed = std::visit(
-                    [&](auto const& held) noexcept { return record_lsm_tree_runs(held.tree(), runs); },
-                    collections_[index]->held);
-                listed.failed())
-                return listed;
-        st::vector<uuid_t> named;
-        if (named.resize(runs.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to list the runs the schema names"};
-        for (std::size_t index = 0; index != runs.size(); ++index) named[index] = runs[index].content_id;
-        std::sort(named.begin(), named.end());
+        if (starts.resize(collections + 1, 0) != st::status_t::success_k ||
+            runs.resize(loaded.files.size()) != st::status_t::success_k ||
+            collections_.reserve(collections) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room for what the manifest names"};
+        std::size_t run_count = 0;
+        for (manifest_file_t const& file : loaded.files) {
+            if (file.collection == manifest_no_collection_k) {
+                if (user_data_bytes_ != 0)
+                    return {status_code_t::malformed_k, "The manifest names the user data twice"};
+                auto [opened, open_status] = volume_->open(file);
+                if (open_status.failed()) return open_status;
+                user_data_run_ = file.run;
+                user_data_ = opened;
+                user_data_bytes_ = file.bytes;
+                continue;
+            }
+            ++starts[file.collection + 1];
+            ++run_count;
+        }
+        for (std::size_t index = 0; index != collections; ++index) starts[index + 1] += starts[index];
+        for (manifest_file_t const& file : loaded.files) {
+            if (file.collection == manifest_no_collection_k) continue;
+            auto [opened, open_status] = volume_->open(file);
+            if (open_status.failed()) return open_status;
+            lsm_tree_run_record_t& record = runs[starts[file.collection]++];
+            record.level_number = file.level;
+            record.content_id = file.run;
+            record.extent = opened;
+            record.stamp = file.stamp;
+        }
 
-        st::vector<uuid_t> unnamed;
-        status_t listed;
-        router_->for_each(blob_kind_t::sorted_run_k, [&](blob_name_t name, volume_blob_t const&) noexcept {
-            if (listed.failed() || name.size() != uuid_t::size_bytes_k) return;
-            uuid_t content_id;
-            std::memcpy(content_id.bytes, name.data(), uuid_t::size_bytes_k);
-            if (std::binary_search(named.begin(), named.end(), content_id)) return;
-            if (unnamed.push_back(std::move(content_id)) != st::status_t::success_k)
-                listed = {status_code_t::out_of_memory_k, "No room to list the runs the schema leaves unnamed"};
-        });
-        if (listed.failed()) return listed;
-        // The catalog cannot change while it is walked, so the drops follow the walk.
-        for (uuid_t const& content_id : unnamed)
-            if (status_t const dropped = router_->drop(
-                    channel, blob_name_t {reinterpret_cast<byte_t const*>(content_id.bytes), uuid_t::size_bytes_k});
-                dropped.failed())
-                return dropped;
-        return {};
-    }
-
-    /** Opens every collection @p records names over the runs @p runs carries for them, in order, with the
-     *  @p stamps ingests assigned. */
-    status_t adopt_all_(io_channel_t& channel, st::vector<collection_record_t> const& records,
-                        st::vector<lsm_tree_run_record_t> const& runs,
-                        st::vector<lsm_tree_run_stamp_t> const& stamps) noexcept {
-        if (collections_.reserve(records.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room for the collections the schema names"};
-        std::size_t named = 0;
-        for (std::size_t index = 0; index != records.size(); ++index) {
-            if (records[index].run_count > runs.size() - named)
-                return {status_code_t::malformed_k, "The schema names more runs than it carries"};
-            std::size_t const count = static_cast<std::size_t>(records[index].run_count);
-            if (status_t const opened = adopt_(channel, records[index],
-                                               std::span<lsm_tree_run_record_t const> {runs.data() + named, count},
-                                               std::span<lsm_tree_run_stamp_t const> {stamps});
+        std::size_t begin = 0;
+        for (std::size_t index = 0; index != collections; ++index) {
+            std::size_t const end = starts[index];
+            if (status_t const opened = adopt_(
+                    channel, loaded.collections[index],
+                    std::span<lsm_tree_run_record_t const> {runs.data() + begin, end - begin});
                 opened.failed())
                 return opened;
-            named += count;
+            begin = end;
         }
-        if (named != runs.size()) return {status_code_t::malformed_k, "The schema carries runs no collection claims"};
+        if (begin != run_count) return {status_code_t::internal_k, "The manifest's runs were not all adopted"};
         return {};
     }
 
-    /** Opens the collection @p record describes over the runs @p runs names, with the @p stamps ingests
-     *  assigned, and takes it into the schema. */
-    status_t adopt_(io_channel_t& channel, collection_record_t const& record,
-                    std::span<lsm_tree_run_record_t const> runs,
-                    std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
-        if (static_cast<std::size_t>(record.volume) >= router_->size())
-            return {status_code_t::malformed_k, "The schema names a volume this mount did not open"};
-        if (store_tags_type_::index_of(record.store_tag) >= sizeof...(store_types_))
-            return {status_code_t::malformed_k, "The schema names a store this database does not keep"};
+    /** Opens the collection @p record describes over the runs @p runs names, and takes it
+     *  into the database. */
+    status_t adopt_(io_channel_t& channel, manifest_collection_t const& record,
+                    std::span<lsm_tree_run_record_t const> runs) noexcept {
+        if (store_tags_type_::index_of(record.store) >= sizeof...(store_types_))
+            return {status_code_t::malformed_k, "The manifest names a store this database does not keep"};
+        if (record.name.size() == 0 || record.name.size() > collection_name_max_bytes_k)
+            return {status_code_t::malformed_k, "The manifest names a collection by no name or too long a one"};
 
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
         if (!entry) return {status_code_t::out_of_memory_k, "No room for another collection"};
-        entry->id = record.id;
-        if (sz::failed(entry->name.assign(record.name())))
+        std::memcpy(entry->id.uuid.bytes, record.id.bytes, sizeof(record.id.bytes));
+        if (sz::failed(entry->name.assign(record.name.view())))
             return {status_code_t::out_of_memory_k, "No room for a collection's name"};
-        entry->store_tag = record.store_tag;
-        entry->config = record.config();
-        entry->volume = static_cast<volume_id_t>(record.volume);
+        entry->store_tag = record.store;
+        entry->config = config_of(record);
         if (status_t const mounted = mount_collection_(*entry); mounted.failed()) return mounted;
-        if (status_t const restored = std::visit(
-                [&](auto& held) noexcept { return held.restore(channel, runs, stamps); }, entry->held);
+        if (status_t const restored = std::visit([&](auto& held) noexcept { return held.restore(channel, runs); },
+                                                 entry->held);
             restored.failed())
             return restored;
         if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
@@ -2259,19 +2440,20 @@ class basic_database {
     }
 
     /** What a compaction's hook is handed, which is the database and the channel it records through. */
-    struct schema_write_t {
+    struct manifest_write_t {
 
-        /** The database whose schema the hook writes out. */
+        /** The database whose manifest the hook publishes. */
         basic_database* store = nullptr;
 
-        /** The channel the schema blob is queued and sealed on, held by the compacting thread. */
+        /** The channel the manifest is published on, held by the compacting thread. */
         io_channel_t* channel = nullptr;
     };
 
-    /** Writes the schema out for a compaction that has published, before it drops what it consumed. */
-    static status_t record_schema_(void* context) noexcept {
-        schema_write_t const& writing = *static_cast<schema_write_t const*>(context);
-        return writing.store->save_schema_(*writing.channel);
+    /** Publishes the manifest for a compaction that has published, before it drops
+     *  what it consumed. */
+    static status_t record_manifest_(void* context) noexcept {
+        manifest_write_t const& writing = *static_cast<manifest_write_t const*>(context);
+        return writing.store->publish_manifest_(*writing.channel);
     }
 
 #pragma endregion Private Methods
@@ -2291,11 +2473,22 @@ class basic_database {
     /** The transactions of this database, which names this store for as long as it lives. */
     registry_t transactions_;
 
-    /** The two copies of the schema and the caller's own blob, and which copy is newer. */
-    schema_copies<named_blobs_t> schema_ {database_schema_name(0), database_schema_name(1), database_user_data_name()};
+    /** The volume every run lands on and every manifest is committed through, null until the
+     *  database is mounted. */
+    volume_t* volume_ = nullptr;
 
-    /** The volumes every run lands on, null until the database is mounted. */
-    router_t* router_ = nullptr;
+    /** The ID a directory volume names the file of the caller's own data by. */
+    uuid_t user_data_run_ {};
+
+    /** Where the caller's own data lies, meaningful while @c user_data_bytes_ is not zero. */
+    medium_extent_t user_data_ {};
+
+    /** Bytes of the caller's own data, zero when it has saved none. */
+    std::uint64_t user_data_bytes_ = 0;
+
+    /** One pool of runs per store, made at its store's first collection and
+     *  outliving every collection. */
+    st::vector<any_run_pool_t> run_pools_;
 
     /** The queue pairs every call that moves bytes takes one of, null until the database is mounted. */
     channel_pool_t* channels_ = nullptr;
@@ -2303,7 +2496,7 @@ class basic_database {
     /** The delta bounds a transaction takes when its caller names none. */
     database_config_t config_ {};
 
-    /** Every collection the schema names, pinned so a snapshot may point into one. */
+    /** Every collection the database names, pinned so a snapshot may point into one. */
     st::vector<entry_pointer_t> collections_;
 
     /** The collections readers load, which @c latest_collections_ owns. */
@@ -2315,7 +2508,8 @@ class basic_database {
     /** How many times the collections have been published, which is what lets a caller memoize a lookup. */
     std::uint64_t collections_version_ = 0;
 
-    /** Held by whichever call changes the schema, a tree or a blob, a commit paying for its maintenance included. */
+    /** Held by whichever call changes the manifest, a tree or the user data, a commit paying for
+     *  its maintenance included. */
     maintenance_claim<atomic_reference_, waiter_type_> claim_;
 
 #pragma endregion Private Members

@@ -3,6 +3,10 @@
 The extension carries every engine its build enabled, so each case runs once per engine, and a case
 marked as needing a capability skips on the engines that lack it. Suites write integer keys and
 expect them back as the `uuid.UUID` every key is answered as, which `key` and `keys` spell.
+
+File: test/capabilities.py
+Author: Ash Vardanian
+Date: September 18, 2026
 """
 
 import os
@@ -20,13 +24,18 @@ ENGINES = ustore.engines_compiled()
 ISOLATIONS = {"ram": tuple(ustore.Isolation)}
 
 
+def location(engine: str, directory: str | os.PathLike[str]) -> str | os.PathLike[str]:
+    """What `engine` opens or saves a database in `directory` by: the NVMe manifest there, or `directory` itself."""
+    return os.path.join(directory, "ustore.ustore.json") if engine == "nvme" else directory
+
+
 def open_engine(
     engine: str, directory: str | os.PathLike[str], isolation: ustore.Isolation | None = None
 ) -> ustore.Database:
     """Opens `engine` in `directory`, at `isolation` when the engine takes one."""
     if isolation is not None:
         return ustore.Database.open_ram(directory, isolation=isolation)
-    return getattr(ustore.Database, f"open_{engine}")(directory)
+    return getattr(ustore.Database, f"open_{engine}")(location(engine, directory))
 
 
 def probe(engine: str) -> dict[str, bool]:

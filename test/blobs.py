@@ -12,7 +12,7 @@ from uuid import UUID
 
 import numpy as np
 import pytest
-from capabilities import BATCH_SIZES, key, keys
+from capabilities import BATCH_SIZES, key, keys, location
 
 import ustore
 
@@ -569,7 +569,7 @@ def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path):
         ustore.Executor.for_nvme(1, transport=ustore.Transport.BLOCKING, queue_depth=32) as executor,
         pytest.raises((ustore.DeviceError, ustore.UnsupportedError)),
     ):
-        ustore.Database.open_nvme(tmp_path, compactions=executor)
+        ustore.Database.open_nvme(location("nvme", tmp_path), compactions=executor)
     # A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries
     with pytest.raises((ustore.UnsupportedError, ustore.DeviceError)):
         ustore.Executor.for_vram(1 << 20, gds=ustore.Gds.COMPATIBILITY)
@@ -579,13 +579,13 @@ def test_a_database_opens_on_an_executor(engine: str, tmp_path):
     """A constructor given an executor blocks on it, and one given a closed executor opens nothing."""
     with (
         ustore.Executor.for_ram(2) as executor,
-        getattr(ustore.Database, f"open_{engine}")(tmp_path, executor=executor) as database,
+        getattr(ustore.Database, f"open_{engine}")(location(engine, tmp_path), executor=executor) as database,
     ):
         blobs = database.collection_create("blobs", modality=ustore.Modality.BLOBS)
         database.set(1, b"a", collection=blobs)
     with pytest.raises(ustore.UninitializedError):
-        getattr(ustore.Database, f"open_{engine}")(tmp_path, executor=executor)
-    with getattr(ustore.Database, f"open_{engine}")(tmp_path) as reopened:
+        getattr(ustore.Database, f"open_{engine}")(location(engine, tmp_path), executor=executor)
+    with getattr(ustore.Database, f"open_{engine}")(location(engine, tmp_path)) as reopened:
         assert reopened.get(1, collection=blobs) == b"a"
 
 

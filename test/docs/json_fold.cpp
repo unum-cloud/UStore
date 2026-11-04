@@ -831,7 +831,8 @@ std::size_t json_fold_own_changes(config_t const& config) {
     return failures;
 }
 
-/** Opens the NVMe engine over @p directory, every collection flushing past 64 KiB, every level twice the one above. */
+/** Opens the NVMe engine over a manifest in @p directory, every collection flushing past 64 KiB,
+ *  every level twice the one above. */
 expected<database_t> open_small_nvme(char const* directory) noexcept {
     constexpr std::size_t memory_runs_bytes_k = 64 * 1024;
     ustore_database_t database = nullptr;
@@ -839,7 +840,8 @@ expected<database_t> open_small_nvme(char const* directory) noexcept {
     ustore_database_open_nvme_t open {};
     open.database = &database;
     open.outcome = &outcome;
-    open.directory = {reinterpret_cast<ustore_byte_t const*>(directory), std::strlen(directory)};
+    path_t const manifest {directory, "docs.ustore.json"};
+    open.directory = {reinterpret_cast<ustore_byte_t const*>(manifest.c_str()), std::strlen(manifest.c_str())};
     open.collection_memory_runs_max_bytes = memory_runs_bytes_k;
     open.collection_value_max_size = memory_runs_bytes_k / 4;
     open.transaction_max_bytes = memory_runs_bytes_k / 2;

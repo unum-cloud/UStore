@@ -27,7 +27,6 @@
 
 #include "ustore/blobs/nvme_database.hpp"     // `basic_database`
 #include "ustore/blobs/nvme_transactions.hpp" // `watch_schedule_t`
-#include "ustore/utilities/nvme_volume.hpp"   // `basic_volume_router`
 
 #include "nvme/fixture.hpp" // `run_on_transport`, `painted`
 
@@ -60,12 +59,11 @@ constexpr stored_value_size_t variable_width_max_k = 1000;
 using stored_key_t = std::uint64_t;
 using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeric_id_t>;
 
-/** The router, the database and its transactions every case drives over the volume of @p fixture_type_. */
+/** The database and its transactions every case drives over the volume of @p fixture_type_. */
 template <typename fixture_type_>
 struct database_types {
     using fixture_t = fixture_type_;
     using volume_t = typename fixture_t::volume_t;
-    using router_t = basic_volume_router<volume_t>;
     template <value_layout_t value_layout_>
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
                                       last_write_fold_t, no_device_fold_t>;
@@ -78,14 +76,14 @@ struct database_types {
     using transaction_t = typename database_t::transaction_t;
     using transaction_unique_ptr_t = typename database_t::transaction_unique_ptr_t;
 
-    /** A fixture, the router over its one volume, and the database mounted over the router. */
+    /** A fixture, its volume, and the database mounted over the volume. */
     struct stack_t {
 
         /** The disk, the arena, the channels and the one volume. */
         std::unique_ptr<fixture_t> fixture;
 
-        /** The volumes of the database, of which this stack opens one. */
-        router_t router;
+        /** The volume of the database. */
+        volume_t volume;
 
         /** The database, destroyed before the mount it borrows. */
         std::unique_ptr<database_t> store;
@@ -359,7 +357,7 @@ template <typename transaction_type_>
 
 #pragma region Fixtures
 
-/** Mounts a fixture through @p mount, adopts its volume into a router and opens one database over it. */
+/** Mounts a fixture through @p mount, mounts its volume and opens one database over it. */
 template <typename mount_type_>
 expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
     mount_type_ const& mount) noexcept {
@@ -373,19 +371,17 @@ expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t
     if (mount_status.failed()) return mount_status;
     stack->fixture = std::move(fixture);
 
-    auto [built, make_status] = types_t::router_t::make();
-    if (make_status.failed()) return make_status;
-    stack->router = std::move(built);
-
-    auto [guard, acquire_status] = stack->fixture->channels.acquire();
-    if (acquire_status.failed()) return acquire_status;
-    expected<typename types_t::volume_t> volume = stack->fixture->mount_volume(guard.channel());
-    if (!volume) return volume.status();
-    if (status_t const adopted = stack->router.bind_queue_pair(std::move(*volume)); adopted.failed()) return adopted;
+    {
+        auto [guard, acquire_status] = stack->fixture->channels.acquire();
+        if (acquire_status.failed()) return acquire_status;
+        auto [volume, mount_volume_status] = stack->fixture->mount_volume(guard.channel());
+        if (mount_volume_status.failed()) return mount_volume_status;
+        stack->volume = std::move(volume);
+    }
 
     stack->store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack->fixture->resources}};
     if (!stack->store) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
-    if (status_t const mounted = stack->store->mount(stack->router, stack->fixture->channels, test_database_config());
+    if (status_t const mounted = stack->store->mount(stack->volume, stack->fixture->channels, test_database_config());
         mounted.failed())
         return mounted;
     return stack;

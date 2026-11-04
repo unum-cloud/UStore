@@ -14,9 +14,11 @@
  *  only the bottom level may forget one, which is a property of the merge that writes it rather
  *  than of the level that holds it.
  *
- *  A level holds its runs through pointers that never move, so the level set a compaction publishes can
- *  name the same runs the set it replaces named. Ownership follows one rule and no other: a level frees
- *  its runs unless it has been told to @c relinquish them, which only a level set being retired is.
+ *  A level names its runs by handles into the database's run pool, whose records never move, so the
+ *  level set a compaction publishes can name the same runs the set it replaces named. Ownership
+ *  follows one rule and no other:
+ *  a run counts the level sets naming it, at most the current one and the next, and is given back
+ *  to its volume when the last of them lets it go.
  *
  *  The merge itself is arithmetic over key slots and belongs to @c nvme_compaction.hpp, which
  *  decides who survives, cuts the survivors into runs that fit their bounds and plans where every
@@ -25,13 +27,14 @@
  *  channels because a channel is one queue pair with one completion queue, so a read pipeline
  *  polling on the channel a write pipeline submits on would swallow the writes' completions.
  *
- *  A flush writes one run and a compaction writes a whole level, and both publish by building the
- *  next level set beside the current one, which no one changes once a reader may hold it. The tree
- *  hands the new set to the publication hook its caller names, which publishes it to readers and
- *  returns only once no reader is left in the set it replaced; that set is freed then, which is the
- *  whole of the reclamation, and readers never wait on a writer. A batched read refills the ring as
- *  completions retire rather than submitting a batch and waiting on it, so the depth a read reaches
- *  is the queue pair's and not the batch's.
+ *  A flush writes one run, and a compaction merges a whole level zero or one deeper run with the
+ *  runs below that it overlaps, or moves a run that overlaps nothing down untouched. Both publish
+ *  by building the next level set in the spare beside the current one, which no one changes once a
+ *  reader may hold it. The tree hands the new set to the publication hook its caller names, which
+ *  publishes it to readers and returns only once no reader is left in the set it replaced; that set
+ *  is emptied then, which is the whole of the reclamation, and readers never wait on a writer. A
+ *  batched read refills the ring as completions retire rather than submitting a batch and waiting
+ *  on it, so the depth a read reaches is the queue pair's and not the batch's.
  */
 
 #pragma once
@@ -44,8 +47,6 @@
 #include <chrono>      // `std::chrono::system_clock`
 #include <concepts>    // `std::invocable`, `std::same_as`, `std::unsigned_integral`
 #include <limits>      // `std::numeric_limits`
-#include <memory>      // `std::unique_ptr`
-#include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::exchange`, `std::forward`, `std::move`
@@ -53,26 +54,31 @@
 #include <fmt/format.h>
 #include <yyjson.h>
 
-#include <forkunion/atomics.hpp>       // `std::memory_order_acquire`, `std::memory_order_release`
-#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <forkunion/atomics.hpp>                  // `std::memory_order_acquire`, `std::memory_order_release`
+#include <smashtable/basic_chunked_slot_pool.hpp> // `st::basic_chunked_slot_pool`
+#include <smashtable/basic_vector.hpp>            // `st::vector`
 
 #include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compaction_output`, `compaction_kind_t`
 #include "ustore/blobs/nvme_key_slot.hpp"          // `storage_limits_t`, `stored_value_size_t`, `value_layout_t`
 #include "ustore/blobs/nvme_sorted_run.hpp"        // `lsm_sorted_run`, `sorted_run_header_t`, `sorted_run_layout`
 #include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 #include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
-#include "ustore/utilities/nvme_catalog.hpp"       // `blob_kind_t`
 #include "ustore/utilities/nvme_mounts.hpp"        // `resources_config_t`
 #include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`, `portable_alignment_k`
-#include "ustore/utilities/nvme_volume.hpp"        // `volume_blob_t`, `volume_id_t`
+#include "ustore/utilities/nvme_slots.hpp"         // `slot_bytes_k`, `slot_payload_offset_k`
+#include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
+#include "ustore/utilities/ram_buffers.hpp"        // `constrained_allocator`, `resource_constraint`
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`, `byte_t`, `uuid_t`, `uuid_generator`, `save_fields`, `load_fields`
 
 namespace unum::ustore::blobs {
 
+using utilities::constrained_allocator;
 using utilities::fields_storage_requirements;
 using utilities::load;
 using utilities::load_fields;
+using utilities::medium_reference_t;
 using utilities::pooled_buffer_t;
+using utilities::resource_constraint;
 using utilities::resources_config_t;
 using utilities::ring_concept;
 using utilities::save;
@@ -172,6 +178,7 @@ struct lsm_level_config_t {
 struct lsm_tree_config_t {
     lsm_level_config_t lsm_level_0;
     std::size_t level_enlarge_factor = 0;
+    uuid_t collection {};
 };
 
 /** Configuration of one collection. */
@@ -825,7 +832,7 @@ template <issue_sink_concept sink_type_>
         return report_issue(sink, issue_kind_t::error_k, "GPU memory limit is set but no GPU device is selected");
     if (!config.gpu_devices.empty() && config.gpu_memory_limit < 4 * 1024 * 1024)
         return report_issue(sink, issue_kind_t::error_k, "GPU memory limit leaves no room for device buffers");
-    if (config.directory.empty()) return report_issue(sink, issue_kind_t::error_k, "Metadata directory is not set");
+    if (config.manifest.empty()) return report_issue(sink, issue_kind_t::error_k, "Manifest is not set");
     if (config.channels.depth == 0) return report_issue(sink, issue_kind_t::error_k, "I/O depth is not set");
     if (config.channels.request_buffers_count == 0 || config.channels.stream_buffers_count == 0)
         return report_issue(sink, issue_kind_t::error_k, "A channel needs a request block and a streaming block");
@@ -1004,17 +1011,199 @@ struct lsm_level_position_t {
 
 #pragma endregion Vocabulary
 
+#pragma region Record Pools
+
+/**
+ *  @brief Records of one kind that never move, taken and vacated by the threads of one
+ *      store or database.
+ *
+ *  A holder names a record by a handle, its index and the generation it was taken at. A record
+ *  lives from @c take until @c vacate, which steps the generation, so a handle kept past that
+ *  resolves to nothing. Takes and vacates from several threads go through one claim word; resolving
+ *  a handle reads only its record, which its holder keeps alive. Every byte of the records is
+ *  charged to the budget the pool was made with.
+ *
+ *  @tparam record_type_ What a record holds, whose move assignment carries its payload and
+ *      keeps its generation and any list links, so a taken record is filled and a vacated one
+ *      emptied in place.
+ *  @tparam index_type_ Names a record, and is the width of its generation.
+ *  @tparam atomic_reference_ The reference the claim word and the budget's word are owned through.
+ *  @tparam waiter_type_ What the core does while another thread holds the claim.
+ */
+template <typename record_type_, std::unsigned_integral index_type_, template <typename> typename atomic_reference_,
+          typename waiter_type_>
+class lsm_record_pool {
+  public:
+
+#pragma region Types
+
+    /** One record of the pool. */
+    using record_t = record_type_;
+
+    /** Names a record. */
+    using index_t = index_type_;
+
+    /** The budget the records are charged to. */
+    using constraint_t = resource_constraint<atomic_reference_>;
+
+    /** The records and the stack of the free ones, in chunks charged to the budget, which a reader
+     *  resolves without the claim while a take grows them. */
+    using records_t =
+        st::basic_chunked_slot_pool<record_t, index_t, constrained_allocator<std::byte, atomic_reference_>>;
+
+    /** A record's index and the generation it was taken at. */
+    using handle_t = typename records_t::handle_t;
+
+    /** What @c take answers when every record is taken. */
+    static constexpr index_t absent_k = records_t::absent_k;
+
+#pragma endregion Types
+
+#pragma region Construction
+
+    lsm_record_pool() noexcept = default;
+    lsm_record_pool(lsm_record_pool const&) = delete;
+    lsm_record_pool& operator=(lsm_record_pool const&) = delete;
+    lsm_record_pool(lsm_record_pool&&) noexcept = default;
+    lsm_record_pool& operator=(lsm_record_pool&&) noexcept = default;
+
+    /** A pool of @p capacity free records charged to @p constraint, which must outlive it. */
+    static expected<lsm_record_pool> make(std::size_t capacity, constraint_t& constraint) noexcept {
+        using allocator_t = constrained_allocator<std::byte, atomic_reference_>;
+        return adopt_(records_t::make(capacity, capacity, allocator_t {constraint}));
+    }
+
+    /** A pool of @p capacity free records that grows by chunks up to @p capacity_limit when a
+     *  @c take finds none, charged to @p constraint, which must outlive it. */
+    static expected<lsm_record_pool> make(std::size_t capacity, std::size_t capacity_limit,
+                                          constraint_t& constraint) noexcept {
+        using allocator_t = constrained_allocator<std::byte, atomic_reference_>;
+        return adopt_(records_t::make(capacity, capacity_limit, allocator_t {constraint}));
+    }
+
+#pragma endregion Construction
+
+#pragma region Records
+
+    /** Moves @p record into a free record and answers its handle, leaving @p record untouched when
+     *  every record is taken. */
+    expected<handle_t> take(record_t&& record) noexcept {
+        lock_();
+        index_t const index = records_.take();
+        unlock_();
+        if (index == absent_k) return status_t {status_code_t::capacity_exhausted_k, "Every record of a pool is taken"};
+        records_[index] = std::move(record);
+        return records_.handle_of(index);
+    }
+
+    /** Records taken. */
+    [[nodiscard]] std::size_t size() const noexcept { return records_.size(); }
+
+    /** Records the pool holds, taken or free. */
+    [[nodiscard]] std::size_t capacity() const noexcept { return records_.capacity(); }
+
+    /** The record @p record names, or null once it was vacated. */
+    [[nodiscard]] record_t* at(handle_t record) noexcept { return records_.at(record); }
+
+    /** The record @p record names, or null once it was vacated. */
+    [[nodiscard]] record_t const* at(handle_t record) const noexcept { return records_.at(record); }
+
+    /** The record at @p index, taken or not, which list links reach by index. */
+    [[nodiscard]] record_t& operator[](index_t index) noexcept { return records_[index]; }
+
+    /** The record at @p index, taken or not. */
+    [[nodiscard]] record_t const& operator[](index_t index) const noexcept { return records_[index]; }
+
+    /** The handle naming @p record, which is a record of this pool. */
+    [[nodiscard]] handle_t handle_of(record_t const& record) const noexcept {
+        return records_.handle_of(records_.index_of(record));
+    }
+
+    /** Empties the record @p record names and frees it, so every copy of the handle
+     *  resolves to nothing. */
+    void vacate(handle_t record) noexcept {
+        record_t* const held = records_.at(record);
+        if (held == nullptr) return;
+        *held = record_t {};
+        lock_();
+        records_.vacate(record.index);
+        unlock_();
+    }
+
+    /** Gives back the extent of every run @p runs names to @p volume and vacates them, for runs
+     *  no manifest names. */
+    template <typename volume_type_>
+    void discard(volume_type_& volume, std::span<handle_t const> runs) noexcept {
+        for (handle_t const run : runs)
+            if (record_t const* const held = records_.at(run); held != nullptr) {
+                volume.deallocate(held->extent());
+                vacate(run);
+            }
+    }
+
+#pragma endregion Records
+
+  private:
+
+#pragma region Private Methods
+
+    /** A pool over the records @p made, or the status SmashTable refused them with. */
+    static expected<lsm_record_pool> adopt_(st::expected<records_t>&& made) noexcept {
+        if (made.status() == st::status_t::invalid_argument_k)
+            return status_t {status_code_t::invalid_argument_k, "A pool holds fewer records than its index names"};
+        if (!made) return status_t {status_code_t::out_of_memory_k, "No room for the records of a pool"};
+        lsm_record_pool pool;
+        pool.records_ = std::move(*made);
+        return pool;
+    }
+
+    /** Takes the claim word, which guards the free-index stack alone. */
+    void lock_() noexcept {
+        atomic_reference_<std::int32_t> const word {claim_};
+        std::int32_t expected_free = 0;
+        while (!word.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+            waiter_type_ {}(&claim_, expected_free, std::size_t {0});
+            expected_free = 0;
+        }
+    }
+
+    /** Lets the claim word go. */
+    void unlock_() noexcept { atomic_reference_<std::int32_t> {claim_}.store(0, std::memory_order_release); }
+
+#pragma endregion Private Methods
+
+#pragma region Private Members
+
+    /** The records and the stack of the free ones. */
+    records_t records_;
+
+    /** Zero while no thread takes or vacates a record. */
+    std::int32_t claim_ = 0;
+
+#pragma endregion Private Members
+};
+
+/** Every run the trees of one database and one key slot hold, at most 65,534, which is what a
+ *  request token packs. */
+template <typename sorted_run_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+using lsm_run_pool = lsm_record_pool<sorted_run_type_, std::uint16_t, atomic_reference_, waiter_type_>;
+
+#pragma endregion Record Pools
+
 #pragma region Level
 
 /**
  *  @brief The sorted runs of one level, answering lookups and scans over all of them at once.
  *
- *  Every run is one heap allocation the level owns, so a successor level set copies the pointer rather
- *  than the index behind it and a reader of either set reads the same bytes.
+ *  A level names its runs by handles into the database's run pool, so a successor level set names
+ *  the same records rather than copying the index behind them and a reader of either set reads the
+ *  same bytes. The level owns none of them; its tree decides when nothing names a run.
  *
+ *  @tparam atomic_reference_ The reference the run pool's words are owned through.
  *  @tparam waiter_type_ What the core does while a run waits for its reads.
  */
-template <typename key_slot_type_, typename volume_type_, typename waiter_type_>
+template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
+          typename waiter_type_>
 class lsm_level {
   public:
 
@@ -1028,6 +1217,12 @@ class lsm_level {
 
     /** One immutable run of this level. */
     using sorted_run_t = lsm_sorted_run<key_slot_t, volume_t, waiter_type_>;
+
+    /** The pool the runs of this level live in. */
+    using run_pool_t = lsm_run_pool<sorted_run_t, atomic_reference_, waiter_type_>;
+
+    /** How this level names one of its runs. */
+    using run_handle_t = typename run_pool_t::handle_t;
 
     /** The key the runs order their key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
@@ -1047,7 +1242,7 @@ class lsm_level {
     lsm_level& operator=(lsm_level const&) = delete;
 
     lsm_level(lsm_level&& other) noexcept
-        : runs_(std::move(other.runs_)), number_(other.number_), order_(other.order_),
+        : runs_(std::move(other.runs_)), run_pool_(other.run_pool_), number_(other.number_), order_(other.order_),
           size_bytes_(std::exchange(other.size_bytes_, 0)),
           population_count_(std::exchange(other.population_count_, 0)),
           lower_(std::exchange(other.lower_, limit<stored_key_t>::max())),
@@ -1055,8 +1250,8 @@ class lsm_level {
 
     lsm_level& operator=(lsm_level&& other) noexcept {
         if (this == &other) return *this;
-        discard();
         runs_ = std::move(other.runs_);
+        run_pool_ = other.run_pool_;
         number_ = other.number_;
         order_ = other.order_;
         size_bytes_ = std::exchange(other.size_bytes_, 0);
@@ -1066,75 +1261,70 @@ class lsm_level {
         return *this;
     }
 
-    ~lsm_level() noexcept { discard(); }
-
-    /** An empty level numbered @p number whose runs are read in the order @p order names. */
-    [[nodiscard]] static lsm_level of(std::uint32_t number, lsm_level_order_t order) noexcept {
+    /** An empty level numbered @p number of runs from @p runs, read in the order @p order names. */
+    [[nodiscard]] static lsm_level of(run_pool_t& runs, std::uint32_t number, lsm_level_order_t order) noexcept {
         lsm_level level;
+        level.run_pool_ = &runs;
         level.number_ = number;
         level.order_ = order;
         return level;
     }
 
-    /** Takes @p run into the level, at the back for an overlapping level and in key order for a sorted one. */
-    status_t insert_run(sorted_run_t&& run) noexcept {
+    /** Names @p run, at the back for an overlapping level and in key order for a sorted one, which
+     *  it must not overlap. */
+    status_t insert_run(run_handle_t run) noexcept {
         if (runs_.reserve(runs_.size() + 1) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A level could not hold another run"};
+        sorted_run_t const& inserted = *run_pool_->at(run);
         std::size_t position = runs_.size();
         if (order_ == lsm_level_order_t::sorted_k) {
-            position = 0;
-            while (position != runs_.size() && runs_[position]->upper_stored_key() < run.lower_stored_key()) ++position;
-            if (position != runs_.size() && !(run.upper_stored_key() < runs_[position]->lower_stored_key()))
+            std::size_t low = 0;
+            while (low != position) {
+                std::size_t const middle = low + (position - low) / 2;
+                if (run_at_(middle).precedes(inserted)) low = middle + 1;
+                else position = middle;
+            }
+            if (position != runs_.size() && !inserted.precedes(run_at_(position)))
                 return {status_code_t::invalid_argument_k, "A sorted level takes runs that overlap no other"};
         }
-        sorted_run_t* held = new (std::nothrow) sorted_run_t {std::move(run)};
-        if (held == nullptr) return {status_code_t::out_of_memory_k, "A level could not hold another run"};
-        note_(*held);
-        [[maybe_unused]] st::status_t const placed = runs_.insert(position, std::move(held));
+        note_(inserted);
+        [[maybe_unused]] st::status_t const placed = runs_.insert(position, std::move(run));
         return {};
     }
 
-    /** Names every run @p other names, which is how a prepared level set carries an untouched level. */
-    status_t carry(lsm_level const& other) noexcept {
+    /** Names every run @p other names but those @p skipped lists, in the order @p other holds
+     *  them, which is how a prepared level set carries a level a merge leaves alone or
+     *  consumes in part. */
+    status_t carry(lsm_level const& other, std::span<sorted_run_t const* const> skipped) noexcept {
         if (runs_.reserve(runs_.size() + other.runs_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A level could not name that many runs"};
         for (std::size_t index = 0; index != other.runs_.size(); ++index) {
-            sorted_run_t* named = other.runs_[index];
+            sorted_run_t const* const named = &other.run_at_(index);
+            bool consumed = false;
+            for (sorted_run_t const* const picked : skipped) consumed |= picked == named;
+            if (consumed) continue;
             note_(*named);
-            [[maybe_unused]] st::status_t const placed = runs_.push_back(std::move(named));
+            [[maybe_unused]] st::status_t const placed = runs_.push_back(run_handle_t {other.runs_[index]});
         }
         return {};
     }
 
-    /** Makes room for @p count more runs, so a merge that plans them all fails before it writes any. */
+    /** Makes room for @p count more runs, so a publication that places them all fails before
+     *  it names any. */
     status_t reserve(std::size_t count) noexcept {
         if (runs_.reserve(runs_.size() + count) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A level could not hold that many runs"};
         return {};
     }
 
-    /** Forgets every run without freeing it, which only a level set handing its runs on may do. */
-    void relinquish() noexcept {
+    /** Forgets every run, which the tree does once it stops counting this level among those
+     *  naming them. */
+    void clear() noexcept {
         runs_.clear();
-        forget_();
-    }
-
-    /** Frees every run's memory without touching the medium, which the destructor does anyway. */
-    void discard() noexcept {
-        for (std::size_t index = 0; index != runs_.size(); ++index) delete runs_[index];
-        runs_.clear();
-        forget_();
-    }
-
-    /** Returns every run's bytes to @p volume and then frees them, which destroys the level's data. */
-    status_t drop(volume_t& volume, io_channel_t& channel) noexcept {
-        status_t first;
-        for (std::size_t index = 0; index != runs_.size(); ++index)
-            if (status_t const dropped = sorted_run_t::drop(volume, channel, runs_[index]->content_id());
-                dropped.failed() && first.succeeded())
-                first = dropped;
-        discard();
-        return first;
+        size_bytes_ = 0;
+        population_count_ = 0;
+        lower_ = limit<stored_key_t>::max();
+        upper_ = limit<stored_key_t>::min();
     }
 
 #pragma endregion Construction
@@ -1166,7 +1356,10 @@ class lsm_level {
     [[nodiscard]] stored_key_t upper_stored_key() const noexcept { return upper_; }
 
     /** The run at @p index, which for an overlapping level is ordered oldest first. */
-    [[nodiscard]] sorted_run_t const& run(std::size_t index) const noexcept { return *runs_[index]; }
+    [[nodiscard]] sorted_run_t const& run(std::size_t index) const noexcept { return run_at_(index); }
+
+    /** The handles of the runs, in the order @c run answers them. */
+    [[nodiscard]] std::span<run_handle_t const> runs() const noexcept { return std::span<run_handle_t const> {runs_}; }
 
 #pragma endregion Shape
 
@@ -1187,7 +1380,7 @@ class lsm_level {
         position = lsm_level_position_t {};
         if (order_ == lsm_level_order_t::overlapping_k) {
             for (std::size_t index = runs_.size(); index-- != 0;) {
-                sorted_run_t const& run = *runs_[index];
+                sorted_run_t const& run = run_at_(index);
                 if (run.population_count() == 0) continue;
                 if (stored_key < run.lower_stored_key() || run.upper_stored_key() < stored_key) continue;
                 std::uint64_t at = 0;
@@ -1203,7 +1396,7 @@ class lsm_level {
         std::size_t high = runs_.size();
         while (low != high) {
             std::size_t const middle = low + (high - low) / 2;
-            sorted_run_t const& run = *runs_[middle];
+            sorted_run_t const& run = run_at_(middle);
             if (run.upper_stored_key() < stored_key) {
                 low = middle + 1;
                 continue;
@@ -1223,12 +1416,12 @@ class lsm_level {
 
     /** The key slot at @p position, which must have come from a @c find that answered anything but missing. */
     [[nodiscard]] key_slot_t const& key_slot(lsm_level_position_t position) const noexcept {
-        return runs_[position.run_index]->key_slot(position.key_slot_position);
+        return run_at_(position.run_index).key_slot(position.key_slot_position);
     }
 
     /** Where the value of the key slot at @p position sits, empty for one that needs no read. */
     [[nodiscard]] value_window_t value_window(lsm_level_position_t position) const noexcept {
-        return runs_[position.run_index]->value_window(position.key_slot_position);
+        return run_at_(position.run_index).value_window(position.key_slot_position);
     }
 
     /**
@@ -1241,7 +1434,7 @@ class lsm_level {
     status_t for_each_key_slot(visitor_type_&& visitor) const noexcept {
         if (order_ == lsm_level_order_t::sorted_k) {
             for (std::size_t index = 0; index != runs_.size(); ++index)
-                runs_[index]->for_each_key_slot([&](std::uint64_t at, key_slot_t const& slot) noexcept {
+                run_at_(index).for_each_key_slot([&](std::uint64_t at, key_slot_t const& slot) noexcept {
                     visitor(lsm_level_position_t {static_cast<std::uint32_t>(index), at}, slot);
                 });
             return {};
@@ -1256,8 +1449,8 @@ class lsm_level {
             std::size_t chosen = runs_.size();
             stored_key_t smallest = limit<stored_key_t>::max();
             for (std::size_t index = 0; index != runs_.size(); ++index) {
-                if (cursors[index] == runs_[index]->population_count()) continue;
-                stored_key_t const key = runs_[index]->key_slot(cursors[index]).stored_key;
+                if (cursors[index] == run_at_(index).population_count()) continue;
+                stored_key_t const key = run_at_(index).key_slot(cursors[index]).stored_key;
                 if (chosen != runs_.size() && smallest < key) continue;
                 chosen = index;
                 smallest = key;
@@ -1265,10 +1458,10 @@ class lsm_level {
             if (chosen == runs_.size()) return {};
 
             visitor(lsm_level_position_t {static_cast<std::uint32_t>(chosen), cursors[chosen]},
-                    runs_[chosen]->key_slot(cursors[chosen]));
+                    run_at_(chosen).key_slot(cursors[chosen]));
             for (std::size_t index = 0; index != runs_.size(); ++index)
-                if (cursors[index] != runs_[index]->population_count() &&
-                    runs_[index]->key_slot(cursors[index]).stored_key == smallest)
+                if (cursors[index] != run_at_(index).population_count() &&
+                    run_at_(index).key_slot(cursors[index]).stored_key == smallest)
                     ++cursors[index];
         }
     }
@@ -1279,6 +1472,9 @@ class lsm_level {
 
 #pragma region Private Methods
 
+    /** The run at @p index, whose record the level set naming it keeps alive. */
+    [[nodiscard]] sorted_run_t const& run_at_(std::size_t index) const noexcept { return *run_pool_->at(runs_[index]); }
+
     /** Folds @p run into the bounds, the byte count and the population the level reports. */
     void note_(sorted_run_t const& run) noexcept {
         size_bytes_ += run.size_bytes();
@@ -1287,20 +1483,15 @@ class lsm_level {
         if (upper_ < run.upper_stored_key()) upper_ = run.upper_stored_key();
     }
 
-    /** Resets everything the runs contributed, which both ways of emptying a level need. */
-    void forget_() noexcept {
-        size_bytes_ = 0;
-        population_count_ = 0;
-        lower_ = limit<stored_key_t>::max();
-        upper_ = limit<stored_key_t>::min();
-    }
-
 #pragma endregion Private Methods
 
 #pragma region Private Members
 
     /** The runs of the level, oldest first when they overlap and ascending when they do not. */
-    st::vector<sorted_run_t*> runs_;
+    st::vector<run_handle_t> runs_;
+
+    /** The pool every run of the level lives in, which outlives the level. */
+    run_pool_t* run_pool_ = nullptr;
 
     /** Where this level sits in its tree. */
     std::uint32_t number_ = 0;
@@ -1308,10 +1499,10 @@ class lsm_level {
     /** Whether the runs may overlap. */
     lsm_level_order_t order_ = lsm_level_order_t::sorted_k;
 
-    /** Bytes every run takes, kept as runs are adopted rather than recounted. */
+    /** Bytes every run takes, kept as runs are named rather than recounted. */
     std::uint64_t size_bytes_ = 0;
 
-    /** Key slots every run holds, kept as runs are adopted rather than recounted. */
+    /** Key slots every run holds, kept as runs are named rather than recounted. */
     std::uint64_t population_count_ = 0;
 
     /** The least key any run holds. */
@@ -1438,10 +1629,12 @@ class channel_drain {
 #pragma region Merger
 
 /**
- *  @brief Merges one level into the level below it, writing a whole new sorted level.
+ *  @brief Merges runs of one level with the runs of the level below that they overlap, writing
+ *      new sorted runs.
  *
- *  Both source levels are consumed whole rather than by the ranges they overlap, so the runs the new
- *  level holds are the only survivors and every source run is free the moment the merge is published.
+ *  The tree picks the runs, which are a whole level zero or one run of a deeper level, and the runs
+ *  below that overlap them; the new runs replace exactly those, so every source run is free once
+ *  the merge is published and no run of either level outside the picked range is read or written.
  *
  *  @tparam atomic_reference_ The reference a caller's cancellation word is read through.
  *  @tparam waiter_type_ What the core does while the merge waits for its reads and barriers.
@@ -1460,10 +1653,19 @@ class lsm_level_merger {
     using volume_t = volume_type_;
 
     /** The level this merge reads and writes. */
-    using level_t = lsm_level<key_slot_t, volume_t, waiter_type_>;
+    using level_t = lsm_level<key_slot_t, volume_t, atomic_reference_, waiter_type_>;
 
     /** One immutable run of a level. */
     using sorted_run_t = typename level_t::sorted_run_t;
+
+    /** The pool the new runs are taken into. */
+    using run_pool_t = typename level_t::run_pool_t;
+
+    /** How a level names one run. */
+    using run_handle_t = typename level_t::run_handle_t;
+
+    /** The runs one merge wrote, ascending and disjoint. */
+    using merged_runs_t = st::vector<run_handle_t>;
 
     /** The key the runs order their key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
@@ -1474,7 +1676,7 @@ class lsm_level_merger {
     /** The word a caller raises to stop a merge. */
     using cancellation_t = compaction_cancellation<atomic_reference_>;
 
-    /** Where the sections of a run sit inside its blob. */
+    /** Where the sections of a run sit inside its extent. */
     using sorted_run_layout_t = sorted_run_layout<key_slot_t>;
 
     /** The pipeline the gather reads its source values through. */
@@ -1495,23 +1697,25 @@ class lsm_level_merger {
     /** What one merge is asked to do, beyond the volume and the channels it is handed. */
     struct merge_request_t {
 
-        /** The level whose runs shadow the lower level's, which is never null and never empty. */
-        level_t const* upper = nullptr;
+        /** The runs whose versions shadow the lower ones', oldest first when they overlap and
+         *  ascending otherwise, which are never none. */
+        std::span<sorted_run_t const* const> upper;
 
-        /** The level the upper one merges into, or null when the merge writes a level that holds nothing yet. */
-        level_t const* lower = nullptr;
+        /** Whether the upper runs may overlap, which they do on level zero alone. */
+        lsm_level_order_t upper_order = lsm_level_order_t::overlapping_k;
 
-        /** The number the new level takes. */
-        std::uint32_t number = 0;
+        /** The runs of the level below that the upper ones overlap, ascending, or none. */
+        std::span<sorted_run_t const* const> lower;
 
-        /** Whether anything sits below the new level, which decides whether remove deltas drop. */
+        /** Whether anything below the new runs overlaps their range, which decides whether
+         *  remove deltas drop. */
         lsm_level_depth_t depth = lsm_level_depth_t::intermediate_k;
+
+        /** The collection every new run's header names. */
+        uuid_t collection {};
 
         /** The largest value the collection admits, which every new run's header carries. */
         stored_value_size_t value_max_size = 0;
-
-        /** Most key slots one new run takes, which bounds how far a binary search inside it walks. */
-        std::uint64_t run_key_slots_capacity = storage_limits_t::memory_runs_max_deltas_k;
 
         /** Largest new run in bytes, which a run of one key slot may still exceed. */
         std::uint64_t run_bytes_limit = storage_limits_t::sorted_run_file_max_size_k;
@@ -1534,28 +1738,45 @@ class lsm_level_merger {
 #pragma region Merging
 
     /**
-     *  @brief Merges @p request.upper into @p request.lower and writes the survivors as a new sorted level.
-     *  @param[in,out] volume The volume the new runs are reserved on, which every source run also lives on.
+     *  @brief Merges @p request.upper into @p request.lower and writes the survivors as
+     *      new sorted runs.
+     *  @param[in,out] volume The volume the new runs are allocated on, which every source run
+     *      also lives on.
+     *  @param[in,out] runs The pool the new runs are taken into, naming them in no level yet.
      *  @param[in,out] reading_channel The channel the source values are gathered on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the new runs are written on, which must not be @p reading_channel.
      *  @param[in] request Which levels merge, what the new runs may grow to, and where the compaction runs.
      *  @param[in] fold How the collection's changes compose and apply, which reads their values
      *      on @p reading_channel before any is gathered.
      *  @param[in] device_fold How a device composes the collection's changes, or @c no_device_fold_t where none does.
-     *  @return The new level, or the status that stopped the merge with every new run already dropped.
+     *  @return The new runs in ascending order, or the status that stopped the merge with every new
+     *      run already given back.
      */
     template <utilities::fold_concept fold_type_, typename device_fold_type_>
-    static expected<level_t> merge(volume_t& volume, io_channel_t& reading_channel, io_channel_t& writing_channel,
-                                   merge_request_t const& request, fold_type_ const& fold,
-                                   device_fold_type_ const& device_fold) noexcept {
-        if (request.upper == nullptr)
-            return status_t {status_code_t::invalid_argument_k, "A merge reads an upper level"};
+    static expected<merged_runs_t> merge(volume_t& volume, run_pool_t& runs, io_channel_t& reading_channel,
+                                         io_channel_t& writing_channel, merge_request_t const& request,
+                                         fold_type_ const& fold, device_fold_type_ const& device_fold) noexcept {
+        if (request.upper.empty())
+            return status_t {status_code_t::invalid_argument_k, "A merge reads at least one upper run"};
         if (&reading_channel == &writing_channel)
             return status_t {status_code_t::invalid_argument_k, "A merge reads and writes on two channels"};
+        if constexpr (sorted_run_t::tailed_k) return merge_strings_(volume, runs, writing_channel, request);
+        else return merge_fixed_(volume, runs, reading_channel, writing_channel, request, fold, device_fold);
+    }
 
+#pragma endregion Merging
+
+  private:
+
+    /** Merges runs of fixed-width keys through the compactor the request names, then gathers and
+     *  writes their survivors as new runs. */
+    template <utilities::fold_concept fold_type_, typename device_fold_type_>
+    static expected<merged_runs_t> merge_fixed_(volume_t& volume, run_pool_t& runs, io_channel_t& reading_channel,
+                                                io_channel_t& writing_channel, merge_request_t const& request,
+                                                fold_type_ const& fold, device_fold_type_ const& device_fold) noexcept {
         st::vector<sorted_run_t const*> sources;
         st::vector<sorted_run_index_view<key_slot_t>> views;
-        if (status_t const pointed = point_views_(*request.upper, request.lower, sources, views); pointed.failed())
+        if (status_t const pointed = point_views_(request.upper, request.lower, sources, views); pointed.failed())
             return pointed;
 
         // A fold reads the values of the changes it folds, from their runs, one at a time.
@@ -1570,52 +1791,337 @@ class lsm_level_merger {
             return st::status_t::success_k;
         };
 
-        std::size_t const upper_runs = request.upper->size();
+        std::size_t const upper_runs = request.upper.size();
         std::span<sorted_run_index_view<key_slot_t> const> const level_views {views};
         compaction_output_t output;
         if (status_t const compacted = run_compaction_(
-                kind_of_(request.upper->order(), request.depth), level_views.first(upper_runs),
+                kind_of_(request.upper_order, request.depth), level_views.first(upper_runs),
                 level_views.subspan(upper_runs), std::span<sorted_run_t const* const> {sources}, bounds_of_(request),
                 request.stamps, request.placement, request.compactor, fold, device_fold, read_value, output);
             compacted.failed())
             return compacted;
 
-        level_t merged = level_t::of(request.number, lsm_level_order_t::sorted_k);
-        if (status_t const room = merged.reserve(output.sorted_runs.size()); room.failed()) return room;
+        merged_runs_t merged;
+        if (merged.reserve(output.sorted_runs.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge could not track the runs it writes"};
 
-        std::uint64_t first_cell = 0;
         std::uint64_t first_key_slot = 0;
         std::uint64_t first_copy_range = 0;
         for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
             planned_run_t planned;
             planned.key_slots_count = output.sorted_runs[index].key_slots_count;
             planned.stored_values_bytes = output.sorted_runs[index].stored_values_bytes;
-            planned.first_cell = first_cell;
             planned.first_key_slot = first_key_slot;
             planned.first_copy_range = first_copy_range;
             planned.copy_ranges_count = output.sorted_runs[index].value_copy_ranges_count;
 
             auto [written, write_run_status] = write_run_(
                 volume, reading_channel, writing_channel, std::span<sorted_run_t const* const> {sources}, output,
-                planned, request.value_max_size, request.stamps.floor, request.cancellation);
+                planned, request.collection, request.value_max_size, request.stamps.floor, request.cancellation);
             if (write_run_status.failed()) {
-                [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_channel);
+                runs.discard(volume, std::span<run_handle_t const> {merged});
                 return write_run_status;
             }
-            if (status_t const adopted = merged.insert_run(std::move(written)); adopted.failed()) {
-                [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_channel);
-                return adopted;
+            auto [taken, take_status] = runs.take(std::move(written));
+            if (take_status.failed()) {
+                volume.deallocate(written.extent());
+                runs.discard(volume, std::span<run_handle_t const> {merged});
+                return take_status;
             }
-            first_cell += round_up_to_multiple(planned.key_slots_count, sorted_run_layout_t::branching_k);
+            [[maybe_unused]] st::status_t const placed = merged.push_back(std::move(taken));
             first_key_slot += planned.key_slots_count;
             first_copy_range += planned.copy_ranges_count;
         }
         return merged;
     }
 
-#pragma endregion Merging
+#pragma region Strings Merge
 
-  private:
+    /** One version a merge of strings carries, as its source run holds it. */
+    struct string_version_t {
+
+        /** Its source: the upper runs in their order, then the lower runs. */
+        std::uint32_t source = 0;
+
+        /** Its sorted position in that source. */
+        std::uint32_t position = 0;
+    };
+
+    /** Versions in ascending order of their keys, the versions of one key newest first, and where
+     *  each key's start. */
+    struct string_side_t {
+
+        /** Every version. */
+        st::vector<string_version_t> versions;
+
+        /** Where the versions of each key start in @c versions. */
+        st::vector<std::uint32_t> keys;
+    };
+
+    /** The whole key of @p version. */
+    [[nodiscard]] static std::string_view key_of_(std::span<sorted_run_t const* const> sources,
+                                                  string_version_t version) noexcept {
+        return sources[version.source]->key(version.position);
+    }
+
+    /** Appends every version of the runs of @p sources from @p first to @p last, which are disjoint
+     *  and ascend, to @p side, noting where each key starts. */
+    static status_t side_of_(std::span<sorted_run_t const* const> sources, std::uint32_t first, std::uint32_t last,
+                             string_side_t& side) noexcept {
+        std::uint64_t versions = 0;
+        for (std::uint32_t source = first; source != last; ++source) versions += sources[source]->population_count();
+        if (versions > limit<std::uint32_t>::max())
+            return {status_code_t::capacity_exhausted_k, "A merge of strings holds more versions than it counts"};
+        if (side.versions.reserve(static_cast<std::size_t>(versions)) != st::status_t::success_k ||
+            side.keys.reserve(static_cast<std::size_t>(versions)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A merge of strings could not list its versions"};
+        for (std::uint32_t source = first; source != last; ++source)
+            for (std::uint64_t position = 0; position != sources[source]->population_count(); ++position) {
+                string_version_t const version {source, static_cast<std::uint32_t>(position)};
+                if (position == 0 || sources[source]->key(position) != sources[source]->key(position - 1))
+                    [[maybe_unused]]
+                    st::status_t const noted = side.keys.push_back(st::assume_reserved,
+                                                                   static_cast<std::uint32_t>(side.versions.size()));
+                [[maybe_unused]] st::status_t const placed = side.versions.push_back(st::assume_reserved,
+                                                                                     string_version_t {version});
+            }
+        return {};
+    }
+
+    /** Folds @p older into @p newer by the union of their keys, so every key's versions from
+     *  @p newer come before those from @p older, which @p newer takes in place. */
+    static status_t fold_sides_(std::span<sorted_run_t const* const> sources, string_side_t& newer,
+                                string_side_t const& older) noexcept {
+        auto const reader_of = [sources](string_side_t const& side) noexcept {
+            return [sources, &side](std::size_t first, std::span<std::string_view> views) noexcept {
+                for (std::size_t index = 0; index != views.size(); ++index)
+                    views[index] = key_of_(sources, side.versions[side.keys[first + index]]);
+            };
+        };
+
+        std::size_t const rows_max = newer.keys.size() + older.keys.size();
+        st::vector<std::size_t> newer_positions;
+        st::vector<std::size_t> older_positions;
+        string_side_t joined;
+        if (newer_positions.resize(rows_max) != st::status_t::success_k ||
+            older_positions.resize(rows_max) != st::status_t::success_k ||
+            joined.versions.reserve(newer.versions.size() + older.versions.size()) != st::status_t::success_k ||
+            joined.keys.reserve(rows_max) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A merge of strings could not hold its union"};
+        std::size_t const rows = union_sorted_keys(reader_of(newer), newer.keys.size(), reader_of(older),
+                                                   older.keys.size(), std::span<std::size_t> {newer_positions},
+                                                   std::span<std::size_t> {older_positions});
+
+        auto append_key = [&](string_side_t const& side, std::size_t key) noexcept {
+            std::size_t const begin = side.keys[key];
+            std::size_t const end = key + 1 != side.keys.size() ? side.keys[key + 1] : side.versions.size();
+            for (std::size_t version = begin; version != end; ++version) [[maybe_unused]]
+                st::status_t const placed = joined.versions.push_back(st::assume_reserved,
+                                                                      string_version_t {side.versions[version]});
+        };
+        for (std::size_t row = 0; row != rows; ++row) {
+            [[maybe_unused]] st::status_t const noted = joined.keys.push_back(
+                st::assume_reserved, static_cast<std::uint32_t>(joined.versions.size()));
+            if (newer_positions[row] != absent_position_k) append_key(newer, newer_positions[row]);
+            if (older_positions[row] != absent_position_k) append_key(older, older_positions[row]);
+        }
+        newer = std::move(joined);
+        return {};
+    }
+
+    /** Adds one to @p depths for every version of a tie of equal heads, @p depth heads deep, among
+     *  the versions from @p first to @p last that a run would give a layer, and recurses into the
+     *  ties nested in it. */
+    static void count_layers_(std::span<sorted_run_t const* const> sources, std::span<string_version_t const> versions,
+                              std::size_t first, std::size_t last, std::uint32_t depth,
+                              std::span<std::uint32_t> depths) noexcept {
+        std::size_t const skipped = std::size_t {depth} * strings::head_prefix_bytes_k;
+        auto head_of_version = [&](std::size_t index) noexcept {
+            return strings::head_of(key_of_(sources, versions[index]).substr(skipped));
+        };
+        for (std::size_t begin = first; begin != last;) {
+            st::key128_t const head = head_of_version(begin);
+            std::size_t end = begin + 1;
+            while (end != last && head_of_version(end) == head) ++end;
+            if (end - begin > sorted_run_t::strings_layout_t::keys_per_row_k &&
+                key_of_(sources, versions[begin]) != key_of_(sources, versions[end - 1])) {
+                for (std::size_t index = begin; index != end; ++index) ++depths[index];
+                count_layers_(sources, versions, begin, end, depth + 1, depths);
+            }
+            begin = end;
+        }
+    }
+
+    /** Merges runs of strings: the upper runs folded newest first and then the lower runs,
+     *  concatenated, as one side, by unions of their keys, keeping the versions @p request's stamps
+     *  keep, written as new runs cut to equal sizes that never split the versions of one key. */
+    static expected<merged_runs_t> merge_strings_(volume_t& volume, run_pool_t& runs, io_channel_t& writing_channel,
+                                                  merge_request_t const& request) noexcept {
+        st::vector<sorted_run_t const*> listed;
+        if (listed.resize(request.upper.size() + request.lower.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge could not track its source runs"};
+        for (std::size_t index = 0; index != request.upper.size(); ++index) listed[index] = request.upper[index];
+        for (std::size_t index = 0; index != request.lower.size(); ++index)
+            listed[request.upper.size() + index] = request.lower[index];
+        std::span<sorted_run_t const* const> const sources {listed};
+
+        // The newest upper run is the first side, and each older one folds in after it, the
+        // lower level last.
+        std::uint32_t const upper_count = static_cast<std::uint32_t>(request.upper.size());
+        string_side_t merged_side;
+        if (status_t const first = side_of_(sources, upper_count - 1, upper_count, merged_side); first.failed())
+            return first;
+        for (std::uint32_t source = upper_count - 1; source-- != 0;) {
+            if (stopped_(request.cancellation)) return cancelled_status_();
+            string_side_t older;
+            if (status_t const listed_side = side_of_(sources, source, source + 1, older); listed_side.failed())
+                return listed_side;
+            if (status_t const folded = fold_sides_(sources, merged_side, older); folded.failed()) return folded;
+        }
+        if (!request.lower.empty()) {
+            if (stopped_(request.cancellation)) return cancelled_status_();
+            string_side_t lower;
+            if (status_t const listed_side = side_of_(sources, upper_count, static_cast<std::uint32_t>(sources.size()),
+                                                      lower);
+                listed_side.failed())
+                return listed_side;
+            if (status_t const folded = fold_sides_(sources, merged_side, lower); folded.failed()) return folded;
+        }
+
+        // The versions that survive, as the compaction of fixed-width keys decides it for each
+        // key in turn.
+        compaction_kind_t const kind = kind_of_(request.upper_order, request.depth);
+        st::vector<string_version_t> survivors;
+        if (survivors.reserve(merged_side.versions.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge of strings could not list its survivors"};
+        located_key_slot<key_slot_t> previous;
+        for (std::size_t key = 0; key != merged_side.keys.size(); ++key) {
+            std::size_t const begin = merged_side.keys[key];
+            std::size_t const end = key + 1 != merged_side.keys.size() ? merged_side.keys[key + 1]
+                                                                       : merged_side.versions.size();
+            for (std::size_t index = begin; index != end; ++index) {
+                string_version_t const version = merged_side.versions[index];
+                sorted_run_t const& source = *sources[version.source];
+                located_key_slot<key_slot_t> current;
+                current.key_slot.stored_key = source.head(version.position);
+                current.sorted_run = version.source;
+                current.kind = source.kind(version.position);
+                current.stamp = source.stamp(version.position);
+                current.position = version.position;
+                if (survives(index != begin ? &previous : nullptr, current, kind, request.stamps)) [[maybe_unused]]
+                    st::status_t const kept = survivors.push_back(st::assume_reserved, string_version_t {version});
+                previous = current;
+            }
+        }
+
+        // Each survivor plans its key, and a share of the layers it lands in, so the cut runs
+        // fit their limit.
+        st::vector<std::uint32_t> depths;
+        st::vector<std::uint64_t> planned;
+        if (depths.resize(survivors.size()) != st::status_t::success_k ||
+            planned.resize(survivors.size() + 1) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge of strings could not plan its runs"};
+        for (std::uint32_t& depth : depths) depth = 0;
+        count_layers_(sources, std::span<string_version_t const> {survivors}, 0, survivors.size(), 0,
+                      std::span<std::uint32_t> {depths});
+        planned[0] = 0;
+        for (std::size_t index = 0; index != survivors.size(); ++index)
+            planned[index + 1] = planned[index] + key_of_(sources, survivors[index]).size() +
+                                 2 * sizeof(st::key128_t) * depths[index];
+        auto const read_prefix = [&planned](std::uint64_t index, std::uint64_t& bytes) noexcept {
+            bytes = planned[static_cast<std::size_t>(index)];
+            return st::status_t::success_k;
+        };
+        // Runs split between keys alone, so a level finds every version of a key in one run.
+        auto const shares_key = [&](std::uint64_t index, bool& shared) noexcept {
+            shared = key_of_(sources, survivors[static_cast<std::size_t>(index)]) ==
+                     key_of_(sources, survivors[static_cast<std::size_t>(index) - 1]);
+            return st::status_t::success_k;
+        };
+        st::vector<compacted_sorted_run_t> cuts;
+        if (st::status_t const cut = plan_sorted_runs<key_slot_t>(survivors.size(), bounds_of_(request), read_prefix,
+                                                                  shares_key, cuts);
+            cut != st::status_t::success_k)
+            return compaction_status(cut);
+
+        merged_runs_t merged;
+        if (merged.reserve(cuts.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge could not track the runs it writes"};
+        std::size_t first = 0;
+        for (compacted_sorted_run_t const& cut : cuts) {
+            if (stopped_(request.cancellation)) {
+                runs.discard(volume, std::span<run_handle_t const> {merged});
+                return cancelled_status_();
+            }
+            std::span<string_version_t const> const run_versions =
+                std::span<string_version_t const> {survivors}.subspan(first,
+                                                                      static_cast<std::size_t>(cut.key_slots_count));
+            auto [written, write_status] = write_strings_run_(volume, writing_channel, sources, run_versions, request);
+            if (write_status.failed()) {
+                runs.discard(volume, std::span<run_handle_t const> {merged});
+                return write_status;
+            }
+            auto [taken, take_status] = runs.take(std::move(written));
+            if (take_status.failed()) {
+                volume.deallocate(written.extent());
+                runs.discard(volume, std::span<run_handle_t const> {merged});
+                return take_status;
+            }
+            [[maybe_unused]] st::status_t const placed = merged.push_back(std::move(taken));
+            first += static_cast<std::size_t>(cut.key_slots_count);
+        }
+        return merged;
+    }
+
+    /** Writes @p versions of @p sources, in order, as one new run of strings stamped from
+     *  @p request's floor. */
+    static expected<sorted_run_t> write_strings_run_(volume_t& volume, io_channel_t& writing_channel,
+                                                     std::span<sorted_run_t const* const> sources,
+                                                     std::span<string_version_t const> versions,
+                                                     merge_request_t const& request) noexcept {
+        std::size_t const count = versions.size();
+        std::uint64_t tails_bytes = 0;
+        for (string_version_t const version : versions)
+            tails_bytes += strings::tail_of(key_of_(sources, version)).size();
+        if (tails_bytes > limit<std::uint32_t>::max())
+            return status_t {status_code_t::capacity_exhausted_k, "A merged run's keys outgrow their offsets"};
+        st::vector<key_slot_t> key_slots;
+        st::vector<std::uint64_t> stamps;
+        st::vector<std::uint8_t> kinds;
+        st::vector<std::uint32_t> tail_offsets;
+        st::vector<byte_t> tails;
+        if (key_slots.resize(count) != st::status_t::success_k || stamps.resize(count) != st::status_t::success_k ||
+            kinds.resize(count) != st::status_t::success_k ||
+            tail_offsets.resize(count + 1) != st::status_t::success_k ||
+            tails.resize(static_cast<std::size_t>(tails_bytes)) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge of strings could not lay out a run"};
+        std::uint32_t written = 0;
+        for (std::size_t index = 0; index != count; ++index) {
+            sorted_run_t const& source = *sources[versions[index].source];
+            std::uint64_t const position = versions[index].position;
+            std::string_view const tail = strings::tail_of(source.key(position));
+            key_slot_t slot {};
+            slot.stored_key = source.head(position);
+            std::memcpy(slot.data, source.value(position).data(), key_slot_t::size);
+            key_slots[index] = slot;
+            stamps[index] = std::max(source.stamp(position), request.stamps.floor);
+            kinds[index] = static_cast<std::uint8_t>(source.kind(position));
+            tail_offsets[index] = written;
+            if (!tail.empty()) std::memcpy(tails.data() + written, tail.data(), tail.size());
+            written += static_cast<std::uint32_t>(tail.size());
+        }
+        tail_offsets[count] = written;
+        key_tails_column_t const column = tails_bytes != 0
+                                              ? key_tails_column_t {std::span<std::uint32_t const> {tail_offsets},
+                                                                    std::span<byte_t const> {tails}}
+                                              : key_tails_column_t {};
+        return sorted_run_t::write(volume, writing_channel, request.collection, uuid_generator(),
+                                   std::span<key_slot_t const> {key_slots}, std::span<std::uint64_t const> {stamps},
+                                   std::span<std::uint8_t const> {kinds}, request.stamps.floor, {}, {},
+                                   request.value_max_size, column);
+    }
+
+#pragma endregion Strings Merge
 
 #pragma region Private Types
 
@@ -1628,10 +2134,8 @@ class lsm_level_merger {
         /** Bytes of the values its key slots locate, before the section's alignment padding. */
         std::uint64_t stored_values_bytes = 0;
 
-        /** Where this run's cells start in the compaction's cells. */
-        std::uint64_t first_cell = 0;
-
-        /** Where this run's survivors start in the compaction's stamps, kinds and offsets. */
+        /** Where this run's survivors start in the compaction's cells, stamps,
+         *  kinds and offsets. */
         std::uint64_t first_key_slot = 0;
 
         /** Where this run's value copy ranges start in the compaction's. */
@@ -1670,34 +2174,36 @@ class lsm_level_merger {
 
     /** The bounds every run the merge writes must fit, which the run layout and @p request together fix. */
     [[nodiscard]] static sorted_run_bounds_t bounds_of_(merge_request_t const& request) noexcept {
+        // The trailer packs at most a stamp and a kind per key slot, which its cells outweigh, and
+        // one page of headers and padding, so the plan cuts the cells and values short enough to
+        // leave it room.
+        std::uint64_t const trailer_per_key_slot = sizeof(std::uint64_t) + sizeof(std::uint8_t);
+        std::uint64_t const planned = request.run_bytes_limit > portable_alignment_k
+                                          ? request.run_bytes_limit - portable_alignment_k
+                                          : 1;
         sorted_run_bounds_t bounds;
-        bounds.key_slots_capacity = request.run_key_slots_capacity;
-        bounds.file_bytes_limit = request.run_bytes_limit;
+        bounds.file_bytes_limit = planned / (sizeof(key_slot_t) + trailer_per_key_slot) * sizeof(key_slot_t);
         bounds.header_bytes = sorted_run_layout_t::header_bytes();
         bounds.alignment_bytes = portable_alignment_k;
-        bounds.branching = sorted_run_layout_t::branching_k;
         bounds.value_stride = is_fixed(value_layout_k) ? request.value_max_size : 0;
         return bounds;
     }
 
     /** Points a view of @p views at every source run's own cells, which the compactor reads in place. */
-    static status_t point_views_(level_t const& upper, level_t const* lower, st::vector<sorted_run_t const*>& sources,
+    static status_t point_views_(std::span<sorted_run_t const* const> upper, std::span<sorted_run_t const* const> lower,
+                                 st::vector<sorted_run_t const*>& sources,
                                  st::vector<sorted_run_index_view<key_slot_t>>& views) noexcept {
-        std::size_t const lower_runs = lower != nullptr ? lower->size() : 0;
-        std::size_t const runs = upper.size() + lower_runs;
+        std::size_t const runs = upper.size() + lower.size();
         if (sources.resize(runs) != st::status_t::success_k || views.resize(runs) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A merge could not track its source runs"};
-        for (std::size_t index = 0; index != upper.size(); ++index) sources[index] = &upper.run(index);
-        for (std::size_t index = 0; index != lower_runs; ++index) sources[upper.size() + index] = &lower->run(index);
+        for (std::size_t index = 0; index != upper.size(); ++index) sources[index] = upper[index];
+        for (std::size_t index = 0; index != lower.size(); ++index) sources[upper.size() + index] = lower[index];
 
         for (std::size_t index = 0; index != runs; ++index) {
             sorted_run_t const& run = *sources[index];
             std::span<key_slot_t const> const cells = run.cells();
-            if (run.layout().branching != sorted_run_layout_t::branching_k ||
-                cells.size() != run.layout().cells_count())
-                return {status_code_t::malformed_k, "A run's index is not laid out as a merge reads it"};
             views[index] = sorted_run_index_view<key_slot_t> {
-                cells.data(), run.population_count(), &run.stamps(), &run.kinds(), run.tails(), run.value_offsets()};
+                cells.data(), run.population_count(), &run.stamps(), &run.kinds(), {}, run.value_offsets()};
         }
         return {};
     }
@@ -1705,17 +2211,18 @@ class lsm_level_merger {
     /** Where the sections of @p run sit on its volume, and the stamp an ingest gave it, which a device compactor
      *  reads. */
     [[nodiscard]] static sorted_run_extents_t extents_of_(sorted_run_t const& run) noexcept {
-        volume_blob_t const& blob = run.blob();
-        if (blob.volume == utilities::volume_id_t::unmounted_k) return {.assigned_stamp = run.assigned_stamp()};
+        medium_extent_t const& blob = run.extent();
+        if (blob.medium.medium_id == utilities::registered_medium_id_t::unregistered_k)
+            return {.assigned_stamp = run.assigned_stamp()};
         sorted_run_header_t const& header = run.header();
         std::uint64_t const count = header.key_slots_count;
         std::uint64_t const offsets_bytes = round_up_to_multiple(sorted_run_layout_t::value_offsets_bytes(count),
                                                                  portable_alignment_k);
         return sorted_run_extents_t {
-            static_cast<std::uint32_t>(blob.volume),
+            std::uint32_t {blob.data_directory},
             blob.slice(sorted_run_layout_t::index_offset(), sorted_run_layout_t::index_section_bytes(count)),
             blob.slice(sorted_run_layout_t::value_offsets_offset(count), offsets_bytes),
-            blob.slice(sorted_run_layout_t::stamps_offset(count, header.stored_values_bytes, header.key_tails_bytes),
+            blob.slice(sorted_run_layout_t::stamps_offset(count, header.stored_values_bytes),
                        sorted_run_layout_t::trailer_bytes(header.stamps_bytes, header.kinds_bytes)),
             header.stamps_bytes,
             run.assigned_stamp()};
@@ -1800,13 +2307,13 @@ class lsm_level_merger {
         return {status_code_t::uninitialized_k, "The caller cancelled this compaction"};
     }
 
-    /** Reserves a blob for the run @p planned describes, writes its three sections, and opens it. */
+    /** Allocates an extent for the run @p planned describes, writes its sections, and opens it. */
     static expected<sorted_run_t> write_run_(volume_t& volume, io_channel_t& reading_channel,
                                              io_channel_t& writing_channel,
                                              std::span<sorted_run_t const* const> sources,
                                              compaction_output_t const& output, planned_run_t const& planned,
-                                             stored_value_size_t value_max_size, std::uint64_t floor,
-                                             cancellation_t const* cancellation) noexcept {
+                                             uuid_t const& collection, stored_value_size_t value_max_size,
+                                             std::uint64_t floor, cancellation_t const* cancellation) noexcept {
         uuid_t const content_id = uuid_generator();
         if (!content_id.is_valid())
             return status_t {status_code_t::internal_k, "A merge could not name the run it writes"};
@@ -1832,6 +2339,7 @@ class lsm_level_merger {
         header.branching = static_cast<std::uint16_t>(sorted_run_layout_t::branching_k);
         header.value_layout = value_layout_k;
         header.content_id = content_id;
+        header.collection = collection;
         header.stamps_bytes = column.saved_bytes();
         header.stamps_floor = floor;
         header.newest_stamp = newest;
@@ -1848,57 +2356,36 @@ class lsm_level_merger {
                     output.value_offsets[planned.first_key_slot + index] - begin);
         }
 
-        // The run's own tails and their offsets from its first key slot on, none for a run of whole keys.
-        st::vector<std::uint32_t> tail_offsets;
-        std::span<byte_t const> tails;
-        if (!output.tail_offsets.empty()) {
-            std::uint64_t const begin = output.tail_offsets[planned.first_key_slot];
-            std::uint64_t const end = output.tail_offsets[planned.first_key_slot + planned.key_slots_count];
-            if (end - begin > std::numeric_limits<std::uint32_t>::max())
-                return status_t {status_code_t::capacity_exhausted_k, "A merged run's tails outgrow their offsets"};
-            if (end != begin) {
-                if (tail_offsets.resize(static_cast<std::size_t>(planned.key_slots_count + 1)) !=
-                    st::status_t::success_k)
-                    return status_t {status_code_t::out_of_memory_k, "A merge could not lay out a run's tails"};
-                for (std::uint64_t index = 0; index != tail_offsets.size(); ++index)
-                    tail_offsets[index] = static_cast<std::uint32_t>(
-                        output.tail_offsets[planned.first_key_slot + index] - begin);
-                tails = std::span<byte_t const> {output.tails.data() + begin, static_cast<std::size_t>(end - begin)};
-            }
-        }
-        header.key_tails_bytes = tails.size();
+        std::span<key_slot_t const> const cells {output.cells.data() + planned.first_key_slot,
+                                                 static_cast<std::size_t>(planned.key_slots_count)};
+        st::vector<std::uint64_t> keys;
+        if (status_t const saved = sorted_run_t::save_keys(cells, keys); saved.failed()) return saved;
 
-        std::uint64_t const reserved_bytes = sorted_run_layout_t::blob_bytes(
-            header.key_slots_count, header.stored_values_bytes, header.stamps_bytes, header.kinds_bytes,
-            header.key_tails_bytes);
-        auto [reserved, create_status] = volume.create(sorted_run_t::name_of(content_id), blob_kind_t::sorted_run_k,
-                                                       reserved_bytes);
-        if (create_status.failed()) return create_status;
-        volume_blob_t const blob = reserved;
+        auto [extent, allocate_status] = volume.allocate(content_id, sorted_run_layout_t::blob_bytes(header));
+        if (allocate_status.failed()) return allocate_status;
 
-        key_tails_column_t const run_tails {std::span<std::uint32_t const> {tail_offsets}, tails};
         if (status_t const written = write_sections_(
-                volume, reading_channel, writing_channel, sources, output, planned, header, column, kinds,
-                std::span<stored_value_offset_t const> {value_offsets}, run_tails, blob, cancellation);
+                volume, reading_channel, writing_channel, sources, output, planned, header, column, kinds, cells,
+                std::span<std::uint64_t const> {keys}, std::span<stored_value_offset_t const> {value_offsets}, extent,
+                cancellation);
             written.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume.drop(writing_channel, sorted_run_t::name_of(content_id));
+            volume.deallocate(extent);
             return written;
         }
-        if (status_t const sealed = volume.seal(writing_channel, blob); sealed.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume.drop(writing_channel, sorted_run_t::name_of(content_id));
-            return sealed;
-        }
-        return sorted_run_t::attach(volume, writing_channel, blob);
+        expected<sorted_run_t> opened = sorted_run_t::open(volume, writing_channel, extent);
+        if (!opened) volume.deallocate(extent);
+        return opened;
     }
 
-    /** Writes the header, the cells, the value offsets, the gathered values, the tail offsets, the tails, the stamps
-     *  and the kinds of one new run, and makes them all durable. */
+    /** Writes the header, the cells and the saved tree of their keys, the value offsets, the
+     *  gathered values, the stamps and the kinds of one new run, and reaps every write, leaving the
+     *  flush to the manifest that names it. */
     static status_t write_sections_(volume_t& volume, io_channel_t& reading_channel, io_channel_t& writing_channel,
                                     std::span<sorted_run_t const* const> sources, compaction_output_t const& output,
                                     planned_run_t const& planned, sorted_run_header_t const& header,
                                     stamps_column_t const& column, kinds_column_t const& kinds,
-                                    std::span<stored_value_offset_t const> value_offsets,
-                                    key_tails_column_t const& tails, volume_blob_t const& blob,
+                                    std::span<key_slot_t const> cells, std::span<std::uint64_t const> keys,
+                                    std::span<stored_value_offset_t const> value_offsets, medium_extent_t const& blob,
                                     cancellation_t const* cancellation) noexcept {
         std::uint64_t const block_bytes = round_down_to_multiple(writing_channel.streams().buffer_bytes(),
                                                                  portable_alignment_k);
@@ -1918,8 +2405,8 @@ class lsm_level_merger {
             return queued;
         if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
 
-        if (status_t const cells = write_cells_(writer, output, planned, header, blob, block_bytes); cells.failed())
-            return cells;
+        if (status_t const index = sorted_run_t::write_index(writer, blob, header, cells, keys); index.failed())
+            return index;
         if (status_t const offsets = sorted_run_t::write_value_offsets(writer, blob, header, value_offsets);
             offsets.failed())
             return offsets;
@@ -1927,38 +2414,9 @@ class lsm_level_merger {
                                                   blob, block_bytes, cancellation);
             values.failed())
             return values;
-        if (status_t const written = sorted_run_t::write_tails(writer, blob, header, tails); written.failed())
-            return written;
         if (status_t const trailer = sorted_run_t::write_trailer(writer, blob, header, column, kinds); trailer.failed())
             return trailer;
-        return writer.make_durable();
-    }
-
-    /** Writes the cells the compaction laid out, which are already in cell order with their padding. */
-    static status_t write_cells_(write_pipeline_t& writer, compaction_output_t const& output,
-                                 planned_run_t const& planned, sorted_run_header_t const& header,
-                                 volume_blob_t const& blob, std::uint64_t block_bytes) noexcept {
-        std::uint64_t const section = sorted_run_layout_t::index_section_bytes(header.key_slots_count);
-        std::uint64_t const filled = sorted_run_layout_t::index_bytes(header.key_slots_count);
-        byte_t const* const cells = reinterpret_cast<byte_t const*>(output.cells.data() + planned.first_cell);
-        for (std::uint64_t written = 0; written != section;) {
-            std::uint64_t const room = section - written;
-            std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            auto [block, acquire_buffer_or_poll_status] = acquire_buffer_or_poll_(writer);
-            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
-            std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
-            std::uint64_t const left = filled > written ? filled - written : 0;
-            std::uint64_t const carried = left < chunk ? left : chunk;
-            if (carried != 0) std::memcpy(bytes.data(), cells + written, static_cast<std::size_t>(carried));
-            std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
-            if (status_t const queued = writer.enqueue_write(
-                    std::move(block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
-                queued.failed())
-                return queued;
-            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
-            written += chunk;
-        }
-        return {};
+        return writer.poll_all_completions();
     }
 
     /**
@@ -1971,7 +2429,7 @@ class lsm_level_merger {
     static status_t write_values_(volume_t& volume, io_channel_t& reading_channel, write_pipeline_t& writer,
                                   std::span<sorted_run_t const* const> sources, compaction_output_t const& output,
                                   planned_run_t const& planned, sorted_run_header_t const& header,
-                                  volume_blob_t const& blob, std::uint64_t block_bytes,
+                                  medium_extent_t const& blob, std::uint64_t block_bytes,
                                   cancellation_t const* cancellation) noexcept {
         if constexpr (holds_values_inline_k) return {};
         else {
@@ -1991,7 +2449,7 @@ class lsm_level_merger {
             if (scratch.resize(static_cast<std::size_t>(block_bytes + read_block)) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A merge could not hold the values it gathers"};
 
-            read_pipeline_t reader {volume.disk(), reading_channel, volume.medium()};
+            read_pipeline_t reader {volume.disk(), reading_channel, medium_reference_t {}};
             channel_drain<disk_t> const parked {volume.disk(), reading_channel};
 
             status_t first;
@@ -2042,7 +2500,7 @@ class lsm_level_merger {
                         std::uint64_t const skipped = first - aligned;
                         std::uint64_t const covered = round_up_to_multiple(skipped + copied.bytes,
                                                                            portable_alignment_k);
-                        extent_t const window = source.blob().slice(aligned, covered);
+                        extent_t const window = source.extent().slice(aligned, covered);
                         if (window.length != covered)
                             return {status_code_t::malformed_k, "A source run is shorter than the values it copies"};
 
@@ -2057,7 +2515,11 @@ class lsm_level_merger {
                         piece.skipped = static_cast<std::uint32_t>(from - chunk_offset);
                         piece.carried = static_cast<std::uint32_t>(to > from ? to - from : 0);
                         pending[tag % depth] = piece;
-                        if (reader.enqueue_read(extent_t {window.offset + chunk_offset, length}, tag).failed()) break;
+                        if (reader
+                                .enqueue_read(source.extent().medium, extent_t {window.offset + chunk_offset, length},
+                                              tag)
+                                .failed())
+                            break;
                         ++tag;
                         gathered += piece.carried;
                         chunk_offset += length;
@@ -2128,24 +2590,22 @@ enum class compaction_outcome_t : std::uint8_t {
     published_k,
 };
 
-/** One run of a tree as a schema names it, which is everything a restore needs to open it again. */
+/** One run of a tree as a manifest names it, which is everything a restore needs to
+ *  open it again. */
 struct lsm_tree_run_record_t {
 
     /** The level the run belongs to, zero being the level flushes land on. */
     std::uint32_t level_number = 0;
 
-    /** The run's own identifier, which is also the name its blob answers to on the volume. */
-    uuid_t content_id {};
-};
-
-/** The stamp an ingest assigned a run written at stamp zero, which a schema keeps beside the run's record, since the
- *  run's blob keeps its zeros and the record is copied raw into another schema. */
-struct lsm_tree_run_stamp_t {
-
-    /** The run's own identifier, as its record names it. */
+    /** The run's own identifier, which its header also carries and which a manifest
+     *  may leave zero. */
     uuid_t content_id {};
 
-    /** The stamp every version of the run carries. */
+    /** Where the run sits on its volume. */
+    medium_extent_t extent {};
+
+    /** The stamp an ingest assigned a run written at stamp zero, since the run keeps its
+     *  zeros, or zero. */
     std::uint64_t stamp = 0;
 };
 
@@ -2161,7 +2621,8 @@ struct lsm_tree_publication_hook_t {
      *  the set and every run only it names, leaving the current set as it was. */
     status_t (*prepare)(void* context) noexcept = nullptr;
 
-    /** Called with @c context after the publication and before the first consumed run is dropped. */
+    /** Called with @c context after the publication and before the first consumed run is given
+     *  back; a failure leaves the consumed runs' bytes to the next mount. */
     status_t (*notify)(void* context) noexcept = nullptr;
 
     /** What @c notify is handed, which is the owner that records the run set the tree now holds. */
@@ -2175,8 +2636,10 @@ struct lsm_tree_publication_hook_t {
 /**
  *  @brief Every level of one collection's LSM tree, as the level set its writer last published.
  *
- *  Readers never reach the tree's own pointer: each publication hands the new set to a hook that publishes it, and
- *  the set is the only allocation a reader walks, so moving the tree moves no set.
+ *  The tree holds two level sets, the current one and a spare that a publication builds the next
+ *  one in; both live in one allocation made at mount, so moving the tree moves no set a reader
+ *  walks. A run lives in the database's run pool and counts the sets naming it, so it is given back
+ *  once the last of the two lets it go.
  *
  *  @tparam atomic_reference_ The reference the compaction claim and a caller's cancellation word are owned through.
  *  @tparam waiter_type_ What the core does while the tree waits for its reads and barriers.
@@ -2195,10 +2658,16 @@ class lsm_tree {
     using volume_t = volume_type_;
 
     /** One level of the tree. */
-    using level_t = lsm_level<key_slot_t, volume_t, waiter_type_>;
+    using level_t = lsm_level<key_slot_t, volume_t, atomic_reference_, waiter_type_>;
 
     /** One immutable run of a level. */
     using sorted_run_t = typename level_t::sorted_run_t;
+
+    /** The database's pool every run of this tree lives in. */
+    using run_pool_t = typename level_t::run_pool_t;
+
+    /** How a level names one run. */
+    using run_handle_t = typename level_t::run_handle_t;
 
     /** The key the runs order their key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
@@ -2206,7 +2675,7 @@ class lsm_tree {
     /** The transport the volume moves bytes through. */
     using disk_t = std::remove_reference_t<decltype(std::declval<volume_type_&>().disk())>;
 
-    /** The compaction that replaces two levels with one. */
+    /** The compaction that replaces picked runs of two levels with new ones. */
     using merger_t = lsm_level_merger<key_slot_t, volume_t, atomic_reference_, waiter_type_>;
 
     /** The word a caller raises to stop a merge. */
@@ -2228,8 +2697,10 @@ class lsm_tree {
         level_set_t() noexcept = default;
         level_set_t(level_set_t const&) = delete;
         level_set_t& operator=(level_set_t const&) = delete;
+        level_set_t(level_set_t&&) noexcept = default;
+        level_set_t& operator=(level_set_t&&) noexcept = default;
 
-        /** Levels the set holds, which is at least one. */
+        /** Levels the set holds, which is at least one once published. */
         [[nodiscard]] std::size_t size() const noexcept { return levels_.size(); }
 
         /** The level numbered @p number, which is also the level at that index. */
@@ -2263,7 +2734,7 @@ class lsm_tree {
 
         friend class lsm_tree;
 
-        /** The levels, which own their runs unless the set relinquishes them to its successor. */
+        /** The levels, which name runs the tree counts this set among the namers of. */
         st::vector<level_t> levels_;
     };
 
@@ -2274,37 +2745,61 @@ class lsm_tree {
     lsm_tree() noexcept = default;
     lsm_tree(lsm_tree const&) = delete;
     lsm_tree& operator=(lsm_tree const&) = delete;
-    lsm_tree(lsm_tree&&) noexcept = default;
-    lsm_tree& operator=(lsm_tree&&) noexcept = default;
 
-    /** An empty tree of one level zero over @p volume, which must outlive it, flushed memory runs of up to
-     *  @p memory_runs_max_bytes at a time. */
-    static expected<lsm_tree> mount(volume_t& volume, lsm_tree_config_t const& config,
-                                    std::size_t memory_runs_max_bytes) noexcept {
+    lsm_tree(lsm_tree&& other) noexcept
+        : volume_(std::exchange(other.volume_, nullptr)), runs_(std::exchange(other.runs_, nullptr)),
+          config_(other.config_), slot_bytes_(other.slot_bytes_), level_sets_(std::move(other.level_sets_)),
+          current_level_set_(other.current_level_set_), compacting_(other.compacting_) {}
+
+    lsm_tree& operator=(lsm_tree&& other) noexcept {
+        if (this == &other) return *this;
+        forget_level_sets_();
+        volume_ = std::exchange(other.volume_, nullptr);
+        runs_ = std::exchange(other.runs_, nullptr);
+        config_ = other.config_;
+        slot_bytes_ = other.slot_bytes_;
+        level_sets_ = std::move(other.level_sets_);
+        current_level_set_ = other.current_level_set_;
+        compacting_ = other.compacting_;
+        return *this;
+    }
+
+    /** Lets go of every run without giving its bytes back, since the manifest still names them. */
+    ~lsm_tree() noexcept { forget_level_sets_(); }
+
+    /**
+     *  @brief An empty tree of one level zero over @p volume, whose runs live in @p runs.
+     *  @param[in,out] volume The volume the runs are allocated on, outliving the tree.
+     *  @param[in] config The enlarge factor and value sizes of the tree, and the collection
+     *      its runs name.
+     *  @param[in,out] runs The database's pool the runs live in, outliving the tree.
+     *  @param[in] slot_bytes The unit levels and runs are sized by, which only tests shrink.
+     */
+    static expected<lsm_tree> mount(volume_t& volume, lsm_tree_config_t const& config, run_pool_t& runs,
+                                    std::uint64_t slot_bytes = utilities::slot_bytes_k) noexcept {
         // The enlarge factor sizes every level and level zero's run count alike, so a tree without one has no shape
         if (config.level_enlarge_factor < storage_limits_t::level_min_enlarge_factor_k ||
             config.level_enlarge_factor > storage_limits_t::level_max_enlarge_factor_k)
             return status_t {status_code_t::invalid_argument_k, "A tree grows its levels by a factor in its bounds"};
+        if (slot_bytes <= utilities::slot_payload_offset_k)
+            return status_t {status_code_t::invalid_argument_k, "A slot holds more than its owner block"};
         lsm_tree tree;
         tree.volume_ = &volume;
+        tree.runs_ = &runs;
         tree.config_ = config;
-        tree.memory_runs_max_bytes_ = memory_runs_max_bytes;
-        tree.levels_.reset(new (std::nothrow) level_set_t {});
-        if (!tree.levels_ || tree.levels_->levels_.push_back(level_t::of(0, lsm_level_order_t::overlapping_k)) !=
-                                 st::status_t::success_k)
+        tree.slot_bytes_ = slot_bytes;
+        if (tree.level_sets_.resize(2) != st::status_t::success_k ||
+            tree.level_sets_[0].levels_.push_back(level_t::of(runs, 0, lsm_level_order_t::overlapping_k)) !=
+                st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "A tree could not hold its first level"};
         return tree;
     }
 
-    /** Returns every run of every level to the volume, which destroys the tree's data and which only a tree no
-     *  reader reaches may. */
-    status_t destroy(io_channel_t& channel) noexcept {
-        status_t first;
-        for (std::size_t number = 0; number != levels_->size(); ++number)
-            if (status_t const dropped = levels_->levels_[number].drop(*volume_, channel);
-                dropped.failed() && first.succeeded())
-                first = dropped;
-        return first;
+    /** Gives every run of every level back to the volume, which destroys the tree's data and which
+     *  only a tree no reader reaches and no manifest names may. */
+    void destroy() noexcept {
+        abandon_(current_());
+        abandon_(spare_());
     }
 
 #pragma endregion Construction
@@ -2312,10 +2807,13 @@ class lsm_tree {
 #pragma region Lookups
 
     /** The level set the last publication made current, which its writer builds the next one from. */
-    [[nodiscard]] level_set_t const& levels() const noexcept { return *levels_; }
+    [[nodiscard]] level_set_t const& levels() const noexcept { return level_sets_[current_level_set_]; }
 
     /** The volume every run of this tree lives on. */
     [[nodiscard]] volume_t& volume() const noexcept { return *volume_; }
+
+    /** The pool every run of this tree lives in. */
+    [[nodiscard]] run_pool_t& runs() const noexcept { return *runs_; }
 
     /**
      *  @brief Whether @p taken carries @p stored_key, and whether the key slot holding it locates a value.
@@ -2382,7 +2880,7 @@ class lsm_tree {
             if (pending.resize(depth) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A tree could not track its reads in flight"};
 
-            read_pipeline_t reader {volume_->disk(), channel, volume_->medium()};
+            read_pipeline_t reader {volume_->disk(), channel, medium_reference_t {}};
             status_t first;
             auto adapter = [&](completed_buffer_t const& completed) noexcept {
                 pending_read_t const& piece = pending[completed.tag % depth];
@@ -2397,27 +2895,29 @@ class lsm_tree {
             std::uint64_t chunk = 0;
             request_tag_t tag = 0;
             value_window_t window;
+            medium_reference_t medium;
             while (request != stored_keys.size() || reader.outstanding() != 0) {
                 while (request != stored_keys.size() && reader.can_enqueue()) {
                     if (chunk == 0) {
                         lsm_tree_position_t position;
                         lookup_result_t const found = find(taken, stored_keys[request], position, stamp);
                         results[request] = found;
-                        window = found == lookup_result_t::written_k
-                                     ? taken.level(position.level_number).value_window(position.level_position)
-                                     : value_window_t {};
+                        level_t const& level = taken.level(position.level_number);
+                        window = found == lookup_result_t::written_k ? level.value_window(position.level_position)
+                                                                     : value_window_t {};
                         if (window.extent.length == 0) {
                             if (found == lookup_result_t::written_k)
                                 sink(request, std::uint64_t {0}, std::span<byte_t const> {});
                             ++request;
                             continue;
                         }
+                        medium = level.run(position.level_position.run_index).extent().medium;
                     }
                     std::uint64_t const at = chunk * block_bytes;
                     std::uint64_t const room = window.extent.length - at;
                     std::uint64_t const length = block_bytes < room ? block_bytes : room;
                     pending[tag % depth] = piece_of_(window, request, at, length);
-                    if (reader.enqueue_read(extent_t {window.extent.offset + at, length}, tag).failed()) break;
+                    if (reader.enqueue_read(medium, extent_t {window.extent.offset + at, length}, tag).failed()) break;
                     ++tag;
                     if (at + length == window.extent.length) {
                         ++request;
@@ -2457,117 +2957,110 @@ class lsm_tree {
                    std::span<stored_value_offset_t const> value_offsets, stored_value_size_t value_max_size,
                    lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
                    key_tails_column_t const& tails = {}) noexcept {
-        auto [written, write_sorted_run_status] = sorted_run_t::write(*volume_, channel, uuid_generator(), key_slots,
-                                                                      stamps, kinds, floor, stored_values,
-                                                                      value_offsets, value_max_size, tails);
+        auto [written, write_sorted_run_status] = sorted_run_t::write(
+            *volume_, channel, config_.collection, uuid_generator(), key_slots, stamps, kinds, floor, stored_values,
+            value_offsets, value_max_size, tails);
         if (write_sorted_run_status.failed()) return write_sorted_run_status;
-        uuid_t const content_id = written.content_id();
-
-        std::size_t const nothing_consumed = levels_->size();
-        auto [next, carried_status] = carried_(nothing_consumed, nothing_consumed);
-        if (carried_status.failed()) {
-            [[maybe_unused]] status_t const abandoned = sorted_run_t::drop(*volume_, channel, content_id);
-            return carried_status;
+        auto [flushed, take_status] = runs_->take(std::move(written));
+        if (take_status.failed()) {
+            volume_->deallocate(written.extent());
+            return take_status;
         }
-        if (status_t const adopted = next->levels_[0].insert_run(std::move(written)); adopted.failed()) {
-            relinquish_(*next);
-            [[maybe_unused]] status_t const abandoned = sorted_run_t::drop(*volume_, channel, content_id);
-            return adopted;
+        std::span<run_handle_t const> const placed {&flushed, 1};
+        if (status_t const prepared = prepare_next_({}, 0, placed); prepared.failed()) {
+            runs_->discard(*volume_, placed);
+            return prepared;
         }
-        return replace_(std::move(next), published, channel, {});
+        return publish_(published);
     }
 
     /**
      *  @brief Opens the runs @p runs names and publishes them as the level set of this tree.
      *  @param[in,out] channel The channel every run's header and index is read on, held by the calling thread.
-     *  @param[in] runs The runs in the order their levels hold them, which is oldest first on level zero.
-     *  @param[in] stamps The stamps ingests assigned runs written at stamp zero, which each such run takes again.
+     *  @param[in] runs The runs in the order their levels hold them, which is oldest first on level
+     *      zero, each carrying the stamp an ingest assigned it or zero.
      *  @param[in] published What to call once the restored set is current, as a flush does.
-     *  @return Success, or the status that stopped it with the empty level set still current.
+     *  @return Success, or the status that stopped it with the empty level set still current and
+     *      every run left on the volume.
      *
      *  @note Only a tree still holding the one empty level @c mount built takes these, so a reopen
      *      adopts what the medium carries and no call ever merges two level sets into one.
      */
     status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
-                     std::span<lsm_tree_run_stamp_t const> stamps,
                      lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        if (levels_->size() != 1 || !levels_->level(0).empty())
+        if (levels().size() != 1 || !levels().level(0).empty())
             return {status_code_t::invalid_argument_k, "A tree takes its stored runs only while it holds none"};
         if (runs.empty()) return {};
 
         std::uint32_t deepest = 0;
-        for (std::size_t index = 0; index != runs.size(); ++index)
-            if (runs[index].level_number > deepest) deepest = runs[index].level_number;
+        for (lsm_tree_run_record_t const& record : runs)
+            if (record.level_number > deepest) deepest = record.level_number;
 
-        // The set owns every run it opens, so abandoning it frees them all.
-        std::unique_ptr<level_set_t> next {new (std::nothrow) level_set_t {}};
-        if (!next || next->levels_.reserve(std::size_t {deepest} + 1) != st::status_t::success_k)
+        level_set_t& next = spare_();
+        if (next.levels_.reserve(std::size_t {deepest} + 1) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A tree could not hold the levels it restores"};
-        for (std::uint32_t number = 0; number <= deepest; ++number) {
-            level_t level = level_t::of(number,
-                                        number == 0 ? lsm_level_order_t::overlapping_k : lsm_level_order_t::sorted_k);
-            [[maybe_unused]] st::status_t const placed = next->levels_.push_back(std::move(level));
-        }
+        for (std::uint32_t number = 0; number <= deepest; ++number) [[maybe_unused]]
+            st::status_t const placed = next.levels_.push_back(level_t::of(
+                *runs_, number, number == 0 ? lsm_level_order_t::overlapping_k : lsm_level_order_t::sorted_k));
 
-        for (std::size_t index = 0; index != runs.size(); ++index) {
-            auto [opened, open_sorted_run_status] = sorted_run_t::open(*volume_, channel, runs[index].content_id);
-            if (open_sorted_run_status.failed()) return open_sorted_run_status;
-            for (lsm_tree_run_stamp_t const& assigned : stamps) {
-                if (!(assigned.content_id == runs[index].content_id)) continue;
-                if (status_t const stamped = opened.assign_stamp(assigned.stamp); stamped.failed()) return stamped;
-                break;
+        for (lsm_tree_run_record_t const& record : runs) {
+            if (status_t const restored = restore_run_(channel, record, next); restored.failed()) {
+                forget_(next);
+                return restored;
             }
-            if (status_t const adopted = next->levels_[runs[index].level_number].insert_run(std::move(opened));
-                adopted.failed())
-                return adopted;
         }
-        return replace_(std::move(next), published, channel, {});
+        if (published.prepare != nullptr)
+            if (status_t const prepared = published.prepare(published.context); prepared.failed()) {
+                forget_(next);
+                return prepared;
+            }
+        return replace_(published);
     }
 
     /**
-     *  @brief A new set naming every run of the current one, and @p runs, sorted and
-     *      disjoint, on the level @c ingest_level_ picks for them, which grows empty sorted
+     *  @brief Prepares the next level set naming every run of the current one, and @p runs, sorted
+     *      and disjoint, on the level @c ingest_level_ picks for them, which grows empty sorted
      *      levels until it exists.
-     *  @param[in,out] channel The channel a failed set's runs are dropped on, held by the calling thread.
-     *  @param[in,out] runs The runs an ingest wrote, in ascending order of their keys, each moved into the set.
-     *  @return The set, or the status that stopped it, with every run it took dropped and the rest left attached.
-     *  @note The caller holds what serializes the tree's publications, so the current set holds still.
+     *  @param[in,out] runs The runs an ingest wrote, in ascending order of their keys, each taken
+     *      into the run pool.
+     *  @return Success, or the status that stopped it, with every run it took given back and the
+     *      rest left in @p runs.
+     *  @note The caller holds what serializes the tree's publications, so the current set holds
+     *      still, and calls @c adopt and then @c retire before it prepares again.
      */
-    expected<std::unique_ptr<level_set_t>> prepare_ingest(io_channel_t& channel,
-                                                          std::span<sorted_run_t> runs) noexcept {
-        if (runs.empty()) return status_t {status_code_t::invalid_argument_k, "An ingest publishes at least one run"};
+    status_t prepare_ingest(std::span<sorted_run_t> runs) noexcept {
+        if (runs.empty()) return {status_code_t::invalid_argument_k, "An ingest publishes at least one run"};
+        if (!spare_().levels_.empty())
+            return {status_code_t::invalid_argument_k, "A tree retires one set before it prepares another"};
         std::uint64_t bytes = 0;
         for (sorted_run_t const& run : runs) bytes += run.size_bytes();
-        std::size_t const target = ingest_level_(*levels_, runs.front().lower_stored_key(),
+        std::size_t const target = ingest_level_(levels(), runs.front().lower_stored_key(),
                                                  runs.back().upper_stored_key(), bytes);
-        auto [next, carried_status] = carried_(levels_->size(), levels_->size());
-        if (carried_status.failed()) return carried_status;
-        for (std::size_t number = next->levels_.size(); number <= target; ++number)
-            if (next->levels_.push_back(level_t::of(static_cast<std::uint32_t>(number), lsm_level_order_t::sorted_k)) !=
-                st::status_t::success_k) {
-                relinquish_(*next);
-                return status_t {status_code_t::out_of_memory_k, "A tree could not hold another level"};
+
+        st::vector<run_handle_t> taken;
+        if (taken.reserve(runs.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A tree could not track the runs an ingest wrote"};
+        for (sorted_run_t& run : runs) {
+            auto [handle, take_status] = runs_->take(std::move(run));
+            if (take_status.failed()) {
+                runs_->discard(*volume_, std::span<run_handle_t const> {taken});
+                return take_status;
             }
-        if (status_t const reserved = next->levels_[target].reserve(runs.size()); reserved.failed()) {
-            relinquish_(*next);
-            return reserved;
+            [[maybe_unused]] st::status_t const placed = taken.push_back(std::move(handle));
         }
-        for (sorted_run_t& run : runs)
-            if (status_t const bound = next->levels_[target].insert_run(std::move(run)); bound.failed()) {
-                abandon_(*next, channel);
-                return bound;
-            }
-        return std::move(next);
+        if (status_t const prepared = prepare_next_({}, target, taken); prepared.failed()) {
+            runs_->discard(*volume_, std::span<run_handle_t const> {taken});
+            return prepared;
+        }
+        return {};
     }
 
-    /** Makes @p next current and answers the set it replaced, which still names every run, so a reader holding it
-     *  reads on until the caller hands it to @c retire. */
-    [[nodiscard]] std::unique_ptr<level_set_t> adopt(std::unique_ptr<level_set_t> next) noexcept {
-        return std::exchange(levels_, std::move(next));
-    }
+    /** Makes the set @c prepare_ingest prepared current; the set it replaced still names every run,
+     *  so a reader holding it reads on until the caller calls @c retire. */
+    void adopt() noexcept { current_level_set_ ^= 1; }
 
-    /** Frees @p replaced, a set @c adopt replaced, without freeing a run, since its successor names them all. */
-    static void retire(std::unique_ptr<level_set_t> replaced) noexcept { relinquish_(*replaced); }
+    /** Empties the set @c adopt replaced, once no reader can hold it. */
+    void retire() noexcept { abandon_(spare_()); }
 
     /** Whether any level of @p taken is over the bytes its number admits. */
     [[nodiscard]] bool needs_compaction(level_set_t const& taken) const noexcept {
@@ -2575,7 +3068,9 @@ class lsm_tree {
     }
 
     /**
-     *  @brief Merges the shallowest level that is over its bounds into the level below it and publishes it.
+     *  @brief Merges the runs of the shallowest level over its bounds that cost least with the
+     *      runs below they overlap, or moves one down untouched when it overlaps none, and
+     *      publishes the result.
      *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] placement Where the compaction runs, which a collection leaves automatic.
@@ -2586,7 +3081,7 @@ class lsm_tree {
      *  @param[in] device_fold How a device composes the collection's changes, or @c no_device_fold_t where none does,
      *      which keeps every merge holding a change on the host.
      *  @param[in] published What to call once the merged set is current, which returns once no reader holds the set
-     *      it replaced and before a consumed run is dropped.
+     *      it replaced and before a consumed run is given back.
      *  @param[in] stamps Which older versions survive for readers and for a mount, and the floor the new runs count
      *      from, where the default keeps the newest version of every key alone.
      *  @return What the pass did, or the status that stopped it with the current level set untouched.
@@ -2609,10 +3104,12 @@ class lsm_tree {
     }
 
     /**
-     *  @brief Drops every version stamped above @p ceiling, merging down each level that holds one until none does.
+     *  @brief Drops every version stamped above @p ceiling, merging down each run that holds one
+     *      until none does.
      *
-     *  A mount runs this before anything draws a stamp: a crash may leave runs holding commits the schema it found
-     *  never promised, and those land nowhere else, so dropping them all leaves only commits that landed whole.
+     *  A mount runs this before anything draws a stamp: a crash may leave runs holding commits the
+     *  manifest it found never promised, and those land nowhere else, so dropping them all leaves
+     *  only commits that landed whole.
      */
     template <utilities::fold_concept fold_type_>
     status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel, std::uint64_t ceiling,
@@ -2624,7 +3121,7 @@ class lsm_tree {
         stamps.ceiling = ceiling;
         stamps.floor = ceiling;
         status_t result;
-        while (result.succeeded() && above_(*levels_, ceiling) != levels_->size()) {
+        while (result.succeeded() && above_(levels(), ceiling) != levels().size()) {
             // A mount truncates on the host, so no device composes a change
             expected<compaction_outcome_t> const outcome = compact_once_(
                 reading_channel, writing_channel, compaction_placement_t::host_k, {}, nullptr, fold,
@@ -2642,13 +3139,14 @@ class lsm_tree {
 
 #pragma region Private Types
 
-    /** Which level one merge pass takes down into the level below it. */
+    /** Which runs one merge pass takes down into the level below. */
     enum class merge_choice_t : std::uint8_t {
 
-        /** The shallowest level over the bytes its number admits. */
+        /** Runs of the shallowest level over the bytes its number admits. */
         overfull_k,
 
-        /** The shallowest level holding a version above the ceiling of the pass's stamps. */
+        /** Runs of the shallowest level holding a version above the ceiling of
+         *  the pass's stamps. */
         above_ceiling_k,
     };
 
@@ -2666,6 +3164,34 @@ class lsm_tree {
 
         /** Bytes of the value that the blocks before this one carried. */
         std::uint64_t offset = 0;
+    };
+
+    /** The runs one pass consumes: those of the upper level first, then those
+     *  below they overlap. */
+    struct picked_runs_t {
+
+        /** The picked runs, the upper level's oldest first or ascending, then the
+         *  lower level's ascending. */
+        st::vector<sorted_run_t const*> runs;
+
+        /** How many of @c runs belong to the upper level. */
+        std::size_t upper_count = 0;
+
+        /** The least key any picked run holds. */
+        stored_key_t lower_stored_key = limit<stored_key_t>::max();
+
+        /** The greatest key any picked run holds. */
+        stored_key_t upper_stored_key = limit<stored_key_t>::min();
+
+        /** The upper level's picked runs. */
+        [[nodiscard]] std::span<sorted_run_t const* const> upper() const noexcept {
+            return std::span<sorted_run_t const* const> {runs}.first(upper_count);
+        }
+
+        /** The lower level's picked runs. */
+        [[nodiscard]] std::span<sorted_run_t const* const> lower() const noexcept {
+            return std::span<sorted_run_t const* const> {runs}.subspan(upper_count);
+        }
     };
 
 #pragma endregion Private Types
@@ -2695,95 +3221,145 @@ class lsm_tree {
             std::memory_order_relaxed);
     }
 
-    /** Forgets every run of @p set without freeing one, since the set that replaced it names them. */
-    static void relinquish_(level_set_t& set) noexcept {
-        for (std::size_t number = 0; number != set.levels_.size(); ++number) set.levels_[number].relinquish();
+    /** The set readers are handed. */
+    [[nodiscard]] level_set_t& current_() noexcept { return level_sets_[current_level_set_]; }
+
+    /** The set the next publication is built in, which is empty between publications. */
+    [[nodiscard]] level_set_t& spare_() noexcept { return level_sets_[current_level_set_ ^ 1]; }
+
+    /** Counts @p levels among the sets naming each of its runs. */
+    void name_(level_set_t& levels) noexcept {
+        for (level_t const& level : levels.levels_)
+            for (run_handle_t const handle : level.runs()) ++runs_->at(handle)->level_sets_naming;
     }
 
-    /** Drops and frees every run of @p levels the current level set does not name, and forgets the
-     *  rest. */
-    void abandon_(level_set_t& levels, io_channel_t& channel) noexcept {
-        for (std::size_t number = 0; number != levels.levels_.size(); ++number)
-            for (std::size_t index = 0; index != levels.level(number).size(); ++index) {
-                sorted_run_t const* const run = &levels.level(number).run(index);
-                if (names_(*levels_, run)) continue;
-                [[maybe_unused]] status_t const dropped = sorted_run_t::drop(*volume_, channel, run->content_id());
-                delete run;
-            }
-        relinquish_(levels);
-    }
-
-    /** Whether @p levels names @p run. */
-    [[nodiscard]] static bool names_(level_set_t const& levels, sorted_run_t const* run) noexcept {
-        for (std::size_t number = 0; number != levels.size(); ++number)
-            for (std::size_t index = 0; index != levels.level(number).size(); ++index)
-                if (&levels.level(number).run(index) == run) return true;
-        return false;
-    }
-
-    /**
-     *  @brief A new set naming every run of the current one but those of the levels @p first through @p last.
-     *  @param[in] first The first level whose runs are left behind, which a merge consumes.
-     *  @param[in] last The last such level, below @p first when the caller consumes none.
-     */
-    expected<std::unique_ptr<level_set_t>> carried_(std::size_t first, std::size_t last) const noexcept {
-        level_set_t const& source = *levels_;
-        std::unique_ptr<level_set_t> next {new (std::nothrow) level_set_t {}};
-        if (!next || next->levels_.reserve(source.size()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A tree could not prepare its next level set"};
-
-        for (std::size_t number = 0; number != source.size(); ++number) {
-            level_t level = level_t::of(source.level(number).number(), source.level(number).order());
-            if (number < first || number > last)
-                if (status_t const carried = level.carry(source.level(number)); carried.failed()) {
-                    level.relinquish();
-                    relinquish_(*next);
-                    return carried;
+    /** Empties @p levels, giving back the bytes of every run no other set names and vacating it. */
+    void abandon_(level_set_t& levels) noexcept {
+        for (level_t const& level : levels.levels_)
+            for (run_handle_t const handle : level.runs())
+                if (sorted_run_t* const run = runs_->at(handle); run && --run->level_sets_naming == 0) {
+                    volume_->deallocate(run->extent());
+                    // Readers of its last naming set left before the retire, so this generation
+                    // step races none.
+                    runs_->vacate(handle);
                 }
-            [[maybe_unused]] st::status_t const placed = next->levels_.push_back(std::move(level));
+        levels.levels_.clear();
+    }
+
+    /** Empties @p levels, vacating every run no other set names and leaving its bytes to the
+     *  manifest that names it. */
+    void forget_(level_set_t& levels) noexcept {
+        for (level_t const& level : levels.levels_)
+            for (run_handle_t const handle : level.runs())
+                if (sorted_run_t* const run = runs_->at(handle); run && --run->level_sets_naming == 0)
+                    runs_->vacate(handle); // Its last set's readers already left, as in abandon_.
+        levels.levels_.clear();
+    }
+
+    /** Forgets both sets, which a tree going away does while a manifest still names its runs. */
+    void forget_level_sets_() noexcept {
+        for (level_set_t& levels : level_sets_) forget_(levels);
+    }
+
+    /** Opens the run @p record names into its level of @p next, taking the stamp an ingest assigned
+     *  it again, and counts @p next among its namers. */
+    status_t restore_run_(io_channel_t& channel, lsm_tree_run_record_t const& record, level_set_t& next) noexcept {
+        auto [opened, open_sorted_run_status] = sorted_run_t::open(*volume_, channel, record.extent);
+        if (open_sorted_run_status.failed()) return open_sorted_run_status;
+        if (record.stamp != 0)
+            if (status_t const stamped = opened.assign_stamp(record.stamp); stamped.failed()) return stamped;
+        auto [handle, take_status] = runs_->take(std::move(opened));
+        if (take_status.failed()) return take_status;
+        if (status_t const inserted = next.levels_[record.level_number].insert_run(handle); inserted.failed()) {
+            runs_->vacate(handle);
+            return inserted;
         }
-        return next;
+        ++runs_->at(handle)->level_sets_naming;
+        return {};
     }
 
     /**
-     *  @brief Makes @p next current, calls @p published, then frees the set it replaced and drops @p consumed.
-     *
-     *  The hook publishes the new set to readers and returns only once none is left in the old one, so the old set
-     *  and the runs only it named are unreachable by then; its other runs belong to @p next.
+     *  @brief Builds the spare set from the current one, leaving out @p consumed and naming
+     *      @p placed on level @p number, which grows empty sorted levels until it exists, then
+     *      counts the spare among their namers.
+     *  @return Success, or the status that stopped it with the spare empty and @p placed for the
+     *      caller to give back.
      */
-    status_t replace_(std::unique_ptr<level_set_t> next, lsm_tree_publication_hook_t const& published,
-                      io_channel_t& channel, std::span<sorted_run_t const* const> consumed) noexcept {
+    status_t prepare_next_(std::span<sorted_run_t const* const> consumed, std::size_t number,
+                           std::span<run_handle_t const> placed) noexcept {
+        level_set_t const& source = levels();
+        level_set_t& next = spare_();
+        std::size_t const deepest = !placed.empty() && number >= source.size() ? number + 1 : source.size();
+        if (next.levels_.reserve(deepest) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A tree could not prepare its next level set"};
+        for (std::size_t index = 0; index != deepest; ++index) {
+            lsm_level_order_t const order = index == 0 ? lsm_level_order_t::overlapping_k : lsm_level_order_t::sorted_k;
+            [[maybe_unused]] st::status_t const pushed = next.levels_.push_back(
+                level_t::of(*runs_, static_cast<std::uint32_t>(index), order));
+            if (index >= source.size()) continue;
+            if (status_t const carried = next.levels_[index].carry(source.level(index), consumed); carried.failed()) {
+                next.levels_.clear();
+                return carried;
+            }
+        }
+        if (!placed.empty()) {
+            level_t& target = next.levels_[number];
+            if (status_t const reserved = target.reserve(placed.size()); reserved.failed()) {
+                next.levels_.clear();
+                return reserved;
+            }
+            for (run_handle_t const handle : placed)
+                if (status_t const inserted = target.insert_run(handle); inserted.failed()) {
+                    next.levels_.clear();
+                    return inserted;
+                }
+        }
+        name_(next);
+        return {};
+    }
+
+    /** Asks @p published to prepare for the spare set and publishes it, or gives back what only
+     *  the spare names. */
+    status_t publish_(lsm_tree_publication_hook_t const& published) noexcept {
         if (published.prepare != nullptr)
             if (status_t const prepared = published.prepare(published.context); prepared.failed()) {
-                abandon_(*next, channel);
+                abandon_(spare_());
                 return prepared;
             }
-        std::unique_ptr<level_set_t> replaced = std::exchange(levels_, std::move(next));
-        status_t const recorded = published.notify != nullptr ? published.notify(published.context) : status_t {};
-        relinquish_(*replaced);
-        if (recorded.failed()) {
-            for (sorted_run_t const* run : consumed) delete run;
-            return recorded;
-        }
-        status_t first;
-        for (sorted_run_t const* run : consumed) {
-            if (status_t const dropped = sorted_run_t::drop(*volume_, channel, run->content_id());
-                dropped.failed() && first.succeeded())
-                first = dropped;
-            delete run;
-        }
-        return first;
+        return replace_(published);
     }
 
-    /** Level 0 holds F runs of one flush each, and every level below F times the one above. */
-    [[nodiscard]] std::uint64_t level_bytes_(std::size_t number) const noexcept {
+    /**
+     *  @brief Makes the spare set current, calls @p published, then empties the set it replaced.
+     *
+     *  The hook publishes the new set to readers and returns only once none is left in the old
+     *  one, so the runs only the old set named are unreachable by then; their bytes go back to
+     *  the volume only once the hook recorded the new set, and a failed record leaves them to
+     *  the next mount.
+     */
+    status_t replace_(lsm_tree_publication_hook_t const& published) noexcept {
+        current_level_set_ ^= 1;
+        status_t const recorded = published.notify != nullptr ? published.notify(published.context) : status_t {};
+        if (recorded.failed()) forget_(spare_());
+        else abandon_(spare_());
+        return recorded;
+    }
+
+    /** Bytes level @p number of @p levels admits: one slot times F to the level's number at most,
+     *  and above the deepest level that level's bytes divided by F per level between them, but
+     *  never under one slot. */
+    [[nodiscard]] std::uint64_t level_bytes_(level_set_t const& levels, std::size_t number) const noexcept {
         std::uint64_t const factor = config_.level_enlarge_factor;
-        std::uint64_t bytes = memory_runs_max_bytes_ * factor;
+        std::uint64_t ceiling = slot_bytes_;
         for (std::size_t step = 0; step != number; ++step) {
-            if (bytes > limit<std::uint64_t>::max() / factor) return limit<std::uint64_t>::max();
-            bytes *= factor;
+            if (ceiling > limit<std::uint64_t>::max() / factor) return limit<std::uint64_t>::max();
+            ceiling *= factor;
         }
-        return bytes;
+        std::size_t const deepest = levels.size() - 1;
+        if (number >= deepest) return ceiling;
+        std::uint64_t tracked = levels.level(deepest).size_bytes();
+        for (std::size_t step = number; step != deepest; ++step) tracked /= factor;
+        return tracked < slot_bytes_ ? slot_bytes_ : tracked > ceiling ? ceiling : tracked;
     }
 
     /** The level an ingest of @p bytes of keys from @p lower to @p upper lands on, so no shallower level holds a key
@@ -2805,18 +3381,19 @@ class lsm_tree {
         for (std::size_t number = 1;; ++number) {
             if (overlapping != levels.size() && number + 1 == overlapping) return number;
             std::uint64_t const held = number < levels.size() ? levels.level(number).size_bytes() : 0;
-            if (held + bytes <= level_bytes_(number) || level_bytes_(number) == limit<std::uint64_t>::max())
-                return number;
+            std::uint64_t const admitted = level_bytes_(levels, number);
+            if (held + bytes <= admitted || admitted == limit<std::uint64_t>::max()) return number;
         }
     }
 
-    /** The shallowest level of @p levels that is over its bounds, or the level count when none is. */
+    /** The shallowest level of @p levels that is over its bounds, or the level count when none is:
+     *  level zero at F runs or one slot of bytes, and every deeper one over @c level_bytes_. */
     [[nodiscard]] std::size_t overfull_(level_set_t const& levels) const noexcept {
-        // Every level grows by the factor, and a flushed run is one flush of memory runs, so L0 is due at factor runs.
-        if (levels.size() != 0 && levels.level(0).size() >= config_.level_enlarge_factor) return 0;
-        for (std::size_t number = 0; number != levels.size(); ++number)
-            if (!levels.level(number).empty() && levels.level(number).size_bytes() > level_bytes_(number))
-                return number;
+        if (levels.size() != 0 &&
+            (levels.level(0).size() >= config_.level_enlarge_factor || levels.level(0).size_bytes() >= slot_bytes_))
+            return 0;
+        for (std::size_t number = 1; number != levels.size(); ++number)
+            if (levels.level(number).size_bytes() > level_bytes_(levels, number)) return number;
         return levels.size();
     }
 
@@ -2828,7 +3405,90 @@ class lsm_tree {
         return levels.size();
     }
 
-    /** Runs one merge of the level @p choice picks and publishes it, which the claim around it keeps to one thread. */
+    /** Whether @p run holds a key between @p lower and @p upper. */
+    [[nodiscard]] static bool overlaps_(sorted_run_t const& run, stored_key_t lower, stored_key_t upper) noexcept {
+        return run.population_count() != 0 && !(run.upper_stored_key() < lower || upper < run.lower_stored_key());
+    }
+
+    /**
+     *  @brief Picks the runs one pass consumes from level @p upper of @p source and the
+     *      level below it.
+     *
+     *  Level zero's runs overlap, so it goes whole. A deeper level gives the run holding a version
+     *  above @p ceiling when @p choice asks for one, and otherwise the run whose overlap below
+     *  holds the fewest bytes. The lower level then gives every run that overlaps the picked range.
+     */
+    status_t pick_runs_(level_set_t const& source, std::size_t upper, merge_choice_t choice, std::uint64_t ceiling,
+                        picked_runs_t& picked) const noexcept {
+        level_t const& from = source.level(upper);
+        level_t const* const below = upper + 1 != source.size() ? &source.level(upper + 1) : nullptr;
+        std::size_t const lower_runs = below != nullptr ? below->size() : 0;
+        if (picked.runs.reserve(from.size() + lower_runs) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A tree could not list the runs a merge consumes"};
+
+        if (upper == 0)
+            for (std::size_t index = 0; index != from.size(); ++index) [[maybe_unused]]
+                st::status_t const placed = picked.runs.push_back(&from.run(index));
+        else {
+            std::size_t chosen = 0;
+            std::uint64_t cheapest = limit<std::uint64_t>::max();
+            std::size_t first_overlapping = 0;
+            for (std::size_t index = 0; index != from.size(); ++index) {
+                sorted_run_t const& run = from.run(index);
+                if (choice == merge_choice_t::above_ceiling_k) {
+                    if (run.newest_stamp() <= ceiling) continue;
+                    chosen = index;
+                    break;
+                }
+                while (first_overlapping != lower_runs &&
+                       below->run(first_overlapping).upper_stored_key() < run.lower_stored_key())
+                    ++first_overlapping;
+                std::uint64_t overlapped = 0;
+                for (std::size_t lower = first_overlapping;
+                     lower != lower_runs && !(run.upper_stored_key() < below->run(lower).lower_stored_key()); ++lower)
+                    overlapped += below->run(lower).size_bytes();
+                if (overlapped >= cheapest) continue;
+                cheapest = overlapped;
+                chosen = index;
+            }
+            [[maybe_unused]] st::status_t const placed = picked.runs.push_back(&from.run(chosen));
+        }
+        picked.upper_count = picked.runs.size();
+
+        stored_key_t range_lower = limit<stored_key_t>::max();
+        stored_key_t range_upper = limit<stored_key_t>::min();
+        for (sorted_run_t const* run : picked.upper()) {
+            if (run->population_count() == 0) continue;
+            if (run->lower_stored_key() < range_lower) range_lower = run->lower_stored_key();
+            if (range_upper < run->upper_stored_key()) range_upper = run->upper_stored_key();
+        }
+        picked.lower_stored_key = range_lower;
+        picked.upper_stored_key = range_upper;
+        for (std::size_t index = 0; index != lower_runs; ++index) {
+            sorted_run_t const& run = below->run(index);
+            if (!overlaps_(run, range_lower, range_upper)) continue;
+            [[maybe_unused]] st::status_t const placed = picked.runs.push_back(&run);
+            if (run.lower_stored_key() < picked.lower_stored_key) picked.lower_stored_key = run.lower_stored_key();
+            if (picked.upper_stored_key < run.upper_stored_key()) picked.upper_stored_key = run.upper_stored_key();
+        }
+        return {};
+    }
+
+    /** Whether a level of @p source deeper than @p lower holds a key between @p lower_key
+     *  and @p upper_key. */
+    [[nodiscard]] static bool overlaps_below_(level_set_t const& source, std::size_t lower, stored_key_t lower_key,
+                                              stored_key_t upper_key) noexcept {
+        for (std::size_t number = lower + 1; number < source.size(); ++number) {
+            level_t const& level = source.level(number);
+            if (level.empty() || level.upper_stored_key() < lower_key || upper_key < level.lower_stored_key()) continue;
+            for (std::size_t index = 0; index != level.size(); ++index)
+                if (overlaps_(level.run(index), lower_key, upper_key)) return true;
+        }
+        return false;
+    }
+
+    /** Runs one pass over the runs @p choice picks and publishes it, which the claim around it
+     *  keeps to one thread. */
     template <typename fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact_once_(io_channel_t& reading_channel, io_channel_t& writing_channel,
                                                  compaction_placement_t placement, compactor_ref_t const& compactor,
@@ -2836,73 +3496,54 @@ class lsm_tree {
                                                  device_fold_type_ const& device_fold,
                                                  lsm_tree_publication_hook_t const& published,
                                                  compaction_stamps_t const& stamps, merge_choice_t choice) noexcept {
-        level_set_t const& source = *levels_;
+        level_set_t const& source = levels();
         std::size_t const upper = choice == merge_choice_t::overfull_k ? overfull_(source)
                                                                        : above_(source, stamps.ceiling);
         if (upper == source.size()) return compaction_outcome_t::nothing_to_compact_k;
         std::size_t const lower = upper + 1;
-        bool const grows = lower == source.size();
-        std::size_t const last_consumed = grows ? upper : lower;
 
-        st::vector<sorted_run_t const*> consumed;
-        if (status_t const recorded = record_consumed_(source, upper, last_consumed, consumed); recorded.failed())
-            return recorded;
+        picked_runs_t picked;
+        if (status_t const pick = pick_runs_(source, upper, choice, stamps.ceiling, picked); pick.failed()) return pick;
+
+        // A run that overlaps nothing below moves down by its handle, and no byte is
+        // read or written
+        if (picked.lower().empty() && picked.upper_count == 1 && choice == merge_choice_t::overfull_k) {
+            run_handle_t const moved = runs_->handle_of(*picked.runs[0]);
+            if (status_t const prepared = prepare_next_(picked.upper(), lower,
+                                                        std::span<run_handle_t const> {&moved, 1});
+                prepared.failed())
+                return prepared;
+            if (status_t const replaced = publish_(published); replaced.failed()) return replaced;
+            return compaction_outcome_t::published_k;
+        }
 
         typename merger_t::merge_request_t request;
-        request.upper = &source.level(upper);
-        request.lower = grows ? nullptr : &source.level(lower);
-        request.number = static_cast<std::uint32_t>(lower);
-        request.depth = lsm_level_depth_t::bottom_k;
+        request.upper = picked.upper();
+        request.upper_order = source.level(upper).order();
+        request.lower = picked.lower();
+        request.depth = overlaps_below_(source, lower, picked.lower_stored_key, picked.upper_stored_key)
+                            ? lsm_level_depth_t::intermediate_k
+                            : lsm_level_depth_t::bottom_k;
+        request.collection = config_.collection;
         sorted_run_config_t const& values = config_.lsm_level_0.sorted_run;
         request.value_max_size = is_fixed(value_layout_k) ? values.value_size : values.value_max_size;
-        request.run_key_slots_capacity = storage_limits_t::memory_runs_max_deltas_k;
-        request.run_bytes_limit = storage_limits_t::sorted_run_file_max_size_k;
+        request.run_bytes_limit = slot_bytes_ - utilities::slot_payload_offset_k;
         request.placement = placement;
         request.compactor = compactor;
         request.cancellation = cancellation;
         request.stamps = stamps;
-        if (!grows && lower + 1 != source.size()) request.depth = lsm_level_depth_t::intermediate_k;
 
-        auto [merged, merge_status] = merger_t::merge(*volume_, reading_channel, writing_channel, request, fold,
+        auto [merged, merge_status] = merger_t::merge(*volume_, *runs_, reading_channel, writing_channel, request, fold,
                                                       device_fold);
         if (merge_status.failed()) return merge_status;
-
-        auto [next, carried_status] = carried_(upper, last_consumed);
-        if (carried_status.failed()) {
-            [[maybe_unused]] status_t const abandoned = merged.drop(*volume_, writing_channel);
-            return carried_status;
+        std::span<run_handle_t const> const placed {merged};
+        if (status_t const prepared = prepare_next_(std::span<sorted_run_t const* const> {picked.runs}, lower, placed);
+            prepared.failed()) {
+            runs_->discard(*volume_, placed);
+            return prepared;
         }
-        if (grows) {
-            if (next->levels_.push_back(level_t::of(static_cast<std::uint32_t>(lower), lsm_level_order_t::sorted_k)) !=
-                st::status_t::success_k) {
-                [[maybe_unused]] status_t const abandoned = merged.drop(*volume_, writing_channel);
-                relinquish_(*next);
-                return status_t {status_code_t::out_of_memory_k, "A tree could not hold another level"};
-            }
-        }
-        next->levels_[lower] = std::move(merged);
-
-        if (status_t const replaced = replace_(std::move(next), published, writing_channel,
-                                               std::span<sorted_run_t const* const> {consumed});
-            replaced.failed())
-            return replaced;
+        if (status_t const replaced = publish_(published); replaced.failed()) return replaced;
         return compaction_outcome_t::published_k;
-    }
-
-    /** Collects every run of levels @p first through @p last, which the merge has already rewritten. */
-    static status_t record_consumed_(level_set_t const& source, std::size_t first, std::size_t last,
-                                     st::vector<sorted_run_t const*>& consumed) noexcept {
-        std::size_t runs = 0;
-        for (std::size_t number = first; number <= last && number != source.size(); ++number)
-            runs += source.level(number).size();
-        if (consumed.reserve(runs) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A tree could not list the runs it retires"};
-        for (std::size_t number = first; number <= last && number != source.size(); ++number)
-            for (std::size_t index = 0; index != source.level(number).size(); ++index) {
-                sorted_run_t const* run = &source.level(number).run(index);
-                [[maybe_unused]] st::status_t const placed = consumed.push_back(std::move(run));
-            }
-        return {};
     }
 
 #pragma endregion Private Methods
@@ -2912,14 +3553,23 @@ class lsm_tree {
     /** The volume every run of this tree lives on, null until the tree is mounted or once it is moved from. */
     volume_t* volume_ = nullptr;
 
-    /** How fast the bytes a level admits grow with depth, and the value sizes of its runs. */
+    /** The database's pool every run of this tree lives in, null until the tree is mounted or once
+     *  it is moved from. */
+    run_pool_t* runs_ = nullptr;
+
+    /** How fast the bytes a level admits grow with depth, the value sizes of its runs
+     *  and their collection. */
     lsm_tree_config_t config_ {};
 
-    /** Bytes the memory runs of one flush hold, which level zero admits F of. */
-    std::uint64_t memory_runs_max_bytes_ = 0;
+    /** The unit levels and runs are sized by. */
+    std::uint64_t slot_bytes_ = 0;
 
-    /** The level set the last publication made current, which owns every run it names. */
-    std::unique_ptr<level_set_t> levels_;
+    /** The current set and the spare, allocated once at mount so a reader's set never moves
+     *  with the tree. */
+    st::vector<level_set_t> level_sets_;
+
+    /** Which of @c level_sets_ readers are handed. */
+    std::size_t current_level_set_ = 0;
 
     /** A @c compaction_state_t, moved by @c claim_compaction_ alone. */
     std::int32_t compacting_ = 0;
@@ -2941,31 +3591,15 @@ status_t record_lsm_tree_runs(tree_type_ const& tree, st::vector<lsm_tree_run_re
         return {status_code_t::out_of_memory_k, "No room to name the runs a tree holds"};
 
     for (std::size_t number = 0; number != taken.size(); ++number) {
-        auto const& level = taken.level(number);
-        for (std::size_t index = 0; index != level.size(); ++index) {
-            lsm_tree_run_record_t record;
-            record.level_number = static_cast<std::uint32_t>(number);
-            record.content_id = level.run(index).content_id();
-            [[maybe_unused]] st::status_t const placed = into.push_back(std::move(record));
-        }
-    }
-    return {};
-}
-
-/** Appends the stamp of every run of @p tree an ingest assigned to @p into, which a schema saves beside the runs. */
-template <typename tree_type_>
-status_t record_lsm_tree_run_stamps(tree_type_ const& tree, st::vector<lsm_tree_run_stamp_t>& into) noexcept {
-    typename tree_type_::level_set_t const& taken = tree.levels();
-    for (std::size_t number = 0; number != taken.size(); ++number) {
         typename tree_type_::level_t const& level = taken.level(number);
         for (std::size_t index = 0; index != level.size(); ++index) {
             typename tree_type_::sorted_run_t const& run = level.run(index);
-            if (run.assigned_stamp() == 0) continue;
-            lsm_tree_run_stamp_t record;
+            lsm_tree_run_record_t record;
+            record.level_number = static_cast<std::uint32_t>(number);
             record.content_id = run.content_id();
+            record.extent = run.extent();
             record.stamp = run.assigned_stamp();
-            if (into.push_back(std::move(record)) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "No room to name the runs ingests stamped"};
+            [[maybe_unused]] st::status_t const placed = into.push_back(std::move(record));
         }
     }
     return {};

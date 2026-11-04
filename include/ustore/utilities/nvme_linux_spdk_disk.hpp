@@ -32,13 +32,16 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `std::snprintf`
 
-#if defined(__linux__)
+#include "ustore/types.h" // `USTORE_OS_LINUX_`
+
+#if USTORE_OS_LINUX_
 #include <fcntl.h>  // `O_RDONLY`, `O_CLOEXEC`
 #include <unistd.h> // `read`, `readlink`, `access`, `close`
 #endif
 
 #include <array>       // `std::array`
 #include <bit>         // `std::has_single_bit`
+#include <limits>      // `std::numeric_limits`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -275,7 +278,7 @@ inline expected<pci_address_t> pci_address_parsed(std::string_view spelled) noex
 
 #pragma region Files
 
-#if defined(__linux__)
+#if USTORE_OS_LINUX_
 
 /** Reads what fits of @p path into @p into, answering an empty text when the file will not open. */
 [[nodiscard]] inline std::string_view read_system_text(char const* path, std::span<char> into) noexcept {
@@ -479,7 +482,7 @@ class linux_spdk_environment {
     holders_t* holders_ = nullptr;
 };
 
-#if defined(__linux__)
+#if USTORE_OS_LINUX_
 
 /** Bytes of @c /proc/meminfo the probe reads, which is more than the file has ever held. */
 inline constexpr std::size_t meminfo_bytes_k = 8192;
@@ -771,7 +774,7 @@ class linux_spdk_disk {
             slot.locals_first = 0;
             slot.locals_count = 0;
             link_free_lists_(seat);
-            return queue_pair_t::leased(static_cast<queue_pair_id_t>(seat), slot.generation, depth);
+            return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(seat), slot.generation}, depth};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
     }
@@ -852,8 +855,8 @@ class linux_spdk_disk {
             slot.base = chunk.data();
             slot.length = chunk.size();
             slot.space = space;
-            return registered_memory_t::registered(static_cast<registered_memory_id_t>(index), slot.generation, chunk,
-                                                   space);
+            return registered_memory_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, chunk,
+                                        space};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every registered_memory slot of this ring is taken"};
     }
@@ -890,7 +893,7 @@ class linux_spdk_disk {
         slot.access = request.access == medium_access_t::read_only_k ? medium_access_t::read_only_k
                                                                      : medium_access_t::read_write_k;
         slot.capacity = namespace_bytes_;
-        return registered_medium_t::registered(static_cast<registered_medium_id_t>(0), slot.generation, slot.capacity);
+        return registered_medium_t {disk_handle_t {0, slot.generation}, slot.capacity, sector_bytes_};
     }
 
     /**
@@ -1190,7 +1193,7 @@ class linux_spdk_disk {
         memory_reference_t buffer;
 
         /** The target the request borrowed, given back when its completion is completed. */
-        medium_reference_t target;
+        medium_reference_t medium;
 
         /** The staged request waiting on this one, or @c no_entry_k when none does. */
         std::uint32_t successor = no_entry_k;
@@ -1530,9 +1533,18 @@ class linux_spdk_disk {
     status_t inspect_(request_t const& request) noexcept {
         registered_medium_slot_t const* const target = resolve_(request.medium);
         if (!target) return {status_code_t::invalid_argument_k, "The request names no registered target"};
-        if (request.kind == request_kind_t::write_k && target->access == medium_access_t::read_only_k)
+        if ((request.kind == request_kind_t::write_k || request.kind == request_kind_t::deallocate_k) &&
+            target->access == medium_access_t::read_only_k)
             return {status_code_t::invalid_argument_k, "The target was registered for reads alone"};
         if (request.kind == request_kind_t::flush_k) return {};
+        if (request.kind == request_kind_t::deallocate_k) {
+            if (!request.extent.aligned_to(sector_bytes_) ||
+                request.extent.length / sector_bytes_ > std::numeric_limits<std::uint32_t>::max())
+                return {status_code_t::invalid_argument_k, "A deallocation covers whole sectors, at most one range"};
+            if (!request.extent.fits_within(target->capacity))
+                return {status_code_t::invalid_argument_k, "The request runs past the namespace"};
+            return {};
+        }
         registered_memory_slot_t const* const chunk = resolve_(request.buffer);
         if (!chunk) return {status_code_t::invalid_argument_k, "The request names no registered range"};
         if (request.extent.length == 0)
@@ -1560,7 +1572,9 @@ class linux_spdk_disk {
             return status_t {status_code_t::capacity_exhausted_k, "This queue pair has no room for another command"};
         flight_t& flight = flights_[base + index];
         flight.token = request.token;
-        flight.length = request.kind == request_kind_t::flush_k ? 0 : request.extent.length;
+        flight.length = request.kind == request_kind_t::flush_k || request.kind == request_kind_t::deallocate_k
+                            ? 0
+                            : request.extent.length;
         flight.buffer = request.buffer;
         flight.medium = request.medium;
         flight.successor = no_entry_k;
@@ -1570,6 +1584,15 @@ class linux_spdk_disk {
         int issued = 0;
         if (request.kind == request_kind_t::flush_k) {
             issued = spdk_nvme_ns_cmd_flush(namespace_, slot.queue, &linux_spdk_disk::completed_, &flight);
+        }
+        else if (request.kind == request_kind_t::deallocate_k) {
+            // The driver copies the range into the command's own payload, so it may live
+            // on this stack.
+            spdk_nvme_dsm_range range {};
+            range.starting_lba = request.extent.offset / sector_bytes_;
+            range.length = static_cast<std::uint32_t>(request.extent.length / sector_bytes_);
+            issued = spdk_nvme_ns_cmd_dataset_management(namespace_, slot.queue, SPDK_NVME_DSM_ATTR_DEALLOCATE, &range,
+                                                         1, &linux_spdk_disk::completed_, &flight);
         }
         else {
             registered_memory_slot_t const* const chunk = resolve_(request.buffer);

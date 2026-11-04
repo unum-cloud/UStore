@@ -259,10 +259,12 @@ typedef enum ustore_engine_t {
 /** A directory the data files may occupy, with the bytes they may take there. */
 typedef struct ustore_data_directory_t {
 
-    /** The directory, which must exist. */
+    /** The directory, which must exist; on NVMe also a raw device from a base, as in
+     *  @c /dev/nvme0n1@64GiB. */
     ustore_bytes_view_t path;
 
-    /** Bytes the files may take there: zero is unlimited on RocksDB and the default volume size on NVMe. */
+    /** Bytes the files may take there, zero being unlimited on RocksDB and the whole
+     *  medium on NVMe. */
     ustore_size_t max_bytes;
 
 } ustore_data_directory_t;
@@ -490,10 +492,12 @@ typedef struct ustore_database_open_nvme_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Directory of the database's own files, which must exist. */
+    /** The manifest, @c <database>.ustore.json, whose directory must exist and holds the database's
+     *  first data directory, or the raw address of its first slot, as in @c /dev/nvme0n1@64GiB. */
     ustore_bytes_view_t directory;
 
-    /** Directories the volumes fill, or null for one inside @c directory. */
+    /** Further data directories every run may land on, the one with the most free bytes taking
+     *  it, or null. */
     ustore_data_directory_t const* data_directories;
 
     /** Entries of @c data_directories. */
@@ -540,11 +544,12 @@ typedef struct ustore_database_open_nvme_t {
 } ustore_database_open_nvme_t;
 
 /**
- *  @brief Serves a directory in place through the NVMe engine.
+ *  @brief Serves the database a manifest names through the NVMe engine, creating it when the
+ *      manifest is absent.
  *
  *  @par Statuses:
  *  @c ustore_status_unsupported_k means the library was built without the engine, SPDK is asked
- *  for, the volumes or the schema have another format version, the @c compactions executor is given
+ *  for, the manifest or a slot has another format version, the @c compactions executor is given
  *  to a library built without a CUDA compiler or drives an AMD device, the CPU does not run the
  *  @c cpu_class, or the io_uring transport was named on a kernel without one.
  *
@@ -553,13 +558,16 @@ typedef struct ustore_database_open_nvme_t {
  *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
  *    executor running it.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
- *    empty, the counted @c data_directories are @c NULL, one has an empty path or a path past the
- *    platform's limit, the transport or the CPU class is unknown, or a size or count is out of range.
+ *    empty or names no @c .ustore.json file nor raw address, the counted @c data_directories are
+ *    @c NULL, one has an empty path or a path past the platform's limit, the transport or the CPU
+ *    class is unknown, or a size or count is out of range.
  *  - @c ustore_status_out_of_memory_k The @c memory_limit refuses the arena or the channels.
- *  - @c ustore_status_not_found_k The directory does not exist.
- *  - @c ustore_status_capacity_exhausted_k The drives need more queue pairs or targets than a volume
- *    holds, the @c memory_limit leaves no block per channel, or every shared channel is taken.
- *  - @c ustore_status_malformed_k The volumes or the schema are corrupt.
+ *  - @c ustore_status_not_found_k The manifest's directory does not exist.
+ *  - @c ustore_status_already_exists_k The first slot of a raw medium belongs to something else.
+ *  - @c ustore_status_capacity_exhausted_k The drives need more queue pairs than a disk holds,
+ *    the @c memory_limit leaves no block per channel, or every shared channel is taken.
+ *  - @c ustore_status_malformed_k The manifest is corrupt, or raw data directories are listed in
+ *    another order than the database was created with.
  */
 USTORE_EXPORT void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments);
 
@@ -757,7 +765,8 @@ typedef struct ustore_snapshot_save_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Directory that receives the saved database. */
+    /** Directory that receives the saved database, or on NVMe its manifest,
+     *  @c <database>.ustore.json, or the raw address of its first slot. */
     ustore_bytes_view_t path;
 
     /** Optional callback reporting the bytes saved. */

@@ -105,6 +105,16 @@ struct collection_types {
 
 #pragma region Fixtures
 
+/** Run records a case's pool holds, far more than any case keeps at once. */
+constexpr std::size_t run_records_k = 4096;
+
+/** A run pool for stores of @p store_type_ charged to @p stack's budget, which a case declares
+ *  before its store. */
+template <typename store_type_, typename stack_type_>
+expected<typename store_type_::run_pool_t> make_run_pool(stack_type_& stack) noexcept {
+    return store_type_::run_pool_t::make(run_records_k, stack.fixture->resources->memory_constraint);
+}
+
 /** Mounts a fixture through @p mount, takes one channel and formats one volume over it. */
 template <typename mount_type_>
 expected<std::unique_ptr<typename collection_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
@@ -231,8 +241,11 @@ std::size_t mixed_widths_round_trip(mount_type_ const& mount) {
     if (!stack) return failures;
 
     collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -280,8 +293,11 @@ template <typename key_slot_type_, typename mount_type_>
     if (!stack) return failures;
 
     collection_config_t const config = test_config(value_size, value_max_size);
+    expected<typename nvme_store_t::run_pool_t> runs = make_run_pool<nvme_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<nvme_store_t> store = nvme_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -333,8 +349,11 @@ std::size_t misses_and_remove_deltas(mount_type_ const& mount) {
     if (!stack) return failures;
 
     collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -397,8 +416,11 @@ std::size_t memory_runs_answer_before_the_tree(mount_type_ const& mount) {
     if (!stack) return failures;
 
     collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -445,6 +467,56 @@ std::size_t memory_runs_answer_before_the_tree(mount_type_ const& mount) {
     return failures;
 }
 
+/** A burst of one-delta commits many times the memory-run records the collection holds
+ *  stalls on the records, merges by tier and lands every commit, keeping no more runs than a
+ *  merged view holds. */
+template <typename mount_type_>
+std::size_t burst_past_records_lands_every_commit(mount_type_ const& mount) {
+    using types_t = collection_types<typename mount_type_::fixture_t>;
+    using variable_store_t = typename types_t::variable_store_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    constexpr std::size_t count_k = 2000;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+
+    // Bounds of deltas and bytes no burst below reaches, so only the records stall it: (4 − 1)(7 +
+    // 1) runs at most.
+    collection_config_t const config = test_config(0, value_max_size_k);
+    std::size_t const merged_runs_max = (config.lsm_tree.level_enlarge_factor - 1) * (7 + 1);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<variable_store_t> store = variable_store_t::mount(
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
+    failures += expect(store.has_value());
+    if (!store) return failures;
+
+    st::vector<expectation_t> model;
+    failures += expect(model.resize(count_k) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    std::size_t widest_shape = 0;
+    st::vector<byte_t> value;
+    for (std::size_t index = 0; index != count_k; ++index) {
+        expectation_t entry;
+        entry.stored_key = static_cast<stored_key_t>(index) * 3 + 1;
+        entry.state = lookup_result_t::written_k;
+        entry.bytes = 1 + index % 16;
+        entry.seed = index + 11;
+        model[index] = entry;
+        failures += expect(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
+        paint_into(entry, std::span<byte_t> {value});
+        failures += expect(
+            store->insert((*stack)->channel(), entry.stored_key, std::span<byte_t const> {value}).succeeded());
+        widest_shape = std::max(widest_shape, store->memory_shape().runs);
+    }
+    failures += expect(widest_shape <= merged_runs_max);
+    failures += expect_eq(store->memory_deltas_count(), count_k);
+    failures += check_model(*store, (*stack)->channel(), std::span<expectation_t const> {model});
+    return failures;
+}
+
 /** Memory runs too small for the batch flush themselves, and every value survives the flushes it forced. */
 template <typename mount_type_>
 std::size_t full_memory_runs_flush_themselves(mount_type_ const& mount) {
@@ -460,8 +532,11 @@ std::size_t full_memory_runs_flush_themselves(mount_type_ const& mount) {
     collection_config_t config = test_config(0, value_max_size_k);
     config.memory_runs_max_bytes = 32ull * 1024ull;
     config.memory_runs_max_deltas = 64;
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -526,8 +601,11 @@ std::size_t unaligned_exact_span_is_taken(mount_type_ const& mount) {
     if (!stack) return failures;
 
     collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -570,8 +648,11 @@ std::size_t widest_and_empty_values(mount_type_ const& mount) {
     if (!stack) return failures;
 
     collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
     failures += expect_eq(store->value_max_size(), value_max_size_k);
@@ -720,8 +801,11 @@ std::size_t batched_select_holds_its_depth(mount_type_ const& mount) {
     if (!stack) return failures;
 
     collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -797,8 +881,11 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     if (!stack) return failures;
 
     collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -868,8 +955,11 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     if (!stack) return failures;
 
     collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<variable_store_t> store = variable_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -986,7 +1076,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
 struct counter_fold {
     static std::uint64_t count_of(std::span<byte_t const> bytes) noexcept {
         std::uint64_t count = 0;
-        std::memcpy(&count, bytes.data(), std::min(bytes.size(), sizeof(count)));
+        if (!bytes.empty()) std::memcpy(&count, bytes.data(), std::min(bytes.size(), sizeof(count)));
         return count;
     }
     static expected<std::span<byte_t const>> counted(std::uint64_t count, arena_allocator<byte_t>& arena) noexcept {
@@ -1027,11 +1117,15 @@ std::size_t counter_fold_reads_alike_everywhere(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    // A level zero of a few hundred bytes, which one flushed run already overfills.
+    // A level zero due at two runs, which the two flushes below fill.
     collection_config_t config = test_config(0, value_max_size_k);
     config.memory_runs_max_bytes = 64;
+    config.lsm_tree.level_enlarge_factor = 2;
+    expected<typename counter_store_t::run_pool_t> runs = make_run_pool<counter_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
     expected<counter_store_t> store = counter_store_t::mount(
-        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
     failures += expect(store.has_value());
     if (!store) return failures;
 
@@ -1159,6 +1253,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "misses_and_remove_deltas", misses_and_remove_deltas);
         report(totals, mount, "buffer_before_tree", memory_runs_answer_before_the_tree);
         report(totals, mount, "full_buffer_flushes", full_memory_runs_flush_themselves);
+        report(totals, mount, "burst_past_records", burst_past_records_lands_every_commit);
         report(totals, mount, "unaligned_exact_span", unaligned_exact_span_is_taken);
         report(totals, mount, "widest_and_empty", widest_and_empty_values);
         report(totals, mount, "holds_its_depth", batched_select_holds_its_depth);

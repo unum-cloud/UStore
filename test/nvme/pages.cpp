@@ -54,14 +54,16 @@ constexpr std::string_view page_absent_k = "<absent>";
 
 #pragma region Pages Client
 
-/** Opens the NVMe engine over @p directory, every collection flushing past 64 KiB, every level twice the one above. */
+/** Opens the NVMe engine over a manifest in @p directory, every collection flushing past 64 KiB,
+ *  every level twice the one above. */
 expected<database_t> open_small_nvme(char const* directory) noexcept {
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
     ustore_database_open_nvme_t open {};
     open.database = &database;
     open.outcome = &outcome;
-    open.directory = {reinterpret_cast<ustore_byte_t const*>(directory), std::strlen(directory)};
+    path_t const manifest {directory, "pages.ustore.json"};
+    open.directory = {reinterpret_cast<ustore_byte_t const*>(manifest.c_str()), std::strlen(manifest.c_str())};
     open.collection_memory_runs_max_bytes = small_memory_runs_bytes_k;
     open.collection_value_max_size = small_memory_runs_bytes_k / 4;
     open.transaction_max_bytes = small_memory_runs_bytes_k / 2;

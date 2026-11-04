@@ -302,7 +302,7 @@ class NotFoundError(Error, KeyError):
     """A collection, a directory, or a document a modification needs does not exist."""
 
 class AlreadyExistsError(Error, ValueError):
-    """A collection name or a document the call creates is already taken."""
+    """A collection name or a document the call creates is already taken, or a raw medium's first slot is not free."""
 
 class ConflictError(Error):
     """A concurrent writer touched what this transaction wrote, read or scanned: the one base a retry loop catches."""
@@ -1104,7 +1104,7 @@ class Database(_Writes, _Receivers):
     @classmethod
     def open_nvme(
         cls,
-        directory: PathLikeOrStr,
+        manifest: PathLikeOrStr,
         *,
         executor: Executor | None = None,
         data_directories: Sequence[DataDirectory] = (),
@@ -1121,7 +1121,8 @@ class Database(_Writes, _Receivers):
         collection_value_size: int = 0,
         collection_value_max_size: int = 0,
     ) -> Self:
-        """A database on the NVMe engine, where every zero size keeps the engine's default, opened blocking on
+        """A database on the NVMe engine, named by its `manifest`, `<database>.ustore.json` in an existing directory or
+        the raw address of its first slot, where every zero size keeps the engine's default, opened blocking on
         `executor`, which tells it how to move bytes when `Executor.for_nvme` made it, merging on the device of
         `compactions` when `Executor.for_vram` made it."""
     def __enter__(self) -> Self: ...
@@ -1710,11 +1711,13 @@ class DeferredView:
 
         Writes the snapshot out as a new database of the same engine, holding exactly the
         collections and names the snapshot records, which that engine's open then serves.
-        RocksDB and LevelDB create the directory, while the RAM engine writes its image into
-        the directory the path names. Calls `ustore_snapshot_save`.
+        RocksDB and LevelDB create the directory, the RAM engine writes its image into the
+        directory the path names, and NVMe takes the path as the new database's manifest.
+        Calls `ustore_snapshot_save`.
 
         Args:
-          path (str | bytes | PathLike): The directory the saved database lands in.
+          path (str | bytes | PathLike): The directory the saved database lands in, or its
+            manifest on NVMe.
           progress (Callable[[int, int], bool | None], optional): Called with the bytes of the
             keys and values saved and the bytes in all. A falsy answer other than None stops
             the save, which removes what it wrote.

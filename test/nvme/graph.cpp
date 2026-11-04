@@ -71,8 +71,9 @@ constexpr std::size_t bottom_rounds_k = 32;
 
 #pragma region Edge Fixtures
 
-/** Opens the NVMe engine over @p directory, every collection flushing past @p memory_runs_bytes when not zero, every
- *  level @p enlarge_factor times the one above, and every value @p value_size bytes when not zero. */
+/** Opens the NVMe engine over a manifest in @p directory, every collection flushing past
+ *  @p memory_runs_bytes when not zero, every level @p enlarge_factor times the one above, and every
+ *  value @p value_size bytes when not zero. */
 expected<database_t> open_nvme(char const* directory, std::size_t memory_runs_bytes = 0, std::size_t enlarge_factor = 0,
                                std::size_t value_size = 0) noexcept {
     ustore_database_t database = nullptr;
@@ -80,7 +81,8 @@ expected<database_t> open_nvme(char const* directory, std::size_t memory_runs_by
     ustore_database_open_nvme_t open {};
     open.database = &database;
     open.outcome = &outcome;
-    open.directory = {reinterpret_cast<ustore_byte_t const*>(directory), std::strlen(directory)};
+    path_t const manifest {directory, "graph.ustore.json"};
+    open.directory = {reinterpret_cast<ustore_byte_t const*>(manifest.c_str()), std::strlen(manifest.c_str())};
     if (memory_runs_bytes) {
         open.collection_memory_runs_max_bytes = memory_runs_bytes;
         open.collection_value_max_size = memory_runs_bytes / 4;

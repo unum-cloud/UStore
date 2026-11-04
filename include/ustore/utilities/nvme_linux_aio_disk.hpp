@@ -28,7 +28,9 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 
-#if defined(__linux__)
+#include "ustore/types.h" // `USTORE_OS_LINUX_`
+
+#if USTORE_OS_LINUX_
 #include <linux/aio_abi.h> // `aio_context_t`, `iocb`, `io_event`, `IOCB_CMD_PREAD`, `IOCB_CMD_FDSYNC`
 #include <sys/syscall.h>   // `__NR_io_setup`, `__NR_io_submit`, `__NR_io_getevents`, `__NR_io_destroy`
 #include <unistd.h>        // `syscall`
@@ -40,8 +42,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_disks.hpp"            // `native_file_t`, `open_native_file`
-#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `direct_alignment_of`, `direct_alignment_t`
+#include "ustore/utilities/nvme_disks.hpp" // `open_native_file`, `direct_alignment_of`, `deallocate_native_file`
 #include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -86,7 +87,7 @@ enum class linux_aio_probe_t : std::uint8_t {
 
 #pragma endregion Configuration
 
-#if defined(__linux__)
+#if USTORE_OS_LINUX_
 
 #pragma region Disk
 
@@ -238,7 +239,7 @@ class linux_aio_files_disk {
             slot.flights_count = 0;
             slot.locals_first = 0;
             slot.locals_count = 0;
-            return queue_pair_t::leased(static_cast<queue_pair_id_t>(index), slot.generation, depth);
+            return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, depth};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this disk is already held"};
     }
@@ -303,8 +304,8 @@ class linux_aio_files_disk {
             slot.base = memory.data();
             slot.length = memory.size();
             slot.space = space;
-            return registered_memory_t::registered(static_cast<registered_memory_id_t>(index), slot.generation, memory,
-                                                   space);
+            return registered_memory_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, memory,
+                                        space};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every registered memory slot of this disk is taken"};
     }
@@ -350,15 +351,16 @@ class linux_aio_files_disk {
                     claim_(slot.registered).store(0, std::memory_order_release);
                     return sized;
                 }
+            direct_alignment_t const direct = direct_alignment_of(file);
             direct_alignment_t const alignment = buffering_ == file_buffering_t::unbuffered_k
-                                                     ? direct_alignment_of(file)
+                                                     ? direct
                                                      : direct_alignment_t {1, 1};
             slot.file = file;
             slot.capacity = native_file_capacity(file);
             slot.memory_alignment = alignment.memory;
             slot.offset_alignment = alignment.offset;
-            return registered_medium_t::registered(static_cast<registered_medium_id_t>(index), slot.generation,
-                                                   slot.capacity);
+            return registered_medium_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation},
+                                        slot.capacity, direct.offset};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every medium slot of this disk is taken"};
     }
@@ -418,6 +420,18 @@ class linux_aio_files_disk {
                 push_local_(*slot, base, failed_completion_(request.token, defect));
                 linked = no_seat_k;
                 chain_broken = chains_next_(request);
+                continue;
+            }
+            if (request.kind == request_kind_t::deallocate_k) {
+                bool const chained_into = linked != no_seat_k;
+                linked = no_seat_k;
+                status_t const deallocated = chained_into
+                                                 ? status_t {status_code_t::invalid_argument_k,
+                                                             "A deallocation runs at submission, outside chains"}
+                                                 : deallocate_native_file(resolve_(request.medium)->file,
+                                                                          request.extent);
+                push_local_(*slot, base, deallocated_completion_(request.token, deallocated));
+                chain_broken = chains_next_(request) && deallocated.failed();
                 continue;
             }
             std::uint32_t const seat = take_seat_(*slot, base);
@@ -803,6 +817,15 @@ class linux_aio_files_disk {
         return completion;
     }
 
+    /** The completion of a deallocation the disk ran itself at submission, failed for @p outcome's
+     *  reason if any. */
+    [[nodiscard]] static completion_t deallocated_completion_(request_token_t token, status_t outcome) noexcept {
+        if (outcome.failed()) return failed_completion_(token, outcome);
+        completion_t completion;
+        completion.token = token;
+        return completion;
+    }
+
     /** Whether the request that follows @p request in its batch waits for this one to transfer in full. */
     [[nodiscard]] static bool chains_next_(request_t const& request) noexcept {
         return request.chaining == request_chaining_t::chained_k;
@@ -812,7 +835,7 @@ class linux_aio_files_disk {
     status_t inspect_(request_t const& request) noexcept {
         registered_medium_slot_t const* const medium = resolve_(request.medium);
         if (!medium) return {status_code_t::invalid_argument_k, "The request names no registered medium"};
-        if (request.kind == request_kind_t::flush_k) return {};
+        if (request.kind == request_kind_t::flush_k || request.kind == request_kind_t::deallocate_k) return {};
         registered_memory_slot_t const* const memory = resolve_(request.buffer);
         if (!memory) return {status_code_t::invalid_argument_k, "The request names no registered range"};
         if (request.buffer.offset > memory->length || request.extent.length > memory->length - request.buffer.offset)

@@ -58,8 +58,8 @@ struct merge_run {
     /** Index of the run's first record among the records of every run. */
     std::uint64_t first = 0;
 
-    /** Layout of the run's sorted run index. */
-    sorted_run_index_layout_t layout;
+    /** Key slots the run holds, whose cells sit in sorted order. */
+    std::uint64_t key_slots_count = 0;
 };
 
 /** The C names of the merge kernels the bundles export for @p key_slot_type_, none for a key slot
@@ -124,7 +124,7 @@ constexpr value_type_ saved_field(std::uint64_t const* saved, std::uint64_t inde
 template <typename key_slot_type_>
 __device__ located_key_slot<key_slot_type_> merge_record(merge_run<key_slot_type_> const& run, std::uint32_t index,
                                                          std::uint64_t value_stride, std::uint64_t position) noexcept {
-    located_key_slot<key_slot_type_> record {run.cells[run.layout.sorted_to_cell(position)],
+    located_key_slot<key_slot_type_> record {run.cells[position],
                                              index,
                                              delta_kind_t::write_k,
                                              0,
@@ -176,10 +176,10 @@ __device__ void merge_rank(merge_run<key_slot_type_> const* runs, std::uint32_t 
             if (other == run) continue;
             merge_run<key_slot_type_> const& theirs = runs[other];
             std::uint64_t before = 0;
-            for (std::uint64_t count = theirs.layout.key_slots_count; count;) {
+            for (std::uint64_t count = theirs.key_slots_count; count;) {
                 std::uint64_t const half = count / 2;
                 record_t probe {};
-                probe.key_slot = theirs.cells[theirs.layout.sorted_to_cell(before + half)];
+                probe.key_slot = theirs.cells[before + half];
                 probe.sorted_run = other;
                 if (order(probe, record)) before += half + 1, count -= half + 1;
                 else count = half;
@@ -268,32 +268,16 @@ __device__ void merge_pack(located_key_slot<key_slot_type_> const* merged, std::
     }
 }
 
-/** Writes every cell of the new runs @p placements describe: the survivor its sorted position
- *  holds, with its stamp and its kind, or padding past the run's survivors. */
+/** Writes the cell of every one of @p survivors_count survivors, which the new runs hold in order,
+ *  with its stamp and its kind. */
 template <typename key_slot_type_>
-__device__ void merge_place(located_key_slot<key_slot_type_> const* survivors, sorted_run_placement_t const* placements,
-                            std::uint64_t placements_count, std::uint64_t cells_count, std::uint64_t floor,
-                            key_slot_type_* cells, std::uint64_t* stamps, std::uint8_t* kinds) noexcept {
-    key_slot_type_ const padding = padding_key_slot<key_slot_type_>();
+__device__ void merge_place(located_key_slot<key_slot_type_> const* survivors, std::uint64_t survivors_count,
+                            std::uint64_t floor, key_slot_type_* cells, std::uint64_t* stamps,
+                            std::uint8_t* kinds) noexcept {
     std::uint64_t const stride = std::uint64_t {gridDim.x} * blockDim.x;
-    for (std::uint64_t cell = std::uint64_t {blockIdx.x} * blockDim.x + threadIdx.x; cell < cells_count;
-         cell += stride) {
-        std::uint64_t low = 0;
-        for (std::uint64_t high = placements_count; high - low > 1;) {
-            std::uint64_t const middle = low + (high - low) / 2;
-            if (placements[middle].first_cell <= cell) low = middle;
-            else high = middle;
-        }
-        sorted_run_placement_t const& placement = placements[low];
-        std::uint64_t const sorted = placement.layout.cell_to_sorted(cell - placement.first_cell);
-        if (sorted >= placement.layout.key_slots_count) {
-            cells[cell] = padding;
-            continue;
-        }
-        std::uint64_t const survivor = placement.first_key_slot + sorted;
-        place_key_slot(survivors[survivor], placement.layout, sorted, floor, cells + placement.first_cell,
-                       stamps + survivor, kinds + survivor);
-    }
+    for (std::uint64_t survivor = std::uint64_t {blockIdx.x} * blockDim.x + threadIdx.x; survivor < survivors_count;
+         survivor += stride)
+        place_key_slot(survivors[survivor], floor, cells[survivor], stamps[survivor], kinds[survivor]);
 }
 
 #pragma endregion Kernels
@@ -393,7 +377,7 @@ run_sections<key_slot_type_> carve_sections(sorted_run_index_view<key_slot_type_
     run_sections<key_slot_type_> sections;
     if (preferred == sections_source_t::volume_k && !extents.cells.empty() && !extents.trailer.empty())
         sections.source = sections_source_t::volume_k;
-    std::uint64_t const cells_count = round_up_to_multiple(view.key_slots_count, bounds.branching);
+    std::uint64_t const cells_count = view.key_slots_count;
     std::size_t const page = static_cast<std::size_t>(utilities::portable_alignment_k);
     if (sections.source == sections_source_t::volume_k) {
         sections.cells = cursor.take<key_slot_type_>(
@@ -652,7 +636,7 @@ st::status_t cuda_compactor_t::compact(
             described = merge_run<key_slot_type_> {};
             described.cells = sections.cells, described.value_offsets = sections.value_offsets;
             described.assigned_stamp = run_extents.assigned_stamp, described.first = first;
-            described.layout = sorted_run_index_layout_t(view.key_slots_count, bounds.branching);
+            described.key_slots_count = view.key_slots_count;
             first += view.key_slots_count;
             if (sections.source == sections_source_t::volume_k) {
                 auto const into = [&](void const* target) noexcept {
@@ -670,8 +654,7 @@ st::status_t cuda_compactor_t::compact(
                 described.saved_kinds = sections.trailer + run_extents.kinds_begin / sizeof(std::uint64_t);
                 continue;
             }
-            std::size_t const cells_count = static_cast<std::size_t>(
-                round_up_to_multiple(view.key_slots_count, bounds.branching));
+            std::size_t const cells_count = static_cast<std::size_t>(view.key_slots_count);
             if ((status = upload(*executor_, sections.cells, view.cells, cells_count)) != status_t::success_k)
                 return status;
             status = upload(*executor_, sections.value_offsets, view.value_offsets.data(), view.value_offsets.size());
@@ -784,38 +767,19 @@ st::status_t cuda_compactor_t::compact(
         status = plan_sorted_runs<key_slot_type_>(survivors_count, bounds, read_prefix, shares_key, output.sorted_runs);
         if (status != status_t::success_k) return status;
 
-        std::size_t const placements_count = output.sorted_runs.size();
-        sorted_run_placement_t* const host_placements = carve_bounce<sorted_run_placement_t>(*executor_,
-                                                                                             placements_count);
-        if (placements_count != 0 && !host_placements) return status_t::out_of_memory_heap_k;
-        std::uint64_t key_slots_before = 0;
-        std::uint64_t cells_count = 0;
-        for (std::size_t index = 0; index != placements_count; ++index) {
-            std::uint64_t const count = output.sorted_runs[index].key_slots_count;
-            host_placements[index] = sorted_run_placement_t {key_slots_before, cells_count,
-                                                             sorted_run_index_layout_t(count, bounds.branching)};
-            key_slots_before += count;
-            cells_count += round_up_to_multiple(count, bounds.branching);
-        }
-
+        std::uint64_t const cells_count = survivors_count;
         std::size_t const survivors_size = static_cast<std::size_t>(survivors_count);
-        sorted_run_placement_t* const placements = carve_<sorted_run_placement_t>(placements_count);
-        key_slot_type_* const cells = carve_<key_slot_type_>(static_cast<std::size_t>(cells_count));
+        key_slot_type_* const cells = carve_<key_slot_type_>(survivors_size);
         std::uint64_t* const survivor_stamps = carve_<std::uint64_t>(survivors_size);
         std::uint8_t* const survivor_kinds = carve_<std::uint8_t>(survivors_size);
-        if ((placements_count && !placements) || (cells_count && !cells) ||
-            (survivors_size && (!survivor_stamps || !survivor_kinds)))
-            return status_t::out_of_memory_heap_k;
+        if (survivors_size && (!cells || !survivor_stamps || !survivor_kinds)) return status_t::out_of_memory_heap_k;
         std::size_t const placed_count = locates_k ? survivors_size : 0;
         record_t* const placed = carve_bounce<record_t>(*executor_, placed_count);
         if ((placed_count != 0 && !placed) || executor_->pin_bounce().failed()) return status_t::out_of_memory_heap_k;
-        if ((status = upload(*executor_, placements, host_placements, placements_count)) != status_t::success_k)
-            return status;
         if (cells_count != 0) {
-            status = launch_over(
-                *executor_, names_t::place_k, cells_count, std::uint64_t {1} << 20,
-                static_cast<record_t const*>(survivors), static_cast<sorted_run_placement_t const*>(placements),
-                std::uint64_t {placements_count}, cells_count, stamps.floor, cells, survivor_stamps, survivor_kinds);
+            status = launch_over(*executor_, names_t::place_k, cells_count, std::uint64_t {1} << 20,
+                                 static_cast<record_t const*>(survivors), cells_count, stamps.floor, cells,
+                                 survivor_stamps, survivor_kinds);
             if (status != status_t::success_k) return status;
         }
 

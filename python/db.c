@@ -427,30 +427,31 @@ failed:
     return NULL;
 }
 
-static char const doc_Database_open_nvme[] =                                                    //
-    "open_nvme(directory, *, executor=None, cpu_class=CPUClass.AUTOMATIC, **sizes) answers a\n" //
-    "database on NVMe.\n"                                                                       //
-    "\n"                                                                                        //
-    "Every size keyword names a field of ustore_database_open_nvme_t, like memory_limit,\n"     //
-    "transaction_max_bytes or collection_cache_limit, where zero keeps the engine's default.\n" //
-    "The database moves bytes as an executor of Executor.for_nvme() says, read once here,\n"    //
-    "and with that call's defaults for any other executor and for none.\n"                      //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  directory (str | bytes | PathLike): The directory of the database's own files.\n"        //
-    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n"    //
-    "    the calling thread.\n"                                                                 //
-    "  data_directories (Sequence): Directories the volumes fill, each a path or a\n"           //
-    "    (path, max_bytes) pair; none keeps one volume inside the directory.\n"                 //
-    "  compactions (Executor, optional): An executor of Executor.for_vram() whose device and\n" //
-    "    scratch limit every merge takes, read once here; None merges on host threads.\n"       //
-    "  cpu_class (CPUClass): The CPU class the database confines its waits, atomics and\n"      //
-    "    string kernels to; AUTOMATIC takes what the CPU offers.\n"                             //
-    "Returns:\n"                                                                                //
-    "  Database: The opened database.\n"                                                        //
-    "Raises:\n"                                                                                 //
-    "  UnsupportedError: This build carries no NVMe engine, or the CPU does not run the\n"      //
-    "    `cpu_class`.\n"                                                                        //
+static char const doc_Database_open_nvme[] =                                                     //
+    "open_nvme(manifest, *, executor=None, cpu_class=CPUClass.AUTOMATIC, **sizes) answers a\n"   //
+    "database on NVMe.\n"                                                                        //
+    "\n"                                                                                         //
+    "Every size keyword names a field of ustore_database_open_nvme_t, like memory_limit,\n"      //
+    "transaction_max_bytes or collection_cache_limit, where zero keeps the engine's default.\n"  //
+    "The database moves bytes as an executor of Executor.for_nvme() says, read once here,\n"     //
+    "and with that call's defaults for any other executor and for none.\n"                       //
+    "\n"                                                                                         //
+    "Args:\n"                                                                                    //
+    "  manifest (str | bytes | PathLike): The manifest, <database>.ustore.json in an existing\n" //
+    "    directory, or the raw address of the database's first slot, like /dev/nvme0n1@64GiB.\n" //
+    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n"     //
+    "    the calling thread.\n"                                                                  //
+    "  data_directories (Sequence): Further data directories runs land on, each a path or a\n"   //
+    "    (path, max_bytes) pair, where zero bytes take the whole medium.\n"                      //
+    "  compactions (Executor, optional): An executor of Executor.for_vram() whose device and\n"  //
+    "    scratch limit every merge takes, read once here; None merges on host threads.\n"        //
+    "  cpu_class (CPUClass): The CPU class the database confines its waits, atomics and\n"       //
+    "    string kernels to; AUTOMATIC takes what the CPU offers.\n"                              //
+    "Returns:\n"                                                                                 //
+    "  Database: The opened database.\n"                                                         //
+    "Raises:\n"                                                                                  //
+    "  UnsupportedError: This build carries no NVMe engine, or the CPU does not run the\n"       //
+    "    `cpu_class`.\n"                                                                         //
     "  DeviceError: The `compactions` executor was not made by Executor.for_vram().";
 
 static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* arguments,
@@ -1174,11 +1175,13 @@ static char const doc_Snapshot_save[] =                                         
     "\n"                                                                                       //
     "Writes the snapshot out as a new database of the same engine, holding exactly the\n"      //
     "collections and names the snapshot records, which that engine's open then serves.\n"      //
-    "RocksDB and LevelDB create the directory, while the RAM engine writes its image into\n"   //
-    "the directory the path names. Calls `ustore_snapshot_save`.\n"                            //
+    "RocksDB and LevelDB create the directory, the RAM engine writes its image into the\n"     //
+    "directory the path names, and NVMe takes the path as the new database's manifest.\n"      //
+    "Calls `ustore_snapshot_save`.\n"                                                          //
     "\n"                                                                                       //
     "Args:\n"                                                                                  //
-    "  path (str | bytes | PathLike): The directory the saved database lands in.\n"            //
+    "  path (str | bytes | PathLike): The directory the saved database lands in, or its\n"     //
+    "    manifest on NVMe.\n"                                                                  //
     "  progress (Callable[[int, int], bool | None], optional): Called with the bytes of the\n" //
     "    keys and values saved and the bytes in all. A falsy answer other than None stops\n"   //
     "    the save, which removes what it wrote.\n"                                             //

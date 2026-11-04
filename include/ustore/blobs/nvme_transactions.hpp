@@ -1046,18 +1046,19 @@ concept nvme_store_concept = requires(
     collection_config_t const& config, typename store_type_::constraint_t& constraint,
     typename store_type_::ledger_t& ledger, io_channel_t& channel, lsm_tree_publication_hook_t const& published,
     compactor_ref_t const& compactor, std::span<lsm_tree_run_record_t const> runs,
-    std::span<lsm_tree_run_stamp_t const> stamps, st::vector<lsm_tree_run_record_t>& listed,
-    st::vector<lsm_tree_run_stamp_t>& listed_stamps, typename store_type_::ingest_runs_t& ingest_runs,
-    typename store_type_::stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size,
-    typename store_type_::sealed_commit_t& sealed, transaction_stamp_t stamp, std::size_t thread_index) {
+    st::vector<lsm_tree_run_record_t>& listed, typename store_type_::run_pool_t& run_pool,
+    typename store_type_::ingest_runs_t& ingest_runs, typename store_type_::stored_key_t stored_key,
+    std::span<byte_t> into, stored_value_size_t& size, typename store_type_::sealed_commit_t& sealed,
+    transaction_stamp_t stamp, std::size_t thread_index) {
     typename store_type_::key_slot_t;
     typename store_type_::fold_t;
-    { store_type_::mount(volume, config, constraint, ledger) } noexcept -> std::same_as<expected<store_type_>>;
-    { store.restore(channel, runs, stamps) } noexcept -> std::same_as<status_t>;
+    {
+        store_type_::mount(volume, config, constraint, ledger, run_pool)
+    } noexcept -> std::same_as<expected<store_type_>>;
+    { store.restore(channel, runs) } noexcept -> std::same_as<status_t>;
     { store.truncate_above(channel, channel, stamp, published) } noexcept -> std::same_as<status_t>;
-    { store.destroy(channel) } noexcept -> std::same_as<status_t>;
+    { store.destroy() } noexcept;
     { record_lsm_tree_runs(viewed.tree(), listed) } noexcept -> std::same_as<status_t>;
-    { record_lsm_tree_run_stamps(viewed.tree(), listed_stamps) } noexcept -> std::same_as<status_t>;
     { viewed.population_count() } noexcept -> std::same_as<std::uint64_t>;
     { viewed.size_bytes() } noexcept -> std::same_as<std::uint64_t>;
     { viewed.value_max_size() } noexcept -> std::same_as<stored_value_size_t>;
@@ -1078,7 +1079,7 @@ concept nvme_store_concept = requires(
     { store.compact(channel, channel, compactor, published) } noexcept -> std::same_as<expected<compaction_outcome_t>>;
     { store.begin_ingest() } noexcept -> std::same_as<typename store_type_::ingest_runs_t>;
     { store.publish_ingest(channel, ingest_runs) } noexcept -> std::same_as<expected<transaction_stamp_t>>;
-    { store.drop_ingest(channel, ingest_runs) } noexcept;
+    { store.drop_ingest(ingest_runs) } noexcept;
 };
 
 /**
@@ -1192,6 +1193,7 @@ class transaction_registry {
     inline status_t prepare_(transaction_state_t& data, transaction_stamp_t start_stamp) noexcept;
     inline void forget_(transaction_state_t& data, std::size_t prepared) noexcept;
     inline void maintain_(transaction_state_t& data) noexcept;
+    inline bool flushed_records_(transaction_state_t& data) noexcept;
     static inline status_t prepare_commit_(void* context) noexcept;
     static inline void publish_commit_(void* context, transaction_stamp_t stamp) noexcept;
 
@@ -1252,14 +1254,19 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
     // Sealed before the leader word is taken, so the sort, the copy and any flush hold up
     // no other committer.
     if (status_t const sealed = seal_(data); sealed.failed()) return sealed;
-    store_->ledger().lead();
-    stage_stamp = current_stamp_();
-    if (status_t const prepared = prepare_(data, start_stamp); prepared.failed()) {
+    for (;;) {
+        store_->ledger().lead();
+        stage_stamp = current_stamp_();
+        status_t const prepared = prepare_(data, start_stamp);
+        if (prepared.succeeded()) return status_t {};
         store_->ledger().stop_leading();
-        data.sealed.clear();
-        return prepared;
+        // A stage refused a memory-run record prepares again only once a flush gave records back,
+        // so it never spins.
+        if (prepared != status_code_t::capacity_exhausted_k || !flushed_records_(data)) {
+            data.sealed.clear();
+            return prepared;
+        }
     }
-    return status_t {};
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
@@ -1293,6 +1300,10 @@ transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_ty
     request.prepare = &prepare_commit_;
     request.publish = &publish_commit_;
     expected<transaction_stamp_t> committed = store_->ledger().submit(request);
+    // A commit refused a memory-run record resubmits only once a flush gave records back, so
+    // it never spins.
+    while (committed == status_code_t::capacity_exhausted_k && flushed_records_(data))
+        committed = store_->ledger().submit(request);
     if (committed) maintain_(data);
     data.sealed.clear();
     return committed;
@@ -1364,6 +1375,18 @@ template <typename stored_key_type_, typename store_type_, template <typename> t
 inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::forget_(
     transaction_state_t& data, std::size_t prepared) noexcept {
     for (std::size_t index = 0; index != prepared; ++index) store_->forget_collection(data.sealed[index].id);
+}
+
+/** Flushes every collection @p data sealed, answering whether any of them gave
+ *  memory-run records back. */
+template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
+          typename waiter_type_>
+inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::flushed_records_(
+    transaction_state_t& data) noexcept {
+    bool freed = false;
+    for (typename transaction_state_t::sealed_collection_t const& sealed : data.sealed)
+        freed |= store_->flushed_records(sealed.id);
+    return freed;
 }
 
 /** Merges, flushes and compacts whatever the landed commit left due in the collections it wrote; a

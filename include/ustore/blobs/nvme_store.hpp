@@ -309,11 +309,12 @@ class value_cache {
 template <typename stored_key_type_, template <typename> typename atomic_reference_>
 struct sealed_commit {
 
-    /** The deltas, sorted and copied, which the leader moves into @c run once it draws the stamp. */
+    /** The deltas, sorted and copied, which the leader moves into a run of the store's pool once it
+     *  draws the stamp. */
     sealed_deltas<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>> deltas;
 
-    /** The run they become, allocated by the committer, owned by the store once published. */
-    std::unique_ptr<memory_run<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>>> run;
+    /** Whether the commit carries no delta for this store, so it adds no run. */
+    [[nodiscard]] bool empty() const noexcept { return deltas.size() == 0; }
 };
 
 /** One key a scan hands out: what it carries at the scan's stamp and how wide its value is. */
@@ -437,6 +438,9 @@ class nvme_store {
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
 
+    /** The database's pool the runs of that tree live in. */
+    using run_pool_t = typename tree_t::run_pool_t;
+
     /** Everything a reader of this collection needs, which nothing changes once it is published. */
     using view_t = typename published_runs_t::view_t;
 
@@ -468,9 +472,10 @@ class nvme_store {
      *  @param[in] config The bounds of the memory runs, the cache bound and the shape of the tree below.
      *  @param[in,out] constraint The budget the memory runs and the cache are charged to.
      *  @param[in,out] ledger The stamps the store's writes carry and its readers pin, outliving the store.
+     *  @param[in,out] runs The database's pool the tree's runs live in, outliving the store.
      */
     static expected<nvme_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
-                                      ledger_t& ledger) noexcept {
+                                      ledger_t& ledger, run_pool_t& runs) noexcept {
         sorted_run_config_t const& values = config.lsm_tree.lsm_level_0.sorted_run;
         nvme_store mounted;
         mounted.value_size_ = is_fixed(value_layout_k) ? values.value_size : 0;
@@ -481,15 +486,15 @@ class nvme_store {
             return status_t {status_code_t::invalid_argument_k, "A collection admits values of some width"};
         mounted.cache_ = value_cache_t::of(holds_values_inline_k ? 0 : config.cache_limit, mounted.value_max_size_,
                                            constraint);
-        if (status_t const mounted_runs = mounted.runs_.mount(volume, config, constraint, ledger);
+        if (status_t const mounted_runs = mounted.runs_.mount(volume, config, constraint, ledger, runs);
             mounted_runs.failed())
             return mounted_runs;
         return mounted;
     }
 
     /** Returns every run to the volume and forgets every memory run, which destroys the data and which only a
-     *  collection no reader reaches and no commit names may. */
-    status_t destroy(io_channel_t& channel) noexcept { return runs_.destroy(channel); }
+     *  collection no reader reaches and no manifest names may. */
+    void destroy() noexcept { runs_.destroy(); }
 
 #pragma endregion Construction
 
@@ -833,8 +838,6 @@ class nvme_store {
             deltas, constrained_allocator<byte_t, atomic_reference_> {runs_.constraint()});
         if (seal_status.failed()) return seal_status;
         sealed.deltas = std::move(sealed_deltas);
-        sealed.run.reset(new (std::nothrow) memory_run_t {});
-        if (!sealed.run) return status_t {status_code_t::out_of_memory_k, "No room for another memory run"};
         return sealed;
     }
 
@@ -848,16 +851,22 @@ class nvme_store {
      *  @note Called by the thread holding the ledger's leader word, which then publishes or forgets it before it lets
      *      the word go.
      */
-    status_t prepare(sealed_commit_t& sealed) noexcept { return runs_.prepare(sealed.run.get()); }
+    status_t prepare(sealed_commit_t& sealed) noexcept {
+        if (sealed.empty()) {
+            runs_.forget_prepared();
+            return {};
+        }
+        return runs_.prepare();
+    }
 
     /** Stamps @p sealed's run with @p stamp, publishes the view @c prepare laid out, and takes the run over, which the
      *  leader does before it publishes @p stamp itself, so a reader at the stamp finds the run. */
     void publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
+        if (sealed.empty()) return;
         expected<memory_run_t> stamped = memory_run_t::stamped(
             std::move(sealed.deltas), stamp, constrained_allocator<byte_t, atomic_reference_> {runs_.constraint()});
         assert(stamped.has_value() && "A drawn stamp packs into no words");
-        if (stamped) *sealed.run = std::move(*stamped);
-        runs_.publish(std::move(sealed.run), stamp);
+        runs_.publish(stamped ? std::move(*stamped) : memory_run_t {}, stamp);
     }
 
     /** Drops the view @c prepare laid out, which the leader does for a commit it then refuses. */
@@ -866,7 +875,7 @@ class nvme_store {
     /** Lands @p sealed as a commit of its own through the ledger's sequencer, and returns once it is published; a
      *  commit sealing no run draws no stamp. */
     status_t commit(sealed_commit_t& sealed) noexcept {
-        if (!sealed.run) return {};
+        if (sealed.empty()) return {};
         alone_t alone {this, &sealed};
         commit_request_t request;
         request.context = &alone;
@@ -937,11 +946,10 @@ class nvme_store {
         return false;
     }
 
-    /** Opens the runs @p runs names as this collection's tree, with the @p stamps ingests assigned, which a mount does
-     *  before anything reads. */
-    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
-                     std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
-        return runs_.restore(channel, runs, stamps);
+    /** Opens the runs @p runs names as this collection's tree, with the stamps ingests assigned,
+     *  which a mount does before anything reads. */
+    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs) noexcept {
+        return runs_.restore(channel, runs);
     }
 
     /** Writes @p stored_value under @p stored_key as a commit of its own, flushing first when the memory runs are past
@@ -1069,13 +1077,13 @@ class nvme_store {
 
     /**
      *  @brief Lays @p rows out behind the rows @p ingested laid out before, at stamp zero, writing a run each time one
-     *      fills the deltas one flush holds or the bytes one run file takes.
+     *      fills one slot.
      *  @param[in,out] channel The channel the runs are written on, held by the calling thread.
      *  @param[in] rows Rows in ascending order of their keys, readable until the call returns.
      *  @return Success, or the status that stopped it with @p ingested as it was: @c invalid_argument_k for keys that
      *      do not strictly ascend past every key before them, @c malformed_k for a row this collection admits no value
      *      of.
-     *  @note Changes the volume's catalog, so the caller holds what serializes those changes.
+     *  @note Allocates on the volume, so the caller holds what serializes the volume's placements.
      */
     status_t write_ingest(io_channel_t& channel, std::span<keyed_delta_t const> rows,
                           ingest_runs_t& ingested) noexcept {
@@ -1100,8 +1108,7 @@ class nvme_store {
         std::size_t const values_before = drained.stored_values.size();
         if (status_t const laid = lay_out_ingested_(channel, rows, ingested); laid.failed()) {
             while (ingested.runs.size() != runs_before) {
-                [[maybe_unused]] status_t const dropped = sorted_run_t::drop(runs_.tree().volume(), channel,
-                                                                             ingested.runs.back().content_id());
+                runs_.tree().volume().deallocate(ingested.runs.back().extent());
                 ingested.runs.pop_back();
             }
             drained.resize(slots_before, values_before);
@@ -1121,17 +1128,17 @@ class nvme_store {
     expected<transaction_stamp_t> publish_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
         if (!ingested.drained.key_slots.empty())
             if (status_t const written = write_ingested_run_(channel, ingested); written.failed()) {
-                drop_ingest(channel, ingested);
+                drop_ingest(ingested);
                 return written;
             }
-        return runs_.publish_ingest(channel, ingested.runs, [&]() noexcept { return flush(channel); });
+        return runs_.publish_ingest(ingested.runs, [&]() noexcept { return flush(channel); });
     }
 
-    /** Drops every run @p ingested wrote and every row it laid out, which an ingest that never published leaves. */
-    void drop_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
+    /** Gives back every run @p ingested wrote and drops every row it laid out, which an ingest that
+     *  never published leaves. */
+    void drop_ingest(ingest_runs_t& ingested) noexcept {
         for (sorted_run_t const& run : ingested.runs)
-            if (run.attached()) [[maybe_unused]]
-                status_t const dropped = sorted_run_t::drop(runs_.tree().volume(), channel, run.content_id());
+            if (run.attached()) runs_.tree().volume().deallocate(run.extent());
         ingested.runs.clear();
         ingested.drained.clear();
     }
@@ -1511,9 +1518,21 @@ class nvme_store {
      *  the caller serializes with every other flush, and returns once it is published. */
     status_t commit_alone_(io_channel_t& channel, expected<sealed_commit_t> sealed) noexcept {
         if (!sealed) return sealed.status();
-        if (sealed->run && memory_pressure(*sealed) != memory_pressure_t::fits_k)
+        // Merging by tier frees records without a write, so a flush is left to deltas and bytes
+        // past their bounds.
+        if (!sealed->empty() && memory_pressure(*sealed) == memory_pressure_t::stalled_k)
+            if (status_t const merged = merge_memory_runs(); merged.failed()) return merged;
+        if (!sealed->empty() && memory_pressure(*sealed) != memory_pressure_t::fits_k)
             if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
-        return commit(*sealed);
+        for (;;) {
+            status_t const committed = commit(*sealed);
+            if (committed != status_code_t::capacity_exhausted_k) return committed;
+            // A commit refused a memory-run record resubmits only once a flush gave records back,
+            // so it never spins.
+            std::size_t const held = runs_.memory_shape().runs;
+            if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
+            if (runs_.memory_shape().runs >= held) return committed;
+        }
     }
 
     static status_t prepare_alone_(void* context) noexcept {
@@ -1547,10 +1566,9 @@ class nvme_store {
                                                key_slots + portable_alignment_k);
     }
 
-    /** Whether a run of @p key_slots key slots and @p values bytes outgrows what one flush or one file holds. */
+    /** Whether a run of @p key_slots key slots and @p values bytes outgrows one slot. */
     [[nodiscard]] static bool ingested_run_overflows_(std::uint64_t key_slots, std::uint64_t values) noexcept {
-        return key_slots > storage_limits_t::memory_runs_max_deltas_k ||
-               ingested_run_bytes_(key_slots, values) > storage_limits_t::sorted_run_file_max_size_k;
+        return ingested_run_bytes_(key_slots, values) > utilities::sorted_run_bytes_max_k;
     }
 
     /** Writes the rows @p ingested laid out as one run of stamp zero, and empties the layout for the next. */
@@ -1558,7 +1576,8 @@ class nvme_store {
         if (ingested.runs.reserve(ingested.runs.size() + 1) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "An ingest could not hold another run"};
         auto [written, write_status] = sorted_run_t::write(
-            runs_.tree().volume(), channel, uuid_generator(), std::span<key_slot_t const> {ingested.drained.key_slots},
+            runs_.tree().volume(), channel, runs_.config().lsm_tree.collection, uuid_generator(),
+            std::span<key_slot_t const> {ingested.drained.key_slots},
             std::span<std::uint64_t const> {ingested.drained.stamps},
             std::span<std::uint8_t const> {ingested.drained.kinds}, 0,
             std::span<byte_t const> {ingested.drained.stored_values},
@@ -1854,7 +1873,7 @@ class nvme_store_cursor {
                 cursor.level_number = static_cast<std::uint32_t>(number);
                 cursor.run_index = static_cast<std::uint32_t>(index);
                 cursor.population = level.run(index).population_count();
-                cursor.position = lower_bound_(level.run(index), cursor.population, from);
+                cursor.position = level.run(index).lower_bound(from);
                 [[maybe_unused]] st::status_t const placed = cursors_.push_back(std::move(cursor));
             }
         }
@@ -1898,20 +1917,6 @@ class nvme_store_cursor {
                     ++cursors_[index].position;
             if (taken) return true;
         }
-    }
-
-    /** The first of the @p population sorted positions of @p run whose key is not below @p from. */
-    template <typename run_type_>
-    [[nodiscard]] static std::uint64_t lower_bound_(run_type_ const& run, std::uint64_t population,
-                                                    stored_key_t from) noexcept {
-        std::uint64_t low = 0;
-        std::uint64_t high = population;
-        while (low != high) {
-            std::uint64_t const middle = low + (high - low) / 2;
-            if (run.key_slot(middle).stored_key < from) low = middle + 1;
-            else high = middle;
-        }
-        return low;
     }
 
     /** The key slot @p cursor sits on, which must not be spent. */

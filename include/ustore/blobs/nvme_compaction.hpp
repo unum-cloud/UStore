@@ -24,6 +24,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
+#include <algorithm>   // `std::min`
 #include <array>       // `std::array`
 #include <concepts>    // `std::convertible_to`
 #include <limits>      // `std::numeric_limits`
@@ -36,9 +37,10 @@
 
 #include <smashtable/basic_vector.hpp>           // `st::vector`
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
+#include <smashtable/immutable_splus_tree.hpp>   // `st::immutable_splus_tree_view`
 #include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`
 
-#include "ustore/blobs/nvme_key_slot.hpp"   // `limit`, `stored_key_concept`, `sorted_run_index_layout_t`
+#include "ustore/blobs/nvme_key_slot.hpp"   // `stored_key_concept`
 #include "ustore/utilities/folds.hpp"       // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
 #include "ustore/utilities/nvme_ring.hpp"   // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
 #include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`, `arena_allocator`
@@ -145,14 +147,14 @@ struct sorted_run_extents_t {
     std::uint64_t assigned_stamp = 0;
 };
 
-/** The key slots of one sorted run as its sorted run index's cells hold them, and the stamp and kind of every one. */
+/** The key slots of one sorted run in sorted order, and the stamp and kind of every one. */
 template <typename key_slot_type_>
 struct sorted_run_index_view {
 
-    /** The sorted run index's cells, whole rows including padding. */
+    /** The run's cells in sorted order. */
     key_slot_type_ const* cells = nullptr;
 
-    /** Key slots in the sorted run index, padding excluded. */
+    /** Key slots the run holds. */
     std::uint64_t key_slots_count = 0;
 
     /** The stamp of every key slot in sorted order, or null for a run whose every stamp reads as zero. */
@@ -204,9 +206,6 @@ struct compaction_stamps_t {
 /** Bounds every sorted run a compaction writes must fit, derived from the sorted run layout and the storage limits. */
 struct sorted_run_bounds_t {
 
-    /** Most key slots in one sorted run. */
-    std::uint64_t key_slots_capacity = 0;
-
     /** Largest sorted run file in bytes, which a sorted run of one key slot may still exceed. */
     std::uint64_t file_bytes_limit = 0;
 
@@ -215,9 +214,6 @@ struct sorted_run_bounds_t {
 
     /** Alignment of the key slots and stored values sections. */
     std::uint64_t alignment_bytes = 0;
-
-    /** Cells in one sorted run index row, the same for the input and the output sorted runs. */
-    std::uint64_t branching = 0;
 
     /** Bytes every value of a fixed-width layout takes in its runs, removals included, and zero for any other. */
     std::uint64_t value_stride = 0;
@@ -265,7 +261,7 @@ using rebound_vector =
 template <typename key_slot_type_, typename allocator_type_ = st::default_allocator<key_slot_type_>>
 struct compaction_output {
 
-    /** Sorted run indexes of the new sorted runs one after another, padding included. */
+    /** The cells of the new sorted runs one after another, each run's in sorted order. */
     rebound_vector<key_slot_type_, allocator_type_> cells;
 
     /** The new sorted runs in ascending order of stored keys. */
@@ -496,77 +492,66 @@ constexpr std::uint32_t stored_value_bytes(stored_value_offset_t const* value_of
                                     : static_cast<std::uint32_t>(value_stride);
 }
 
-/** Offset of the stored values section in a sorted run of @p key_slots_count key slots, past its value offsets. */
+/** Offset of the stored values section in a sorted run of @p key_slots_count key slots, past its
+ *  cells, the saved tree of its keys and its value offsets. */
 template <typename key_slot_type_>
 constexpr std::uint64_t stored_values_offset(sorted_run_bounds_t const& bounds,
                                              std::uint64_t key_slots_count) noexcept {
-    std::uint64_t const cells_bytes = round_up_to_multiple(key_slots_count, bounds.branching) * sizeof(key_slot_type_);
+    std::uint64_t const cells_bytes = key_slots_count * sizeof(key_slot_type_);
+    std::uint64_t const keys_bytes = sizeof(st::splus_tree_header_t) +
+                                     st::immutable_splus_tree_view<typename key_slot_type_::stored_key_t>::size_bytes(
+                                         static_cast<std::size_t>(key_slots_count));
     std::uint64_t offsets_bytes = 0;
     if constexpr (locates_stored_values_concept<key_slot_type_>)
         if (is_variable_width(key_slot_type_::value_layout_k))
             offsets_bytes = round_up_to_multiple((key_slots_count + 1) * sizeof(stored_value_offset_t),
                                                  bounds.alignment_bytes);
-    return bounds.header_bytes + round_up_to_multiple(cells_bytes, bounds.alignment_bytes) + offsets_bytes;
+    return bounds.header_bytes + round_up_to_multiple(cells_bytes, bounds.alignment_bytes) +
+           round_up_to_multiple(keys_bytes, bounds.alignment_bytes) + offsets_bytes;
 }
 
 /** Bytes of a sorted run file of @p key_slots_count key slots locating @p stored_values_bytes bytes of stored
- *  values. */
+ *  values, which for a run of strings are its keys whole and the layers they land in. */
 template <typename key_slot_type_>
 constexpr std::uint64_t sorted_run_file_bytes(sorted_run_bounds_t const& bounds, std::uint64_t key_slots_count,
                                               std::uint64_t stored_values_bytes) noexcept {
+    // A run of strings keeps its heads in a saved S+ tree, then its values, key offsets, keys
+    // and layers apart.
+    if constexpr (tailed_key_slot_concept<key_slot_type_>) {
+        std::uint64_t const heads = sizeof(st::splus_tree_header_t) +
+                                    st::immutable_splus_tree_view<st::key128_t>::size_bytes(
+                                        static_cast<std::size_t>(key_slots_count));
+        return bounds.header_bytes + round_up_to_multiple(heads, bounds.alignment_bytes) +
+               round_up_to_multiple(key_slots_count * key_slot_type_::size, bounds.alignment_bytes) +
+               round_up_to_multiple((key_slots_count + 1) * sizeof(std::uint32_t), bounds.alignment_bytes) +
+               round_up_to_multiple(stored_values_bytes, bounds.alignment_bytes) + bounds.alignment_bytes;
+    }
     std::uint64_t const key_slots_end = stored_values_offset<key_slot_type_>(bounds, key_slots_count);
     if constexpr (locates_stored_values_concept<key_slot_type_>)
         return key_slots_end + round_up_to_multiple(stored_values_bytes, bounds.alignment_bytes);
     else return key_slots_end;
 }
 
-/** Whether @p bounds admit sorted runs: a key slot per sorted run, rows of two cells or more, and an alignment. */
+/** Whether @p bounds admit sorted runs: a file limit and an alignment. */
 constexpr bool admits_sorted_runs(sorted_run_bounds_t const& bounds) noexcept {
-    return (bounds.key_slots_capacity != 0) & (bounds.branching >= 2) & (bounds.alignment_bytes != 0);
-}
-
-/** The key slot padding cells hold: the greatest stored key, with everything else as a key slot starts. */
-template <typename key_slot_type_>
-constexpr key_slot_type_ padding_key_slot() noexcept {
-    key_slot_type_ padding {};
-    padding.stored_key = limit<typename key_slot_type_::stored_key_t>::max();
-    return padding;
-}
-
-/** Copies @p cell of a sorted run, as a write stamped zero, and its value's bytes as @c stored_value_bytes reads them,
- *  into its sorted position among @p records, skipping padding; the run's stamps and kinds land over it after. */
-template <typename key_slot_type_>
-constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout_t const& layout, std::uint64_t cell,
-                            std::uint32_t sorted_run, stored_value_offset_t const* value_offsets,
-                            std::uint64_t value_stride, located_key_slot<key_slot_type_>* records) noexcept {
-    std::uint64_t const sorted = layout.cell_to_sorted(cell);
-    if (sorted < layout.key_slots_count)
-        records[sorted] = located_key_slot<key_slot_type_> {cells[cell],
-                                                            sorted_run,
-                                                            delta_kind_t::write_k,
-                                                            0,
-                                                            static_cast<std::uint32_t>(sorted),
-                                                            stored_value_bytes(value_offsets, value_stride, sorted)};
+    return (bounds.file_bytes_limit != 0) & (bounds.alignment_bytes != 0);
 }
 
 /**
- *  @brief Writes a surviving key slot into its cell of a new sorted run, with its stamp and its kind.
- *
+ *  @brief Writes a survivor into its cell of the new sorted runs, which hold the survivors in
+ *      order, with its stamp and its kind.
  *  @param[in] source The survivor with the index of its old sorted run.
- *  @param[in] layout Layout of the new sorted run's sorted run index.
- *  @param[in] position Position of the survivor in the new sorted run's sorted order.
  *  @param[in] floor The stamp the survivor's stamp is raised to at least.
- *  @param[out] cells The new sorted run's cells.
+ *  @param[out] cell The survivor's cell.
  *  @param[out] stamp The survivor's stamp, raised to @p floor.
  *  @param[out] kind The survivor's kind.
  */
 template <typename key_slot_type_>
-constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, sorted_run_index_layout_t const& layout,
-                              std::uint64_t position, std::uint64_t floor, key_slot_type_* cells, std::uint64_t* stamp,
-                              std::uint8_t* kind) noexcept {
-    *stamp = source.stamp > floor ? source.stamp : floor;
-    *kind = static_cast<std::uint8_t>(source.kind);
-    cells[layout.sorted_to_cell(position)] = source.key_slot;
+constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, std::uint64_t floor, key_slot_type_& cell,
+                              std::uint64_t& stamp, std::uint8_t& kind) noexcept {
+    stamp = source.stamp > floor ? source.stamp : floor;
+    kind = static_cast<std::uint8_t>(source.kind);
+    cell = source.key_slot;
 }
 
 /**
@@ -672,14 +657,17 @@ st::status_t plan_value_copies(record_type_ const* survivors,
 }
 
 /**
- *  @brief Cuts @p key_slots_count sorted survivors into sorted runs, filling each as far as @p bounds allow.
+ *  @brief Cuts @p key_slots_count sorted survivors into sorted runs of equal size that each
+ *      fit @p bounds.
  *
- *  A sorted run takes the most key slots that fit its capacity and file limit, and always at least one. The
- *  versions of one key never straddle two runs, since a sorted level answers a key from the one run whose bounds
- *  hold it: a cut moves back to where the key begins, or past where it ends when it began the run.
+ *  Every cut aims at the bytes left divided by the runs they still need, so a cut that writes two
+ *  or more runs fills each at least halfway, and a run always takes at least one key slot. The
+ *  versions of one key never straddle two runs, since a sorted level answers a key from the one run
+ *  whose bounds hold it: a cut moves back to where the key begins, or past where it ends when it
+ *  began the run.
  *
  *  @param[in] key_slots_count How many survivors there are to cut.
- *  @param[in] bounds The capacity and file limit every sorted run holds to.
+ *  @param[in] bounds The file limit every sorted run holds to.
  *  @param[in] read_prefix Called as @c read_prefix(index, bytes) to write the stored value bytes of the first @c index
  *      survivors.
  *  @param[in] shares_key Called as @c shares_key(index, shared) to say whether survivor @c index carries the key
@@ -693,16 +681,28 @@ st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t
     using st::status_t;
     sorted_runs.clear();
 
+    std::uint64_t all_bytes = 0;
+    status_t status = read_prefix(key_slots_count, all_bytes);
+    if (status != status_t::success_k) return status;
+
     std::uint64_t first = 0;
     std::uint64_t first_bytes = 0;
     while (first != key_slots_count) {
         std::uint64_t const remaining = key_slots_count - first;
-        std::uint64_t taken = remaining < bounds.key_slots_capacity ? remaining : bounds.key_slots_capacity;
-        std::uint64_t taken_bytes = 0;
-        status_t status = read_prefix(first + taken, taken_bytes);
-        if (status != status_t::success_k) return status;
+        std::uint64_t const remaining_bytes = sorted_run_file_bytes<key_slot_type_>(bounds, remaining,
+                                                                                    all_bytes - first_bytes);
+        std::uint64_t const runs_needed = divide_round_up(remaining_bytes, bounds.file_bytes_limit);
+        // Every run pays its sections' first pages and its tree's first row, which an equal share
+        // must not split.
+        std::uint64_t const run_overhead = sorted_run_file_bytes<key_slot_type_>(bounds, 1, 0);
+        std::uint64_t const target_bytes =
+            runs_needed > 1 ? std::min(divide_round_up(remaining_bytes + (runs_needed - 1) * run_overhead, runs_needed),
+                                       bounds.file_bytes_limit)
+                            : bounds.file_bytes_limit;
 
-        if (sorted_run_file_bytes<key_slot_type_>(bounds, taken, taken_bytes - first_bytes) > bounds.file_bytes_limit) {
+        std::uint64_t taken = remaining;
+        std::uint64_t taken_bytes = all_bytes;
+        if (sorted_run_file_bytes<key_slot_type_>(bounds, taken, taken_bytes - first_bytes) > target_bytes) {
             std::uint64_t fitting = 1;
             std::uint64_t low = 2;
             std::uint64_t high = taken - 1;
@@ -711,8 +711,7 @@ st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t
                 std::uint64_t middle_bytes = 0;
                 status = read_prefix(first + middle, middle_bytes);
                 if (status != status_t::success_k) return status;
-                if (sorted_run_file_bytes<key_slot_type_>(bounds, middle, middle_bytes - first_bytes) <=
-                    bounds.file_bytes_limit) {
+                if (sorted_run_file_bytes<key_slot_type_>(bounds, middle, middle_bytes - first_bytes) <= target_bytes) {
                     fitting = middle;
                     low = middle + 1;
                 }
@@ -767,6 +766,60 @@ constexpr bool views_locate_values(std::span<sorted_run_index_view<key_slot_type
             if (view.key_slots_count != 0 && view.value_offsets.size() != view.key_slots_count + 1) return false;
         return true;
     }
+}
+
+/** The position a row of @c union_sorted_keys names in a side that lacks its key. */
+inline constexpr std::size_t absent_position_k = std::numeric_limits<std::size_t>::max();
+
+/**
+ *  @brief Merges two ascending sequences of distinct keys into their union, writing for each row,
+ *      in ascending order of keys, the key's position in each side or @c absent_position_k where
+ *      the side lacks it.
+ *  @param[in] read_first Called as <tt>read_first(index, views)</tt>, filling every one of @p views with
+ *      the keys of the first side from @p index on.
+ *  @param[in] first_count Keys of the first side.
+ *  @param[in] read_second As @p read_first, for the second side.
+ *  @param[in] second_count Keys of the second side.
+ *  @param[out] first_positions Room for @p first_count plus @p second_count positions in
+ *      the first side.
+ *  @param[out] second_positions As much room, for positions in the second side.
+ *  @return Rows written.
+ */
+template <typename first_reader_type_, typename second_reader_type_>
+std::size_t union_sorted_keys(first_reader_type_&& read_first, std::size_t first_count,
+                              second_reader_type_&& read_second, std::size_t second_count,
+                              std::span<std::size_t> first_positions,
+                              std::span<std::size_t> second_positions) noexcept {
+    // Each side is read 64 views at a time, refilled only once its cursor walks off the block.
+    constexpr std::size_t block_k = 64;
+    std::array<std::string_view, block_k> first_views, second_views;
+    std::size_t first_index = 0, second_index = 0, first_block_start = 0, second_block_start = 0;
+    std::size_t first_block_end = 0, second_block_end = 0, rows = 0;
+    auto const emit = [&](std::size_t first, std::size_t second) noexcept {
+        first_positions[rows] = first;
+        second_positions[rows] = second;
+        ++rows;
+    };
+    while (first_index != first_count && second_index != second_count) {
+        if (first_index == first_block_end) {
+            std::size_t const filled = std::min(block_k, first_count - first_index);
+            read_first(first_index, std::span<std::string_view> {first_views}.first(filled));
+            first_block_start = first_index, first_block_end = first_index + filled;
+        }
+        if (second_index == second_block_end) {
+            std::size_t const filled = std::min(block_k, second_count - second_index);
+            read_second(second_index, std::span<std::string_view> {second_views}.first(filled));
+            second_block_start = second_index, second_block_end = second_index + filled;
+        }
+        int const order = first_views[first_index - first_block_start].compare(
+            second_views[second_index - second_block_start]);
+        if (order == 0) emit(first_index++, second_index++);
+        else if (order < 0) emit(first_index++, absent_position_k);
+        else emit(absent_position_k, second_index++);
+    }
+    for (; first_index != first_count; ++first_index) emit(first_index, absent_position_k);
+    for (; second_index != second_count; ++second_index) emit(absent_position_k, second_index);
+    return rows;
 }
 
 #pragma endregion Rules
@@ -920,7 +973,7 @@ struct host_compactor_t {
         status = scratch.resize(merged_count);
         if (status != status_t::success_k) return status;
 
-        // Every sorted run's cells land at their sorted positions, in one run per sorted run
+        // Every sorted run's cells are already in sorted order, in one run per sorted run
         vector<std::uint64_t> run_starts;
         status = run_starts.resize(upper.size() + 1);
         if (status != status_t::success_k) return status;
@@ -930,20 +983,16 @@ struct host_compactor_t {
                                                                     ? upper[sorted_run]
                                                                     : lower[sorted_run - upper.size()];
             if (sorted_run <= upper.size()) run_starts[sorted_run] = run_offset;
-            sorted_run_index_layout_t const layout(view.key_slots_count, bounds.branching);
             stored_value_offset_t const* const offsets = !view.value_offsets.empty() ? view.value_offsets.data()
                                                                                      : nullptr;
-            for (std::uint64_t cell = 0; cell != layout.cells_count(); ++cell) {
-                std::uint64_t const sorted = layout.cell_to_sorted(cell);
-                if (sorted < layout.key_slots_count)
-                    located_of(records[run_offset + sorted]) = located_key_slot<key_slot_type_> {
-                        view.cells[cell],
-                        static_cast<std::uint32_t>(sorted_run),
-                        delta_kind_t::write_k,
-                        0,
-                        static_cast<std::uint32_t>(sorted),
-                        stored_value_bytes(offsets, bounds.value_stride, sorted)};
-            }
+            for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
+                located_of(records[run_offset + sorted]) = located_key_slot<key_slot_type_> {
+                    view.cells[sorted],
+                    static_cast<std::uint32_t>(sorted_run),
+                    delta_kind_t::write_k,
+                    0,
+                    static_cast<std::uint32_t>(sorted),
+                    stored_value_bytes(offsets, bounds.value_stride, sorted)};
             if (view.stamps != nullptr)
                 for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
                     located_of(records[run_offset + sorted]).stamp = (*view.stamps)[static_cast<std::size_t>(sorted)];
@@ -1072,33 +1121,15 @@ struct host_compactor_t {
             }
         }
 
-        std::uint64_t cells_count = 0;
-        for (std::size_t index = 0; index != output.sorted_runs.size(); ++index)
-            cells_count += round_up_to_multiple(output.sorted_runs[index].key_slots_count, bounds.branching);
-        status = output.cells.resize(cells_count);
+        status = output.cells.resize(survivors);
         if (status != status_t::success_k) return status;
-        key_slot_type_ const padding = padding_key_slot<key_slot_type_>();
-        for (std::uint64_t cell = 0; cell != cells_count; ++cell) output.cells[cell] = padding;
-
         status = output.stamps.resize(survivors);
         if (status != status_t::success_k) return status;
         status = output.kinds.resize(survivors);
         if (status != status_t::success_k) return status;
-
-        std::uint64_t first = 0;
-        std::uint64_t first_cell = 0;
-        for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
-            std::uint64_t const count = output.sorted_runs[index].key_slots_count;
-            sorted_run_index_layout_t const layout(count, bounds.branching);
-            for (std::uint64_t position = 0; position != count; ++position) {
-                std::uint64_t const survivor = first + position;
-                place_key_slot(located_of(records[survivor]), layout, position, stamps.floor,
-                               output.cells.data() + first_cell, output.stamps.data() + survivor,
-                               output.kinds.data() + survivor);
-            }
-            first += count;
-            first_cell += layout.cells_count();
-        }
+        for (std::uint64_t survivor = 0; survivor != survivors; ++survivor)
+            place_key_slot(located_of(records[survivor]), stamps.floor, output.cells[survivor], output.stamps[survivor],
+                           output.kinds[survivor]);
 
         status = plan_value_copies<key_slot_type_>(records.data(), upper, lower, bounds.value_stride,
                                                    output.sorted_runs, output.value_copy_ranges);
@@ -1369,19 +1400,6 @@ class ring_sections_reader {
 
     /** The scratch the reads land in, as the ring registered it. */
     utilities::registered_memory_t registered_;
-};
-
-/** Where one new sorted run starts among the survivors and the cells. */
-struct sorted_run_placement_t {
-
-    /** Index of the sorted run's first survivor. */
-    std::uint64_t first_key_slot = 0;
-
-    /** Index of the sorted run's first cell. */
-    std::uint64_t first_cell = 0;
-
-    /** Layout of the sorted run's sorted run index. */
-    sorted_run_index_layout_t layout;
 };
 
 class cuda_compactor_t;

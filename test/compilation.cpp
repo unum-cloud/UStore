@@ -341,7 +341,7 @@ std::size_t wrappers_compile(config_t const& config) {
         if (config.directory()) {
             path_t const saved {config.directory(), "saved"};
             failures += expect(create_directories(saved.c_str()));
-            failures += expect(snapshot.deferred(executor).save(saved.c_str()).wait().succeeded());
+            failures += expect(snapshot.deferred(executor).save(save_target(config, saved).c_str()).wait().succeeded());
         }
     }
 

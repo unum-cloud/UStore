@@ -10,16 +10,22 @@
 
 #include <cerrno>  // `errno`, `EEXIST`, `ENOENT`, `ENOTDIR`
 #include <cstddef> // `std::size_t`
-#include <cstring> // `std::memcpy`, `std::strlen`
+#include <cstdint> // `std::uint64_t`
+#include <cstring> // `std::memcpy`, `std::strlen`, `std::strrchr`
 
-#if defined(_WIN32)
+#include "ustore/types.h" // `USTORE_OS_WINDOWS_`
+
+#if USTORE_OS_WINDOWS_
 #include <windows.h> // `CreateFileW`, `MapViewOfFile`, `GetFileAttributesW`, `CreateDirectoryA`, `DeleteFileA`
 #else
-#include <dlfcn.h>    // `dlopen`, `dlsym`
-#include <fcntl.h>    // `open`
-#include <sys/mman.h> // `mmap`, `madvise`, `munmap`
-#include <sys/stat.h> // `stat`, `fstat`, `S_ISDIR`, `mkdir`
-#include <unistd.h>   // `close`, `rmdir`, `unlink`
+#include <dlfcn.h>       // `dlopen`, `dlsym`
+#include <dirent.h>      // `opendir`, `readdir`, `closedir`
+#include <fcntl.h>       // `open`
+#include <sys/file.h>    // `flock`
+#include <sys/mman.h>    // `mmap`, `madvise`, `munmap`
+#include <sys/stat.h>    // `stat`, `fstat`, `S_ISDIR`, `mkdir`
+#include <sys/statvfs.h> // `statvfs`
+#include <unistd.h>      // `close`, `rmdir`, `unlink`, `write`, `read`, `fdatasync`, `fsync`
 #endif
 
 #include <memory>      // `std::unique_ptr`
@@ -28,13 +34,15 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::exchange`, `std::swap`
 
+#include <smashtable/basic_vector.hpp> // `st::vector`
+
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`
 
 namespace unum::ustore::utilities {
 
 #pragma region Paths
 
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
 /** Longest path the wide Windows calls accept, including the null terminator. */
 inline constexpr std::size_t path_capacity_k = 32768;
@@ -76,7 +84,7 @@ inline status_t join_path(char const* directory, char const* name, std::span<cha
 /** An owned file descriptor, opened for reading, which a mapping is made from. */
 class seekable_file_t {
   public:
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
     /** What the platform calls an open file. */
     using registered_medium_t = HANDLE;
@@ -121,7 +129,7 @@ class seekable_file_t {
     registered_medium_t descriptor_ = closed_k;
 };
 
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
 inline expected<seekable_file_t> seekable_file_t::open(char const* path) noexcept {
     wide_path_t const wide {new (std::nothrow) wchar_t[path_capacity_k]};
@@ -176,7 +184,7 @@ struct shared_library_t {
 
     /** Opens the library named @p path, or answers the empty one. */
     static shared_library_t open(char const* path) noexcept {
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
         return {reinterpret_cast<void*>(::LoadLibraryA(path))};
 #else
         return {::dlopen(path, RTLD_NOW | RTLD_LOCAL)};
@@ -187,7 +195,7 @@ struct shared_library_t {
     template <typename function_type_>
     bool resolve(char const* name, function_type_& entry) const noexcept {
         if (!handle) return false;
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
         entry = reinterpret_cast<function_type_>(::GetProcAddress(static_cast<HMODULE>(handle), name));
 #else
         entry = reinterpret_cast<function_type_>(::dlsym(handle, name));
@@ -230,7 +238,7 @@ class mapped_file_t {
     std::size_t size_ = 0;
 };
 
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
 inline mapped_file_t::~mapped_file_t() noexcept {
     if (data_) { [[maybe_unused]] BOOL const unmapped = ::UnmapViewOfFile(data_); }
@@ -283,7 +291,7 @@ inline expected<mapped_file_t> mapped_file_t::map(char const* path) noexcept {
 
 #pragma region Directories
 
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
 /** Whether the null-terminated @p path names a directory, where a missing path is simply not one. */
 inline expected<bool> directory_exists(char const* path) noexcept {
@@ -309,7 +317,7 @@ inline expected<bool> directory_exists(char const* path) noexcept {
 
 #endif
 
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
 /** Creates @p path alone, treating a directory that is already there as success. */
 inline status_t create_directory(char const* path) noexcept {
@@ -375,5 +383,279 @@ inline status_t create_directories(char const* path) noexcept {
 }
 
 #pragma endregion Directories
+
+#pragma region Durable Files
+
+#if USTORE_OS_WINDOWS_
+
+/** Replaces @p path with @p bytes so a crash leaves the old file or the new one whole: a sibling
+ *  @c .tmp is written and flushed, then moved over @p path with write-through. */
+inline status_t replace_file_durably(char const* path, std::span<char const> bytes) noexcept {
+    char temporary[path_max_bytes_k];
+    std::size_t const length = std::strlen(path);
+    if (length + 5 > sizeof(temporary)) return {status_code_t::invalid_argument_k, "A path outgrew the limit"};
+    std::memcpy(temporary, path, length);
+    std::memcpy(temporary + length, ".tmp", 5);
+    HANDLE const file = ::CreateFileA(temporary, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                      nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {status_code_t::io_k, "A manifest copy would not be created"};
+    DWORD written = 0;
+    BOOL const wrote = ::WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    BOOL const flushed = wrote && written == bytes.size() && ::FlushFileBuffers(file);
+    [[maybe_unused]] BOOL const closed = ::CloseHandle(file);
+    if (!flushed) return {status_code_t::io_k, "A manifest copy would not be written"};
+    if (!::MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return {status_code_t::io_k, "A manifest copy would not replace the manifest"};
+    return {};
+}
+
+/** Reads the whole of @p path into @p into, answering @c not_found_k for a missing file. */
+inline status_t read_file(char const* path, st::vector<char>& into) noexcept {
+    HANDLE const file = ::CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return ::GetLastError() == ERROR_FILE_NOT_FOUND ? status_t {status_code_t::not_found_k, "No such file"}
+                                                        : status_t {status_code_t::io_k, "A file would not open"};
+    LARGE_INTEGER size {};
+    status_t result;
+    DWORD read = 0;
+    if (!::GetFileSizeEx(file, &size)) result = {status_code_t::io_k, "A file would not be measured"};
+    else if (into.resize(static_cast<std::size_t>(size.QuadPart)) != st::status_t::success_k)
+        result = {status_code_t::out_of_memory_k, "No room to read a file"};
+    else if (!::ReadFile(file, into.data(), static_cast<DWORD>(into.size()), &read, nullptr) || read != into.size())
+        result = {status_code_t::io_k, "A file would not be read"};
+    [[maybe_unused]] BOOL const closed = ::CloseHandle(file);
+    return result;
+}
+
+/** Calls @p visitor with the name of every entry of the directory @p path. */
+template <typename visitor_type_>
+status_t list_directory(char const* path, visitor_type_&& visitor) noexcept {
+    char pattern[path_max_bytes_k];
+    if (status_t const joined = join_path(path, "*", pattern); joined.failed()) return joined;
+    WIN32_FIND_DATAA found {};
+    HANDLE const search = ::FindFirstFileA(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE) return {};
+    do visitor(std::string_view {found.cFileName});
+    while (::FindNextFileA(search, &found));
+    [[maybe_unused]] BOOL const closed = ::FindClose(search);
+    return {};
+}
+
+/** What @c link_or_copy_file did to land a file at its target. */
+enum class file_landing_t : unsigned char {
+    linked_k,
+    copied_k,
+};
+
+/** Hard-links @p source at @p target, or copies it whole and flushes the copy where no link
+ *  reaches across volumes. */
+inline expected<file_landing_t> link_or_copy_file(char const* source, char const* target) noexcept {
+    if (::CreateHardLinkA(target, source, nullptr)) return file_landing_t::linked_k;
+    if (!::CopyFileA(source, target, TRUE)) return status_t {status_code_t::io_k, "A run file would not be copied"};
+    return file_landing_t::copied_k;
+}
+
+/** Bytes the filesystem holding @p directory still offers an unprivileged writer. */
+inline expected<std::uint64_t> free_bytes_of(char const* directory) noexcept {
+    ULARGE_INTEGER available {};
+    if (!::GetDiskFreeSpaceExA(directory, &available, nullptr, nullptr))
+        return status_t {status_code_t::io_k, "A data directory would not report its free space"};
+    return static_cast<std::uint64_t>(available.QuadPart);
+}
+
+#else
+
+/** Replaces @p path with @p bytes so a crash leaves the old file or the new one whole: a
+ *  sibling @c .tmp is written and @c fdatasync -ed, renamed over @p path, and the directory is
+ *  @c fsync -ed. */
+inline status_t replace_file_durably(char const* path, std::span<char const> bytes) noexcept {
+    char temporary[path_max_bytes_k];
+    std::size_t const length = std::strlen(path);
+    if (length + 5 > sizeof(temporary)) return {status_code_t::invalid_argument_k, "A path outgrew the limit"};
+    std::memcpy(temporary, path, length);
+    std::memcpy(temporary + length, ".tmp", 5);
+    int const file = ::open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (file < 0) return {status_code_t::io_k, "A manifest copy would not be created"};
+    std::size_t written = 0;
+    while (written != bytes.size()) {
+        ssize_t const step = ::write(file, bytes.data() + written, bytes.size() - written);
+        if (step <= 0 && errno != EINTR) break;
+        if (step > 0) written += static_cast<std::size_t>(step);
+    }
+    bool const synced = written == bytes.size() && ::fdatasync(file) == 0;
+    [[maybe_unused]] int const closed = ::close(file);
+    if (!synced) return {status_code_t::io_k, "A manifest copy would not be written"};
+    if (::rename(temporary, path) != 0) return {status_code_t::io_k, "A manifest copy would not replace the manifest"};
+
+    char directory[path_max_bytes_k];
+    std::memcpy(directory, path, length + 1);
+    char* const slash = std::strrchr(directory, '/');
+    if (slash == directory) slash[1] = '\0';
+    else if (slash) *slash = '\0';
+    else std::memcpy(directory, ".", 2);
+    int const parent = ::open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (parent < 0) return {status_code_t::io_k, "The manifest's directory would not open"};
+    bool const durable = ::fsync(parent) == 0;
+    [[maybe_unused]] int const closed_parent = ::close(parent);
+    return durable ? status_t {} : status_t {status_code_t::io_k, "The manifest's directory would not sync"};
+}
+
+/** Reads the whole of @p path into @p into, answering @c not_found_k for a missing file. */
+inline status_t read_file(char const* path, st::vector<char>& into) noexcept {
+    int const file = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (file < 0)
+        return errno == ENOENT ? status_t {status_code_t::not_found_k, "No such file"}
+                               : status_t {status_code_t::io_k, "A file would not open"};
+    struct stat information;
+    status_t result;
+    if (::fstat(file, &information) != 0) result = {status_code_t::io_k, "A file would not be measured"};
+    else if (into.resize(static_cast<std::size_t>(information.st_size)) != st::status_t::success_k)
+        result = {status_code_t::out_of_memory_k, "No room to read a file"};
+    for (std::size_t read = 0; result.succeeded() && read != into.size();) {
+        ssize_t const step = ::read(file, into.data() + read, into.size() - read);
+        if (step > 0) read += static_cast<std::size_t>(step);
+        else if (step == 0 || errno != EINTR) result = {status_code_t::io_k, "A file would not be read"};
+    }
+    [[maybe_unused]] int const closed = ::close(file);
+    return result;
+}
+
+/** Calls @p visitor with the name of every entry of the directory @p path. */
+template <typename visitor_type_>
+status_t list_directory(char const* path, visitor_type_&& visitor) noexcept {
+    DIR* const directory = ::opendir(path);
+    if (!directory) return {status_code_t::io_k, "A data directory would not be listed"};
+    while (dirent const* const entry = ::readdir(directory)) visitor(std::string_view {entry->d_name});
+    [[maybe_unused]] int const closed = ::closedir(directory);
+    return {};
+}
+
+/** What @c link_or_copy_file did to land a file at its target. */
+enum class file_landing_t : unsigned char {
+    linked_k,
+    copied_k,
+};
+
+/** Hard-links @p source at @p target, or copies it whole and @c fdatasync -s the copy where no link
+ *  reaches across filesystems. */
+inline expected<file_landing_t> link_or_copy_file(char const* source, char const* target) noexcept {
+    if (::link(source, target) == 0) return file_landing_t::linked_k;
+    if (errno != EXDEV && errno != EPERM) return status_t {status_code_t::io_k, "A run file would not be linked"};
+    int const from = ::open(source, O_RDONLY | O_CLOEXEC);
+    if (from < 0) return status_t {status_code_t::io_k, "A run file would not open to be copied"};
+    int const into = ::open(target, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (into < 0) {
+        [[maybe_unused]] int const closed = ::close(from);
+        return status_t {status_code_t::io_k, "A run file copy would not be created"};
+    }
+    char buffer[64 * 1024];
+    bool copied = true;
+    for (;;) {
+        ssize_t const read = ::read(from, buffer, sizeof(buffer));
+        if (read == 0) break;
+        if (read < 0) {
+            if (errno == EINTR) continue;
+            copied = false;
+            break;
+        }
+        for (ssize_t written = 0; copied && written != read;) {
+            ssize_t const step = ::write(into, buffer + written, static_cast<std::size_t>(read - written));
+            if (step > 0) written += step;
+            else if (step < 0 && errno != EINTR) copied = false;
+        }
+        if (!copied) break;
+    }
+    copied = copied && ::fdatasync(into) == 0;
+    [[maybe_unused]] int const closed_from = ::close(from);
+    [[maybe_unused]] int const closed_into = ::close(into);
+    if (!copied) return status_t {status_code_t::io_k, "A run file would not be copied"};
+    return file_landing_t::copied_k;
+}
+
+/** Bytes the filesystem holding @p directory still offers an unprivileged writer. */
+inline expected<std::uint64_t> free_bytes_of(char const* directory) noexcept {
+    struct statvfs information;
+    if (::statvfs(directory, &information) != 0)
+        return status_t {status_code_t::io_k, "A data directory would not report its free space"};
+    return static_cast<std::uint64_t>(information.f_bavail) * information.f_frsize;
+}
+
+#endif
+
+#pragma endregion Durable Files
+
+#pragma region File Locks
+
+/** An exclusive advisory lock on a file or a device, held until it dies, which serializes the
+ *  processes claiming slots of one raw medium. */
+class file_lock_t {
+  public:
+#if USTORE_OS_WINDOWS_
+    using native_t = HANDLE;
+    inline static native_t const unlocked_k = INVALID_HANDLE_VALUE;
+#else
+    using native_t = int;
+    inline static constexpr native_t unlocked_k = -1;
+#endif
+
+    file_lock_t() noexcept = default;
+    file_lock_t(file_lock_t&& other) noexcept : held_(std::exchange(other.held_, unlocked_k)) {}
+    file_lock_t& operator=(file_lock_t&& other) noexcept {
+        std::swap(held_, other.held_);
+        return *this;
+    }
+    file_lock_t(file_lock_t const&) = delete;
+    file_lock_t& operator=(file_lock_t const&) = delete;
+    ~file_lock_t() noexcept { release_(); }
+
+    /** Locks @p path without waiting, answering @c contended_k while another holder keeps it. */
+    static expected<file_lock_t> acquire(char const* path) noexcept;
+
+  private:
+    void release_() noexcept;
+
+    native_t held_ = unlocked_k;
+};
+
+#if USTORE_OS_WINDOWS_
+
+inline expected<file_lock_t> file_lock_t::acquire(char const* path) noexcept {
+    file_lock_t lock;
+    lock.held_ = ::CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (lock.held_ == unlocked_k) return status_t {status_code_t::io_k, "A raw medium would not open to be locked"};
+    OVERLAPPED whole {};
+    if (!::LockFileEx(lock.held_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &whole))
+        return status_t {status_code_t::contended_k, "Another process claims slots of that raw medium"};
+    return lock;
+}
+
+inline void file_lock_t::release_() noexcept {
+    if (held_ == unlocked_k) return;
+    [[maybe_unused]] BOOL const closed = ::CloseHandle(std::exchange(held_, unlocked_k));
+}
+
+#else
+
+inline expected<file_lock_t> file_lock_t::acquire(char const* path) noexcept {
+    file_lock_t lock;
+    lock.held_ = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (lock.held_ < 0) return status_t {status_code_t::io_k, "A raw medium would not open to be locked"};
+    if (::flock(lock.held_, LOCK_EX | LOCK_NB) != 0)
+        return errno == EWOULDBLOCK
+                   ? status_t {status_code_t::contended_k, "Another process claims slots of that raw medium"}
+                   : status_t {status_code_t::io_k, "A raw medium would not be locked"};
+    return lock;
+}
+
+inline void file_lock_t::release_() noexcept {
+    if (held_ == unlocked_k) return;
+    [[maybe_unused]] int const closed = ::close(std::exchange(held_, unlocked_k));
+}
+
+#endif
+
+#pragma endregion File Locks
 
 } // namespace unum::ustore::utilities

@@ -24,6 +24,7 @@
 
 #include <smashtable/basic_vector.hpp>           // `st::vector`
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
+#include <smashtable/immutable_splus_tree.hpp>   // `st::immutable_splus_tree`
 #include <smashtable/shared.hpp>                 // `st::default_allocator`, `st::expected`
 
 #include "ustore/blobs/nvme_compaction.hpp" // `compaction_stamps_t`, `keeps_older_version`
@@ -141,7 +142,7 @@ class sealed_deltas {
     [[nodiscard]] std::size_t values_bytes() const noexcept { return values_.size(); }
 
     /** The key at sorted @p position. */
-    [[nodiscard]] stored_key_t const& stored_key(std::size_t position) const noexcept { return stored_keys_[position]; }
+    [[nodiscard]] stored_key_t stored_key(std::size_t position) const noexcept { return stored_keys_.select(position); }
 
     /** The delta at sorted @p position: its kind and the bytes it carries. */
     [[nodiscard]] delta_view_t delta(std::size_t position) const noexcept {
@@ -153,19 +154,14 @@ class sealed_deltas {
 
     /** The first sorted position whose key is not below @p stored_key, or @c size when every key is. */
     [[nodiscard]] std::size_t lower_bound(stored_key_t const& stored_key) const noexcept {
-        std::size_t low = 0;
-        std::size_t high = stored_keys_.size();
-        while (low != high) {
-            std::size_t const middle = low + (high - low) / 2;
-            if (stored_keys_[middle] < stored_key) low = middle + 1;
-            else high = middle;
-        }
-        return low;
+        return stored_keys_.rank(stored_key);
     }
 
   private:
+    using key_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_key_t>;
     using stored_keys_t =
-        st::vector<stored_key_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_key_t>>;
+        st::immutable_splus_tree<stored_key_t, st::keys_per_row<stored_key_t>(st::default_row_bytes_k),
+                                 st::native_row_kit_t, key_allocator_t>;
     using offsets_t =
         st::vector<stored_value_offset_t,
                    typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_value_offset_t>>;
@@ -181,19 +177,24 @@ class sealed_deltas {
                                                std::uint8_t least_kind, std::uint8_t greatest_kind,
                                                allocator_t const& allocator) noexcept {
         sealed_deltas sealed(allocator);
-        if (sealed.stored_keys_.resize(deltas.size()) != st::status_t::success_k ||
+        st::vector<stored_key_t, key_allocator_t> keys {key_allocator_t(allocator)};
+        if (keys.resize(deltas.size()) != st::status_t::success_k ||
             sealed.offsets_.resize(deltas.size() + 1) != st::status_t::success_k ||
             sealed.values_.resize(static_cast<std::size_t>(total_bytes)) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room to seal the deltas"};
         stored_value_offset_t offset = 0;
         for (std::size_t index = 0; index != deltas.size(); ++index) {
             std::span<byte_t const> const bytes = deltas[index].delta.bytes;
-            sealed.stored_keys_[index] = deltas[index].stored_key;
+            keys[index] = deltas[index].stored_key;
             sealed.offsets_[index] = offset;
             if (!bytes.empty()) std::memcpy(sealed.values_.data() + offset, bytes.data(), bytes.size());
             offset += static_cast<stored_value_offset_t>(bytes.size());
         }
         sealed.offsets_[deltas.size()] = offset;
+        st::expected<stored_keys_t> tree = stored_keys_t::make(std::span<stored_key_t const> {keys},
+                                                               key_allocator_t(allocator));
+        if (!tree) return status_t {status_code_t::out_of_memory_k, "No room for the tree of the sealed keys"};
+        sealed.stored_keys_ = std::move(*tree);
 
         std::uint8_t pulled = 0;
         auto fill = [&](std::size_t position) noexcept {
@@ -208,7 +209,7 @@ class sealed_deltas {
         return sealed;
     }
 
-    /** The keys in ascending order. */
+    /** The keys in ascending order, as an S+ tree every lookup descends. */
     stored_keys_t stored_keys_;
 
     /** One offset per delta and one past the last, so a delta's bytes run from its offset to the next one. */
@@ -311,9 +312,7 @@ class memory_run {
     [[nodiscard]] std::uint64_t memory_bytes() const noexcept { return values_bytes(); }
 
     /** The key at sorted @p position. */
-    [[nodiscard]] stored_key_t const& stored_key(std::size_t position) const noexcept {
-        return deltas_.stored_key(position);
-    }
+    [[nodiscard]] stored_key_t stored_key(std::size_t position) const noexcept { return deltas_.stored_key(position); }
 
     /** The delta at sorted @p position: its kind and the bytes it carries. */
     [[nodiscard]] delta_view_t delta(std::size_t position) const noexcept { return deltas_.delta(position); }

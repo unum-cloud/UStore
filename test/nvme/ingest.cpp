@@ -20,10 +20,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_database.hpp"    // `basic_database`
-#include "ustore/strings/nvme_store.hpp"     // `strings::nvme_store`
-#include "ustore/utilities/nvme_catalog.hpp" // `blob_kind_t`, `blob_name_t`
-#include "ustore/utilities/nvme_volume.hpp"  // `basic_volume_router`, `volume_blob_t`, `volume_id_t`
+#include "ustore/blobs/nvme_database.hpp" // `basic_database`
+#include "ustore/strings/nvme_store.hpp"  // `strings::nvme_store`
 
 #include "nvme/fixture.hpp" // `run_on_transport`
 
@@ -46,13 +44,12 @@ using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeri
 /** One row an ingest lands. */
 using row_t = keyed_delta<stored_key_t>;
 
-/** The router, the database and its transactions every case drives over the volume of @p fixture_type_. */
+/** The database and its transactions every case drives over the volume of @p fixture_type_. */
 template <typename fixture_type_>
 struct database_types {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using router_t = basic_volume_router<volume_t>;
     template <value_layout_t value_layout_>
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
                                       last_write_fold_t, no_device_fold_t>;
@@ -67,14 +64,14 @@ struct database_types {
                                          blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
 
-    /** A fixture, the router over its one volume, and the database mounted over the router. */
+    /** A fixture, its volume, and the database mounted over the volume. */
     struct stack_t {
 
         /** The disk, the arena, the channels and the one volume. */
         std::unique_ptr<fixture_t> fixture;
 
-        /** The volumes of the database, of which this stack opens one. */
-        router_t router;
+        /** The volume of the database, which every reopen mounts again. */
+        volume_t volume;
 
         /** The database, destroyed before the mount it borrows. */
         std::unique_ptr<database_t> store;
@@ -138,28 +135,33 @@ expected<collection_id_t> create_named(store_type_& store, string_view_t name,
     return value;
 }
 
-/** Sorted runs @p volume names right now, which a reopen neither adds to nor loses. */
-template <typename volume_type_>
-[[nodiscard]] std::size_t run_count_of(volume_type_ const& volume) noexcept {
-    std::size_t counted = 0;
-    volume.for_each(blob_kind_t::sorted_run_k, [&](blob_name_t, volume_blob_t const&) noexcept { ++counted; });
-    return counted;
+/** Mounts the volume of @p stack again, dropping the one it held, as a process starting over the
+ *  same media does. */
+template <typename stack_type_>
+status_t remount_volume(stack_type_& stack) noexcept {
+    stack.volume = typename stack_type_::database_t::volume_t {};
+    auto [guard, acquire_status] = stack.fixture->channels.acquire();
+    if (acquire_status.failed()) return acquire_status;
+    auto [volume, mount_status] = stack.fixture->mount_volume(guard.channel());
+    if (mount_status.failed()) return mount_status;
+    stack.volume = std::move(volume);
+    return {};
 }
 
-/** Mounts a database over the router and the channels of @p stack, which a reopen does a second time over the same
- *  volume. */
+/** Mounts the volume of @p stack again and a database over it and the channels of @p stack. */
 template <typename stack_type_>
 expected<std::unique_ptr<typename stack_type_::database_t>> open_database(stack_type_& stack) noexcept {
     using database_t = typename stack_type_::database_t;
+    if (status_t const remounted = remount_volume(stack); remounted.failed()) return remounted;
     auto store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack.fixture->resources}};
     if (!store) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
-    if (status_t const mounted = store->mount(stack.router, stack.fixture->channels, test_database_config());
+    if (status_t const mounted = store->mount(stack.volume, stack.fixture->channels, test_database_config());
         mounted.failed())
         return mounted;
     return store;
 }
 
-/** Mounts a fixture through @p mount, adopts its volume into a router and opens one database over it. */
+/** Mounts a fixture through @p mount and opens one database over its volume. */
 template <typename mount_type_>
 expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
     mount_type_ const& mount) noexcept {
@@ -172,81 +174,10 @@ expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t
     if (mount_status.failed()) return mount_status;
     stack->fixture = std::move(fixture);
 
-    auto [built, make_status] = types_t::router_t::make();
-    if (make_status.failed()) return make_status;
-    stack->router = std::move(built);
-
-    auto [guard, acquire_status] = stack->fixture->channels.acquire();
-    if (acquire_status.failed()) return acquire_status;
-    expected<typename types_t::volume_t> volume = stack->fixture->mount_volume(guard.channel());
-    if (!volume) return volume.status();
-    if (status_t const adopted = stack->router.bind_queue_pair(std::move(*volume)); adopted.failed()) return adopted;
-
     auto [store, open_database_status] = open_database(*stack);
     if (open_database_status.failed()) return open_database_status;
     stack->store = std::move(store);
     return stack;
-}
-
-/** Copies the whole medium of volume zero of @p fixture into @p image, block by block on @p channel, which is what a
- *  crash would leave on it at this moment. */
-template <typename fixture_type_>
-status_t capture_medium(fixture_type_& fixture, io_channel_t& channel, st::vector<byte_t>& image) noexcept {
-    std::uint64_t const capacity = fixture.config.volume_bytes;
-    std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
-    if (block == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
-    if (image.resize(static_cast<std::size_t>(capacity)) != st::status_t::success_k)
-        return {status_code_t::out_of_memory_k, "No room for the image of a medium"};
-    basic_read_pipeline<typename fixture_type_::disk_t> reader {fixture.disk, channel, fixture.media[0].reference()};
-    for (std::uint64_t offset = 0; offset < capacity; offset += block) {
-        std::uint64_t const length = capacity - offset < block ? capacity - offset : block;
-        if (status_t const offered = reader.enqueue_read(extent_t {offset, length}, 0); offered.failed())
-            return offered;
-        if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
-        status_t carried;
-        auto sink = [&](completed_buffer_t const& completed) noexcept {
-            if (status_t const whole = require_completed_in_full(completed); whole.failed()) carried = whole;
-            else std::memcpy(image.data() + offset, completed.bytes.data(), static_cast<std::size_t>(length));
-        };
-        if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
-        if (carried.failed()) return carried;
-    }
-    return {};
-}
-
-/** Writes @p image back over the whole medium of volume zero of @p fixture, as a restart after a crash finds it. */
-template <typename fixture_type_>
-status_t restore_medium(fixture_type_& fixture, io_channel_t& channel, std::span<byte_t const> image) noexcept {
-    basic_write_pipeline<typename fixture_type_::disk_t, waiter_t> writer {fixture.disk, channel,
-                                                                           fixture.media[0].reference()};
-    std::uint64_t offset = 0;
-    while (offset != image.size()) {
-        auto [buffer, acquire_status] = writer.acquire_buffer_or_poll();
-        if (acquire_status.failed()) return acquire_status;
-        std::uint64_t const room = round_down_to_multiple(buffer.size(), portable_alignment_k);
-        if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
-        std::uint64_t const length = image.size() - offset < room ? image.size() - offset : room;
-        std::memcpy(buffer.bytes().data(), image.data() + offset, static_cast<std::size_t>(length));
-        if (status_t const queued = writer.enqueue_write(std::move(buffer), extent_t {offset, length}); queued.failed())
-            return queued;
-        if (status_t const submitted = writer.submit(); submitted.failed()) return submitted;
-        offset += length;
-    }
-    return writer.make_durable();
-}
-
-/** Mounts volume zero of the fixture of @p stack again into a fresh router, as a process starting after a crash
- *  does. */
-template <typename stack_type_>
-status_t remount_volume(stack_type_& stack) noexcept {
-    auto [built, make_status] = basic_volume_router<typename stack_type_::database_t::volume_t>::make();
-    if (make_status.failed()) return make_status;
-    stack.router = std::move(built);
-    auto [guard, acquire_status] = stack.fixture->channels.acquire();
-    if (acquire_status.failed()) return acquire_status;
-    auto volume = stack.fixture->mount_volume(guard.channel(), 0, volume_recovery_t::refuse_k);
-    if (!volume) return volume.status();
-    return stack.router.bind_queue_pair(std::move(*volume));
 }
 
 #pragma endregion Shape
@@ -414,7 +345,11 @@ std::size_t appends_share_one_run(mount_type_ const& mount) {
     failures += expect(ingest_rows(*(*stack)->store, *coalesced, rows_of(std::span<stored_key_t const> {keys}, 3),
                                    ustore_durability_buffered_k, 1000)
                            .has_value());
-    failures += expect_eq(run_count_of((*stack)->router.volume(volume_id_t {0})), std::size_t {1});
+    st::vector<std::size_t> runs;
+    failures += expect(level_runs(*(*stack)->store, *coalesced, runs).succeeded());
+    std::size_t total_runs = 0;
+    for (std::size_t const level : runs) total_runs += level;
+    failures += expect_eq(total_runs, std::size_t {1});
     failures += expect_eq(count_valued(*(*stack)->store, *coalesced, std::span<stored_key_t const> {keys}, 3),
                           keys.size());
     return failures;
@@ -428,7 +363,6 @@ std::size_t appends_share_one_run(mount_type_ const& mount) {
 template <typename mount_type_>
 std::size_t crash_after_ingest(mount_type_ const& mount, ustore_durability_t durability) {
     using types_t = database_types<typename mount_type_::fixture_t>;
-    using guard_t = typename types_t::guard_t;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
     std::size_t failures = 0;
@@ -443,22 +377,10 @@ std::size_t crash_after_ingest(mount_type_ const& mount, ustore_durability_t dur
         ingest_rows(*(*stack)->store, *landed, rows_of(std::span<stored_key_t const> {keys}, 5), durability)
             .has_value());
 
-    st::vector<byte_t> image;
-    {
-        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-        failures += expect(guard.has_value());
-        if (!guard) return failures;
-        failures += expect(capture_medium(*(*stack)->fixture, guard->channel(), image).succeeded());
-    }
+    failures += expect(capture_data_directory(*(*stack)->fixture).succeeded());
     (*stack)->store.reset();
-    {
-        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-        failures += expect(guard.has_value());
-        if (!guard) return failures;
-        failures += expect(
-            restore_medium(*(*stack)->fixture, guard->channel(), std::span<byte_t const> {image}).succeeded());
-    }
-    failures += expect(remount_volume(**stack).succeeded());
+    (*stack)->volume = typename types_t::volume_t {};
+    failures += expect(restore_data_directory(*(*stack)->fixture).succeeded());
     expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
     failures += expect(reopened.has_value());
     if (!reopened) return failures;
@@ -471,6 +393,7 @@ std::size_t crash_after_ingest(mount_type_ const& mount, ustore_durability_t dur
 /** A buffered ingest a crash catches before any flush reopens whole or not at all. */
 template <typename mount_type_>
 case_result_t buffered_ingest_is_all_or_nothing(mount_type_ const& mount) {
+    if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
     if (mount.transport == transport_t::device_k)
         return case_result_t::skipped("a block device's medium is not one a case may copy", 0);
     return crash_after_ingest(mount, ustore_durability_buffered_k);
@@ -479,6 +402,7 @@ case_result_t buffered_ingest_is_all_or_nothing(mount_type_ const& mount) {
 /** A flushed ingest survives a crash right after it returns. */
 template <typename mount_type_>
 case_result_t flushed_ingest_survives_reopen(mount_type_ const& mount) {
+    if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
     if (mount.transport == transport_t::device_k)
         return case_result_t::skipped("a block device's medium is not one a case may copy", 0);
     return crash_after_ingest(mount, ustore_durability_flushed_k);
@@ -574,7 +498,8 @@ std::size_t descending_key_is_refused(mount_type_ const& mount) {
     failures += expect_status(landed, status_code_t::invalid_argument_k);
     failures += expect_eq(count_valued(*(*stack)->store, *refused, std::span<stored_key_t const> {keys}, 7),
                           std::size_t {0});
-    failures += expect_eq(run_count_of((*stack)->router.volume(volume_id_t {0})), std::size_t {0});
+    failures += expect_eq(run_count_of(*(*stack)->fixture), std::size_t {0});
+    failures += expect_eq(run_files_of(*(*stack)->fixture), std::size_t {0});
     return failures;
 }
 

@@ -798,7 +798,7 @@ case_result_t database_save_snapshot(config_t const& config) {
     failures += round_trip(collection_reference, triplet);
 
     auto first_snapshot = *database.snapshot();
-    failures += expect(first_snapshot.save(first_saved_directory.c_str()).succeeded());
+    failures += expect(first_snapshot.save(save_target(config, first_saved_directory).c_str()).succeeded());
     failures += check_equalities(collection_reference, triplet);
 
     config_t const first_config {config.options(), first_saved_directory.c_str()};
@@ -813,7 +813,7 @@ case_result_t database_save_snapshot(config_t const& config) {
     failures += round_trip(collection_reference, same_values_triplet);
 
     auto second_snapshot = *database.snapshot();
-    failures += expect(second_snapshot.save(second_saved_directory.c_str()).succeeded());
+    failures += expect(second_snapshot.save(save_target(config, second_saved_directory).c_str()).succeeded());
     failures += check_equalities(collection_reference, same_values_triplet);
 
     config_t const second_config {config.options(), second_saved_directory.c_str()};
@@ -873,12 +873,13 @@ case_result_t database_save_progress(config_t const& config) {
         return ustore_continue_k;
     };
     auto snapshot = *database.snapshot();
-    failures += expect(snapshot.save(blocking_directory.c_str(), recording).succeeded());
+    failures += expect(snapshot.save(save_target(config, blocking_directory).c_str(), recording).succeeded());
     failures += expect(last_total != 0 && last_finished == last_total);
 
     last_finished = 0;
     last_total = 0;
-    failures += expect(snapshot.deferred(executor).save(deferred_directory.c_str(), recording).wait().succeeded());
+    path_t const deferred_target = save_target(config, deferred_directory);
+    failures += expect(snapshot.deferred(executor).save(deferred_target.c_str(), recording).wait().succeeded());
     failures += expect(last_total != 0 && last_finished == last_total);
     failures += expect_eq(misordered, 0u);
     return failures;

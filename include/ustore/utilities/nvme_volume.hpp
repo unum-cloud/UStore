@@ -2,948 +2,1418 @@
  *  @file include/ustore/utilities/nvme_volume.hpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief Volumes, the names they resolve to extents, and the router placing blobs across them.
+ *  @brief Volumes: where the runs of one database are placed across its data directories, and how
+ *      the manifest naming them is committed.
  *
- *  A volume maps names to bytes and a transport moves them; the pair is one disk. Where there is a
- *  filesystem the filesystem is the catalog, so a run is a file, publication is a rename, and a
- *  crash leaves a partial file the mount deletes. Where there is none - a namespace, a passthrough
- *  character device, an SPDK blobstore - names live in the catalog of @c nvme_catalog.hpp inside
- *  the volume. Neither is on the read path - a name is resolved once when a run is opened, and
- *  every block read afterwards is an extent plus a submit.
+ *  A volume spans every data directory of a database and places each run on the medium with the
+ *  most free bytes. Neither volume keeps a container file:
+ *  - @c basic_directory_volume keeps one @c <database>-<run id>.ustore file per run, its own
+ *    registered medium, and commits @c <database>.ustore.json by flushing a sibling copy and
+ *    renaming it over the manifest, then syncs the directory and unlinks consumed files.
+ *  - @c basic_slotted_volume cuts raw block devices and SPDK namespaces into slots of
+ *    @c slot_bytes_k. The slot at data directory 0's base holds the manifest in one of two JSON
+ *    regions, and the commit rewrites that slot's owner block to point at the region just written.
  *
- *  A machine has one volume per data directory rather than one per database, so the router above
- *  the volumes is a placement decision and nothing else: it holds the mounted volumes, answers
- *  which of them a blob of a given length should go to, and stamps every handle it hands back with
- *  the volume that owns the bytes. It keeps no lock and no claim, since one volume's catalog and
- *  free map are mutated by one thread at a time.
+ *  A run written into a volume is durable only once a manifest naming it is published: the volume's
+ *  @c publish_manifest flushes every medium written since the last one before it commits, which is
+ *  two flushes per publication however many runs it names. Neither volume is on the read path: a
+ *  run is placed once, and every block read afterwards is an extent plus a submit.
  */
 
 #pragma once
 
-#include <cassert> // `assert`
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint32_t`, `std::uint64_t`
-#include <cstring> // `std::memcmp`, `std::memcpy`, `std::memset`
+#include <cstdint> // `std::uint16_t`, `std::uint32_t`, `std::uint64_t`
+#include <cstring> // `std::memcpy`, `std::memset`
 
-#include <array>    // `std::array`
-#include <bit>      // `std::has_single_bit`
-#include <concepts> // `std::same_as`
-#include <span>     // `std::span`, `std::as_bytes`
-#include <utility>  // `std::move`
+#include <algorithm>   // `std::sort`, `std::binary_search`
+#include <charconv>    // `std::from_chars`
+#include <limits>      // `std::numeric_limits`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
+#include <utility>     // `std::move`, `std::exchange`
+#include <variant>     // `std::variant`, `std::monostate`, `std::holds_alternative`, `std::get_if`
 
-#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <smashtable/basic_chunked_slot_pool.hpp> // `st::basic_chunked_slot_pool`
+#include <smashtable/basic_slot_pool.hpp>         // `st::basic_slot_pool`
+#include <smashtable/basic_vector.hpp>            // `st::vector`
 
-#include "ustore/utilities/nvme_catalog.hpp" // `catalog_t`, `catalog_entry_t`, `blob_kind_t`, `blob_name_t`, `volume_header_t`
-#include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`
-#include "ustore/utilities/nvme_ring.hpp"     // `extent_t`, `ring_concept`, `read_request`, `poll_completions_at_least`
-#include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `expected`, `byte_t`, `uuid_t`
+#include "ustore/utilities/blocking_files.hpp" // `replace_file_durably`, `read_file`, `list_directory`, `join_path`
+#include "ustore/utilities/nvme_channels.hpp"  // `io_channel_t`, `basic_read_pipeline`, `basic_write_pipeline`
+#include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `manifest_file_t`
+#include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `ring_concept`, `registered_medium_t`
+#include "ustore/utilities/nvme_slots.hpp"     // `slot_t`, `slot_owner_block_t`, `slot_bytes_k`
+#include "ustore/utilities/types.hpp"          // `status_t`, `status_code_t`, `expected`, `uuid_t`
 
 namespace unum::ustore::utilities {
 
-#pragma region Extent Allocator
+#pragma region Placement
 
-#pragma region Granularities
+/** Where one run lies: the medium requests address, the bytes inside it, and the volume's
+ *  record of it. */
+struct medium_extent_t {
 
-/** Bytes from which an allocation rounds its offset as well as its length. */
-inline constexpr std::uint64_t large_allocation_bytes_k = std::uint64_t {8} << 20;
-
-/** The offset alignment such an allocation takes, coarse enough for a stripe and an erase block. */
-inline constexpr std::uint64_t large_allocation_alignment_k = std::uint64_t {1} << 20;
-
-#pragma endregion Granularities
-
-#pragma region Allocator
-
-/**
- *  @brief The free ranges of one contiguous region, handed out by best fit and coalesced on return.
- *
- *  Two granularities, not one: every allocation rounds its length up to the disk's own granularity,
- *  and only an allocation of @c large_allocation_bytes_k or more rounds its offset up to the coarse
- *  alignment as well, since rounding a kilobyte of blob to a megabyte would waste three orders of
- *  magnitude. The map holds no allocation, only what is left, so it is rebuilt by @c reserve at
- *  mount and never written down.
- */
-class extent_allocator_t {
-  public:
-
-    extent_allocator_t() noexcept = default;
-    extent_allocator_t(extent_allocator_t&&) noexcept = default;
-    extent_allocator_t& operator=(extent_allocator_t&&) noexcept = default;
-    extent_allocator_t(extent_allocator_t const&) = delete;
-    extent_allocator_t& operator=(extent_allocator_t const&) = delete;
-
-    /**
-     *  @brief Builds an empty map of @p region, refusing a shape no allocation could satisfy.
-     *  @param[in] region The bytes the volume hands out, which begins and ends on @p granularity.
-     *  @param[in] granularity The multiple every allocated length takes, a power of two.
-     *  @param[in] large_alignment The multiple a large allocation's offset takes, at least @p granularity.
-     *  @return The map, or @c status_code_t::invalid_argument_k for a shape it cannot serve.
-     */
-    static expected<extent_allocator_t> make(extent_t region, std::uint64_t granularity,
-                                             std::uint64_t large_alignment) noexcept {
-        if (!std::has_single_bit(granularity) || !std::has_single_bit(large_alignment))
-            return status_t {status_code_t::invalid_argument_k, "An allocation granularity is a power of two"};
-        if (large_alignment < granularity)
-            return status_t {status_code_t::invalid_argument_k, "A large allocation is aligned no more finely"};
-        if (!region.aligned_to(granularity) || region.offset > UINT64_MAX - region.length)
-            return status_t {status_code_t::invalid_argument_k, "A region begins and ends on its granularity"};
-
-        extent_allocator_t allocator;
-        allocator.region_ = region;
-        allocator.granularity_ = granularity;
-        allocator.large_alignment_ = large_alignment;
-        allocator.free_bytes_ = region.length;
-        if (!region.empty() && allocator.free_ranges_.push_back(extent_t {region}) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "The free map would not hold the region"};
-        return allocator;
-    }
-
-    /**
-     *  @brief Takes @p extent out of the map verbatim, which is how a mount replays the catalog.
-     *  @param[in] extent The range one catalog entry occupies, already rounded when it was allocated.
-     *  @return Success, or @c status_code_t::malformed_k when the catalog claims it twice or claims
-     *      bytes the volume does not have.
-     */
-    status_t reserve(extent_t extent) noexcept {
-        if (extent.empty()) return {};
-        if (!region_.contains(extent))
-            return status_t {status_code_t::malformed_k, "A cataloged extent falls outside the volume"};
-        for (std::size_t index = 0; index != free_ranges_.size(); ++index)
-            if (free_ranges_[index].contains(extent)) return carve_(index, extent);
-        return status_t {status_code_t::malformed_k, "Two cataloged extents overlap"};
-    }
-
-    /**
-     *  @brief Hands out the range that leaves the least behind, rounded as the two granularities ask.
-     *  @param[in] length Bytes the caller needs, rounded up to the granularity before the search.
-     *  @return The range, or @c status_code_t::capacity_exhausted_k when no free range fits.
-     */
-    expected<extent_t> allocate(std::uint64_t length) noexcept {
-        if (length == 0) return status_t {status_code_t::invalid_argument_k, "An allocation of no bytes names nothing"};
-        std::uint64_t const rounded = round_up_to_multiple(length, granularity_);
-        if (rounded < length)
-            return status_t {status_code_t::capacity_exhausted_k, "The rounded length does not fit an address"};
-        std::uint64_t const alignment = rounded >= large_allocation_bytes_k ? large_alignment_ : granularity_;
-
-        // A linear scan, since the range count is bounded by the number of live blobs.
-        std::size_t chosen = free_ranges_.size();
-        std::uint64_t chosen_leftover = 0;
-        std::uint64_t chosen_offset = 0;
-        for (std::size_t index = 0; index != free_ranges_.size(); ++index) {
-            extent_t const range = free_ranges_[index];
-            std::uint64_t const start = round_up_to_multiple(range.offset, alignment);
-            if (start < range.offset || start > range.end()) continue;
-            std::uint64_t const reachable = range.end() - start;
-            if (reachable < rounded) continue;
-            std::uint64_t const leftover = reachable - rounded;
-            if (chosen != free_ranges_.size() && leftover >= chosen_leftover) continue;
-            chosen = index;
-            chosen_leftover = leftover;
-            chosen_offset = start;
-        }
-        if (chosen == free_ranges_.size())
-            return status_t {status_code_t::capacity_exhausted_k, "No free range fits the allocation"};
-
-        extent_t const taken {chosen_offset, rounded};
-        status_t const carved = carve_(chosen, taken);
-        if (carved.failed()) return carved;
-        return taken;
-    }
-
-    /**
-     *  @brief Gives @p extent back, merging it with the free range before it and the one after it.
-     *  @param[in] extent The range one allocation held, exactly as it was handed out.
-     *  @return Success, or @c status_code_t::invalid_argument_k when any of those bytes is free already.
-     */
-    status_t release(extent_t extent) noexcept {
-        if (extent.empty()) return {};
-        if (!region_.contains(extent))
-            return status_t {status_code_t::invalid_argument_k, "A released extent falls outside the volume"};
-
-        std::size_t position = 0;
-        while (position != free_ranges_.size() && free_ranges_[position].offset < extent.offset) ++position;
-        if (position != 0 && free_ranges_[position - 1].end() > extent.offset)
-            return status_t {status_code_t::invalid_argument_k, "A released extent is free already"};
-        if (position != free_ranges_.size() && free_ranges_[position].offset < extent.end())
-            return status_t {status_code_t::invalid_argument_k, "A released extent is free already"};
-
-        if (position != 0 && free_ranges_[position - 1].end() == extent.offset) {
-            free_ranges_[position - 1].length += extent.length;
-            if (position != free_ranges_.size() && free_ranges_[position - 1].end() == free_ranges_[position].offset) {
-                free_ranges_[position - 1].length += free_ranges_[position].length;
-                erase_at_(position);
-            }
-        }
-        else if (position != free_ranges_.size() && extent.end() == free_ranges_[position].offset)
-            free_ranges_[position] = extent_t {extent.offset, extent.length + free_ranges_[position].length};
-        else {
-            status_t const inserted = insert_at_(position, extent);
-            if (inserted.failed()) return inserted;
-        }
-        free_bytes_ += extent.length;
-        return {};
-    }
-
-    /** Bytes no allocation holds, which the alignment padding of a large allocation counts among. */
-    [[nodiscard]] std::uint64_t free_bytes() const noexcept { return free_bytes_; }
-
-    /** Bytes of the longest free range, which bounds the largest allocation that can still succeed. */
-    [[nodiscard]] std::uint64_t largest_free_bytes() const noexcept {
-        std::uint64_t longest = 0;
-        for (std::size_t index = 0; index != free_ranges_.size(); ++index)
-            if (free_ranges_[index].length > longest) longest = free_ranges_[index].length;
-        return longest;
-    }
-
-    /** Bytes of the region the map hands out, free and allocated alike. */
-    [[nodiscard]] std::uint64_t capacity() const noexcept { return region_.length; }
-
-  private:
-
-    /** Takes @p taken out of the free range at @p position, leaving its head and its tail behind. */
-    status_t carve_(std::size_t position, extent_t taken) noexcept {
-        extent_t const range = free_ranges_[position];
-        extent_t const head {range.offset, taken.offset - range.offset};
-        extent_t const tail {taken.end(), range.end() - taken.end()};
-        if (!head.empty() && !tail.empty()) {
-            status_t const inserted = insert_at_(position + 1, tail);
-            if (inserted.failed()) return inserted;
-            free_ranges_[position] = head;
-        }
-        else if (!head.empty()) free_ranges_[position] = head;
-        else if (!tail.empty()) free_ranges_[position] = tail;
-        else erase_at_(position);
-        free_bytes_ -= taken.length;
-        return {};
-    }
-
-    /** Puts @p range at @p position, shifting the later ranges up, since the vector has no insert. */
-    status_t insert_at_(std::size_t position, extent_t range) noexcept {
-        if (free_ranges_.push_back(extent_t {}) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "The free map would not grow"};
-        for (std::size_t index = free_ranges_.size() - 1; index != position; --index)
-            free_ranges_[index] = free_ranges_[index - 1];
-        free_ranges_[position] = range;
-        return {};
-    }
-
-    /** Drops the range at @p position, shifting the later ranges down, since the vector has no erase. */
-    void erase_at_(std::size_t position) noexcept {
-        for (std::size_t index = position + 1; index != free_ranges_.size(); ++index)
-            free_ranges_[index - 1] = free_ranges_[index];
-        free_ranges_.pop_back();
-    }
-
-    /** The free ranges, disjoint, non-adjacent and sorted by offset. */
-    st::vector<extent_t> free_ranges_;
-
-    /** The region every range sits inside, which no allocation ever leaves. */
-    extent_t region_;
-
-    /** The multiple every allocated length takes. */
-    std::uint64_t granularity_ = 1;
-
-    /** The multiple a large allocation's offset takes. */
-    std::uint64_t large_alignment_ = 1;
-
-    /** Bytes the free ranges add up to, kept as they change rather than summed on demand. */
-    std::uint64_t free_bytes_ = 0;
-};
-
-#pragma endregion Allocator
-
-#pragma endregion Extent Allocator
-
-#pragma region Volume
-
-#pragma region Blobs
-
-/** One mounted volume, or @c unmounted_k for a handle that names none. */
-enum class volume_id_t : std::uint16_t {
-    unmounted_k = 0xFFFF,
-};
-
-/**
- *  @brief A named range of one volume, and all the read path needs after a lookup.
- *
- *  A blob hands out extents through @c slice and the caller submits them itself, so reading one
- *  block of a sorted run costs one addition and no lookup, no lock and no virtual call. That is what
- *  lets a volume be a template while the choice of transport stays a runtime one.
- */
-struct volume_blob_t {
-
-    /** The volume the bytes live on, which a router resolves to a disk exactly once. */
-    volume_id_t volume = volume_id_t::unmounted_k;
-
-    /** The medium the bytes live in, which is the whole volume or one file of a directory. */
+    /** The medium every read and write of the run names. */
     medium_reference_t medium;
 
-    /** The range reserved for this blob, whose length is the rounded-up size the caller asked for. */
+    /** The run's bytes, absolute inside that medium. */
     extent_t extent;
 
-    /** The bytes the caller asked for, which is at most @c extent.length and usually less. */
-    std::uint64_t length = 0;
+    /** The data directory holding the run, which a manifest prints as @c medium. */
+    std::uint16_t data_directory = 0;
 
-    /** The part of this blob @p offset bytes in, as the extent a request carries. */
+    /** The volume's record of the placement: a slot on raw media, a run file on a filesystem. */
+    placement_handle_t placement;
+
+    /** The part of the run @p offset bytes in, as the extent a request carries. */
     [[nodiscard]] constexpr extent_t slice(std::uint64_t offset, std::uint64_t bytes) const noexcept {
         extent_t const inside = extent_t {offset, bytes}.clipped_to(extent.length);
         return extent_t {extent.offset + inside.offset, inside.length};
     }
 };
 
-#pragma endregion Blobs
+/** What a data directory address names. */
+enum class data_address_kind_t : std::uint8_t {
 
-#pragma region Configuration
+    /** A directory of a filesystem, which a directory volume keeps run files in. */
+    directory_k,
 
-/** What a mount does when a volume holds no readable catalog. */
-enum class volume_recovery_t : std::uint8_t {
+    /** A block device or a file standing in for one, from a base address on, which a slotted volume
+     *  cuts into slots. */
+    raw_k,
 
-    /** Reports @c malformed_k and leaves the medium untouched, which is what a database does. */
-    refuse_k,
-
-    /** Formats the volume empty, which only a test fixture and a repair tool ask for. */
-    reformat_k,
+    /** A namespace of an SPDK controller, which a slotted volume cuts into slots. */
+    spdk_k,
 };
-
-/** What a format fixes about a volume before any blob is written into it. */
-struct volume_format_t {
-
-    /** The database this volume belongs to, which a mount refuses to open under another one. */
-    uuid_t database {};
-
-    /** Bytes the volume spans, which a format writes and a mount checks. */
-    std::uint64_t capacity_bytes = 0;
-
-    /** Bytes one catalog slot may grow to, of which the volume keeps two. */
-    std::uint64_t catalog_slot_bytes = 4ull * 1024ull * 1024ull;
-
-    /** Bytes the data region rounds every allocation up to, at least the disk's own alignment. */
-    std::uint64_t allocation_granularity = portable_alignment_k;
-
-    /** Bytes an allocation of at least eight megabytes rounds its first byte up to. */
-    std::uint64_t large_allocation_alignment = 1024ull * 1024ull;
-
-    /** What a mount does when neither catalog slot verifies. */
-    volume_recovery_t recovery = volume_recovery_t::refuse_k;
-};
-
-#pragma endregion Configuration
-
-#pragma region Extent Volume
 
 /**
- *  @brief Names resolved to extents of one medium, with a catalog of two slots inside the volume.
+ *  @brief One data directory as its address names it, in any of these forms:
  *
- *  This is the shape a medium without a filesystem takes. @c create reserves a range in memory
- *  alone, the caller writes the bytes through the ring, and @c seal performs the order the model
- *  checks, so a crash before @c seal leaves a range that is free by definition rather than a blob
- *  with a hole in it.
+ *  @verbatim
+ *  /mnt/nvme0/molecules            a directory
+ *  /dev/nvme0n1@64GiB              a device node from byte 64 GiB
+ *  /dev/nvme0n1@64GiB+16GiB        the 16 GiB of it from byte 64 GiB on
+ *  spdk://0000:5e:00.0/2@0GiB      namespace 2 of a local PCIe controller
+ *  @endverbatim
  *
- *  A reservation is deliberately invisible to @c find and to every publication until its @c seal,
- *  since a catalog that named a range whose bytes are still in flight would publish a hole the next
- *  unrelated @c seal made durable.
- *
- *  @tparam waiter_type_ What the core does while it waits for a catalog read or a barrier.
+ *  A base and a length are whole numbers of B, KiB, MiB, GiB or TiB, all binary, bytes when bare.
  */
+struct data_address_t {
+
+    /** The directory, the device node or file, or the PCIe address of an SPDK controller. */
+    std::string_view location;
+
+    /** The namespace of an SPDK controller, one by default. */
+    std::uint32_t namespace_id = 0;
+
+    /** Where the database's first slot begins on a raw medium. */
+    std::uint64_t byte_base = 0;
+
+    /** Bytes past the base the database may take, zero meaning the whole medium. */
+    std::uint64_t byte_limit = 0;
+
+    /** What the address names. */
+    data_address_kind_t kind = data_address_kind_t::directory_k;
+};
+
+/** Reads @p text, a whole decimal number and an optional binary unit, into @p bytes. */
+[[nodiscard]] inline bool parse_byte_count(std::string_view text, std::uint64_t& bytes) noexcept {
+    std::uint64_t count = 0;
+    std::from_chars_result const result = std::from_chars(text.data(), text.data() + text.size(), count);
+    if (result.ec != std::errc {}) return false;
+    std::string_view const suffix = text.substr(static_cast<std::size_t>(result.ptr - text.data()));
+    std::string_view const unit = suffix.empty() ? "B" : suffix;
+    constexpr std::string_view units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    unsigned shift = 0;
+    for (std::string_view const known : units) {
+        if (unit == known) {
+            if (count > ~std::uint64_t {0} >> shift) return false;
+            bytes = count << shift;
+            return true;
+        }
+        shift += 10;
+    }
+    return false;
+}
+
+/** The suffix of every manifest on a filesystem, which the database's name precedes. */
+inline constexpr std::string_view manifest_suffix_k = ".ustore.json";
+
+/** Splits @p address into a @c data_address_t, refusing a base, a length or a namespace that
+ *  does not read. */
+inline expected<data_address_t> parse_data_address(std::string_view address) noexcept {
+    data_address_t parsed;
+    std::string_view location = address;
+    std::size_t const at = location.rfind('@');
+    if (at != std::string_view::npos && at + 1 < location.size() && location[at + 1] >= '0' &&
+        location[at + 1] <= '9') {
+        std::string_view const extent = location.substr(at + 1);
+        std::size_t const plus = extent.find('+');
+        if ((plus != std::string_view::npos && !parse_byte_count(extent.substr(plus + 1), parsed.byte_limit)) ||
+            !parse_byte_count(extent.substr(0, plus), parsed.byte_base))
+            return status_t {status_code_t::invalid_argument_k, "A data directory's base or length does not read"};
+        location = location.substr(0, at);
+        parsed.kind = data_address_kind_t::raw_k;
+    }
+    std::string_view const scheme = "spdk://";
+    if (location.starts_with(scheme)) {
+        location.remove_prefix(scheme.size());
+        std::size_t const slash = location.find('/');
+        parsed.namespace_id = 1;
+        if (slash != std::string_view::npos) {
+            std::string_view const number = location.substr(slash + 1);
+            std::from_chars_result const result = std::from_chars(number.data(), number.data() + number.size(),
+                                                                  parsed.namespace_id);
+            if (result.ec != std::errc {} || result.ptr != number.data() + number.size())
+                return status_t {status_code_t::invalid_argument_k, "An SPDK namespace does not read"};
+            location = location.substr(0, slash);
+        }
+        parsed.kind = data_address_kind_t::spdk_k;
+    }
+    parsed.location = location;
+    if (location.empty()) return status_t {status_code_t::invalid_argument_k, "A data directory names no location"};
+    return parsed;
+}
+
+/** What a volume is mounted over. */
+struct volume_config_t {
+
+    /** The database's name, which prefixes every run file and names the manifest of
+     *  a directory volume. */
+    string_view_t database;
+
+    /** Every data directory, the first holding the manifest; all of one kind. */
+    std::span<data_address_t const> data_directories;
+
+    /** Run files a directory volume keeps registered at once, which bounds the runs
+     *  of the database. */
+    std::size_t runs_capacity = 0;
+};
+
+#pragma endregion Placement
+
+#pragma region Extent Bytes
+
+/** Stages @p bytes at the start of @p extent, zero-padded to a page, one channel block at a
+ *  time, and drains the writes without a flush, which the publication of the manifest naming the
+ *  extent pays for. */
 template <typename disk_type_, typename waiter_type_>
-    requires ring_concept<disk_type_>
-class basic_extent_volume {
+status_t write_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t const& extent,
+                      std::span<byte_t const> bytes) noexcept {
+    basic_write_pipeline<disk_type_, waiter_type_> writer {disk, channel, extent.medium};
+    std::uint64_t const total = round_up_to_multiple<std::uint64_t>(bytes.size(), portable_alignment_k);
+    if (total > extent.extent.length) return {status_code_t::invalid_argument_k, "The bytes outgrow their extent"};
+    for (std::uint64_t written = 0; written != total;) {
+        auto [block, acquire_status] = writer.acquire_buffer_or_poll();
+        if (acquire_status.failed()) return acquire_status;
+        std::uint64_t const room = round_down_to_multiple<std::uint64_t>(block.size(), portable_alignment_k);
+        if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
+        std::uint64_t const chunk = total - written < room ? total - written : room;
+        std::uint64_t const left = bytes.size() - written;
+        std::uint64_t const carried = left < chunk ? left : chunk;
+        std::span<byte_t> const target = block.bytes();
+        std::memcpy(target.data(), bytes.data() + written, static_cast<std::size_t>(carried));
+        std::memset(target.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
+        if (status_t const queued = writer.enqueue_write(std::move(block), extent.slice(written, chunk));
+            queued.failed())
+            return queued;
+        if (status_t const submitted = writer.submit(); submitted.failed()) return submitted;
+        written += chunk;
+    }
+    return writer.poll_all_completions();
+}
+
+/** Reads the first @p into.size() bytes of @p extent into @p into, a whole number of pages
+ *  at a time. */
+template <typename disk_type_>
+status_t read_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t const& extent,
+                     std::span<byte_t> into) noexcept {
+    basic_read_pipeline<disk_type_> reader {disk, channel, extent.medium};
+    std::uint64_t const block_bytes = round_down_to_multiple<std::uint64_t>(channel.requests().buffer_bytes(),
+                                                                            portable_alignment_k);
+    if (block_bytes == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
+    status_t carried;
+    auto sink = [&](completed_buffer_t const& completed) noexcept {
+        if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
+            carried = whole;
+            return;
+        }
+        std::uint64_t const begin = completed.tag * block_bytes;
+        std::uint64_t const length = into.size() - begin < completed.bytes.size() ? into.size() - begin
+                                                                                  : completed.bytes.size();
+        std::memcpy(into.data() + begin, completed.bytes.data(), static_cast<std::size_t>(length));
+    };
+    std::uint64_t const total = round_up_to_multiple<std::uint64_t>(into.size(), portable_alignment_k);
+    request_tag_t tag = 0;
+    for (std::uint64_t offered = 0; offered < total; offered += block_bytes, ++tag) {
+        std::uint64_t const chunk = total - offered < block_bytes ? total - offered : block_bytes;
+        while (!reader.can_enqueue())
+            if (status_t const polled = reader.poll_one_completion(sink); polled.failed()) return polled;
+        if (status_t const queued = reader.enqueue_read(extent.slice(offered, chunk), tag); queued.failed())
+            return queued;
+        if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
+    }
+    if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
+    return carried;
+}
+
+#pragma endregion Extent Bytes
+
+#pragma region Slot Allocator
+
+/** What became of a slot since the last publication, which tells whether its owner block is
+ *  written or cleared. */
+enum class slot_change_t : bool { vacated_k, taken_k };
+
+/**
+ *  @brief The slots of one raw medium, taken and given back through a SmashTable slot pool.
+ *
+ *  Runs under @c packed_run_bytes_max_k are appended into the open packed slot, which is vacated
+ *  once nothing in it is live; longer runs take a whole slot. Every slot taken or vacated is
+ *  marked, so the volume writes or zeroes its owner block at the next publication.
+ */
+template <typename allocator_type_>
+class basic_slot_allocator {
   public:
 
-    basic_extent_volume(basic_extent_volume const&) = delete;
-    basic_extent_volume& operator=(basic_extent_volume const&) = delete;
-    basic_extent_volume(basic_extent_volume&&) noexcept = default;
+    using slot_pool_t = st::basic_slot_pool<slot_t, std::uint32_t, allocator_type_>;
+    static constexpr std::uint32_t absent_k = slot_pool_t::absent_k;
+
+    basic_slot_allocator() noexcept = default;
+    basic_slot_allocator(basic_slot_allocator&&) noexcept = default;
+    basic_slot_allocator& operator=(basic_slot_allocator&&) noexcept = default;
+
+    /** A pool of @p count slots of data directory @p medium, every one taken until a mount releases
+     *  the free ones. */
+    static expected<basic_slot_allocator> make(std::uint16_t medium, std::size_t count,
+                                               allocator_type_ allocator) noexcept {
+        basic_slot_allocator made;
+        auto [pool, make_status] = slot_pool_t::make(count, std::move(allocator));
+        if (make_status != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the slots of a medium"};
+        made.slots_ = std::move(pool);
+        for (std::size_t index = 0; index != count; ++index) [[maybe_unused]]
+            std::uint32_t const taken = made.slots_.take();
+        if (made.touched_.resize((count + 63) / 64, 0) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the slots of a medium"};
+        made.medium_ = medium;
+        return made;
+    }
+
+    /** Places a run of @p bytes, with its offset counted from the medium's base. */
+    expected<medium_extent_t> allocate(std::uint64_t bytes) noexcept {
+        std::uint64_t const rounded = round_up_to_multiple(bytes, portable_alignment_k);
+        if (rounded == 0 || rounded > sorted_run_bytes_max_k)
+            return status_t {status_code_t::invalid_argument_k, "A run fits one slot"};
+        bool const packed = rounded < packed_run_bytes_max_k;
+        std::uint32_t slot = packed ? open_ : absent_k;
+        if (slot == absent_k || slots_[slot].tail_bytes + rounded > slot_bytes_k) {
+            std::uint32_t const taken = slots_.take();
+            if (taken == absent_k) return status_t {status_code_t::capacity_exhausted_k, "No free slot"};
+            slots_[taken].tail_bytes = static_cast<std::uint32_t>(slot_payload_offset_k);
+            touch_(taken);
+            if (packed) {
+                if (open_ != absent_k && slots_[open_].live_bytes == 0) vacate_(open_);
+                open_ = taken;
+            }
+            slot = taken;
+        }
+        slot_t& held = slots_[slot];
+        medium_extent_t placed;
+        placed.extent = extent_t {std::uint64_t {slot} * slot_bytes_k + held.tail_bytes, rounded};
+        placed.data_directory = medium_;
+        placed.placement = handle_of(slot);
+        held.tail_bytes += static_cast<std::uint32_t>(rounded);
+        held.live_bytes += static_cast<std::uint32_t>(rounded);
+        return placed;
+    }
+
+    /** Gives @p extent back once the manifest that stopped naming it is durable. */
+    void deallocate(medium_extent_t const& extent) noexcept {
+        slot_t* const slot = slots_.at(
+            typename slot_pool_t::handle_t {extent.placement.index, extent.placement.generation});
+        if (!slot) return;
+        slot->live_bytes -= static_cast<std::uint32_t>(extent.extent.length);
+        if (slot->live_bytes == 0 && extent.placement.index != open_) vacate_(extent.placement.index);
+    }
+
+    /** Marks @p length bytes from @p offset inside slot @p index live, as a mount does for every
+     *  run the manifest names. */
+    void credit(std::uint32_t index, std::uint64_t offset, std::uint64_t length) noexcept {
+        slot_t& slot = slots_[index];
+        slot.live_bytes += static_cast<std::uint32_t>(length);
+        // A run of a slot of its own leaves no room a packed run may take.
+        std::uint64_t const tail = length < packed_run_bytes_max_k ? offset + length : slot_bytes_k;
+        if (tail > slot.tail_bytes) slot.tail_bytes = static_cast<std::uint32_t>(tail);
+    }
+
+    /** Reopens the held packed slot with the most room left, so a mount keeps packing where the
+     *  last one stopped. */
+    void reopen_packed() noexcept {
+        std::uint32_t chosen = absent_k;
+        for (std::uint32_t index = 0; index != slots_.capacity(); ++index) {
+            slot_t const& slot = slots_[index];
+            if (slot.live_bytes == 0 || slot.tail_bytes >= slot_bytes_k) continue;
+            if (chosen == absent_k || slot.tail_bytes < slots_[chosen].tail_bytes) chosen = index;
+        }
+        open_ = chosen;
+    }
+
+    /** Frees slot @p index, which a mount does for a zero owner block and a crash leftover,
+     *  in descending order. */
+    void release(std::uint32_t index) noexcept {
+        slots_[index].live_bytes = 0;
+        slots_[index].tail_bytes = 0;
+        slots_.vacate(index);
+    }
+
+    /** Whether the slot @p placement names is still held under the generation it was placed at. */
+    [[nodiscard]] bool holds(placement_handle_t placement) const noexcept {
+        return slots_.at(typename slot_pool_t::handle_t {placement.index, placement.generation}) != nullptr;
+    }
+
+    /** The handle of slot @p index as it stands. */
+    [[nodiscard]] placement_handle_t handle_of(std::uint32_t index) const noexcept {
+        return placement_handle_t {index, slots_[index].generation};
+    }
+
+    /** The record of slot @p index. */
+    [[nodiscard]] slot_t const& slot(std::uint32_t index) const noexcept { return slots_[index]; }
+
+    /** Slots of the medium, taken or free. */
+    [[nodiscard]] std::size_t size() const noexcept { return slots_.capacity(); }
+
+    /** Bytes still placeable: whole free slots and the open packed slot's room. */
+    [[nodiscard]] std::uint64_t free_bytes() const noexcept {
+        std::uint64_t free = (slots_.capacity() - slots_.size()) * sorted_run_bytes_max_k;
+        if (open_ != absent_k) free += slot_bytes_k - slots_[open_].tail_bytes;
+        return free;
+    }
+
+    /** Calls @p visitor with every slot taken or vacated since the last call and what became of it,
+     *  and forgets them. */
+    template <typename visitor_type_>
+    status_t drain_touched(visitor_type_&& visitor) noexcept {
+        for (std::size_t word = 0; word != touched_.size(); ++word)
+            for (std::uint64_t bits = std::exchange(touched_[word], 0); bits != 0; bits &= bits - 1) {
+                std::uint32_t const index = static_cast<std::uint32_t>(word * 64 + std::countr_zero(bits));
+                slot_change_t const change = slots_[index].tail_bytes != 0 ? slot_change_t::taken_k
+                                                                           : slot_change_t::vacated_k;
+                if (status_t const visited = visitor(index, change); visited.failed()) return visited;
+            }
+        return {};
+    }
+
+  private:
+
+    void touch_(std::uint32_t index) noexcept { touched_[index / 64] |= std::uint64_t {1} << (index % 64); }
+
+    void vacate_(std::uint32_t index) noexcept {
+        if (index == open_) open_ = absent_k;
+        release(index);
+        touch_(index);
+    }
+
+    slot_pool_t slots_;
+
+    /** One bit per slot whose owner block awaits a write or a zeroing. */
+    st::vector<std::uint64_t> touched_;
+
+    /** The packed slot small runs are appended to, or @c absent_k. */
+    std::uint32_t open_ = absent_k;
+
+    /** The data directory these slots belong to. */
+    std::uint16_t medium_ = 0;
+};
+
+#pragma endregion Slot Allocator
+
+#pragma region Directory Volume
+
+/**
+ *  @brief Runs as @c <database>-<run id>.ustore files across directories of filesystems, named by a
+ *      @c <database>.ustore.json manifest in the first directory.
+ *  @tparam allocator_type_ The byte allocator the run-file pool and the manifest are charged to.
+ */
+template <typename disk_type_, typename waiter_type_, typename allocator_type_>
+    requires ring_concept<disk_type_>
+class basic_directory_volume {
+  public:
+
+    using disk_t = disk_type_;
+    using allocator_t = allocator_type_;
+
+    basic_directory_volume() noexcept = default;
+    basic_directory_volume(basic_directory_volume const&) = delete;
+    basic_directory_volume& operator=(basic_directory_volume const&) = delete;
+
+    basic_directory_volume(basic_directory_volume&& other) noexcept
+        : disk_(std::exchange(other.disk_, nullptr)), allocator_(std::move(other.allocator_)),
+          directories_(std::move(other.directories_)), run_files_(std::move(other.run_files_)),
+          unflushed_(std::move(other.unflushed_)), manifest_(std::move(other.manifest_)) {}
+
+    basic_directory_volume& operator=(basic_directory_volume&& other) noexcept {
+        if (this == &other) return *this;
+        [[maybe_unused]] status_t const released = unmount();
+        disk_ = std::exchange(other.disk_, nullptr);
+        allocator_ = std::move(other.allocator_);
+        directories_ = std::move(other.directories_);
+        run_files_ = std::move(other.run_files_);
+        unflushed_ = std::move(other.unflushed_);
+        manifest_ = std::move(other.manifest_);
+        return *this;
+    }
+
+    ~basic_directory_volume() noexcept { [[maybe_unused]] status_t const released = unmount(); }
 
     /**
-     *  @brief Mounts @p medium of @p disk, formatting it when it holds no volume and @p format allows.
-     *  @param[in,out] disk The transport, borrowed and outliving the volume.
-     *  @param[in,out] channel A channel to read the head and the slots through, borrowed for this call.
-     *  @param[in] medium The registered medium the volume occupies.
-     *  @param[in] format The identity and geometry a format writes, and what to do with a bad catalog.
-     *  @return The volume, @c status_code_t::malformed_k for a medium @p format refuses to repair,
-     *      or @c status_code_t::already_exists_k for a medium opening with a SafeGraphs index,
-     *      whatever @p format says.
+     *  @brief Opens every directory of @p config, reads the manifest when there is one, and unlinks
+     *      every run file of this database the manifest does not name, which a crash left behind.
+     *  @return The volume, @c invalid_argument_k for an address that names no directory, or
+     *      @c malformed_k for a manifest of another database or one naming a directory this mount
+     *      did not list.
      */
-    static expected<basic_extent_volume> mount(disk_type_& disk, io_channel_t& channel,
-                                               registered_medium_t const& medium,
-                                               volume_format_t const& format) noexcept {
-        basic_extent_volume volume {disk};
-        volume.medium_ = medium.reference();
-        volume.capacity_ = medium.capacity() != 0 ? medium.capacity() : format.capacity_bytes;
-
-        auto [head, read_head_status] = volume.read_head_(channel);
-        if (read_head_status.failed() &&
-            (format.recovery == volume_recovery_t::refuse_k || read_head_status == status_code_t::already_exists_k))
-            return read_head_status;
-        if (read_head_status.succeeded() && head.magic == volume_magic_k) {
-            if (head.format_version != volume_format_version_k)
-                return status_t {status_code_t::unsupported_k, "The volume follows another format version"};
-            if (format.database.is_valid() && head.database != format.database)
-                return status_t {status_code_t::invalid_argument_k, "The volume belongs to another database"};
-            volume.header_ = head;
-            if (status_t const loaded = volume.load_catalog_(channel, format.recovery); loaded.failed()) return loaded;
+    static expected<basic_directory_volume> mount(disk_type_& disk, [[maybe_unused]] io_channel_t& channel,
+                                                  volume_config_t const& config, allocator_type_ allocator) noexcept {
+        if (config.data_directories.empty() || config.data_directories.size() > limit_of_<std::uint16_t>())
+            return status_t {status_code_t::invalid_argument_k, "A volume spans one to 65,535 data directories"};
+        if (config.database.empty()) return status_t {status_code_t::invalid_argument_k, "A database needs a name"};
+        basic_directory_volume volume {disk, allocator};
+        if (volume.directories_.reserve(config.data_directories.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the data directories"};
+        for (data_address_t const& address : config.data_directories) {
+            if (address.kind != data_address_kind_t::directory_k)
+                return status_t {status_code_t::invalid_argument_k, "A directory volume spans directories alone"};
+            directory_t directory;
+            directory.quota = address.byte_limit;
+            if (sz::failed(directory.path.assign(string_view_t {address.location})))
+                return status_t {status_code_t::out_of_memory_k, "No room for a data directory's path"};
+            if (status_t const made = create_directories(directory.path.c_str()); made.failed()) return made;
+            [[maybe_unused]] st::status_t const placed = volume.directories_.push_back(st::assume_reserved,
+                                                                                       std::move(directory));
         }
-        else if (status_t const written = volume.write_head_(channel, format); written.failed()) return written;
+        // The records grow in chunks that never move, so a small database pays for few of them.
+        auto [files, make_status] = run_files_t::make(1, config.runs_capacity, allocator);
+        if (make_status != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the run files"};
+        volume.run_files_ = std::move(files);
 
-        if (status_t const rebuilt = volume.rebuild_free_map_(); rebuilt.failed()) return rebuilt;
+        if (sz::failed(volume.manifest_.database.assign(config.database)))
+            return status_t {status_code_t::out_of_memory_k, "No room for the database's name"};
+        char path[path_max_bytes_k];
+        if (status_t const named = volume.manifest_path_(path); named.failed()) return named;
+        st::vector<char> text;
+        status_t const read = read_file(path, text);
+        if (read == status_code_t::not_found_k) volume.manifest_.id = uuid_generator();
+        else if (read.failed()) return read;
+        else if (status_t const parsed = volume.manifest_.parse(text, allocator); parsed.failed()) return parsed;
+        if (volume.manifest_.database != config.database || volume.manifest_.placement != manifest_placement_t::paths_k)
+            return status_t {status_code_t::malformed_k, "The manifest names another database or no paths"};
+        for (manifest_file_t const& file : volume.manifest_.files)
+            if (file.medium >= volume.directories_.size())
+                return status_t {status_code_t::malformed_k, "The manifest names a data directory this mount lacks"};
+        if (status_t const swept = volume.sweep_leftovers_(); swept.failed()) return swept;
         return volume;
     }
 
-    /**
-     *  @brief Reserves @p length bytes for @p name, without touching the medium.
-     *  @param[in] name The bytes the blob is named by, at most @c blob_name_max_bytes_k of them.
-     *  @param[in] kind What the blob is, which is how @c for_each enumerates it later.
-     *  @param[in] length Bytes the caller will write, rounded up to the allocation granularity.
-     *  @return The blob to write into, which @c find answers for only once @c seal has recorded it.
-     */
-    expected<volume_blob_t> create(blob_name_t name, blob_kind_t kind, std::uint64_t length) noexcept {
-        if (name.empty() || name.size() > blob_name_max_bytes_k)
-            return status_t {status_code_t::invalid_argument_k, "A blob name is one byte to the format's limit"};
-        if (names(name)) return status_t {status_code_t::already_exists_k, "The volume names that blob"};
+    /** The manifest the mount read, or an empty one naming the database's fresh ID. */
+    [[nodiscard]] manifest_t const& manifest() const noexcept { return manifest_; }
 
-        auto [reserved, allocate_status] = allocator_.allocate(length);
-        if (allocate_status.failed()) return allocate_status;
-        catalog_entry_t entry;
-        std::memcpy(entry.name_storage.data(), name.data(), name.size());
-        entry.name_bytes = static_cast<std::uint16_t>(name.size());
-        entry.kind = kind;
-        entry.extent = reserved;
-        entry.content_length = length;
-        if (reserved_.push_back(std::move(entry)) != st::status_t::success_k) {
-            [[maybe_unused]] status_t const returned = allocator_.release(reserved);
-            return status_t {status_code_t::out_of_memory_k, "The volume could not track another reservation"};
-        }
-        return blob_of_(reserved, length);
+    /** How many manifests have been published, whose successor the next publication prints. */
+    [[nodiscard]] std::uint64_t generation() const noexcept { return manifest_.generation; }
+
+    /** How the manifests of this volume name their files. */
+    [[nodiscard]] static constexpr manifest_placement_t placement() noexcept { return manifest_placement_t::paths_k; }
+
+    /** Opens the run file @p file names, which the manifest the mount read lists. */
+    expected<medium_extent_t> open(manifest_file_t const& file) noexcept {
+        return register_run_(file.medium, file.run, 0, medium_access_t::read_write_k,
+                             round_up_to_multiple(file.bytes, portable_alignment_k));
     }
 
-    /** Whether this volume already answers to @p name, by a sealed blob or by a live reservation. */
-    [[nodiscard]] bool names(blob_name_t name) const noexcept {
-        return catalog_.find(name) != nullptr || reservation_named_(name) != reserved_.size();
-    }
-
-    /** The blob @p name resolves to, or @c not_found_k, which costs one lookup and no I/O. */
-    expected<volume_blob_t> find(blob_name_t name) const noexcept {
-        catalog_entry_t const* const found = catalog_.find(name);
-        if (!found) return status_t {status_code_t::not_found_k, "The volume holds no blob of that name"};
-        return blob_of_(found->extent, found->content_length);
-    }
-
-    /**
-     *  @brief Makes the bytes of @p blob durable and then records it, in that order and no other.
-     *  @param[in,out] channel The channel the caller wrote the bytes on, which is the only one that can flush them.
-     *  @param[in] blob The reservation @c create handed out, whose bytes the caller has already completed.
-     *  @return Success, or @c status_code_t::not_found_k when no live reservation covers that range.
-     */
-    status_t seal(io_channel_t& channel, volume_blob_t const& blob) noexcept {
-        if (blob.medium.medium_id != medium_.medium_id || blob.medium.generation != medium_.generation)
-            return {status_code_t::invalid_argument_k, "That blob was reserved on another volume"};
-        std::size_t const position = reservation_at_(blob.extent);
-        if (position == reserved_.size()) return {status_code_t::not_found_k, "The volume reserved no such range"};
-
-        if (status_t const flushed = flush_bytes_(channel); flushed.failed()) return flushed;
-        catalog_entry_t const& entry = reserved_[position];
-        if (status_t const recorded = catalog_.insert(entry.name(), entry.kind, entry.extent, entry.content_length);
-            recorded.failed())
-            return recorded;
-        if (status_t const published = publish_catalog_(channel); published.failed()) {
-            [[maybe_unused]] expected<extent_t> const undone = catalog_.erase(entry.name());
-            return published;
-        }
-        reserved_.erase(position);
-        return {};
-    }
-
-    /** Forgets @p name durably, and only then returns its range to the free map. */
-    status_t drop(io_channel_t& channel, blob_name_t name) noexcept {
-        if (std::size_t const position = reservation_named_(name); position != reserved_.size()) {
-            extent_t const abandoned = reserved_[position].extent;
-            reserved_.erase(position);
-            return allocator_.release(abandoned);
-        }
-
-        catalog_entry_t const* const found = catalog_.find(name);
-        if (!found) return {status_code_t::not_found_k, "The volume holds no blob of that name"};
-        catalog_entry_t const restored = *found;
-        auto [forgotten, erase_status] = catalog_.erase(name);
-        if (erase_status.failed()) return erase_status;
-        if (status_t const published = publish_catalog_(channel); published.failed()) {
-            [[maybe_unused]] status_t const undone = catalog_.insert(restored.name(), restored.kind, restored.extent,
-                                                                     restored.content_length);
-            return published;
-        }
-        return allocator_.release(forgotten);
-    }
-
-    /** Calls @p visitor with the name and the blob of every catalog entry of @p kind. */
-    template <typename visitor_type_>
-    void for_each(blob_kind_t kind, visitor_type_&& visitor) const noexcept {
-        catalog_.for_each(kind, [&](catalog_entry_t const& entry) noexcept {
-            visitor(entry.name(), blob_of_(entry.extent, entry.content_length));
-        });
-    }
-
-    /** Bytes the data region hands out, which is the capacity minus the head and both slots. */
-    [[nodiscard]] std::uint64_t capacity() const noexcept { return allocator_.capacity(); }
-
-    /** Bytes no entry and no reservation covers, which a router's placement decision reads. */
-    [[nodiscard]] std::uint64_t free_bytes() const noexcept { return allocator_.free_bytes(); }
-
-    /** The largest single blob this volume could still allocate, which fragmentation lowers. */
-    [[nodiscard]] std::uint64_t largest_free_bytes() const noexcept { return allocator_.largest_free_bytes(); }
-
-    /** Blobs the catalog names right now, of which a reservation is not yet one. */
-    [[nodiscard]] std::size_t size() const noexcept { return catalog_.size(); }
-
-    /** Ranges @c create handed out that no @c seal has recorded, which a remount forgets. */
-    [[nodiscard]] std::size_t reservations() const noexcept { return reserved_.size(); }
-
-    /** The transport underneath, which every read and write of a blob's bytes goes to directly. */
-    [[nodiscard]] disk_type_& disk() const noexcept { return disk_; }
-
-    /** The medium every blob of this volume lives in. */
-    [[nodiscard]] medium_reference_t medium() const noexcept { return medium_; }
-
-    /** The head of the volume, which names the geometry a repair tool reads the slots by. */
-    [[nodiscard]] volume_header_t const& header() const noexcept { return header_; }
-
-    /**
-     *  @brief Zeroes the first block of the volume durably, so the next mount formats the
-     *      medium afresh and a slot mapper reads its slots as free; the blobs' bytes stay
-     *      behind, named by nothing.
-     *  @param[in,out] channel The channel the zeroes are written on, borrowed for this call.
-     *  @note A zero write rather than @c BLKZEROOUT, since the ring reaches a medium by reference
-     *      and never by descriptor; nothing but the volume's destruction follows.
-     */
-    status_t erase(io_channel_t& channel) noexcept { return write_first_block_(channel, {}); }
-
-  private:
-
-    /** The blob a catalog entry describes, which carries the medium so a caller needs nothing else. */
-    [[nodiscard]] volume_blob_t blob_of_(extent_t extent, std::uint64_t length) const noexcept {
-        volume_blob_t blob;
-        blob.volume = volume_id_t::unmounted_k;
-        blob.medium = medium_;
-        blob.extent = extent;
-        blob.length = length;
-        return blob;
-    }
-
-    /** Where the reservation of @p name sits, or @c reserved_.size() when there is none. */
-    [[nodiscard]] std::size_t reservation_named_(blob_name_t name) const noexcept {
-        for (std::size_t index = 0; index != reserved_.size(); ++index) {
-            catalog_entry_t const& entry = reserved_[index];
-            if (entry.name_bytes != name.size()) continue;
-            if (std::memcmp(entry.name_storage.data(), name.data(), name.size()) == 0) return index;
-        }
-        return reserved_.size();
-    }
-
-    /** Where the reservation covering @p extent sits, or @c reserved_.size() when there is none. */
-    [[nodiscard]] std::size_t reservation_at_(extent_t extent) const noexcept {
-        for (std::size_t index = 0; index != reserved_.size(); ++index)
-            if (reserved_[index].extent == extent) return index;
-        return reserved_.size();
-    }
-
-    /** Reads the head of the volume, which a fresh medium answers with zeroes rather than a failure. */
-    expected<volume_header_t> read_head_(io_channel_t& channel) noexcept {
-        if (channel.requests().buffer_bytes() < portable_alignment_k)
-            return status_t {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a volume's head"};
-
-        basic_read_pipeline<disk_type_> reader {disk_, channel, medium_};
-        if (status_t const offered = reader.enqueue_read(extent_t {0, portable_alignment_k}, 0); offered.failed())
-            return offered;
-        if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
-
-        volume_header_t header {};
-        status_t sink_status;
-        auto sink = [&](completed_buffer_t const& completed) noexcept {
-            if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
-                sink_status = whole;
-                return;
-            }
-            std::memcpy(&header, completed.bytes.data(), sizeof(header));
-        };
-        if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
-        if (sink_status.failed()) return sink_status;
-        if (header.magic == safegraphs_magic_k)
-            return status_t {status_code_t::already_exists_k, "The medium opens with a SafeGraphs index"};
-        if (header.magic != 0 && header.magic != volume_magic_k)
-            return status_t {status_code_t::malformed_k, "The volume carries another magic"};
-        if (header.magic == volume_magic_k && !header_checksum_holds(header))
-            return status_t {status_code_t::malformed_k, "The volume header does not match its checksum"};
-        return header;
-    }
-
-    /** Writes the head and two empty catalog slots, which is what a format is. */
-    status_t write_head_(io_channel_t& channel, volume_format_t const& format) noexcept {
-        volume_header_t header {};
-        header.magic = volume_magic_k;
-        header.format_version = volume_format_version_k;
-        header.header_bytes = sizeof(volume_header_t);
-        header.database = format.database;
-        header.capacity_bytes = capacity_;
-        header.catalog_slot_offset = portable_alignment_k;
-        header.catalog_slot_bytes = round_up_to_multiple(format.catalog_slot_bytes, portable_alignment_k);
-        header.data_offset = round_up_to_multiple(header.catalog_slot_offset + 2 * header.catalog_slot_bytes,
-                                                  format.large_allocation_alignment);
-        header.allocation_granularity = format.allocation_granularity;
-        header.large_allocation_alignment = format.large_allocation_alignment;
-        header.catalog_generation = 0;
-        set_header_checksum(header);
-        if (header.data_offset >= capacity_)
-            return {status_code_t::capacity_exhausted_k, "The volume is too small for its own catalog"};
-
-        header_ = header;
-        catalog_ = catalog_t {};
-        if (status_t const written = write_first_block_(channel, std::as_bytes(std::span {&header, 1}));
-            written.failed())
-            return written;
-        return publish_both_slots_(channel);
-    }
-
-    /** Writes @p head over the first block of the volume, zeroes past it, and makes
-     *  the block durable. */
-    status_t write_first_block_(io_channel_t& channel, std::span<byte_t const> head) noexcept {
-        basic_write_pipeline<disk_type_, waiter_type_> writer {disk_, channel, medium_};
-        auto [block, acquire_buffer_status] = writer.acquire_buffer();
-        if (acquire_buffer_status.failed()) return acquire_buffer_status;
-        if (block.size() < portable_alignment_k)
-            return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a volume's head"};
-        std::span<byte_t> const bytes = block.bytes();
-        std::memset(bytes.data(), 0, static_cast<std::size_t>(portable_alignment_k));
-        if (!head.empty()) std::memcpy(bytes.data(), head.data(), head.size());
-        if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {0, portable_alignment_k});
-            queued.failed())
-            return queued;
-        return writer.make_durable();
-    }
-
-    /** Reads both slots and takes the newer one that verifies, which is the whole of recovery. */
-    status_t load_catalog_(io_channel_t& channel, volume_recovery_t recovery) noexcept {
-        catalog_t newest;
-        std::uint64_t newest_generation = 0;
-        bool found = false;
-        for (std::uint32_t slot = 0; slot != 2; ++slot) {
-            catalog_t parsed;
-            expected<std::uint64_t> const generation = read_slot_(channel, slot, parsed);
-            if (!generation) continue;
-            if (found && *generation <= newest_generation) continue;
-            newest = std::move(parsed);
-            newest_generation = *generation;
-            found = true;
-        }
-        if (found) {
-            catalog_ = std::move(newest);
-            header_.catalog_generation = newest_generation;
-            return {};
-        }
-        if (recovery == volume_recovery_t::refuse_k)
-            return {status_code_t::malformed_k, "Neither catalog slot of the volume verifies"};
-
-        catalog_ = catalog_t {};
-        header_.catalog_generation = 0;
-        return publish_both_slots_(channel);
-    }
-
-    /**
-     *  @brief Reads one slot into @p into, answering its generation when it verifies.
-     *
-     *  @note The image is read through a streaming block with one request of its own, since a
-     *      pipeline fills the request pool whose blocks are far shorter than a catalog slot.
-     */
-    expected<std::uint64_t> read_slot_(io_channel_t& channel, std::uint32_t slot, catalog_t& into) noexcept {
-        auto [block, acquire_status] = channel.streams().acquire();
-        if (acquire_status.failed()) return acquire_status;
-        std::uint64_t const wanted = slot_image_bytes_(block.size());
-        if (wanted == 0)
-            return status_t {status_code_t::capacity_exhausted_k, "A channel's streaming block holds no catalog page"};
-
-        std::array<request_t, 1> const batch {
-            read_request(medium_, extent_t {slot_offset_(slot), wanted}, block.reference(), channel.token(slot))};
-        auto [taken, submit_status] = disk_.submit(channel.queue_pair(), std::span<request_t const> {batch});
-        if (submit_status.failed()) return submit_status;
-        if (taken != 1) return status_t {status_code_t::io_k, "The ring would not take a catalog read"};
-        auto [completed, poll_completions_status] = poll_completions_at_least<waiter_type_>(
-            disk_, channel.queue_pair(), channel.completion_buffer(), 1);
-        if (poll_completions_status.failed()) return poll_completions_status;
-        if (completed == 0) return status_t {status_code_t::io_k, "A catalog read never completed"};
-
-        completion_t const& completion = channel.completion_buffer().front();
-        if (!completion.completed_in_full())
-            return completion.status.failed()
-                       ? completion.status
-                       : status_t {status_code_t::malformed_k, "The volume is shorter than its catalog slot"};
-
-        std::span<byte_t const> const image {block.bytes().data(),
-                                             static_cast<std::size_t>(completion.transferred_bytes)};
-        if (status_t const parsed = into.load(image); parsed.failed()) return parsed;
-        catalog_slot_header_t header {};
-        std::memcpy(&header, image.data(), sizeof(header));
-        return header.generation;
-    }
-
-    /** Writes the whole catalog image into the older slot and flushes it, which publishes it. */
-    status_t publish_catalog_(io_channel_t& channel) noexcept {
-        std::uint64_t const generation = header_.catalog_generation + 1;
-        std::uint32_t const slot = static_cast<std::uint32_t>(generation & 1);
-
-        auto [block, acquire_status] = channel.streams().acquire();
-        if (acquire_status.failed()) return acquire_status;
-        std::uint64_t const room = slot_image_bytes_(block.size());
-        std::uint64_t const needed = catalog_.image_bytes();
-        if (needed > room) return {status_code_t::capacity_exhausted_k, "The catalog outgrew the slot that holds it"};
-
-        std::uint64_t const written = round_up_to_multiple(needed, portable_alignment_k);
-        std::span<byte_t> const bytes = block.bytes();
-        std::memset(bytes.data(), 0, static_cast<std::size_t>(written));
-        auto [filled, save_status] = catalog_.save(bytes.first(static_cast<std::size_t>(room)), generation);
-        if (save_status.failed()) return save_status;
-
-        basic_write_pipeline<disk_type_, waiter_type_> writer {disk_, channel, medium_};
-        if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {slot_offset_(slot), written});
-            queued.failed())
-            return queued;
-        if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
-        header_.catalog_generation = generation;
-        return {};
-    }
-
-    /** Publishes into both slots, so no image of an earlier life outlives a format or a repair. */
-    status_t publish_both_slots_(io_channel_t& channel) noexcept {
-        if (status_t const older = publish_catalog_(channel); older.failed()) return older;
-        return publish_catalog_(channel);
-    }
-
-    /** Makes every write the channel has already completed durable, which is the step before recording. */
-    status_t flush_bytes_(io_channel_t& channel) noexcept {
-        basic_write_pipeline<disk_type_, waiter_type_> writer {disk_, channel, medium_};
-        return writer.make_durable();
-    }
-
-    /** Rebuilds the free map by subtracting every catalog entry from the data region. */
-    status_t rebuild_free_map_() noexcept {
-        if (header_.data_offset > capacity_)
-            return {status_code_t::malformed_k, "The volume is shorter than its own catalog"};
-        std::uint64_t const granularity = header_.allocation_granularity;
-        if (!std::has_single_bit(granularity))
-            return {status_code_t::malformed_k, "The volume names no power-of-two granularity"};
-
-        extent_t const region {header_.data_offset,
-                               round_down_to_multiple(capacity_ - header_.data_offset, granularity)};
-        auto [allocator, make_extent_allocator_status] = extent_allocator_t::make(region, granularity,
-                                                                                  header_.large_allocation_alignment);
-        if (make_extent_allocator_status.failed()) return make_extent_allocator_status;
-        allocator_ = std::move(allocator);
-
-        status_t first;
-        for (blob_kind_t const kind :
-             {blob_kind_t::sorted_run_k, blob_kind_t::schema_k, blob_kind_t::backup_schema_k, blob_kind_t::user_data_k})
-            catalog_.for_each(kind, [&](catalog_entry_t const& entry) noexcept {
-                if (status_t const reserved = allocator_.reserve(entry.extent); reserved.failed() && first.succeeded())
-                    first = reserved;
-            });
-        return first;
-    }
-
-    /** Bytes of a catalog slot a block of @p block_bytes can carry, which bounds the catalog both ways. */
-    [[nodiscard]] std::uint64_t slot_image_bytes_(std::uint64_t block_bytes) const noexcept {
-        std::uint64_t const bounded = header_.catalog_slot_bytes < block_bytes ? header_.catalog_slot_bytes
-                                                                               : block_bytes;
-        return round_down_to_multiple(bounded, portable_alignment_k);
-    }
-
-    /** Where slot @p slot begins, which alternates so a torn image never overwrites the live one. */
-    [[nodiscard]] std::uint64_t slot_offset_(std::uint32_t slot) const noexcept {
-        return header_.catalog_slot_offset + slot * header_.catalog_slot_bytes;
-    }
-
-    explicit basic_extent_volume(disk_type_& disk) noexcept : disk_(disk) {}
-
-    /** The transport, which outlives the volume. */
-    disk_type_& disk_;
-
-    /** The medium the whole volume occupies. */
-    medium_reference_t medium_;
-
-    /** Bytes the volume spans, as the transport reported them. */
-    std::uint64_t capacity_ = 0;
-
-    /** The head of the volume: identity, geometry and the generation of the live slot. */
-    volume_header_t header_ {};
-
-    /** Every live entry, rebuilt at mount and rewritten whole at every publication. */
-    catalog_t catalog_;
-
-    /** Ranges @c create handed out that no @c seal has recorded, which no publication names. */
-    st::vector<catalog_entry_t> reserved_;
-
-    /** Ranges no entry covers, derived from @c catalog_ and never itself stored on the medium. */
-    extent_allocator_t allocator_;
-};
-
-#pragma endregion Extent Volume
-
-#pragma endregion Volume
-
-#pragma region Volume Router
-
-#pragma region Contract
-
-/** What a router asks of a volume: the names it resolves, and the free space it reports. */
-template <typename volume_type_>
-concept extent_volume_concept = requires(volume_type_& volume, volume_type_ const& constant, io_channel_t& channel,
-                                         blob_name_t name, blob_kind_t kind, std::uint64_t length) {
-    { volume.create(name, kind, length) } -> std::same_as<expected<volume_blob_t>>;
-    { constant.find(name) } -> std::same_as<expected<volume_blob_t>>;
-    { volume.drop(channel, name) } -> std::same_as<status_t>;
-    { constant.names(name) } -> std::same_as<bool>;
-    { constant.free_bytes() } -> std::same_as<std::uint64_t>;
-    { constant.largest_free_bytes() } -> std::same_as<std::uint64_t>;
-};
-
-#pragma endregion Contract
-
-#pragma region Router
-
-/**
- *  @brief Every mounted volume of one database, and the free-space placement that spreads blobs over them.
- *
- *  The template is on the volume rather than on a variant of volumes, because a mount already knows
- *  which transport it opened and a virtual call per placement would buy nothing; a runtime-dispatched
- *  router wraps this one rather than replacing it.
- */
-template <typename volume_type_>
-    requires extent_volume_concept<volume_type_>
-class basic_volume_router {
-  public:
-
-    basic_volume_router() noexcept = default;
-    basic_volume_router(basic_volume_router const&) = delete;
-    basic_volume_router& operator=(basic_volume_router const&) = delete;
-    basic_volume_router(basic_volume_router&&) noexcept = default;
-    basic_volume_router& operator=(basic_volume_router&&) noexcept = default;
-
-    /**
-     *  @brief An empty router with room for @p volumes_limit volumes, which a mount fills one at a time.
-     *  @param[in] volumes_limit Volumes this router will ever hold, which is one per data directory.
-     *
-     *  @note The room is taken here and never grown, because an LSM tree holds a pointer to the volume
-     *      it was mounted on; a later adoption that moved the volumes would leave every tree
-     *      addressing freed memory.
-     */
-    static expected<basic_volume_router> make(std::size_t volumes_limit = 1) noexcept {
-        if (volumes_limit == 0 || volumes_limit >= static_cast<std::size_t>(volume_id_t::unmounted_k))
-            return status_t {status_code_t::invalid_argument_k, "A router names one volume to an identifier's worth"};
-        basic_volume_router router;
-        if (router.volumes_.reserve(volumes_limit) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "The router could not reserve its volumes"};
-        router.limit_ = volumes_limit;
-        return router;
-    }
-
-    /**
-     *  @brief Takes @p volume in under the next identifier, which every blob placed on it carries.
-     *  @param[in] volume The mounted volume, moved in and owned by the router from here on.
-     */
-    status_t bind_queue_pair(volume_type_&& volume) noexcept {
-        // Refused rather than grown, since growing would move volumes their trees still point at.
-        if (volumes_.size() >= limit_)
-            return {status_code_t::capacity_exhausted_k, "The router reserved room for fewer volumes than that"};
-        if (volumes_.push_back(std::move(volume)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "The router could not track another volume"};
-        return {};
-    }
-
-    /**
-     *  @brief The volume with the most free space that a blob of @p length still fits in.
-     *  @param[in] length Bytes the blob asks for, before the volume rounds it to its granularity.
-     *  @return The volume, or @c status_code_t::capacity_exhausted_k when none has a range that long.
-     */
-    expected<volume_id_t> optimal_volume(std::uint64_t length) const noexcept {
-        std::size_t chosen = volumes_.size();
+    /** Creates @c <database>-<run>.ustore of @p bytes, rounded to a page, in the directory with the
+     *  most free bytes; the file is durable only once a manifest naming it is published. */
+    expected<medium_extent_t> allocate(uuid_t const& run, std::uint64_t bytes) noexcept {
+        std::uint64_t const rounded = round_up_to_multiple(bytes, portable_alignment_k);
+        if (rounded == 0 || rounded > sorted_run_bytes_max_k)
+            return status_t {status_code_t::invalid_argument_k, "A run fits one slot"};
+        std::size_t chosen = directories_.size();
         std::uint64_t chosen_free = 0;
-        for (std::size_t index = 0; index != volumes_.size(); ++index) {
-            volume_type_ const& candidate = volumes_[index];
-            if (candidate.largest_free_bytes() < length) continue;
-            std::uint64_t const free = candidate.free_bytes();
-            if (chosen != volumes_.size() && free <= chosen_free) continue;
+        for (std::size_t index = 0; index != directories_.size(); ++index) {
+            std::uint64_t const free = free_bytes_(directories_[index]);
+            if (free < rounded || (chosen != directories_.size() && free <= chosen_free)) continue;
             chosen = index;
             chosen_free = free;
         }
-        if (chosen == volumes_.size())
-            return status_t {status_code_t::capacity_exhausted_k, "No mounted volume fits a blob that long"};
-        return static_cast<volume_id_t>(chosen);
+        if (chosen == directories_.size())
+            return status_t {status_code_t::capacity_exhausted_k, "No data directory has room for that run"};
+        if (unflushed_.reserve(unflushed_.size() + 1) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room to track another run file"};
+        auto [placed, register_status] = register_run_(static_cast<std::uint16_t>(chosen), run, rounded,
+                                                       medium_access_t::create_read_write_k, rounded);
+        if (register_status.failed()) return register_status;
+        [[maybe_unused]] st::status_t const tracked = unflushed_.push_back(st::assume_reserved,
+                                                                           placement_handle_t {placed.placement});
+        return placed;
     }
 
-    /**
-     *  @brief Places @p name by free space and reserves @p length bytes for it on the volume that won.
-     *  @param[in] name The bytes the blob is named by, which no other volume of the router may hold.
-     *  @param[in] kind What the blob is, which is how @c for_each enumerates it later.
-     *  @param[in] length Bytes the caller will write, rounded up by the volume that takes it.
-     *  @return The blob, stamped with the volume it was placed on, which the caller seals there.
-     */
-    expected<volume_blob_t> create(blob_name_t name, blob_kind_t kind, std::uint64_t length) noexcept {
-        for (std::size_t index = 0; index != volumes_.size(); ++index)
-            if (volumes_[index].names(name))
-                return status_t {status_code_t::already_exists_k, "A volume of this router names that blob"};
-
-        auto [placed, optimal_volume_status] = optimal_volume(length);
-        if (optimal_volume_status.failed()) return optimal_volume_status;
-        auto [created, create_status] = volumes_[static_cast<std::size_t>(placed)].create(name, kind, length);
-        if (create_status.failed()) return create_status;
-        created.volume = placed;
-        return created;
+    /** Closes and unlinks the file of @p extent, once the manifest that stopped naming
+     *  it is durable. */
+    void deallocate(medium_extent_t const& extent) noexcept {
+        run_file_t* const file = run_files_.at(handle_of_(extent.placement));
+        if (!file) return;
+        [[maybe_unused]] status_t const closed = disk_->unregister_medium(file->medium);
+        char path[path_max_bytes_k];
+        if (run_path_(file->data_directory, file->run, path).succeeded()) [[maybe_unused]]
+            status_t const removed = remove_file(path);
+        directories_[file->data_directory].used -= file->bytes;
+        run_files_.vacate(extent.placement.index);
     }
 
-    /** The blob @p name resolves to on whichever volume holds it, stamped with that volume. */
-    expected<volume_blob_t> find(blob_name_t name) const noexcept {
-        for (std::size_t index = 0; index != volumes_.size(); ++index) {
-            expected<volume_blob_t> found = volumes_[index].find(name);
-            if (!found) continue;
-            found->volume = static_cast<volume_id_t>(index);
-            return found;
+    /** Flushes every run file written since the last publication, then replaces the manifest
+     *  with @p json. */
+    status_t publish_manifest(io_channel_t& channel, std::span<char const> json) noexcept {
+        for (placement_handle_t const& handle : unflushed_) {
+            run_file_t* const file = run_files_.at(handle_of_(handle));
+            if (!file) continue;
+            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, file->medium.reference()};
+            if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
         }
-        return status_t {status_code_t::not_found_k, "No volume of this router holds that blob"};
+        unflushed_.clear();
+        char path[path_max_bytes_k];
+        if (status_t const named = manifest_path_(path); named.failed()) return named;
+        if (status_t const replaced = replace_file_durably(path, json); replaced.failed()) return replaced;
+        ++manifest_.generation;
+        return {};
     }
 
-    /** Forgets @p name on the one volume that holds it, which is the only one the drop reaches. */
-    status_t drop(io_channel_t& channel, blob_name_t name) noexcept {
-        for (std::size_t index = 0; index != volumes_.size(); ++index)
-            if (volumes_[index].names(name)) return volumes_[index].drop(channel, name);
-        return {status_code_t::not_found_k, "No volume of this router holds that blob"};
+    /** Writes the path of the file of @p run in data directory @p medium into @p into, which
+     *  an archive links. */
+    status_t file_path(std::uint16_t medium, uuid_t const& run, std::span<char> into) const noexcept {
+        if (medium >= directories_.size())
+            return {status_code_t::invalid_argument_k, "The volume holds no data directory of that index"};
+        return run_path_(medium, run, into);
     }
 
-    /** Calls @p visitor with the name and the stamped blob of every entry of @p kind, volume by volume. */
-    template <typename visitor_type_>
-    void for_each(blob_kind_t kind, visitor_type_&& visitor) const noexcept {
-        for (std::size_t index = 0; index != volumes_.size(); ++index)
-            volumes_[index].for_each(kind, [&](blob_name_t name, volume_blob_t blob) noexcept {
-                blob.volume = static_cast<volume_id_t>(index);
-                visitor(name, blob);
-            });
+    /** Run files this volume keeps registered at most. */
+    [[nodiscard]] std::size_t runs_capacity() const noexcept { return run_files_.capacity_limit(); }
+
+    /** Bytes every data directory still offers. */
+    [[nodiscard]] std::uint64_t free_bytes() const noexcept {
+        std::uint64_t free = 0;
+        for (directory_t const& directory : directories_) free += free_bytes_(directory);
+        return free;
     }
 
-    /** The volume @p id names, which a caller reaches to seal the blob it has just written. */
-    [[nodiscard]] volume_type_& volume(volume_id_t id) noexcept {
-        assert(static_cast<std::size_t>(id) < volumes_.size() && "A router resolves only the volumes it adopted");
-        return volumes_[static_cast<std::size_t>(id)];
-    }
+    /** The transport every read and write of a run goes to directly. */
+    [[nodiscard]] disk_type_& disk() const noexcept { return *disk_; }
 
-    /** Volumes the router has adopted, whose identifiers run from zero to one below it. */
-    [[nodiscard]] std::size_t size() const noexcept { return volumes_.size(); }
+    /** Closes every run file, which a destructor does for a caller that did not. */
+    status_t unmount() noexcept {
+        if (!disk_) return {};
+        status_t first;
+        for (run_file_t& file : run_files_.records())
+            if (file.medium.held())
+                if (status_t const closed = disk_->unregister_medium(file.medium); closed.failed() && first.succeeded())
+                    first = closed;
+        run_files_ = run_files_t {};
+        disk_ = nullptr;
+        return first;
+    }
 
   private:
 
-    /** Volumes this router reserved room for, fixed when it was made and never grown. */
-    std::size_t limit_ = 0;
+    /** One run file, registered while it is live. */
+    struct run_file_t {
+        registered_medium_t medium;
+        uuid_t run;
+        std::uint64_t bytes = 0;
+        std::uint32_t generation = 0;
+        std::uint16_t data_directory = 0;
+    };
 
-    /** Every adopted volume, in the order they were adopted, which is the order of their identifiers. */
-    st::vector<volume_type_> volumes_;
+    /** One data directory, with its quota and the bytes this database's files take there. */
+    struct directory_t {
+        string_t path;
+        std::uint64_t quota = 0;
+        std::uint64_t used = 0;
+    };
+
+    using run_files_t = st::basic_chunked_slot_pool<run_file_t, std::uint32_t, allocator_type_>;
+
+    template <typename integer_type_>
+    static constexpr std::size_t limit_of_() noexcept {
+        return std::numeric_limits<integer_type_>::max();
+    }
+
+    static typename run_files_t::handle_t handle_of_(placement_handle_t handle) noexcept {
+        return typename run_files_t::handle_t {handle.index, handle.generation};
+    }
+
+    basic_directory_volume(disk_type_& disk, allocator_type_ const& allocator) noexcept
+        : disk_(&disk), allocator_(allocator) {}
+
+    [[nodiscard]] static std::uint64_t free_bytes_(directory_t const& directory) noexcept {
+        if (directory.quota != 0) return directory.quota > directory.used ? directory.quota - directory.used : 0;
+        expected<std::uint64_t> const free = free_bytes_of(directory.path.c_str());
+        return free ? *free : 0;
+    }
+
+    status_t manifest_path_(std::span<char> into) const noexcept {
+        char name[path_max_bytes_k];
+        std::size_t const length = manifest_.database.size();
+        constexpr std::string_view suffix = ".ustore.json";
+        if (length + suffix.size() + 1 > sizeof(name))
+            return {status_code_t::invalid_argument_k, "A database name outgrew the platform's limit"};
+        std::memcpy(name, manifest_.database.data(), length);
+        std::memcpy(name + length, suffix.data(), suffix.size());
+        name[length + suffix.size()] = '\0';
+        return join_path(directories_[0].path.c_str(), name, into);
+    }
+
+    status_t run_path_(std::uint16_t directory, uuid_t const& run, std::span<char> into) const noexcept {
+        char name[path_max_bytes_k];
+        if (status_t const named = manifest_.file_name(run, name); named.failed()) return named;
+        return join_path(directories_[directory].path.c_str(), name, into);
+    }
+
+    expected<medium_extent_t> register_run_(std::uint16_t directory, uuid_t const& run, std::uint64_t length,
+                                            medium_access_t access, std::uint64_t bytes) noexcept {
+        std::uint32_t const index = run_files_.take();
+        if (index == run_files_t::absent_k)
+            return status_t {status_code_t::capacity_exhausted_k, "Every run file this volume tracks is taken"};
+        char path[path_max_bytes_k];
+        if (status_t const named = run_path_(directory, run, path); named.failed()) {
+            run_files_.vacate(index);
+            return named;
+        }
+        medium_options_t request;
+        request.name = path;
+        request.length = length;
+        request.access = access;
+        auto [registered, register_status] = disk_->register_medium(request);
+        if (register_status.failed()) {
+            run_files_.vacate(index);
+            return register_status;
+        }
+        run_file_t& file = run_files_[index];
+        file.medium = std::move(registered);
+        file.run = run;
+        file.bytes = bytes;
+        file.data_directory = directory;
+        directories_[directory].used += bytes;
+
+        medium_extent_t placed;
+        placed.medium = file.medium.reference();
+        placed.extent = extent_t {0, bytes};
+        placed.data_directory = directory;
+        placed.placement = placement_handle_t {index, file.generation};
+        return placed;
+    }
+
+    /** Unlinks every run file of this database no manifest entry names, and a manifest copy
+     *  a crash left. */
+    status_t sweep_leftovers_() noexcept {
+        st::vector<uuid_t> named;
+        if (named.reserve(manifest_.files.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to list the runs the manifest names"};
+        for (manifest_file_t const& file : manifest_.files) [[maybe_unused]]
+            st::status_t const placed = named.push_back(st::assume_reserved, uuid_t {file.run});
+        std::sort(named.begin(), named.end());
+
+        st::vector<uuid_t> leftovers;
+        for (std::size_t directory = 0; directory != directories_.size(); ++directory) {
+            leftovers.clear();
+            status_t listed;
+            status_t const walked = list_directory(directories_[directory].path.c_str(), [&](std::string_view name) {
+                uuid_t const run = manifest_.run_of(name);
+                if (!run.is_valid() || std::binary_search(named.begin(), named.end(), run)) return;
+                if (leftovers.push_back(uuid_t {run}) != st::status_t::success_k)
+                    listed = {status_code_t::out_of_memory_k, "No room to list the leftover run files"};
+            });
+            if (walked.failed()) return walked;
+            if (listed.failed()) return listed;
+            char path[path_max_bytes_k];
+            for (uuid_t const& run : leftovers)
+                if (status_t const named_path = run_path_(static_cast<std::uint16_t>(directory), run, path);
+                    named_path.failed() || remove_file(path).failed())
+                    return {status_code_t::io_k, "A leftover run file would not be removed"};
+        }
+        char path[path_max_bytes_k];
+        if (status_t const named_path = manifest_path_(path); named_path.failed()) return named_path;
+        std::size_t const length = std::strlen(path);
+        if (length + 5 > sizeof(path)) return {};
+        std::memcpy(path + length, ".tmp", 5);
+        return remove_file(path);
+    }
+
+    disk_type_* disk_ = nullptr;
+    allocator_type_ allocator_;
+    st::vector<directory_t> directories_;
+    run_files_t run_files_;
+
+    /** Run files written since the last publication, which it flushes before it commits. */
+    st::vector<placement_handle_t> unflushed_;
+
+    /** The manifest the mount read, whose generation counts every publication since. */
+    manifest_t manifest_;
 };
 
-#pragma endregion Router
+#pragma endregion Directory Volume
 
-#pragma endregion Volume Router
+#pragma region Slotted Volume
+
+/**
+ *  @brief Runs inside 1 GB slots of raw block devices or SPDK namespaces, named by a manifest kept
+ *      in the slot at data directory 0's base.
+ *
+ *  The manifest slot keeps two JSON regions. A publication writes the owner blocks of every slot
+ *  taken or freed, writes the JSON into the idle region and flushes every medium, then rewrites the
+ *  manifest slot's owner block to point at that region and flushes again. A crash before the second
+ *  flush leaves the old generation in force.
+ */
+template <typename disk_type_, typename waiter_type_, typename allocator_type_>
+    requires ring_concept<disk_type_>
+class basic_slotted_volume {
+  public:
+
+    using disk_t = disk_type_;
+    using allocator_t = allocator_type_;
+    using slot_allocator_t = basic_slot_allocator<allocator_type_>;
+
+    /** Bytes of each of the manifest slot's two JSON regions. */
+    static constexpr std::uint64_t manifest_region_bytes_k = round_down_to_multiple(
+        (slot_bytes_k - slot_payload_offset_k) / 2, portable_alignment_k);
+
+    basic_slotted_volume() noexcept = default;
+    basic_slotted_volume(basic_slotted_volume const&) = delete;
+    basic_slotted_volume& operator=(basic_slotted_volume const&) = delete;
+
+    basic_slotted_volume(basic_slotted_volume&& other) noexcept
+        : disk_(std::exchange(other.disk_, nullptr)), allocator_(std::move(other.allocator_)),
+          media_(std::move(other.media_)), manifest_(std::move(other.manifest_)),
+          manifest_owner_(other.manifest_owner_) {}
+
+    basic_slotted_volume& operator=(basic_slotted_volume&& other) noexcept {
+        if (this == &other) return *this;
+        [[maybe_unused]] status_t const released = unmount();
+        disk_ = std::exchange(other.disk_, nullptr);
+        allocator_ = std::move(other.allocator_);
+        media_ = std::move(other.media_);
+        manifest_ = std::move(other.manifest_);
+        manifest_owner_ = other.manifest_owner_;
+        return *this;
+    }
+
+    ~basic_slotted_volume() noexcept { [[maybe_unused]] status_t const released = unmount(); }
+
+    /**
+     *  @brief Opens every raw medium of @p config, reads one logical block per slot, and rebuilds
+     *      the slot pools.
+     *
+     *  The manifest slot is read first: a zero block makes a fresh database, claimed at once. Every
+     *  other slot this database holds that the manifest does not name is a crash leftover, zeroed
+     *  and freed; zero blocks are freed in descending order so later takes come out lowest first;
+     *  foreign slots stay taken.
+     *
+     *  @return The volume, @c already_exists_k when the base slot belongs to something else,
+     *      @c malformed_k for media listed in another order than the database was created with, or
+     *      @c unsupported_k for SPDK.
+     */
+    static expected<basic_slotted_volume> mount(disk_type_& disk, io_channel_t& channel, volume_config_t const& config,
+                                                allocator_type_ allocator) noexcept {
+        if (config.data_directories.empty() ||
+            config.data_directories.size() > std::numeric_limits<std::uint16_t>::max())
+            return status_t {status_code_t::invalid_argument_k, "A volume spans one to 65,535 data directories"};
+        basic_slotted_volume volume {disk, allocator};
+        if (volume.media_.reserve(config.data_directories.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the raw media"};
+        for (std::size_t index = 0; index != config.data_directories.size(); ++index)
+            if (status_t const opened = volume.open_medium_(config.data_directories[index],
+                                                            static_cast<std::uint16_t>(index));
+                opened.failed())
+                return opened;
+        if (volume.media_[0].slots.size() == 0)
+            return status_t {status_code_t::capacity_exhausted_k, "The first data directory holds no slot"};
+
+        if (status_t const claimed = volume.claim_manifest_slot_(channel, config.database); claimed.failed())
+            return claimed;
+        for (manifest_file_t const& file : volume.manifest_.files)
+            if (status_t const credited = volume.credit_(file); credited.failed()) return credited;
+        for (std::size_t index = 0; index != volume.media_.size(); ++index)
+            if (status_t const scanned = volume.scan_slots_(channel, index); scanned.failed()) return scanned;
+        return volume;
+    }
+
+    /** The manifest the mount read, or an empty one naming the database's fresh ID. */
+    [[nodiscard]] manifest_t const& manifest() const noexcept { return manifest_; }
+
+    /** How many manifests have been published, whose successor the next publication prints. */
+    [[nodiscard]] std::uint64_t generation() const noexcept { return manifest_.generation; }
+
+    /** How the manifests of this volume name their files. */
+    [[nodiscard]] static constexpr manifest_placement_t placement() noexcept { return manifest_placement_t::offsets_k; }
+
+    /** The extent @p file names, which the mount has already credited to its slot. */
+    expected<medium_extent_t> open(manifest_file_t const& file) noexcept {
+        raw_medium_t const& medium = media_[file.medium];
+        std::uint32_t const index = static_cast<std::uint32_t>((file.offset - medium.base) / slot_bytes_k);
+        medium_extent_t placed;
+        placed.medium = medium.medium.reference();
+        placed.extent = extent_t {file.offset, round_up_to_multiple(file.bytes, portable_alignment_k)};
+        placed.data_directory = file.medium;
+        placed.placement = medium.slots.handle_of(index);
+        return placed;
+    }
+
+    /** Places @p bytes on the medium with the most free bytes, packing a short run into the
+     *  open packed slot. */
+    expected<medium_extent_t> allocate([[maybe_unused]] uuid_t const& run, std::uint64_t bytes) noexcept {
+        std::uint64_t const rounded = round_up_to_multiple(bytes, portable_alignment_k);
+        std::size_t chosen = media_.size();
+        std::uint64_t chosen_free = 0;
+        for (std::size_t index = 0; index != media_.size(); ++index) {
+            std::uint64_t const free = media_[index].slots.free_bytes();
+            if (free < rounded || (chosen != media_.size() && free <= chosen_free)) continue;
+            chosen = index;
+            chosen_free = free;
+        }
+        if (chosen == media_.size())
+            return status_t {status_code_t::capacity_exhausted_k, "No raw medium has room for that run"};
+        raw_medium_t& medium = media_[chosen];
+        auto [placed, allocate_status] = medium.slots.allocate(rounded);
+        if (allocate_status.failed()) return allocate_status;
+        placed.medium = medium.medium.reference();
+        placed.extent.offset += medium.base;
+        return placed;
+    }
+
+    /** Gives @p extent back once the manifest that stopped naming it is durable; the next
+     *  publication zeroes the run's first block, so a slot walk never mistakes it for a live run,
+     *  and a slot left empty is zeroed and deallocated. */
+    void deallocate(medium_extent_t const& extent) noexcept {
+        if (extent.data_directory >= media_.size()) return;
+        raw_medium_t& medium = media_[extent.data_directory];
+        // A run left unzeroed is a run a recovery may take back, never a run the manifest names.
+        [[maybe_unused]] st::status_t const remembered = medium.dropped.push_back(medium_extent_t {extent});
+        medium.slots.deallocate(extent);
+    }
+
+    /** Writes the owner blocks awaiting a write, @p json into the idle region, flushes every
+     *  medium, then points the manifest slot's owner block at the new copy and flushes again. */
+    status_t publish_manifest(io_channel_t& channel, std::span<char const> json) noexcept {
+        if (json.size() > manifest_region_bytes_k)
+            return {status_code_t::capacity_exhausted_k, "The manifest outgrew its region of the manifest slot"};
+        for (std::size_t index = 0; index != media_.size(); ++index)
+            if (status_t const written = write_touched_(channel, index); written.failed()) return written;
+
+        raw_medium_t& first = media_[0];
+        std::uint64_t const regions = first.base + slot_payload_offset_k;
+        std::uint64_t const idle = manifest_owner_.manifest_offset == regions ? regions + manifest_region_bytes_k
+                                                                              : regions;
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, first.medium.reference()};
+        if (status_t const written = write_bytes_(writer, idle, std::as_bytes(json), first.block_bytes);
+            written.failed())
+            return written;
+        if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
+
+        slot_owner_block_t committed = manifest_owner_;
+        committed.manifest_generation = manifest_.generation + 1;
+        committed.manifest_offset = idle;
+        committed.manifest_bytes = json.size();
+        if (status_t const written = write_owner_block_(writer, first, first.base, &committed); written.failed())
+            return written;
+        if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
+        manifest_owner_ = committed;
+        ++manifest_.generation;
+        return {};
+    }
+
+    /** Answers @c unsupported_k, as a run on raw media is no file an archive could link. */
+    status_t file_path(std::uint16_t, uuid_t const&, std::span<char>) const noexcept {
+        return {status_code_t::unsupported_k, "A run on raw media is no file"};
+    }
+
+    /** Runs a database on raw media may hold, which the run pools above it are sized by. */
+    [[nodiscard]] std::size_t runs_capacity() const noexcept { return std::numeric_limits<std::uint16_t>::max() - 1; }
+
+    /** Bytes every raw medium still offers. */
+    [[nodiscard]] std::uint64_t free_bytes() const noexcept {
+        std::uint64_t free = 0;
+        for (raw_medium_t const& medium : media_) free += medium.slots.free_bytes();
+        return free;
+    }
+
+    /** The transport every read and write of a run goes to directly. */
+    [[nodiscard]] disk_type_& disk() const noexcept { return *disk_; }
+
+    /** Closes every raw medium, which a destructor does for a caller that did not. */
+    status_t unmount() noexcept {
+        if (!disk_) return {};
+        status_t first;
+        for (raw_medium_t& medium : media_)
+            if (medium.medium.held())
+                if (status_t const closed = disk_->unregister_medium(medium.medium);
+                    closed.failed() && first.succeeded())
+                    first = closed;
+        media_.clear();
+        disk_ = nullptr;
+        return first;
+    }
+
+  private:
+
+    /** One raw medium: its registration, where its first slot begins, its logical block,
+     *  and its slots. */
+    struct raw_medium_t {
+        file_lock_t claims;
+        registered_medium_t medium;
+        std::uint64_t base = 0;
+        std::uint64_t block_bytes = 0;
+        slot_allocator_t slots;
+
+        /** Runs given back since the last publication, whose first pages it zeroes. */
+        st::vector<medium_extent_t> dropped;
+    };
+
+    /** What a mount finds in one owner block. */
+    enum class owner_t : std::uint8_t {
+        free_k,
+        ours_k,
+        misplaced_k,
+        foreign_k,
+    };
+
+    basic_slotted_volume(disk_type_& disk, allocator_type_ const& allocator) noexcept
+        : disk_(&disk), allocator_(allocator) {}
+
+    status_t open_medium_(data_address_t const& address, std::uint16_t index) noexcept {
+        if (address.kind == data_address_kind_t::spdk_k)
+            return {status_code_t::unsupported_k, "The SPDK transport is not mounted by this build"};
+        if (address.kind != data_address_kind_t::raw_k)
+            return {status_code_t::invalid_argument_k, "A slotted volume spans raw media alone"};
+        char path[path_max_bytes_k];
+        if (address.location.size() >= sizeof(path))
+            return {status_code_t::invalid_argument_k, "A raw medium's path outgrew the platform's limit"};
+        std::memcpy(path, address.location.data(), address.location.size());
+        path[address.location.size()] = '\0';
+        // Slot claims of two processes would race on the owner blocks, so one mount holds the
+        // medium at a time.
+        auto [claims, lock_status] = file_lock_t::acquire(path);
+        if (lock_status.failed()) return lock_status;
+        medium_options_t request;
+        request.name = path;
+        request.access = medium_access_t::read_write_k;
+        auto [registered, register_status] = disk_->register_medium(request);
+        if (register_status.failed()) return register_status;
+
+        raw_medium_t medium;
+        medium.claims = std::move(claims);
+        medium.medium = std::move(registered);
+        medium.base = address.byte_base;
+        medium.block_bytes = medium.medium.logical_block_bytes();
+        std::uint64_t const capacity = medium.medium.capacity();
+        status_t refused;
+        if (medium.block_bytes < sizeof(slot_owner_block_t) || medium.block_bytes > slot_payload_offset_k)
+            refused = {status_code_t::unsupported_k, "A raw medium's logical block does not hold an owner block"};
+        else if (medium.base % medium.block_bytes != 0 || medium.base > capacity)
+            refused = {status_code_t::invalid_argument_k, "A raw medium's base is not a block inside it"};
+        std::uint64_t usable = capacity - (refused.failed() ? 0 : medium.base);
+        if (address.byte_limit != 0 && address.byte_limit < usable) usable = address.byte_limit;
+        if (refused.succeeded()) {
+            auto [slots, make_status] = slot_allocator_t::make(index, static_cast<std::size_t>(usable / slot_bytes_k),
+                                                               allocator_);
+            if (make_status.failed()) refused = make_status;
+            else medium.slots = std::move(slots);
+        }
+        if (refused.succeeded() && media_.push_back(std::move(medium)) != st::status_t::success_k)
+            refused = {status_code_t::out_of_memory_k, "No room for another raw medium"};
+        if (refused.failed() && medium.medium.held()) [[maybe_unused]]
+            status_t const closed = disk_->unregister_medium(medium.medium);
+        return refused;
+    }
+
+    /** Reads the manifest slot's owner block: a zero block becomes this database's, claimed at
+     *  once; a block of this layout names the database and the manifest copy in force. */
+    status_t claim_manifest_slot_(io_channel_t& channel, string_view_t database) noexcept {
+        raw_medium_t& first = media_[0];
+        basic_read_pipeline<disk_type_> reader {*disk_, channel, first.medium.reference()};
+        slot_owner_block_t found {};
+        if (status_t const read = read_owner_blocks_(
+                reader, first, 0, 1, [&](std::uint32_t, slot_owner_block_t const& block) noexcept { found = block; });
+            read.failed())
+            return read;
+
+        if (is_zero_(found)) {
+            manifest_.id = uuid_generator();
+            if (sz::failed(manifest_.database.assign(database)))
+                return {status_code_t::out_of_memory_k, "No room for the database's name"};
+            manifest_.placement = manifest_placement_t::offsets_k;
+            manifest_owner_ = owner_block_(0);
+            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, first.medium.reference()};
+            if (status_t const written = write_owner_block_(writer, first, first.base, &manifest_owner_);
+                written.failed())
+                return written;
+            if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
+        }
+        else {
+            if (found.magic != slot_owner_magic_k || found.format_version != slot_format_version_k)
+                return {status_code_t::already_exists_k, "The base slot belongs to something else"};
+            if (found.medium != 0)
+                return {status_code_t::malformed_k, "The data directories are listed in another order"};
+            manifest_owner_ = found;
+            manifest_.id = found.database;
+            if (found.manifest_bytes != 0)
+                if (status_t const loaded = load_manifest_(channel, found); loaded.failed()) return loaded;
+        }
+        first.slots.credit(0, 0, slot_bytes_k);
+        return {};
+    }
+
+    /** Reads the manifest copy @p owner points at and parses it. */
+    status_t load_manifest_(io_channel_t& channel, slot_owner_block_t const& owner) noexcept {
+        raw_medium_t& first = media_[0];
+        std::uint64_t const regions = first.base + slot_payload_offset_k;
+        if (owner.manifest_bytes > manifest_region_bytes_k ||
+            (owner.manifest_offset != regions && owner.manifest_offset != regions + manifest_region_bytes_k))
+            return {status_code_t::malformed_k, "The manifest slot points outside its regions"};
+        st::vector<char> text;
+        std::uint64_t const rounded = round_up_to_multiple(owner.manifest_bytes, first.block_bytes);
+        if (text.resize(static_cast<std::size_t>(rounded)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to read the manifest"};
+        basic_read_pipeline<disk_type_> reader {*disk_, channel, first.medium.reference()};
+        std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(), first.block_bytes);
+        std::uint64_t offered = 0;
+        status_t carried;
+        auto sink = [&](completed_buffer_t const& completed) noexcept {
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) carried = whole;
+            else std::memcpy(text.data() + completed.tag * block_bytes, completed.bytes.data(), completed.bytes.size());
+        };
+        for (request_tag_t tag = 0; offered != rounded; ++tag) {
+            std::uint64_t const chunk = rounded - offered < block_bytes ? rounded - offered : block_bytes;
+            while (!reader.can_enqueue())
+                if (status_t const polled = reader.poll_one_completion(sink); polled.failed()) return polled;
+            if (status_t const queued = reader.enqueue_read(extent_t {owner.manifest_offset + offered, chunk}, tag);
+                queued.failed())
+                return queued;
+            if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
+            offered += chunk;
+        }
+        if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
+        if (carried.failed()) return carried;
+        if (status_t const parsed = manifest_.parse(std::span<char> {text.data(), owner.manifest_bytes}, allocator_);
+            parsed.failed())
+            return parsed;
+        if (manifest_.id != owner.database || manifest_.generation != owner.manifest_generation ||
+            (!manifest_.files.empty() && manifest_.placement != manifest_placement_t::offsets_k))
+            return {status_code_t::malformed_k, "The manifest copy disagrees with the slot pointing at it"};
+        manifest_.placement = manifest_placement_t::offsets_k;
+        return {};
+    }
+
+    /** Credits the slot @p file lies in, refusing a file outside every slot. */
+    status_t credit_(manifest_file_t const& file) noexcept {
+        if (file.medium >= media_.size())
+            return {status_code_t::malformed_k, "The manifest names a data directory this mount lacks"};
+        raw_medium_t& medium = media_[file.medium];
+        std::uint64_t const slots_end = medium.base + medium.slots.size() * slot_bytes_k;
+        if (file.offset < medium.base || file.offset > slots_end || file.bytes > slots_end - file.offset)
+            return {status_code_t::malformed_k, "The manifest names bytes outside the slots"};
+        std::uint64_t const inside = file.offset - medium.base;
+        std::uint32_t const index = static_cast<std::uint32_t>(inside / slot_bytes_k);
+        std::uint64_t const offset = inside % slot_bytes_k;
+        std::uint64_t const bytes = round_up_to_multiple(file.bytes, portable_alignment_k);
+        if (offset < slot_payload_offset_k || offset % portable_alignment_k != 0 || bytes > slot_bytes_k - offset)
+            return {status_code_t::malformed_k, "The manifest names a run across a slot's edge"};
+        medium.slots.credit(index, offset, bytes);
+        return {};
+    }
+
+    /** Reads every owner block of medium @p index, then frees zero and leftover slots and
+     *  refuses misplaced ones. */
+    status_t scan_slots_(io_channel_t& channel, std::size_t index) noexcept {
+        raw_medium_t& medium = media_[index];
+        std::uint32_t const count = static_cast<std::uint32_t>(medium.slots.size());
+        st::vector<owner_t> owners;
+        if (owners.resize(count, owner_t::foreign_k) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to classify a medium's slots"};
+        std::uint32_t const first_scanned = index == 0 ? 1 : 0;
+        basic_read_pipeline<disk_type_> reader {*disk_, channel, medium.medium.reference()};
+        if (status_t const read = read_owner_blocks_(
+                reader, medium, first_scanned, count,
+                [&](std::uint32_t slot, slot_owner_block_t const& block) noexcept {
+                    if (is_zero_(block)) owners[slot] = owner_t::free_k;
+                    else if (block.magic != slot_owner_magic_k || block.database != manifest_.id)
+                        owners[slot] = owner_t::foreign_k;
+                    else owners[slot] = block.medium == index ? owner_t::ours_k : owner_t::misplaced_k;
+                });
+            read.failed())
+            return read;
+
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, medium.medium.reference()};
+        for (std::uint32_t slot = count; slot != first_scanned; --slot) {
+            std::uint32_t const at = slot - 1;
+            bool const named = medium.slots.slot(at).live_bytes != 0;
+            if (owners[at] == owner_t::misplaced_k)
+                return {status_code_t::malformed_k, "The data directories are listed in another order"};
+            if (named && owners[at] != owner_t::ours_k)
+                return {status_code_t::malformed_k, "The manifest names a slot this database does not hold"};
+            if (owners[at] == owner_t::ours_k && !named)
+                if (status_t const zeroed = free_on_device_(writer, medium, at); zeroed.failed()) return zeroed;
+            if (owners[at] == owner_t::free_k || (owners[at] == owner_t::ours_k && !named)) medium.slots.release(at);
+        }
+        medium.slots.reopen_packed();
+        return writer.make_durable();
+    }
+
+    /** Writes the owner block of every slot of medium @p index taken since the last publication,
+     *  and zeroes and deallocates every one freed. */
+    status_t write_touched_(io_channel_t& channel, std::size_t index) noexcept {
+        raw_medium_t& medium = media_[index];
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, medium.medium.reference()};
+        slot_owner_block_t const owner = owner_block_(static_cast<std::uint32_t>(index));
+        // A slot vacated since a run was dropped has its owner block zeroed below, and may hold a
+        // newer run already.
+        for (medium_extent_t const& dropped : medium.dropped)
+            if (medium.slots.holds(dropped.placement))
+                if (status_t const zeroed = zero_first_page_(writer, dropped.extent.offset); zeroed.failed())
+                    return zeroed;
+        medium.dropped.clear();
+        if (status_t const drained = medium.slots.drain_touched([&](std::uint32_t slot, slot_change_t change) noexcept {
+                return change == slot_change_t::taken_k
+                           ? write_owner_block_(writer, medium, slot_base_(medium, slot), &owner)
+                           : free_on_device_(writer, medium, slot);
+            });
+            drained.failed())
+            return drained;
+        return writer.make_durable();
+    }
+
+    /** Zeroes the owner block of @p slot and deallocates its payload, leaving the zeroed
+     *  block in place. */
+    status_t free_on_device_(basic_write_pipeline<disk_type_, waiter_type_>& writer, raw_medium_t const& medium,
+                             std::uint32_t slot) noexcept {
+        std::uint64_t const base = slot_base_(medium, slot);
+        if (status_t const zeroed = write_owner_block_(writer, medium, base, nullptr); zeroed.failed()) return zeroed;
+        return writer.enqueue_deallocate(extent_t {base + slot_payload_offset_k, slot_bytes_k - slot_payload_offset_k});
+    }
+
+    /** Stages a page of zeros over the first page of the run at @p offset, which
+     *  its header occupies. */
+    static status_t zero_first_page_(basic_write_pipeline<disk_type_, waiter_type_>& writer,
+                                     std::uint64_t offset) noexcept {
+        auto [block, acquire_status] = writer.acquire_buffer_or_poll();
+        if (acquire_status.failed()) return acquire_status;
+        std::memset(block.bytes().data(), 0, static_cast<std::size_t>(portable_alignment_k));
+        if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {offset, portable_alignment_k});
+            queued.failed())
+            return queued;
+        return writer.submit();
+    }
+
+    /** Stages @p owner, or zeroes when null, over the first logical block at @p offset. */
+    static status_t write_owner_block_(basic_write_pipeline<disk_type_, waiter_type_>& writer,
+                                       raw_medium_t const& medium, std::uint64_t offset,
+                                       slot_owner_block_t const* owner) noexcept {
+        auto [block, acquire_status] = writer.acquire_buffer_or_poll();
+        if (acquire_status.failed()) return acquire_status;
+        std::span<byte_t> const bytes = block.bytes();
+        std::memset(bytes.data(), 0, static_cast<std::size_t>(medium.block_bytes));
+        if (owner) std::memcpy(bytes.data(), owner, sizeof(slot_owner_block_t));
+        if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {offset, medium.block_bytes});
+            queued.failed())
+            return queued;
+        return writer.submit();
+    }
+
+    /** Stages @p bytes zero-padded to @p block_bytes at @p offset, one channel block at a time. */
+    static status_t write_bytes_(basic_write_pipeline<disk_type_, waiter_type_>& writer, std::uint64_t offset,
+                                 std::span<byte_t const> bytes, std::uint64_t block_bytes) noexcept {
+        std::uint64_t const total = round_up_to_multiple<std::uint64_t>(bytes.size(), block_bytes);
+        for (std::uint64_t written = 0; written != total;) {
+            auto [block, acquire_status] = writer.acquire_buffer_or_poll();
+            if (acquire_status.failed()) return acquire_status;
+            std::uint64_t const room = round_down_to_multiple<std::uint64_t>(block.size(), block_bytes);
+            std::uint64_t const chunk = total - written < room ? total - written : room;
+            std::span<byte_t> const target = block.bytes();
+            std::uint64_t const copied = written < bytes.size()
+                                             ? (bytes.size() - written < chunk ? bytes.size() - written : chunk)
+                                             : 0;
+            std::memset(target.data(), 0, static_cast<std::size_t>(chunk));
+            if (copied) std::memcpy(target.data(), bytes.data() + written, static_cast<std::size_t>(copied));
+            if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {offset + written, chunk});
+                queued.failed())
+                return queued;
+            if (status_t const submitted = writer.submit(); submitted.failed()) return submitted;
+            written += chunk;
+        }
+        return {};
+    }
+
+    /** Reads the owner blocks of slots @p begin up to @p end of @p medium, handing each
+     *  to @p visitor. */
+    template <typename visitor_type_>
+    static status_t read_owner_blocks_(basic_read_pipeline<disk_type_>& reader, raw_medium_t const& medium,
+                                       std::uint32_t begin, std::uint32_t end, visitor_type_&& visitor) noexcept {
+        status_t carried;
+        auto sink = [&](completed_buffer_t const& completed) noexcept {
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
+                carried = whole;
+                return;
+            }
+            slot_owner_block_t block {};
+            std::memcpy(&block, completed.bytes.data(), sizeof(block));
+            visitor(static_cast<std::uint32_t>(completed.tag), block);
+        };
+        for (std::uint32_t slot = begin; slot != end; ++slot) {
+            while (!reader.can_enqueue())
+                if (status_t const polled = reader.poll_one_completion(sink); polled.failed()) return polled;
+            if (status_t const queued = reader.enqueue_read(extent_t {slot_base_(medium, slot), medium.block_bytes},
+                                                            slot);
+                queued.failed())
+                return queued;
+            if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
+        }
+        if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
+        return carried;
+    }
+
+    [[nodiscard]] static std::uint64_t slot_base_(raw_medium_t const& medium, std::uint32_t slot) noexcept {
+        return medium.base + std::uint64_t {slot} * slot_bytes_k;
+    }
+
+    [[nodiscard]] static bool is_zero_(slot_owner_block_t const& block) noexcept {
+        slot_owner_block_t const zero {};
+        return std::memcmp(&block, &zero, sizeof(block)) == 0;
+    }
+
+    /** The owner block every slot of data directory @p medium carries, without
+     *  the manifest fields. */
+    [[nodiscard]] slot_owner_block_t owner_block_(std::uint32_t medium) const noexcept {
+        slot_owner_block_t owner {};
+        owner.magic = slot_owner_magic_k;
+        owner.format_version = slot_format_version_k;
+        owner.medium = medium;
+        owner.database = manifest_.id;
+        return owner;
+    }
+
+    disk_type_* disk_ = nullptr;
+    allocator_type_ allocator_;
+    st::vector<raw_medium_t> media_;
+
+    /** The manifest the mount read, whose generation counts every publication since. */
+    manifest_t manifest_;
+
+    /** The manifest slot's owner block as last committed. */
+    slot_owner_block_t manifest_owner_ {};
+};
+
+#pragma endregion Slotted Volume
+
+#pragma region Any Volume
+
+/** The volume a mount opened: a directory volume when its first data directory is a
+ *  directory, a slotted volume when it is a raw medium; every call is one @c visit, paid per
+ *  run rather than per request. */
+template <typename disk_type_, typename waiter_type_, typename allocator_type_>
+    requires ring_concept<disk_type_>
+class any_volume {
+  public:
+
+    using disk_t = disk_type_;
+    using directory_volume_t = basic_directory_volume<disk_type_, waiter_type_, allocator_type_>;
+    using slotted_volume_t = basic_slotted_volume<disk_type_, waiter_type_, allocator_type_>;
+
+    any_volume() noexcept = default;
+    any_volume(any_volume&&) noexcept = default;
+    any_volume& operator=(any_volume&&) noexcept = default;
+
+    /** Mounts the volume @p config's first data directory calls for. */
+    static expected<any_volume> mount(disk_type_& disk, io_channel_t& channel, volume_config_t const& config,
+                                      allocator_type_ allocator) noexcept {
+        if (config.data_directories.empty())
+            return status_t {status_code_t::invalid_argument_k, "A volume spans at least one data directory"};
+        any_volume volume;
+        volume.disk_ = &disk;
+        if (config.data_directories[0].kind == data_address_kind_t::directory_k) {
+            auto [opened, mount_status] = directory_volume_t::mount(disk, channel, config, std::move(allocator));
+            if (mount_status.failed()) return mount_status;
+            volume.held_.template emplace<directory_volume_t>(std::move(opened));
+        }
+        else {
+            auto [opened, mount_status] = slotted_volume_t::mount(disk, channel, config, std::move(allocator));
+            if (mount_status.failed()) return mount_status;
+            volume.held_.template emplace<slotted_volume_t>(std::move(opened));
+        }
+        return volume;
+    }
+
+    [[nodiscard]] manifest_t const& manifest() const noexcept {
+        return visit_(*this, [](auto const& held) noexcept -> manifest_t const& { return held.manifest(); });
+    }
+
+    [[nodiscard]] std::uint64_t generation() const noexcept { return manifest().generation; }
+
+    [[nodiscard]] manifest_placement_t placement() const noexcept {
+        return std::holds_alternative<slotted_volume_t>(held_) ? manifest_placement_t::offsets_k
+                                                               : manifest_placement_t::paths_k;
+    }
+
+    expected<medium_extent_t> open(manifest_file_t const& file) noexcept {
+        return visit_(*this, [&](auto& held) noexcept { return held.open(file); });
+    }
+
+    expected<medium_extent_t> allocate(uuid_t const& run, std::uint64_t bytes) noexcept {
+        return visit_(*this, [&](auto& held) noexcept { return held.allocate(run, bytes); });
+    }
+
+    void deallocate(medium_extent_t const& extent) noexcept {
+        visit_(*this, [&](auto& held) noexcept { held.deallocate(extent); });
+    }
+
+    status_t publish_manifest(io_channel_t& channel, std::span<char const> json) noexcept {
+        return visit_(*this, [&](auto& held) noexcept { return held.publish_manifest(channel, json); });
+    }
+
+    [[nodiscard]] std::size_t runs_capacity() const noexcept {
+        return visit_(*this, [](auto const& held) noexcept { return held.runs_capacity(); });
+    }
+
+    status_t file_path(std::uint16_t medium, uuid_t const& run, std::span<char> into) const noexcept {
+        return visit_(*this, [&](auto const& held) noexcept { return held.file_path(medium, run, into); });
+    }
+
+    [[nodiscard]] std::uint64_t free_bytes() const noexcept {
+        return visit_(*this, [](auto const& held) noexcept { return held.free_bytes(); });
+    }
+
+    [[nodiscard]] disk_type_& disk() const noexcept { return *disk_; }
+
+    /** Whether a volume is mounted, which every call but this one and @c unmount assumes. */
+    [[nodiscard]] bool mounted() const noexcept { return !std::holds_alternative<std::monostate>(held_); }
+
+    /** Closes every medium the volume registered, and leaves the handle naming none. */
+    status_t unmount() noexcept {
+        status_t released;
+        if (mounted()) released = visit_(*this, [](auto& held) noexcept { return held.unmount(); });
+        held_.template emplace<std::monostate>();
+        return released;
+    }
+
+  private:
+
+    /** Calls @p visitor with the mounted volume of @p self, which must hold one. */
+    template <typename self_type_, typename visitor_type_>
+    static decltype(auto) visit_(self_type_& self, visitor_type_&& visitor) noexcept {
+        if (auto* const directory = std::get_if<directory_volume_t>(&self.held_)) return visitor(*directory);
+        return visitor(*std::get_if<slotted_volume_t>(&self.held_));
+    }
+
+    disk_type_* disk_ = nullptr;
+    std::variant<std::monostate, directory_volume_t, slotted_volume_t> held_;
+};
+
+#pragma endregion Any Volume
 
 } // namespace unum::ustore::utilities

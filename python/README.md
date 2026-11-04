@@ -26,6 +26,7 @@ pip install . --config-settings=cmake.define.USTORE_WITH_LEVELDB=OFF
 `cibuildwheel` builds wheels for CPython 3.12, 3.13, 3.14 and 3.15, and for the free-threaded 3.14t and 3.15t, where importing `ustore` keeps the GIL disabled.
 `engines_compiled()` names the engines a build carries, each opened through its own class method: `Database.open_ram()`, `open_rocksdb()`, `open_leveldb()` or `open_nvme()`, and `view_rocksdb()` for a read-only RocksDB database.
 `open_ram(directory)` persists the database as one image in that directory, while `open_ram()` keeps it in memory alone.
+`open_nvme(manifest)` names the database by its manifest, `<database>.ustore.json` in an existing directory or the raw address of its first slot, such as `/dev/nvme0n1@64GiB`, and a snapshot of it saves to a manifest path too.
 `open_ram` and `open_nvme` take a `cpu_class=` keyword, a `CPUClass` that confines the database's waits, atomics and string kernels, and raise `UnsupportedError` where the CPU does not run it.
 
 ## Quickstart

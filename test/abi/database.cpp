@@ -1441,9 +1441,10 @@ case_result_t database_view_refusals(config_t const& config) {
     ustore_snapshot_init_t snapshot_init {.snapshot = &snapshot, .database = database, .outcome = &outcome};
     ustore_snapshot_init(&snapshot_init);
     failures += expect_success(outcome);
+    path_t const target = save_target(config, saved);
     ustore_snapshot_save_t save {.snapshot = snapshot,
                                  .outcome = &outcome,
-                                 .path = bytes_of(std::string_view {saved.c_str()})};
+                                 .path = bytes_of(std::string_view {target.c_str()})};
     ustore_snapshot_save(&save);
     failures += expect_success(outcome);
     ustore_snapshot_free(snapshot);
@@ -1645,7 +1646,7 @@ bool ready_save_path(config_t const& config, char const* path) noexcept {
 /** Opens the copy saved at @p path with the engine of @p config. */
 expected<ustore_database_t> open_saved(config_t const& config, char const* path) noexcept {
     engine_options_t options = config.options();
-    options.directory = path;
+    options.locate(path);
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
     open_engine(options, &database, &outcome);
@@ -1691,9 +1692,10 @@ case_result_t progress_cancel_save(config_t const& config) {
     ustore_snapshot_init(&snapshot_init);
     failures += expect_success(outcome);
     progress_record_t record {.cancelling_report = 1};
+    path_t const target = save_target(config, saved);
     ustore_snapshot_save_t save {.snapshot = snapshot,
                                  .outcome = &outcome,
-                                 .path = bytes_of(std::string_view {saved.c_str()}),
+                                 .path = bytes_of(std::string_view {target.c_str()}),
                                  .progress = &record_progress,
                                  .progress_state = &record};
     ustore_snapshot_save(&save);
@@ -1833,11 +1835,12 @@ std::size_t progress_serialized(config_t const& config) {
         ustore_snapshot_init(&snapshot_init);
         failures += expect_success(outcome);
         progress_record_t saved_record {.outcome = &outcome};
+        path_t const target = save_target(config, saved);
         ustore_snapshot_save_t save {.snapshot = snapshot,
                                      .executor = executor,
                                      .outcome = &outcome,
                                      .completion = ustore_completion_deferred_k,
-                                     .path = bytes_of(std::string_view {saved.c_str()}),
+                                     .path = bytes_of(std::string_view {target.c_str()}),
                                      .progress = &record_progress,
                                      .progress_state = &saved_record};
         ustore_snapshot_save(&save);
@@ -1885,9 +1888,10 @@ case_result_t snapshot_save_recorded(config_t const& config) {
 
     path_t const saved {config.directory(), "save.recorded"};
     failures += expect(ready_save_path(config, saved.c_str()));
+    path_t const target = save_target(config, saved);
     ustore_snapshot_save_t save {.snapshot = snapshot,
                                  .outcome = &outcome,
-                                 .path = bytes_of(std::string_view {saved.c_str()})};
+                                 .path = bytes_of(std::string_view {target.c_str()})};
     ustore_snapshot_save(&save);
     failures += expect_success(outcome);
     ustore_snapshot_free(snapshot);

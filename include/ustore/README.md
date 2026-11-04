@@ -31,8 +31,9 @@ Pin a commit, not a version, when building on them.
   - `nvme_disks.hpp`: the ring machinery every disk shares, the volume in memory, and the blocking floor of positioned reads and writes.
   - `nvme_linux_uring_disk.hpp`, `nvme_linux_aio_disk.hpp`, `nvme_linux_cufile_disk.hpp` and `nvme_linux_spdk_disk.hpp`: the io_uring, Linux AIO, cuFile and SPDK transports.
   - `nvme_channels.hpp`: the pinned buffer pool, the channels checking a queue pair out with its blocks, and the pipelines holding a ring at depth.
-  - `nvme_catalog.hpp`: the catalog of one volume, its checksum, blob kinds and names, on-disk layouts and the index resolving a name to an extent, and `schema_copies`, the two schema copies and the user blob a database keeps beside its runs.
-  - `nvme_volume.hpp`: the extent allocator, volumes and the router placing blobs across them.
+  - `nvme_slots.hpp`: the 1 GB slots of a raw medium, the owner block opening every slot a database holds, and the slot record.
+  - `nvme_manifest.hpp`: the `<database>.ustore.json` manifest naming a database's collections and run files.
+  - `nvme_volume.hpp`: data directory addresses, the slot allocator, and the directory and slotted volumes placing runs across every data directory.
   - `nvme_mounts.hpp`: the mount of one database's storage, the transport it probes, the disk erased over the file transports, the volumes it opens and the shared resources over it.
 - `blobs/`, in `unum::ustore::blobs`:
   - `ram_store.hpp`: `ordered_store`, the multi-version SmashTable store every RAM collection is, `values_by_key_store` of a blobs collection, the owned texts and trees of documents and pages, and the status translation every store shares.

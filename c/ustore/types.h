@@ -134,6 +134,27 @@
 
 #include <stdint.h> // `uint8_t`, `uint32_t`, `uint64_t`
 
+/** Whether the target is Windows, as 1 or 0; no other file reads the compiler's macro. */
+#if defined(_WIN32)
+#define USTORE_OS_WINDOWS_ 1
+#else
+#define USTORE_OS_WINDOWS_ 0
+#endif
+
+/** Whether the target is Linux, as 1 or 0; no other file reads the compiler's macro. */
+#if defined(__linux__)
+#define USTORE_OS_LINUX_ 1
+#else
+#define USTORE_OS_LINUX_ 0
+#endif
+
+/** Whether the target is an Apple platform, as 1 or 0; no other file reads the compiler's macro. */
+#if defined(__APPLE__)
+#define USTORE_OS_APPLE_ 1
+#else
+#define USTORE_OS_APPLE_ 0
+#endif
+
 /**
  *  @brief Marks every function the library exports, and nothing else.
  *
@@ -142,7 +163,7 @@
  *  library. GCC and Clang give the function default visibility, so it survives @c -fvisibility=hidden.
  */
 #if !defined(USTORE_EXPORT)
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if USTORE_OS_WINDOWS_ || defined(__CYGWIN__)
 #if defined(USTORE_EXPORTING)
 #define USTORE_EXPORT __declspec(dllexport)
 #elif defined(USTORE_SHARED)
@@ -285,7 +306,8 @@ typedef enum ustore_status_t {
      *  arena belong to different residencies or devices. */
     ustore_status_device_k = 8,
 
-    /** Stored or supplied data could not be decoded, like a corrupted file or an invalid document. */
+    /** Stored or supplied data could not be decoded, like a corrupted file, an invalid document, or
+     *  raw NVMe data directories listed in another order than the database was created with. */
     ustore_status_malformed_k = 9,
 
     /** The engine failed in a way no other status names, which points at a defect. */
@@ -312,7 +334,8 @@ typedef enum ustore_status_t {
      *  key with an unset presence bit instead. */
     ustore_status_not_found_k = 18,
 
-    /** A collection name or a document the call creates is already taken. */
+    /** A collection name or a document the call creates is already taken, or the first slot of a
+     *  raw medium an NVMe database opens belongs to something else. */
     ustore_status_already_exists_k = 19,
 
     /** A concurrent writer changed a key this transaction wrote; retry the transaction. */

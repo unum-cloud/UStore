@@ -324,8 +324,9 @@ std::size_t device_reports_its_capacity(std::string_view device) {
     failures += expect(device_transport.has_value());
     if (!device_transport) return failures;
     disk_config_t blocking_config;
+    resource_constraint_t budget {unlimited_resource_k};
     expected<blocking_files_disk_t> blocking = blocking_files_disk_t::make(std::move(*device_transport),
-                                                                           blocking_config);
+                                                                           blocking_config, budget);
     failures += expect(blocking.has_value());
     if (!blocking) return failures;
     expected<std::uint64_t> const blocking_capacity = registered_capacity(*blocking, request);
@@ -382,6 +383,12 @@ void uring_transport(suite_totals_t& totals, char const* directory) {
     path_t const borrowed_path {directory, "volume_borrowed.bin"};
     report(totals, "linux-uring.medium_in_flight", ring_holds_a_medium_in_flight<linux_uring_files_disk_t>, *disk,
            volume_request(borrowed_path.c_str()));
+    path_t const deallocated_path {directory, "volume_deallocated.bin"};
+    report(totals, "linux-uring.deallocates_a_file_extent", ring_deallocates_a_file_extent<linux_uring_files_disk_t>,
+           *disk, volume_request(deallocated_path.c_str()));
+    path_t const logical_block_path {directory, "volume_logical_block.bin"};
+    report(totals, "linux-uring.logical_block", ring_reports_a_logical_block<linux_uring_files_disk_t>, *disk,
+           volume_request(logical_block_path.c_str()));
 }
 
 #pragma endregion Driver

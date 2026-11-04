@@ -48,7 +48,8 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h> // `fmt::join`
 
-#include "ustore/db.h" // the init call of every engine and its arguments
+#include "ustore/db.h"                      // the init call of every engine and its arguments
+#include "ustore/utilities/nvme_volume.hpp" // `parse_data_address`, `manifest_suffix_k`
 
 namespace unum::ustore::tools {
 
@@ -545,6 +546,26 @@ inline constexpr std::array<std::string_view, 2> isolation_names_k {"strict-seri
 inline constexpr std::array<std::string_view, 5> transport_names_k {"automatic", "blocking", "linux-uring", "linux-aio",
                                                                     "linux-spdk"};
 
+/** The database name @c nvme gives the manifest it opens in @c engine_options_t::directory. */
+inline constexpr std::string_view nvme_database_name_k = "ustore";
+
+/** Bytes the longest manifest path of @c nvme_manifest_in takes, its terminator included. */
+inline constexpr std::size_t nvme_manifest_capacity_k = 4096;
+
+/** The manifest @c nvme opens at @p directory, written terminated into @p into:
+ *  @c <directory>/ustore.ustore.json for a plain directory, and @p directory itself for a raw
+ *  address or a path to a manifest. */
+inline std::string_view nvme_manifest_in(std::string_view directory, std::span<char> into) noexcept {
+    auto const [address, address_status] = utilities::parse_data_address(directory);
+    bool const named = address_status.failed() || address.kind != utilities::data_address_kind_t::directory_k ||
+                       directory.ends_with(utilities::manifest_suffix_k);
+    auto const written = named ? fmt::format_to_n(into.data(), into.size() - 1, "{}", directory)
+                               : fmt::format_to_n(into.data(), into.size() - 1, "{}/{}{}", directory,
+                                                  nvme_database_name_k, utilities::manifest_suffix_k);
+    *written.out = '\0';
+    return std::string_view {into.data(), static_cast<std::size_t>(written.out - into.data())};
+}
+
 /** The engine a binary opens and the options its flags give the engine's init call. */
 struct engine_options_t {
 
@@ -560,9 +581,21 @@ struct engine_options_t {
     /** How @c nvme moves bytes between its files and memory. */
     choice_t transport {transport_names_k};
 
-    /** Directories the volumes of @c nvme or the table files of @c rocksdb fill, one per drive;
+    /** Directories the runs of @c nvme or the table files of @c rocksdb fill, one per drive;
      *  none keeps them in @c directory. */
     texts_t directories;
+
+    /** The manifest @c nvme opens in @c directory, kept here so a deferred open still reads it. */
+    std::array<char, nvme_manifest_capacity_k> nvme_manifest {};
+
+    /** Points the engine at @p path, a directory or null, and spells the manifest
+     *  @c nvme opens there. */
+    void locate(char const* path) noexcept {
+        directory = path;
+        if (path) [[maybe_unused]]
+            std::string_view const spelled = nvme_manifest_in(path, nvme_manifest);
+        else nvme_manifest[0] = '\0';
+    }
 };
 
 /** Opens the engine @p options name into @p database, running the open on @p executor with @p completion as every
@@ -620,11 +653,14 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
         return ustore_database_open_leveldb(&open);
     }
     if (options.name == "nvme") {
+        std::string_view const located = directory.length ? std::string_view {options.nvme_manifest.data()} : "";
+        ustore_bytes_view_t const manifest_path {reinterpret_cast<ustore_byte_t const*>(located.data()),
+                                                 located.size()};
         ustore_database_open_nvme_t open {.database = database,
                                           .executor = executor,
                                           .outcome = outcome,
                                           .completion = completion,
-                                          .directory = directory,
+                                          .directory = manifest_path,
                                           .data_directories = listed,
                                           .data_directories_count = options.directories.size};
         auto const transport = static_cast<ustore_transport_t>(options.transport.selected);

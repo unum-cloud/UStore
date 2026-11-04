@@ -5,13 +5,20 @@
  *  @brief Command-line tool over collections, snapshots and datasets, one command per invocation.
  *
  *  Status lines go to standard error, so an export to @c - leaves standard output carrying only Arrow bytes.
+ *
+ *  The @c manifest and @c recover commands read the files of an NVMe database directly and open
+ *  no engine: one prints the manifest a database is opened by, the other writes a fresh one from
+ *  the runs alone.
  */
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstdio>  // `stderr`
+#include <cstring> // `std::memcpy`
 
-#if defined(_WIN32)
+#include "ustore/types.h" // `USTORE_OS_WINDOWS_`
+
+#if USTORE_OS_WINDOWS_
 #include <io.h> // `_isatty`, `_fileno`
 #else
 #include <unistd.h> // `isatty`
@@ -29,14 +36,23 @@
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::argsort`
 
-#include "ustore/db.h"       // `ustore_database_t`, `ustore_outcome_t`
-#include "ustore/ranges.hpp" // `u64_tape`, `tape_string`
-#include "ustore/types.hpp"  // `uuid_to_text`, `uuid_text_length_k`, `bytes_of`
+#include "ustore/blobs/nvme_key_slot.hpp"      // `key_slot`, `value_layout_t`
+#include "ustore/blobs/nvme_sorted_run.hpp"    // `sorted_run_header_t`, `sorted_run_layout`, `sorted_run_magic_k`
+#include "ustore/db.h"                         // `ustore_database_t`, `ustore_outcome_t`
+#include "ustore/ranges.hpp"                   // `u64_tape`, `tape_string`
+#include "ustore/types.hpp"                    // `uuid_to_text`, `uuid_text_length_k`, `bytes_of`
+#include "ustore/utilities/blocking_files.hpp" // `read_file`, `replace_file_durably`, `list_directory`, `join_path`
+#include "ustore/utilities/nvme_disks.hpp"     // `open_native_file`, `read_native_file`, `write_native_file`
+#include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `default_reserved_record`, `collections_record_t`
+#include "ustore/utilities/nvme_slots.hpp"     // `slot_owner_block_t`, `slot_bytes_k`, `slot_payload_offset_k`
+#include "ustore/utilities/nvme_volume.hpp"    // `parse_data_address`, `manifest_suffix_k`, `basic_slotted_volume`
 
 #include "arguments.hpp" // `parse_arguments`, `print_error`
 #include "dataset.h"     // `ustore_docs_import`, `ustore_docs_export`
 
 namespace unum::ustore::tools {
+
+using namespace unum::ustore::utilities;
 
 /** How a message reads, which decides its color on a terminal. */
 enum class tone_t : std::uint8_t {
@@ -45,7 +61,7 @@ enum class tone_t : std::uint8_t {
     listing_k,
 };
 
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
 /** Whether @p stream writes to a terminal. */
 inline bool is_terminal(std::FILE* stream) noexcept { return ::_isatty(::_fileno(stream)) != 0; }
@@ -78,11 +94,15 @@ constexpr std::string_view commands_k = R"(Commands:
   snapshot save <path>
   snapshot export <directory>
   snapshot import <directory>
+  manifest <manifest path or address> [--database <name>]
+  recover <data directories or addresses...> --database <name>
 
 Files ending in .arrows hold Arrow streams, .arrow or .feather Arrow files, and .ndjson or .csv documents. An Arrow
 import creates a missing collection, of the --modality given, the schema's ustore.modality, or what its columns spell,
 and '-' reads standard input or writes standard output. A snapshot export writes one <name>.arrow per collection into an
-empty directory, all at one snapshot, and a snapshot import recreates them on any engine.)";
+empty directory, all at one snapshot, and a snapshot import recreates them on any engine. The manifest and recover
+commands read an NVMe database's files without opening it: manifest prints <database>.ustore.json, or the copy a raw
+address's manifest slot points at, and recover writes a fresh manifest naming every run found, each on level 0.)";
 
 /** The names @c --format accepts, in the order of @c dataset_formats_k. */
 inline constexpr std::array<std::string_view, 5> format_names_k {"automatic", "ndjson", "csv", "arrows", "arrow"};
@@ -111,6 +131,8 @@ enum class command_t {
     snapshot_save_k,
     snapshot_export_k,
     snapshot_import_k,
+    manifest_print_k,
+    database_recover_k,
 };
 
 /** One invocation: the flags, which view into @c argv and so end in null terminators, and the command they serve. */
@@ -157,6 +179,17 @@ struct command_line_t {
 
     /** Most rows per Arrow batch of an export, zero for the default. */
     count_t batch_rows;
+
+    /** The NVMe database a manifest or a recovery names. */
+    std::string_view database;
+
+    /** The manifest path or the data directory addresses a manifest or a recovery reads. */
+    std::span<std::string_view const> addresses;
+
+    /** Whether the command reads files directly rather than through an open engine. */
+    [[nodiscard]] bool opens_no_engine() const noexcept {
+        return command == command_t::manifest_print_k || command == command_t::database_recover_k;
+    }
 
     /** The format the input or output resolves to, through its extension unless @c --format names one. */
     [[nodiscard]] ustore_dataset_format_t format_of(std::string_view path) const noexcept {
@@ -216,6 +249,19 @@ struct command_line_t {
         line.command = action == "save"     ? command_t::snapshot_save_k
                        : action == "export" ? command_t::snapshot_export_k
                                             : command_t::snapshot_import_k;
+        return nullptr;
+    }
+    if (object == "manifest") {
+        if (action.empty() || !argument.empty()) return "A manifest command takes one path or address";
+        line.addresses = positionals.subspan(1);
+        line.command = command_t::manifest_print_k;
+        return nullptr;
+    }
+    if (object == "recover") {
+        if (action.empty()) return "A recovery needs at least one data directory or address";
+        if (line.database.empty()) return "A recovery needs --database";
+        line.addresses = positionals.subspan(1);
+        line.command = command_t::database_recover_k;
         return nullptr;
     }
     return object.empty() ? "The command is missing" : "Unknown command";
@@ -588,6 +634,561 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     return true;
 }
 
+#pragma region Manifests
+
+/** Prints a red failure line with a status of the NVMe layer. */
+void print_failure(char const* what, status_t const& status) noexcept {
+    fmt::println(stderr, style_of(tone_t::failure_k, stderr), "{}: {}", what, status.message);
+}
+
+/** Copies @p text into @p into with a terminator, refusing a path the platform cannot hold. */
+status_t terminated(std::string_view text, std::span<char> into) noexcept {
+    if (text.size() >= into.size()) return {status_code_t::invalid_argument_k, "A path outgrew the platform's limit"};
+    std::memcpy(into.data(), text.data(), text.size());
+    into[text.size()] = '\0';
+    return {};
+}
+
+/** Reads exactly @p into's bytes of @p file from @p offset, refusing a medium that
+ *  ends before them. */
+status_t read_exactly(native_file_t file, std::uint64_t offset, std::span<byte_t> into) noexcept {
+    auto [moved, read_status] = read_native_file(file, offset, into);
+    if (read_status.failed()) return read_status;
+    if (moved != into.size()) return {status_code_t::io_k, "The medium ended before the bytes asked for"};
+    return {};
+}
+
+/** Writes all of @p from into @p file at @p offset, refusing a medium that took fewer bytes. */
+status_t write_exactly(native_file_t file, std::uint64_t offset, std::span<byte_t const> from) noexcept {
+    auto [moved, write_status] = write_native_file(file, offset, from);
+    if (write_status.failed()) return write_status;
+    if (moved != from.size()) return {status_code_t::capacity_exhausted_k, "The medium took fewer bytes than given"};
+    return {};
+}
+
+/** The owner block opening the slot at @p offset of @p file. */
+expected<slot_owner_block_t> read_owner_block(native_file_t file, std::uint64_t offset) noexcept {
+    slot_owner_block_t owner {};
+    if (status_t const read = read_exactly(file, offset, std::as_writable_bytes(std::span {&owner, 1})); read.failed())
+        return read;
+    return owner;
+}
+
+/** Bytes of each of a manifest slot's two JSON regions, as a slotted volume lays them out. */
+inline constexpr std::uint64_t manifest_region_bytes_k =
+    basic_slotted_volume<memory_disk<fu::standard_atomic_ref, fu::standard_yield_t>, fu::standard_yield_t,
+                         st::default_allocator<byte_t>>::manifest_region_bytes_k;
+
+/** Prints @p bytes to standard output, answering whether every byte went out. */
+[[nodiscard]] bool print_bytes(std::span<char const> bytes) noexcept {
+    return std::fwrite(bytes.data(), 1, bytes.size(), stdout) == bytes.size() && std::fflush(stdout) == 0;
+}
+
+/** Reads the manifest copy the manifest slot of the raw medium at @p address points at
+ *  into @p json. */
+status_t read_raw_manifest(data_address_t const& address, st::vector<char>& json) noexcept {
+    char path[path_max_bytes_k];
+    if (status_t const copied = terminated(address.location, path); copied.failed()) return copied;
+    auto [file, open_status] = open_native_file(path, medium_access_t::read_only_k, file_buffering_t::buffered_k);
+    if (open_status.failed()) return open_status;
+    status_t result;
+    auto [owner, owner_status] = read_owner_block(file, address.byte_base);
+    if (owner_status.failed()) result = owner_status;
+    else if (owner.magic != slot_owner_magic_k || owner.format_version != slot_format_version_k)
+        result = {status_code_t::not_found_k, "The address holds no database of this layout"};
+    else if (owner.manifest_bytes == 0) result = {status_code_t::not_found_k, "The database has published no manifest"};
+    else if (owner.manifest_bytes > manifest_region_bytes_k)
+        result = {status_code_t::malformed_k, "The manifest slot names a copy longer than its region"};
+    else if (json.resize(static_cast<std::size_t>(owner.manifest_bytes)) != st::status_t::success_k)
+        result = {status_code_t::out_of_memory_k, "No room to read the manifest"};
+    else result = read_exactly(file, owner.manifest_offset, std::as_writable_bytes(std::span<char> {json}));
+    close_native_file(file);
+    return result;
+}
+
+/** The path of @p database's manifest inside the directory @p location, into @p into. */
+status_t manifest_path(std::string_view location, std::string_view database, std::span<char> into) noexcept {
+    char directory[path_max_bytes_k], name[path_max_bytes_k];
+    if (status_t const copied = terminated(location, directory); copied.failed()) return copied;
+    if (database.size() + manifest_suffix_k.size() >= sizeof(name))
+        return {status_code_t::invalid_argument_k, "A database name outgrew the platform's limit"};
+    std::memcpy(name, database.data(), database.size());
+    std::memcpy(name + database.size(), manifest_suffix_k.data(), manifest_suffix_k.size());
+    name[database.size() + manifest_suffix_k.size()] = '\0';
+    return join_path(directory, name, into);
+}
+
+/** Prints the manifest @p line names: a @c .ustore.json path, a directory with @c --database, or
+ *  a raw address. */
+[[nodiscard]] bool print_manifest(command_line_t const& line) noexcept {
+    std::string_view const address = line.addresses.front();
+    st::vector<char> json;
+    char path[path_max_bytes_k];
+    status_t status;
+    if (address.ends_with(manifest_suffix_k)) {
+        status = terminated(address, path);
+        if (status.succeeded()) status = read_file(path, json);
+    }
+    else {
+        auto [parsed, parse_status] = parse_data_address(address);
+        status = parse_status;
+        if (status.failed()) {}
+        else if (parsed.kind == data_address_kind_t::spdk_k)
+            status = {status_code_t::unsupported_k, "SPDK namespaces are read through a mounted database"};
+        else if (parsed.kind == data_address_kind_t::raw_k) status = read_raw_manifest(parsed, json);
+        else if (line.database.empty()) status = {status_code_t::invalid_argument_k, "A directory needs --database"};
+        else {
+            status = manifest_path(parsed.location, line.database, path);
+            if (status.succeeded()) status = read_file(path, json);
+        }
+    }
+    if (status.failed()) {
+        print_failure("Failed to read the manifest", status);
+        return false;
+    }
+    return print_bytes(std::span<char const> {json});
+}
+
+#pragma endregion Manifests
+
+#pragma region Recovery
+
+/** Bytes the run @p header opens spans when its cells are @p key_slot_type_, refusing a header of
+ *  another key slot. */
+template <typename key_slot_type_>
+expected<std::uint64_t> run_bytes_as(blobs::sorted_run_header_t const& header) noexcept {
+    using layout_t = blobs::sorted_run_layout<key_slot_type_>;
+    if (header.key_slot_bytes != sizeof(key_slot_type_) || header.branching != layout_t::branching_k)
+        return status_t {status_code_t::malformed_k, "A run's cells match no key slot of this build"};
+    return layout_t::blob_bytes(header);
+}
+
+/** Bytes the run @p header opens spans, by the key slot its value layout names. */
+expected<std::uint64_t> run_bytes_of(blobs::sorted_run_header_t const& header) noexcept {
+    using blobs::key_slot;
+    using blobs::value_layout_t;
+    switch (header.value_layout) {
+    case value_layout_t::inline_12_bytes_k:
+        return run_bytes_as<key_slot<st::key128_t, value_layout_t::inline_12_bytes_k>>(header);
+    case value_layout_t::inline_44_bytes_k:
+        return run_bytes_as<key_slot<st::key128_t, value_layout_t::inline_44_bytes_k>>(header);
+    case value_layout_t::fixed_width_k:
+        return run_bytes_as<key_slot<st::key128_t, value_layout_t::fixed_width_k>>(header);
+    case value_layout_t::variable_width_k:
+        return run_bytes_as<key_slot<st::key128_t, value_layout_t::variable_width_k>>(header);
+    case value_layout_t::uuid_k: {
+        using layout_t =
+            blobs::strings_run_layout<key_slot<st::key128_t, value_layout_t::uuid_k, blobs::key_tails_t::carried_k>>;
+        if (header.key_slot_bytes != sizeof(typename layout_t::key_slot_t) ||
+            header.branching != layout_t::keys_per_row_k)
+            return status_t {status_code_t::malformed_k, "A run's cells match no key slot of this build"};
+        return layout_t::blob_bytes(header);
+    }
+    default: return status_t {status_code_t::malformed_k, "A run names no value layout of this build"};
+    }
+}
+
+/** One run a recovery found: where it lies, as the manifest will name it, and the header
+ *  it opens with. */
+struct found_run_t {
+    manifest_file_t file;
+    blobs::sorted_run_header_t header;
+};
+
+/** What a recovery gathers before it writes the manifest: the runs found and the manifest
+ *  they go into. */
+struct recovery_t {
+    manifest_t manifest;
+    st::vector<found_run_t> runs;
+};
+
+/** Adds the run @p header opens, at @p file's place, to @p recovery, on level 0. */
+status_t recover_run(recovery_t& recovery, blobs::sorted_run_header_t const& header, manifest_file_t file) noexcept {
+    file.level = 0;
+    if (header.newest_stamp > recovery.manifest.durable_stamp) recovery.manifest.durable_stamp = header.newest_stamp;
+    if (recovery.runs.push_back(found_run_t {std::move(file), header}) != st::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "No room to record a recovered run"};
+    return {};
+}
+
+/** Reads the header at @p offset of @p file, answering whether a run of this layout opens there. */
+expected<bool> read_run_header(native_file_t file, std::uint64_t offset, blobs::sorted_run_header_t& header) noexcept {
+    if (status_t const read = read_exactly(file, offset, std::as_writable_bytes(std::span {&header, 1})); read.failed())
+        return read;
+    return header.magic == blobs::sorted_run_magic_k && header.format_version == blobs::sorted_run_format_version_k;
+}
+
+/** Adds every run file of the database in the directory @p location, data directory @p medium,
+ *  to @p recovery. */
+status_t recover_directory(recovery_t& recovery, std::string_view location, std::uint16_t medium) noexcept {
+    char directory[path_max_bytes_k];
+    if (status_t const copied = terminated(location, directory); copied.failed()) return copied;
+    status_t first;
+    status_t const listed = list_directory(directory, [&](std::string_view name) noexcept {
+        uuid_t const run = recovery.manifest.run_of(name);
+        if (!run.is_valid() || first.failed()) return;
+        char file_name[path_max_bytes_k], path[path_max_bytes_k];
+        if (status_t const copied = terminated(name, file_name); copied.failed()) {
+            first = copied;
+            return;
+        }
+        if (status_t const joined = join_path(directory, file_name, path); joined.failed()) {
+            first = joined;
+            return;
+        }
+        auto [file, open_status] = open_native_file(path, medium_access_t::read_only_k, file_buffering_t::buffered_k);
+        if (open_status.failed()) {
+            first = open_status;
+            return;
+        }
+        blobs::sorted_run_header_t header {};
+        auto [opens, read_status] = read_run_header(file, 0, header);
+        std::uint64_t const bytes = native_file_capacity(file);
+        close_native_file(file);
+        if (read_status.failed()) first = read_status;
+        else if (!opens || header.content_id != run)
+            fmt::println(stderr, style_of(tone_t::failure_k, stderr), "Skipping {}, which holds no run of its name",
+                         name);
+        else {
+            manifest_file_t found;
+            found.run = run;
+            found.bytes = bytes;
+            found.medium = medium;
+            first = recover_run(recovery, header, found);
+        }
+    });
+    return listed.failed() ? listed : first;
+}
+
+/** Adds every run in the slots the database holds on the raw medium at @p address to @p recovery,
+ *  reading the database's ID from data directory 0's manifest slot when @p medium is zero. */
+status_t recover_raw(recovery_t& recovery, data_address_t const& address, std::uint16_t medium) noexcept {
+    char path[path_max_bytes_k];
+    if (status_t const copied = terminated(address.location, path); copied.failed()) return copied;
+    auto [file, open_status] = open_native_file(path, medium_access_t::read_only_k, file_buffering_t::buffered_k);
+    if (open_status.failed()) return open_status;
+    std::uint64_t const capacity = native_file_capacity(file);
+    std::uint64_t usable = capacity > address.byte_base ? capacity - address.byte_base : 0;
+    if (address.byte_limit != 0 && address.byte_limit < usable) usable = address.byte_limit;
+    status_t result;
+    for (std::uint64_t slot = 0; result.succeeded() && slot != usable / slot_bytes_k; ++slot) {
+        std::uint64_t const base = address.byte_base + slot * slot_bytes_k;
+        auto [owner, owner_status] = read_owner_block(file, base);
+        if (owner_status.failed()) {
+            result = owner_status;
+            break;
+        }
+        bool const held = owner.magic == slot_owner_magic_k && owner.format_version == slot_format_version_k;
+        if (medium == 0 && slot == 0) {
+            if (!held) result = {status_code_t::not_found_k, "The first address holds no database of this layout"};
+            // The copy a slot points at repeats the slot's generation, which the publication steps.
+            else recovery.manifest.id = owner.database, recovery.manifest.generation = owner.manifest_generation + 1;
+            continue;
+        }
+        if (!held || owner.database != recovery.manifest.id) continue;
+        if (owner.medium != medium) {
+            result = {status_code_t::malformed_k, "The data directories are listed in another order"};
+            break;
+        }
+        // Short runs share a packed slot back to back, each starting where the one before
+        // it ends, aligned
+        std::uint64_t offset = base + slot_payload_offset_k;
+        while (result.succeeded() && offset + sizeof(blobs::sorted_run_header_t) <= base + slot_bytes_k) {
+            blobs::sorted_run_header_t header {};
+            auto [opens, read_status] = read_run_header(file, offset, header);
+            if (read_status.failed()) result = read_status;
+            if (!opens || read_status.failed()) break;
+            auto [bytes, bytes_status] = run_bytes_of(header);
+            if (bytes_status.failed()) {
+                result = bytes_status;
+                break;
+            }
+            manifest_file_t found;
+            found.offset = offset;
+            found.bytes = bytes;
+            found.medium = medium;
+            result = recover_run(recovery, header, found);
+            offset += round_up_to_multiple(bytes, portable_alignment_k);
+        }
+    }
+    close_native_file(file);
+    return result;
+}
+
+/** The transport recover reads runs back through, positioned reads on the calling thread. */
+using recovery_disk_t = blocking_files_disk<fu::standard_atomic_ref, fu::standard_yield_t>;
+
+/** What a run opened offline reads through: the disk the run's file or device is registered on. */
+struct recovery_volume_t {
+    recovery_disk_t* disk_ = nullptr;
+    [[nodiscard]] recovery_disk_t& disk() const noexcept { return *disk_; }
+};
+
+/** A run of the collections system collection, whose values are variable-width records. */
+using collections_run_t = blobs::lsm_sorted_run<blobs::key_slot<st::key128_t, blobs::value_layout_t::variable_width_k>,
+                                                recovery_volume_t, fu::standard_yield_t>;
+
+/** The newest version of one collection's record across every run of the
+ *  collections system collection. */
+struct collections_version_t {
+    st::key128_t key;
+    std::uint64_t stamp = 0;
+    delta_kind_t kind = delta_kind_t::write_k;
+    st::vector<char> value;
+};
+
+/** Reads every key slot of the run at @p extent into @p newest, keeping the version of the newest
+ *  stamp per key. */
+status_t read_collections_run(recovery_volume_t& volume, io_channel_t& channel, medium_extent_t const& extent,
+                              st::vector<collections_version_t>& newest) noexcept {
+    auto [run, open_status] = collections_run_t::open(volume, channel, extent);
+    if (open_status.failed()) return open_status;
+    st::vector<byte_t> value;
+    for (std::uint64_t position = 0; position != run.population_count(); ++position) {
+        st::key128_t const key = run.key_slot(position).stored_key;
+        std::uint64_t const stamp = run.stamp(position);
+        std::size_t index = 0;
+        while (index != newest.size() && !(newest[index].key == key)) ++index;
+        if (index != newest.size() && newest[index].stamp >= stamp) continue;
+        std::uint32_t const bytes = run.value_window(position).bytes;
+        if (value.resize(bytes) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to read a collection's record"};
+        if (status_t const read = run.read_value(channel, position, std::span<byte_t> {value}); read.failed())
+            return read;
+        if (index == newest.size() && newest.push_back(collections_version_t {}) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to keep a collection's record"};
+        collections_version_t& version = newest[index];
+        version.key = key, version.stamp = stamp, version.kind = run.kind(position);
+        if (version.value.resize(bytes) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to keep a collection's record"};
+        std::memcpy(version.value.data(), value.data(), bytes);
+    }
+    return {};
+}
+
+/** Reads the newest record of every collection from the runs of the collections system collection
+ *  @p recovery found, registering each run's file, or the raw medium holding it, on one blocking
+ *  disk in turn. */
+status_t read_collections_records(recovery_t const& recovery, std::span<data_address_t const> addresses,
+                                  st::vector<collections_version_t>& newest) noexcept {
+    resource_constraint<fu::standard_atomic_ref> budget {unlimited_resource_k};
+    auto [device, device_status] = blocking_files_device_t::make(file_buffering_t::buffered_k);
+    if (device_status.failed()) return device_status;
+    disk_config_t config;
+    expected<recovery_disk_t> made = recovery_disk_t::make(std::move(device), config, budget);
+    if (!made) return made.status();
+    recovery_disk_t& disk = *made;
+    io_channel_config_t const channels_config;
+    memory_arena_config_t arena_config;
+    arena_config.bytes = channels_config.arena_bytes();
+    auto [arena, arena_status] = registered_memory_arena<fu::standard_atomic_ref>::make(disk, budget, arena_config);
+    if (arena_status.failed()) return arena_status;
+    auto [channels, channels_status] = basic_io_channel_pool<recovery_disk_t, fu::standard_atomic_ref>::make(
+        disk, arena.registration(), 0, 1, channels_config);
+    status_t result = channels_status;
+    recovery_volume_t volume {&disk};
+    for (std::size_t index = 0; result.succeeded() && index != recovery.runs.size(); ++index) {
+        found_run_t const& found = recovery.runs[index];
+        if (found.header.collection != collections_collection_uuid_k) continue;
+        char path[path_max_bytes_k];
+        data_address_t const& address = addresses[found.file.medium];
+        if (recovery.manifest.placement == manifest_placement_t::paths_k) {
+            char directory[path_max_bytes_k], name[path_max_bytes_k];
+            result = terminated(address.location, directory);
+            if (result.succeeded()) result = recovery.manifest.file_name(found.file.run, name);
+            if (result.succeeded()) result = join_path(directory, name, path);
+        }
+        else result = terminated(address.location, path);
+        if (result.failed()) break;
+        medium_options_t request;
+        request.name = path;
+        request.access = medium_access_t::read_only_k;
+        auto [medium, register_status] = disk.register_medium(request);
+        if ((result = register_status).failed()) break;
+        auto [guard, acquire_status] = channels.acquire();
+        result = acquire_status;
+        if (result.succeeded()) {
+            medium_extent_t extent;
+            extent.medium = medium.reference();
+            extent.extent = extent_t {found.file.offset, round_up_to_multiple(found.file.bytes, portable_alignment_k)};
+            result = read_collections_run(volume, guard.channel(), extent, newest);
+        }
+        guard = {};
+        if (status_t const closed = disk.unregister_medium(medium); closed.failed() && result.succeeded())
+            result = closed;
+    }
+    [[maybe_unused]] status_t const released = channels.release_all();
+    [[maybe_unused]] status_t const unpinned = arena.unregister(disk);
+    return result;
+}
+
+/** The record of the reserved collection a run of @p header belongs to, as the engine's
+ *  open creates it. */
+[[nodiscard]] manifest_collection_t reserved_record(blobs::sorted_run_header_t const& header) noexcept {
+    manifest_collection_t record = default_reserved_record(header.collection, header.value_max_size);
+    ustore_modality_t const modality = header.collection == names_collection_uuid_k ? ustore_modality_strings_k
+                                                                                    : ustore_modality_blobs_k;
+    // A store tag keeps the modality in its high byte and the value layout in its low one, as the
+    // engine persists it.
+    record.store = static_cast<std::uint16_t>(static_cast<unsigned>(modality) << 8 |
+                                              static_cast<unsigned>(header.value_layout));
+    return record;
+}
+
+/**
+ *  @brief Rebuilds every collection the newest records of the collections system collection list,
+ *      and points every run @p recovery found at its collection.
+ *
+ *  The two system collections take the records the engine opens them with, when runs of theirs were
+ *  found. A run of a collection the records list as dropped, which a crash left behind, or never
+ *  list at all is left out with a note.
+ */
+status_t assign_collections(recovery_t& recovery, std::span<data_address_t const> addresses) noexcept {
+    st::vector<collections_version_t> newest;
+    if (status_t const read = read_collections_records(recovery, addresses, newest); read.failed()) return read;
+    manifest_t& manifest = recovery.manifest;
+    for (found_run_t const& found : recovery.runs) {
+        uuid_t const& id = found.header.collection;
+        if (id != collections_collection_uuid_k && id != names_collection_uuid_k) continue;
+        std::size_t index = 0;
+        while (index != manifest.collections.size() && manifest.collections[index].id != id) ++index;
+        if (index != manifest.collections.size()) continue;
+        if (manifest.collections.push_back(reserved_record(found.header)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to record a recovered collection"};
+    }
+    for (collections_version_t const& version : newest) {
+        if (version.kind != delta_kind_t::write_k) continue;
+        if (version.value.size() < sizeof(collections_record_t))
+            return {status_code_t::malformed_k, "A collection's record is shorter than its fields"};
+        collections_record_t fields;
+        std::memcpy(&fields, version.value.data(), sizeof(fields));
+        manifest_collection_t record;
+        version.key.to_bytes(std::as_writable_bytes(std::span<std::uint8_t, uuid_t::size_bytes_k> {record.id.bytes}));
+        // The engine names a collection in the manifest by its printed UUID, its own name living in
+        // the record alone
+        char printed[uuid_t::printed_length_k];
+        record.id.print(printed);
+        if (sz::failed(record.name.assign(string_view_t {printed, sizeof(printed)})))
+            return {status_code_t::out_of_memory_k, "No room to name a recovered collection"};
+        record.store = fields.store_tag;
+        record.value_size = fields.value_size;
+        record.value_max_size = fields.value_max_size;
+        record.level_enlarge_factor = fields.level_enlarge_factor;
+        record.cache_limit = fields.cache_limit;
+        record.memory_runs_max_bytes = fields.memory_runs_max_bytes;
+        record.memory_runs_max_deltas = fields.memory_runs_max_deltas;
+        if (manifest.collections.push_back(std::move(record)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to record a recovered collection"};
+    }
+    if (manifest.files.reserve(recovery.runs.size()) != st::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "No room to record the recovered runs"};
+    for (found_run_t const& found : recovery.runs) {
+        std::size_t index = 0;
+        while (index != manifest.collections.size() && manifest.collections[index].id != found.header.collection)
+            ++index;
+        if (index == manifest.collections.size()) {
+            char printed[uuid_t::printed_length_k];
+            found.file.run.print(printed);
+            fmt::println(stderr, style_of(tone_t::failure_k, stderr),
+                         "Leaving out run {}, whose collection the records list as dropped or never named",
+                         std::string_view {printed, sizeof(printed)});
+            continue;
+        }
+        manifest_file_t file = found.file;
+        file.collection = static_cast<std::uint32_t>(index);
+        [[maybe_unused]] st::status_t const placed = manifest.files.push_back(st::assume_reserved, std::move(file));
+    }
+    return {};
+}
+
+/** Writes @p json into the idle region of the manifest slot at @p address and points the slot's
+ *  owner block at it, flushing after each step, as a slotted volume publishes. */
+status_t publish_raw_manifest(data_address_t const& address, std::span<char const> json) noexcept {
+    if (json.size() > manifest_region_bytes_k)
+        return {status_code_t::capacity_exhausted_k, "The manifest outgrew its region of the manifest slot"};
+    char path[path_max_bytes_k];
+    if (status_t const copied = terminated(address.location, path); copied.failed()) return copied;
+    auto [file, open_status] = open_native_file(path, medium_access_t::read_write_k, file_buffering_t::buffered_k);
+    if (open_status.failed()) return open_status;
+    status_t result;
+    auto [owner, owner_status] = read_owner_block(file, address.byte_base);
+    std::uint64_t const regions = address.byte_base + slot_payload_offset_k;
+    std::uint64_t const idle = owner.manifest_offset == regions ? regions + manifest_region_bytes_k : regions;
+    if (owner_status.failed()) result = owner_status;
+    else result = write_exactly(file, idle, std::as_bytes(json));
+    // The copy ends at its first zero byte too, so a zero follows it whenever the region has room.
+    byte_t const terminator[1] {};
+    if (result.succeeded() && json.size() < manifest_region_bytes_k)
+        result = write_exactly(file, idle + json.size(), terminator);
+    if (result.succeeded()) result = flush_native_file(file);
+    if (result.succeeded()) {
+        owner.manifest_generation += 1;
+        owner.manifest_offset = idle;
+        owner.manifest_bytes = json.size();
+        result = write_exactly(file, address.byte_base, std::as_bytes(std::span {&owner, 1}));
+    }
+    if (result.succeeded()) result = flush_native_file(file);
+    close_native_file(file);
+    return result;
+}
+
+/** Rebuilds the manifest of the database @p line names from its runs, every one on level 0,
+ *  and publishes it. */
+[[nodiscard]] bool recover_database(command_line_t const& line) noexcept {
+    recovery_t recovery;
+    manifest_t& manifest = recovery.manifest;
+    st::vector<data_address_t> addresses;
+    status_t status;
+    if (line.addresses.size() > std::numeric_limits<std::uint16_t>::max())
+        status = {status_code_t::invalid_argument_k, "A database spans at most 65,535 data directories"};
+    else if (sz::failed(manifest.database.assign(string_view_t {line.database})) ||
+             addresses.reserve(line.addresses.size()) != st::status_t::success_k)
+        status = {status_code_t::out_of_memory_k, "No room for the data directories"};
+    for (std::size_t index = 0; status.succeeded() && index != line.addresses.size(); ++index) {
+        auto [parsed, parse_status] = parse_data_address(line.addresses[index]);
+        if (parse_status.failed()) status = parse_status;
+        else if (parsed.kind == data_address_kind_t::spdk_k)
+            status = {status_code_t::unsupported_k, "SPDK namespaces are recovered through a mounted database"};
+        else if (index != 0 && parsed.kind != addresses[0].kind)
+            status = {status_code_t::invalid_argument_k, "The data directories are of one kind"};
+        else [[maybe_unused]]
+            st::status_t const placed = addresses.push_back(st::assume_reserved, data_address_t {parsed});
+    }
+    bool const raw = status.succeeded() && addresses[0].kind == data_address_kind_t::raw_k;
+    manifest.placement = raw ? manifest_placement_t::offsets_k : manifest_placement_t::paths_k;
+    char path[path_max_bytes_k];
+    if (status.succeeded() && !raw) {
+        status = manifest_path(addresses[0].location, line.database, path);
+        st::vector<char> existing;
+        status_t const found = status.succeeded() ? read_file(path, existing) : status;
+        if (status.succeeded() && found != status_code_t::not_found_k)
+            status = found.failed() ? found
+                                    : status_t {status_code_t::already_exists_k,
+                                                "The database has a manifest; move it away to recover"};
+        manifest.id = uuid_generator();
+    }
+    for (std::size_t index = 0; status.succeeded() && index != addresses.size(); ++index)
+        status = raw ? recover_raw(recovery, addresses[index], static_cast<std::uint16_t>(index))
+                     : recover_directory(recovery, addresses[index].location, static_cast<std::uint16_t>(index));
+    if (status.succeeded()) status = assign_collections(recovery, std::span<data_address_t const> {addresses});
+
+    st::vector<char> json;
+    if (status.succeeded()) status = manifest.print(st::default_allocator<byte_t> {}, json);
+    if (status.succeeded())
+        status = raw ? publish_raw_manifest(addresses[0], std::span<char const> {json})
+                     : replace_file_durably(path, std::span<char const> {json});
+    if (status.failed()) {
+        print_failure("Failed to recover the database", status);
+        return false;
+    }
+    fmt::println(stderr, style_of(tone_t::success_k, stderr),
+                 "Recovered {} runs of {} collections, every run on level 0", manifest.files.size(),
+                 manifest.collections.size());
+    return true;
+}
+
+#pragma endregion Recovery
+
 /** Runs the command of @p line and answers whether it succeeded. */
 [[nodiscard]] bool execute(ustore_database_t database, command_line_t const& line) noexcept {
     switch (line.command) {
@@ -602,6 +1203,8 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     case command_t::snapshot_save_k: return save_snapshot(database, line.snapshot_path);
     case command_t::snapshot_export_k: return export_snapshot(database, line.snapshot_path);
     case command_t::snapshot_import_k: return import_snapshot(database, line.snapshot_path);
+    case command_t::manifest_print_k: return print_manifest(line);
+    case command_t::database_recover_k: return recover_database(line);
     }
     return false;
 }
@@ -615,7 +1218,7 @@ int main(int argc, char* argv[]) {
     using namespace unum::ustore::tools;
 
     command_line_t line;
-    std::array<flag_t, 14> const flags {{
+    std::array<flag_t, 15> const flags {{
         {"--directory", "path", "database directory, required", &line.directory},
         {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &line.engine.name},
         {"--isolation", "name", "isolation of the transactions of ram", &line.engine.isolation},
@@ -630,9 +1233,12 @@ int main(int argc, char* argv[]) {
         {"--ingest", "order", "ingest as one commit: sorted or unsorted keys", &line.ingest},
         {"--alignment", "bytes", "Arrow buffer alignment of an export", &line.alignment},
         {"--batch-rows", "count", "most rows per Arrow batch of an export", &line.batch_rows},
+        {"--database", "name", "NVMe database a manifest or a recovery names", &line.database},
     }};
-    std::array<std::string_view, 3> positionals {};
-    arguments_t const parsed = parse_arguments(argc, argv, flags, positionals);
+    // A recovery takes every data directory as a positional, so there is room for every argument
+    st::vector<std::string_view> positionals;
+    if (positionals.resize(static_cast<std::size_t>(argc)) != st::status_t::success_k) return 1;
+    arguments_t const parsed = parse_arguments(argc, argv, flags, std::span<std::string_view> {positionals});
 
     char synopsis[4096 + commands_k.size()];
     auto const written = fmt::format_to_n(synopsis, sizeof(synopsis) - 1,
@@ -647,18 +1253,18 @@ int main(int argc, char* argv[]) {
         print_error(parsed);
         return 1;
     }
-    char const* const problem = line.directory.empty()
-                                    ? "The --directory flag is required"
-                                    : parse_command({positionals.data(), parsed.positionals_count}, line);
+    char const* problem = parse_command({positionals.data(), parsed.positionals_count}, line);
+    if (!problem && line.directory.empty() && !line.opens_no_engine()) problem = "The --directory flag is required";
     if (problem) {
         fmt::println(stderr, "{}\n", problem);
         print_usage(synopsis, flags);
         return 1;
     }
+    if (line.opens_no_engine()) return execute(nullptr, line) ? 0 : 1;
 
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
-    line.engine.directory = line.directory.data();
+    line.engine.locate(line.directory.data());
     open_engine(line.engine, &database, &outcome);
     if (failed(outcome)) {
         print_failure("Failed to open the database", outcome);

@@ -1,7 +1,7 @@
 # UStoreNVMe
 
 UStoreNVMe is UStore's NVMe-focused LSM engine, with `io_uring`, Linux AIO, SPDK and blocking transports, GPU compaction and GPUDirect Storage, and SIMD row kits.
-Every collection is a log-structured merge tree of immutable sorted runs, each opening with a memory-mapped B-tree of its keys.
+Every collection is a log-structured merge tree of immutable sorted runs, each carrying a saved S+ tree of its keys that every lookup descends in place.
 Keys are fixed-width stored keys, `ustore_key_t` at the C ABI, and values are opaque bytes whose width a collection fixes at compile time.
 The C ABI in `variants.hpp` backs each UStore database with one `database` and each collection with one `nvme_store` under the same UUID.
 Every call is a template on the CPU class, whose atomic reference and waiter instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class its ceiling fits, ending on the serial floor, and every handle it hands out carries that class's table.
@@ -30,8 +30,9 @@ The types are templates of `include/ustore/`, which `variants.hpp` instantiates 
 - `utilities/nvme_disks.hpp` — the disk base, the memory disk and the blocking floor.
 - `utilities/nvme_linux_uring_disk.hpp`, `nvme_linux_aio_disk.hpp`, `nvme_linux_spdk_disk.hpp` — the Linux transports.
 - `utilities/nvme_channels.hpp` — the buffer pool, the I/O channels and the pipelines.
-- `utilities/nvme_catalog.hpp` — the checksum, blob names and kinds, layouts and index of a volume's catalog.
-- `utilities/nvme_volume.hpp` — the extent allocator, volumes and the router.
+- `utilities/nvme_slots.hpp` — the 1 GB slots of a raw medium, the owner block opening each held slot, and the slot record.
+- `utilities/nvme_manifest.hpp` — the `<database>.ustore.json` manifest, printed and parsed with yyjson.
+- `utilities/nvme_volume.hpp` — data directory addresses, the slot allocator, and the directory and slotted volumes.
 - `utilities/nvme_mounts.hpp` — the transport probe, the erased files disk, the mount and the shared resources.
 - `blobs/nvme_key_slot.hpp` — identifiers, value layouts, stored keys and values, key slots and the sorted run index.
 - `blobs/nvme_sorted_run.hpp` — `lsm_sorted_run`.
@@ -42,7 +43,7 @@ The types are templates of `include/ustore/`, which `variants.hpp` instantiates 
 - `blobs/nvme_database.hpp` and `nvme_single_collection_database.hpp` — both databases, their snapshots and transactions over the shared registry and core.
 - `graph/adjacency_fold.hpp`, `vram_nvidia_adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below, and the host face of its device fold.
 
-The sorted run index is a B-tree of the run's key slots, and the merger hands the compactor each run's index.
+A run keeps its key slots in sorted order beside a saved S+ tree of their keys, and the merger hands the compactor each run's cells.
 
 Levels differ by depth:
 
@@ -84,13 +85,13 @@ A reader the memory budget cannot keep history for is refused at its next read w
 
 ### Crash atomicity
 
-The schema lives in two copies saved in turn, each with a generation and the durable stamp D: every commit at or below D is wholly in the runs that copy names.
+The manifest carries a generation and the durable stamp D: every commit at or below D is wholly in the runs it names.
 D is the least stamp below the oldest commit any collection holds in memory runs alone, or the published stamp while no collection holds one.
-A mount reads the newer copy, resumes the stamps at D and merges down every level holding a version above D, dropping those versions, so a crash loses a suffix of commits and never half of one.
+A mount reads the manifest in force, resumes the stamps at D and merges down every level holding a version above D, dropping those versions, so a crash loses a suffix of commits and never half of one.
 A graph truncates both of its databases at the lesser of their two promises.
 
 Backup, move and sorted-run export are not implemented.
-They belong on the blob surface of `nvme_volume.hpp` rather than on the disk router they were written against, so the files that carried them were removed instead of adapted.
+They belong on the run files and the manifest of `nvme_volume.hpp`.
 
 ## Transactions
 
@@ -171,18 +172,19 @@ The ring is exposed rather than hidden behind a blocking read because a blocking
 - __`automatic_k`__ — io_uring where the kernel allows it, Linux AIO where it refuses a ring, the blocking floor where it offers neither.
   What the mount settled on is reported back rather than inferred.
 
-Above the transport, `nvme_volume.hpp` resolves a name to an extent.
-A volume without a filesystem under it keeps its catalog in two slots of the volume itself: an image is written whole into the older slot, flushed, and from that instant it is the newer one, while a torn image fails the checksum its header carries and a mount reads the other slot.
-The extent allocator rebuilds the free map from the catalog at mount, which is what makes an extent missing from the catalog free after a crash.
-The volume router places a blob on the volume with the most free space that still fits.
+Above the transport, `nvme_volume.hpp` places runs across every data directory of a database, each on the medium with the most free bytes, and commits the manifest that names them.
+A database is the manifest `<database>.ustore.json` plus one self-describing sorted run per `.ustore` file, which a mount takes back level by level; a run the manifest in force does not name is a crash leftover, freed at mount.
+Every publication costs two flushes, however many runs it writes and consumes: the new runs and the manifest copy are flushed first, and the commit second.
 
-On a raw block device or an SPDK namespace, UStore shares one layout with USearch, so either project's tools can map a drive and tell owners from free space:
+- __Directories.__ `basic_directory_volume` keeps each run as `<database>-<run id>.ustore`, its own registered medium, and commits by writing `<database>.ustore.json.tmp`, `fdatasync`, `renameat` over the manifest and an `fsync` of the directory. Consumed runs are unlinked once the manifest that stopped naming them is durable. The manifest's directory is data directory 0, and the manifest lists files by `path` and `medium`.
+- __Raw media.__ `basic_slotted_volume` cuts block devices and SPDK namespaces into 1 GiB slots from a base address, as in `/dev/nvme0n1@64GiB`, and the manifest lists runs by `medium` and `offset`. Runs under 512 MiB are packed into a shared slot, and longer ones take a slot of their own.
 
-- __Slots.__ The device is cut into 1 GiB slots, 2³⁰ bytes counted from byte 0. A volume starts on a slot boundary and its `capacity_bytes` covers whole slots. A database's volumes may occupy separate slot ranges, as the router already spreads one database over several volumes.
-- __No label.__ Slot 0 holds whatever file starts there, and the drive carries no table of contents.
-- __Self-describing starts.__ The first block of a volume's first slot is its `volume_header_t`: the `USTOREV1` magic, `capacity_bytes`, the owning database's UUID and a CRC-32C over the header.
-- __Live or free.__ A mapper reads the first 4 KiB of each slot in order. A slot is live only when a known magic and its check both verify, and then the mapper skips the slots the length covers; any other slot is free. USearch recognizes this header as it is laid out in `nvme_catalog.hpp` today, so a change to it is a change to the shared convention.
-- __Deletion.__ Destroying a volume zeroes the first block of its first slot, with `BLKZEROOUT` or an SPDK write-zeroes, so stale bytes never read as a live volume.
+On raw media every slot a database holds opens with a `slot_owner_block_t` in its first logical block:
+
+- __Owner block.__ The `USTORESL` magic, the format version, the slot's data directory, and the database's UUID, minted at its first open. A block of all zeros is a free slot, and anything else is foreign and skipped without being identified, so two databases and other tools share one medium.
+- __Manifest slot.__ The slot at data directory 0's base keeps two JSON regions, and its owner block also names the generation, offset and length of the copy in force. A commit writes the idle region, flushes every medium, then rewrites that one block and flushes again, so a crash before the second flush leaves the old generation in force.
+- __Mount.__ One logical block is read per slot. Slots this database holds that the manifest does not name are zeroed and freed, zero blocks are freed lowest first, and a slot naming another data directory index refuses the mount as reordered media.
+- __Release.__ A slot left empty has its owner block zeroed and its payload deallocated at the next publication, with a punched hole, `BLKDISCARD` or Dataset Management.
 
 Every I/O buffer comes from one registered arena, because a range can be pinned only once — io_uring answers `EBUSY` on re-registration and a growing arena cannot be pinned at all.
 In `nvme_channels.hpp`, the buffer pool carves that arena into fixed blocks, each I/O channel gives a queue pair its own pools and polling room, and a pipeline holds the ring at its depth by refilling as completions retire rather than submitting a batch and waiting for all of it.

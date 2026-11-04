@@ -5,11 +5,12 @@
  *  @brief The vocabulary of UStoreNVMe's LSM trees: identifiers and value layouts, the keys key slots are ordered
  *      by, stored values and their locations, key slots, and the sorted run index laid over them.
  *
- *  A key slot is a stored key, with an inline value beside it for the layouts holding values inline, and the kind of
- *  its delta sits in its run's kinds column beside the stamps. A value held apart is found by the key slot's sorted
- *  position: by stride for fixed-width values, and through the run's value offsets column for variable-width ones.
- *  Keys carry their bounds through @c limit, and the 16-byte key is ordered like @c memcmp. The sorted run index is
- *  the B-tree whose cells hold a sorted run's key slots, which both compactors lay out the same way.
+ *  A key slot is a stored key, with an inline value beside it for the layouts holding values
+ *  inline, and the kind of its delta sits in its run's kinds column beside the stamps. A value held
+ *  apart is found by the key slot's sorted position: by stride for fixed-width values, and through
+ *  the run's value offsets column for variable-width ones. Keys carry their bounds through
+ *  @c limit, and the 16-byte key is ordered like @c memcmp. A sorted run keeps its key slots in
+ *  sorted order, which both compactors lay out the same way.
  */
 
 #pragma once
@@ -30,6 +31,7 @@
 
 #include "ustore/utilities/folds.hpp"       // `delta_kind_t`
 #include "ustore/utilities/nvme_ring.hpp"   // `disk_id_t`, `file_id_t`
+#include "ustore/utilities/nvme_slots.hpp"  // `slot_bytes_k`, `sorted_run_bytes_max_k`
 #include "ustore/utilities/ram_buffers.hpp" // `heap_allocator`, `buffer_alignment_k`
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_t`, `bytes_span_t`, `bytes_view_t`, `to_status`
 
@@ -55,9 +57,6 @@ using utilities::u64_t;
 using utilities::uuid_t;
 
 #pragma region Identifiers and Layouts
-
-/** Branching factor of the on-disk B-trees. */
-inline constexpr std::size_t btree_branching_k = 16;
 
 #pragma region Identifiers
 
@@ -798,7 +797,9 @@ struct storage_limits_t {
     static constexpr std::size_t variable_value_max_size_k = 4 * 1024 * 1024;
     static constexpr std::size_t cache_limit_max_size_k = 100 * 1024 * 1024 * 1024ull;
     static constexpr std::size_t memory_runs_min_bytes_k = 1024;
-    static constexpr std::size_t memory_runs_max_bytes_k = 1024 * 1024 * 1024ull;
+
+    /** A flush drains up to twice the memory-run bound, which one run must still hold. */
+    static constexpr std::size_t memory_runs_max_bytes_k = utilities::slot_bytes_k / 4;
     static constexpr std::size_t memory_runs_min_deltas_k = 16;
     static constexpr std::size_t memory_runs_max_deltas_k = 1024 * 1024;
     static constexpr std::size_t transaction_min_bytes_k = 1;
@@ -807,7 +808,7 @@ struct storage_limits_t {
     static constexpr std::size_t transaction_max_deltas_k = memory_runs_max_deltas_k;
     static constexpr std::size_t level_min_enlarge_factor_k = 2;
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
-    static constexpr std::size_t sorted_run_file_max_size_k = 4 * 1024 * 1024 * 1024ull - 4096;
+    static constexpr std::size_t sorted_run_file_max_size_k = utilities::sorted_run_bytes_max_k;
     static constexpr std::size_t cuda_compaction_threshold_k = 900'000;
     static constexpr std::size_t value_max_size_k = std::max(fixed_value_max_size_k, variable_value_max_size_k);
     static constexpr std::size_t user_data_max_size_k = 4 * 1024 * 1024;
@@ -889,145 +890,12 @@ static_assert(sizeof(key_slot<st::key128_t, value_layout_t::inline_44_bytes_k>) 
 static_assert(sizeof(key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>) == 32,
               "A strings cell is a 16-byte head and its 16-byte value");
 static_assert(sizeof(key_slot<st::key128_t, value_layout_t::fixed_width_k>) == 16,
-              "A fixed-width cell is its 16-byte key alone, so a row of 16 cells is 256 bytes");
+              "A fixed-width cell is its 16-byte key alone");
 static_assert(sizeof(key_slot<st::key128_t, value_layout_t::variable_width_k>) == 16,
-              "A variable-width cell is its 16-byte key alone, so a row of 16 cells is 256 bytes");
+              "A variable-width cell is its 16-byte key alone");
 static_assert(sizeof(key_slot<st::key128_t, value_layout_t::variable_width_k, key_tails_t::carried_k>) == 16,
               "A tailed variable-width cell is its 16-byte head alone");
 
 #pragma endregion Key Slot
-
-#pragma region Sorted Run Index
-
-/** Levels a sorted run index layout describes, far beyond any sorted run index a sorted run file holds. */
-inline constexpr std::uint64_t sorted_run_index_levels_capacity_k = 32;
-
-/**
- *  @brief Maps between a sorted run index's cells and the sorted order of the key slots they hold.
- *
- *  Cells form rows of @c branching stored breadth-first, row @c p parenting rows
- *  @c p*(branching+1)+1 through @c p*(branching+1)+branching+1, and an in-order walk visits the
- *  cells in ascending order. Only sorted positions below @c key_slots_count hold key slots; the
- *  positions past them up to @c cells_count are padding.
- */
-struct sorted_run_index_layout_t {
-
-    /** Key slots in the sorted run index. */
-    std::uint64_t key_slots_count = 0;
-
-    /** Cells in one row. */
-    std::uint64_t branching = 0;
-
-    /** Rows of cells, enough for every key slot. */
-    std::uint64_t rows_count = 0;
-
-    /** Levels of rows, the root counting as one, and zero for a layout of no key slots. */
-    std::uint64_t height = 0;
-
-    /** Cells in the deepest level. */
-    std::uint64_t leaf_cells_count = 0;
-
-    /** Rows in the deepest level. */
-    std::uint64_t leaf_rows_count = 0;
-
-    /** At zero the key slots count, and at @c index above zero the cells of the top @c height minus @c index levels. */
-    std::uint64_t cells_above[sorted_run_index_levels_capacity_k] = {};
-
-    /** At @c index above zero the cells of level @c index minus one in a complete sorted run index, the root being
-     *  level zero. */
-    std::uint64_t level_cells[sorted_run_index_levels_capacity_k] = {};
-
-    /** Sorted positions between neighbouring cells of a level in a complete sorted run index. */
-    std::uint64_t level_stride[sorted_run_index_levels_capacity_k] = {};
-
-    constexpr sorted_run_index_layout_t() noexcept = default;
-
-    /** Lays out @p key_slots key slots in rows of @p cells_per_row, which must be two or more. */
-    constexpr sorted_run_index_layout_t(std::uint64_t key_slots, std::uint64_t cells_per_row) noexcept
-        : key_slots_count(key_slots), branching(cells_per_row), rows_count(divide_round_up(key_slots, cells_per_row)) {
-        if (key_slots == 0) return;
-        std::uint64_t levels = 1;
-        for (std::uint64_t reach = branching + 1; reach <= key_slots && levels + 1 < sorted_run_index_levels_capacity_k;
-             reach *= branching + 1)
-            ++levels;
-        height = levels;
-
-        std::uint64_t const upper_cells = power_(branching + 1, height - 1) - 1;
-        leaf_cells_count = rows_count * branching - upper_cells;
-        leaf_rows_count = rows_count - upper_cells / branching;
-
-        cells_above[0] = key_slots;
-        for (std::uint64_t index = 1; index <= height; ++index)
-            cells_above[index] = power_(branching + 1, height - index) - 1;
-
-        level_cells[1] = cells_above[height - 1];
-        level_stride[height - 1] = 1;
-        for (std::uint64_t index = 2; index <= height; ++index) {
-            level_cells[index] = cells_above[height - index] - cells_above[height - index + 1];
-            level_stride[index - 2] = cells_above[index - 1] + 1;
-        }
-    }
-
-    /** Cells in the sorted run index, padding included. */
-    constexpr std::uint64_t cells_count() const noexcept { return rows_count * branching; }
-
-    /** Level of the row holding @p cell, the root being level zero. */
-    constexpr std::uint64_t level_of(std::uint64_t cell) const noexcept {
-        for (std::uint64_t index = 1; index < height; ++index)
-            if (cells_above[index] <= cell) return height - index;
-        return 0;
-    }
-
-    /** Whether the layout describes any key slot, which decides whether its two mappings mean anything. */
-    constexpr bool holds_key_slots() const noexcept { return height != 0; }
-
-    /** Sorted position of @p cell, at or past @c key_slots_count for padding and for an empty layout. */
-    constexpr std::uint64_t cell_to_sorted(std::uint64_t cell) const noexcept {
-        if (!holds_key_slots()) return key_slots_count;
-        std::uint64_t const level = level_of(cell);
-        std::uint64_t const offset_in_level = cell - cells_above[height - level];
-        std::uint64_t const slots = offset_in_level + offset_in_level / branching + 1;
-        std::uint64_t const leaf_cells_before = level_cells[height - level - 1] * slots;
-        std::uint64_t const missing_leaf_cells = leaf_cells_before < leaf_cells_count
-                                                     ? 0
-                                                     : leaf_cells_before - leaf_cells_count;
-        return slots * level_stride[level] - 1 - missing_leaf_cells;
-    }
-
-    /** Cell holding sorted position @p sorted, which is @c cells_count for an empty layout that holds none. */
-    constexpr std::uint64_t sorted_to_cell(std::uint64_t sorted) const noexcept {
-        if (!holds_key_slots()) return cells_count();
-        std::uint64_t const leaf_row = sorted / (branching + 1);
-        std::uint64_t leaf_cells_before = leaf_rows_count * branching;
-        if (leaf_row < leaf_rows_count) {
-            std::uint64_t const offset_in_row = sorted - leaf_row * (branching + 1);
-            if (offset_in_row != branching) return cells_above[1] + leaf_row * branching + offset_in_row;
-            leaf_cells_before = (leaf_row + 1) * branching;
-        }
-
-        // Without the leaves the sorted run index is complete, so the trailing zeros of the position in base
-        // branching+1 name its level
-        std::uint64_t level_from_bottom = 0;
-        std::uint64_t rows_before = sorted - leaf_cells_before + 1;
-        std::uint64_t offset_in_row = 0;
-        while (true) {
-            std::uint64_t const previous = rows_before;
-            rows_before /= branching + 1;
-            offset_in_row = previous - rows_before * (branching + 1);
-            if (offset_in_row != 0) break;
-            ++level_from_bottom;
-        }
-        return cells_above[level_from_bottom + 2] + rows_before * branching + offset_in_row - 1;
-    }
-
-  private:
-    static constexpr std::uint64_t power_(std::uint64_t base, std::uint64_t exponent) noexcept {
-        std::uint64_t result = 1;
-        for (std::uint64_t step = 0; step != exponent; ++step) result *= base;
-        return result;
-    }
-};
-
-#pragma endregion Sorted Run Index
 
 } // namespace unum::ustore::blobs

@@ -318,6 +318,10 @@ enum class request_kind_t : std::uint8_t {
 
     /** Makes every write this queue pair has already completed durable; its extent is empty. */
     flush_k,
+
+    /** Gives @c extent back to the medium, which may read it as anything afterwards; no buffer is
+     *  named, and a transport that runs it at submission refuses it behind a chained request. */
+    deallocate_k,
 };
 
 /**
@@ -586,9 +590,73 @@ struct completion_t {
         medium, extent_t {}, memory_reference_t {}, request_kind_t::flush_k, request_chaining_t::independent_k, token};
 }
 
+/** A deallocation of @p extent of @p medium, which names no buffer, tagged with @p token. */
+[[nodiscard]] constexpr request_t deallocate_request(medium_reference_t medium, extent_t extent,
+                                                     request_token_t token) noexcept {
+    return request_t {
+        medium, extent, memory_reference_t {}, request_kind_t::deallocate_k, request_chaining_t::independent_k, token};
+}
+
 #pragma endregion Requests
 
 #pragma region Queue Pairs
+
+/**
+ *  @brief The move-only claim on one record of a disk's pool: the record's index and the generation
+ *      it was taken at.
+ *
+ *  A disk builds it from its pool's handle and empties it with @c surrender once it has vacated the
+ *  record, so a handle that outlives its record never resolves to the one that took the index next.
+ */
+class disk_handle_t {
+  public:
+
+    /** The index an empty handle carries, which is every 16-bit pool's absent index. */
+    static constexpr std::uint16_t absent_k = 0xFFFF;
+
+    disk_handle_t() noexcept = default;
+    disk_handle_t(disk_handle_t const&) = delete;
+    disk_handle_t& operator=(disk_handle_t const&) = delete;
+
+    /** The claim on record @p index of a pool, taken at @p generation, as the pool's
+     *  @c handle_t names it. */
+    disk_handle_t(std::uint16_t index, std::uint16_t generation) noexcept : index_(index), generation_(generation) {}
+
+    disk_handle_t(disk_handle_t&& other) noexcept
+        : index_(std::exchange(other.index_, absent_k)), generation_(std::exchange(other.generation_, 0)) {}
+
+    disk_handle_t& operator=(disk_handle_t&& other) noexcept {
+        assert(!held() && "Give a record back to its disk before overwriting its handle");
+        index_ = std::exchange(other.index_, absent_k);
+        generation_ = std::exchange(other.generation_, 0);
+        return *this;
+    }
+
+    ~disk_handle_t() noexcept { assert(!held() && "Give a record back to its disk before destroying its handle"); }
+
+    /** Empties the handle once the disk has vacated the record; callers never call this. */
+    void surrender() noexcept {
+        index_ = absent_k;
+        generation_ = 0;
+    }
+
+    /** Whether this handle still names a record. */
+    [[nodiscard]] bool held() const noexcept { return index_ != absent_k; }
+
+    /** The record's index in its pool. */
+    [[nodiscard]] std::uint16_t index() const noexcept { return index_; }
+
+    /** The generation the record was taken at, which its vacate steps. */
+    [[nodiscard]] std::uint16_t generation() const noexcept { return generation_; }
+
+  private:
+
+    /** The record's index, @c absent_k once surrendered. */
+    std::uint16_t index_ = absent_k;
+
+    /** The generation the record was taken at. */
+    std::uint16_t generation_ = 0;
+};
 
 /**
  *  @brief One queue pair on a share of the ring's depth, held by exactly one thread at a time.
@@ -608,64 +676,34 @@ class queue_pair_t {
   public:
 
     queue_pair_t() noexcept = default;
-    queue_pair_t(queue_pair_t const&) = delete;
-    queue_pair_t& operator=(queue_pair_t const&) = delete;
 
-    queue_pair_t(queue_pair_t&& other) noexcept
-        : id_(std::exchange(other.id_, queue_pair_id_t::unallocated_k)),
-          generation_(std::exchange(other.generation_, 0)), depth_(std::exchange(other.depth_, 0)) {}
-
-    queue_pair_t& operator=(queue_pair_t&& other) noexcept {
-        assert(!held() && "Release a queue pair before overwriting it");
-        id_ = std::exchange(other.id_, queue_pair_id_t::unallocated_k);
-        generation_ = std::exchange(other.generation_, 0);
-        depth_ = std::exchange(other.depth_, 0);
-        return *this;
-    }
-
-    ~queue_pair_t() noexcept { assert(!held() && "Release a queue pair before destroying it"); }
-
-    /** Builds the handle a disk hands back from its @c open; callers never call this. */
-    [[nodiscard]] static queue_pair_t leased(queue_pair_id_t id, queue_pair_generation_t generation,
-                                             queue_depth_t depth) noexcept {
-        queue_pair_t queue_pair;
-        queue_pair.id_ = id;
-        queue_pair.generation_ = generation;
-        queue_pair.depth_ = depth;
-        return queue_pair;
-    }
+    /** The handle a disk hands back from @c acquire_queue_pair; callers never call this. */
+    queue_pair_t(disk_handle_t&& handle, queue_depth_t depth) noexcept : handle_(std::move(handle)), depth_(depth) {}
 
     /** Empties the handle once the disk has taken the queue pair back; callers never call this. */
-    void surrender() noexcept {
-        id_ = queue_pair_id_t::unallocated_k;
-        generation_ = 0;
-        depth_ = 0;
-    }
+    void surrender() noexcept { handle_.surrender(); }
 
     /** Whether this handle still holds a queue pair. */
-    [[nodiscard]] bool held() const noexcept { return id_ != queue_pair_id_t::unallocated_k; }
+    [[nodiscard]] bool held() const noexcept { return handle_.held(); }
 
     /** The slot this queue pair occupies. */
-    [[nodiscard]] queue_pair_id_t id() const noexcept { return id_; }
+    [[nodiscard]] queue_pair_id_t id() const noexcept { return static_cast<queue_pair_id_t>(handle_.index()); }
 
     /** The generation that separates this queue pair from the slot's previous one. */
-    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return generation_; }
+    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return handle_.generation(); }
 
     /** Requests this queue pair may keep in flight at once, reserved when the queue pair was taken. */
     [[nodiscard]] queue_depth_t depth() const noexcept { return depth_; }
 
     /** Mints a token of this queue pair carrying the queue pair's own @p tag. */
     [[nodiscard]] request_token_t token(request_tag_t tag) const noexcept {
-        return request_token_t::make(id_, generation_, tag);
+        return request_token_t::make(id(), generation(), tag);
     }
 
   private:
 
-    /** The slot the queue pair occupies, @c unallocated_k once surrendered. */
-    queue_pair_id_t id_ = queue_pair_id_t::unallocated_k;
-
-    /** The generation of this queue pair, raised every time the slot is leased again. */
-    queue_pair_generation_t generation_ = 0;
+    /** The record the queue pair occupies in its disk's pool. */
+    disk_handle_t handle_;
 
     /** Requests this queue pair may keep in flight at once. */
     queue_depth_t depth_ = 0;
@@ -683,70 +721,43 @@ class registered_memory_t {
   public:
 
     registered_memory_t() noexcept = default;
-    registered_memory_t(registered_memory_t const&) = delete;
-    registered_memory_t& operator=(registered_memory_t const&) = delete;
 
-    registered_memory_t(registered_memory_t&& other) noexcept
-        : id_(std::exchange(other.id_, registered_memory_id_t::unregistered_k)),
-          generation_(std::exchange(other.generation_, 0)), memory_(std::exchange(other.memory_, std::span<byte_t> {})),
-          space_(other.space_) {}
-
-    registered_memory_t& operator=(registered_memory_t&& other) noexcept {
-        assert(!held() && "Deregister a range before overwriting its handle");
-        id_ = std::exchange(other.id_, registered_memory_id_t::unregistered_k);
-        generation_ = std::exchange(other.generation_, 0);
-        memory_ = std::exchange(other.memory_, std::span<byte_t> {});
-        space_ = other.space_;
-        return *this;
-    }
-
-    ~registered_memory_t() noexcept { assert(!held() && "Deregister a range before destroying its handle"); }
-
-    /** Builds the handle a disk hands back from its @c register_memory; callers never call this. */
-    [[nodiscard]] static registered_memory_t registered(registered_memory_id_t id, queue_pair_generation_t generation,
-                                                        std::span<byte_t> memory, memory_space_t space) noexcept {
-        registered_memory_t registered_memory;
-        registered_memory.id_ = id;
-        registered_memory.generation_ = generation;
-        registered_memory.memory_ = memory;
-        registered_memory.space_ = space;
-        return registered_memory;
-    }
+    /** The handle a disk hands back from @c register_memory; callers never call this. */
+    registered_memory_t(disk_handle_t&& handle, std::span<byte_t> memory, memory_space_t space) noexcept
+        : handle_(std::move(handle)), memory_(memory), space_(space) {}
 
     /** Empties the handle once the disk has taken the range back; callers never call this. */
     void surrender() noexcept {
-        id_ = registered_memory_id_t::unregistered_k;
-        generation_ = 0;
+        handle_.surrender();
         memory_ = std::span<byte_t> {};
     }
 
     /** Whether this handle still names a registered range. */
-    [[nodiscard]] bool held() const noexcept { return id_ != registered_memory_id_t::unregistered_k; }
+    [[nodiscard]] bool held() const noexcept { return handle_.held(); }
 
     /** The slot the range occupies. */
-    [[nodiscard]] registered_memory_id_t id() const noexcept { return id_; }
+    [[nodiscard]] registered_memory_id_t id() const noexcept {
+        return static_cast<registered_memory_id_t>(handle_.index());
+    }
 
     /** The generation that separates this range from the slot's previous one. */
-    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return generation_; }
+    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return handle_.generation(); }
 
     /** The memory the range covers, which the queue pair allocated and still owns. */
     [[nodiscard]] std::span<byte_t> bytes() const noexcept { return memory_; }
 
-    /** Where the range lives, which the disk agreed to at registered_memory. */
+    /** Where the range lives, which the disk agreed to at registration. */
     [[nodiscard]] memory_space_t space() const noexcept { return space_; }
 
     /** The place @p offset bytes into this range, which a request carries instead of a pointer. */
     [[nodiscard]] memory_reference_t reference(std::uint64_t offset = 0) const noexcept {
-        return memory_reference_t {id_, generation_, offset};
+        return memory_reference_t {id(), generation(), offset};
     }
 
   private:
 
-    /** The slot the range occupies, @c unregistered_k once surrendered. */
-    registered_memory_id_t id_ = registered_memory_id_t::unregistered_k;
-
-    /** The generation of this registered memory, raised every time the slot is used again. */
-    queue_pair_generation_t generation_ = 0;
+    /** The record the range occupies in its disk's pool. */
+    disk_handle_t handle_;
 
     /** The memory the range covers, owned by the caller throughout. */
     std::span<byte_t> memory_;
@@ -767,65 +778,49 @@ class registered_medium_t {
   public:
 
     registered_medium_t() noexcept = default;
-    registered_medium_t(registered_medium_t const&) = delete;
-    registered_medium_t& operator=(registered_medium_t const&) = delete;
 
-    registered_medium_t(registered_medium_t&& other) noexcept
-        : id_(std::exchange(other.id_, registered_medium_id_t::unregistered_k)),
-          generation_(std::exchange(other.generation_, 0)), capacity_(std::exchange(other.capacity_, 0)) {}
-
-    registered_medium_t& operator=(registered_medium_t&& other) noexcept {
-        assert(!held() && "Deregister a medium before overwriting its handle");
-        id_ = std::exchange(other.id_, registered_medium_id_t::unregistered_k);
-        generation_ = std::exchange(other.generation_, 0);
-        capacity_ = std::exchange(other.capacity_, 0);
-        return *this;
-    }
-
-    ~registered_medium_t() noexcept { assert(!held() && "Deregister a medium before destroying its handle"); }
-
-    /** Builds the handle a disk hands back from its @c register_medium; callers never call this. */
-    [[nodiscard]] static registered_medium_t registered(registered_medium_id_t id, queue_pair_generation_t generation,
-                                                        std::uint64_t capacity) noexcept {
-        registered_medium_t registered_medium;
-        registered_medium.id_ = id;
-        registered_medium.generation_ = generation;
-        registered_medium.capacity_ = capacity;
-        return registered_medium;
-    }
+    /** The handle a disk hands back from @c register_medium; callers never call this. */
+    registered_medium_t(disk_handle_t&& handle, std::uint64_t capacity, std::uint64_t logical_block_bytes) noexcept
+        : handle_(std::move(handle)), capacity_(capacity), logical_block_bytes_(logical_block_bytes) {}
 
     /** Empties the handle once the disk has taken the medium back; callers never call this. */
     void surrender() noexcept {
-        id_ = registered_medium_id_t::unregistered_k;
-        generation_ = 0;
+        handle_.surrender();
         capacity_ = 0;
+        logical_block_bytes_ = 0;
     }
 
     /** Whether this handle still names a registered medium. */
-    [[nodiscard]] bool held() const noexcept { return id_ != registered_medium_id_t::unregistered_k; }
+    [[nodiscard]] bool held() const noexcept { return handle_.held(); }
 
     /** The slot the medium occupies. */
-    [[nodiscard]] registered_medium_id_t id() const noexcept { return id_; }
+    [[nodiscard]] registered_medium_id_t id() const noexcept {
+        return static_cast<registered_medium_id_t>(handle_.index());
+    }
 
     /** The generation that separates this medium from the slot's previous one. */
-    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return generation_; }
+    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return handle_.generation(); }
 
     /** Bytes the medium spans, which an extent past it reads short or fails. */
     [[nodiscard]] std::uint64_t capacity() const noexcept { return capacity_; }
 
+    /** The smallest unit the medium writes atomically, which an on-disk block that must never
+     *  tear fits inside. */
+    [[nodiscard]] std::uint64_t logical_block_bytes() const noexcept { return logical_block_bytes_; }
+
     /** The place a request carries instead of a name. */
-    [[nodiscard]] medium_reference_t reference() const noexcept { return medium_reference_t {id_, generation_}; }
+    [[nodiscard]] medium_reference_t reference() const noexcept { return medium_reference_t {id(), generation()}; }
 
   private:
 
-    /** The slot the medium occupies, @c unregistered_k once surrendered. */
-    registered_medium_id_t id_ = registered_medium_id_t::unregistered_k;
+    /** The record the medium occupies in its disk's pool. */
+    disk_handle_t handle_;
 
-    /** The generation of this registered memory, raised every time the slot is used again. */
-    queue_pair_generation_t generation_ = 0;
-
-    /** Bytes the medium spans, as the transport reported them at registered_memory. */
+    /** Bytes the medium spans, as the transport reported them at registration. */
     std::uint64_t capacity_ = 0;
+
+    /** The medium's logical block, as the transport reported it at registration. */
+    std::uint64_t logical_block_bytes_ = 0;
 };
 
 #pragma endregion Queue Pairs

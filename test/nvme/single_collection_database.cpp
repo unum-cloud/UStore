@@ -16,12 +16,14 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcmp`
 
-#include <array>   // `std::array`
-#include <memory>  // `std::unique_ptr`
-#include <new>     // `std::nothrow`
-#include <span>    // `std::span`
-#include <thread>  // `std::thread`
-#include <utility> // `std::move`
+#include <array>       // `std::array`
+#include <filesystem>  // `std::filesystem::remove`
+#include <memory>      // `std::unique_ptr`
+#include <new>         // `std::nothrow`
+#include <span>        // `std::span`
+#include <thread>      // `std::thread`
+#include <type_traits> // `std::remove_reference_t`
+#include <utility>     // `std::move`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -162,10 +164,16 @@ expected<std::unique_ptr<typename scdb_types<typename mount_type_::fixture_t>::s
     return stack;
 }
 
-/** Opens a database of @p database_type_ over the volume and the channels of @p stack. */
+/** Mounts the volume of @p stack again and opens a database of @p database_type_ over it and the
+ *  channels of @p stack, as a process starting after a close or a crash does. */
 template <typename database_type_, typename stack_type_>
 expected<typename database_type_::database_unique_ptr_t> open_over(
     stack_type_& stack, single_collection_database_config_t const& config) noexcept {
+    using volume_t = typename std::remove_reference_t<decltype(*stack.volume)>;
+    *stack.volume = volume_t {};
+    auto [volume, mount_status] = stack.fixture->mount_volume(stack.writing.channel());
+    if (mount_status.failed()) return mount_status;
+    *stack.volume = std::move(volume);
     return database_type_::open(*stack.volume, stack.writing.channel(), stack.merging.channel(), config,
                                 stack.fixture->resources);
 }
@@ -288,39 +296,6 @@ std::size_t every_layout_round_trips(mount_type_ const& mount) {
     return failures;
 }
 
-/** The name copy @p copy of the schema blob of this layer answers to, which a crash case removes by hand. */
-[[nodiscard]] blob_name_t schema_blob_name(std::size_t copy) noexcept {
-    return copy == 0 ? blob_name_of("single-collection-database.schema.0")
-                     : blob_name_of("single-collection-database.schema.1");
-}
-
-/** Sorted runs @p volume names right now, which a reopen neither adds to nor loses. */
-template <typename volume_type_>
-[[nodiscard]] std::size_t run_count_of(volume_type_ const& volume) noexcept {
-    std::size_t counted = 0;
-    volume.for_each(blob_kind_t::sorted_run_k, [&](blob_name_t, volume_blob_t const&) noexcept { ++counted; });
-    return counted;
-}
-
-/** Bytes every sorted run of @p volume takes, which a schema that never landed leaves behind. */
-template <typename volume_type_>
-[[nodiscard]] std::uint64_t run_bytes_of(volume_type_ const& volume) noexcept {
-    std::uint64_t counted = 0;
-    volume.for_each(blob_kind_t::sorted_run_k,
-                    [&](blob_name_t, volume_blob_t const& blob) noexcept { counted += blob.extent.length; });
-    return counted;
-}
-
-/** Runs the copy of the schema blob on @p volume that save @p generation wrote names, counted off the length its
- *  fixed-width records fix. */
-template <typename volume_type_>
-[[nodiscard]] std::size_t runs_named_by_schema(volume_type_ const& volume, std::uint64_t generation) noexcept {
-    expected<volume_blob_t> const found = volume.find(schema_blob_name(schema_copy_of(generation)));
-    if (!found || found->length < sizeof(single_collection_database_schema_record_t)) return 0;
-    return static_cast<std::size_t>((found->length - sizeof(single_collection_database_schema_record_t)) /
-                                    sizeof(lsm_tree_run_record_t));
-}
-
 /**
  *  @brief Writes a model of @p key_slot_type_, closes over its volume and reads every byte back after a reopen.
  *  @param[in] value_size Bytes every value takes, which is zero for every layout but the fixed one.
@@ -379,9 +354,9 @@ template <typename key_slot_type_, typename mount_type_>
         if (!merged) return failures;
         failures += expect(*merged == compaction_outcome_t::published_k);
 
-        // A merge records its new set before it drops what it consumed, so neither outlives the other.
-        failures += expect_eq(runs_named_by_schema(*(*stack)->volume, (*store)->schema_generation()),
-                              run_count_of(*(*stack)->volume));
+        // A merge publishes its new set before it drops what it consumed, so the manifest names
+        // every run file left.
+        failures += expect_eq(run_count_of(*(*stack)->fixture), run_files_of(*(*stack)->fixture));
 
         // Two overlapping rounds go back onto level zero, so age alone decides which run answers a key,
         // and the keys neither round names can only be answered from the level the merge wrote.
@@ -423,7 +398,8 @@ template <typename key_slot_type_, typename mount_type_>
 
 /** Every layout the database serves comes back byte for byte, and out of every level, after a reopen. */
 template <typename mount_type_>
-std::size_t every_layout_survives_reopen(mount_type_ const& mount) {
+case_result_t every_layout_survives_reopen(mount_type_ const& mount) {
+    if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
     std::size_t failures = 0;
     failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>>(mount, 0, 0);
     failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::fixed_width_k>>(mount, 512, 0);
@@ -433,18 +409,20 @@ std::size_t every_layout_survives_reopen(mount_type_ const& mount) {
 }
 
 /**
- *  @brief A schema that never reached the medium wastes its runs, and one naming a missing run is refused on every
- *      reopen, as a refused mount saves nothing.
+ *  @brief Runs no manifest ever named are unlinked at the next mount, and a manifest naming a
+ *      missing run is refused on every reopen, as a refused mount publishes nothing.
  *
- *  A flush seals the run first and records it second, so the only state a crash between the two leaves
- *  is a run nobody names. The other order would leave a schema naming bytes the volume never got, which
- *  the second half forces by hand to show what a reopen does with it.
+ *  A flush writes the run first and publishes the manifest second, so the only state a crash
+ *  between the two leaves is a run nobody names. The other order would leave a manifest
+ *  naming bytes the volume never got, which the second half forces by hand to show what a
+ *  reopen does with it.
  */
 template <typename mount_type_>
-std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
+case_result_t crash_between_seal_and_schema(mount_type_ const& mount) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
     using variable_database_t = typename types_t::variable_database_t;
     using stack_t = typename types_t::stack_t;
+    if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
     std::size_t failures = 0;
     single_collection_database_config_t const config = test_config(0, value_max_size_k);
 
@@ -465,29 +443,28 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
                 failures += expect((*store)->insert(key, std::span<byte_t const> {value}).succeeded());
             failures += expect((*store)->flush().succeeded());
 
-            // A flush seals its run and records it second, so the schema already names every run on the volume.
-            failures += expect_eq(runs_named_by_schema(*(*stack)->volume, (*store)->schema_generation()),
-                                  run_count_of(*(*stack)->volume));
+            // A flush writes its run and publishes the manifest second, so the manifest names
+            // every run file.
+            failures += expect_eq(run_count_of(*(*stack)->fixture), run_files_of(*(*stack)->fixture));
         }
 
-        std::size_t const runs = run_count_of(*(*stack)->volume);
-        std::uint64_t const wasted = run_bytes_of(*(*stack)->volume);
-        failures += expect(runs != std::size_t {0});
-        failures += expect(wasted != std::uint64_t {0});
+        failures += expect(run_count_of(*(*stack)->fixture) != std::size_t {0});
+        failures += expect(run_bytes_of(*(*stack)->fixture) != std::uint64_t {0});
 
-        // No copy of the schema that would have named those runs ever landed.
-        for (std::size_t copy = 0; copy != 2; ++copy)
-            if ((*stack)->volume->names(schema_blob_name(copy)))
-                failures += expect(
-                    (*stack)->volume->drop((*stack)->writing.channel(), schema_blob_name(copy)).succeeded());
+        // No manifest that would have named those runs ever landed.
+        std::array<char, 96> name {};
+        auto const written = fmt::format_to_n(name.data(), name.size() - 1, "{}.ustore.json", (*stack)->fixture->suite);
+        *written.out = '\0';
+        path_t const manifest {(*stack)->fixture->data_directory_path(0).c_str(), name.data()};
+        failures += expect(std::filesystem::remove(manifest.c_str()));
 
         expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                              config);
         failures += expect(store.has_value());
         if (!store) return failures;
         failures += expect_eq((*store)->population_count(), std::uint64_t {0});
-        failures += expect_eq(run_count_of(*(*stack)->volume), runs);
-        failures += expect_eq(run_bytes_of(*(*stack)->volume), wasted);
+        // The mount unlinked the run files no manifest names.
+        failures += expect_eq(run_files_of(*(*stack)->fixture), std::size_t {0});
 
         // The volume is still a volume: a write over it flushes and answers.
         st::vector<byte_t> value;
@@ -523,27 +500,20 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
                 failures += expect((*store)->flush().succeeded());
             }
         }
-        failures += expect_eq(run_count_of(*(*stack)->volume), std::size_t {2});
+        failures += expect_eq(run_count_of(*(*stack)->fixture), std::size_t {2});
 
-        std::array<byte_t, blob_name_max_bytes_k> named {};
-        std::size_t named_bytes = 0;
-        (*stack)->volume->for_each(blob_kind_t::sorted_run_k, [&](blob_name_t name, volume_blob_t const&) noexcept {
-            if (named_bytes != 0) return;
-            std::memcpy(named.data(), name.data(), name.size());
-            named_bytes = name.size();
-        });
-        failures += expect(named_bytes != std::size_t {0});
-        if (named_bytes == 0) return failures;
+        // The file of one of the two runs the manifest names never reached the environment.
+        manifest_t const manifest = manifest_on_disk(*(*stack)->fixture);
+        char name[path_max_bytes_k];
+        failures += expect(manifest.file_name(manifest.files[0].run, name).succeeded());
+        path_t const run_path {(*stack)->fixture->data_directory_path(0).c_str(), name};
+        failures += expect(std::filesystem::remove(run_path.c_str()));
 
-        // The bytes of one of the two runs the schema names never reached the environment.
-        failures += expect(
-            (*stack)->volume->drop((*stack)->writing.channel(), blob_name_t {named.data(), named_bytes}).succeeded());
-
-        // A mount refused after taking back the other run saves no schema naming that run alone, so it refuses again.
+        // A refused mount publishes no manifest naming the other run alone, so it refuses again.
         for (std::size_t attempt = 0; attempt != 2; ++attempt) {
             expected<typename variable_database_t::database_unique_ptr_t> const store = open_over<variable_database_t>(
                 **stack, config);
-            failures += expect_status(store, status_code_t::not_found_k);
+            failures += expect(!store.has_value());
         }
     }
     return failures;
@@ -551,10 +521,11 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
 
 /** A reopen takes back what the database itself wrote to the volume, and refuses another config. */
 template <typename mount_type_>
-std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
+case_result_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
     using variable_database_t = typename types_t::variable_database_t;
     using stack_t = typename types_t::stack_t;
+    if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
     std::size_t failures = 0;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
     failures += expect_status(stack, status_code_t::success_k);
@@ -582,7 +553,7 @@ std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
     }
 
     // The runs the flush published are still named on the volume the database was closed over.
-    std::size_t const runs = run_count_of(*(*stack)->volume);
+    std::size_t const runs = run_count_of(*(*stack)->fixture);
     failures += expect(runs != 0);
 
     {
@@ -599,13 +570,13 @@ std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
 
         // The runs above are back in the tree, so every key the close left behind answers again.
         failures += expect_eq((*store)->population_count(), std::uint64_t {64});
-        failures += expect_eq(run_count_of(*(*stack)->volume), runs);
+        failures += expect_eq(run_count_of(*(*stack)->fixture), runs);
 
         failures += expect((*store)->clear_user_data().succeeded());
         failures += expect_eq((*store)->user_data_size_bytes(), std::uint64_t {0});
     }
 
-    // A volume whose schema names one shape refuses a database of another.
+    // A volume whose manifest names one shape refuses a database of another.
     single_collection_database_config_t narrower = config;
     narrower.collection.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size_k / 2;
     expected<typename variable_database_t::database_unique_ptr_t> refused = open_over<variable_database_t>(**stack,

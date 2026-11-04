@@ -17,7 +17,9 @@
 #include <cstdint> // `SIZE_MAX`, `std::int64_t`, `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::strlen`
 
-#if defined(_WIN32)
+#include "ustore/types.h" // `USTORE_OS_WINDOWS_`
+
+#if USTORE_OS_WINDOWS_
 #include <windows.h> // NTSTATUS, which <bcrypt.h> needs
 #include <bcrypt.h>  // `BCryptGenRandom`
 #else
@@ -574,7 +576,7 @@ static_assert(sizeof(uuid_t) == uuid_t::size_bytes_k, "An identifier is its sixt
 
 /** Fills @p destination with bytes from the operating system, answering whether it could. */
 inline bool fill_with_entropy(std::span<std::uint8_t> destination) noexcept {
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
     return ::BCryptGenRandom(nullptr, destination.data(), static_cast<ULONG>(destination.size()),
                              BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
 #else

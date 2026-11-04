@@ -9,7 +9,9 @@
 #include <cstddef> // size_t, which Emscripten's <sys/random.h> needs
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 
-#if defined(_WIN32)
+#include "ustore/types.h" // `USTORE_OS_WINDOWS_`
+
+#if USTORE_OS_WINDOWS_
 #include <windows.h> // NTSTATUS, which <bcrypt.h> needs
 #include <bcrypt.h>  // `BCryptGenRandom`
 #else
@@ -79,7 +81,7 @@ constexpr enumerator_spelling<ustore_modality_t> modality_names_k[] {
 expected<ustore_collection_id_t> mint_collection_id() noexcept {
     ustore_collection_id_t id {};
     std::uint8_t* const bytes = id.uuid.bytes;
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
     bool const drawn = BCRYPT_SUCCESS(
         BCryptGenRandom(nullptr, bytes, sizeof(id.uuid.bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG));
 #else

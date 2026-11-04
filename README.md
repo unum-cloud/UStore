@@ -239,8 +239,9 @@ The engines build into one library, offered as the `ustore_static` archive and t
 An engine reports itself through `ustore_database_describe`: its name, what it supports, its isolation, and its estimates of the keys, memory and disk the data takes.
 The C++ `database_t` exposes the capability bits as `supports_transactions`, `supports_snapshots` and `supports_collections`.
 `ustore_database_clear` empties every collection at once, and `ustore_database_compact` reclaims the space overwritten and removed data still takes.
-NVMe's sources are not yet ported to the current C ABI, so `USTORE_WITH_NVME` stays off until they build.
-Once ported, NVMe runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_CUDA_ARCH`; [`src/nvme/README.md`](src/nvme/README.md) describes its layers.
+NVMe builds behind `USTORE_WITH_NVME`, which is off by default and on in the presets that test it.
+It runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_CUDA_ARCH`; [`src/nvme/README.md`](src/nvme/README.md) describes its layers.
+A database on NVMe is a `<database>.ustore.json` manifest and one `.ustore` file per sorted run, on filesystems or in 1 GB slots of raw drives, as [`docs/format.md`](docs/format.md) describes.
 
 ## Compatibility
 
@@ -255,7 +256,7 @@ The C headers are C11, checked by `c/test.c` under every platform's compiler aga
 | Windows x86-64 |       ✅        |   ✅    |   ✅    | untested |   ✅   |  ✅  |
 
 Every column but NVMe is exercised by CI on all four platforms: `.github/workflows/prerelease.yml` builds and tests the C ABI and each engine, the Python extension and the Rust crate.
-The NVMe column records the suites in [`test/`](test/) on two Linux x86-64 machines rather than CI, which builds NVMe only once its sources are ported to the current C ABI; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP but is not yet mounted by the engine.
+The NVMe column records the suites in [`test/`](test/) on two Linux x86-64 machines rather than CI, which does not build NVMe yet; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP but is not yet mounted by the engine.
 GPU compaction targets NVIDIA Hopper and Blackwell alike, and its output must match CPU compaction on the same runs.
 The engines and the layout of `src/` are described in [`src/README.md`](src/README.md).
 
@@ -283,10 +284,10 @@ A call writes its tapes with 32-bit offsets while the bytes fit in 4 GiB and 64-
 
 v1 is planned for mid-November 2026.
 
-- __Keys__ — today 128-bit UUID keys and UUIDv7 collection identifiers, except on NVMe, which takes keys below 2⁶⁴ and names collections by catalog numbers; v1 brings both to NVMe, with time-ordered UUIDv7 keys for local inserts.
+- __Keys__ — today 128-bit UUID keys and UUIDv7 collection identifiers on every engine, NVMe included; v1 adds time-ordered UUIDv7 keys for local inserts.
 - __The `ram` engine__ — today `strict_serializable` or `snapshot` at open, with binary image persistence; v1 targets the conformance suite passing at both levels, every level proven by anomaly tests.
 - __RocksDB, LevelDB__ — today built against their current headers; v1 targets the same conformance suite, each reporting the isolation it delivers.
-- __NVMe__ — today its sources are being ported to the current C ABI, having passed the conformance suite on Linux over blocking and io_uring transports with GPU compaction wired in; v1 targets the port, the graph as two collections of one database, backup and export, and CI on every platform.
+- __NVMe__ — today on the current C ABI over blocking and io_uring transports with GPU compaction wired in, each database a manifest and its run files, on filesystems or raw slots; v1 targets the graph as two collections of one database, backup and export by syncing the run files, and CI on every platform.
 - __Kernel bypass__ — today io_uring on files and block devices, with registered buffers where the memlock cap allows and plain pointers otherwise, and an SPDK transport passing the shared ring cases over NVMe/TCP; v1 targets SPDK mounted by the engine and NVMe passthrough.
 - __SIMD point lookups__ — today the sorted-run index is searched on SmashTable's kits; v1 targets one kit chosen per artifact at open.
 - __GPU__ — today LSM compaction in three kernels per merge, launched through the driver with no CUDA runtime, reached from the engine when built with CUDA, with the host and device merges checked to agree byte for byte on every transport; v1 targets GPUDirect Storage between drives and GPU memory.

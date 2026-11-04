@@ -14,7 +14,9 @@
 #include <cstdio>  // `std::FILE`, `std::fopen`, `std::fread`, `std::fwrite`, `std::rename`
 #include <cstring> // `std::memcmp`
 
-#if defined(_WIN32)
+#include "ustore/types.h" // `USTORE_OS_WINDOWS_`
+
+#if USTORE_OS_WINDOWS_
 #include <io.h>      // `_commit`, `_fileno`
 #include <windows.h> // `MoveFileExA`
 #else
@@ -1256,7 +1258,7 @@ inline constexpr std::string_view image_name_k = "/ram.image";
 /** Name of the image while it is being written, renamed over the image once whole. */
 inline constexpr std::string_view partial_image_name_k = "/ram.image.partial";
 
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
 /** Flushes the file behind @p file to the drive. */
 inline bool sync_file(std::FILE* file) noexcept { return ::_commit(::_fileno(file)) == 0; }

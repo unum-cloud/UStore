@@ -60,7 +60,7 @@ static struct {
     {ustore_status_not_found_k, "ustore.NotFoundError", &ErrorType, &PyExc_KeyError,
      "A collection, a directory, or a document a modification needs does not exist."},
     {ustore_status_already_exists_k, "ustore.AlreadyExistsError", &ErrorType, &PyExc_ValueError,
-     "A collection name or a document the call creates is already taken."},
+     "A collection name or a document the call creates is already taken, or a raw medium's first slot is not free."},
     {ustore_status_write_conflict_k, "ustore.WriteConflictError", &ConflictErrorType, NULL,
      "A concurrent writer changed a key this transaction wrote; retry the transaction."},
     {ustore_status_read_conflict_k, "ustore.ReadConflictError", &ConflictErrorType, NULL,

@@ -2,6 +2,10 @@
 
 Each case runs its writes in a child process that leaves through `os._exit`, which skips every destructor and flush
 the way a killed process does, on every platform.
+
+File: test/durability.py
+Author: Ash Vardanian
+Date: September 27, 2026
 """
 
 import subprocess
@@ -9,7 +13,7 @@ import sys
 import textwrap
 from pathlib import Path
 
-from capabilities import NEEDS_TRANSACTIONS, open_engine
+from capabilities import NEEDS_TRANSACTIONS, location, open_engine
 
 import ustore
 
@@ -23,7 +27,7 @@ def crash_after(engine: str, directory: Path, body: str) -> None:
     """)
     script = opening + textwrap.dedent(body) + "\nos._exit(0)\n"
     # A child that never exits fails its case instead of stalling the suite.
-    subprocess.run([sys.executable, "-c", script, str(directory)], check=True, timeout=120)
+    subprocess.run([sys.executable, "-c", script, str(location(engine, directory))], check=True, timeout=120)
 
 
 def test_a_flushed_write_survives_a_crash(engine: str, tmp_path: Path):

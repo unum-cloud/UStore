@@ -482,7 +482,7 @@ class config_t {
 
     /** Opens the engine @p options name in @p directory, or in memory when @p directory is null. */
     explicit config_t(engine_options_t options, char const* directory) noexcept : options_(options) {
-        options_.directory = directory;
+        options_.locate(directory);
     }
 
     /** The engine and the options of its init call, which a second database of a case repeats. */
@@ -497,6 +497,13 @@ class config_t {
   private:
     engine_options_t options_;
 };
+
+/** What a save of @p config's engine names to land in @p path: the manifest NVMe opens there, or
+ *  @p path itself. */
+inline path_t save_target(config_t const& config, path_t const& path) noexcept {
+    if (config.engine() != "nvme") return path;
+    return path_t {path.c_str(), "ustore.ustore.json"};
+}
 
 /** Opens the engine @p config names through the C ABI. */
 inline expected<ustore_database_t> open_raw(config_t const& config) noexcept {

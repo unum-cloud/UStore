@@ -33,9 +33,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/blocking_files.hpp"        // `shared_library_t`
-#include "ustore/utilities/nvme_disks.hpp"            // `native_file_t`, `open_native_file`, `flush_native_file`
-#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `direct_alignment_of`, `direct_alignment_t`
+#include "ustore/utilities/blocking_files.hpp" // `shared_library_t`
+#include "ustore/utilities/nvme_disks.hpp"     // `flush_native_file`, `deallocate_native_file`, `direct_alignment_of`
 #include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -230,7 +229,7 @@ enum class linux_cufile_probe_t : std::uint8_t {
 
 #pragma endregion Configuration
 
-#if defined(__linux__)
+#if USTORE_OS_LINUX_
 
 #pragma region Disk
 
@@ -397,7 +396,7 @@ class linux_cufile_files_disk {
             slot.flights_count = 0;
             slot.locals_first = 0;
             slot.locals_count = 0;
-            return queue_pair_t::leased(static_cast<queue_pair_id_t>(index), slot.generation, depth);
+            return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, depth};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this disk is already held"};
     }
@@ -466,8 +465,8 @@ class linux_cufile_files_disk {
             slot.base = memory.data();
             slot.length = memory.size();
             slot.space = space;
-            return registered_memory_t::registered(static_cast<registered_memory_id_t>(index), slot.generation, memory,
-                                                   space);
+            return registered_memory_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, memory,
+                                        space};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every registered memory slot of this disk is taken"};
     }
@@ -529,8 +528,8 @@ class linux_cufile_files_disk {
             slot.capacity = native_file_capacity(file);
             slot.memory_alignment = alignment.memory > portable_alignment_k ? alignment.memory : portable_alignment_k;
             slot.offset_alignment = alignment.offset;
-            return registered_medium_t::registered(static_cast<registered_medium_id_t>(index), slot.generation,
-                                                   slot.capacity);
+            return registered_medium_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation},
+                                        slot.capacity, alignment.offset};
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every medium slot of this disk is taken"};
     }
@@ -939,7 +938,7 @@ class linux_cufile_files_disk {
         parameters = cufile_io_parameters_t {};
         parameters.mode = cufile_batch_mode_k;
         parameters.cookie = reinterpret_cast<void*>(static_cast<std::uintptr_t>(seat));
-        if (request.kind == request_kind_t::flush_k) return;
+        if (request.kind == request_kind_t::flush_k || request.kind == request_kind_t::deallocate_k) return;
         // Compat mode drops a non-zero base offset, so the base points at the first byte and the offset stays zero
         registered_memory_slot_t const* const memory = resolve_(request.buffer);
         parameters.batch.base = memory->base + request.buffer.offset;
@@ -1024,7 +1023,7 @@ class linux_cufile_files_disk {
     status_t inspect_(request_t const& request) noexcept {
         registered_medium_slot_t const* const medium = resolve_(request.medium);
         if (!medium) return {status_code_t::invalid_argument_k, "The request names no registered medium"};
-        if (request.kind == request_kind_t::flush_k) return {};
+        if (request.kind == request_kind_t::flush_k || request.kind == request_kind_t::deallocate_k) return {};
         registered_memory_slot_t const* const memory = resolve_(request.buffer);
         if (!memory) return {status_code_t::invalid_argument_k, "The request names no registered range"};
         if (request.buffer.offset > memory->length || request.extent.length > memory->length - request.buffer.offset)
@@ -1039,7 +1038,8 @@ class linux_cufile_files_disk {
     }
 
     /**
-     *  @brief Hands the staged requests to the library in one batch, answering every flush on this thread first.
+     *  @brief Hands the staged requests to the library in one batch, answering every flush and
+     *      deallocation here first.
      *
      *  A batch the library refuses as full stays staged for the next poll. Any other refusal belongs to the batch as a
      *  whole, so every staged request fails, and the chains behind them are cut.
@@ -1050,11 +1050,14 @@ class linux_cufile_files_disk {
         for (std::uint32_t index = 0; index != slot.staged_count; ++index) {
             std::uint32_t const seat = seat_of_(staged[index]);
             request_t const& request = flights_[base + seat].request;
-            if (request.kind != request_kind_t::flush_k) {
+            if (request.kind != request_kind_t::flush_k && request.kind != request_kind_t::deallocate_k) {
                 staged[kept++] = staged[index];
                 continue;
             }
-            status_t const flushed = flush_native_file(resolve_(request.medium)->file);
+            native_file_t const file = resolve_(request.medium)->file;
+            status_t const flushed = request.kind == request_kind_t::flush_k
+                                         ? flush_native_file(file)
+                                         : deallocate_native_file(file, request.extent);
             completion_t const completion = flushed.failed() ? failed_completion_(request.token, flushed)
                                                              : flushed_completion_(request.token);
             push_local_(slot, base, retire_(slot, base, seat, completion));
@@ -1077,7 +1080,8 @@ class linux_cufile_files_disk {
         }
     }
 
-    /** The completion of a flush that synchronized its file. */
+    /** The completion of a flush that synchronized its file, or a deallocation that gave
+     *  its extent back. */
     [[nodiscard]] static completion_t flushed_completion_(request_token_t token) noexcept {
         completion_t completion;
         completion.token = token;

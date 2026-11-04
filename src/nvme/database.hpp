@@ -41,7 +41,7 @@
 #include "ustore/pages/nvme_store.hpp"                 // `pages::nvme_store`
 #include "ustore/strings/nvme_store.hpp"               // `strings::nvme_store`, `nvme_transaction`, `strings_page_t`
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`, `join_path`, `path_max_bytes_k`, `remove_file`
-#include "ustore/utilities/nvme_mounts.hpp" // `resources_config_t`, `open_resources`, `mounted_storage`, `volume_file_name_k`
+#include "ustore/utilities/nvme_mounts.hpp" // `resources_config_t`, `open_resources`, `mounted_storage`, `addresses_of`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growth_status`
 
 #include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `state_of`, `view_t`, `nvme_placement_of`
@@ -177,33 +177,24 @@ using database_transaction_of = typename basic_database_of<cpu_class_>::transact
 template <cpu_class_t cpu_class_>
 using strings_transaction_of = nvme_transaction<basic_database_of<cpu_class_>, strings_store_of<cpu_class_>>;
 
-/** The collections system collection, mapping every collection's UUID onto its name, which no minted UUIDv7 spells,
- *  as its byte 6 is @c 0x7X. */
-inline constexpr ustore_collection_id_t collections_collection_k {
-    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD}}};
+/** @p uuid as the collection ID the C ABI addresses a collection by. */
+constexpr ustore_collection_id_t collection_id_of(uuid_t const& uuid) noexcept {
+    ustore_collection_id_t collection {};
+    for (std::size_t index = 0; index != uuid_t::size_bytes_k; ++index)
+        collection.uuid.bytes[index] = uuid.bytes[index];
+    return collection;
+}
+
+/** The collections system collection, keeping every collection's record and name, which no minted
+ *  UUIDv7 spells, as its byte 6 is @c 0x7X. */
+inline constexpr ustore_collection_id_t collections_collection_k = collection_id_of(collections_collection_uuid_k);
 
 /** The names system collection, a strings collection mapping every collection's name onto its UUID, which no minted
  *  UUIDv7 spells either. */
-inline constexpr ustore_collection_id_t names_collection_k {
-    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}}};
-
-/** The directory a mount opens its only volume in, under the database's own directory. */
-inline constexpr char data_directory_name_k[] = "data";
-
-/** Bytes the only volume of a database spans when its configuration names no capacity. */
-inline constexpr std::size_t default_volume_bytes_k = 1024ull * 1024ull * 1024ull;
+inline constexpr ustore_collection_id_t names_collection_k = collection_id_of(names_collection_uuid_k);
 
 /** Channels the threads outside an executor share, beyond one per thread of the executor opening the database. */
 inline constexpr std::size_t engine_shared_io_channels_k = 4;
-
-/** Bytes the largest value of a collection takes. */
-inline constexpr stored_value_size_t engine_value_max_size_k = 1024u * 1024u;
-
-/** Bytes one collection's memory runs hold before a flush is due, and bytes one collection's value cache holds. */
-inline constexpr std::size_t engine_collection_bytes_k = 16ull * 1024ull * 1024ull;
-
-/** Deltas one collection's memory runs hold before a flush is due. */
-inline constexpr std::size_t engine_memory_runs_deltas_k = 64ull * 1024ull;
 
 /** Bytes one caller's transaction buffers, which it takes eagerly when it opens. */
 inline constexpr std::size_t engine_transaction_bytes_k = 4ull * 1024ull * 1024ull;
@@ -257,6 +248,7 @@ inline user_collection_config_t engine_collection_defaults() noexcept {
     config.cache_limit = engine_collection_bytes_k;
     config.memory_runs_max_deltas = engine_memory_runs_deltas_k;
     config.memory_runs_max_bytes = engine_collection_bytes_k;
+    config.level_enlarge_factor = engine_level_enlarge_factor_k;
     config.value_max_size = engine_value_max_size_k;
     return config;
 }
@@ -352,8 +344,9 @@ class device_compaction {
 
   private:
 
-    /** Opens the reader over the volume file of every data directory of @p resources where @p gds lets bytes move by
-     *  DMA and cuFile reaches the device, refusing @c ustore_gds_direct_k where it does not. */
+    /** Opens the reader over every raw medium of @p resources where @p gds lets bytes move by DMA
+     *  and cuFile reaches the device, refusing @c ustore_gds_direct_k where it does not and over
+     *  a directory volume. */
     status_t open_sections(cufile_api_t const& cufile, ustore_gds_t gds, resources_config_t const& resources) noexcept {
         if (gds == ustore_gds_compatibility_k) return {};
         if (sections_disk_of<cpu_class_>::probe(cufile) != linux_cufile_probe_t::direct_k) {
@@ -361,21 +354,33 @@ class device_compaction {
                 return {status_code_t::device_k, "GPUDirect Storage needs the nvidia_fs module, which is absent"};
             return {};
         }
-        std::size_t const volumes = resources.data_directories.size();
+        auto [addresses, addresses_status] = addresses_of(resources);
+        if (addresses_status.failed()) return addresses_status;
+        // A directory volume keeps a file per run, which the reader opens by data directory and not
+        // yet by run.
+        if (addresses.data_directories[0].kind == data_address_kind_t::directory_k) {
+            if (gds == ustore_gds_direct_k)
+                return {status_code_t::unsupported_k, "GPUDirect Storage does not yet read a directory volume's runs"};
+            return {};
+        }
+        std::size_t const media_count = addresses.data_directories.size();
         linux_cufile_disk_config_t config;
         config.gds = ustore_gds_direct_k;
-        if (volumes > config.media_limit) config.media_limit = static_cast<std::uint16_t>(volumes);
+        if (media_count > config.media_limit) config.media_limit = static_cast<std::uint16_t>(media_count);
         auto [disk, disk_status] = sections_disk_of<cpu_class_>::make(cufile, config);
         if (disk_status.failed()) return disk_status;
         st::vector<std::array<char, path_max_bytes_k>> paths;
         st::vector<medium_options_t> media;
-        if (paths.resize(volumes) != st::status_t::success_k || media.resize(volumes) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "The compactions could not track their volumes"};
-        for (std::size_t index = 0; index != volumes; ++index) {
-            if (status_t const joined = join_path(resources.data_directories[index].path.c_str(), volume_file_name_k,
-                                                  paths[index]);
-                joined.failed())
-                return joined;
+        if (paths.resize(media_count) != st::status_t::success_k ||
+            media.resize(media_count) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "The compactions could not track their media"};
+        // Raw media are read in data directory order, which is the index a run's extent names.
+        for (std::size_t index = 0; index != media_count; ++index) {
+            std::string_view const location = addresses.data_directories[index].location;
+            if (location.size() >= path_max_bytes_k)
+                return {status_code_t::invalid_argument_k, "A raw medium's path outgrew the platform's limit"};
+            std::memcpy(paths[index].data(), location.data(), location.size());
+            paths[index][location.size()] = '\0';
             media[index].name = paths[index].data();
             media[index].access = medium_access_t::read_only_k;
         }
@@ -918,36 +923,65 @@ status_t collection_modality(database_state<cpu_class_>& state, collection_id_t 
     return {};
 }
 
-/** Creates the collection @p collection named @p name, holding @p modality, shaped as @p shape, in the store tagged
- *  for values of one 16-byte key for strings and of the layout of their width otherwise. */
-template <cpu_class_t cpu_class_>
-status_t create_collection(database_state<cpu_class_>& state, collection_id_t const& collection, std::string_view name,
-                           ustore_modality_t modality, collection_config_t const& shape) noexcept {
+/** The tag of the store keeping a collection of @p modality shaped as @p shape, @c store_tags_k's
+ *  size for none. */
+inline std::uint16_t store_tag_for(ustore_modality_t modality, collection_config_t const& shape) noexcept {
     value_layout_t const layout = entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k
                                       ? value_layout_t::uuid_k
                                       : resolve_value_layout(shape.lsm_tree.lsm_level_0.sorted_run.value_size);
-    std::uint16_t const store_tag = store_tag_of(modality, layout);
-    if (store_tags_t::index_of(store_tag) == std::size(store_tags_k))
-        return {status_code_t::unsupported_k, "No store keeps a collection of that modality and layout"};
-    return state.store->create_collection(collection, string_view_t {name}, store_tag, shape);
+    return store_tag_of(modality, layout);
 }
 
-/** What the engine knows of a listed collection: its modality, which the store records, and its name, which the
- *  collections system collection records, empty for an anonymous one. */
+/** Creates the collection @p collection named @p name, holding @p modality, shaped as @p shape, in
+ *  the store tagged for values of one 16-byte key for strings and of the layout of their width
+ *  otherwise; the manifest naming it also names the memory runs of @p flushed_with, which the
+ *  caller wrote its listing into. */
+template <cpu_class_t cpu_class_>
+status_t create_collection(database_state<cpu_class_>& state, collection_id_t const& collection, std::string_view name,
+                           ustore_modality_t modality, collection_config_t const& shape,
+                           collection_id_t flushed_with = collection_invalid_id_k) noexcept {
+    std::uint16_t const store_tag = store_tag_for(modality, shape);
+    if (store_tags_t::index_of(store_tag) == std::size(store_tags_k))
+        return {status_code_t::unsupported_k, "No store keeps a collection of that modality and layout"};
+    return state.store->create_collection(collection, string_view_t {name}, store_tag, shape, flushed_with);
+}
+
+/** Lays the record of a collection of @p store_tag shaped as @p shape and named @p name out
+ *  into @p into. */
+inline status_t lay_out_collections_record(std::uint16_t store_tag, collection_config_t const& shape,
+                                           std::string_view name, st::vector<byte_t>& into) noexcept {
+    collections_record_t record;
+    record.store_tag = store_tag;
+    record.value_size = static_cast<std::uint32_t>(shape.lsm_tree.lsm_level_0.sorted_run.value_size);
+    record.value_max_size = static_cast<std::uint32_t>(shape.lsm_tree.lsm_level_0.sorted_run.value_max_size);
+    record.level_enlarge_factor = shape.lsm_tree.level_enlarge_factor;
+    record.cache_limit = shape.cache_limit;
+    record.memory_runs_max_bytes = shape.memory_runs_max_bytes;
+    record.memory_runs_max_deltas = shape.memory_runs_max_deltas;
+    if (into.resize(sizeof(record) + name.size()) != st::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "No room for a collections record"};
+    std::memcpy(into.data(), &record, sizeof(record));
+    if (!name.empty()) std::memcpy(into.data() + sizeof(record), name.data(), name.size());
+    return {};
+}
+
+/** What the engine knows of a listed collection: its modality and its name, empty for
+ *  an anonymous one. */
 struct collections_entry_t {
     ustore_modality_t modality {};
     std::string_view name;
 };
 
-/** The entry of @p collection, whose listing in the collections system collection is @p held, refusing one the store
- *  no longer holds. */
+/** The entry @p held, a listing of the collections system collection, carries. */
 template <cpu_class_t cpu_class_>
-expected<collections_entry_t> read_collections_entry(database_state<cpu_class_>& state,
-                                                     ustore_collection_id_t const& collection,
+expected<collections_entry_t> read_collections_entry(database_state<cpu_class_>&, ustore_collection_id_t const&,
                                                      value_view_t held) noexcept {
-    collections_entry_t entry {ustore_modality_t {}, std::string_view {held}};
-    if (status_t const known = collection_modality(state, collection, entry.modality); known.failed()) return known;
-    return entry;
+    std::string_view const bytes {held};
+    if (bytes.size() < sizeof(collections_record_t))
+        return status_t {status_code_t::malformed_k, "A collections record is shorter than its fields"};
+    collections_record_t record;
+    std::memcpy(&record, bytes.data(), sizeof(record));
+    return collections_entry_t {modality_of(record.store_tag), bytes.substr(sizeof(record))};
 }
 
 /** What the collections system collection records of @p collection at @p stamp, refusing one it does not list, the
@@ -1346,7 +1380,11 @@ status_t drop_collection(database_state<cpu_class_>& state, ustore_arena_t scrat
         auto [listing, read_status] = read_value(head, collections_collection_k, listed);
         if (read_status.failed()) return read_status;
         if (!listing) return {status_code_t::not_found_k, "No collection has such identifier"};
-        if (std::string_view const name {listing}; !name.empty())
+        std::string_view const record {listing};
+        std::string_view const name = record.size() > sizeof(collections_record_t)
+                                          ? record.substr(sizeof(collections_record_t))
+                                          : std::string_view {};
+        if (!name.empty())
             if (status_t const unnamed = write_name(state, scratch, name, nullptr); unnamed.failed()) return unnamed;
         if (status_t const unlisted = write_value(head, collections_collection_k, listed, {}); unlisted.failed())
             return unlisted;
@@ -1355,7 +1393,8 @@ status_t drop_collection(database_state<cpu_class_>& state, ustore_arena_t scrat
             state.retired_collections.push_back(ustore_collection_id_t {collection}) == st::status_t::success_k)
             return {};
     }
-    return state.store->drop_collection(collection);
+    // The unlisting reaches a run in the same manifest that stops naming the collection
+    return state.store->drop_collection(collection, collections_collection_k);
 }
 
 /** Drops every collection a drop left for the snapshots, which the last snapshot freed no longer reads. */
@@ -1451,8 +1490,9 @@ status_t collection_list(ustore_collection_list_t const& arguments, view_t const
     return outputs.finish(arguments);
 }
 
-/** Implements @c ustore_collection_create: the collection's runs first, then its collections entry and name in one
- *  commit, which drops the runs again when the name is taken. */
+/** Implements @c ustore_collection_create: the collections record and the name first, then the
+ *  collection, whose manifest also names the run the record lands in, unlisting it again when the
+ *  store refuses the collection. */
 template <cpu_class_t cpu_class_>
 status_t collection_create(ustore_collection_create_t const& arguments, view_t const& view) noexcept {
     auto [name, name_status] = validate_collection_create(arguments);
@@ -1467,35 +1507,42 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
     collection_config_t const shape = entry_layout_of(arguments.modality) == entry_layout_t::strings_to_uuids_k
                                           ? strings_shape_of(state.collection_shape)
                                           : state.collection_shape;
-    if (status_t const made = create_collection(state, created, std::string_view {text, sizeof(text)},
-                                                arguments.modality, shape);
-        made.failed())
-        return made;
+    std::uint16_t const store_tag = store_tag_for(arguments.modality, shape);
+    st::vector<byte_t> record;
+    if (status_t const laid = lay_out_collections_record(store_tag, shape, name, record); laid.failed()) return laid;
 
-    // The collections system collection changes under its own claim, outside the registry, and lists the collection
-    // before the names system collection names it
+    // The collections system collection changes under its own claim, outside the registry, and
+    // lists the collection before the names system collection names it; the create's manifest then
+    // names the collection and the run its listing lands in at once, so the two never disagree
+    // after a crash
+    call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, view.scratch};
     status_t listed;
+    bool taken = false;
     {
         collections_guard<cpu_class_> const held {state};
-        call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, view.scratch};
-        bool taken = false;
         ustore_collection_id_t holder;
         if (!name.empty()) listed = look_up_name(head, name, holder, taken);
         if (listed.succeeded() && taken)
             listed = {status_code_t::already_exists_k, "A collection already carries the name"};
         if (listed.succeeded())
-            listed = write_value(head, collections_collection_k, stored_of(created.uuid), value_view_t {name});
+            listed = write_value(head, collections_collection_k, stored_of(created.uuid),
+                                 value_view_t {std::span<byte_t const> {record}});
         if (listed.succeeded() && !name.empty()) {
             listed = write_name(state, view.scratch, name, &created);
-            if (listed.failed()) {
-                [[maybe_unused]] status_t const unlisted = write_value(head, collections_collection_k,
-                                                                       stored_of(created.uuid), {});
-            }
+            if (listed.failed()) [[maybe_unused]]
+                status_t const unlisted = write_value(head, collections_collection_k, stored_of(created.uuid), {});
         }
     }
-    if (listed.failed()) {
-        [[maybe_unused]] status_t const dropped = state.store->drop_collection(created);
-        return listed;
+    if (listed.failed()) return listed;
+    status_t const made = create_collection(state, created, std::string_view {text, sizeof(text)}, arguments.modality,
+                                            shape, collections_collection_k);
+    if (made.failed()) {
+        collections_guard<cpu_class_> const held {state};
+        if (!name.empty()) [[maybe_unused]]
+            status_t const unnamed = write_name(state, view.scratch, name, nullptr);
+        [[maybe_unused]] status_t const unlisted = write_value(head, collections_collection_k, stored_of(created.uuid),
+                                                               {});
+        return made;
     }
     if (!name.empty())
         if (status_t const flushed = state.store->flush(); flushed.failed()) return flushed;
@@ -1617,11 +1664,12 @@ status_t transaction_rollback(ustore_transaction_rollback_t const&, view_t const
 
 #pragma region Lifetime
 
-/** Fills @p resources with the directories @p arguments name, one data directory inside the database's own when they
- *  name none. */
+/** Fills @p resources with the manifest and the data directories @p arguments name; data
+ *  directory 0 is the manifest's own directory, or the raw address it names, and a quota of zero
+ *  takes the whole medium. */
 inline status_t read_directories(ustore_database_open_nvme_t const& arguments, resources_config_t& resources) noexcept {
-    if (sz::failed(resources.directory.assign(string_view_t {string_of(arguments.directory)})))
-        return {status_code_t::out_of_memory_k, "Failed to copy the directory"};
+    if (sz::failed(resources.manifest.assign(string_view_t {string_of(arguments.directory)})))
+        return {status_code_t::out_of_memory_k, "Failed to copy the manifest path"};
     if (arguments.data_directories_count && !arguments.data_directories)
         return {status_code_t::invalid_argument_k, "Counted data directories are null"};
     for (std::size_t index = 0; index != arguments.data_directories_count; ++index) {
@@ -1630,21 +1678,26 @@ inline status_t read_directories(ustore_database_open_nvme_t const& arguments, r
         data_directory_config_t directory;
         if (sz::failed(directory.path.assign(string_view_t {string_of(given.path)})))
             return {status_code_t::out_of_memory_k, "Failed to copy a data directory"};
-        directory.max_size = given.max_bytes ? given.max_bytes : default_volume_bytes_k;
+        directory.max_size = given.max_bytes;
         if (st::failed(resources.data_directories.push_back(std::move(directory))))
             return {status_code_t::out_of_memory_k, "Failed to list the data directories"};
     }
-    if (!resources.data_directories.empty()) return {};
+    return {};
+}
 
-    char path[path_max_bytes_k];
-    if (status_t const joined = join_path(resources.directory.c_str(), data_directory_name_k, path); joined.failed())
-        return joined;
-    data_directory_config_t only;
-    if (sz::failed(only.path.assign(string_view_t {path})))
-        return {status_code_t::out_of_memory_k, "Failed to copy the data directory"};
-    only.max_size = default_volume_bytes_k;
-    if (st::failed(resources.data_directories.push_back(std::move(only))))
-        return {status_code_t::out_of_memory_k, "Failed to list the data directory"};
+/** The directory the manifest of @p resources sits in, into @p into, or an empty path for
+ *  a raw address. */
+inline status_t manifest_directory_of(resources_config_t const& resources, std::span<char> into) noexcept {
+    auto [addresses, addresses_status] = addresses_of(resources);
+    if (addresses_status.failed()) return addresses_status;
+    std::string_view const location = addresses.data_directories[0].location;
+    bool const raw = addresses.data_directories[0].kind != data_address_kind_t::directory_k;
+    if (raw || location.size() >= into.size()) {
+        into[0] = '\0';
+        return raw ? status_t {} : status_t {status_code_t::invalid_argument_k, "A manifest path outgrew the limit"};
+    }
+    std::memcpy(into.data(), location.data(), location.size());
+    into[location.size()] = '\0';
     return {};
 }
 
@@ -1712,8 +1765,9 @@ status_t reserve_collection(database_state<cpu_class_>& state, collection_id_t c
     return create_collection(state, collection, name, modality, shape);
 }
 
-/** Drops every collection of the store the collections system collection does not list, which a crash between a
- *  create's two steps leaves behind. */
+/** Drops every collection of the store the collections system collection does not list, and
+ *  unlists every listed one the store does not hold, which a crash between a create's or a drop's
+ *  two steps leaves behind. */
 template <cpu_class_t cpu_class_>
 status_t drop_unlisted(database_state<cpu_class_>& state, ustore_arena_t scratch) noexcept {
     st::vector<collection_ids_t> const held = state.store->list_collections();
@@ -1725,7 +1779,22 @@ status_t drop_unlisted(database_state<cpu_class_>& state, ustore_arena_t scratch
         if (look_up_status == status_code_t::not_found_k) first = state.store->drop_collection(id);
         else if (look_up_status.failed()) first = look_up_status;
     }
-    return first;
+    if (first.failed()) return first;
+
+    st::vector<listed_collection_t, arena_allocator<listed_collection_t>> listed {{scratch}};
+    if (status_t const collected = list_collections(state, scratch, listed); collected.failed()) return collected;
+    collections_guard<cpu_class_> const guarded {state};
+    call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch};
+    for (listed_collection_t const& collection : listed) {
+        if (state.store->has_collection(collection.id)) continue;
+        if (!collection.entry.name.empty())
+            if (status_t const unnamed = write_name(state, scratch, collection.entry.name, nullptr); unnamed.failed())
+                return unnamed;
+        if (status_t const unlisted = write_value(head, collections_collection_k, stored_of(collection.id.uuid), {});
+            unlisted.failed())
+            return unlisted;
+    }
+    return {};
 }
 
 /** The compactor every merge of @p state runs on: the device compaction @p state owns over an executor of its own on
@@ -1748,7 +1817,7 @@ status_t mount_store(database_state<cpu_class_>& state, database_config_t const&
     return state.resources->storage.visit([&](auto& mount) noexcept -> status_t {
         using mount_t = std::remove_reference_t<decltype(mount)>;
         if constexpr (std::is_same_v<mount_t, storage_mount_of<cpu_class_>>)
-            return state.store->mount(mount.router(), mount.channels(), transactions, compactor);
+            return state.store->mount(mount.volume(), mount.channels(), transactions, compactor);
         else return {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     });
 }
@@ -1762,8 +1831,7 @@ status_t open_state(database_state<cpu_class_>& state, resources_config_t const&
     state.collection_shape = shape;
     state.transaction_shape = transactions.default_transaction;
     auto [opened, open_status] =
-        open_resources<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>(resources,
-                                                                                                   uuid_t {});
+        open_resources<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>(resources);
     if (open_status.failed()) return open_status;
     state.resources = std::move(opened);
     state.store.reset(new (std::nothrow) basic_database_of<cpu_class_> {state.resources});
@@ -1772,19 +1840,18 @@ status_t open_state(database_state<cpu_class_>& state, resources_config_t const&
     if (compactor_status.failed()) return compactor_status;
     if (status_t const mounted = mount_store(state, transactions, compactor); mounted.failed()) return mounted;
 
-    // The collections system collection holds the names of collections, whatever one width the caller's values take
-    collection_config_t records = shape;
-    sorted_run_config_t& record_values = records.lsm_tree.lsm_level_0.sorted_run;
-    if (record_values.value_size != 0)
-        record_values.value_max_size = static_cast<stored_value_size_t>(
-            std::min<std::size_t>(engine_value_max_size_k, records.memory_runs_max_bytes));
-    record_values.value_size = 0;
+    // Both system collections take the records a recovery rebuilds them with, whatever bounds
+    // the open names
+    collection_config_t records = config_of(
+        default_reserved_record(collections_collection_uuid_k, engine_value_max_size_k));
+    collection_config_t names = config_of(default_reserved_record(names_collection_uuid_k, 0));
+    records.concurrency_limit = names.concurrency_limit = shape.concurrency_limit;
     if (status_t const reserved = reserve_collection(state, collections_collection_k, "_collections",
                                                      ustore_modality_blobs_k, records);
         reserved.failed())
         return reserved;
     if (status_t const reserved = reserve_collection(state, names_collection_k, "_names", ustore_modality_strings_k,
-                                                     strings_shape_of(shape));
+                                                     names);
         reserved.failed())
         return reserved;
     return drop_unlisted(state, scratch);
@@ -1794,16 +1861,20 @@ status_t open_state(database_state<cpu_class_>& state, resources_config_t const&
 template <cpu_class_t cpu_class_>
 status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& arguments, view_t const& view) noexcept {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
-    if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
+    if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a manifest"};
 
     resources_config_t resources;
     database_config_t transactions;
     transactions.default_transaction = {engine_transaction_bytes_k, engine_transaction_deltas_k};
     user_collection_config_t collections = engine_collection_defaults();
     if (status_t const read = read_directories(arguments, resources); read.failed()) return read;
-    auto [exists, exists_status] = directory_exists(resources.directory.c_str());
-    if (exists_status.failed()) return exists_status;
-    if (!exists) return {status_code_t::not_found_k, "The directory doesn't exist"};
+    char directory[path_max_bytes_k];
+    if (status_t const located = manifest_directory_of(resources, directory); located.failed()) return located;
+    if (directory[0] != '\0') {
+        auto [exists, exists_status] = directory_exists(directory);
+        if (exists_status.failed()) return exists_status;
+        if (!exists) return {status_code_t::not_found_k, "The manifest's directory doesn't exist"};
+    }
     ustore_executor_handle_t const* compactions = nullptr;
     if (status_t const read = read_options(arguments, resources, transactions, collections, compactions); read.failed())
         return read;
@@ -1959,11 +2030,11 @@ status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t
 }
 
 /**
- *  @brief Implements @c ustore_snapshot_save as a database of this engine in the directory it names, holding every
- *      collection as the snapshot reads it.
+ *  @brief Implements @c ustore_snapshot_save as a database of this engine at the manifest path or
+ *      the raw address it names, holding every collection as the snapshot reads it.
  *
- *  A save its progress cancels, or one that fails, removes the volume it wrote and the directories it made, so a retry
- *  at the same path saves afresh.
+ *  A save its progress cancels, or one that fails, removes the run files and the manifest it wrote
+ *  and the directory it made, so a retry at the same path saves afresh.
  */
 template <cpu_class_t cpu_class_>
 status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& view) noexcept {
@@ -1973,7 +2044,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
 
     ustore_database_open_nvme_t saving {};
     saving.directory = arguments.path;
-    if (!saving.directory.length) return {status_code_t::invalid_argument_k, "A save needs a directory"};
+    if (!saving.directory.length) return {status_code_t::invalid_argument_k, "A save needs a manifest path"};
     resources_config_t resources;
     database_config_t transactions;
     transactions.default_transaction = source.transaction_shape;
@@ -1983,54 +2054,29 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     ustore_executor_handle_t const* host_merges = nullptr;
     if (status_t const read = read_options(saving, resources, transactions, collections, host_merges); read.failed())
         return read;
-    auto [existed, exists_status] = directory_exists(resources.directory.c_str());
-    if (exists_status.failed()) return exists_status;
-
-    st::vector<collection_ids_t> const held = source.store->list_collections();
-    ustore_size_t total = 0;
-    if (arguments.progress)
-        for (collection_ids_t const& collection : held) {
-            ustore_modality_t modality {};
-            if (status_t const known = collection_modality(source, collection.id, modality); known.failed())
-                return known;
-            status_t const measured = entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k
-                                          ? walk_strings(access, collection.id, {}, {}, access.stamp,
-                                                         [&](std::string_view text, lookup_result_t found,
-                                                             ustore_key_t const&) noexcept {
-                                                             if (found == lookup_result_t::written_k)
-                                                                 total += text.size() + sizeof(ustore_uuid_t);
-                                                             return true;
-                                                         })
-                                          : walk(access, collection.id, limit<stored_key_t>::min(),
-                                                 [&](stored_key_t, stored_value_size_t size) noexcept {
-                                                     total += sizeof(stored_key_t) + size;
-                                                     return true;
-                                                 });
-            if (measured.failed()) return measured;
-        }
-    progress_t progress {arguments.progress, arguments.progress_state, total};
-
-    status_t saved;
-    {
-        std::unique_ptr<database_state<cpu_class_>> target {new (std::nothrow) database_state<cpu_class_>};
-        saved = target ? open_state<cpu_class_>(*target, resources, transactions, source.collection_shape, view.scratch,
-                                                host_merges)
-                       : status_t {status_code_t::out_of_memory_k, "Failed to allocate the database"};
-        for (collection_ids_t const& collection : held)
-            if (saved.succeeded()) saved = save_collection(access, collection, *target, progress);
-        if (saved.succeeded()) saved = target->store->flush();
-        if (saved.succeeded()) return {};
+    char directory[path_max_bytes_k];
+    if (status_t const located = manifest_directory_of(resources, directory); located.failed()) return located;
+    // A raw target names no directory, so a failed save there leaves nothing to remove
+    bool existed = true;
+    if (directory[0] != '\0') {
+        auto [found, exists_status] = directory_exists(directory);
+        if (exists_status.failed()) return exists_status;
+        existed = found;
     }
 
-    // The store is closed by now, so the volume file it kept, and the directories the open made, go with it
-    for (data_directory_config_t const& directory : resources.data_directories) {
-        char path[path_max_bytes_k];
-        if (join_path(directory.path.c_str(), volume_file_name_k, path).succeeded()) [[maybe_unused]]
-            status_t const removed = remove_file(path);
-        [[maybe_unused]] status_t const emptied = remove_directory(directory.path.c_str());
-    }
-    if (!existed) [[maybe_unused]]
-        status_t const emptied = remove_directory(resources.directory.c_str());
+    auto [addresses, addresses_status] = addresses_of(resources);
+    if (addresses_status.failed()) return addresses_status;
+    volume_config_t target;
+    target.database = addresses.database;
+    target.data_directories = std::span<data_address_t const> {addresses.data_directories};
+    auto report = [&](std::uint64_t placed, std::uint64_t total) noexcept {
+        return !arguments.progress || arguments.progress(placed, total, arguments.progress_state) != ustore_cancel_k;
+    };
+    status_t const saved = source.store->save(target, access.stamp, report).status();
+    // A cancelled or failed save gave back every run it placed, and the directory it made
+    // goes with them
+    if (saved.failed() && !existed) [[maybe_unused]]
+        status_t const emptied = remove_directory(directory);
     return saved;
 }
 

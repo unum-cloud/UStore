@@ -27,15 +27,15 @@
 
 #include <algorithm> // `std::max`, `std::min`, `std::sort`
 #include <atomic>    // `std::atomic_thread_fence`, `std::memory_order_acquire`, `std::memory_order_release`
-#include <memory>    // `std::unique_ptr`
-#include <new>       // `std::nothrow`
+#include <memory>    // `std::construct_at`, `std::destroy_at`
 #include <span>      // `std::span`
 #include <utility>   // `std::exchange`, `std::move`
 
 #include <forkunion/types.hpp> // `fu::default_alignment_k`
 
-#include <smashtable/basic_vector.hpp> // `st::vector`, `st::assume_reserved`
-#include <smashtable/shared.hpp>       // `st::basic_commit_order`, `st::standard_waiting_policy`
+#include <smashtable/basic_vector.hpp>   // `st::vector`, `st::assume_reserved`
+#include <smashtable/intrusive_list.hpp> // `st::intrusive_list`
+#include <smashtable/shared.hpp>         // `st::basic_commit_order`, `st::standard_waiting_policy`
 
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`
 #include "ustore/blobs/nvme_memory_run.hpp"      // `kept_versions`, `stamped_delta`
@@ -240,6 +240,9 @@ class commit_ledger {
      *  @note A thread already holding the leader word waits on itself here, as a staged transaction's would.
      */
     expected<transaction_stamp_t> submit(commit_request_t& request) noexcept {
+        // A resubmitted request still carries the refusal it came back with, which would return
+        // it at once.
+        request.outcome = commit_outcome_t::pending_k;
         atomic_reference_<commit_request_t*> const pending {pending_};
         commit_request_t* next = pending.load(std::memory_order_relaxed);
         do request.next = next;
@@ -833,6 +836,9 @@ class published_runs {
     /** One immutable run of that tree. */
     using sorted_run_t = typename tree_t::sorted_run_t;
 
+    /** The database's pool the runs of that tree live in. */
+    using run_pool_t = typename tree_t::run_pool_t;
+
     /** The stamps the store's writes carry and its readers pin. */
     using ledger_t = commit_ledger<atomic_reference_, waiter_type_>;
 
@@ -866,6 +872,10 @@ class published_runs {
         /** Its room in the ledger's list of what the leader unpublished, once a publication replaces it. */
         unpublished_t unpublished;
 
+        /** The budget the view is charged to, which takes its bytes back once the
+         *  ledger frees it. */
+        constraint_t* constraint = nullptr;
+
         /** How its runs are arranged, which a flush, a compaction or a merge of memory runs moves past and a commit,
          *  only putting a newer run ahead, keeps. */
         std::uint64_t layout_generation = 0;
@@ -888,8 +898,36 @@ class published_runs {
     published_runs() noexcept = default;
     published_runs(published_runs const&) = delete;
     published_runs& operator=(published_runs const&) = delete;
-    published_runs(published_runs&&) noexcept = default;
-    published_runs& operator=(published_runs&&) noexcept = default;
+
+    published_runs(published_runs&& other) noexcept
+        : config_(other.config_), constraint_(std::exchange(other.constraint_, nullptr)),
+          ledger_(std::exchange(other.ledger_, nullptr)), tree_(std::move(other.tree_)),
+          view_pin_(std::move(other.view_pin_)), view_(std::move(other.view_)),
+          current_(std::exchange(other.current_, nullptr)), memory_runs_(std::move(other.memory_runs_)),
+          memory_order_(std::exchange(other.memory_order_, memory_order_t {})),
+          prepared_view_(std::exchange(other.prepared_view_, nullptr)),
+          prepared_run_(std::exchange(other.prepared_run_, absent_run_k)) {}
+
+    published_runs& operator=(published_runs&& other) noexcept {
+        if (this == &other) return *this;
+        release_views_();
+        config_ = other.config_;
+        constraint_ = std::exchange(other.constraint_, nullptr);
+        ledger_ = std::exchange(other.ledger_, nullptr);
+        tree_ = std::move(other.tree_);
+        view_pin_ = std::move(other.view_pin_);
+        view_ = std::move(other.view_);
+        current_ = std::exchange(other.current_, nullptr);
+        memory_runs_ = std::move(other.memory_runs_);
+        memory_order_ = std::exchange(other.memory_order_, memory_order_t {});
+        prepared_view_ = std::exchange(other.prepared_view_, nullptr);
+        prepared_run_ = std::exchange(other.prepared_run_, absent_run_k);
+        return *this;
+    }
+
+    /** Gives the published view and any prepared one back to the budget; the memory runs go
+     *  with their pool. */
+    ~published_runs() noexcept { release_views_(); }
 
     /**
      *  @brief Mounts an empty tree over @p volume and publishes a view naming it alone.
@@ -897,20 +935,25 @@ class published_runs {
      *  @param[in] config The bounds of the memory runs and the shape of the tree below.
      *  @param[in,out] constraint The budget the memory runs are charged to.
      *  @param[in,out] ledger The stamps the store's writes carry and its readers pin, outliving the runs.
+     *  @param[in,out] runs The database's pool the tree's runs live in, outliving the store.
      */
-    status_t mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
-                   ledger_t& ledger) noexcept {
+    status_t mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint, ledger_t& ledger,
+                   run_pool_t& runs) noexcept {
         config_ = config;
         constraint_ = &constraint;
         ledger_ = &ledger;
         if (config.memory_runs_max_deltas == 0)
             return {status_code_t::invalid_argument_k, "A collection holds at least one write in memory"};
 
-        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, config.memory_runs_max_bytes);
+        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, runs);
         if (mount_tree_status.failed()) return mount_tree_status;
         tree_ = std::move(tree);
-        current_.reset(new (std::nothrow) view_t {});
-        if (!current_) return {status_code_t::out_of_memory_k, "A store could not hold a view"};
+        auto [records, records_status] = memory_run_pool_t::make(memory_run_records_(config), constraint);
+        if (records_status.failed()) return records_status;
+        memory_runs_ = std::move(records);
+        auto [view, view_status] = make_view_(view_t {});
+        if (view_status.failed()) return view_status;
+        current_ = view;
         current_->levels = &tree_.levels();
         view_.replace(*current_);
         ledger.register_view(view_pin_);
@@ -918,12 +961,14 @@ class published_runs {
     }
 
     /** Returns every run to the volume and forgets every memory run, which destroys the data and which only a store no
-     *  reader reaches and no commit names may. */
-    status_t destroy(io_channel_t& channel) noexcept {
+     *  reader reaches and no manifest names may. */
+    void destroy() noexcept {
         current_->memory_runs = memory_view_t::of(typename memory_view_t::runs_t {});
-        memory_runs_.clear();
+        for (std::uint32_t index = memory_order_.pop(memory_runs_); index != memory_order_t::absent_k;
+             index = memory_order_.pop(memory_runs_))
+            memory_runs_.vacate(memory_runs_.handle_of(memory_runs_[index]));
         ledger_->bound_view(view_pin_, head_stamp_k);
-        return tree_.destroy(channel);
+        tree_.destroy();
     }
 
 #pragma endregion Construction
@@ -1013,8 +1058,11 @@ class published_runs {
         std::uint64_t const all_bytes = memory_bytes_(view) + bytes;
         std::uint64_t const deltas_bound = config_.memory_runs_max_deltas;
         std::uint64_t const bytes_bound = config_.memory_runs_max_bytes;
-        // One flush in flight and one buffer filling behind it.
-        if (all_deltas > 2 * deltas_bound || all_bytes > 2 * bytes_bound) return memory_pressure_t::stalled_k;
+        // One flush in flight and one buffer filling behind it, or every record but the commits
+        // beside them taken.
+        if (all_deltas > 2 * deltas_bound || all_bytes > 2 * bytes_bound ||
+            view.memory_runs.runs().size() >= merged_memory_runs_(config_))
+            return memory_pressure_t::stalled_k;
         if (all_deltas > deltas_bound || all_bytes > bytes_bound) return memory_pressure_t::flush_due_k;
         return memory_pressure_t::fits_k;
     }
@@ -1043,41 +1091,55 @@ class published_runs {
 #pragma region Commits
 
     /**
-     *  @brief Lays out the view naming @p run, when not null, ahead of the current ones, so @c publish cannot fail.
+     *  @brief Takes a memory-run record and lays out the view naming its run ahead of the current
+     *      ones, so @c publish cannot fail.
+     *  @return Success, @c capacity_exhausted_k when every record is taken, which the
+     *      committer meets by making room and resubmitting, or @c out_of_memory_k when the
+     *      budget refuses the view.
      *  @note Called by the thread holding the ledger's leader word, which then publishes or forgets it before it lets
      *      the word go.
      */
-    status_t prepare(memory_run_t const* run) noexcept {
+    status_t prepare() noexcept {
         forget_prepared();
-        auto [view, view_status] = next_view_(run, current_->memory_runs.runs(), current_->oldest_readable,
-                                              current_->layout_generation);
-        if (view_status.failed() || memory_runs_.reserve(memory_runs_.size() + 1) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to prepare a commit"};
+        auto [record, take_status] = memory_runs_.take(memory_run_record_t {});
+        if (take_status.failed()) return take_status;
+        auto [view, view_status] = next_view_(&memory_runs_[record.index].run, current_->memory_runs.runs(),
+                                              current_->oldest_readable, current_->layout_generation);
+        if (view_status.failed()) {
+            memory_runs_.vacate(record);
+            return view_status;
+        }
         view->levels = current_->levels;
-        prepared_view_ = std::move(view);
+        prepared_view_ = view;
+        prepared_run_ = record;
         return {};
     }
 
-    /** Publishes the view @c prepare laid out and takes @p run over, stamped @p stamp, which the leader does before it
-     *  publishes @p stamp itself, so a reader at the stamp finds the run. */
-    void publish(std::unique_ptr<memory_run_t> run, transaction_stamp_t stamp) noexcept {
+    /** Moves @p run, stamped @p stamp, into the record @c prepare took and publishes the view it
+     *  laid out, which the leader does before it publishes @p stamp itself, so a reader at the
+     *  stamp finds the run. */
+    void publish(memory_run_t&& run, transaction_stamp_t stamp) noexcept {
         assert(prepared_view_ && "A commit publishes only what its leader prepared");
         // The durable horizon stays below the oldest commit that only memory holds.
         if (current_->memory_runs.runs().empty()) ledger_->bound_view(view_pin_, stamp - 1);
-        replace_view_(std::move(prepared_view_));
-        [[maybe_unused]] st::status_t const owned = memory_runs_.push_back(st::assume_reserved, std::move(run));
+        memory_runs_[prepared_run_.index].run = std::move(run);
+        memory_order_.push(memory_runs_, std::exchange(prepared_run_, absent_run_k).index);
+        replace_view_(std::exchange(prepared_view_, nullptr));
     }
 
-    /** Drops the view @c prepare laid out, which the leader does for a commit it then refuses. */
-    void forget_prepared() noexcept { prepared_view_.reset(); }
+    /** Drops the view @c prepare laid out and gives its record back, which the leader does for a
+     *  commit it then refuses. */
+    void forget_prepared() noexcept {
+        if (prepared_view_ != nullptr) destroy_view_(std::exchange(prepared_view_, nullptr));
+        memory_runs_.vacate(std::exchange(prepared_run_, absent_run_k));
+    }
 
-    /** Opens the runs @p runs names as the tree, each run an ingest stamped taking its stamp from @p stamps again,
+    /** Opens the runs @p runs names as the tree, each run an ingest stamped taking its stamp again,
      *  which a mount does before anything reads. */
-    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
-                     std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
+    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs) noexcept {
         publication_t publication;
         publication.owner = this;
-        return tree_.restore(channel, runs, stamps, publication.hook());
+        return tree_.restore(channel, runs, publication.hook());
     }
 
 #pragma endregion Commits
@@ -1130,15 +1192,24 @@ class published_runs {
                                                                 group.back()->oldest_stamp(), group.back()->tier(),
                                                                 typename memory_run_t::allocator_t {*constraint_});
             if (merged_status.failed()) return merged_status;
-            std::unique_ptr<memory_run_t> merged_run {new (std::nothrow) memory_run_t {std::move(merged)}};
             // The replaced runs, freed here once the publication waited out every reader that could hold one.
-            st::vector<std::unique_ptr<memory_run_t>> away;
-            if (!merged_run || away.reserve(fan_in) != st::status_t::success_k)
+            st::vector<memory_run_handle_t> away;
+            if (away.reserve(fan_in) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "No room to merge memory runs"};
-            if (status_t const published = publish_merged_(std::span<memory_run_t const* const> {group},
-                                                           std::move(merged_run), away, survival.horizon);
-                published.failed())
+            memory_run_record_t laid_out;
+            laid_out.run = std::move(merged);
+            auto [record, take_status] = memory_runs_.take(std::move(laid_out));
+            // With every record taken the runs wait for the flush the stall runs, which
+            // frees them all.
+            if (take_status == status_code_t::capacity_exhausted_k) return {};
+            if (take_status.failed()) return take_status;
+            if (status_t const published = publish_merged_(std::span<memory_run_t const* const> {group}, record, away,
+                                                           survival.horizon);
+                published.failed()) {
+                memory_runs_.vacate(record);
                 return published;
+            }
+            for (memory_run_handle_t const replaced : away) memory_runs_.vacate(replaced);
         }
     }
 
@@ -1213,8 +1284,8 @@ class published_runs {
     /**
      *  @brief Publishes @p runs, written at stamp zero, as one commit of their own, stamped with the stamp the commit
      *      draws and placed so no shallower level holds a key of theirs, once the store holds no memory run.
-     *  @param[in,out] channel The channel a refused set's runs are dropped on, held by the calling thread.
-     *  @param[in,out] runs The runs in ascending order of their keys, emptied: moved into the tree, or dropped.
+     *  @param[in,out] runs The runs in ascending order of their keys, emptied: moved into the tree,
+     *      or given back.
      *  @param[in] flush Called as @c flush() before every attempt, writing the memory runs out as the store does.
      *  @return The stamp every version of @p runs carries, the stamp published for no runs, or the status that stopped
      *      it, @c contended_k once memory runs kept reappearing.
@@ -1222,8 +1293,7 @@ class published_runs {
      *      inside no epoch.
      */
     template <typename runs_type_, typename flush_type_>
-    expected<transaction_stamp_t> publish_ingest(io_channel_t& channel, runs_type_& runs,
-                                                 flush_type_&& flush) noexcept {
+    expected<transaction_stamp_t> publish_ingest(runs_type_& runs, flush_type_&& flush) noexcept {
         if (runs.empty()) return ledger_->published();
         expected<transaction_stamp_t> landed = status_t {status_code_t::contended_k,
                                                          "Commits kept refilling the memory runs an ingest waits out"};
@@ -1239,13 +1309,12 @@ class published_runs {
                 ledger_->stop_leading();
                 continue;
             }
-            landed = publish_ingest_leading_(channel, std::span<sorted_run_t> {runs});
+            landed = publish_ingest_leading_(std::span<sorted_run_t> {runs});
             break;
         }
-        // A set the tree refused dropped the runs it took, and the rest are still attached here.
+        // A set the tree refused gave back the runs it took, and the rest are still attached here.
         for (sorted_run_t const& run : runs)
-            if (run.attached()) [[maybe_unused]]
-                status_t const dropped = sorted_run_t::drop(tree_.volume(), channel, run.content_id());
+            if (run.attached()) tree_.volume().deallocate(run.extent());
         runs.clear();
         return landed;
     }
@@ -1276,6 +1345,46 @@ class published_runs {
     /** The versions one merge carries over, before and after they are sorted into a run's order. */
     using stamped_deltas_t = st::vector<stamped_delta_t, constrained_allocator<stamped_delta_t, atomic_reference_>>;
 
+    /** The order the store published its memory runs in, threaded through their records. */
+    using memory_order_t = st::intrusive_list<std::uint32_t>;
+
+    /** One memory run in a record that never moves, so a view names the run by its address. */
+    struct memory_run_record_t {
+
+        /** The run, which a view names once a commit or a merge published it. */
+        memory_run_t run;
+
+        /** Stepped by every vacate, as the pool asks. */
+        std::uint32_t generation = 0;
+
+        /** The record published after this one, or none. */
+        std::uint32_t next = memory_order_t::absent_k;
+
+        /** The record published before this one, or none. */
+        std::uint32_t previous = memory_order_t::absent_k;
+
+        memory_run_record_t() noexcept = default;
+        memory_run_record_t(memory_run_record_t&& other) noexcept : run(std::move(other.run)) {}
+
+        /** Carries the run alone, so a record keeps its generation and its place in the order. */
+        memory_run_record_t& operator=(memory_run_record_t&& other) noexcept {
+            run = std::move(other.run);
+            return *this;
+        }
+    };
+
+    /** The records of a store's memory runs, charged to its budget. */
+    using memory_run_pool_t = lsm_record_pool<memory_run_record_t, std::uint32_t, atomic_reference_, waiter_type_>;
+
+    /** One memory-run record and the generation it was taken at. */
+    using memory_run_handle_t = typename memory_run_pool_t::handle_t;
+
+    /** A handle naming no record. */
+    static constexpr memory_run_handle_t absent_run_k {memory_run_pool_t::absent_k, 0};
+
+    /** What a view is allocated and freed through, charged to the store's budget. */
+    using view_allocator_t = constrained_allocator<view_t, atomic_reference_>;
+
     /** What a publication of a new level set hands its hooks: the memory runs it wrote out, the view naming the set,
      *  and the hook it calls once no reader is left in the views before it. */
     struct publication_t {
@@ -1290,10 +1399,11 @@ class published_runs {
         transaction_stamp_t oldest_readable = unwritten_stamp_k;
 
         /** The view laid out under the leader word just before the set becomes current. */
-        std::unique_ptr<view_t> next;
+        view_t* next = nullptr;
 
-        /** The flushed runs, taken over under the leader word and freed once no reader can hold one. */
-        st::vector<std::unique_ptr<memory_run_t>> freed;
+        /** The records of the flushed runs, unlinked under the leader word and freed once no reader
+         *  can hold one. */
+        st::vector<memory_run_handle_t> freed;
 
         /** The hook of whoever records the new set, called last, or null for none. */
         lsm_tree_publication_hook_t const* chained = nullptr;
@@ -1315,36 +1425,29 @@ class published_runs {
     /** Times an ingest flushes and looks again for memory runs before it gives up. */
     static constexpr std::size_t ingest_attempts_k = 8;
 
-    /** What the commit of an ingest hands its publication: the set and the view it publishes, and the set they
-     *  replace, which outlives every reader of the view replaced. */
+    /** What the commit of an ingest hands its publication: the view naming the
+     *  tree's prepared set. */
     struct ingest_publication_t {
 
         /** The runs publishing. */
         published_runs* owner = nullptr;
 
-        /** The level set naming the ingested runs. */
-        std::unique_ptr<level_set_t> next_levels;
-
-        /** The view naming that set. */
-        std::unique_ptr<view_t> next_view;
-
-        /** The set it replaced, retired once the commit returns. */
-        std::unique_ptr<level_set_t> replaced;
+        /** The view naming the set the tree prepared. */
+        view_t* next_view = nullptr;
     };
 
     /** Publishes the view of an ingest under the stamp its commit drew, which the ingested runs carry already. */
     static void publish_ingest_view_(void* context, transaction_stamp_t) noexcept {
         ingest_publication_t& ingestion = *static_cast<ingest_publication_t*>(context);
         published_runs& owner = *ingestion.owner;
-        ingestion.replaced = owner.tree_.adopt(std::move(ingestion.next_levels));
+        owner.tree_.adopt();
         ingestion.next_view->levels = &owner.tree_.levels();
-        owner.replace_view_(std::move(ingestion.next_view));
+        owner.replace_view_(std::exchange(ingestion.next_view, nullptr));
     }
 
     /** Stamps @p runs with the stamp the next commit draws, lays out the set and the view naming them and commits,
      *  which only the thread holding the leader word does, letting it go on every path. */
-    expected<transaction_stamp_t> publish_ingest_leading_(io_channel_t& channel,
-                                                          std::span<sorted_run_t> runs) noexcept {
+    expected<transaction_stamp_t> publish_ingest_leading_(std::span<sorted_run_t> runs) noexcept {
         transaction_stamp_t const stamp = ledger_->next_stamp_leading();
         for (sorted_run_t& run : runs)
             if (status_t const stamped = run.assign_stamp(stamp); stamped.failed()) {
@@ -1358,19 +1461,18 @@ class published_runs {
             ledger_->stop_leading();
             return view_status;
         }
-        ingestion.next_view = std::move(view);
-        auto [levels, levels_status] = tree_.prepare_ingest(channel, runs);
-        if (levels_status.failed()) {
+        ingestion.next_view = view;
+        if (status_t const prepared = tree_.prepare_ingest(runs); prepared.failed()) {
+            destroy_view_(view);
             ledger_->stop_leading();
-            return levels_status;
+            return prepared;
         }
-        ingestion.next_levels = std::move(levels);
         commit_request_t request;
         request.context = &ingestion;
         request.publish = &publish_ingest_view_;
         transaction_stamp_t const landed = ledger_->commit_leading(request);
         // Letting the leader word go waited out every reader of the replaced view, so the replaced set is unreachable.
-        tree_t::retire(std::move(ingestion.replaced));
+        tree_.retire();
         return landed;
     }
 
@@ -1404,6 +1506,28 @@ class published_runs {
         return newest >= config_.lsm_tree.level_enlarge_factor || flush_due_(view);
     }
 
+    /** Tiers memory runs reach while commits stall only past twice the delta bound, T = ⌈log_F(2
+     *  × max deltas)⌉. */
+    [[nodiscard]] static std::size_t memory_run_tiers_(collection_config_t const& config) noexcept {
+        std::size_t tiers = 0;
+        for (std::uint64_t covered = 1; covered < 2 * std::uint64_t {config.memory_runs_max_deltas};
+             covered *= config.lsm_tree.level_enlarge_factor)
+            ++tiers;
+        return tiers;
+    }
+
+    /** Memory runs a merged view holds at most, (F − 1)(T + 1), past which commits stall
+     *  until a flush. */
+    [[nodiscard]] static std::size_t merged_memory_runs_(collection_config_t const& config) noexcept {
+        return (config.lsm_tree.level_enlarge_factor - 1) * (memory_run_tiers_(config) + 1);
+    }
+
+    /** Memory-run records a store holds, (F − 1)(T + 1) + concurrency limit + F: a merged view, the
+     *  commits landing past its stall, and the run one merge adds before it frees F. */
+    [[nodiscard]] static std::size_t memory_run_records_(collection_config_t const& config) noexcept {
+        return merged_memory_runs_(config) + config.concurrency_limit + config.lsm_tree.level_enlarge_factor;
+    }
+
     /**
      *  @brief The oldest F runs of the lowest tier holding F of @p runs, newest first, or none.
      *
@@ -1422,34 +1546,71 @@ class published_runs {
         return {};
     }
 
-    /** A view naming @p newest, when not null, ahead of @p older, below levels its caller fills in, arranged as
-     *  @p layout_generation says, which no reader reaches until it is published. */
-    static expected<std::unique_ptr<view_t>> next_view_(memory_run_t const* newest,
-                                                        std::span<memory_run_t const* const> older,
-                                                        transaction_stamp_t oldest_readable,
-                                                        std::uint64_t layout_generation) noexcept {
+    /** A view naming @p newest, when not null, ahead of @p older, below levels its caller fills in,
+     *  arranged as @p layout_generation says, charged to the budget, which no reader reaches until
+     *  it is published. */
+    expected<view_t*> next_view_(memory_run_t const* newest, std::span<memory_run_t const* const> older,
+                                 transaction_stamp_t oldest_readable, std::uint64_t layout_generation) noexcept {
         std::size_t const ahead = newest != nullptr ? 1 : 0;
         typename memory_view_t::runs_t runs;
         if (runs.resize(older.size() + ahead) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room to lay out a view"};
         if (newest != nullptr) runs[0] = newest;
         for (std::size_t index = 0; index != older.size(); ++index) runs[index + ahead] = older[index];
-        std::unique_ptr<view_t> view {new (std::nothrow)
-                                          view_t {memory_view_t::of(std::move(runs)), nullptr, oldest_readable}};
-        if (!view) return status_t {status_code_t::out_of_memory_k, "No room to lay out a view"};
+        auto [view, view_status] = make_view_(view_t {memory_view_t::of(std::move(runs)), nullptr, oldest_readable});
+        if (view_status.failed()) return view_status;
         view->layout_generation = layout_generation;
         return view;
     }
 
+    /** Allocates @p laid_out on the budget, where no reader reaches it until it is published. */
+    expected<view_t*> make_view_(view_t&& laid_out) noexcept {
+        view_allocator_t allocator {*constraint_};
+        view_t* const view = allocator.allocate(1);
+        if (view == nullptr) return status_t {status_code_t::out_of_memory_k, "The budget refused a view"};
+        std::construct_at(view, std::move(laid_out));
+        view->constraint = constraint_;
+        return view;
+    }
+
+    /** Destroys @p view and gives its bytes back to the budget it was charged to, which the ledger
+     *  calls once no reader can hold it. */
+    static void destroy_view_(void* view) noexcept {
+        view_t* const held = static_cast<view_t*>(view);
+        view_allocator_t allocator {*held->constraint};
+        std::destroy_at(held);
+        allocator.deallocate(held, 1);
+    }
+
+    /** Destroys the published view and a prepared one, which only an owner no
+     *  reader reaches does. */
+    void release_views_() noexcept {
+        if (prepared_view_ != nullptr) destroy_view_(std::exchange(prepared_view_, nullptr));
+        if (current_ != nullptr) destroy_view_(std::exchange(current_, nullptr));
+    }
+
     /** Publishes @p newer in place of the current view, which only the thread holding the leader word does, and hands
      *  the view it replaces to the ledger, which frees it once that thread lets the word go and its readers left. */
-    void replace_view_(std::unique_ptr<view_t> newer) noexcept {
+    void replace_view_(view_t* newer) noexcept {
         view_.replace(*newer);
-        view_t* const older = std::exchange(current_, std::move(newer)).release();
+        view_t* const older = std::exchange(current_, newer);
         ledger_->unpublish(older->unpublished, older, &destroy_view_);
     }
 
-    static void destroy_view_(void* view) noexcept { delete static_cast<view_t*>(view); }
+    /** The record holding @p run, which the store owns, found by a walk in publication order. */
+    [[nodiscard]] memory_run_handle_t record_of_(memory_run_t const* run) noexcept {
+        std::uint32_t index = memory_order_.oldest;
+        while (&memory_runs_[index].run != run) index = memory_runs_[index].next;
+        return memory_runs_.handle_of(memory_runs_[index]);
+    }
+
+    /** Unlinks the record holding @p run from the publication order and answers it, for its caller
+     *  to free once no reader can hold the run. */
+    [[nodiscard]] memory_run_handle_t unlink_(memory_run_t const* run) noexcept {
+        memory_run_handle_t const record = record_of_(run);
+        [[maybe_unused]] st::status_t const erased = memory_order_.erase(memory_runs_, record.index);
+        return record;
+    }
 
     /**
      *  @brief Takes the leader word and lays out the view the tree's next level set will be named by: the current
@@ -1465,16 +1626,18 @@ class published_runs {
         assert(runs.size() >= publication.flushed.size() &&
                (publication.flushed.empty() || runs[kept] == publication.flushed[0]) &&
                "A flush writes out the oldest memory runs");
-        auto [next, next_status] = next_view_(nullptr, runs.first(kept),
-                                              std::max(owner.current_->oldest_readable, publication.oldest_readable),
-                                              owner.current_->layout_generation + 1);
-        if (next_status.succeeded() && publication.freed.reserve(publication.flushed.size()) != st::status_t::success_k)
-            next_status = status_t {status_code_t::out_of_memory_k, "A flush could not take its memory runs over"};
+        if (publication.freed.reserve(publication.flushed.size()) != st::status_t::success_k) {
+            owner.ledger_->stop_leading();
+            return {status_code_t::out_of_memory_k, "A flush could not take its memory runs over"};
+        }
+        auto [next, next_status] = owner.next_view_(
+            nullptr, runs.first(kept), std::max(owner.current_->oldest_readable, publication.oldest_readable),
+            owner.current_->layout_generation + 1);
         if (next_status.failed()) {
             owner.ledger_->stop_leading();
             return next_status;
         }
-        publication.next = std::move(next);
+        publication.next = next;
         return {};
     }
 
@@ -1485,19 +1648,17 @@ class published_runs {
         publication_t& publication = *static_cast<publication_t*>(context);
         published_runs& owner = *publication.owner;
         publication.next->levels = &owner.tree_.levels();
-        owner.replace_view_(std::move(publication.next));
+        owner.replace_view_(std::exchange(publication.next, nullptr));
         if (!publication.flushed.empty()) {
-            // The flushed runs are the oldest, which the store owns first.
-            for (std::size_t index = 0; index != publication.flushed.size(); ++index) [[maybe_unused]]
-                st::status_t const taken = publication.freed.push_back(st::assume_reserved,
-                                                                       std::move(owner.memory_runs_[index]));
-            for (std::size_t index = 0; index != publication.flushed.size(); ++index) owner.memory_runs_.erase(0);
+            for (memory_run_t const* flushed : publication.flushed) [[maybe_unused]]
+                st::status_t const taken = publication.freed.push_back(st::assume_reserved, owner.unlink_(flushed));
             std::span<memory_run_t const* const> const kept = owner.current_->memory_runs.runs();
             owner.ledger_->bound_view(owner.view_pin_, kept.empty() ? head_stamp_k : kept.back()->oldest_stamp() - 1);
             publication.flushed.clear();
         }
         // Every reader that could hold a flushed run entered before the view replaced above, which this waits out.
         owner.ledger_->stop_leading();
+        for (memory_run_handle_t const freed : publication.freed) owner.memory_runs_.vacate(freed);
         publication.freed.clear();
         lsm_tree_publication_hook_t const* const chained = publication.chained;
         if (chained == nullptr || chained->notify == nullptr) return {};
@@ -1505,15 +1666,17 @@ class published_runs {
     }
 
     /**
-     *  @brief Takes the leader word, publishes a view naming @p merged where exactly the runs of @p group sat, moves
-     *      those runs into @p away, and lets the word go, which returns once no reader can reach them.
+     *  @brief Takes the leader word, publishes a view naming the run of @p merged where exactly the
+     *      runs of @p group sat, unlinks their records into @p away, and lets the word go, which
+     *      returns once no reader can reach them.
      *  @param[in] group The runs merged, newest first, which commits since may have put newer runs ahead of.
-     *  @param[in,out] merged The run that replaces them, moved into the published view.
-     *  @param[out] away Room reserved for the runs of @p group, which the caller frees.
+     *  @param[in] merged The record of the run that replaces them, linked as the newest
+     *      the store published.
+     *  @param[out] away Room reserved for the records of @p group, which the caller frees.
      *  @param[in] horizon The stamp published when the merge began, which a head reader below it reads past.
      */
-    status_t publish_merged_(std::span<memory_run_t const* const> group, std::unique_ptr<memory_run_t> merged,
-                             st::vector<std::unique_ptr<memory_run_t>>& away, transaction_stamp_t horizon) noexcept {
+    status_t publish_merged_(std::span<memory_run_t const* const> group, memory_run_handle_t merged,
+                             st::vector<memory_run_handle_t>& away, transaction_stamp_t horizon) noexcept {
         ledger_->lead();
         std::span<memory_run_t const* const> const runs = current_->memory_runs.runs();
         std::size_t first = 0;
@@ -1526,25 +1689,20 @@ class published_runs {
             return {status_code_t::out_of_memory_k, "No room to lay out a merged view"};
         }
         for (std::size_t index = 0; index != first; ++index) laid_out[index] = runs[index];
-        laid_out[first] = merged.get();
+        laid_out[first] = &memory_runs_[merged.index].run;
         for (std::size_t index = first + group.size(); index != runs.size(); ++index)
             laid_out[index - group.size() + 1] = runs[index];
-        std::unique_ptr<view_t> next {new (std::nothrow) view_t {memory_view_t::of(std::move(laid_out)),
-                                                                 current_->levels,
-                                                                 std::max(current_->oldest_readable, horizon),
-                                                                 {}}};
-        if (!next) {
+        auto [next, next_status] = make_view_(view_t {memory_view_t::of(std::move(laid_out)), current_->levels,
+                                                      std::max(current_->oldest_readable, horizon)});
+        if (next_status.failed()) {
             ledger_->stop_leading();
-            return {status_code_t::out_of_memory_k, "No room to lay out a merged view"};
+            return next_status;
         }
         next->layout_generation = current_->layout_generation + 1;
-        // The runs the store owns run oldest first, opposite to the view, so the group's oldest sits here.
-        std::size_t const oldest = runs.size() - first - group.size();
-        replace_view_(std::move(next));
-        for (std::size_t index = 0; index != group.size(); ++index) [[maybe_unused]]
-            st::status_t const taken = away.push_back(st::assume_reserved, std::move(memory_runs_[oldest + index]));
-        memory_runs_[oldest] = std::move(merged);
-        for (std::size_t index = 1; index != group.size(); ++index) memory_runs_.erase(oldest + 1);
+        replace_view_(next);
+        for (memory_run_t const* replaced : group) [[maybe_unused]]
+            st::status_t const taken = away.push_back(st::assume_reserved, unlink_(replaced));
+        memory_order_.push(memory_runs_, merged.index);
         ledger_->stop_leading();
         return {};
     }
@@ -1571,15 +1729,24 @@ class published_runs {
     /** The view readers load, which @c current_ owns. */
     published_view<view_t, atomic_reference_> view_;
 
-    /** The view published last, owned here and replaced only under the ledger's leader word. */
-    std::unique_ptr<view_t> current_;
+    /** The view published last, allocated on the budget and replaced only under the
+     *  ledger's leader word. */
+    view_t* current_ = nullptr;
 
-    /** Every memory run the current view names, oldest first, freed by the flush that writes them out or the merge
-     *  that replaces them, once no reader can reach them. */
-    st::vector<std::unique_ptr<memory_run_t>> memory_runs_;
+    /** The records of every memory run the store holds, charged to the budget, freed by the flush
+     *  that writes them out or the merge that replaces them, once no reader can reach them. */
+    memory_run_pool_t memory_runs_;
+
+    /** The records the current view names, oldest published first, which a flush and
+     *  a merge unlink. */
+    memory_order_t memory_order_;
 
     /** The view a leader laid out for the commit it prepared, published or forgotten before it lets the word go. */
-    std::unique_ptr<view_t> prepared_view_;
+    view_t* prepared_view_ = nullptr;
+
+    /** The record that view names for the commit's run, taken by @c prepare and linked
+     *  by @c publish. */
+    memory_run_handle_t prepared_run_ = absent_run_k;
 
 #pragma endregion Private Members
 };

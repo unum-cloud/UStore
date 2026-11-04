@@ -13,8 +13,12 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
+#include <cstring> // `std::memset`
+
+#include <sys/stat.h> // `stat`, `st_blocks`
 
 #include <array>   // `std::array`
+#include <bit>     // `std::has_single_bit`
 #include <span>    // `std::span`
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
@@ -767,7 +771,8 @@ std::size_t ring_refuses_an_undrained_release(disk_type_& disk, medium_reference
     return failures;
 }
 
-/** A medium with requests against it refuses to be given back, exactly as a registered range does. */
+/** A medium with requests against it refuses to be given back, exactly as a registered range does,
+ *  and a reference kept past its release names nothing, even once another medium takes its slot. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
 std::size_t ring_holds_a_medium_in_flight(disk_type_& disk, medium_options_t const& request) {
@@ -807,9 +812,26 @@ std::size_t ring_holds_a_medium_in_flight(disk_type_& disk, medium_options_t con
     std::array<completion_t, polling_room_k> completions {};
     failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
                                                            1) == std::size_t {1});
+    medium_reference_t const stale = registered_medium.reference();
+    failures += expect(disk.unregister_medium(registered_medium).succeeded());
+
+    medium_options_t reopened = request;
+    reopened.access = medium_access_t::read_write_k;
+    expected<registered_medium_t> successor = disk.register_medium(reopened);
+    failures += expect(successor.has_value());
+    if (successor) {
+        registered_medium_t successor_medium = std::move(*successor);
+        std::array<request_t, 1> stale_batch {
+            read_request(stale, extent_t {0, block_bytes_k}, registered_memory.reference(0), queue_pair.token(1))};
+        failures += expect(disk.submit(queue_pair, std::span<request_t const> {stale_batch}) == std::size_t {1});
+        failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                               1) == std::size_t {1});
+        failures += expect(completions[0].state == completion_state_t::failed_k);
+        failures += expect_status(completions[0].status, status_code_t::invalid_argument_k);
+        failures += expect(disk.unregister_medium(successor_medium).succeeded());
+    }
     failures += expect(disk.unregister_memory(registered_memory).succeeded());
     failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    failures += expect(disk.unregister_medium(registered_medium).succeeded());
     return failures;
 }
 
@@ -939,6 +961,95 @@ std::size_t ring_keeps_what_it_flushed(disk_type_& disk, medium_options_t const&
 
     failures += expect(disk.unregister_memory(registered_memory).succeeded());
     failures += expect(disk.release_queue_pair(queue_pair).succeeded());
+    return failures;
+}
+
+/** Deallocating a written extent of a file gives its blocks back to the filesystem, and it
+ *  reads as zeros. */
+template <typename disk_type_>
+    requires ring_concept<disk_type_>
+std::size_t ring_deallocates_a_file_extent(disk_type_& disk, medium_options_t const& request) {
+    std::size_t failures = 0;
+    constexpr std::size_t blocks_k = 16;
+    test_buffer_t buffer = make_buffer(blocks_k * block_bytes_k);
+    failures += expect_eq(buffer.size(), blocks_k * block_bytes_k);
+    if (buffer.size() != blocks_k * block_bytes_k) return failures;
+
+    expected<registered_medium_t> registered = disk.register_medium(request);
+    failures += expect(registered.has_value());
+    if (!registered) return failures;
+    registered_medium_t registered_medium = std::move(*registered);
+    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(leased.has_value());
+    if (!leased) {
+        failures += expect(disk.unregister_medium(registered_medium).succeeded());
+        return failures;
+    }
+    queue_pair_t queue_pair = std::move(*leased);
+    expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
+    failures += expect(pinned.has_value());
+    if (!pinned) {
+        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
+        failures += expect(disk.unregister_medium(registered_medium).succeeded());
+        return failures;
+    }
+    registered_memory_t registered_memory = std::move(*pinned);
+    extent_t const extent {0, blocks_k * block_bytes_k};
+    std::array<completion_t, polling_room_k> completions {};
+
+    paint(whole(buffer), 5);
+    std::array<request_t, 2> writes {
+        write_request(registered_medium.reference(), extent, registered_memory.reference(0), queue_pair.token(0)),
+        flush_request(registered_medium.reference(), queue_pair.token(1))};
+    writes[0].chaining = request_chaining_t::chained_k;
+    failures += expect(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {2});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           2) == std::size_t {2});
+    struct stat written {};
+    failures += expect(::stat(request.name, &written) == 0);
+
+    std::array<request_t, 1> deallocations {
+        deallocate_request(registered_medium.reference(), extent, queue_pair.token(2))};
+    failures += expect(disk.submit(queue_pair, std::span<request_t const> {deallocations}) == std::size_t {1});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           1) == std::size_t {1});
+    failures += expect(completions[0].completed_in_full());
+    struct stat punched {};
+    failures += expect(::stat(request.name, &punched) == 0);
+    failures += expect(punched.st_blocks < written.st_blocks);
+    failures += expect_eq(static_cast<std::uint64_t>(punched.st_size), static_cast<std::uint64_t>(written.st_size));
+
+    std::array<request_t, 1> reads {
+        read_request(registered_medium.reference(), extent, registered_memory.reference(0), queue_pair.token(3))};
+    failures += expect(disk.submit(queue_pair, std::span<request_t const> {reads}) == std::size_t {1});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           1) == std::size_t {1});
+    failures += expect(completions[0].completed_in_full());
+    test_buffer_t zeros = make_buffer(blocks_k * block_bytes_k);
+    std::memset(zeros.data(), 0, zeros.size());
+    failures += expect(same_bytes(whole(buffer), whole(zeros)));
+
+    failures += expect(disk.unregister_memory(registered_memory).succeeded());
+    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
+    failures += expect(disk.unregister_medium(registered_medium).succeeded());
+    return failures;
+}
+
+/** A file reports a power-of-two logical block, and an unbuffered disk aligns every request to
+ *  whole ones of it. */
+template <typename disk_type_>
+    requires ring_concept<disk_type_>
+std::size_t ring_reports_a_logical_block(disk_type_& disk, medium_options_t const& request) {
+    std::size_t failures = 0;
+    expected<registered_medium_t> registered = disk.register_medium(request);
+    failures += expect(registered.has_value());
+    if (!registered) return failures;
+    registered_medium_t registered_medium = std::move(*registered);
+    std::uint64_t const logical_block_bytes = registered_medium.logical_block_bytes();
+    failures += expect(std::has_single_bit(logical_block_bytes));
+    if (std::has_single_bit(logical_block_bytes))
+        failures += expect_eq(disk.capabilities().offset_alignment % logical_block_bytes, std::uint64_t {0});
+    failures += expect(disk.unregister_medium(registered_medium).succeeded());
     return failures;
 }
 

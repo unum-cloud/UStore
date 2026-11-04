@@ -5,12 +5,14 @@
  *  @brief The NVMe store of a strings collection, keyed by whole strings: strings memory runs in front of an LSM tree
  *      whose runs carry the tails of their strings, and the strings one database transaction writes and watches.
  *
- *  Every string is a key of its own, mapped onto one 16-byte key of another collection. A memory run keeps it whole on
- *  its key tape, and a run file keeps its 16-byte head and its 16-byte value in a 32-byte cell and the bytes past the
- *  head in the run's tails, which are read into memory with the index, so a lookup binary-searches the heads and
- *  compares tails only between equal heads, and answers the value from the cell, with no I/O. Two strings sharing
- *  their leading 15 bytes stay two keys everywhere: in a commit's watches, in a merge, which keeps the newest version
- *  of each, and in a sorted level, whose runs never split one head, so a level finds a head in one run.
+ *  Every string is a key of its own, mapped onto one 16-byte key of another collection. A memory
+ *  run keeps it whole on its key tape, and a run file keeps its 16-byte head and its 16-byte value
+ *  in a 32-byte cell and the bytes past the head in the run's tails, which are read into memory
+ *  with the index, so a lookup binary-searches the heads and compares tails only between equal
+ *  heads, and answers the value from the cell, with no I/O. Two strings sharing their leading 15
+ *  bytes stay two keys everywhere: in a commit's watches, in a merge, which keeps the newest
+ *  version of each, and in a sorted level, whose runs never split the versions of one string, so a
+ *  level finds a string in one run.
  *
  *  The store lives in a database beside the blobs stores and draws its stamps from the same ledger. The database keys
  *  its own transactions by 16 bytes, so the strings of a transaction ride in a @c nvme_transaction, which joins the
@@ -55,6 +57,7 @@ using blobs::commit_ledger;
 using blobs::compaction_outcome_t;
 using blobs::head_stamp_k;
 using blobs::invalid_transaction_stamp_k;
+using blobs::key_positions_t;
 using blobs::key_slot;
 using blobs::key_tails_column_t;
 using blobs::key_tails_t;
@@ -62,7 +65,6 @@ using blobs::lookup_result_t;
 using blobs::lsm_level_order_t;
 using blobs::lsm_tree_publication_hook_t;
 using blobs::lsm_tree_run_record_t;
-using blobs::lsm_tree_run_stamp_t;
 using blobs::memory_pressure_t;
 using blobs::memory_shape_t;
 using blobs::published_runs;
@@ -222,6 +224,9 @@ class nvme_store {
     /** One immutable run of a level. */
     using sorted_run_t = typename tree_t::sorted_run_t;
 
+    /** The database's pool the runs of that tree live in. */
+    using run_pool_t = typename tree_t::run_pool_t;
+
     /** Everything a reader of this store needs, which nothing changes once it is published. */
     using view_t = typename published_runs_t::view_t;
 
@@ -235,11 +240,12 @@ class nvme_store {
      *  stamps them into, both charged to the store's budget. */
     struct sealed_commit_t {
 
-        /** The deltas, sorted and copied, which the leader moves into @c run once it draws the stamp. */
+        /** The deltas, sorted and copied, which the leader moves into a run of the store's pool
+         *  once it draws the stamp. */
         sealed_deltas_t deltas;
 
-        /** The run they become, allocated by the committer, owned by the store once published. */
-        std::unique_ptr<memory_run_t> run;
+        /** Whether the commit carries no string for this store, so it adds no run. */
+        [[nodiscard]] bool empty() const noexcept { return deltas.size() == 0; }
     };
 
 #pragma endregion Types
@@ -258,19 +264,20 @@ class nvme_store {
      *  @param[in] config The bounds of the memory runs and the shape of the tree below.
      *  @param[in,out] constraint The budget the memory runs are charged to.
      *  @param[in,out] ledger The stamps the store's writes carry and its readers pin, outliving the store.
+     *  @param[in,out] runs The database's pool the tree's runs live in, outliving the store.
      */
     static expected<nvme_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
-                                      ledger_t& ledger) noexcept {
+                                      ledger_t& ledger, run_pool_t& runs) noexcept {
         nvme_store mounted;
-        if (status_t const mounted_runs = mounted.runs_.mount(volume, config, constraint, ledger);
+        if (status_t const mounted_runs = mounted.runs_.mount(volume, config, constraint, ledger, runs);
             mounted_runs.failed())
             return mounted_runs;
         return mounted;
     }
 
     /** Returns every run to the volume and forgets every memory run, which destroys the data and which only a store no
-     *  reader reaches and no commit names may. */
-    status_t destroy(io_channel_t& channel) noexcept { return runs_.destroy(channel); }
+     *  reader reaches and no manifest names may. */
+    void destroy() noexcept { runs_.destroy(); }
 
 #pragma endregion Construction
 
@@ -314,7 +321,7 @@ class nvme_store {
         found_t found;
         if (!newest_(*read.view, text, read.stamp, found)) return lookup_result_t::missing_k;
         if (found.delta.kind == delta_kind_t::remove_k) return lookup_result_t::removed_k;
-        std::memcpy(value.data(), found.run ? found.run->key_slot(found.position).data : found.delta.bytes.data(),
+        std::memcpy(value.data(), found.run ? found.run->value(found.position).data() : found.delta.bytes.data(),
                     key_slot_t::size);
         return lookup_result_t::written_k;
     }
@@ -375,8 +382,6 @@ class nvme_store {
         st::vector<cursor_t> cursors;
         if (cursors.reserve(runs) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A walk could not hold a cursor per run"};
-        st::key128_t const from_head = head_of(from);
-        std::string_view const from_tail = tail_of(from);
         for (memory_run_t const* run : view.memory_runs.runs()) {
             cursor_t cursor;
             cursor.memory = run;
@@ -390,9 +395,10 @@ class nvme_store {
                 sorted_run_t const& run = level.run(index);
                 cursor_t cursor;
                 cursor.level = &run;
-                cursor.end = prefix_end_in_(run, run.population_count(), prefix);
-                cursor.position = std::min(lower_bound_in_(run, run.population_count(), from_head, from_tail),
-                                           cursor.end);
+                auto [end, end_status] = prefix_end_in_(run, prefix);
+                if (end_status.failed()) return end_status;
+                cursor.end = end;
+                cursor.position = std::min(run.lower_bound(from), cursor.end);
                 [[maybe_unused]] st::status_t const placed = cursors.push_back(std::move(cursor));
             }
         }
@@ -432,7 +438,7 @@ class nvme_store {
                     listed.state = lookup_result_t::written_k;
                     std::memcpy(&listed.value,
                                 cursor.memory ? cursor.memory->delta(cursor.position).bytes.data()
-                                              : cursor.level->key_slot(cursor.position).data,
+                                              : cursor.level->value(cursor.position).data(),
                                 key_slot_t::size);
                 }
             if (!taken) continue;
@@ -475,8 +481,6 @@ class nvme_store {
                                                                   allocator_t {runs_.constraint()});
         if (seal_status.failed()) return seal_status;
         sealed.deltas = std::move(sealed_deltas);
-        sealed.run.reset(new (std::nothrow) memory_run_t {});
-        if (!sealed.run) return status_t {status_code_t::out_of_memory_k, "No room for another memory run"};
         return sealed;
     }
 
@@ -521,21 +525,20 @@ class nvme_store {
      *      the word go.
      */
     status_t prepare(sealed_commit_t& sealed) noexcept {
-        if (!sealed.run) {
+        if (sealed.empty()) {
             runs_.forget_prepared();
             return {};
         }
-        return runs_.prepare(sealed.run.get());
+        return runs_.prepare();
     }
 
     /** Stamps @p sealed's run with @p stamp, publishes the view @c prepare laid out, and takes the run over, which the
      *  leader does before it publishes @p stamp itself, so a reader at the stamp finds the run. */
     void publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
-        if (!sealed.run) return;
+        if (sealed.empty()) return;
         expected<memory_run_t> stamped = memory_run_t::stamped(std::move(sealed.deltas), stamp,
                                                                allocator_t {runs_.constraint()});
-        if (stamped) *sealed.run = std::move(*stamped);
-        runs_.publish(std::move(sealed.run), stamp);
+        runs_.publish(stamped ? std::move(*stamped) : memory_run_t {}, stamp);
     }
 
     /** Drops the view @c prepare laid out, which the leader does for a commit it then refuses. */
@@ -552,7 +555,7 @@ class nvme_store {
             if (position != run->size() && run->stored_key(position) == text) return run->stamp(position) > from;
         }
         found_t found;
-        if (!newest_in_levels_(*view.levels, head_of(text), tail_of(text), head_stamp_k, found)) return false;
+        if (!newest_in_levels_(*view.levels, text, head_stamp_k, found)) return false;
         return found.run->stamp(found.position) > from;
     }
 
@@ -564,14 +567,10 @@ class nvme_store {
         reader_t const inside = runs_.enter();
         view_t const& view = *runs_.view();
         if (view.memory_runs.range_written_since(lower, upper, from)) return true;
-        st::key128_t const upper_head = head_of(upper);
-        std::string_view const upper_tail = tail_of(upper);
         return any_level_run_(*view.levels, [&](sorted_run_t const& run) noexcept {
             if (run.newest_stamp() <= from) return false;
-            for (std::uint64_t position = lower_bound_in_(run, run.population_count(), head_of(lower), tail_of(lower));
-                 position != run.population_count() &&
-                 order_keys(run.key_slot(position).stored_key, run.tail(position), upper_head, upper_tail) <= 0;
-                 ++position)
+            for (std::uint64_t position = run.lower_bound(lower);
+                 position != run.population_count() && run.key(position) <= upper; ++position)
                 if (run.stamp(position) > from) return true;
             return false;
         });
@@ -592,19 +591,20 @@ class nvme_store {
         }
         return any_level_run_(*view.levels, [&](sorted_run_t const& run) noexcept {
             if (run.newest_stamp() <= from) return false;
-            std::uint64_t const end = prefix_end_in_(run, run.population_count(), prefix);
-            for (std::uint64_t position = lower_bound_in_(run, run.population_count(), head_of(first), tail_of(first));
-                 position < end; ++position)
+            auto [end, end_status] = prefix_end_in_(run, prefix);
+            // Without room to bound the prefix, the commit is told it conflicts, which
+            // a retry clears.
+            if (end_status.failed()) return true;
+            for (std::uint64_t position = run.lower_bound(first); position < end; ++position)
                 if (run.stamp(position) > from) return true;
             return false;
         });
     }
 
-    /** Opens the runs @p runs names as this store's tree, with the @p stamps ingests assigned, which a mount does
-     *  before anything reads. */
-    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
-                     std::span<lsm_tree_run_stamp_t const> stamps) noexcept {
-        return runs_.restore(channel, runs, stamps);
+    /** Opens the runs @p runs names as this store's tree, with the stamps ingests assigned, which a
+     *  mount does before anything reads. */
+    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs) noexcept {
+        return runs_.restore(channel, runs);
     }
 
 #pragma endregion Writes
@@ -665,11 +665,10 @@ class nvme_store {
      *      tails in their tails, as a flush lays them, writing a run each time one fills.
      *  @param[in] rows Strings in ascending order, each one 16-byte value under its string, readable until the call
      *      returns.
-     *  @return Success, or the status that stopped it with @p ingested as it was, but where the strings laid out before
-     *      share their last head with the first of @p rows and both overflow a run together.
+     *  @return Success, or the status that stopped it with @p ingested as it was.
      *
-     *  A run is cut once it holds as many cells as a flush writes, or tails nearing what its 32-bit offsets reach, but
-     *  only where the head changes, so no level splits one head between two runs.
+     *  A run is cut once its keys and layers would outgrow one slot, between any two strings, which
+     *  an ingest takes distinct.
      */
     status_t write_ingest(io_channel_t& channel, std::span<keyed_delta_t const> rows,
                           ingest_runs_t& ingested) noexcept {
@@ -688,12 +687,10 @@ class nvme_store {
                 return {status_code_t::malformed_k, "A string maps onto one 16-byte key"};
             tails += tail_of(text).size();
         }
-        // The strings laid out before take a run of their own when these overflow it, unless one head spans both
-        bool const overflows = drained.key_slots.size() + rows.size() >
-                                   blobs::storage_limits_t::memory_runs_max_deltas_k ||
-                               drained.tails.size() + tails > ingested_tails_max_bytes_k;
-        if (overflows && !drained.key_slots.empty() &&
-            drained.key_slots.back().stored_key != head_of(rows.front().stored_key))
+        // The strings laid out before take a run of their own when these overflow it.
+        bool const overflows = ingested_run_overflows_(drained.key_slots.size() + rows.size(),
+                                                       drained.tails.size() + tails);
+        if (overflows && !drained.key_slots.empty())
             if (status_t const written = write_ingested_run_(channel, drained, ingested.runs); written.failed())
                 return written;
         std::size_t const runs_before = ingested.runs.size();
@@ -701,8 +698,7 @@ class nvme_store {
         std::size_t const tails_before = drained.tails.size();
         if (status_t const laid = lay_out_ingested_(channel, rows, ingested); laid.failed()) {
             while (ingested.runs.size() != runs_before) {
-                [[maybe_unused]] status_t const dropped = sorted_run_t::drop(runs_.tree().volume(), channel,
-                                                                             ingested.runs.back().content_id());
+                runs_.tree().volume().deallocate(ingested.runs.back().extent());
                 ingested.runs.pop_back();
             }
             drained.resize(cells_before, tails_before);
@@ -721,17 +717,17 @@ class nvme_store {
         if (!ingested.drained.key_slots.empty())
             if (status_t const written = write_ingested_run_(channel, ingested.drained, ingested.runs);
                 written.failed()) {
-                drop_ingest(channel, ingested);
+                drop_ingest(ingested);
                 return written;
             }
-        return runs_.publish_ingest(channel, ingested.runs, [&]() noexcept { return flush(channel); });
+        return runs_.publish_ingest(ingested.runs, [&]() noexcept { return flush(channel); });
     }
 
-    /** Drops every run @p ingested wrote and every string it laid out, which an ingest that never published leaves. */
-    void drop_ingest(io_channel_t& channel, ingest_runs_t& ingested) noexcept {
+    /** Gives back every run @p ingested wrote and drops every string it laid out, which an ingest
+     *  that never published leaves. */
+    void drop_ingest(ingest_runs_t& ingested) noexcept {
         for (sorted_run_t const& run : ingested.runs)
-            if (run.attached()) [[maybe_unused]]
-                status_t const dropped = sorted_run_t::drop(runs_.tree().volume(), channel, run.content_id());
+            if (run.attached()) runs_.tree().volume().deallocate(run.extent());
         ingested.runs.clear();
         ingested.drained.clear();
     }
@@ -848,7 +844,7 @@ class nvme_store {
 #pragma region Private Methods
 
     /** The head of the key at sorted @p position of a memory run. */
-    [[nodiscard]] static st::key128_t const& head_at_(memory_run_t const& run, std::uint64_t position) noexcept {
+    [[nodiscard]] static st::key128_t head_at_(memory_run_t const& run, std::uint64_t position) noexcept {
         return run.head(static_cast<std::size_t>(position));
     }
 
@@ -858,86 +854,62 @@ class nvme_store {
     }
 
     /** The head of the key at sorted @p position of a run of a level. */
-    [[nodiscard]] static st::key128_t const& head_at_(sorted_run_t const& run, std::uint64_t position) noexcept {
-        return run.key_slot(position).stored_key;
+    [[nodiscard]] static st::key128_t head_at_(sorted_run_t const& run, std::uint64_t position) noexcept {
+        return run.head(position);
     }
 
     /** The tail of the key at sorted @p position of a run of a level. */
     [[nodiscard]] static std::string_view tail_at_(sorted_run_t const& run, std::uint64_t position) noexcept {
-        return run.tail(position);
+        return tail_of(run.key(position));
     }
 
-    /** The first of the @p count sorted positions of @p run whose key is not below @p head and @p tail. */
-    template <typename run_type_>
-    [[nodiscard]] static std::uint64_t lower_bound_in_(run_type_ const& run, std::uint64_t count,
-                                                       st::key128_t const& head, std::string_view tail) noexcept {
-        std::uint64_t low = 0;
-        std::uint64_t high = count;
-        while (low != high) {
-            std::uint64_t const middle = low + (high - low) / 2;
-            if (order_keys(head_at_(run, middle), tail_at_(run, middle), head, tail) < 0) low = middle + 1;
-            else high = middle;
-        }
-        return low;
+    /**
+     *  @brief The first sorted position of @p run past every string starting with @p prefix: the
+     *      lower bound of the least string above all of them, or the run's end when no string is.
+     *  @return The position, or @c out_of_memory_k when that string had no room.
+     */
+    static expected<std::uint64_t> prefix_end_in_(sorted_run_t const& run, std::string_view prefix) noexcept {
+        std::size_t kept = prefix.size();
+        while (kept != 0 && static_cast<unsigned char>(prefix[kept - 1]) == 0xFF) --kept;
+        if (kept == 0) return run.population_count();
+        st::vector<char> above;
+        if (above.resize(kept) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room to bound a prefix"};
+        std::memcpy(above.data(), prefix.data(), kept);
+        above[kept - 1] = static_cast<char>(static_cast<unsigned char>(above[kept - 1]) + 1);
+        return run.lower_bound(std::string_view {above.data(), kept});
     }
 
-    /** The first of the @p count sorted positions of @p run past every string starting with @p prefix, as
-     *  @c sealed_deltas::prefix_end finds it. */
-    template <typename run_type_>
-    [[nodiscard]] static std::uint64_t prefix_end_in_(run_type_ const& run, std::uint64_t count,
-                                                      std::string_view prefix) noexcept {
-        std::string_view const leading = prefix.substr(0, std::min(prefix.size(), head_prefix_bytes_k));
-        std::string_view const trailing = tail_of(prefix);
-        std::uint64_t low = 0;
-        std::uint64_t high = count;
-        while (low != high) {
-            std::uint64_t const middle = low + (high - low) / 2;
-            st::key128_t const& head = head_at_(run, middle);
-            std::byte head_bytes[sizeof(st::key128_t)];
-            head.to_bytes(head_bytes);
-            std::string_view const head_leading {reinterpret_cast<char const*>(head_bytes), leading.size()};
-            int const order = head_leading.compare(leading);
-            // Only a string longer than its head can reach past the leading bytes of a longer prefix.
-            bool const within_or_below =
-                order < 0 || (order == 0 && (trailing.empty() || head_length_of(head) != long_head_length_k ||
-                                             tail_at_(run, middle).substr(0, trailing.size()) <= trailing));
-            if (within_or_below) low = middle + 1;
-            else high = middle;
-        }
-        return low;
-    }
-
-    /** Whether the key at sorted @p position of @p run is the string of @p head and @p tail. */
-    template <typename run_type_>
-    [[nodiscard]] static bool same_key_at_(run_type_ const& run, std::uint64_t position, st::key128_t const& head,
-                                           std::string_view tail) noexcept {
-        return head_at_(run, position) == head && tail_at_(run, position) == tail;
-    }
-
-    /** The run of the sorted @p level whose heads cover @p head, which only one run's may, or null. */
-    [[nodiscard]] static sorted_run_t const* run_holding_(typename tree_t::level_t const& level,
+    /** The run of the sorted @p level whose keys reach @p text, whose head is @p head, which only
+     *  one run's may, or null: runs order by heads, and by their first and last keys whole only
+     *  where a head spans two of them. */
+    [[nodiscard]] static sorted_run_t const* run_holding_(typename tree_t::level_t const& level, std::string_view text,
                                                           st::key128_t const& head) noexcept {
         std::size_t low = 0;
         std::size_t high = level.size();
         while (low != high) {
             std::size_t const middle = low + (high - low) / 2;
             sorted_run_t const& run = level.run(middle);
-            if (run.upper_stored_key() < head) low = middle + 1;
-            else if (head < run.lower_stored_key()) high = middle;
+            std::uint64_t const count = run.population_count();
+            if (count == 0 || run.upper_stored_key() < head ||
+                (run.upper_stored_key() == head && run.key(count - 1) < text))
+                low = middle + 1;
+            else if (head < run.lower_stored_key() || (run.lower_stored_key() == head && text < run.key(0)))
+                high = middle;
             else return &run;
         }
         return nullptr;
     }
 
-    /** Whether @p run holds a version of the string of @p head and @p tail stamped at or below @p at, answering the
-     *  newest one in @p found. */
-    [[nodiscard]] static bool version_in_(sorted_run_t const& run, st::key128_t const& head, std::string_view tail,
+    /** Whether @p run holds a version of @p text, whose head is @p head, stamped at or below @p at,
+     *  answering the newest one in @p found: the heads and the layers narrow it to one row of keys,
+     *  compared whole in order. */
+    [[nodiscard]] static bool version_in_(sorted_run_t const& run, std::string_view text, st::key128_t const& head,
                                           transaction_stamp_t at, found_t& found) noexcept {
-        std::uint64_t const count = run.population_count();
-        if (count == 0 || head < run.lower_stored_key() || run.upper_stored_key() < head) return false;
-        for (std::uint64_t position = lower_bound_in_(run, count, head, tail);
-             position != count && same_key_at_(run, position, head, tail); ++position)
-            if (run.stamp(position) <= at) {
+        if (run.population_count() == 0 || head < run.lower_stored_key() || run.upper_stored_key() < head) return false;
+        key_positions_t const range = run.key_range(text);
+        for (std::uint64_t position = range.first; position != range.last; ++position)
+            if (run.stamp(position) <= at && run.key(position) == text) {
                 found = found_t {delta_view_t {run.kind(position), {}}, &run, position};
                 return true;
             }
@@ -946,18 +918,18 @@ class nvme_store {
 
     /** Whether any level of @p levels holds a version of the string of @p head and @p tail at or below @p at,
      *  answering the newest in @p found: the youngest run of level zero first, then each sorted level's one run. */
-    [[nodiscard]] static bool newest_in_levels_(level_set_t const& levels, st::key128_t const& head,
-                                                std::string_view tail, transaction_stamp_t at,
-                                                found_t& found) noexcept {
+    [[nodiscard]] static bool newest_in_levels_(level_set_t const& levels, std::string_view text,
+                                                transaction_stamp_t at, found_t& found) noexcept {
+        st::key128_t const head = head_of(text);
         for (std::size_t number = 0; number != levels.size(); ++number) {
             auto const& level = levels.level(number);
             if (level.order() == lsm_level_order_t::overlapping_k) {
                 for (std::size_t index = level.size(); index-- != 0;)
-                    if (version_in_(level.run(index), head, tail, at, found)) return true;
+                    if (version_in_(level.run(index), text, head, at, found)) return true;
                 continue;
             }
-            if (sorted_run_t const* const run = run_holding_(level, head))
-                if (version_in_(*run, head, tail, at, found)) return true;
+            if (sorted_run_t const* const run = run_holding_(level, text, head))
+                if (version_in_(*run, text, head, at, found)) return true;
         }
         return false;
     }
@@ -967,7 +939,7 @@ class nvme_store {
     [[nodiscard]] static bool newest_(view_t const& view, std::string_view text, transaction_stamp_t at,
                                       found_t& found) noexcept {
         if (view.memory_runs.find(text, at, found.delta)) return true;
-        return newest_in_levels_(*view.levels, head_of(text), tail_of(text), at, found);
+        return newest_in_levels_(*view.levels, text, at, found);
     }
 
     /** Whether @p check answers true for any run of any level of @p levels. */
@@ -980,7 +952,7 @@ class nvme_store {
     }
 
     /** The head and the tail of the key a walk's @p cursor sits on. */
-    [[nodiscard]] static st::key128_t const& cursor_head_(cursor_t const& cursor) noexcept {
+    [[nodiscard]] static st::key128_t cursor_head_(cursor_t const& cursor) noexcept {
         return cursor.memory ? head_at_(*cursor.memory, cursor.position) : head_at_(*cursor.level, cursor.position);
     }
 
@@ -1018,8 +990,17 @@ class nvme_store {
         return {};
     }
 
-    /** Tails one ingested run carries at most, well inside what its 32-bit tail offsets and its file reach. */
-    static constexpr std::uint64_t ingested_tails_max_bytes_k = std::uint64_t {1} << 31;
+    /** Whether a run of @p key_slots strings carrying @p tails bytes of tails outgrows one slot:
+     *  its keys whole, its trailer of zero-width stamps, its kinds at a byte each, and layers at
+     *  most a head and a row's share per 15 bytes of every key. */
+    [[nodiscard]] static bool ingested_run_overflows_(std::uint64_t key_slots, std::uint64_t tails) noexcept {
+        using strings_layout_t = typename sorted_run_t::strings_layout_t;
+        std::uint64_t const keys = tails + key_slots * head_prefix_bytes_k;
+        std::uint64_t const layers = 2 * sizeof(st::key128_t) * (tails / head_prefix_bytes_k + key_slots);
+        std::uint64_t const bytes = strings_layout_t::blob_bytes(key_slots, keys, utilities::portable_alignment_k,
+                                                                 key_slots + utilities::portable_alignment_k, layers);
+        return bytes > utilities::sorted_run_bytes_max_k;
+    }
 
     /** Writes the cells, stamps, kinds and tails laid out so far as one run of stamp zero into @p runs, and empties
      *  them for the next. */
@@ -1033,7 +1014,7 @@ class nvme_store {
                                                    std::span<std::uint32_t const> {drained.tail_offsets},
                                                    std::span<byte_t const> {drained.tails}};
         auto [written, write_status] = sorted_run_t::write(
-            runs_.tree().volume(), channel, utilities::uuid_generator(),
+            runs_.tree().volume(), channel, runs_.config().lsm_tree.collection, utilities::uuid_generator(),
             std::span<key_slot_t const> {drained.key_slots}, std::span<std::uint64_t const> {drained.stamps},
             std::span<std::uint8_t const> {drained.kinds}, 0, {}, {}, key_slot_t::size, tails);
         if (write_status.failed()) {
@@ -1045,16 +1026,15 @@ class nvme_store {
         return {};
     }
 
-    /** Lays @p rows out behind what @p ingested laid out, writing a run each time one fills where the head changes. */
+    /** Lays @p rows out behind what @p ingested laid out, writing a run each time one fills. */
     status_t lay_out_ingested_(io_channel_t& channel, std::span<keyed_delta_t const> rows,
                                ingest_runs_t& ingested) noexcept {
         drained_t& drained = ingested.drained;
         for (keyed_delta_t const& row : rows) {
             st::key128_t const head = head_of(row.stored_key);
             std::string_view const tail = tail_of(row.stored_key);
-            bool const full = drained.key_slots.size() >= blobs::storage_limits_t::memory_runs_max_deltas_k ||
-                              drained.tails.size() + tail.size() > ingested_tails_max_bytes_k;
-            if (full && !drained.key_slots.empty() && drained.key_slots.back().stored_key != head)
+            bool const full = ingested_run_overflows_(drained.key_slots.size() + 1, drained.tails.size() + tail.size());
+            if (full && !drained.key_slots.empty())
                 if (status_t const written = write_ingested_run_(channel, drained, ingested.runs); written.failed())
                     return written;
 

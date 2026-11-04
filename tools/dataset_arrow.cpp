@@ -14,7 +14,9 @@
 #include <cstdint> // `std::int32_t`, `std::int64_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
-#if defined(_WIN32)
+#include "ustore/types.h" // `USTORE_OS_WINDOWS_`
+
+#if USTORE_OS_WINDOWS_
 #include <fcntl.h>    // `_O_RDONLY`, `_O_BINARY`
 #include <io.h>       // `_read`, `_write`, `_open`, `_close`
 #include <sys/stat.h> // `_S_IREAD`, `_S_IWRITE`
@@ -103,7 +105,7 @@ struct output_piece_t {
     std::size_t size;
 };
 
-#if defined(_WIN32)
+#if USTORE_OS_WINDOWS_
 
 /** Reads up to @p count bytes into @p data, answering how many, zero at the end, or a negative
  *  count on a failure. */

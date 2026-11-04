@@ -150,7 +150,8 @@ ustore_executor_free(executor);
 Each engine opens through its own calls, whose arguments hold what that engine can be asked, and a zero field keeps the engine's default:
 
 - `ustore_database_init_ram` starts an empty database in memory alone, while `ustore_database_open_ram` serves a directory as one image, loading it at open and rewriting it whole on a flushed commit and on close.
-- `ustore_database_open_rocksdb`, `ustore_database_open_leveldb` and `ustore_database_open_nvme` serve a directory in place, and RocksDB and LevelDB create the database when the directory holds none.
+- `ustore_database_open_rocksdb` and `ustore_database_open_leveldb` serve a directory in place, creating the database when the directory holds none.
+- `ustore_database_open_nvme` serves the database its manifest names, `<database>.ustore.json` in an existing directory or the raw address of its first slot, such as `/dev/nvme0n1@64GiB`, creating the database when the manifest is absent.
 - `ustore_database_view_rocksdb` serves an existing RocksDB directory read-only, refusing every call that would change it with `ustore_status_read_only_k`: writes, removes, transactions, collection creates and drops, clears and compactions, while snapshots and their saves still serve.
 
 The opens of an engine the build lacks answer `ustore_status_unsupported_k`, so a program links against every build.
@@ -442,7 +443,7 @@ ustore_snapshot_free(snapshot);
 `ustore_snapshot_init` can export its `read_stamp`, the stamp the snapshot reads at, which LevelDB, keeping its sequence numbers private, reports as zero.
 A snapshot lives no longer than the process that took it, and holds its database open until freed, as a transaction does, so `ustore_database_free` closes the database only once the last of them is freed.
 `ustore_snapshot_save` writes one out as a new database of the same engine, holding exactly the collections and names the snapshot records, which that engine's open then serves, so a save is how a view outlives the process.
-RocksDB and LevelDB create its `path`, while the `ram` engine writes its image into the directory `path` names.
+RocksDB and LevelDB create its `path`, the `ram` engine writes its image into the directory `path` names, and NVMe takes `path` as the manifest of the new database.
 Persistent snapshots, recorded in a system collection under UUIDv7 identifiers and kept across restarts until dropped, are planned.
 
 ## Progress and Cancellation

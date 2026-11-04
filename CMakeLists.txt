@@ -519,7 +519,6 @@ if (${USTORE_BUILD_TEST})
         set(ustore_storage_test_names_
             "ring"
             "channels"
-            "catalog"
             "volume"
             "sorted_run"
             "tree"
@@ -551,6 +550,7 @@ if (${USTORE_BUILD_TEST})
                         forkunion::static
                         smashtable::header
                         stringzilla::static
+                        yyjson
                         fmt::fmt
                         Threads::Threads
                         $<$<PLATFORM_ID:Windows>:bcrypt>
@@ -601,6 +601,7 @@ if (${USTORE_BUILD_TEST})
                         forkunion::static
                         smashtable::header
                         stringzilla::static
+                        yyjson
                         fmt::fmt
                         Threads::Threads
                         $<$<PLATFORM_ID:Windows>:bcrypt>
