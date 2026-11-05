@@ -195,6 +195,28 @@ class notifier {
 
 #pragma endregion Countdown
 
+#pragma region Claims
+
+/** Takes @p claim, a word that is zero while free, waiting through @p waiter_type_ while another
+ *  holder keeps it. */
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+void lock_claim(std::int32_t& claim) noexcept {
+    atomic_reference_<std::int32_t> const word {claim};
+    std::int32_t expected_free = 0;
+    while (!word.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+        waiter_type_ {}(&claim, expected_free, std::size_t {0});
+        expected_free = 0;
+    }
+}
+
+/** Gives @p claim back to the next @c lock_claim. */
+template <template <typename> typename atomic_reference_>
+void unlock_claim(std::int32_t& claim) noexcept {
+    atomic_reference_<std::int32_t> {claim}.store(0, std::memory_order_release);
+}
+
+#pragma endregion Claims
+
 #pragma region IO Types
 
 /** One mounted disk of a data directory, where every stored value names the disk it sits on. */

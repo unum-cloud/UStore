@@ -31,8 +31,8 @@
 #include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`
-#include <utility>     // `std::move`, `std::swap`
+#include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`, `std::is_void_v`
+#include <utility>     // `std::exchange`, `std::move`, `std::swap`
 #include <variant>     // `std::variant`
 
 #include <smashtable/basic_vector.hpp>           // `st::vector`
@@ -40,11 +40,12 @@
 #include <smashtable/immutable_splus_tree.hpp>   // `st::immutable_splus_tree_view`
 #include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`
 
-#include "ustore/blobs/nvme_key_slot.hpp"   // `stored_key_concept`
-#include "ustore/utilities/folds.hpp"       // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
-#include "ustore/utilities/nvme_ring.hpp"   // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
-#include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`, `arena_allocator`
-#include "ustore/utilities/types.hpp"       // `round_up_to_multiple`, `expected`
+#include "ustore/blobs/nvme_key_slot.hpp"      // `stored_key_concept`
+#include "ustore/utilities/blocking_files.hpp" // `path_max_bytes_k`
+#include "ustore/utilities/folds.hpp"          // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
+#include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
+#include "ustore/utilities/ram_buffers.hpp"    // `local_arena_t`, `arena_allocator`
+#include "ustore/utilities/types.hpp"          // `round_up_to_multiple`, `expected`, `uuid_t`
 
 namespace unum::ustore::blobs {
 
@@ -130,7 +131,7 @@ struct sorted_run_extents_t {
     /** The volume the run lives on. */
     std::uint32_t volume = 0;
 
-    /** The index section: every cell, padding included. */
+    /** The index section: every cell, empty for a run whose cells are its keys alone. */
     utilities::extent_t cells;
 
     /** The value offsets section, empty but for a variable width. */
@@ -145,13 +146,22 @@ struct sorted_run_extents_t {
     /** The stamp an ingest gave every version of a run its blob stamps zero, or zero for a run carrying its own, which
      *  the device raises every stamp it unpacks from the trailer to. */
     std::uint64_t assigned_stamp = 0;
+
+    /** The section of the saved key tree, which a run of keys alone is read through. */
+    utilities::extent_t keys;
+
+    /** Where the tree's leaf rows start inside @c keys. */
+    std::uint64_t leaves_begin = 0;
+
+    /** The run's ID, which names its file on a directory volume. */
+    utilities::uuid_t run {};
 };
 
 /** The key slots of one sorted run in sorted order, and the stamp and kind of every one. */
 template <typename key_slot_type_>
 struct sorted_run_index_view {
 
-    /** The run's cells in sorted order. */
+    /** The run's cells in sorted order, or null for a run of keys alone, read through @c keys. */
     key_slot_type_ const* cells = nullptr;
 
     /** Key slots the run holds. */
@@ -169,7 +179,49 @@ struct sorted_run_index_view {
     /** Where each key slot's value starts inside the run's values section and one past the last, in sorted order,
      *  for a variable-width run alone. */
     std::span<stored_value_offset_t const> value_offsets;
+
+    /** The saved tree of the run's keys, which a view without @c cells reads key slots through. */
+    st::immutable_splus_tree_view<typename key_slot_type_::stored_key_t> const* keys = nullptr;
 };
+
+/** One version a merge of strings carries: its source run and its sorted position there. */
+struct strings_version_t {
+
+    /** Its source: the upper runs in their order, then the lower runs. */
+    std::uint32_t source = 0;
+
+    /** Its sorted position in that source. */
+    std::uint32_t position = 0;
+};
+
+/** One run of strings as a merge reads it in place: the saved tree of its heads, its keys whole,
+ *  and the stamp and kind of every one. */
+struct strings_run_view {
+
+    /** The saved S+ tree of the run's heads. */
+    st::immutable_splus_tree_view<st::key128_t> const* heads = nullptr;
+
+    /** One offset per key into @c keys and one past the last. */
+    std::span<std::uint32_t const> key_offsets;
+
+    /** Every key whole, back to back in sorted order. */
+    std::span<byte_t const> keys;
+
+    /** The stamp of every key in sorted order. */
+    stamps_column_t const* stamps = nullptr;
+
+    /** The kind of every key in sorted order. */
+    kinds_column_t const* kinds = nullptr;
+};
+
+/** The key slot at sorted @p position of the run @p view describes, from its cells or tree. */
+template <typename key_slot_type_>
+key_slot_type_ key_slot_of(sorted_run_index_view<key_slot_type_> const& view, std::uint64_t position) noexcept {
+    if (view.cells != nullptr) return view.cells[position];
+    key_slot_type_ slot {};
+    slot.stored_key = view.keys->select(static_cast<std::size_t>(position));
+    return slot;
+}
 
 /** Whether @p kinds may hold a change, which only a fold's merge reads; a column packs from its least kind to its
  *  greatest, so the widest kind it can hold is exactly that. */
@@ -497,7 +549,10 @@ constexpr std::uint32_t stored_value_bytes(stored_value_offset_t const* value_of
 template <typename key_slot_type_>
 constexpr std::uint64_t stored_values_offset(sorted_run_bounds_t const& bounds,
                                              std::uint64_t key_slots_count) noexcept {
-    std::uint64_t const cells_bytes = key_slots_count * sizeof(key_slot_type_);
+    // Only cells carrying inline values are saved; the key tree holds every key of the others.
+    std::uint64_t cells_bytes = 0;
+    if constexpr (!locates_stored_values_concept<key_slot_type_>)
+        cells_bytes = key_slots_count * sizeof(key_slot_type_);
     std::uint64_t const keys_bytes = sizeof(st::splus_tree_header_t) +
                                      st::immutable_splus_tree_view<typename key_slot_type_::stored_key_t>::size_bytes(
                                          static_cast<std::size_t>(key_slots_count));
@@ -987,7 +1042,7 @@ struct host_compactor_t {
                                                                                      : nullptr;
             for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
                 located_of(records[run_offset + sorted]) = located_key_slot<key_slot_type_> {
-                    view.cells[sorted],
+                    key_slot_of(view, sorted),
                     static_cast<std::uint32_t>(sorted_run),
                     delta_kind_t::write_k,
                     0,
@@ -1228,6 +1283,9 @@ struct device_section_read_t {
 
     /** Where the bytes land, counted from the start of the scratch. */
     std::uint64_t into = 0;
+
+    /** The run's ID, which names its file on a directory volume. */
+    utilities::uuid_t run {};
 };
 
 /** A borrowed transport moving run sections from their volumes into a device compactor's scratch, so one compaction
@@ -1289,10 +1347,16 @@ class device_sections_reader_t {
 /**
  *  @brief Reads run sections into device memory through a ring of its own reaching it, cuFile's among them, on one
  *      queue pair, registering the scratch it reads into once per scratch.
+ *
+ *  On raw media every volume is one medium, registered at @c make. On a directory volume every run
+ *  is a file of its own, registered at the first read of the merge reading it and given back by
+ *  @c release after that merge, since a merge's inputs are deallocated once it publishes.
+ *
  *  @tparam disk_type_ The ring, which must reach device memory.
  *  @tparam waiter_type_ What a wait for completions does after a poll that moved nothing.
+ *  @tparam volume_type_ The directory volume naming the run files, or @c void for raw media alone.
  */
-template <typename disk_type_, typename waiter_type_>
+template <typename disk_type_, typename waiter_type_, typename volume_type_ = void>
     requires utilities::ring_concept<disk_type_>
 class ring_sections_reader {
   public:
@@ -1321,8 +1385,22 @@ class ring_sections_reader {
         return reader;
     }
 
+    /** Takes @p disk in, reading each run from its own file in @p volume, and leases a pair. */
+    template <typename named_volume_type_>
+        requires std::same_as<named_volume_type_, volume_type_>
+    static expected<ring_sections_reader> make(disk_type_&& disk, named_volume_type_ const& volume) noexcept {
+        ring_sections_reader reader;
+        reader.disk_ = std::move(disk);
+        reader.volume_ = &volume;
+        expected<utilities::queue_pair_t> leased = reader.disk_.acquire_queue_pair(depth_k);
+        if (!leased) return leased.status();
+        reader.queue_pair_ = std::move(*leased);
+        return reader;
+    }
+
     ring_sections_reader(ring_sections_reader&& other) noexcept
-        : disk_(std::move(other.disk_)), media_(std::move(other.media_)), queue_pair_(std::move(other.queue_pair_)),
+        : disk_(std::move(other.disk_)), media_(std::move(other.media_)), runs_(std::move(other.runs_)),
+          volume_(std::exchange(other.volume_, nullptr)), queue_pair_(std::move(other.queue_pair_)),
           registered_(std::move(other.registered_)) {}
     ring_sections_reader(ring_sections_reader const&) = delete;
     ring_sections_reader& operator=(ring_sections_reader const&) = delete;
@@ -1357,9 +1435,10 @@ class ring_sections_reader {
                 device_section_read_t const& section = reads[read];
                 std::uint64_t const left = section.extent.length - done;
                 std::uint64_t const length = left < request_bytes_k ? left : request_bytes_k;
-                if (section.volume >= media_.size()) return st::status_t::invalid_argument_k;
+                auto [medium, medium_status] = medium_of_(section);
+                if (medium_status.failed()) return st::status_t::input_output_k;
                 requests[staged] = utilities::read_request(
-                    media_[section.volume].reference(), utilities::extent_t {section.extent.offset + done, length},
+                    medium, utilities::extent_t {section.extent.offset + done, length},
                     registered_.reference(section.into + done), queue_pair_.token(static_cast<std::uint32_t>(staged)));
                 ++staged;
                 done += length;
@@ -1380,20 +1459,62 @@ class ring_sections_reader {
         return st::status_t::success_k;
     }
 
-    /** Deregisters the scratch it registered, which the compactor frees next. */
+    /** Deregisters the scratch, which the compactor frees next, and the merge's run files. */
     void release() noexcept {
         if (registered_.held()) [[maybe_unused]]
             status_t const released = disk_.unregister_memory(registered_);
+        for (run_medium_t& run : runs_)
+            if (run.medium.held()) [[maybe_unused]]
+                status_t const detached = disk_.unregister_medium(run.medium);
+        runs_.clear();
     }
 
   private:
     ring_sections_reader() noexcept = default;
 
+    /** One run file a merge reads, registered at its first section. */
+    struct run_medium_t {
+        utilities::uuid_t run {};
+        utilities::registered_medium_t medium;
+    };
+
+    /** The medium @p section is read from: its volume's on raw media, else its run's file. */
+    expected<utilities::medium_reference_t> medium_of_(device_section_read_t const& section) noexcept {
+        if constexpr (!std::is_void_v<volume_type_>)
+            if (volume_) {
+                // A merge reads a handful of runs, which a scan finds sooner than a table would.
+                for (run_medium_t const& known : runs_)
+                    if (known.run == section.run) return known.medium.reference();
+                char path[utilities::path_max_bytes_k];
+                if (status_t const named = volume_->file_path(static_cast<std::uint16_t>(section.volume), section.run,
+                                                              path);
+                    named.failed())
+                    return named;
+                utilities::medium_options_t request;
+                request.name = path;
+                request.access = utilities::medium_access_t::read_only_k;
+                expected<utilities::registered_medium_t> registered = disk_.register_medium(request);
+                if (!registered) return registered.status();
+                if (runs_.push_back(run_medium_t {section.run, std::move(*registered)}) != st::status_t::success_k)
+                    return status_t {status_code_t::out_of_memory_k, "The reader could not track another run"};
+                return runs_[runs_.size() - 1].medium.reference();
+            }
+        if (section.volume >= media_.size())
+            return status_t {status_code_t::invalid_argument_k, "The section names no volume of this reader"};
+        return media_[section.volume].reference();
+    }
+
     /** The ring, owned, and opened for this reader alone. */
     disk_type_ disk_;
 
-    /** The medium of every volume, by volume. */
+    /** The medium of every volume, by volume, on raw media. */
     st::vector<utilities::registered_medium_t> media_;
+
+    /** The run files the current merge read, on a directory volume. */
+    st::vector<run_medium_t> runs_;
+
+    /** The directory volume naming the run files, or null on raw media. */
+    volume_type_ const* volume_ = nullptr;
 
     /** The queue pair every batch goes through. */
     utilities::queue_pair_t queue_pair_;

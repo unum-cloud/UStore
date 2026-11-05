@@ -39,8 +39,8 @@
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`
 
-#include <smashtable/basic_slot_pool.hpp> // `st::basic_slot_pool`
-#include <smashtable/basic_vector.hpp>    // `st::vector`
+#include <smashtable/basic_fixed_pool.hpp> // `st::basic_fixed_pool`
+#include <smashtable/basic_vector.hpp>     // `st::vector`
 
 #include "ustore/utilities/nvme_ring.hpp"   // `ring_concept`, `read_request`, `write_request`, `deallocate_request`
 #include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`, `resource_constraint`
@@ -327,7 +327,7 @@ class buffer_pool_t {
         std::uint32_t generation;
     };
 
-    using buffers_t = st::basic_slot_pool<buffer_record_t>;
+    using buffers_t = st::basic_fixed_pool<buffer_record_t>;
 
     /** Takes @p index back, which only a queue pair's own release calls. */
     void recycle_(std::uint32_t index) noexcept { buffers_.vacate(index); }
@@ -420,6 +420,37 @@ class basic_io_channel_pool;
 class io_channel_t {
   public:
 
+    /** This channel's queue pair held by one pipeline, which gives it back when the lease dies. */
+    class lease_t {
+      public:
+
+        lease_t() noexcept = default;
+        lease_t(lease_t const&) = delete;
+        lease_t& operator=(lease_t const&) = delete;
+        lease_t(lease_t&& other) noexcept : channel_(std::exchange(other.channel_, nullptr)) {}
+        lease_t& operator=(lease_t&& other) noexcept {
+            if (this != &other) release_(), channel_ = std::exchange(other.channel_, nullptr);
+            return *this;
+        }
+        ~lease_t() noexcept { release_(); }
+
+        /** The channel whose queue pair this lease holds. */
+        [[nodiscard]] io_channel_t& channel() const noexcept { return *channel_; }
+
+      private:
+
+        friend class io_channel_t;
+
+        explicit lease_t(io_channel_t& channel) noexcept : channel_(&channel) {}
+
+        void release_() noexcept {
+            if (channel_ != nullptr) channel_->leased_ = false;
+            channel_ = nullptr;
+        }
+
+        io_channel_t* channel_ = nullptr;
+    };
+
     io_channel_t() noexcept = default;
     io_channel_t(io_channel_t const&) = delete;
     io_channel_t& operator=(io_channel_t const&) = delete;
@@ -446,6 +477,13 @@ class io_channel_t {
     /** A token of this channel carrying the caller's own @p tag. */
     [[nodiscard]] request_token_t token(request_tag_t tag) const noexcept { return queue_pair_.token(tag); }
 
+    /** Leases the queue pair to one pipeline, or answers @c contended_k while another holds it. */
+    expected<lease_t> lease() noexcept {
+        if (leased_) return status_t {status_code_t::contended_k, "Another pipeline holds this channel's queue pair"};
+        leased_ = true;
+        return lease_t {*this};
+    }
+
   private:
 
     template <typename disk_type_, template <typename> typename atomic_reference_>
@@ -466,6 +504,9 @@ class io_channel_t {
 
     /** The tag the next request of this channel carries, wrapping harmlessly past the depth. */
     request_tag_t next_tag_ = 0;
+
+    /** Whether a lease holds the queue pair, which only the lease clears. */
+    bool leased_ = false;
 };
 
 /**
@@ -748,9 +789,9 @@ class basic_read_pipeline {
     basic_read_pipeline(basic_read_pipeline const&) = delete;
     basic_read_pipeline& operator=(basic_read_pipeline const&) = delete;
 
-    /** A pipeline over @p channel against @p disk, both of which must outlive it. */
-    basic_read_pipeline(disk_type_& disk, io_channel_t& channel, medium_reference_t medium) noexcept
-        : disk_(disk), channel_(channel), medium_(medium) {}
+    /** A pipeline holding the queue pair of @p lease alone for its life, against @p disk. */
+    basic_read_pipeline(disk_type_& disk, io_channel_t::lease_t&& lease, medium_reference_t medium) noexcept
+        : disk_(disk), lease_(std::move(lease)), channel_(lease_.channel()), medium_(medium) {}
 
     /**
      *  @brief Whether another offer would find a block, credit and room in the window, without taking any.
@@ -904,6 +945,9 @@ class basic_read_pipeline {
     /** The disk this pipeline submits against. */
     disk_type_& disk_;
 
+    /** The queue pair this pipeline holds alone. */
+    io_channel_t::lease_t lease_;
+
     /** The channel this pipeline submits and polls on. */
     io_channel_t& channel_;
 
@@ -943,9 +987,9 @@ class basic_write_pipeline {
     basic_write_pipeline(basic_write_pipeline const&) = delete;
     basic_write_pipeline& operator=(basic_write_pipeline const&) = delete;
 
-    /** A pipeline over @p channel against @p disk, both of which must outlive it. */
-    basic_write_pipeline(disk_type_& disk, io_channel_t& channel, medium_reference_t medium) noexcept
-        : disk_(disk), channel_(channel), medium_(medium) {}
+    /** A pipeline holding the queue pair of @p lease alone for its life, against @p disk. */
+    basic_write_pipeline(disk_type_& disk, io_channel_t::lease_t&& lease, medium_reference_t medium) noexcept
+        : disk_(disk), lease_(std::move(lease)), channel_(lease_.channel()), medium_(medium) {}
 
     /** Takes a block to fill, or answers @c capacity_exhausted_k until a poll_completions frees one. */
     expected<pooled_buffer_t> acquire_buffer() noexcept { return channel_.requests().acquire(); }
@@ -1122,6 +1166,9 @@ class basic_write_pipeline {
 
     /** The disk this pipeline submits against. */
     disk_type_& disk_;
+
+    /** The queue pair this pipeline holds alone. */
+    io_channel_t::lease_t lease_;
 
     /** The channel this pipeline submits and polls on. */
     io_channel_t& channel_;

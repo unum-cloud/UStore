@@ -240,6 +240,41 @@ std::size_t channels_refuse_beyond_their_spares(mount_type_ const& mount) {
 
 #pragma region Pipeline Cases
 
+/** A pipeline holds its channel's queue pair alone: a second pipeline on it is refused with
+ *  @c contended_k while the first lives, and one leases it again once the first is gone. */
+template <typename mount_type_>
+std::size_t second_pipeline_is_refused(mount_type_ const& mount) {
+    using types_t = channels_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename types_t::fixture_t;
+    using guard_t = typename types_t::guard_t;
+    using read_pipeline_t = typename types_t::read_pipeline_t;
+    using write_pipeline_t = typename types_t::write_pipeline_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    failures += expect(guard.has_value());
+    if (!guard) return failures;
+    medium_reference_t const medium = (*fixture)->media[0].reference();
+
+    {
+        expected<io_channel_t::lease_t> first = guard->channel().lease();
+        failures += expect(first.has_value());
+        if (!first) return failures;
+        write_pipeline_t writer {(*fixture)->disk, std::move(*first), medium};
+        expected<io_channel_t::lease_t> second = guard->channel().lease();
+        failures += expect_status(second, status_code_t::contended_k);
+    }
+    expected<io_channel_t::lease_t> again = guard->channel().lease();
+    failures += expect(again.has_value());
+    if (!again) return failures;
+    read_pipeline_t reader {(*fixture)->disk, std::move(*again), medium};
+    expected<io_channel_t::lease_t> beside = guard->channel().lease();
+    failures += expect_status(beside, status_code_t::contended_k);
+    return failures;
+}
+
 /** A write pipeline puts bytes on the volume and a read pipeline brings the same bytes back. */
 template <typename mount_type_>
 std::size_t pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
@@ -259,19 +294,27 @@ std::size_t pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
     if (!guard) return failures;
     medium_reference_t const medium = (*fixture)->media[0].reference();
 
-    write_pipeline_t writer {(*fixture)->disk, guard->channel(), medium};
-    for (std::uint64_t index = 0; index != blocks_k; ++index) {
-        expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
-        failures += expect(block.has_value());
-        if (!block) return failures;
-        paint(block->bytes(), index);
-        failures += expect(
-            writer.enqueue_write(std::move(*block), extent_t {index * block_bytes_k, block_bytes_k}).succeeded());
-        failures += expect(writer.submit().succeeded());
+    {
+        expected<io_channel_t::lease_t> lease = guard->channel().lease();
+        failures += expect(lease.has_value());
+        if (!lease) return failures;
+        write_pipeline_t writer {(*fixture)->disk, std::move(*lease), medium};
+        for (std::uint64_t index = 0; index != blocks_k; ++index) {
+            expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
+            failures += expect(block.has_value());
+            if (!block) return failures;
+            paint(block->bytes(), index);
+            failures += expect(
+                writer.enqueue_write(std::move(*block), extent_t {index * block_bytes_k, block_bytes_k}).succeeded());
+            failures += expect(writer.submit().succeeded());
+        }
+        failures += expect(writer.make_durable().succeeded());
     }
-    failures += expect(writer.make_durable().succeeded());
 
-    read_pipeline_t reader {(*fixture)->disk, guard->channel(), medium};
+    expected<io_channel_t::lease_t> lease = guard->channel().lease();
+    failures += expect(lease.has_value());
+    if (!lease) return failures;
+    read_pipeline_t reader {(*fixture)->disk, std::move(*lease), medium};
     std::size_t seen = 0;
     std::size_t mismatches = 0;
     std::uint64_t offered = 0;
@@ -329,7 +372,10 @@ std::size_t pipeline_holds_its_depth(mount_type_ const& mount) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
 
-    read_pipeline_t reader {(*fixture)->disk, guard->channel(), (*fixture)->media[0].reference()};
+    expected<io_channel_t::lease_t> lease = guard->channel().lease();
+    failures += expect(lease.has_value());
+    if (!lease) return failures;
+    read_pipeline_t reader {(*fixture)->disk, std::move(*lease), (*fixture)->media[0].reference()};
     std::uint64_t offered = 0;
     std::size_t polled_total = 0;
     std::size_t deepest = 0;
@@ -375,7 +421,10 @@ case_result_t pipeline_refuses_a_short_write(mount_type_ const& mount) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
 
-    write_pipeline_t writer {(*fixture)->disk, guard->channel(), (*fixture)->media[0].reference()};
+    expected<io_channel_t::lease_t> lease = guard->channel().lease();
+    failures += expect(lease.has_value());
+    if (!lease) return failures;
+    write_pipeline_t writer {(*fixture)->disk, std::move(*lease), (*fixture)->media[0].reference()};
     expected<pooled_buffer_t> block = writer.acquire_buffer();
     failures += expect(block.has_value());
     if (!block) return failures;
@@ -403,7 +452,10 @@ std::size_t pipeline_reports_a_partial_read(mount_type_ const& mount) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
 
-    read_pipeline_t reader {(*fixture)->disk, guard->channel(), (*fixture)->media[0].reference()};
+    expected<io_channel_t::lease_t> lease = guard->channel().lease();
+    failures += expect(lease.has_value());
+    if (!lease) return failures;
+    read_pipeline_t reader {(*fixture)->disk, std::move(*lease), (*fixture)->media[0].reference()};
     constexpr std::uint64_t reachable_k = block_bytes_k;
     failures += expect(
         reader.enqueue_read(extent_t {channels_config_k.volume_bytes - reachable_k, 2 * block_bytes_k}, 0).succeeded());
@@ -452,6 +504,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "pool_recycles_exactly_once", pool_recycles_exactly_once);
         report(totals, mount, "separate_threads", channels_separate_executor_threads);
         report(totals, mount, "refuse_beyond_spares", channels_refuse_beyond_their_spares);
+        report(totals, mount, "second_pipeline_refused", second_pipeline_is_refused);
         report(totals, mount, "pipeline_reads_back", pipeline_reads_back_what_it_wrote);
         report(totals, mount, "pipeline_holds_its_depth", pipeline_holds_its_depth);
         report(totals, mount, "pipeline_refuses_short_write", pipeline_refuses_a_short_write);

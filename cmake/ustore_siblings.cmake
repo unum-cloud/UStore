@@ -51,7 +51,7 @@ ustore_sibling(
 # SmashTable's containers, header-only
 ustore_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable.git
-    b1c3f7940db08a3cb10fc878f79819f6f61eacab
+    a65d5b81763f683c3a2a167c3a4e3426942a76cd
 )
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel

@@ -29,7 +29,7 @@
 
 #include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`
 #include "ustore/blobs/nvme_tree.hpp"              // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
-#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.cuh" // `cuda_compactor_t`, `strings_merge_verdict`
 #include "ustore/utilities/vram_device.hpp"        // `gpu_drivers_t`, `kernel_tables`, `vram_nvidia_bundle`
 
 #include "nvme/fixture.hpp" // `run_on_transport`, `expectation_t`, `painted`
@@ -1461,7 +1461,7 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     watch = allocation_watch_t {};
     std::size_t all_indexes = 0;
     for (std::size_t run = 0; run != upper.size(); ++run) {
-        std::size_t const index_bytes = upper.run(run).cells().size_bytes();
+        std::size_t const index_bytes = upper.run(run).population_count() * sizeof(variable_slot_t);
         watch.sizes[watch.count++] = index_bytes;
         all_indexes += index_bytes;
     }
@@ -1694,6 +1694,86 @@ template <typename types_type_>
     return failures;
 }
 
+/** Ranks every version of @p sources by @c strings_merge_verdict, compiled for the host, as the
+ *  device kernel ranks them, and compares the survivors in merged order with @p wanted, which the
+ *  host merge wrote. */
+template <typename sorted_run_type_>
+[[nodiscard]] std::size_t check_device_ranking(std::span<sorted_run_type_ const* const> sources,
+                                               std::uint32_t upper_runs, compaction_kind_t kind,
+                                               compaction_stamps_t const& stamps,
+                                               std::span<url_version_t const> wanted) {
+    std::size_t failures = 0;
+    std::size_t records = 0;
+    for (sorted_run_type_ const* source : sources) records += source->population_count();
+    st::vector<st::key128_t> heads;
+    st::vector<st::vector<std::uint64_t>> saved;
+    st::vector<strings_merge_run> runs;
+    failures += expect(heads.resize(records) == st::status_t::success_k);
+    failures += expect(saved.resize(2 * sources.size()) == st::status_t::success_k);
+    failures += expect(runs.resize(sources.size()) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    std::size_t first = 0;
+    for (std::size_t index = 0; index != sources.size(); ++index) {
+        sorted_run_type_ const& source = *sources[index];
+        std::size_t const count = source.population_count();
+        for (std::size_t position = 0; position != count; ++position) heads[first + position] = source.head(position);
+        st::vector<std::uint64_t>& stamps_words = saved[2 * index];
+        st::vector<std::uint64_t>& kinds_words = saved[2 * index + 1];
+        failures += expect(stamps_words.resize(source.stamps().saved_bytes() / sizeof(std::uint64_t)) ==
+                           st::status_t::success_k);
+        failures += expect(kinds_words.resize(source.kinds().saved_bytes() / sizeof(std::uint64_t)) ==
+                           st::status_t::success_k);
+        if (failures != 0) return failures;
+        failures += expect(source.stamps().save(std::as_writable_bytes(std::span<std::uint64_t> {stamps_words})) ==
+                           st::status_t::success_k);
+        failures += expect(source.kinds().save(std::as_writable_bytes(std::span<std::uint64_t> {kinds_words})) ==
+                           st::status_t::success_k);
+        runs[index] = strings_merge_run {heads.data() + first,
+                                         source.key_offsets().data(),
+                                         source.key_tape().data(),
+                                         stamps_words.data(),
+                                         kinds_words.data(),
+                                         first,
+                                         count};
+        first += count;
+    }
+
+    st::vector<strings_version_t> merged;
+    st::vector<std::uint8_t> flags;
+    failures += expect(merged.resize(records) == st::status_t::success_k);
+    failures += expect(flags.resize(records, std::uint8_t {2}) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    std::size_t collisions = 0;
+    for (std::uint32_t run = 0; run != runs.size(); ++run)
+        for (std::uint64_t position = 0; position != runs[run].count; ++position) {
+            strings_merge_verdict_t const verdict = strings_merge_verdict(
+                runs.data(), static_cast<std::uint32_t>(runs.size()), upper_runs, run, position, kind, stamps);
+            if (verdict.rank >= records || flags[verdict.rank] != 2) {
+                ++collisions;
+                continue;
+            }
+            merged[verdict.rank] = strings_version_t {run, static_cast<std::uint32_t>(position)};
+            flags[verdict.rank] = verdict.survives ? 1 : 0;
+        }
+    failures += expect_eq(collisions, std::size_t {0});
+
+    std::size_t at = 0;
+    std::size_t mismatches = 0;
+    for (std::size_t rank = 0; rank != records; ++rank) {
+        if (flags[rank] != 1) continue;
+        if (at == wanted.size()) return failures + expect(false);
+        sorted_run_type_ const& source = *sources[merged[rank].source];
+        char buffer[64];
+        mismatches += source.key(merged[rank].position) != url_of(wanted[at].index, buffer) ||
+                      source.stamp(merged[rank].position) != wanted[at].stamp ||
+                      source.kind(merged[rank].position) != wanted[at].kind;
+        ++at;
+    }
+    failures += expect_eq(at, wanted.size());
+    failures += expect_eq(mismatches, std::size_t {0});
+    return failures;
+}
+
 /**
  *  @brief Strings merges over URLs with long shared prefixes keep the versions a reference keeps,
  *      in one merge or two, cut into runs under their limit that order wholly one after another.
@@ -1782,6 +1862,11 @@ std::size_t strings_merges_match_reference(mount_type_ const& mount) {
         failures += expect(upper_sources.push_back(runs->at(handle)) == st::status_t::success_k);
     for (run_handle_t const& handle : lower)
         failures += expect(lower_sources.push_back(runs->at(handle)) == st::status_t::success_k);
+    st::vector<sorted_run_t const*> all_sources;
+    for (sorted_run_t const* source : upper_sources)
+        failures += expect(all_sources.push_back(static_cast<sorted_run_t const*>(source)) == st::status_t::success_k);
+    for (sorted_run_t const* source : lower_sources)
+        failures += expect(all_sources.push_back(static_cast<sorted_run_t const*>(source)) == st::status_t::success_k);
 
     typename merger_t::merge_request_t request;
     request.upper = upper_sources;
@@ -1801,6 +1886,9 @@ std::size_t strings_merges_match_reference(mount_type_ const& mount) {
     st::vector<url_version_t> wanted;
     reference(request, wanted);
     failures += check_url_runs<types_t>(*runs, *once, wanted, run_bytes_limit_k);
+    failures += check_device_ranking<sorted_run_t>(
+        std::span<sorted_run_t const* const> {all_sources}, std::uint32_t {upper_runs_k},
+        compaction_kind_t::overlapping_into_bottom_k, request.stamps, wanted);
 
     // The upper runs merged first and then into the lower ones end in the very same versions.
     request.lower = {};
@@ -1837,6 +1925,9 @@ std::size_t strings_merges_match_reference(mount_type_ const& mount) {
     st::vector<url_version_t> wanted_pinned;
     reference(request, wanted_pinned);
     failures += check_url_runs<types_t>(*runs, *pinned, wanted_pinned, run_bytes_limit_k);
+    failures += check_device_ranking<sorted_run_t>(
+        std::span<sorted_run_t const* const> {all_sources}, std::uint32_t {upper_runs_k},
+        compaction_kind_t::overlapping_into_intermediate_k, request.stamps, wanted_pinned);
 
     runs->discard(*volume, *once);
     runs->discard(*volume, *folded);

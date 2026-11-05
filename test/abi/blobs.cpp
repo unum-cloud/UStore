@@ -545,6 +545,93 @@ std::size_t database_presences(config_t const& config) {
     return failures;
 }
 
+/** One batched read across two collections, missing keys and repeats, answers the very tape,
+ *  lengths and presences that reading each key alone answers, before and after a compaction moves
+ *  the values out of memory. */
+std::size_t database_batched_read_matches_single(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    auto [first, first_status] = database.create("first");
+    auto [second, second_status] = database.create("second");
+    failures += expect(first_status.succeeded() && second_status.succeeded());
+    if (failures != 0) return failures;
+
+    // Every seventh key stays missing, every eleventh holds an empty value, the rest grow with it.
+    constexpr std::size_t keys_count = 3000;
+    for (std::size_t index = 0; index != keys_count; ++index) {
+        if (index % 7 == 0) continue;
+        std::string const value = index % 11 == 0 ? std::string {}
+                                                  : std::string(1 + index % 600, char('a' + index % 26));
+        auto& collection = index % 2 ? first : second;
+        failures += expect(
+            collection[key_from_integer(index)]
+                .assign(value_view_t {reinterpret_cast<ustore_byte_t const*>(value.data()), value.size()})
+                .succeeded());
+    }
+    std::array<ustore_key_t, keys_count + 64> keys;
+    std::array<ustore_collection_id_t, keys_count + 64> collections;
+    for (std::size_t index = 0; index != keys.size(); ++index) {
+        std::size_t const key = (index * 7919) % keys_count;
+        keys[index] = key_from_integer(key);
+        collections[index] = key % 2 ? *first.member_ptr() : *second.member_ptr();
+    }
+    auto [arena, arena_status] = arena_t::make();
+    auto [single_arena, single_arena_status] = arena_t::make();
+    failures += expect(arena_status.succeeded() && single_arena_status.succeeded());
+    if (failures != 0) return failures;
+
+    auto compare = [&]() {
+        ustore_outcome_t outcome {};
+        ustore_octet_t const* presences = nullptr;
+        ustore_length_t const* lengths = nullptr;
+        ustore_strings_view_t tape {};
+        ustore_blobs_read_t read {.database = database,
+                                  .outcome = &outcome,
+                                  .count = keys.size(),
+                                  .collections = {collections.data(), sizeof(ustore_collection_id_t)},
+                                  .keys = {keys.data(), sizeof(ustore_key_t)},
+                                  .presences = &presences,
+                                  .lengths = &lengths,
+                                  .values = &tape,
+                                  .arena = arena};
+        ustore_blobs_read(&read);
+        failures += expect_success(outcome);
+        if (outcome.status != ustore_status_success_k) return;
+        std::size_t mismatches = 0;
+        for (std::size_t index = 0; index != keys.size(); ++index) {
+            ustore_octet_t const* single_presences = nullptr;
+            ustore_length_t const* single_lengths = nullptr;
+            ustore_strings_view_t single_tape {};
+            ustore_blobs_read_t alone {.database = database,
+                                       .outcome = &outcome,
+                                       .count = 1,
+                                       .collections = {&collections[index], 0},
+                                       .keys = {&keys[index], 0},
+                                       .presences = &single_presences,
+                                       .lengths = &single_lengths,
+                                       .values = &single_tape,
+                                       .arena = single_arena};
+            ustore_blobs_read(&alone);
+            if (outcome.status != ustore_status_success_k) {
+                ++mismatches;
+                continue;
+            }
+            std::string_view const batched = string_of(tape_string(tape, index));
+            std::string_view const single = string_of(tape_string(single_tape, 0));
+            mismatches += batched != single || lengths[index] != single_lengths[0] ||
+                          bits_view_t {presences}[index] != bits_view_t {single_presences}[0];
+        }
+        failures += expect_eq(mismatches, std::size_t {0});
+    };
+    compare();
+    failures += expect(database.compact().succeeded());
+    compare();
+    return failures;
+}
+
 /** One arena serves the reads of two collections in turn, each read rewinding it, while shorthand
  *  reads keep no arena anywhere and own the one-off arena they answer from. */
 case_result_t database_arena_reuse(config_t const& config) {
@@ -1109,6 +1196,7 @@ int main(int argc, char** argv) {
     report(totals, "database.collections_resolve", database_collections_resolve, config);
     report(totals, "database.clear_values", database_clear_values, config);
     report(totals, "database.presences", database_presences, config);
+    report(totals, "database.batched_read_matches_single", database_batched_read_matches_single, config);
     report(totals, "database.arena_reuse", database_arena_reuse, config);
     report(totals, "database.scan", database_scan, config);
     report(totals, "database.batch_scan", database_batch_scan, config);

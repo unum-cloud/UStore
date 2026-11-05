@@ -72,7 +72,8 @@ using sections_disk_of =
 
 /** What reads the sections of a store of @p cpu_class_'s runs into device memory, over a cuFile disk of its own. */
 template <cpu_class_t cpu_class_>
-using sections_reader_of = ring_sections_reader<sections_disk_of<cpu_class_>, waiter_of<cpu_class_>>;
+using sections_reader_of = ring_sections_reader<sections_disk_of<cpu_class_>, waiter_of<cpu_class_>,
+                                                typename storage_mount_of<cpu_class_>::volume_t>;
 
 /** What composes the half-edge changes of a graph's merge on a device: the CUDA tower, which a build without a CUDA
  *  compiler never reaches, as it makes no device compactor. */
@@ -305,15 +306,20 @@ struct nvme_variant {
 template <cpu_class_t cpu_class_>
 class device_compaction {
   public:
+
+    /** The volume the reader names run files through. */
+    using volume_t = typename storage_mount_of<cpu_class_>::volume_t;
+
     device_compaction() noexcept = default;
     device_compaction(device_compaction const&) = delete;
     device_compaction& operator=(device_compaction const&) = delete;
 
     /** Spawns the executor on the device @p compactions computes on, and on an NVIDIA one opens
-     *  the reader over the volume of every data directory of @p resources and binds the
-     *  compactor over both; an AMD device binds no compactor yet, so a merge placed on it
+     *  the reader over @p volume, mounted over the data directories of @p resources, and binds
+     *  the compactor over both; an AMD device binds no compactor yet, so a merge placed on it
      *  answers @c unsupported_k. */
-    status_t open(ustore_executor_handle_t const& compactions, resources_config_t const& resources) noexcept {
+    status_t open(ustore_executor_handle_t const& compactions, resources_config_t const& resources,
+                  volume_t const& volume) noexcept {
         hip_executor_t const* const amd = std::get_if<hip_executor_t>(&compactions.device);
         cuda_executor_t const* const caller = std::get_if<cuda_executor_t>(&compactions.device);
         if (!caller && !amd)
@@ -330,7 +336,7 @@ class device_compaction {
             return spawned;
         if (amd) return {};
         cuda_executor_t* const executor = &std::get<cuda_executor_t>(executor_);
-        if (status_t const opened = open_sections(drivers.cufile, executor->gds(), resources); opened.failed())
+        if (status_t const opened = open_sections(drivers.cufile, executor->gds(), resources, volume); opened.failed())
             return opened;
         expected<cuda_compactor_t> made = cuda_compactor_t::make(
             *executor, sections_ ? device_sections_reader_t {&sections_.value()} : device_sections_reader_t {});
@@ -344,10 +350,11 @@ class device_compaction {
 
   private:
 
-    /** Opens the reader over every raw medium of @p resources where @p gds lets bytes move by DMA
-     *  and cuFile reaches the device, refusing @c ustore_gds_direct_k where it does not and over
-     *  a directory volume. */
-    status_t open_sections(cufile_api_t const& cufile, ustore_gds_t gds, resources_config_t const& resources) noexcept {
+    /** Opens the reader over every raw medium of @p resources, or over the run files of @p volume
+     *  on directories, where @p gds lets bytes move by DMA and cuFile reaches the device,
+     *  refusing @c ustore_gds_direct_k where it does not. */
+    status_t open_sections(cufile_api_t const& cufile, ustore_gds_t gds, resources_config_t const& resources,
+                           volume_t const& volume) noexcept {
         if (gds == ustore_gds_compatibility_k) return {};
         if (sections_disk_of<cpu_class_>::probe(cufile) != linux_cufile_probe_t::direct_k) {
             if (gds == ustore_gds_direct_k)
@@ -356,16 +363,20 @@ class device_compaction {
         }
         auto [addresses, addresses_status] = addresses_of(resources);
         if (addresses_status.failed()) return addresses_status;
-        // A directory volume keeps a file per run, which the reader opens by data directory and not
-        // yet by run.
+        linux_cufile_disk_config_t config;
+        config.gds = ustore_gds_direct_k;
         if (addresses.data_directories[0].kind == data_address_kind_t::directory_k) {
-            if (gds == ustore_gds_direct_k)
-                return {status_code_t::unsupported_k, "GPUDirect Storage does not yet read a directory volume's runs"};
+            // Every run a merge reads is a file of its own, registered while that merge runs.
+            config.media_limit = merged_run_files_k;
+            auto [disk, disk_status] = sections_disk_of<cpu_class_>::make(cufile, config);
+            if (disk_status.failed()) return disk_status;
+            expected<sections_reader_of<cpu_class_>> reader = sections_reader_of<cpu_class_>::make(std::move(disk),
+                                                                                                   volume);
+            if (!reader) return reader.status();
+            sections_.emplace(std::move(*reader));
             return {};
         }
         std::size_t const media_count = addresses.data_directories.size();
-        linux_cufile_disk_config_t config;
-        config.gds = ustore_gds_direct_k;
         if (media_count > config.media_limit) config.media_limit = static_cast<std::uint16_t>(media_count);
         auto [disk, disk_status] = sections_disk_of<cpu_class_>::make(cufile, config);
         if (disk_status.failed()) return disk_status;
@@ -390,6 +401,9 @@ class device_compaction {
         sections_.emplace(std::move(*reader));
         return {};
     }
+
+    /** Run files one merge on a directory volume reads at most. */
+    static constexpr std::uint16_t merged_run_files_k = 1024;
 
     std::variant<std::monostate, cuda_executor_t, hip_executor_t> executor_;
     std::optional<sections_reader_of<cpu_class_>> sections_;
@@ -434,10 +448,12 @@ struct database_state {
     database_state(database_state const&) = delete;
     database_state& operator=(database_state const&) = delete;
 
-    /** Flushes and unmounts the store while its mount is still there, then lets both go. */
+    /** Flushes and unmounts the store, then the storage under it, before letting both go, since
+     *  a collection or buffer may keep the resources alive past the database. */
     ~database_state() noexcept {
         if (store) { [[maybe_unused]] status_t const unmounted = store->unmount(); }
         store.reset();
+        if (resources) { [[maybe_unused]] status_t const released = resources->storage.unmount(); }
         resources.reset();
     }
 };
@@ -697,6 +713,73 @@ expected<value_view_t> read_value(call_access<cpu_class_> const& access, collect
         return value_view_t {};
     }
     return status_t {status_code_t::contended_k, "A value kept changing its size while it was read"};
+}
+
+/**
+ *  @brief The values of @p keys in @p collection at the stamp of @p access, outside a transaction,
+ *      as one batched read of the store with as many reads in flight as its channel takes, each
+ *      copied into the scratch of @p access, a missing key reading as a missing value.
+ *
+ *  Sizes are measured first, from the index in memory, so every value lands in a room of its own;
+ *  a value whose size changed before its bytes arrived is read again alone, as @c read_value does.
+ */
+template <cpu_class_t cpu_class_>
+status_t read_values_batched(call_access<cpu_class_> const& access, collection_id_t collection,
+                             std::span<stored_key_t const> keys, std::span<value_view_t> values) noexcept {
+    basic_database_of<cpu_class_>& store = *access.state.store;
+    std::size_t const count = keys.size();
+    auto [sizes, sizes_status] = arena_allocate<stored_value_size_t>(access.scratch, count);
+    if (sizes_status.failed()) return sizes_status;
+    auto [delivered, delivered_status] = arena_allocate<std::uint64_t>(access.scratch, count);
+    if (delivered_status.failed()) return delivered_status;
+    auto [results, results_status] = arena_allocate<lookup_result_t>(access.scratch, count);
+    if (results_status.failed()) return results_status;
+    auto [present, present_status] = arena_allocate<bool>(access.scratch, count);
+    if (present_status.failed()) return present_status;
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index != count; ++index) {
+        status_t const measured = store.stored_value_size(collection, keys[index], sizes[index], access.stamp,
+                                                          access.thread_index);
+        if (measured.failed() && measured != status_code_t::not_found_k) return measured;
+        present[index] = measured.succeeded();
+        if (!present[index]) sizes[index] = 0;
+        delivered[index] = 0;
+        total += sizes[index];
+    }
+    auto [room, room_status] = arena_allocate<byte_t>(access.scratch, static_cast<std::size_t>(total));
+    if (room_status.failed()) return room_status;
+    auto [rooms, rooms_status] = arena_allocate<byte_t*>(access.scratch, count);
+    if (rooms_status.failed()) return rooms_status;
+    for (std::size_t index = 0, at = 0; index != count; at += sizes[index], ++index) rooms[index] = room.data() + at;
+
+    // Bytes past a value's measured size mark it as changed meanwhile, never written past its room.
+    constexpr std::uint64_t changed_k = std::numeric_limits<std::uint64_t>::max();
+    auto sink = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
+        if (delivered[request] == changed_k || offset + bytes.size() > sizes[request]) {
+            delivered[request] = changed_k;
+            return;
+        }
+        if (!bytes.empty()) std::memcpy(rooms[request] + offset, bytes.data(), bytes.size());
+        delivered[request] += bytes.size();
+    };
+    if (status_t const read = store.select(collection, keys, std::span<lookup_result_t> {results}, sink, access.stamp,
+                                           access.thread_index);
+        read.failed())
+        return read;
+
+    for (std::size_t index = 0; index != count; ++index) {
+        bool const written = results[index] == lookup_result_t::written_k;
+        if (written && present[index] && delivered[index] == sizes[index])
+            values[index] = sizes[index] ? value_view_t {std::span<byte_t const> {rooms[index], sizes[index]}}
+                                         : value_view_t {empty_value_bytes_k, std::size_t {0}};
+        else if (!written && !present[index]) values[index] = value_view_t {};
+        else {
+            auto [value, read_status] = read_value(access, collection, keys[index]);
+            if (read_status.failed()) return read_status;
+            values[index] = value;
+        }
+    }
+    return {};
 }
 
 /** Writes @p value under @p key of @p collection, a missing value removing it: through the transaction of @p access,
@@ -1803,8 +1886,15 @@ template <cpu_class_t cpu_class_>
 expected<compactor_ref_t> compactor_of(database_state<cpu_class_>& state, resources_config_t const& resources,
                                        ustore_executor_handle_t const* compactions) noexcept {
     if (!compactions) return compactor_ref_t {};
+    typename device_compaction<cpu_class_>::volume_t const* volume = nullptr;
+    [[maybe_unused]] status_t const visited = state.resources->storage.visit([&](auto& mount) noexcept -> status_t {
+        if constexpr (std::is_same_v<std::remove_reference_t<decltype(mount)>, storage_mount_of<cpu_class_>>)
+            volume = &mount.volume();
+        return {};
+    });
+    if (!volume) return status_t {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     device_compaction<cpu_class_>& compaction = state.compaction.emplace();
-    if (status_t const opened = compaction.open(*compactions, resources); opened.failed()) return opened;
+    if (status_t const opened = compaction.open(*compactions, resources, *volume); opened.failed()) return opened;
     if (cuda_compactor_t* const compactor = compaction.compactor()) return compactor_ref_t {compactor};
     return compactor_ref_t {};
 }

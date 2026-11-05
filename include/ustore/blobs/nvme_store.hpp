@@ -1920,7 +1920,7 @@ class nvme_store_cursor {
     }
 
     /** The key slot @p cursor sits on, which must not be spent. */
-    [[nodiscard]] key_slot_t const& key_slot_at_(run_cursor_t const& cursor) const noexcept {
+    [[nodiscard]] key_slot_t key_slot_at_(run_cursor_t const& cursor) const noexcept {
         return view_->levels->level(cursor.level_number).run(cursor.run_index).key_slot(cursor.position);
     }
 

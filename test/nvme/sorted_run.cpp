@@ -415,7 +415,9 @@ status_t read_raw(disk_type_& disk, io_channel_t& channel, medium_extent_t const
     if (into.resize(static_cast<std::size_t>(length)) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "No room for the raw bytes"};
     std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
-    basic_read_pipeline<disk_type_> reader {disk, channel, blob.medium};
+    auto [reader_lease, reader_lease_status] = channel.lease();
+    if (reader_lease_status.failed()) return reader_lease_status;
+    basic_read_pipeline<disk_type_> reader {disk, std::move(reader_lease), blob.medium};
     status_t moved;
     auto sink = [&](completed_buffer_t const& completed) noexcept {
         if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
@@ -483,9 +485,8 @@ std::size_t sections_sit_on_page_boundaries(mount_type_ const& mount) {
         std::uint64_t const offsets_section = variable_layout_t::value_offsets_offset(count);
         std::uint64_t const values_section = variable_layout_t::values_offset(count);
         std::uint64_t const trailer_section = variable_layout_t::stamps_offset(count, data.values.size());
-        failures += expect_eq(keys_section,
-                              variable_layout_t::header_bytes() +
-                                  round_up_to_multiple(count * sizeof(variable_slot_t), portable_alignment_k));
+        // A cell that is its key alone is not saved, so the tree of the keys follows the header.
+        failures += expect_eq(keys_section, variable_layout_t::header_bytes());
         failures += expect_eq(offsets_section - keys_section,
                               round_up_to_multiple(variable_layout_t::keys_saved_bytes(count), portable_alignment_k));
         failures += expect_eq(values_section - offsets_section,
@@ -643,7 +644,9 @@ status_t paint_stub_header(disk_type_& disk, io_channel_t& channel, medium_refer
     header.value_layout = value_layout_t::variable_width_k;
     header.content_id = uuid_generator();
 
-    basic_write_pipeline<disk_type_, waiter_t> writer {disk, channel, medium};
+    auto [writer_lease, writer_lease_status] = channel.lease();
+    if (writer_lease_status.failed()) return writer_lease_status;
+    basic_write_pipeline<disk_type_, waiter_t> writer {disk, std::move(writer_lease), medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     std::memset(block.bytes().data(), 0, static_cast<std::size_t>(run_config_k.page_bytes));
@@ -1115,39 +1118,45 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
     failures += expect(run.has_value());
     if (!run) return failures;
 
-    read_pipeline_t reader {(*fixture)->disk, guard->channel(), run->extent().medium};
-    std::size_t offered = 0;
-    std::size_t polled_total = 0;
-    std::size_t mismatches = 0;
-    std::size_t deepest = 0;
-    auto sink = [&](completed_buffer_t const& completed) noexcept {
-        ++polled_total;
-        if (require_completed_in_full(completed).failed()) {
-            ++mismatches;
-            return;
-        }
-        value_window_t const window = run->value_window(completed.tag);
-        for (std::uint32_t index = 0; index != window.bytes; ++index)
-            if (completed.bytes[window.skipped + index] != painted(completed.tag, index)) ++mismatches;
-    };
+    // The test's own pipeline gives the queue pair back before the run's batched read takes it.
+    {
+        expected<io_channel_t::lease_t> lease = guard->channel().lease();
+        failures += expect(lease.has_value());
+        if (!lease) return failures;
+        read_pipeline_t reader {(*fixture)->disk, std::move(*lease), run->extent().medium};
+        std::size_t offered = 0;
+        std::size_t polled_total = 0;
+        std::size_t mismatches = 0;
+        std::size_t deepest = 0;
+        auto sink = [&](completed_buffer_t const& completed) noexcept {
+            ++polled_total;
+            if (require_completed_in_full(completed).failed()) {
+                ++mismatches;
+                return;
+            }
+            value_window_t const window = run->value_window(completed.tag);
+            for (std::uint32_t index = 0; index != window.bytes; ++index)
+                if (completed.bytes[window.skipped + index] != painted(completed.tag, index)) ++mismatches;
+        };
 
-    while (offered != count_k || reader.outstanding() != 0) {
-        while (offered != count_k && reader.can_enqueue()) {
-            value_window_t const window = run->value_window(offered);
-            if (reader.enqueue_read(window.extent, static_cast<std::uint32_t>(offered)).failed()) break;
-            ++offered;
+        while (offered != count_k || reader.outstanding() != 0) {
+            while (offered != count_k && reader.can_enqueue()) {
+                value_window_t const window = run->value_window(offered);
+                if (reader.enqueue_read(window.extent, static_cast<std::uint32_t>(offered)).failed()) break;
+                ++offered;
+            }
+            failures += expect(reader.submit().succeeded());
+            std::size_t const live = (*fixture)->disk.outstanding(guard->channel().queue_pair());
+            if (live > deepest) deepest = live;
+            expected<std::size_t> const seen = reader.poll_completions(sink);
+            failures += expect(seen.has_value());
+            if (!seen) return failures;
         }
-        failures += expect(reader.submit().succeeded());
-        std::size_t const live = (*fixture)->disk.outstanding(guard->channel().queue_pair());
-        if (live > deepest) deepest = live;
-        expected<std::size_t> const seen = reader.poll_completions(sink);
-        failures += expect(seen.has_value());
-        if (!seen) return failures;
+
+        failures += expect_eq(polled_total, count_k);
+        failures += expect_eq(mismatches, std::size_t {0});
+        failures += expect_eq(deepest, static_cast<std::size_t>(run_config_k.queue_depth));
     }
-
-    failures += expect_eq(polled_total, count_k);
-    failures += expect_eq(mismatches, std::size_t {0});
-    failures += expect_eq(deepest, static_cast<std::size_t>(run_config_k.queue_depth));
 
     // The run's own batched read holds as many blocks as the queue pair has credit, counted in the pool
     // because the ring performs a channel's requests inside the poll that hands them to the sink.

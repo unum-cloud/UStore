@@ -84,8 +84,10 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
     return remove_values<cpu_class_>(arguments, view);
 }
 
-/** Reads whole values through the store of each collection, folded as its modality folds them, copying every value
- *  into the scratch once and into the arena at the end, for a caller whose resolver checked the collections. */
+/** Reads whole values through the store of each collection, folded as its modality folds them,
+ *  copying each value into the scratch once and into the arena at the end, for a caller whose
+ *  resolver checked the collections; outside a transaction, every run of keys of one collection is
+ *  one batched read of its store. */
 template <cpu_class_t cpu_class_>
 status_t read_values(ustore_blobs_read_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
@@ -95,6 +97,27 @@ status_t read_values(ustore_blobs_read_t const& arguments, view_t const& view) n
     auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
+    if (!access.transaction) {
+        auto [keys, keys_status] = arena_allocate<stored_key_t>(view.scratch, places.size());
+        if (keys_status.failed()) return keys_status;
+        auto [values, values_status] = arena_allocate<value_view_t>(view.scratch, places.size());
+        if (values_status.failed()) return values_status;
+        for (std::size_t index = 0; index != places.size(); ++index) keys[index] = stored_of(places[index].key.uuid);
+        for (std::size_t first = 0; first != places.size();) {
+            collection_id_t const collection = places[first].collection;
+            std::size_t last = first + 1;
+            while (last != places.size() && places[last].collection == collection) ++last;
+            if (status_t const read = read_values_batched(access, collection, keys.subspan(first, last - first),
+                                                          values.subspan(first, last - first));
+                read.failed())
+                return read;
+            first = last;
+        }
+        for (value_view_t const& value : values)
+            if (value) outputs.append(value);
+            else outputs.append_missing();
+        return outputs.finish(arguments);
+    }
     for (std::size_t index = 0; index != places.size(); ++index) {
         place_t const place = places[index];
         auto [value, read_status] = read_value(access, place.collection, stored_of(place.key.uuid));

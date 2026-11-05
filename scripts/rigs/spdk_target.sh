@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
-# Brings up an SPDK NVMe/TCP target exporting one RAM-backed namespace without hugepages, or tears it down.
+# Brings up an SPDK NVMe/TCP target exporting two RAM-backed namespaces without hugepages, or tears it down.
 # Usage: USTORE_SPDK_ROOT=<spdk tree> spdk_target.sh up [size_mb] | down | address | serial
-# The namespace is 0.25 MB of 4096-byte blocks by default, the 64-block volume the shared ring cases assume.
+# Namespace 1 is 0.25 MB of 4096-byte blocks by default, the 64-block volume the shared ring cases assume.
+# Namespace 2 is 3 GiB, a manifest slot and two run slots of a database, `spdk://<address>/2@0` to a mount.
 set -euo pipefail
 
 root=${USTORE_SPDK_ROOT:?set USTORE_SPDK_ROOT to an SPDK tree with a finished build}
 socket=${USTORE_SPDK_SOCKET:-/tmp/ustore-spdk-target.sock}
 log=${USTORE_SPDK_LOG:-/tmp/ustore-spdk-target.log}
+pid_file=${USTORE_SPDK_PID:-/tmp/ustore-spdk-target.pid}
 subsystem_nqn=nqn.2026-09.io.ustore:malloc
 serial=USTORE00000000000001
 model=USTORE_Malloc
 port=4420
 size_mb=${2:-0.25}
+database_mb=3072
+# Plain pages for both namespaces and the transport's buffers.
+memory_mb=4608
 target=$root/build/bin/nvmf_tgt
 rpc="$root/scripts/rpc.py -s $socket"
 
@@ -29,9 +34,9 @@ address_of() {
     echo "trtype:TCP adrfam:IPv4 traddr:$1 trsvcid:$port subnqn:$subsystem_nqn"
 }
 
-# The main thread is renamed reactor_0, so the target is found by its command line, never by its name.
+# The PID recorded at start, so a teardown never reaches a process this rig did not launch.
 running() {
-    pgrep -f "$target" >/dev/null
+    [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null
 }
 
 up() {
@@ -43,17 +48,21 @@ up() {
     rm -f "$socket"
     # Without hugepages the environment refuses to start unless -s names its memory; the cpumask locks would
     # refuse a start after an unclean stop.
-    "$target" --no-huge -s 512 -m 0x3 --disable-cpumask-locks -r "$socket" >"$log" 2>&1 &
+    "$target" --no-huge -s "$memory_mb" -m 0x3 --disable-cpumask-locks -r "$socket" >"$log" 2>&1 &
+    echo $! >"$pid_file"
+    trap 'status=$?; [ "$status" -eq 0 ] || down' EXIT
     local attempt
     for attempt in $(seq 1 300); do
         [ -S "$socket" ] && $rpc -t 1 framework_wait_init >/dev/null 2>&1 && break
         running || { cat "$log" >&2; echo "the target died before it listened" >&2; exit 1; }
         sleep 0.1
     done
-    $rpc nvmf_create_transport -t TCP -u 16384 -m 8 -c 8192 >&2
+    $rpc nvmf_create_transport -t TCP -m 8 -c 8192 >&2
     $rpc bdev_malloc_create -b Malloc0 "$size_mb" 4096 >&2
+    $rpc bdev_malloc_create -b Malloc1 "$database_mb" 4096 >&2
     $rpc nvmf_create_subsystem "$subsystem_nqn" -a -s "$serial" -d "$model" >&2
-    $rpc nvmf_subsystem_add_ns "$subsystem_nqn" Malloc0 >&2
+    $rpc nvmf_subsystem_add_ns -n 1 "$subsystem_nqn" Malloc0 >&2
+    $rpc nvmf_subsystem_add_ns -n 2 "$subsystem_nqn" Malloc1 >&2
     local candidate address=""
     for candidate in $(candidates); do
         $rpc nvmf_subsystem_add_listener "$subsystem_nqn" -t tcp -f ipv4 -a "$candidate" -s "$port" >&2
@@ -70,14 +79,14 @@ up() {
 
 down() {
     if running; then
-        pkill -f "$target" || true
+        kill "$(cat "$pid_file")" || true
         local attempt
         for attempt in $(seq 1 50); do
             running || break
             sleep 0.1
         done
     fi
-    rm -f "$socket"
+    rm -f "$socket" "$pid_file"
 }
 
 address() {

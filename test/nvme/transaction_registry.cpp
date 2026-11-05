@@ -169,6 +169,9 @@ class test_store_t {
     /** Maintains nothing, since balances live in place. */
     status_t maintain(collection_id_t) noexcept { return {}; }
 
+    /** Frees no memory-run record, since this store holds none. */
+    bool flushed_records(collection_id_t) noexcept { return false; }
+
     /** The balance @p stored_key holds right now, which a later commit may already have moved. */
     std::uint64_t balance(stored_key_t stored_key) const noexcept {
         return balance_(stored_key).load(std::memory_order_acquire);

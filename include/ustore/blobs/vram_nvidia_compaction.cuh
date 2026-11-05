@@ -96,7 +96,30 @@ struct merge_kernel_names<key_slot<st::key128_t, value_layout_>> {
                                            : value_layout_ == value_layout_t::fixed_width_k
                                                ? "ustore_merge_place_fixed_width"
                                                : "ustore_merge_place_variable_width";
+    static constexpr char const* gather_k = value_layout_ == value_layout_t::fixed_width_k
+                                                ? "ustore_merge_gather_fixed_width"
+                                                : "ustore_merge_gather_variable_width";
 };
+
+/** One run of a merge whose cells, its keys alone, come from the leaf rows of its key tree. */
+template <typename key_slot_type_>
+struct key_rows_gather {
+
+    /** The first leaf row on the device, rows of split high and low words for 16-byte keys. */
+    std::uint64_t const* rows = nullptr;
+
+    /** Where the run's cells land on the device. */
+    key_slot_type_* cells = nullptr;
+
+    /** Index of the run's first cell among the cells of every gathered run. */
+    std::uint64_t first = 0;
+
+    /** Keys the run holds. */
+    std::uint64_t count = 0;
+};
+
+/** The C name of the kernel that ranks the versions of a merge of strings. */
+inline constexpr char const* merge_strings_rank_name_k = "ustore_merge_strings_rank";
 
 /** The value at @p index of a column saved as SmashTable saves a packed array: its count, base and width words, then
  *  the packed words. */
@@ -114,6 +137,133 @@ constexpr value_type_ saved_field(std::uint64_t const* saved, std::uint64_t inde
     std::uint64_t const mask = bits == 64 ? ~std::uint64_t {0} : (std::uint64_t {1} << bits) - 1;
     return static_cast<value_type_>(base + (field & mask));
 }
+
+#pragma region Strings Ranking
+
+/** One run of strings as the rank kernel reads it: a head per key, whole keys, saved columns. */
+struct strings_merge_run {
+
+    /** The head of every key in sorted order, which consecutive threads load side by side. */
+    st::key128_t const* heads = nullptr;
+
+    /** One offset per key into @c keys and one past the last. */
+    std::uint32_t const* key_offsets = nullptr;
+
+    /** Every key whole, back to back in sorted order. */
+    byte_t const* keys = nullptr;
+
+    /** The run's saved stamps column, as SmashTable saves a packed array. */
+    std::uint64_t const* saved_stamps = nullptr;
+
+    /** The run's saved kinds column, as SmashTable saves a packed array. */
+    std::uint64_t const* saved_kinds = nullptr;
+
+    /** Index of the run's first record among the records of every run. */
+    std::uint64_t first = 0;
+
+    /** Keys the run holds. */
+    std::uint64_t count = 0;
+};
+
+/** The key slot a merge of strings judges survival on, whose stored key is a head. */
+using strings_merge_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>;
+
+/** Where a version lands in a merge of strings, and whether it survives. */
+struct strings_merge_verdict_t {
+
+    /** Its position in merged order. */
+    std::uint64_t rank = 0;
+
+    /** Whether it survives, as @c survives decides beside the version before it. */
+    bool survives = false;
+};
+
+/** Orders the key at @p first_position of @p first against the one at @p second_position of
+ *  @p second: by their heads, and on a tie by the bytes past them on the tapes, as
+ *  @c union_sorted_keys orders keys. */
+constexpr int strings_merge_order(strings_merge_run const& first, std::uint64_t first_position,
+                                  strings_merge_run const& second, std::uint64_t second_position) noexcept {
+    st::key128_t const first_head = first.heads[first_position];
+    st::key128_t const second_head = second.heads[second_position];
+    if (first_head < second_head) return -1;
+    if (second_head < first_head) return 1;
+    // Equal heads share their leading bytes and a length class, so only the bytes past them differ.
+    constexpr std::uint64_t head_bytes_k = sizeof(st::key128_t) - 1;
+    std::uint64_t first_offset = first.key_offsets[first_position];
+    std::uint64_t const first_end = first.key_offsets[first_position + 1];
+    std::uint64_t second_offset = second.key_offsets[second_position];
+    std::uint64_t const second_end = second.key_offsets[second_position + 1];
+    first_offset += first_end - first_offset < head_bytes_k ? first_end - first_offset : head_bytes_k;
+    second_offset += second_end - second_offset < head_bytes_k ? second_end - second_offset : head_bytes_k;
+    for (; first_offset != first_end && second_offset != second_end; ++first_offset, ++second_offset) {
+        auto const first_byte = static_cast<unsigned char>(first.keys[first_offset]);
+        auto const second_byte = static_cast<unsigned char>(second.keys[second_offset]);
+        if (first_byte != second_byte) return first_byte < second_byte ? -1 : 1;
+    }
+    return first_offset != first_end ? 1 : second_offset != second_end ? -1 : 0;
+}
+
+/** The version at @p position of @p run as @c survives reads it: its head, run, kind and stamp. */
+constexpr located_key_slot<strings_merge_slot_t> strings_merge_record(strings_merge_run const& run, std::uint32_t index,
+                                                                      std::uint64_t position) noexcept {
+    located_key_slot<strings_merge_slot_t> record {};
+    record.key_slot.stored_key = run.heads[position];
+    record.sorted_run = index;
+    record.position = static_cast<std::uint32_t>(position);
+    if (run.saved_stamps != nullptr) record.stamp = saved_field<std::uint64_t>(run.saved_stamps, position);
+    if (run.saved_kinds != nullptr)
+        record.kind = static_cast<delta_kind_t>(saved_field<std::uint8_t>(run.saved_kinds, position));
+    return record;
+}
+
+/**
+ *  @brief Where the version at @p position of run @p run lands in the merge of @p runs, and
+ *      whether it survives.
+ *
+ *  Its merged position is its own position plus, for every other run, how many of that run's
+ *  versions order before it: the keys at or below its key for a run whose versions of a key come
+ *  first, newer upper runs ahead of older ones and every upper run ahead of the lower ones, and the
+ *  keys below it otherwise. The last of those of its key is the version before it, beside which it
+ *  survives as @c survives decides, so the order is the host's.
+ */
+constexpr strings_merge_verdict_t strings_merge_verdict(strings_merge_run const* runs, std::uint32_t runs_count,
+                                                        std::uint32_t upper_runs, std::uint32_t run,
+                                                        std::uint64_t position, compaction_kind_t kind,
+                                                        compaction_stamps_t const& stamps) noexcept {
+    auto const comes_first = [upper_runs](std::uint32_t first_run, std::uint32_t second_run) noexcept {
+        bool const both_upper = (first_run < upper_runs) & (second_run < upper_runs);
+        return both_upper ? first_run > second_run : first_run < second_run;
+    };
+    strings_merge_run const& own = runs[run];
+    std::uint64_t rank = position;
+    std::uint32_t previous_run = run;
+    std::uint64_t previous_position = position;
+    bool preceded = position != 0 && strings_merge_order(own, position - 1, own, position) == 0;
+    if (preceded) previous_position = position - 1;
+    for (std::uint32_t other = 0; other != runs_count; ++other) {
+        if (other == run) continue;
+        strings_merge_run const& theirs = runs[other];
+        bool const ahead = comes_first(other, run);
+        std::uint64_t before = 0;
+        for (std::uint64_t count = theirs.count; count;) {
+            std::uint64_t const half = count / 2;
+            int const order = strings_merge_order(theirs, before + half, own, position);
+            if (order < 0 || (order == 0 && ahead)) before += half + 1, count -= half + 1;
+            else count = half;
+        }
+        rank += before;
+        if (before == 0 || !ahead || strings_merge_order(theirs, before - 1, own, position) != 0) continue;
+        // Of the versions of this key ordered before it, the latest is in the run that comes last.
+        if (!preceded || (previous_run != run && comes_first(previous_run, other)))
+            previous_run = other, previous_position = before - 1, preceded = true;
+    }
+    located_key_slot<strings_merge_slot_t> const record = strings_merge_record(own, run, position);
+    located_key_slot<strings_merge_slot_t> const previous = strings_merge_record(runs[previous_run], previous_run,
+                                                                                 previous_position);
+    return {rank, survives(preceded ? &previous : nullptr, record, kind, stamps)};
+}
+
+#pragma endregion Strings Ranking
 
 #if defined(__CUDACC__) || defined(__HIP__)
 
@@ -280,6 +430,54 @@ __device__ void merge_place(located_key_slot<key_slot_type_> const* survivors, s
         place_key_slot(survivors[survivor], floor, cells[survivor], stamps[survivor], kinds[survivor]);
 }
 
+/** Writes the cell of every key of every run @p gathers names, read from the leaf rows of its key
+ *  tree, where consecutive threads read consecutive words of a row. */
+template <typename key_slot_type_>
+__device__ void merge_gather(key_rows_gather<key_slot_type_> const* gathers, std::uint32_t gathers_count,
+                             std::uint64_t cells_count) noexcept {
+    using format_t = typename st::immutable_splus_tree_view<typename key_slot_type_::stored_key_t>::format_t;
+    std::uint64_t const stride = std::uint64_t {gridDim.x} * blockDim.x;
+    for (std::uint64_t index = std::uint64_t {blockIdx.x} * blockDim.x + threadIdx.x; index < cells_count;
+         index += stride) {
+        std::uint32_t gather = 0;
+        for (std::uint32_t high = gathers_count; high - gather > 1;) {
+            std::uint32_t const middle = gather + (high - gather) / 2;
+            if (gathers[middle].first <= index) gather = middle;
+            else high = middle;
+        }
+        key_rows_gather<key_slot_type_> const& run = gathers[gather];
+        std::uint64_t const position = index - run.first;
+        key_slot_type_ cell {};
+        cell.stored_key = format_t::key_at(reinterpret_cast<typename format_t::word_t const*>(run.rows) +
+                                               position / format_t::keys_per_row_k * format_t::words_per_row_k,
+                                           static_cast<std::size_t>(position % format_t::keys_per_row_k));
+        run.cells[position] = cell;
+    }
+}
+
+/** Writes each version of the merge of @p runs of strings at its merged position of @p merged, with
+ *  its survival flag in @p flags, one thread per version, as @c strings_merge_verdict places it. */
+__device__ inline void merge_strings_rank(strings_merge_run const* runs, std::uint32_t runs_count,
+                                          std::uint32_t upper_runs, std::uint64_t records_count, compaction_kind_t kind,
+                                          compaction_stamps_t stamps, strings_version_t* merged,
+                                          std::uint8_t* flags) noexcept {
+    std::uint64_t const stride = std::uint64_t {gridDim.x} * blockDim.x;
+    for (std::uint64_t index = std::uint64_t {blockIdx.x} * blockDim.x + threadIdx.x; index < records_count;
+         index += stride) {
+        std::uint32_t run = 0;
+        for (std::uint32_t high = runs_count; high - run > 1;) {
+            std::uint32_t const middle = run + (high - run) / 2;
+            if (runs[middle].first <= index) run = middle;
+            else high = middle;
+        }
+        std::uint64_t const position = index - runs[run].first;
+        strings_merge_verdict_t const verdict = strings_merge_verdict(runs, runs_count, upper_runs, run, position, kind,
+                                                                      stamps);
+        merged[verdict.rank] = strings_version_t {run, static_cast<std::uint32_t>(position)};
+        flags[verdict.rank] = verdict.survives ? 1 : 0;
+    }
+}
+
 #pragma endregion Kernels
 
 #else
@@ -365,6 +563,9 @@ struct run_sections {
     /** The trailer of a run reading from its volume, its saved stamps first. */
     std::uint64_t* trailer = nullptr;
 
+    /** The key tree of a run of keys alone read from its volume, gathered into @c cells. */
+    std::uint64_t* keys = nullptr;
+
     sections_source_t source = sections_source_t::memory_k;
 };
 
@@ -372,16 +573,23 @@ struct run_sections {
  *  @p preferred is the volume and the run lives on one, and as its memory holds them otherwise. */
 template <typename key_slot_type_>
 run_sections<key_slot_type_> carve_sections(sorted_run_index_view<key_slot_type_> const& view,
-                                            sorted_run_extents_t const& extents, sorted_run_bounds_t const& bounds,
-                                            sections_source_t preferred, scratch_cursor_t& cursor) noexcept {
+                                            sorted_run_extents_t const& extents, sections_source_t preferred,
+                                            scratch_cursor_t& cursor) noexcept {
     run_sections<key_slot_type_> sections;
-    if (preferred == sections_source_t::volume_k && !extents.cells.empty() && !extents.trailer.empty())
+    bool const gathers = extents.cells.empty() && !extents.keys.empty();
+    if (preferred == sections_source_t::volume_k && (!extents.cells.empty() || gathers) && !extents.trailer.empty())
         sections.source = sections_source_t::volume_k;
     std::uint64_t const cells_count = view.key_slots_count;
     std::size_t const page = static_cast<std::size_t>(utilities::portable_alignment_k);
     if (sections.source == sections_source_t::volume_k) {
-        sections.cells = cursor.take<key_slot_type_>(
-            static_cast<std::size_t>(extents.cells.length / sizeof(key_slot_type_) + 1), page);
+        if (gathers) {
+            sections.keys = cursor.take<std::uint64_t>(
+                static_cast<std::size_t>(extents.keys.length / sizeof(std::uint64_t) + 1), page);
+            sections.cells = cursor.take<key_slot_type_>(static_cast<std::size_t>(cells_count));
+        }
+        else
+            sections.cells = cursor.take<key_slot_type_>(
+                static_cast<std::size_t>(extents.cells.length / sizeof(key_slot_type_) + 1), page);
         if (!view.value_offsets.empty())
             sections.value_offsets = cursor.take<stored_value_offset_t>(
                 static_cast<std::size_t>(extents.value_offsets.length / sizeof(stored_value_offset_t) + 1), page);
@@ -576,7 +784,7 @@ st::status_t cuda_compactor_t::compact(
             view_t const& view = view_of(run);
             changes |= holds_changes(view.kinds);
             merged_count += view.key_slots_count;
-            if (carve_sections(view, extents[run], bounds, preferred, sizing).source == sections_source_t::memory_k)
+            if (carve_sections(view, extents[run], preferred, sizing).source == sections_source_t::memory_k)
                 saved_count += saved_words(view);
         }
         // Without a device fold, changes fold on the host alone, where every merge
@@ -611,15 +819,22 @@ st::status_t cuda_compactor_t::compact(
         std::uint64_t* const prefix = locates_k ? carve_<std::uint64_t>(records_count + 1) : nullptr;
         std::uint8_t* const shares = carve_<std::uint8_t>(records_count);
         std::uint64_t* const chains = carve_<std::uint64_t>(2);
-        if ((sorted_runs_count && !runs) || (saved_count && !saved_columns) || (stamps.pinned_count && !pinned) ||
+        key_rows_gather<key_slot_type_>* const gathers = carve_<key_rows_gather<key_slot_type_>>(sorted_runs_count);
+        if ((sorted_runs_count && (!runs || !gathers)) || (saved_count && !saved_columns) ||
+            (stamps.pinned_count && !pinned) ||
             (records_count && (!merged || !flags || !survivors || !shares || (locates_k && !prefix))) || !chains)
             return status_t::out_of_memory_heap_k;
 
         merge_run<key_slot_type_>* const host_runs = carve_bounce<merge_run<key_slot_type_>>(*executor_,
                                                                                              sorted_runs_count);
         std::uint64_t* const saved = carve_bounce<std::uint64_t>(*executor_, saved_count);
-        if ((sorted_runs_count && !host_runs) || (saved_count && !saved) || executor_->pin_bounce().failed())
+        key_rows_gather<key_slot_type_>* const host_gathers = carve_bounce<key_rows_gather<key_slot_type_>>(
+            *executor_, sorted_runs_count);
+        if ((sorted_runs_count && (!host_runs || !host_gathers)) || (saved_count && !saved) ||
+            executor_->pin_bounce().failed())
             return status_t::out_of_memory_heap_k;
+        std::uint32_t gathers_count = 0;
+        std::uint64_t gathered_cells = 0;
 
         // Every run's sections land where the sizing pass placed them, and its record reads them
         // through @c runs
@@ -631,7 +846,7 @@ st::status_t cuda_compactor_t::compact(
         for (std::uint64_t run = 0; run != sorted_runs_count; ++run) {
             view_t const& view = view_of(run);
             sorted_run_extents_t const& run_extents = extents[run];
-            run_sections<key_slot_type_> const sections = carve_sections(view, run_extents, bounds, preferred, placing);
+            run_sections<key_slot_type_> const sections = carve_sections(view, run_extents, preferred, placing);
             merge_run<key_slot_type_>& described = host_runs[run];
             described = merge_run<key_slot_type_> {};
             described.cells = sections.cells, described.value_offsets = sections.value_offsets;
@@ -643,20 +858,39 @@ st::status_t cuda_compactor_t::compact(
                     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(target) - holding_address);
                 };
                 for (device_section_read_t const read :
-                     {device_section_read_t {run_extents.volume, run_extents.cells, into(sections.cells)},
+                     {device_section_read_t {run_extents.volume, run_extents.cells, into(sections.cells),
+                                             run_extents.run},
                       device_section_read_t {run_extents.volume, run_extents.value_offsets,
-                                             into(sections.value_offsets)},
-                      device_section_read_t {run_extents.volume, run_extents.trailer, into(sections.trailer)}})
+                                             into(sections.value_offsets), run_extents.run},
+                      device_section_read_t {run_extents.volume, run_extents.trailer, into(sections.trailer),
+                                             run_extents.run},
+                      device_section_read_t {run_extents.volume,
+                                             sections.keys ? run_extents.keys : utilities::extent_t {},
+                                             sections.keys ? into(sections.keys) : 0, run_extents.run}})
                     if (!read.extent.empty())
                         if (reads_.push_back(device_section_read_t {read}) != status_t::success_k)
                             return status_t::out_of_memory_heap_k;
                 described.saved_stamps = sections.trailer;
                 described.saved_kinds = sections.trailer + run_extents.kinds_begin / sizeof(std::uint64_t);
+                if (sections.keys != nullptr) {
+                    host_gathers[gathers_count++] = key_rows_gather<key_slot_type_> {
+                        sections.keys + run_extents.leaves_begin / sizeof(std::uint64_t), sections.cells,
+                        gathered_cells, view.key_slots_count};
+                    gathered_cells += view.key_slots_count;
+                }
                 continue;
             }
             std::size_t const cells_count = static_cast<std::size_t>(view.key_slots_count);
-            if ((status = upload(*executor_, sections.cells, view.cells, cells_count)) != status_t::success_k)
-                return status;
+            key_slot_type_ const* cells = view.cells;
+            // A run keeping its keys in its tree alone stages its cells on the bounce to upload.
+            if (cells == nullptr && cells_count != 0) {
+                key_slot_type_* const staged = carve_bounce<key_slot_type_>(*executor_, cells_count);
+                if (!staged) return status_t::out_of_memory_heap_k;
+                for (std::size_t position = 0; position != cells_count; ++position)
+                    staged[position] = key_slot_of(view, position);
+                cells = staged;
+            }
+            if ((status = upload(*executor_, sections.cells, cells, cells_count)) != status_t::success_k) return status;
             status = upload(*executor_, sections.value_offsets, view.value_offsets.data(), view.value_offsets.size());
             if (status != status_t::success_k) return status;
             if (view.key_slots_count == 0) continue;
@@ -683,6 +917,16 @@ st::status_t cuda_compactor_t::compact(
             std::span<byte_t> const scratch {reinterpret_cast<byte_t*>(holding_address), holding_bytes};
             if ((status = sections_.read(reads_, scratch)) != status_t::success_k) return status;
         }
+        // Runs keeping their keys in their trees alone gather their cells in one pass, then rank.
+        if constexpr (!is_inline(key_slot_type_::value_layout_k))
+            if (gathered_cells != 0) {
+                if ((status = upload(*executor_, gathers, host_gathers, gathers_count)) != status_t::success_k)
+                    return status;
+                status = launch_over(*executor_, names_t::gather_k, gathered_cells, std::uint64_t {1} << 20,
+                                     static_cast<key_rows_gather<key_slot_type_> const*>(gathers), gathers_count,
+                                     gathered_cells);
+                if (status != status_t::success_k) return status;
+            }
 
         // The pinned stamps are a few words, read by every survival check, so the device holds
         // its own copy.

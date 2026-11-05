@@ -2,11 +2,14 @@
  *  @file include/ustore/utilities/nvme_linux_spdk_disk.hpp
  *  @author Ash Vardanian
  *  @date September 19, 2026
- *  @brief The ring SPDK offers: a user-space NVMe driver over one namespace, one queue pair per queue pair.
+ *  @brief The ring SPDK offers: a user-space NVMe driver over the namespaces of one controller, one
+ *      queue pair per queue pair.
  *
- *  This transport presents exactly one target, the namespace it was mounted on, and keeps no name
- *  mapping of its own; the catalog above it names what the extents hold, so a torn write of a map
- *  cannot lose a drive. Nothing here blocks, because the driver offers no interrupt at all:
+ *  This transport presents each namespace it registers as a target, named by its number, and keeps
+ *  no name mapping of its own; the manifest above it names what the extents hold, so a torn write
+ *  of a map cannot lose a drive. The driver attaches a controller once per process, so every disk
+ *  opened on one address shares that attachment and takes queue pairs of its own from it, and no
+ *  two disks register the same namespace. Nothing here blocks, as the driver offers no interrupt:
  *  @c spdk_nvme_qpair_process_completions is the only way a command is ever seen to finish.
  *
  *  A queue pair is a queue pair rather than a label, since an @c spdk_nvme_qpair carries no lock
@@ -27,6 +30,7 @@
 
 #pragma once
 
+#include <cassert> // `assert`
 #include <cerrno>  // `errno`, `EINTR`, `ENOMEM`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -41,6 +45,7 @@
 
 #include <array>       // `std::array`
 #include <bit>         // `std::has_single_bit`
+#include <charconv>    // `std::from_chars`
 #include <limits>      // `std::numeric_limits`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -53,7 +58,8 @@
 #include <spdk/nvme.h>     // `spdk_nvme_connect`, `spdk_nvme_ns_cmd_read`, `spdk_nvme_qpair`
 #endif
 
-#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <smashtable/basic_growing_pool.hpp> // `st::basic_growing_pool`
+#include <smashtable/basic_vector.hpp>       // `st::vector`
 
 #include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
@@ -384,47 +390,22 @@ struct linux_spdk_disk_config_t {
 /**
  *  @brief The one DPDK environment a process may hold, handed to every disk that needs it.
  *
- *  The handle is counted by value: copies share one initialisation and the last one to die tears it
- *  down, so a mount takes it, hands copies to its disks and forgets about the order they close in.
- *  Nothing here is process-global; the count lives in a block the first handle allocates. The driver
- *  itself is, and initialises once per process, which is why a second, independent @c acquire is
- *  refused rather than counted.
+ *  The driver initialises once per process and cannot initialise again, so the environment is never
+ *  finished: the first @c acquire brings it up, every later one shares it, and a handle is only the
+ *  proof that it is up.
  *
  *  @note @c probe is the only member that is safe to call before anything is initialised, and it is
  *      the one a mount must call, since @c acquire reaches @c rte_eal_init and that calls @c exit
  *      on the whole process when the machine is not ready for it.
  *
- *  @tparam atomic_reference_ The reference the count of handles is owned through.
+ *  @tparam atomic_reference_ The reference the process's claim goes through.
+ *  @tparam waiter_type_ What an @c acquire waiting on another one does between polls of the claim.
  */
-template <template <typename> typename atomic_reference_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_spdk_environment {
   public:
 
     linux_spdk_environment() noexcept = default;
-
-    linux_spdk_environment(linux_spdk_environment const& other) noexcept : holders_(other.holders_) {
-        if (holders_) count_(*holders_).fetch_add(1, std::memory_order_relaxed);
-    }
-
-    linux_spdk_environment& operator=(linux_spdk_environment const& other) noexcept {
-        if (this == &other) return *this;
-        forget_();
-        holders_ = other.holders_;
-        if (holders_) count_(*holders_).fetch_add(1, std::memory_order_relaxed);
-        return *this;
-    }
-
-    linux_spdk_environment(linux_spdk_environment&& other) noexcept
-        : holders_(std::exchange(other.holders_, nullptr)) {}
-
-    linux_spdk_environment& operator=(linux_spdk_environment&& other) noexcept {
-        if (this == &other) return *this;
-        forget_();
-        holders_ = std::exchange(other.holders_, nullptr);
-        return *this;
-    }
-
-    ~linux_spdk_environment() noexcept { forget_(); }
 
     /**
      *  @brief Decides whether the environment could be initialised, by reading files and nothing else.
@@ -438,48 +419,24 @@ class linux_spdk_environment {
     [[nodiscard]] static linux_spdk_probe_t probe(char const* address) noexcept;
 
     /**
-     *  @brief Initialises the environment, which only a probe that answered @c available_k permits.
-     *  @param[in] config Hugepages for a PCIe controller, or plain pages of a given size for a fabric.
-     *  @return A counted handle, or why the driver would not start.
-     *
-     *  @note The driver initialises once per process: a handle acquired after the last one of an
-     *      earlier environment died is refused, since DPDK keeps its state until the process exits.
+     *  @brief Brings the environment up, which only a probe answering @c available_k permits, or
+     *      shares it once it is up.
+     *  @param[in] config Hugepages for a PCIe controller, or plain pages of a size for a fabric.
+     *  @return The handle, why the driver would not start, or @c unsupported_k for a config asking
+     *      for other pages than the environment runs on.
      */
     static expected<linux_spdk_environment> acquire(linux_spdk_environment_config_t const& config) noexcept;
 
-    /** Whether this handle holds a share of an initialised environment. */
-    [[nodiscard]] bool initialised() const noexcept { return holders_ != nullptr; }
+    /** Whether this handle names the process's environment. */
+    [[nodiscard]] bool initialised() const noexcept { return initialised_; }
 
   private:
 
-    /** The block the counted handles share, allocated by the first of them and freed by the last. */
-    struct holders_t {
+    /** Initialises the driver for the first @c acquire of the process. */
+    static status_t initialise_(linux_spdk_environment_config_t const& config) noexcept;
 
-        /** Handles that still hold this environment, one when the block is first allocated. */
-        std::int32_t count = 1;
-    };
-
-    /** Shuts the driver down, which only the last handle of an environment reaches. */
-    static void finalize_() noexcept;
-
-    /** The counter of @p block as the atomic it is read and written through, once per handle copied or dropped, so
-     *  no CPU class tells it apart. */
-    [[nodiscard]] static atomic_reference_<std::int32_t> count_(holders_t& block) noexcept {
-        return atomic_reference_<std::int32_t> {block.count};
-    }
-
-    /** Drops this handle's share, tearing the environment down when it was the last one. */
-    void forget_() noexcept {
-        if (!holders_) return;
-        if (count_(*holders_).fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            finalize_();
-            delete holders_;
-        }
-        holders_ = nullptr;
-    }
-
-    /** The shared count, @c nullptr in a handle that holds no environment. */
-    holders_t* holders_ = nullptr;
+    /** Whether the handle came from an @c acquire that found or brought the environment up. */
+    bool initialised_ = false;
 };
 
 #if USTORE_OS_LINUX_
@@ -490,8 +447,8 @@ inline constexpr std::size_t meminfo_bytes_k = 8192;
 /** Bytes of a sysfs driver link the probe reads, which is more than such a path has ever spanned. */
 inline constexpr std::size_t link_bytes_k = 512;
 
-template <template <typename> typename atomic_reference_>
-linux_spdk_probe_t linux_spdk_environment<atomic_reference_>::probe(char const* address) noexcept {
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+linux_spdk_probe_t linux_spdk_environment<atomic_reference_, waiter_type_>::probe(char const* address) noexcept {
     if (!address) return linux_spdk_probe_t::not_found_k;
     if (spdk_transport_named(address) == linux_spdk_transport_t::fabric_k) return linux_spdk_probe_t::available_k;
     std::string_view const named = transport_field(address, "traddr:");
@@ -520,8 +477,8 @@ linux_spdk_probe_t linux_spdk_environment<atomic_reference_>::probe(char const* 
 
 #else
 
-template <template <typename> typename atomic_reference_>
-linux_spdk_probe_t linux_spdk_environment<atomic_reference_>::probe(char const* address) noexcept {
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+linux_spdk_probe_t linux_spdk_environment<atomic_reference_, waiter_type_>::probe(char const* address) noexcept {
     if (!address) return linux_spdk_probe_t::not_found_k;
     return spdk_transport_named(address) == linux_spdk_transport_t::fabric_k ? linux_spdk_probe_t::available_k
                                                                              : linux_spdk_probe_t::not_found_k;
@@ -531,14 +488,96 @@ linux_spdk_probe_t linux_spdk_environment<atomic_reference_>::probe(char const* 
 
 #if USTORE_WITH_SPDK
 
-template <template <typename> typename atomic_reference_>
-expected<linux_spdk_environment<atomic_reference_>> linux_spdk_environment<atomic_reference_>::acquire(
+#pragma region Process
+
+/**
+ *  @brief One connection to a controller, which every disk opened on its address shares.
+ *
+ *  The driver attaches a controller once per process, so a second mount on the same address takes
+ *  this one rather than connecting again. Every open disk and every namespace registered holds a
+ *  share, and the last share given back detaches the controller alone, so its drive may be pulled.
+ */
+struct linux_spdk_attachment_t {
+
+    /** The address the controller was connected at, which a later open is matched against. */
+    spdk_nvme_transport_id transport {};
+
+    /** The controller, null until the first share connects it. */
+    spdk_nvme_ctrlr* controller = nullptr;
+
+    /** Disks open and namespaces registered on the connection, zero while the record is free. */
+    std::uint32_t holders = 0;
+
+    /** Held while a share connects the controller or finds it failed. */
+    std::int32_t claim = 0;
+
+    /** Whether a later open passes this connection by, as its controller failed. */
+    bool dropped = false;
+
+    /** Namespaces some disk on the controller registered, which no second disk may register. */
+    st::vector<std::uint32_t> claimed;
+};
+
+/** Controllers one process may hold connected at once. */
+inline constexpr std::size_t linux_spdk_attachments_limit_k = 1024;
+
+/** What DPDK keeps once per process, shared by every instantiation of the environment and the
+ *  disk: whether the environment is up and on which pages, and every connection, under claims. */
+struct linux_spdk_process_t {
+
+    /** Held while an @c acquire brings the environment up or reads that it is. */
+    std::int32_t environment_claim = 0;
+
+    /** Whether the environment is up, set by the first @c acquire and never cleared. */
+    bool up = false;
+
+    /** The pages the environment runs on, which every later @c acquire must ask for. */
+    linux_spdk_memory_t memory = linux_spdk_memory_t::plain_pages_k;
+
+    /** Held while a share is taken or given back, or a namespace claimed. */
+    std::int32_t attachments_claim = 0;
+
+    /** Every connection, in records that never move. */
+    st::basic_growing_pool<linux_spdk_attachment_t> attachments;
+};
+
+[[nodiscard]] inline linux_spdk_process_t& linux_spdk_process() noexcept {
+    // DPDK's state is per process, so its record is one inline object every instantiation shares.
+    static linux_spdk_process_t process;
+    return process;
+}
+
+#pragma endregion Process
+
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+expected<linux_spdk_environment<atomic_reference_, waiter_type_>>
+linux_spdk_environment<atomic_reference_, waiter_type_>::acquire(
+    linux_spdk_environment_config_t const& config) noexcept {
+    linux_spdk_process_t& process = linux_spdk_process();
+    lock_claim<atomic_reference_, waiter_type_>(process.environment_claim);
+    status_t brought = process.up && process.memory != config.memory
+                           ? status_t {status_code_t::unsupported_k, "The process's environment runs on other pages"}
+                           : status_t {};
+    if (!process.up && brought.succeeded()) {
+        brought = initialise_(config);
+        process.up = brought.succeeded();
+        process.memory = config.memory;
+    }
+    unlock_claim<atomic_reference_>(process.environment_claim);
+    if (brought.failed()) return brought;
+    linux_spdk_environment environment;
+    environment.initialised_ = true;
+    return environment;
+}
+
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+status_t linux_spdk_environment<atomic_reference_, waiter_type_>::initialise_(
     linux_spdk_environment_config_t const& config) noexcept {
     bool const plain = config.memory == linux_spdk_memory_t::plain_pages_k;
     if (plain && config.plain_megabytes == 0)
-        return status_t {status_code_t::invalid_argument_k, "Plain pages need a size the driver takes at once"};
+        return {status_code_t::invalid_argument_k, "Plain pages need a size the driver takes at once"};
     if (!spdk_env_dpdk_external_init())
-        return status_t {status_code_t::unsupported_k, "The driver initialises its environment once per process"};
+        return {status_code_t::unsupported_k, "The driver initialises its environment once per process"};
 
     spdk_env_opts options {};
     options.opts_size = sizeof(options);
@@ -548,32 +587,18 @@ expected<linux_spdk_environment<atomic_reference_>> linux_spdk_environment<atomi
     options.no_pci = plain;
     if (plain) options.mem_size = static_cast<int>(config.plain_megabytes);
     if (spdk_env_init(&options) != 0)
-        return status_t {status_code_t::device_k, "The driver would not initialise its environment"};
+        return {status_code_t::device_k, "The driver would not initialise its environment"};
     spdk_unaffinitize_thread();
-    linux_spdk_environment environment;
-    environment.holders_ = new (std::nothrow) holders_t {};
-    if (!environment.holders_) {
-        spdk_env_fini();
-        return status_t {status_code_t::out_of_memory_k, "The environment would not record its holders"};
-    }
-    return environment;
-}
-
-template <template <typename> typename atomic_reference_>
-void linux_spdk_environment<atomic_reference_>::finalize_() noexcept {
-    spdk_env_fini();
+    return {};
 }
 
 #else
 
-template <template <typename> typename atomic_reference_>
-expected<linux_spdk_environment<atomic_reference_>> linux_spdk_environment<atomic_reference_>::acquire(
-    linux_spdk_environment_config_t const&) noexcept {
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+expected<linux_spdk_environment<atomic_reference_, waiter_type_>>
+linux_spdk_environment<atomic_reference_, waiter_type_>::acquire(linux_spdk_environment_config_t const&) noexcept {
     return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
 }
-
-template <template <typename> typename atomic_reference_>
-void linux_spdk_environment<atomic_reference_>::finalize_() noexcept {}
 
 #endif
 
@@ -581,10 +606,108 @@ void linux_spdk_environment<atomic_reference_>::finalize_() noexcept {}
 
 #if USTORE_WITH_SPDK
 
+#pragma region Attachments
+
+/** Gives one share of @p attachment back, detaching its controller after the last. */
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+void linux_spdk_detach(linux_spdk_attachment_t& attachment) noexcept {
+    linux_spdk_process_t& process = linux_spdk_process();
+    lock_claim<atomic_reference_, waiter_type_>(process.attachments_claim);
+    spdk_nvme_ctrlr* detached = nullptr;
+    if (--attachment.holders == 0) {
+        detached = std::exchange(attachment.controller, nullptr);
+        attachment.dropped = false;
+        attachment.claimed.clear();
+        process.attachments.vacate(process.attachments.index_of(attachment));
+    }
+    unlock_claim<atomic_reference_>(process.attachments_claim);
+    if (detached) spdk_nvme_detach(detached);
+}
+
+/** A share of the connection at @p transport, which the first share connects with @p options. */
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+expected<linux_spdk_attachment_t*> linux_spdk_attach(spdk_nvme_transport_id const& transport,
+                                                     spdk_nvme_ctrlr_opts const& options) noexcept {
+    using records_t = st::basic_growing_pool<linux_spdk_attachment_t>;
+    linux_spdk_process_t& process = linux_spdk_process();
+    for (;;) {
+        lock_claim<atomic_reference_, waiter_type_>(process.attachments_claim);
+        linux_spdk_attachment_t* attached = nullptr;
+        status_t refused;
+        for (linux_spdk_attachment_t& record : process.attachments.records())
+            if (record.holders != 0 && !record.dropped &&
+                spdk_nvme_transport_id_compare(&record.transport, &transport) == 0) {
+                attached = &record;
+                break;
+            }
+        if (!attached && process.attachments.capacity_limit() == 0) {
+            auto [records, make_status] = records_t::make(1, linux_spdk_attachments_limit_k);
+            if (make_status != st::status_t::success_k)
+                refused = {status_code_t::out_of_memory_k, "No room to record the controllers"};
+            else process.attachments = std::move(records);
+        }
+        if (!attached && refused.succeeded()) {
+            std::uint32_t const index = process.attachments.take();
+            if (index == records_t::absent_k)
+                refused = {status_code_t::capacity_exhausted_k, "The process holds as many controllers as it may"};
+            else {
+                attached = &process.attachments[index];
+                attached->transport = transport;
+            }
+        }
+        if (attached) ++attached->holders;
+        unlock_claim<atomic_reference_>(process.attachments_claim);
+        if (refused.failed()) return refused;
+
+        // A pulled or reset drive leaves a failed controller, which a fresh connection replaces.
+        lock_claim<atomic_reference_, waiter_type_>(attached->claim);
+        bool const failed = attached->controller && spdk_nvme_ctrlr_is_failed(attached->controller);
+        if (failed) attached->dropped = true;
+        else if (!attached->controller) attached->controller = spdk_nvme_connect(&transport, &options, sizeof(options));
+        bool const connected = attached->controller != nullptr;
+        unlock_claim<atomic_reference_>(attached->claim);
+        if (!failed && connected) return attached;
+        linux_spdk_detach<atomic_reference_, waiter_type_>(*attached);
+        if (!failed) return status_t {status_code_t::not_found_k, "No controller answered at that address"};
+    }
+}
+
+/** Claims namespace @p namespace_id of @p attachment for one disk while no other holds it, which
+ *  holds a share of the connection until it is given back. */
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+status_t linux_spdk_claim_namespace(linux_spdk_attachment_t& attachment, std::uint32_t namespace_id) noexcept {
+    linux_spdk_process_t& process = linux_spdk_process();
+    lock_claim<atomic_reference_, waiter_type_>(process.attachments_claim);
+    status_t claimed;
+    for (std::uint32_t const held : attachment.claimed)
+        if (held == namespace_id) claimed = {status_code_t::contended_k, "Another mount registered that namespace"};
+    if (claimed.succeeded() && attachment.claimed.push_back(std::uint32_t {namespace_id}) != st::status_t::success_k)
+        claimed = {status_code_t::out_of_memory_k, "No room to claim another namespace"};
+    if (claimed.succeeded()) ++attachment.holders;
+    unlock_claim<atomic_reference_>(process.attachments_claim);
+    return claimed;
+}
+
+/** Gives namespace @p namespace_id of @p attachment back, and the share it held. */
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+void linux_spdk_release_namespace(linux_spdk_attachment_t& attachment, std::uint32_t namespace_id) noexcept {
+    linux_spdk_process_t& process = linux_spdk_process();
+    lock_claim<atomic_reference_, waiter_type_>(process.attachments_claim);
+    for (std::size_t index = 0; index != attachment.claimed.size(); ++index)
+        if (attachment.claimed[index] == namespace_id) {
+            attachment.claimed.erase(index);
+            break;
+        }
+    unlock_claim<atomic_reference_>(process.attachments_claim);
+    linux_spdk_detach<atomic_reference_, waiter_type_>(attachment);
+}
+
+#pragma endregion Attachments
+
 #pragma region Disk
 
 /**
- *  @brief The ring SPDK offers, over the one namespace the mount connected to.
+ *  @brief The ring SPDK offers, over the namespaces of the controller the mount connected to.
  *
  *  Every per-request defect the ring reports as a failed completion is checked here rather than by
  *  the driver, which validates almost nothing: a misalignment, an oversized transfer, a stale
@@ -616,9 +739,8 @@ class linux_spdk_disk {
         : environment_(std::move(other.environment_)), queue_pairs_(std::move(other.queue_pairs_)),
           registered_memories_(std::move(other.registered_memories_)), media_(std::move(other.media_)),
           flights_(std::move(other.flights_)), staged_(std::move(other.staged_)), locals_(std::move(other.locals_)),
-          controller_(std::exchange(other.controller_, nullptr)), namespace_(std::exchange(other.namespace_, nullptr)),
-          namespace_bytes_(std::exchange(other.namespace_bytes_, 0)),
-          sector_bytes_(std::exchange(other.sector_bytes_, 0)),
+          attachment_(std::exchange(other.attachment_, nullptr)),
+          controller_(std::exchange(other.controller_, nullptr)), sector_bytes_(std::exchange(other.sector_bytes_, 0)),
           max_transfer_bytes_(std::exchange(other.max_transfer_bytes_, 0)),
           depth_limit_(std::exchange(other.depth_limit_, 0)),
           queue_pairs_limit_(std::exchange(other.queue_pairs_limit_, 0)),
@@ -626,7 +748,7 @@ class linux_spdk_disk {
 
     linux_spdk_disk& operator=(linux_spdk_disk&& other) noexcept {
         if (this == &other) return *this;
-        close_all_();
+        assert(!attachment_ && "release a disk before another takes its place");
         environment_ = std::move(other.environment_);
         queue_pairs_ = std::move(other.queue_pairs_);
         registered_memories_ = std::move(other.registered_memories_);
@@ -634,9 +756,8 @@ class linux_spdk_disk {
         flights_ = std::move(other.flights_);
         staged_ = std::move(other.staged_);
         locals_ = std::move(other.locals_);
+        attachment_ = std::exchange(other.attachment_, nullptr);
         controller_ = std::exchange(other.controller_, nullptr);
-        namespace_ = std::exchange(other.namespace_, nullptr);
-        namespace_bytes_ = std::exchange(other.namespace_bytes_, 0);
         sector_bytes_ = std::exchange(other.sector_bytes_, 0);
         max_transfer_bytes_ = std::exchange(other.max_transfer_bytes_, 0);
         depth_limit_ = std::exchange(other.depth_limit_, 0);
@@ -646,17 +767,18 @@ class linux_spdk_disk {
         return *this;
     }
 
-    ~linux_spdk_disk() noexcept { close_all_(); }
+    ~linux_spdk_disk() noexcept { assert(!attachment_ && "release a disk before it dies"); }
 
     /**
-     *  @brief Connects @p address, takes its first active namespace, and sizes the disk's bookkeeping.
+     *  @brief Connects @p address, or shares the process's connection to it, and sizes the disk's
+     *      bookkeeping by the controller's first active namespace.
      *  @param[in] environment A counted share of an initialised environment, kept for the disk's life.
      *  @param[in] address The PCIe address of the controller, or a fabric transport ID the driver parses.
      *  @param[in] config The queue pairs wanted, the per-queue pair depth and the ranges registered at once.
      *  @return The mounted disk, or why the controller would not answer.
      */
-    static expected<linux_spdk_disk> open(linux_spdk_environment<atomic_reference_> environment, char const* address,
-                                          linux_spdk_disk_config_t const& config) noexcept {
+    static expected<linux_spdk_disk> open(linux_spdk_environment<atomic_reference_, waiter_type_> environment,
+                                          char const* address, linux_spdk_disk_config_t const& config) noexcept {
         if (status_t const sane = inspect_config_(config); sane.failed()) return sane;
         if (!address) return status_t {status_code_t::invalid_argument_k, "A controller needs an address"};
         if (!environment.initialised())
@@ -665,12 +787,13 @@ class linux_spdk_disk {
         spdk_nvme_transport_id transport {};
         if (status_t const named = transport_of_(address, transport); named.failed()) return named;
 
+        // Every disk on this controller takes queue pairs from one connection, which asks for all.
         spdk_nvme_ctrlr_opts options {};
         spdk_nvme_ctrlr_get_default_ctrlr_opts(&options, sizeof(options));
-        options.num_io_queues = config.queue_pairs_limit;
         options.keep_alive_timeout_ms = 0;
-        spdk_nvme_ctrlr* const controller = spdk_nvme_connect(&transport, &options, sizeof(options));
-        if (!controller) return status_t {status_code_t::not_found_k, "No controller answered at that address"};
+        auto [attachment, attach_status] = linux_spdk_attach<atomic_reference_, waiter_type_>(transport, options);
+        if (attach_status.failed()) return attach_status;
+        spdk_nvme_ctrlr* const controller = attachment->controller;
 
         spdk_nvme_ns* chosen = nullptr;
         for (std::uint32_t identifier = spdk_nvme_ctrlr_get_first_active_ns(controller); identifier != 0;
@@ -681,7 +804,7 @@ class linux_spdk_disk {
             break;
         }
         if (!chosen) {
-            spdk_nvme_detach(controller);
+            linux_spdk_detach<atomic_reference_, waiter_type_>(*attachment);
             return status_t {status_code_t::not_found_k, "The controller carries no active namespace"};
         }
 
@@ -694,26 +817,28 @@ class linux_spdk_disk {
 
         linux_spdk_disk disk;
         disk.environment_ = std::move(environment);
+        disk.attachment_ = attachment;
         disk.controller_ = controller;
-        disk.namespace_ = chosen;
-        disk.namespace_bytes_ = spdk_nvme_ns_get_size(chosen);
         disk.sector_bytes_ = spdk_nvme_ns_get_sector_size(chosen);
         disk.max_transfer_bytes_ = spdk_nvme_ns_get_max_io_xfer_size(chosen);
         disk.depth_limit_ = config.depth_limit;
         disk.queue_pairs_limit_ = queue_pairs;
         disk.registered_memories_limit_ = config.registered_memory_limit;
         disk.reach_ = transport.trtype == SPDK_NVME_TRANSPORT_TCP ? reach_t::copied_k : reach_t::translated_k;
-        if (disk.sector_bytes_ == 0 || !std::has_single_bit(disk.sector_bytes_))
-            return status_t {status_code_t::unsupported_k, "The namespace reports no power-of-two sector"};
-
         std::size_t const window = static_cast<std::size_t>(queue_pairs) * config.depth_limit;
-        if (status_t const sized = size_(disk.queue_pairs_, queue_pairs); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.registered_memories_, config.registered_memory_limit); sized.failed())
+        status_t sized;
+        if (disk.sector_bytes_ == 0 || !std::has_single_bit(disk.sector_bytes_))
+            sized = {status_code_t::unsupported_k, "The namespace reports no power-of-two sector"};
+        if (sized.succeeded()) sized = size_(disk.queue_pairs_, queue_pairs);
+        if (sized.succeeded()) sized = size_(disk.registered_memories_, config.registered_memory_limit);
+        if (sized.succeeded()) sized = size_(disk.media_, targets_limit_k);
+        if (sized.succeeded()) sized = size_(disk.flights_, window);
+        if (sized.succeeded()) sized = size_(disk.staged_, window);
+        if (sized.succeeded()) sized = size_(disk.locals_, window);
+        if (sized.failed()) {
+            disk.release();
             return sized;
-        if (status_t const sized = size_(disk.media_, targets_limit_k); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.flights_, window); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.staged_, window); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.locals_, window); sized.failed()) return sized;
+        }
         for (std::size_t seat = 0; seat != disk.queue_pairs_.size(); ++seat) disk.link_free_lists_(seat);
         return disk;
     }
@@ -880,20 +1005,47 @@ class linux_spdk_disk {
     }
 
     /**
-     *  @brief Registers the namespace, which is the one target this transport ever presents.
-     *  @param[in] request Only its access is read; the name and the length a namespace cannot honour.
-     *  @return The handle, or @c capacity_exhausted_k when the namespace is already registered.
+     *  @brief Registers the namespace @p request names by its number, which no other disk of the
+     *      process may hold registered meanwhile.
+     *  @param[in] request The namespace's number in decimal as the name, and the access; a
+     *      namespace cannot honour a length.
+     *  @return The handle, @c contended_k while another disk holds the namespace, @c unsupported_k
+     *      for a namespace of another sector or a shorter transfer than the first one's, or
+     *      @c capacity_exhausted_k when this disk holds as many namespaces as it may.
      */
     expected<registered_medium_t> register_medium(medium_options_t const& request) noexcept {
-        registered_medium_slot_t& slot = media_[0];
-        std::int32_t expected_free = 0;
-        if (!claim_(slot.registered)
-                 .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
-            return status_t {status_code_t::capacity_exhausted_k, "The namespace is already registered"};
-        slot.access = request.access == medium_access_t::read_only_k ? medium_access_t::read_only_k
-                                                                     : medium_access_t::read_write_k;
-        slot.capacity = namespace_bytes_;
-        return registered_medium_t {disk_handle_t {0, slot.generation}, slot.capacity, sector_bytes_};
+        std::string_view const named = request.name ? std::string_view {request.name} : std::string_view {};
+        std::uint32_t namespace_id = 0;
+        std::from_chars_result const read = std::from_chars(named.data(), named.data() + named.size(), namespace_id);
+        if (named.empty() || read.ec != std::errc {} || read.ptr != named.data() + named.size() || namespace_id == 0)
+            return status_t {status_code_t::invalid_argument_k, "A namespace is named by its number"};
+        spdk_nvme_ns* const chosen = spdk_nvme_ctrlr_get_ns(controller_, namespace_id);
+        if (!chosen || !spdk_nvme_ns_is_active(chosen))
+            return status_t {status_code_t::not_found_k, "The controller carries no such active namespace"};
+        if (spdk_nvme_ns_get_sector_size(chosen) != sector_bytes_ ||
+            spdk_nvme_ns_get_max_io_xfer_size(chosen) < max_transfer_bytes_)
+            return status_t {status_code_t::unsupported_k, "The namespace's sector or transfer differs from the first"};
+        for (std::size_t index = 0; index != media_.size(); ++index) {
+            registered_medium_slot_t& slot = media_[index];
+            std::int32_t expected_free = 0;
+            if (!claim_(slot.registered)
+                     .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
+                continue;
+            if (status_t const claimed = linux_spdk_claim_namespace<atomic_reference_, waiter_type_>(*attachment_,
+                                                                                                     namespace_id);
+                claimed.failed()) {
+                claim_(slot.registered).store(0, std::memory_order_release);
+                return claimed;
+            }
+            slot.access = request.access == medium_access_t::read_only_k ? medium_access_t::read_only_k
+                                                                         : medium_access_t::read_write_k;
+            slot.capacity = spdk_nvme_ns_get_size(chosen);
+            slot.space = chosen;
+            slot.namespace_id = namespace_id;
+            return registered_medium_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation},
+                                        slot.capacity, sector_bytes_};
+        }
+        return status_t {status_code_t::capacity_exhausted_k, "This disk holds as many namespaces as it may"};
     }
 
     /**
@@ -905,8 +1057,10 @@ class linux_spdk_disk {
         if (!slot) return {status_code_t::invalid_argument_k, "The target is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
             return {status_code_t::invalid_argument_k, "The target is still named by requests in flight"};
+        linux_spdk_release_namespace<atomic_reference_, waiter_type_>(*attachment_, slot->namespace_id);
         ++slot->generation;
         slot->capacity = 0;
+        slot->space = nullptr;
         claim_(slot->registered).store(0, std::memory_order_release);
         descriptor.surrender();
         return {};
@@ -1155,7 +1309,7 @@ class linux_spdk_disk {
         std::uint64_t length = 0;
     };
 
-    /** The namespace as a registered target, and the count of commands still naming it. */
+    /** One namespace as a registered target, and the count of commands still naming it. */
     struct registered_medium_slot_t {
 
         /** Zero while the namespace is unregistered, one while a handle names it. */
@@ -1172,6 +1326,12 @@ class linux_spdk_disk {
 
         /** Bytes the namespace spans, which an extent past it is refused for. */
         std::uint64_t capacity = 0;
+
+        /** The namespace every request naming this target moves bytes against. */
+        spdk_nvme_ns* space = nullptr;
+
+        /** The namespace's number, which its claim on the controller is given back by. */
+        std::uint32_t namespace_id = 0;
     };
 
     /** One command the device holds, and the result its completion callback writes into it. */
@@ -1206,6 +1366,9 @@ class linux_spdk_disk {
 
         /** Whether the slot is free, holds a command, or holds its result. */
         flight_state_t state = flight_state_t::vacant_k;
+
+        /** The command's opcode, which a command-specific status is spelled by. */
+        std::uint8_t opcode = 0;
     };
 
     /** One successor of a chained request, held back until its predecessor transfers in full. */
@@ -1224,8 +1387,8 @@ class linux_spdk_disk {
     /** The index that names no slot, in a free list and in a chain alike. */
     static constexpr std::uint32_t no_entry_k = 0xFFFFFFFFu;
 
-    /** Targets this transport registers, which is the one namespace it was mounted on. */
-    static constexpr std::uint16_t targets_limit_k = 1;
+    /** Namespaces one disk registers at once. */
+    static constexpr std::uint16_t targets_limit_k = 16;
 
     /** Requests one queue pair may keep in flight at most, which bounds what a mount may ask for. */
     static constexpr queue_depth_t depth_ceiling_k = 16384;
@@ -1322,7 +1485,8 @@ class linux_spdk_disk {
             return;
         }
         flight.outcome = completion_state_t::failed_k;
-        flight.status = {status_code_t::device_k, spdk_nvme_cpl_get_status_string(&result->status)};
+        char const* const spelled = spdk_nvme_cpl_get_status_string_ext(&result->status, flight.opcode);
+        flight.status = {status_code_t::device_k, spelled};
     }
 
     /** Swallows the completion an abort posts for itself, which no queue pair ever asked for. */
@@ -1581,9 +1745,14 @@ class linux_spdk_disk {
         flight.state = flight_state_t::outstanding_k;
         borrow_(request);
 
+        spdk_nvme_ns* const space = resolve_(request.medium)->space;
         int issued = 0;
+        flight.opcode = request.kind == request_kind_t::flush_k        ? SPDK_NVME_OPC_FLUSH
+                        : request.kind == request_kind_t::deallocate_k ? SPDK_NVME_OPC_DATASET_MANAGEMENT
+                        : request.kind == request_kind_t::read_k       ? SPDK_NVME_OPC_READ
+                                                                       : SPDK_NVME_OPC_WRITE;
         if (request.kind == request_kind_t::flush_k) {
-            issued = spdk_nvme_ns_cmd_flush(namespace_, slot.queue, &linux_spdk_disk::completed_, &flight);
+            issued = spdk_nvme_ns_cmd_flush(space, slot.queue, &linux_spdk_disk::completed_, &flight);
         }
         else if (request.kind == request_kind_t::deallocate_k) {
             // The driver copies the range into the command's own payload, so it may live
@@ -1591,8 +1760,8 @@ class linux_spdk_disk {
             spdk_nvme_dsm_range range {};
             range.starting_lba = request.extent.offset / sector_bytes_;
             range.length = static_cast<std::uint32_t>(request.extent.length / sector_bytes_);
-            issued = spdk_nvme_ns_cmd_dataset_management(namespace_, slot.queue, SPDK_NVME_DSM_ATTR_DEALLOCATE, &range,
-                                                         1, &linux_spdk_disk::completed_, &flight);
+            issued = spdk_nvme_ns_cmd_dataset_management(space, slot.queue, SPDK_NVME_DSM_ATTR_DEALLOCATE, &range, 1,
+                                                         &linux_spdk_disk::completed_, &flight);
         }
         else {
             registered_memory_slot_t const* const chunk = resolve_(request.buffer);
@@ -1600,9 +1769,9 @@ class linux_spdk_disk {
             std::uint64_t const first = request.extent.offset / sector_bytes_;
             std::uint32_t const sectors = static_cast<std::uint32_t>(request.extent.length / sector_bytes_);
             issued = request.kind == request_kind_t::read_k
-                         ? spdk_nvme_ns_cmd_read(namespace_, slot.queue, payload, first, sectors,
+                         ? spdk_nvme_ns_cmd_read(space, slot.queue, payload, first, sectors,
                                                  &linux_spdk_disk::completed_, &flight, 0)
-                         : spdk_nvme_ns_cmd_write(namespace_, slot.queue, payload, first, sectors,
+                         : spdk_nvme_ns_cmd_write(space, slot.queue, payload, first, sectors,
                                                   &linux_spdk_disk::completed_, &flight, 0);
         }
         if (issued == 0) return index;
@@ -1680,8 +1849,14 @@ class linux_spdk_disk {
 
 #pragma endregion Requests
 
-    /** Frees every queue pair, unmaps every range, and detaches the controller. */
-    void close_all_() noexcept {
+  public:
+
+    /**
+     *  @brief Frees every queue pair, unmaps every range, and gives back every namespace and the
+     *      disk's share of the controller, detaching it after the last, before the disk dies.
+     *  @note It waits on the process's claims, so the mount's unmount calls it, never a destructor.
+     */
+    void release() noexcept {
         for (std::size_t seat = 0; seat != queue_pairs_.size(); ++seat) {
             if (!queue_pairs_[seat].queue) continue;
             spdk_nvme_ctrlr_free_io_qpair(queue_pairs_[seat].queue);
@@ -1693,15 +1868,21 @@ class linux_spdk_disk {
             unmap_(slot);
             slot.base = nullptr;
         }
-        if (controller_) spdk_nvme_detach(controller_);
+        for (registered_medium_slot_t& slot : media_)
+            if (slot.space)
+                linux_spdk_release_namespace<atomic_reference_, waiter_type_>(*attachment_, slot.namespace_id);
+        if (attachment_) linux_spdk_detach<atomic_reference_, waiter_type_>(*attachment_);
+        attachment_ = nullptr;
         controller_ = nullptr;
-        namespace_ = nullptr;
         queue_pairs_.clear();
         registered_memories_.clear();
+        media_.clear();
     }
 
+  private:
+
     /** The environment this disk holds a share of, declared first so it outlives everything below. */
-    linux_spdk_environment<atomic_reference_> environment_;
+    linux_spdk_environment<atomic_reference_, waiter_type_> environment_;
 
     /** One slot per queue pair the disk hands out, which is one queue pair each. */
     st::vector<queue_pair_slot_t> queue_pairs_;
@@ -1709,7 +1890,7 @@ class linux_spdk_disk {
     /** One slot per memory range the driver has mapped for this disk. */
     st::vector<registered_memory_slot_t> registered_memories_;
 
-    /** The namespace as a target, which is the only one this transport ever presents. */
+    /** The namespaces registered as targets, at most @c targets_limit_k of them. */
     st::vector<registered_medium_slot_t> media_;
 
     /** Every queue pair's commands, in windows of @c depth_limit_ addressed through a free list. */
@@ -1721,14 +1902,11 @@ class linux_spdk_disk {
     /** Every queue pair's own completions, in windows of @c depth_limit_ read as a circle. */
     st::vector<completion_t> locals_;
 
-    /** The controller this disk connected to, detached when the disk closes. */
+    /** The process's connection to the controller, whose share this disk gives back at close. */
+    linux_spdk_attachment_t* attachment_ = nullptr;
+
+    /** The controller of @c attachment_. */
     spdk_nvme_ctrlr* controller_ = nullptr;
-
-    /** The namespace every request moves bytes against. */
-    spdk_nvme_ns* namespace_ = nullptr;
-
-    /** Bytes the namespace spans, which is the capacity its target reports. */
-    std::uint64_t namespace_bytes_ = 0;
 
     /** Bytes one sector spans, which every offset and every length must be a multiple of. */
     std::uint64_t sector_bytes_ = 0;
@@ -1767,7 +1945,7 @@ class linux_spdk_disk {
   public:
 
     /** Refuses the mount, since this build carries no driver to mount with. */
-    static expected<linux_spdk_disk> open(linux_spdk_environment<atomic_reference_>, char const*,
+    static expected<linux_spdk_disk> open(linux_spdk_environment<atomic_reference_, waiter_type_>, char const*,
                                           linux_spdk_disk_config_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
     }
@@ -1833,6 +2011,9 @@ class linux_spdk_disk {
 
     /** Answers that nothing is outstanding, which is always true here. */
     [[nodiscard]] std::size_t outstanding(queue_pair_t const&) const noexcept { return 0; }
+
+    /** Gives back nothing, since nothing was ever taken. */
+    void release() noexcept {}
 };
 
 #pragma endregion Absent

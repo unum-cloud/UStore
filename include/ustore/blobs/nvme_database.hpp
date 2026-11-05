@@ -34,12 +34,14 @@
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
-#include <span>        // `std::span`
+#include <span>        // `std::span`, `std::as_bytes`
 #include <type_traits> // `std::integral_constant`, `std::remove_reference_t`
 #include <utility>     // `std::exchange`, `std::forward`, `std::index_sequence_for`, `std::move`
 #include <variant>     // `std::variant`, `std::variant_alternative_t`, `std::visit`, `std::get_if`
 
-#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <smashtable/basic_growing_pool.hpp> // `st::basic_growing_pool`
+#include <smashtable/basic_hash_index.hpp>   // `st::basic_hash_index`, `st::key128_t`
+#include <smashtable/basic_vector.hpp>       // `st::vector`
 
 #include "ustore/blobs/nvme_key_slot.hpp"       // `stored_value_size_t`, `collection_id_t`
 #include "ustore/blobs/nvme_published_runs.hpp" // `pinned_snapshot`, `maintenance_claim`, `commit_ledger`
@@ -667,11 +669,17 @@ class basic_database {
         channels_ = &channels;
         config_ = config;
         compactor_ = compactor;
-        status_t const opened = open_manifest_();
+        auto [entries, entries_status] = entries_t::make(1, entries_t::capacity_max_k,
+                                                         catalog_allocator_t {resources_->memory_constraint});
+        entries_ = std::move(entries);
+        status_t const opened = entries_status != st::status_t::success_k
+                                    ? status_t {status_code_t::out_of_memory_k, "No room for the collections"}
+                                    : open_manifest_();
         if (opened.failed()) {
             // A manifest this database could not open stays as it lies, never published again
             // without what it missed.
             collections_.clear();
+            entries_ = entries_t {};
             run_pools_.clear();
             user_data_bytes_ = 0;
             volume_ = nullptr;
@@ -704,8 +712,9 @@ class basic_database {
             }
             // The entries outlive the publication that stops naming them, which waits out every reader of the
             // collections it replaced.
-            st::vector<entry_pointer_t> released = std::move(collections_);
+            collections_.clear();
             [[maybe_unused]] status_t const emptied = publish_collections_();
+            entries_ = entries_t {};
         }
         run_pools_.clear();
         user_data_bytes_ = 0;
@@ -727,20 +736,20 @@ class basic_database {
     /** Whether @p id names a collection of this database. */
     [[nodiscard]] bool has_collection(any_collection_id_t const& id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        return entry_at_in_(collection_entries_(), id) != nullptr;
+        return entry_at_(id) != nullptr;
     }
 
     /** The ID @p id resolves to, or @c collection_invalid_id_k when it names nothing. */
     [[nodiscard]] collection_id_t collection_id(any_collection_id_t const& id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t const* const found = entry_at_(id);
         return found ? found->id : collection_invalid_id_k;
     }
 
     /** The name @p collection_id answers to, which is empty when it names nothing. */
     [[nodiscard]] string_t collection_name(collection_id_t collection_id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_(collection_id);
         string_t name;
         if (found) { [[maybe_unused]] sz::status_t const copied = name.assign(found->name.view()); }
         return name;
@@ -749,7 +758,7 @@ class basic_database {
     /** The bounds @p collection_id was created with, which a transaction checks every write against. */
     status_t collection_config(collection_id_t collection_id, collection_config_t& config) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_(collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         config = found->config;
         return {};
@@ -758,7 +767,7 @@ class basic_database {
     /** The store tag @p collection_id was created with, which a copy of it is created with. */
     status_t collection_store_tag(collection_id_t collection_id, std::uint16_t& store_tag) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_(collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         store_tag = found->store_tag;
         return {};
@@ -773,7 +782,7 @@ class basic_database {
     status_t resolve_collection(any_collection_id_t const& id, collection_id_t& collection_id,
                                 collection_config_t& config) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t const* const found = entry_at_(id);
         collection_id = found ? found->id : collection_invalid_id_k;
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         config = found->config;
@@ -829,36 +838,31 @@ class basic_database {
             return status_t {status_code_t::invalid_argument_k, "That tag names no store this database keeps"};
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        if (entry_named_in_(collection_entries_(), name) != nullptr ||
-            entry_with_id_in_(collection_entries_(), collection_id) != nullptr)
+        if (entry_named_(name) != nullptr || entry_with_id_(collection_id) != nullptr)
             return status_t {status_code_t::already_exists_k, "The database already names that collection"};
 
-        entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
+        collection_entry_t* entry = take_entry_();
         if (!entry) return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
         entry->id = collection_id;
-        if (sz::failed(entry->name.assign(name)))
-            return status_t {status_code_t::out_of_memory_k, "No room for a collection's name"};
         entry->store_tag = store_tag;
         entry->config = config;
         std::memcpy(entry->config.lsm_tree.collection.bytes, collection_id.uuid.bytes,
                     sizeof(collection_id.uuid.bytes));
-        if (status_t const mounted = mount_collection_(*entry); mounted.failed()) return mounted;
-
-        if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
-        if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed()) {
-            collections_.erase(collections_.size() - 1);
-            return flushed;
+        status_t created;
+        if (sz::failed(entry->name.assign(name)))
+            created = status_t {status_code_t::out_of_memory_k, "No room for a collection's name"};
+        else if (status_t const mounted = mount_collection_(*entry); mounted.failed()) created = mounted;
+        else if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
+            created = status_t {status_code_t::out_of_memory_k, "No room for another collection"};
+        else {
+            if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed())
+                created = flushed;
+            else if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) created = saved;
+            else created = publish_collections_();
+            if (created.failed()) collections_.erase(collections_.size() - 1);
         }
-        if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) {
-            collections_.erase(collections_.size() - 1);
-            return saved;
-        }
-        if (status_t const publication = publish_collections_(); publication.failed()) {
-            collections_.erase(collections_.size() - 1);
-            return publication;
-        }
-        return {};
+        if (created.failed()) release_entry_(*entry);
+        return created;
     }
 
     /** Returns every run of @p id to its volume and forgets the name, which destroys the
@@ -868,9 +872,8 @@ class basic_database {
                              collection_id_t flushed_with = collection_invalid_id_k) noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        std::size_t const position = position_at_(id);
-        if (position == collections_.size())
-            return {status_code_t::not_found_k, "The database names no such collection"};
+        collection_entry_t* doomed = entry_at_(id);
+        if (!doomed) return {status_code_t::not_found_k, "The database names no such collection"};
         if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed())
             return flushed;
 
@@ -878,7 +881,8 @@ class basic_database {
         // publication takes the leader word, which keeps a staged or combining commit from
         // publishing into the collection meanwhile, and a request still pending finds it gone; it
         // returns once no reader is left in a view of the collection.
-        entry_pointer_t doomed = std::move(collections_[position]);
+        std::size_t position = 0;
+        while (collections_[position] != doomed) ++position;
         collections_.erase(position);
         status_t const publication = publish_collections_();
         if (publication.failed()) {
@@ -891,6 +895,7 @@ class basic_database {
             return saved;
         }
         std::visit([](auto& held) noexcept { held.destroy(); }, doomed->held);
+        release_entry_(*doomed);
         return {};
     }
 
@@ -920,7 +925,7 @@ class basic_database {
     /** Bytes the largest value @p id admits takes, which is what a caller sizes a read buffer by. */
     [[nodiscard]] stored_value_size_t buffer_size_for_any_stored_value(any_collection_id_t const& id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t const* const found = entry_at_(id);
         if (!found) return 0;
         return std::visit([](auto const& collection) noexcept { return collection.value_max_size(); }, found->held);
     }
@@ -937,7 +942,7 @@ class basic_database {
                                        std::size_t thread_index = outside_executor_k) noexcept {
         size = 0;
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t const* const found = entry_at_(id);
         if (!found) return lookup_result_t::missing_k;
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept {
@@ -995,7 +1000,7 @@ class basic_database {
                     std::size_t thread_index = outside_executor_k) noexcept {
         size = 0;
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t* const found = entry_at_(id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         auto [channel, acquire_status] = channels_->acquire(thread_index);
         if (acquire_status.failed()) return acquire_status;
@@ -1022,7 +1027,7 @@ class basic_database {
                     std::span<lookup_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
                     std::size_t thread_index = outside_executor_k) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t const* const found = entry_at_(id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         auto [channel, acquire_status] = channels_->acquire(thread_index);
         if (acquire_status.failed()) return acquire_status;
@@ -1060,7 +1065,7 @@ class basic_database {
             bool follows = false;
             {
                 reader_t const inside = ledger_.epochs().enter(thread_index);
-                collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+                collection_entry_t const* const found = entry_at_(id);
                 if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
                 status_t const read = std::visit(
                     [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
@@ -1104,7 +1109,7 @@ class basic_database {
     expected<counted_runs_t> runs_count(any_collection_id_t const& id, transaction_stamp_t stamp = head_stamp_k,
                                         std::size_t thread_index = outside_executor_k) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t const* const found = entry_at_(id);
         if (!found) return status_t {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept -> expected<counted_runs_t> {
@@ -1135,7 +1140,7 @@ class basic_database {
                       stored_key_t from, visitor_type_&& visitor, transaction_stamp_t stamp = head_stamp_k,
                       std::size_t thread_index = outside_executor_k) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t const* const found = entry_at_(id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
@@ -1209,13 +1214,12 @@ class basic_database {
      */
     status_t begin_ingest(any_collection_id_t const& id, ingest_t& ingest) noexcept {
         claim_guard_t claim {*this};
-        std::size_t const position = position_at_(id);
-        if (position == collections_.size())
-            return {status_code_t::not_found_k, "The database names no such collection"};
+        collection_entry_t* const found = entry_at_(id);
+        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         ingest.claim_ = std::move(claim);
-        ingest.position_ = position;
+        ingest.entry_ = found;
         auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
-            any_collection_t& held = collections_[position]->held;
+            any_collection_t& held = found->held;
             if (held.index() == index_) ingest.runs_.template emplace<index_>(std::get<index_>(held).begin_ingest());
         };
         [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
@@ -1326,22 +1330,22 @@ class basic_database {
     status_t maintain(collection_id_t collection_id) noexcept {
         {
             reader_t const inside = ledger_.epochs().enter();
-            collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
+            collection_entry_t const* const found = entry_with_id_(collection_id);
             if (!found ||
                 !std::visit([](auto const& collection) noexcept { return collection.maintenance_due(); }, found->held))
                 return {};
         }
         claim_guard_t const held = claim_guard_t::taken_if_free(*this);
         if (!held.holding()) return {};
-        std::size_t const position = position_at_(any_collection_id_t {collection_id});
-        if (position == collections_.size()) return {};
-        return maintain_collection_(*collections_[position]);
+        collection_entry_t* const found = entry_with_id_(collection_id);
+        if (!found) return {};
+        return maintain_collection_(*found);
     }
 
     /** How many memory runs @p id's collection holds and how many commits they hold, or none for a missing one. */
     [[nodiscard]] memory_shape_t memory_shape(any_collection_id_t const& id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t const* const found = entry_at_(id);
         if (!found) return {};
         return std::visit([](auto const& collection) noexcept { return collection.memory_shape(); }, found->held);
     }
@@ -1375,7 +1379,7 @@ class basic_database {
     [[nodiscard]] bool written_since(collection_id_t collection_id, stored_key_t stored_key,
                                      transaction_stamp_t from) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_(collection_id);
         if (!found) return true;
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept {
@@ -1390,7 +1394,7 @@ class basic_database {
     [[nodiscard]] bool range_written_since(collection_id_t collection_id, stored_key_t lower, stored_key_t upper,
                                            transaction_stamp_t from) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_(collection_id);
         if (!found) return true;
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept {
@@ -1430,7 +1434,7 @@ class basic_database {
     status_t prepare_collection(collection_id_t collection_id,
                                 sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t* const found = entry_with_id_in_(collection_entries_(), collection_id);
+        collection_entry_t* const found = entry_with_id_(collection_id);
         if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
         return std::visit(
             [&]<typename store_type_>(store_type_& collection) noexcept -> status_t {
@@ -1445,7 +1449,7 @@ class basic_database {
     void publish_collection(collection_id_t collection_id, sealed_commit<stored_key_t, atomic_reference_>& sealed,
                             transaction_stamp_t stamp) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t* const found = entry_with_id_in_(collection_entries_(), collection_id);
+        collection_entry_t* const found = entry_with_id_(collection_id);
         std::visit(
             [&]<typename store_type_>(store_type_& collection) noexcept {
                 if constexpr (keyed_by_database<store_type_>()) collection.publish(sealed, stamp);
@@ -1456,7 +1460,7 @@ class basic_database {
     /** Forgets the view @c prepare_collection laid out for a commit the leader refuses. */
     void forget_collection(collection_id_t collection_id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        if (collection_entry_t* const found = entry_with_id_in_(collection_entries_(), collection_id))
+        if (collection_entry_t* const found = entry_with_id_(collection_id))
             std::visit([](auto& collection) noexcept { collection.forget_prepared(); }, found->held);
     }
 
@@ -1468,7 +1472,7 @@ class basic_database {
     status_t visit_store(any_collection_id_t const& id, visitor_type_&& visitor,
                          std::size_t thread_index = outside_executor_k) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t* const found = entry_at_in_(collection_entries_(), id);
+        collection_entry_t* const found = entry_at_(id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit(std::forward<visitor_type_>(visitor), found->held);
     }
@@ -1490,10 +1494,9 @@ class basic_database {
         std::size_t const held = memory_shape(any_collection_id_t {collection_id}).runs;
         {
             claim_guard_t const claimed {*this};
-            std::size_t const position = position_at_(any_collection_id_t {collection_id});
-            if (position == collections_.size()) return false;
-            if (std::visit([&](auto& collection) noexcept { return flush_and_compact_(collection); },
-                           collections_[position]->held)
+            collection_entry_t* const found = entry_with_id_(collection_id);
+            if (!found) return false;
+            if (std::visit([&](auto& collection) noexcept { return flush_and_compact_(collection); }, found->held)
                     .failed())
                 return false;
         }
@@ -1669,20 +1672,37 @@ class basic_database {
 
 #pragma region Private Types
 
-    /** One collection entry, heap-pinned so a snapshot and a live transaction may name it. */
-    using entry_pointer_t = std::unique_ptr<collection_entry_t>;
+    /** What every collection entry, the pools and the indexes over them are charged to. */
+    using catalog_allocator_t = constrained_allocator<byte_t, atomic_reference_>;
+
+    /** Where every collection entry lives, in records that never move, so a snapshot and a live
+     *  transaction may point into one while a create grows the pool beside them. */
+    using entries_t = st::basic_growing_pool<collection_entry_t, std::uint32_t, catalog_allocator_t>;
+
+    /** The entries of the published collections by ID, their UUID bytes taken as the key. */
+    using ids_index_t = st::basic_hash_index<st::key128_t, std::uint32_t, st::default_hash_t, catalog_allocator_t>;
+
+    /** The entries of the published collections by a hash of their name, which a lookup confirms
+     *  against the name. */
+    using names_index_t = st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t, catalog_allocator_t>;
 
     /**
      *  @brief One published list of collections, naming every entry the database held when it was laid out.
      *
-     *  A lookup that reads nothing but a name, an ID or a shape needs no claim: every entry is pinned on the heap, so
-     *  a create and a drop publish only a new list naming them, and free the one it replaces once every reader that
-     *  loaded it has left.
+     *  A lookup that reads nothing but a name, an ID or a shape needs no claim: every entry is
+     *  pinned in @c entries_, so a create and a drop publish only a new list and new indexes naming
+     *  them, and free the ones they replace once every reader that loaded them has left.
      */
     struct published_collections_t {
 
         /** The entries, in the order @c collections_ held them. */
         st::vector<collection_entry_t*> entries;
+
+        /** The index into @c entries_ of every entry, by its ID. */
+        ids_index_t by_id;
+
+        /** The index into @c entries_ of every entry, by a hash of its name. */
+        names_index_t by_name;
 
         /** Its room in the ledger's list of what the leader unpublished, once a publication replaces it. */
         unpublished_t unpublished;
@@ -1733,9 +1753,8 @@ class basic_database {
         /** The database's claim, held from @c begin_ingest until this is destroyed. */
         claim_guard_t claim_;
 
-        /** Where the collection sits among the collections, which no create or drop moves while the
-         *  claim is held. */
-        std::size_t position_ = 0;
+        /** The collection, which no drop releases while the claim is held. */
+        collection_entry_t* entry_ = nullptr;
 
         /** The rows laid out and the runs written so far, of the store the collection is held in. */
         std::variant<typename store_types_::ingest_runs_t...> runs_;
@@ -1779,8 +1798,20 @@ class basic_database {
         std::unique_ptr<published_collections_t> next {new (std::nothrow) published_collections_t {}};
         if (!next || next->entries.reserve(collections_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to publish the collections"};
-        for (entry_pointer_t const& entry : collections_) [[maybe_unused]]
-            st::status_t const named = next->entries.push_back(st::assume_reserved, entry.get());
+        catalog_allocator_t const allocator {resources_->memory_constraint};
+        auto [by_id, ids_status] = ids_index_t::make(collections_.size(), {}, allocator);
+        auto [by_name, names_status] = names_index_t::make(collections_.size(), {}, allocator);
+        if (ids_status != st::status_t::success_k || names_status != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to publish the collections"};
+        for (collection_entry_t* entry : collections_) {
+            std::uint32_t const index = entries_.index_of(*entry);
+            [[maybe_unused]] st::status_t const listed = next->entries.push_back(st::assume_reserved, std::move(entry));
+            [[maybe_unused]] st::status_t const by_ided = by_id.insert(id_key_(entry->id), index, st::assume_unique);
+            [[maybe_unused]] st::status_t const by_named = by_name.insert(name_key_(entry->name.view()), index,
+                                                                          st::assume_unique);
+        }
+        next->by_id = std::move(by_id);
+        next->by_name = std::move(by_name);
         ledger_.lead();
         atomic_reference_<std::uint64_t> const version {collections_version_};
         version.store(version.load(std::memory_order_relaxed) + 1, std::memory_order_release);
@@ -1795,28 +1826,51 @@ class basic_database {
         delete static_cast<published_collections_t*>(collections);
     }
 
-    /** The entry @p collection_id names in @p entries, or null when they name none. */
-    [[nodiscard]] static collection_entry_t* entry_with_id_in_(std::span<collection_entry_t* const> entries,
-                                                               collection_id_t collection_id) noexcept {
-        for (collection_entry_t* entry : entries)
-            if (entry->id == collection_id) return entry;
-        return nullptr;
+    [[nodiscard]] static st::key128_t id_key_(collection_id_t collection_id) noexcept {
+        return st::key128_t::from_bytes(std::as_bytes(std::span<std::uint8_t const, 16> {collection_id.uuid.bytes}));
     }
 
-    /** The entry @p name answers to in @p entries, or null when they name none. */
-    [[nodiscard]] static collection_entry_t* entry_named_in_(std::span<collection_entry_t* const> entries,
-                                                             string_view_t name) noexcept {
-        for (collection_entry_t* entry : entries)
-            if (entry->name.view() == name) return entry;
-        return nullptr;
+    [[nodiscard]] static std::uint64_t name_key_(string_view_t name) noexcept {
+        return st::hash<string_view_t> {}(name);
     }
 
-    /** The entry @p id names in @p entries, or null when they name none. */
-    [[nodiscard]] static collection_entry_t* entry_at_in_(std::span<collection_entry_t* const> entries,
-                                                          any_collection_id_t const& id) noexcept {
+    /**
+     *  @brief The published entry @p collection_id names, or null when none is published.
+     *  @note Called inside the ledger's epochs or holding the claim, as @c collection_entries_ is.
+     */
+    [[nodiscard]] collection_entry_t* entry_with_id_(collection_id_t collection_id) noexcept {
+        published_collections_t const* const published = published_collections_.load();
+        if (!published) return nullptr;
+        std::uint32_t const index = published->by_id.find(id_key_(collection_id));
+        return index == ids_index_t::absent_k ? nullptr : &entries_[index];
+    }
+
+    /** The published entry @p name answers to, or null when the published collections name none. */
+    [[nodiscard]] collection_entry_t* entry_named_(string_view_t name) noexcept {
+        published_collections_t const* const published = published_collections_.load();
+        if (!published) return nullptr;
+        std::uint32_t const index = published->by_name.find(
+            name_key_(name), [&](std::uint32_t candidate) noexcept { return entries_[candidate].name.view() == name; });
+        return index == names_index_t::absent_k ? nullptr : &entries_[index];
+    }
+
+    /** The published entry @p id names, or null when the published collections name none. */
+    [[nodiscard]] collection_entry_t* entry_at_(any_collection_id_t const& id) noexcept {
         if (collection_id_t const* const identified = std::get_if<collection_id_t>(&id))
-            return entry_with_id_in_(entries, *identified);
-        return entry_named_in_(entries, std::get<collection_alphanumeric_id_t>(id).view());
+            return entry_with_id_(*identified);
+        return entry_named_(std::get<collection_alphanumeric_id_t>(id).view());
+    }
+
+    /** A free record of @c entries_, or null when the pool may not grow. */
+    [[nodiscard]] collection_entry_t* take_entry_() noexcept {
+        std::uint32_t const index = entries_.take();
+        return index == entries_t::absent_k ? nullptr : &entries_[index];
+    }
+
+    /** Destroys the collection @p entry holds and returns its record to @c entries_. */
+    void release_entry_(collection_entry_t& entry) noexcept {
+        entry.held.template emplace<0>();
+        entries_.vacate(entries_.index_of(entry));
     }
 
     /** One head write's commit, as the sequencer hands it to its two steps. */
@@ -1849,7 +1903,7 @@ class basic_database {
         head.store = this;
         {
             reader_t const inside = ledger_.epochs().enter();
-            collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
+            collection_entry_t const* const found = entry_at_(id);
             if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
             head.id = found->id;
         }
@@ -1878,7 +1932,7 @@ class basic_database {
                         sealer_type_&& sealer) noexcept {
         {
             reader_t const inside = ledger_.epochs().enter();
-            collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
+            collection_entry_t const* const found = entry_with_id_(collection_id);
             if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
             status_t const status = std::visit(
                 [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
@@ -1908,7 +1962,7 @@ class basic_database {
         for (;;) {
             {
                 reader_t const inside = ledger_.epochs().enter();
-                collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
+                collection_entry_t const* const found = entry_with_id_(collection_id);
                 if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
                 memory_pressure_t const pressure = std::visit(
                     [&](auto const& collection) noexcept {
@@ -1925,12 +1979,10 @@ class basic_database {
                 claim_.wait_until_released();
                 continue;
             }
-            std::size_t const position = position_at_(any_collection_id_t {collection_id});
-            if (position == collections_.size())
-                return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+            collection_entry_t* const claimed = entry_with_id_(collection_id);
+            if (!claimed) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
             if (status_t const flushed = std::visit(
-                    [&](auto& collection) noexcept { return flush_and_compact_(collection); },
-                    collections_[position]->held);
+                    [&](auto& collection) noexcept { return flush_and_compact_(collection); }, claimed->held);
                 flushed.failed())
                 return flushed;
         }
@@ -1975,7 +2027,7 @@ class basic_database {
     /** Maintains every collection, holding the claim; answers the first failure, after trying every collection. */
     status_t maintain_due_() noexcept {
         status_t first;
-        for (entry_pointer_t const& entry : collections_)
+        for (collection_entry_t* entry : collections_)
             if (status_t const maintained = maintain_collection_(*entry); maintained.failed() && first.succeeded())
                 first = maintained;
         return first;
@@ -2034,23 +2086,10 @@ class basic_database {
         return claimed_channel_t {std::move(claim), std::move(guard)};
     }
 
-    /** Where @p id sits among the collections, or their count when it names nothing. */
-    [[nodiscard]] std::size_t position_at_(any_collection_id_t const& id) const noexcept {
-        if (collection_id_t const* const identified = std::get_if<collection_id_t>(&id)) {
-            for (std::size_t index = 0; index != collections_.size(); ++index)
-                if (collections_[index]->id == *identified) return index;
-            return collections_.size();
-        }
-        collection_alphanumeric_id_t const& named = std::get<collection_alphanumeric_id_t>(id);
-        for (std::size_t index = 0; index != collections_.size(); ++index)
-            if (collections_[index]->name == named) return index;
-        return collections_.size();
-    }
-
     /** Answers @p action on the store @p ingest writes into and the runs it wrote so far. */
     template <typename result_type_, typename action_type_>
     result_type_ with_ingest_(ingest_t& ingest, action_type_&& action) noexcept {
-        any_collection_t& held = collections_[ingest.position_]->held;
+        any_collection_t& held = ingest.entry_->held;
         result_type_ result = status_t {status_code_t::internal_k, "The ingest lost its store"};
         auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
             if (held.index() == index_) result = action(std::get<index_>(held), std::get<index_>(ingest.runs_));
@@ -2097,10 +2136,9 @@ class basic_database {
      *  invalid ID flushes nothing. */
     status_t flush_into_publication_(io_channel_t& channel, collection_id_t collection_id) noexcept {
         if (collection_id == collection_invalid_id_k) return {};
-        std::size_t const position = position_at_(any_collection_id_t {collection_id});
-        if (position == collections_.size())
-            return {status_code_t::not_found_k, "The database names no such collection"};
-        return std::visit([&](auto& held) noexcept { return held.flush(channel); }, collections_[position]->held);
+        collection_entry_t* const found = entry_with_id_(collection_id);
+        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+        return std::visit([&](auto& held) noexcept { return held.flush(channel); }, found->held);
     }
 
     /** Reserves room for one run pool per store, each made at its store's first collection
@@ -2192,8 +2230,12 @@ class basic_database {
     status_t copy_extent_(io_channel_t& reading, io_channel_t& writing, medium_extent_t const& from,
                           medium_extent_t const& into) noexcept {
         disk_t& disk = volume_->disk();
-        basic_read_pipeline<disk_t> reader {disk, reading, from.medium};
-        basic_write_pipeline<disk_t, waiter_type_> writer {disk, writing, into.medium};
+        auto [reader_lease, reader_lease_status] = reading.lease();
+        if (reader_lease_status.failed()) return reader_lease_status;
+        auto [writer_lease, writer_lease_status] = writing.lease();
+        if (writer_lease_status.failed()) return writer_lease_status;
+        basic_read_pipeline<disk_t> reader {disk, std::move(reader_lease), from.medium};
+        basic_write_pipeline<disk_t, waiter_type_> writer {disk, std::move(writer_lease), into.medium};
         std::uint64_t const reading_bytes = reading.requests().buffer_bytes();
         std::uint64_t const writing_bytes = writing.requests().buffer_bytes();
         std::uint64_t const block_bytes = round_down_to_multiple<std::uint64_t>(
@@ -2264,7 +2306,7 @@ class basic_database {
         manifest.id = identity.id;
         if (manifest.collections.reserve(collections_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
-        for (entry_pointer_t const& held : collections_) {
+        for (collection_entry_t const* held : collections_) {
             collection_entry_t const& entry = *held;
             manifest_collection_t record;
             std::memcpy(record.id.bytes, entry.id.uuid.bytes, sizeof(record.id.bytes));
@@ -2422,7 +2464,8 @@ class basic_database {
         if (record.name.size() == 0 || record.name.size() > collection_name_max_bytes_k)
             return {status_code_t::malformed_k, "The manifest names a collection by no name or too long a one"};
 
-        entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
+        // A refusal below leaves the record taken; the failed mount gives up every record at once.
+        collection_entry_t* entry = take_entry_();
         if (!entry) return {status_code_t::out_of_memory_k, "No room for another collection"};
         std::memcpy(entry->id.uuid.bytes, record.id.bytes, sizeof(record.id.bytes));
         if (sz::failed(entry->name.assign(record.name.view())))
@@ -2496,8 +2539,12 @@ class basic_database {
     /** The delta bounds a transaction takes when its caller names none. */
     database_config_t config_ {};
 
-    /** Every collection the database names, pinned so a snapshot may point into one. */
-    st::vector<entry_pointer_t> collections_;
+    /** Every collection the database names, in the order the manifest lists them. */
+    st::vector<collection_entry_t*> collections_;
+
+    /** The records every entry of @c collections_ lives in, made at the mount and given up at
+     *  the unmount. */
+    entries_t entries_;
 
     /** The collections readers load, which @c latest_collections_ owns. */
     published_view<published_collections_t, atomic_reference_> published_collections_;

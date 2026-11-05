@@ -54,9 +54,9 @@
 #include <fmt/format.h>
 #include <yyjson.h>
 
-#include <forkunion/atomics.hpp>                  // `std::memory_order_acquire`, `std::memory_order_release`
-#include <smashtable/basic_chunked_slot_pool.hpp> // `st::basic_chunked_slot_pool`
-#include <smashtable/basic_vector.hpp>            // `st::vector`
+#include <forkunion/atomics.hpp>             // `std::memory_order_acquire`, `std::memory_order_release`
+#include <smashtable/basic_growing_pool.hpp> // `st::basic_growing_pool`
+#include <smashtable/basic_vector.hpp>       // `st::vector`
 
 #include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compaction_output`, `compaction_kind_t`
 #include "ustore/blobs/nvme_key_slot.hpp"          // `storage_limits_t`, `stored_value_size_t`, `value_layout_t`
@@ -1048,8 +1048,7 @@ class lsm_record_pool {
 
     /** The records and the stack of the free ones, in chunks charged to the budget, which a reader
      *  resolves without the claim while a take grows them. */
-    using records_t =
-        st::basic_chunked_slot_pool<record_t, index_t, constrained_allocator<std::byte, atomic_reference_>>;
+    using records_t = st::basic_growing_pool<record_t, index_t, constrained_allocator<std::byte, atomic_reference_>>;
 
     /** A record's index and the generation it was taken at. */
     using handle_t = typename records_t::handle_t;
@@ -1415,7 +1414,7 @@ class lsm_level {
     }
 
     /** The key slot at @p position, which must have come from a @c find that answered anything but missing. */
-    [[nodiscard]] key_slot_t const& key_slot(lsm_level_position_t position) const noexcept {
+    [[nodiscard]] key_slot_t key_slot(lsm_level_position_t position) const noexcept {
         return run_at_(position.run_index).key_slot(position.key_slot_position);
     }
 
@@ -1837,22 +1836,12 @@ class lsm_level_merger {
 
 #pragma region Strings Merge
 
-    /** One version a merge of strings carries, as its source run holds it. */
-    struct string_version_t {
-
-        /** Its source: the upper runs in their order, then the lower runs. */
-        std::uint32_t source = 0;
-
-        /** Its sorted position in that source. */
-        std::uint32_t position = 0;
-    };
-
     /** Versions in ascending order of their keys, the versions of one key newest first, and where
      *  each key's start. */
     struct string_side_t {
 
         /** Every version. */
-        st::vector<string_version_t> versions;
+        st::vector<strings_version_t> versions;
 
         /** Where the versions of each key start in @c versions. */
         st::vector<std::uint32_t> keys;
@@ -1860,7 +1849,7 @@ class lsm_level_merger {
 
     /** The whole key of @p version. */
     [[nodiscard]] static std::string_view key_of_(std::span<sorted_run_t const* const> sources,
-                                                  string_version_t version) noexcept {
+                                                  strings_version_t version) noexcept {
         return sources[version.source]->key(version.position);
     }
 
@@ -1877,13 +1866,13 @@ class lsm_level_merger {
             return {status_code_t::out_of_memory_k, "A merge of strings could not list its versions"};
         for (std::uint32_t source = first; source != last; ++source)
             for (std::uint64_t position = 0; position != sources[source]->population_count(); ++position) {
-                string_version_t const version {source, static_cast<std::uint32_t>(position)};
+                strings_version_t const version {source, static_cast<std::uint32_t>(position)};
                 if (position == 0 || sources[source]->key(position) != sources[source]->key(position - 1))
                     [[maybe_unused]]
                     st::status_t const noted = side.keys.push_back(st::assume_reserved,
                                                                    static_cast<std::uint32_t>(side.versions.size()));
                 [[maybe_unused]] st::status_t const placed = side.versions.push_back(st::assume_reserved,
-                                                                                     string_version_t {version});
+                                                                                     strings_version_t {version});
             }
         return {};
     }
@@ -1917,7 +1906,7 @@ class lsm_level_merger {
             std::size_t const end = key + 1 != side.keys.size() ? side.keys[key + 1] : side.versions.size();
             for (std::size_t version = begin; version != end; ++version) [[maybe_unused]]
                 st::status_t const placed = joined.versions.push_back(st::assume_reserved,
-                                                                      string_version_t {side.versions[version]});
+                                                                      strings_version_t {side.versions[version]});
         };
         for (std::size_t row = 0; row != rows; ++row) {
             [[maybe_unused]] st::status_t const noted = joined.keys.push_back(
@@ -1932,7 +1921,7 @@ class lsm_level_merger {
     /** Adds one to @p depths for every version of a tie of equal heads, @p depth heads deep, among
      *  the versions from @p first to @p last that a run would give a layer, and recurses into the
      *  ties nested in it. */
-    static void count_layers_(std::span<sorted_run_t const* const> sources, std::span<string_version_t const> versions,
+    static void count_layers_(std::span<sorted_run_t const* const> sources, std::span<strings_version_t const> versions,
                               std::size_t first, std::size_t last, std::uint32_t depth,
                               std::span<std::uint32_t> depths) noexcept {
         std::size_t const skipped = std::size_t {depth} * strings::head_prefix_bytes_k;
@@ -1952,6 +1941,87 @@ class lsm_level_merger {
         }
     }
 
+    /** Lists the versions of @p sources that survive a merge of strings, in merged order: on the
+     *  device compactor where @p request places the merge, and by unions of their keys on the host
+     *  otherwise or where the device refuses it. */
+    static status_t strings_survivors_(std::span<sorted_run_t const* const> sources, merge_request_t const& request,
+                                       st::vector<strings_version_t>& survivors) noexcept {
+        std::uint32_t const upper_count = static_cast<std::uint32_t>(request.upper.size());
+        compaction_kind_t const kind = kind_of_(request.upper_order, request.depth);
+        std::uint64_t records = 0;
+        for (sorted_run_t const* source : sources) records += source->population_count();
+        cuda_compactor_t* const* const device = std::get_if<cuda_compactor_t*>(&request.compactor);
+        if (choose_compactor(request.placement, device != nullptr ? 1 : 0, records) == compactor_choice_t::device_k) {
+            if (device == nullptr) return {status_code_t::unsupported_k, "No device compactor serves this database"};
+            st::vector<strings_run_view> views;
+            if (views.resize(sources.size()) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A merge could not track its source runs"};
+            for (std::size_t index = 0; index != sources.size(); ++index)
+                views[index] = strings_run_view {&sources[index]->keys(), sources[index]->key_offsets(),
+                                                 sources[index]->key_tape(), &sources[index]->stamps(),
+                                                 &sources[index]->kinds()};
+            st::status_t const ranked = (*device)->merge_strings(kind, std::span<strings_run_view const> {views},
+                                                                 upper_count, request.stamps, survivors);
+            if (ranked != st::status_t::invalid_argument_k && ranked != st::status_t::out_of_memory_heap_k)
+                return compaction_status(ranked);
+        }
+        return host_strings_survivors_(sources, upper_count, kind, request.stamps, request.cancellation, survivors);
+    }
+
+    /** Lists the versions of @p sources that survive, as @c strings_survivors_ does, on the calling
+     *  thread: the upper runs folded newest first, then the lower runs joined, by key unions. */
+    static status_t host_strings_survivors_(std::span<sorted_run_t const* const> sources, std::uint32_t upper_count,
+                                            compaction_kind_t kind, compaction_stamps_t const& stamps,
+                                            cancellation_t const* cancellation,
+                                            st::vector<strings_version_t>& survivors) noexcept {
+        // The newest upper run is the first side, and each older one folds in after it, the
+        // lower level last.
+        string_side_t merged_side;
+        if (status_t const first = side_of_(sources, upper_count - 1, upper_count, merged_side); first.failed())
+            return first;
+        for (std::uint32_t source = upper_count - 1; source-- != 0;) {
+            if (stopped_(cancellation)) return cancelled_status_();
+            string_side_t older;
+            if (status_t const listed_side = side_of_(sources, source, source + 1, older); listed_side.failed())
+                return listed_side;
+            if (status_t const folded = fold_sides_(sources, merged_side, older); folded.failed()) return folded;
+        }
+        if (upper_count != sources.size()) {
+            if (stopped_(cancellation)) return cancelled_status_();
+            string_side_t lower;
+            if (status_t const listed_side = side_of_(sources, upper_count, static_cast<std::uint32_t>(sources.size()),
+                                                      lower);
+                listed_side.failed())
+                return listed_side;
+            if (status_t const folded = fold_sides_(sources, merged_side, lower); folded.failed()) return folded;
+        }
+
+        // The versions that survive, as the compaction of fixed-width keys decides it for each
+        // key in turn.
+        if (survivors.reserve(merged_side.versions.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge of strings could not list its survivors"};
+        located_key_slot<key_slot_t> previous;
+        for (std::size_t key = 0; key != merged_side.keys.size(); ++key) {
+            std::size_t const begin = merged_side.keys[key];
+            std::size_t const end = key + 1 != merged_side.keys.size() ? merged_side.keys[key + 1]
+                                                                       : merged_side.versions.size();
+            for (std::size_t index = begin; index != end; ++index) {
+                strings_version_t const version = merged_side.versions[index];
+                sorted_run_t const& source = *sources[version.source];
+                located_key_slot<key_slot_t> current;
+                current.key_slot.stored_key = source.head(version.position);
+                current.sorted_run = version.source;
+                current.kind = source.kind(version.position);
+                current.stamp = source.stamp(version.position);
+                current.position = version.position;
+                if (survives(index != begin ? &previous : nullptr, current, kind, stamps)) [[maybe_unused]]
+                    st::status_t const kept = survivors.push_back(st::assume_reserved, strings_version_t {version});
+                previous = current;
+            }
+        }
+        return {};
+    }
+
     /** Merges runs of strings: the upper runs folded newest first and then the lower runs,
      *  concatenated, as one side, by unions of their keys, keeping the versions @p request's stamps
      *  keep, written as new runs cut to equal sizes that never split the versions of one key. */
@@ -1965,54 +2035,8 @@ class lsm_level_merger {
             listed[request.upper.size() + index] = request.lower[index];
         std::span<sorted_run_t const* const> const sources {listed};
 
-        // The newest upper run is the first side, and each older one folds in after it, the
-        // lower level last.
-        std::uint32_t const upper_count = static_cast<std::uint32_t>(request.upper.size());
-        string_side_t merged_side;
-        if (status_t const first = side_of_(sources, upper_count - 1, upper_count, merged_side); first.failed())
-            return first;
-        for (std::uint32_t source = upper_count - 1; source-- != 0;) {
-            if (stopped_(request.cancellation)) return cancelled_status_();
-            string_side_t older;
-            if (status_t const listed_side = side_of_(sources, source, source + 1, older); listed_side.failed())
-                return listed_side;
-            if (status_t const folded = fold_sides_(sources, merged_side, older); folded.failed()) return folded;
-        }
-        if (!request.lower.empty()) {
-            if (stopped_(request.cancellation)) return cancelled_status_();
-            string_side_t lower;
-            if (status_t const listed_side = side_of_(sources, upper_count, static_cast<std::uint32_t>(sources.size()),
-                                                      lower);
-                listed_side.failed())
-                return listed_side;
-            if (status_t const folded = fold_sides_(sources, merged_side, lower); folded.failed()) return folded;
-        }
-
-        // The versions that survive, as the compaction of fixed-width keys decides it for each
-        // key in turn.
-        compaction_kind_t const kind = kind_of_(request.upper_order, request.depth);
-        st::vector<string_version_t> survivors;
-        if (survivors.reserve(merged_side.versions.size()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A merge of strings could not list its survivors"};
-        located_key_slot<key_slot_t> previous;
-        for (std::size_t key = 0; key != merged_side.keys.size(); ++key) {
-            std::size_t const begin = merged_side.keys[key];
-            std::size_t const end = key + 1 != merged_side.keys.size() ? merged_side.keys[key + 1]
-                                                                       : merged_side.versions.size();
-            for (std::size_t index = begin; index != end; ++index) {
-                string_version_t const version = merged_side.versions[index];
-                sorted_run_t const& source = *sources[version.source];
-                located_key_slot<key_slot_t> current;
-                current.key_slot.stored_key = source.head(version.position);
-                current.sorted_run = version.source;
-                current.kind = source.kind(version.position);
-                current.stamp = source.stamp(version.position);
-                current.position = version.position;
-                if (survives(index != begin ? &previous : nullptr, current, kind, request.stamps)) [[maybe_unused]]
-                    st::status_t const kept = survivors.push_back(st::assume_reserved, string_version_t {version});
-                previous = current;
-            }
-        }
+        st::vector<strings_version_t> survivors;
+        if (status_t const kept = strings_survivors_(sources, request, survivors); kept.failed()) return kept;
 
         // Each survivor plans its key, and a share of the layers it lands in, so the cut runs
         // fit their limit.
@@ -2022,7 +2046,7 @@ class lsm_level_merger {
             planned.resize(survivors.size() + 1) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "A merge of strings could not plan its runs"};
         for (std::uint32_t& depth : depths) depth = 0;
-        count_layers_(sources, std::span<string_version_t const> {survivors}, 0, survivors.size(), 0,
+        count_layers_(sources, std::span<strings_version_t const> {survivors}, 0, survivors.size(), 0,
                       std::span<std::uint32_t> {depths});
         planned[0] = 0;
         for (std::size_t index = 0; index != survivors.size(); ++index)
@@ -2053,9 +2077,9 @@ class lsm_level_merger {
                 runs.discard(volume, std::span<run_handle_t const> {merged});
                 return cancelled_status_();
             }
-            std::span<string_version_t const> const run_versions =
-                std::span<string_version_t const> {survivors}.subspan(first,
-                                                                      static_cast<std::size_t>(cut.key_slots_count));
+            std::span<strings_version_t const> const run_versions =
+                std::span<strings_version_t const> {survivors}.subspan(first,
+                                                                       static_cast<std::size_t>(cut.key_slots_count));
             auto [written, write_status] = write_strings_run_(volume, writing_channel, sources, run_versions, request);
             if (write_status.failed()) {
                 runs.discard(volume, std::span<run_handle_t const> {merged});
@@ -2077,11 +2101,11 @@ class lsm_level_merger {
      *  @p request's floor. */
     static expected<sorted_run_t> write_strings_run_(volume_t& volume, io_channel_t& writing_channel,
                                                      std::span<sorted_run_t const* const> sources,
-                                                     std::span<string_version_t const> versions,
+                                                     std::span<strings_version_t const> versions,
                                                      merge_request_t const& request) noexcept {
         std::size_t const count = versions.size();
         std::uint64_t tails_bytes = 0;
-        for (string_version_t const version : versions)
+        for (strings_version_t const version : versions)
             tails_bytes += strings::tail_of(key_of_(sources, version)).size();
         if (tails_bytes > limit<std::uint32_t>::max())
             return status_t {status_code_t::capacity_exhausted_k, "A merged run's keys outgrow their offsets"};
@@ -2201,9 +2225,10 @@ class lsm_level_merger {
 
         for (std::size_t index = 0; index != runs; ++index) {
             sorted_run_t const& run = *sources[index];
-            std::span<key_slot_t const> const cells = run.cells();
+            key_slot_t const* cells = nullptr;
+            if constexpr (sorted_run_t::keeps_cells_k) cells = run.cells().data();
             views[index] = sorted_run_index_view<key_slot_t> {
-                cells.data(), run.population_count(), &run.stamps(), &run.kinds(), {}, run.value_offsets()};
+                cells, run.population_count(), &run.stamps(), &run.kinds(), {}, run.value_offsets(), &run.keys()};
         }
         return {};
     }
@@ -2225,7 +2250,10 @@ class lsm_level_merger {
             blob.slice(sorted_run_layout_t::stamps_offset(count, header.stored_values_bytes),
                        sorted_run_layout_t::trailer_bytes(header.stamps_bytes, header.kinds_bytes)),
             header.stamps_bytes,
-            run.assigned_stamp()};
+            run.assigned_stamp(),
+            blob.slice(sorted_run_layout_t::keys_offset(count), sorted_run_layout_t::keys_section_bytes(count)),
+            sorted_run_layout_t::keys_leaves_offset(count),
+            run.content_id()};
     }
 
     /** Counts the key slots @p upper and @p lower merge, and tells whether any of their runs holds a change. */
@@ -2392,7 +2420,9 @@ class lsm_level_merger {
         if (block_bytes < sorted_run_layout_t::header_bytes())
             return {status_code_t::capacity_exhausted_k, "A channel's streaming block is shorter than a run's header"};
 
-        write_pipeline_t writer {volume.disk(), writing_channel, blob.medium};
+        auto [writer_lease, writer_lease_status] = writing_channel.lease();
+        if (writer_lease_status.failed()) return writer_lease_status;
+        write_pipeline_t writer {volume.disk(), std::move(writer_lease), blob.medium};
         channel_drain<disk_t> const parked {volume.disk(), writing_channel};
         if (stopped_(cancellation)) return cancelled_status_();
 
@@ -2449,7 +2479,9 @@ class lsm_level_merger {
             if (scratch.resize(static_cast<std::size_t>(block_bytes + read_block)) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A merge could not hold the values it gathers"};
 
-            read_pipeline_t reader {volume.disk(), reading_channel, medium_reference_t {}};
+            auto [reader_lease, reader_lease_status] = reading_channel.lease();
+            if (reader_lease_status.failed()) return reader_lease_status;
+            read_pipeline_t reader {volume.disk(), std::move(reader_lease), medium_reference_t {}};
             channel_drain<disk_t> const parked {volume.disk(), reading_channel};
 
             status_t first;
@@ -2880,7 +2912,9 @@ class lsm_tree {
             if (pending.resize(depth) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A tree could not track its reads in flight"};
 
-            read_pipeline_t reader {volume_->disk(), channel, medium_reference_t {}};
+            auto [reader_lease, reader_lease_status] = channel.lease();
+            if (reader_lease_status.failed()) return reader_lease_status;
+            read_pipeline_t reader {volume_->disk(), std::move(reader_lease), medium_reference_t {}};
             status_t first;
             auto adapter = [&](completed_buffer_t const& completed) noexcept {
                 pending_read_t const& piece = pending[completed.tag % depth];

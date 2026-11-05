@@ -329,7 +329,11 @@ if (${USTORE_WITH_NVME})
     # Both libraries link one copy of every CPU class's engine, compiled position-independent once
     add_library(ustore_nvme_variants OBJECT ${ustore_library_exclusion_} ${ustore_nvme_variants_})
     set_target_properties(ustore_nvme_variants PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_link_libraries(ustore_nvme_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_})
+    # SPDK's archives exist only in a build configured with `USTORE_WITH_SPDK`
+    target_link_libraries(
+        ustore_nvme_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_}
+                                     $<TARGET_NAME_IF_EXISTS:ustore_spdk>
+    )
     list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_nvme_variants>)
     list(APPEND ustore_compiled_objects_ ustore_nvme_variants)
     list(APPEND ustore_engine_definitions_ USTORE_WITH_NVME=1)
@@ -445,10 +449,11 @@ target_compile_definitions(
 )
 target_link_libraries(
     ustore_static PUBLIC Threads::Threads $<BUILD_INTERFACE:smashtable::header> ${ustore_dependency_links_}
-                         ${ustore_engine_archives_}
+                         ${ustore_engine_archives_} $<BUILD_INTERFACE:$<TARGET_NAME_IF_EXISTS:ustore_spdk>>
 )
 target_link_libraries(
     ustore_shared PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_} ${ustore_engine_archives_}
+                          $<TARGET_NAME_IF_EXISTS:ustore_spdk>
 )
 # Every GPU runtime and cuFile open through `dlopen` at first use, which glibc before 2.34 keeps in `libdl`
 target_link_libraries(ustore_static PUBLIC ${CMAKE_DL_LIBS})
@@ -885,6 +890,10 @@ if (${USTORE_BUILD_BENCH})
     # The single-collection database benchmark drives the NVMe templates over volumes of its own, with no engine, and
     # links the compactor its merges reach, as the storage suites do
     if (${USTORE_WITH_NVME})
+        # The PubChem ingest opens the engine through the C ABI alone, so one source measures every layout shipped
+        add_executable(ustore_bench_nvme_pubchem bench/nvme_pubchem.cpp)
+        target_link_libraries(ustore_bench_nvme_pubchem PRIVATE ustore::static fmt::fmt ustore_warnings)
+
         add_executable(ustore_bench_nvme_single_collection_database bench/nvme_single_collection_database.cpp)
         target_link_libraries(
             ustore_bench_nvme_single_collection_database

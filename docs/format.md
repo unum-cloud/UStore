@@ -13,7 +13,7 @@ On raw media it is an extent inside a slot, which the manifest locates by offset
 ```c
 struct sorted_run {                       // every section starts on a 4096-byte boundary
     sorted_run_header_t header;           // 112 bytes
-    key_slot cells[n];                    // sorted order
+    key_slot cells[n];                    // sorted order, inline values only
     splus_tree keys;                      // saved immutable_splus_tree over the n keys
     u32 value_offsets[n + 1];             // variable-width values only; [0] = 0, [n] = stored_values_bytes
     byte_t values[stored_values_bytes];   // sorted order, fixed-width ones found by stride
@@ -58,6 +58,7 @@ The header carries everything a reader needs to locate every other section, so a
 
 A cell holds a fixed-width key and nothing of its value, which the cell's sorted position locates.
 A lookup descends the saved tree of the keys, whose rank is the cell's position.
+A cell that is its key alone, for fixed-width and variable-width values, is not saved, as the tree's leaf rows hold every key; a reader or a device compactor takes keys from those rows, 16-byte keys stored as a column of high words and a column of low words per row.
 A run of strings files every key under its 16-byte head, its first 15 bytes and its length, and keeps the keys whole on the key tape.
 A tie of equal heads wider than one row of the tree gets a layer over the next 15 bytes of its keys, nested as deep as they keep tying, so a lookup compares at most one row of whole keys.
 Each cell's kind tells a removal, an empty value and a fold's change apart, so no length or offset carries a sentinel.

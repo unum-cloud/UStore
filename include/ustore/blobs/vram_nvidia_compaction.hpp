@@ -86,6 +86,18 @@ class cuda_compactor_t {
                          std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
                          compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
 
+    /**
+     *  @brief Lists the versions of @p runs that survive their merge, in merged order, as the
+     *      host's key unions and @c survives list them, ranked on the device by head and tape.
+     *  @param[in] runs The upper runs, oldest first, then the lower runs, ascending.
+     *  @param[in] upper_runs How many of @p runs are upper ones.
+     *  @return Success, or @c invalid_argument_k where the device loaded no kernels or a run
+     *      outgrows what a version names, and @c out_of_memory_heap_k where the merge outgrows the
+     *      scratch, both of which the host takes over.
+     */
+    st::status_t merge_strings(compaction_kind_t kind, std::span<strings_run_view const> runs, std::uint32_t upper_runs,
+                               compaction_stamps_t const& stamps, st::vector<strings_version_t>& survivors) noexcept;
+
     /** Device allocations the compactor made, which stop once its scratch holds the largest
      *  merge it serves. */
     std::uint64_t device_allocations() const noexcept { return device_allocations_; }

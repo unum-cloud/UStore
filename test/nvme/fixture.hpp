@@ -527,7 +527,9 @@ expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t media
 template <typename disk_type_>
 status_t blank_head(disk_type_& disk, io_channel_t& channel, medium_reference_t medium,
                     std::uint64_t page_bytes) noexcept {
-    basic_write_pipeline<disk_type_, waiter_t> writer {disk, channel, medium};
+    auto [writer_lease, writer_lease_status] = channel.lease();
+    if (writer_lease_status.failed()) return writer_lease_status;
+    basic_write_pipeline<disk_type_, waiter_t> writer {disk, std::move(writer_lease), medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     if (block.size() < page_bytes)

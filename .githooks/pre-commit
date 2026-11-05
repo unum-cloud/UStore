@@ -31,7 +31,7 @@ project_include_prefix="ustore"
 sibling_projects='numkong|stringzilla|usearch|forkunion|smashtable|ucall|uform'
 abbreviations_refused="hi lo bot acc accum tmp temp res bcast ext idx cnt buf len str val obj elem iter"
 # Name prefixes of third-party APIs the code calls, whose abbreviations are not this project's to spell out.
-third_party_identifier_prefixes='yyjson_'
+third_party_identifier_prefixes='yyjson_ spdk_'
 rustfmt_command="cargo fmt"
 std_collections_baseline_paths=''
 # Uppercase non-cache CMake names this project publishes, and the third-party and toolchain inputs it sets.

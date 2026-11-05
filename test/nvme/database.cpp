@@ -641,6 +641,15 @@ case_result_t dropped_collection_is_gone(mount_type_ const& mount) {
     failures += expect_eq(run_files_of(fixture), std::size_t {0});
     failures += expect_status((*reopened)->drop_collection(any_collection_id_t {*doomed}), status_code_t::not_found_k);
 
+    // The name returns under a new UUID in the record the drop freed, which the old UUID misses.
+    expected<collection_id_t> const reborn = create_named(**reopened, "doomed", test_config(8, 0));
+    failures += expect(reborn.has_value());
+    if (!reborn) return failures;
+    failures += expect(!(*reopened)->has_collection(any_collection_id_t {*doomed}));
+    failures += expect((*reopened)->collection_name(*doomed).empty());
+    failures += expect((*reopened)->collection_id(any_collection_id_t {owned_name("doomed")}) == *reborn);
+    failures += expect((*reopened)->drop_collection(any_collection_id_t {*reborn}).succeeded());
+
     failures += expect((*reopened)->unmount().succeeded());
     (*reopened).reset();
     expected<std::unique_ptr<database_t>> again = open_database(**stack);

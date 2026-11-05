@@ -27,16 +27,16 @@
 #include <cstring> // `std::memcpy`, `std::memset`
 
 #include <algorithm>   // `std::sort`, `std::binary_search`
-#include <charconv>    // `std::from_chars`
+#include <charconv>    // `std::from_chars`, `std::to_chars`
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`, `std::exchange`
 #include <variant>     // `std::variant`, `std::monostate`, `std::holds_alternative`, `std::get_if`
 
-#include <smashtable/basic_chunked_slot_pool.hpp> // `st::basic_chunked_slot_pool`
-#include <smashtable/basic_slot_pool.hpp>         // `st::basic_slot_pool`
-#include <smashtable/basic_vector.hpp>            // `st::vector`
+#include <smashtable/basic_growing_pool.hpp> // `st::basic_growing_pool`
+#include <smashtable/basic_fixed_pool.hpp>   // `st::basic_fixed_pool`
+#include <smashtable/basic_vector.hpp>       // `st::vector`
 
 #include "ustore/utilities/blocking_files.hpp" // `replace_file_durably`, `read_file`, `list_directory`, `join_path`
 #include "ustore/utilities/nvme_channels.hpp"  // `io_channel_t`, `basic_read_pipeline`, `basic_write_pipeline`
@@ -200,7 +200,9 @@ struct volume_config_t {
 template <typename disk_type_, typename waiter_type_>
 status_t write_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t const& extent,
                       std::span<byte_t const> bytes) noexcept {
-    basic_write_pipeline<disk_type_, waiter_type_> writer {disk, channel, extent.medium};
+    auto [writer_lease, writer_lease_status] = channel.lease();
+    if (writer_lease_status.failed()) return writer_lease_status;
+    basic_write_pipeline<disk_type_, waiter_type_> writer {disk, std::move(writer_lease), extent.medium};
     std::uint64_t const total = round_up_to_multiple<std::uint64_t>(bytes.size(), portable_alignment_k);
     if (total > extent.extent.length) return {status_code_t::invalid_argument_k, "The bytes outgrow their extent"};
     for (std::uint64_t written = 0; written != total;) {
@@ -228,7 +230,9 @@ status_t write_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t c
 template <typename disk_type_>
 status_t read_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t const& extent,
                      std::span<byte_t> into) noexcept {
-    basic_read_pipeline<disk_type_> reader {disk, channel, extent.medium};
+    auto [reader_lease, reader_lease_status] = channel.lease();
+    if (reader_lease_status.failed()) return reader_lease_status;
+    basic_read_pipeline<disk_type_> reader {disk, std::move(reader_lease), extent.medium};
     std::uint64_t const block_bytes = round_down_to_multiple<std::uint64_t>(channel.requests().buffer_bytes(),
                                                                             portable_alignment_k);
     if (block_bytes == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
@@ -276,7 +280,7 @@ template <typename allocator_type_>
 class basic_slot_allocator {
   public:
 
-    using slot_pool_t = st::basic_slot_pool<slot_t, std::uint32_t, allocator_type_>;
+    using slot_pool_t = st::basic_fixed_pool<slot_t, std::uint32_t, allocator_type_>;
     static constexpr std::uint32_t absent_k = slot_pool_t::absent_k;
 
     basic_slot_allocator() noexcept = default;
@@ -576,7 +580,10 @@ class basic_directory_volume {
         for (placement_handle_t const& handle : unflushed_) {
             run_file_t* const file = run_files_.at(handle_of_(handle));
             if (!file) continue;
-            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, file->medium.reference()};
+            auto [writer_lease, writer_lease_status] = channel.lease();
+            if (writer_lease_status.failed()) return writer_lease_status;
+            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_lease),
+                                                                   file->medium.reference()};
             if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
         }
         unflushed_.clear();
@@ -639,7 +646,7 @@ class basic_directory_volume {
         std::uint64_t used = 0;
     };
 
-    using run_files_t = st::basic_chunked_slot_pool<run_file_t, std::uint32_t, allocator_type_>;
+    using run_files_t = st::basic_growing_pool<run_file_t, std::uint32_t, allocator_type_>;
 
     template <typename integer_type_>
     static constexpr std::size_t limit_of_() noexcept {
@@ -816,9 +823,8 @@ class basic_slotted_volume {
      *  and freed; zero blocks are freed in descending order so later takes come out lowest first;
      *  foreign slots stay taken.
      *
-     *  @return The volume, @c already_exists_k when the base slot belongs to something else,
-     *      @c malformed_k for media listed in another order than the database was created with, or
-     *      @c unsupported_k for SPDK.
+     *  @return The volume, @c already_exists_k when the base slot belongs to something else, or
+     *      @c malformed_k for media listed in another order than the database was created with.
      */
     static expected<basic_slotted_volume> mount(disk_type_& disk, io_channel_t& channel, volume_config_t const& config,
                                                 allocator_type_ allocator) noexcept {
@@ -911,7 +917,10 @@ class basic_slotted_volume {
         std::uint64_t const regions = first.base + slot_payload_offset_k;
         std::uint64_t const idle = manifest_owner_.manifest_offset == regions ? regions + manifest_region_bytes_k
                                                                               : regions;
-        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, first.medium.reference()};
+        auto [writer_lease, writer_lease_status] = channel.lease();
+        if (writer_lease_status.failed()) return writer_lease_status;
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_lease),
+                                                               first.medium.reference()};
         if (status_t const written = write_bytes_(writer, idle, std::as_bytes(json), first.block_bytes);
             written.failed())
             return written;
@@ -988,19 +997,27 @@ class basic_slotted_volume {
         : disk_(&disk), allocator_(allocator) {}
 
     status_t open_medium_(data_address_t const& address, std::uint16_t index) noexcept {
-        if (address.kind == data_address_kind_t::spdk_k)
-            return {status_code_t::unsupported_k, "The SPDK transport is not mounted by this build"};
-        if (address.kind != data_address_kind_t::raw_k)
+        if (address.kind != data_address_kind_t::raw_k && address.kind != data_address_kind_t::spdk_k)
             return {status_code_t::invalid_argument_k, "A slotted volume spans raw media alone"};
         char path[path_max_bytes_k];
-        if (address.location.size() >= sizeof(path))
-            return {status_code_t::invalid_argument_k, "A raw medium's path outgrew the platform's limit"};
-        std::memcpy(path, address.location.data(), address.location.size());
-        path[address.location.size()] = '\0';
-        // Slot claims of two processes would race on the owner blocks, so one mount holds the
-        // medium at a time.
-        auto [claims, lock_status] = file_lock_t::acquire(path);
-        if (lock_status.failed()) return lock_status;
+        file_lock_t claims;
+        if (address.kind == data_address_kind_t::spdk_k) {
+            // The disk names a namespace by its number and lets one mount register it at a time.
+            [[maybe_unused]] std::to_chars_result const written = std::to_chars(path, path + sizeof(path) - 1,
+                                                                                address.namespace_id);
+            *written.ptr = '\0';
+        }
+        else {
+            if (address.location.size() >= sizeof(path))
+                return {status_code_t::invalid_argument_k, "A raw medium's path outgrew the platform's limit"};
+            std::memcpy(path, address.location.data(), address.location.size());
+            path[address.location.size()] = '\0';
+            // Slot claims of two processes would race on the owner blocks, so one mount holds the
+            // medium at a time.
+            auto [locked, lock_status] = file_lock_t::acquire(path);
+            if (lock_status.failed()) return lock_status;
+            claims = std::move(locked);
+        }
         medium_options_t request;
         request.name = path;
         request.access = medium_access_t::read_write_k;
@@ -1037,12 +1054,18 @@ class basic_slotted_volume {
      *  once; a block of this layout names the database and the manifest copy in force. */
     status_t claim_manifest_slot_(io_channel_t& channel, string_view_t database) noexcept {
         raw_medium_t& first = media_[0];
-        basic_read_pipeline<disk_type_> reader {*disk_, channel, first.medium.reference()};
         slot_owner_block_t found {};
-        if (status_t const read = read_owner_blocks_(
-                reader, first, 0, 1, [&](std::uint32_t, slot_owner_block_t const& block) noexcept { found = block; });
-            read.failed())
-            return read;
+        // The reader gives the queue pair back before the writer or the manifest load takes it.
+        {
+            auto [reader_lease, reader_lease_status] = channel.lease();
+            if (reader_lease_status.failed()) return reader_lease_status;
+            basic_read_pipeline<disk_type_> reader {*disk_, std::move(reader_lease), first.medium.reference()};
+            if (status_t const read = read_owner_blocks_(
+                    reader, first, 0, 1,
+                    [&](std::uint32_t, slot_owner_block_t const& block) noexcept { found = block; });
+                read.failed())
+                return read;
+        }
 
         if (is_zero_(found)) {
             manifest_.id = uuid_generator();
@@ -1050,7 +1073,10 @@ class basic_slotted_volume {
                 return {status_code_t::out_of_memory_k, "No room for the database's name"};
             manifest_.placement = manifest_placement_t::offsets_k;
             manifest_owner_ = owner_block_(0);
-            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, first.medium.reference()};
+            auto [writer_lease, writer_lease_status] = channel.lease();
+            if (writer_lease_status.failed()) return writer_lease_status;
+            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_lease),
+                                                                   first.medium.reference()};
             if (status_t const written = write_owner_block_(writer, first, first.base, &manifest_owner_);
                 written.failed())
                 return written;
@@ -1081,7 +1107,9 @@ class basic_slotted_volume {
         std::uint64_t const rounded = round_up_to_multiple(owner.manifest_bytes, first.block_bytes);
         if (text.resize(static_cast<std::size_t>(rounded)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to read the manifest"};
-        basic_read_pipeline<disk_type_> reader {*disk_, channel, first.medium.reference()};
+        auto [reader_lease, reader_lease_status] = channel.lease();
+        if (reader_lease_status.failed()) return reader_lease_status;
+        basic_read_pipeline<disk_type_> reader {*disk_, std::move(reader_lease), first.medium.reference()};
         std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(), first.block_bytes);
         std::uint64_t offered = 0;
         status_t carried;
@@ -1138,19 +1166,27 @@ class basic_slotted_volume {
         if (owners.resize(count, owner_t::foreign_k) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to classify a medium's slots"};
         std::uint32_t const first_scanned = index == 0 ? 1 : 0;
-        basic_read_pipeline<disk_type_> reader {*disk_, channel, medium.medium.reference()};
-        if (status_t const read = read_owner_blocks_(
-                reader, medium, first_scanned, count,
-                [&](std::uint32_t slot, slot_owner_block_t const& block) noexcept {
-                    if (is_zero_(block)) owners[slot] = owner_t::free_k;
-                    else if (block.magic != slot_owner_magic_k || block.database != manifest_.id)
-                        owners[slot] = owner_t::foreign_k;
-                    else owners[slot] = block.medium == index ? owner_t::ours_k : owner_t::misplaced_k;
-                });
-            read.failed())
-            return read;
+        // The reader gives the queue pair back before the writer below takes it.
+        {
+            auto [reader_lease, reader_lease_status] = channel.lease();
+            if (reader_lease_status.failed()) return reader_lease_status;
+            basic_read_pipeline<disk_type_> reader {*disk_, std::move(reader_lease), medium.medium.reference()};
+            if (status_t const read = read_owner_blocks_(
+                    reader, medium, first_scanned, count,
+                    [&](std::uint32_t slot, slot_owner_block_t const& block) noexcept {
+                        if (is_zero_(block)) owners[slot] = owner_t::free_k;
+                        else if (block.magic != slot_owner_magic_k || block.database != manifest_.id)
+                            owners[slot] = owner_t::foreign_k;
+                        else owners[slot] = block.medium == index ? owner_t::ours_k : owner_t::misplaced_k;
+                    });
+                read.failed())
+                return read;
+        }
 
-        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, medium.medium.reference()};
+        auto [writer_lease, writer_lease_status] = channel.lease();
+        if (writer_lease_status.failed()) return writer_lease_status;
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_lease),
+                                                               medium.medium.reference()};
         for (std::uint32_t slot = count; slot != first_scanned; --slot) {
             std::uint32_t const at = slot - 1;
             bool const named = medium.slots.slot(at).live_bytes != 0;
@@ -1170,7 +1206,10 @@ class basic_slotted_volume {
      *  and zeroes and deallocates every one freed. */
     status_t write_touched_(io_channel_t& channel, std::size_t index) noexcept {
         raw_medium_t& medium = media_[index];
-        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, medium.medium.reference()};
+        auto [writer_lease, writer_lease_status] = channel.lease();
+        if (writer_lease_status.failed()) return writer_lease_status;
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_lease),
+                                                               medium.medium.reference()};
         slot_owner_block_t const owner = owner_block_(static_cast<std::uint32_t>(index));
         // A slot vacated since a run was dropped has its owner block zeroed below, and may hold a
         // newer run already.

@@ -179,6 +179,28 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     merge_place(survivors, survivors_count, floor, cells, stamps, kinds);
 }
 
+/** Gathers the cells of runs of fixed width key slots from the leaf rows of their key trees. */
+extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge_gather_fixed_width(
+    key_rows_gather<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>> const* gathers,
+    std::uint32_t gathers_count, std::uint64_t cells_count) {
+    merge_gather(gathers, gathers_count, cells_count);
+}
+
+/** Gathers the cells of runs of variable width key slots from the leaf rows of their key trees. */
+extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge_gather_variable_width(
+    key_rows_gather<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>> const* gathers,
+    std::uint32_t gathers_count, std::uint64_t cells_count) {
+    merge_gather(gathers, gathers_count, cells_count);
+}
+
+/** Ranks every version of a merge of runs of strings into @p merged with its survival flag. */
+extern "C" __global__ void __launch_bounds__(merge_block_threads_k)
+    ustore_merge_strings_rank(strings_merge_run const* runs, std::uint32_t runs_count, std::uint32_t upper_runs,
+                              std::uint64_t records_count, compaction_kind_t kind, compaction_stamps_t stamps,
+                              strings_version_t* merged, std::uint8_t* flags) {
+    merge_strings_rank(runs, runs_count, upper_runs, records_count, kind, stamps, merged, flags);
+}
+
 #pragma endregion Merge Kernels
 
 #pragma region Fold Kernels

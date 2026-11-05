@@ -20,12 +20,13 @@
  *  position locates: by stride for fixed-width values, and through the value offsets column
  *  for variable-width ones, so the values of any range of positions read as one tape of
  *  offsets and bytes. A lookup descends a saved S+ tree of the keys and lands on the rank,
- *  which is the cell's position:
+ *  which is the cell's position. A cell that is its key alone is not saved, as the tree's
+ *  leaves hold every key:
  *
  *  @code{.c}
  *  struct sorted_run {                       // every section starts on a 4096-byte boundary
  *      sorted_run_header_t header;           // 112 bytes, format_version = 1, branching = keys per tree row
- *      key_slot cells[n];                    // sorted order
+ *      key_slot cells[n];                    // sorted order, inline values only
  *      splus_tree keys;                      // saved immutable_splus_tree<stored key> over n keys
  *      u32 value_offsets[n + 1];             // variable width only; [0] = 0, [n] = stored_values_bytes
  *      byte_t values[stored_values_bytes];   // sorted order, fixed-width ones found by stride
@@ -333,6 +334,9 @@ class sorted_run_layout {
     /** Whether the run locates its values through a value offsets column, which only variable widths need. */
     static constexpr bool carries_value_offsets_k = is_variable_width(value_layout_k);
 
+    /** Whether the run saves its cells, needed for inline values alone; the tree holds the keys. */
+    static constexpr bool keeps_cells_k = holds_values_inline_k;
+
     /** The saved S+ tree of the keys, searched in place. */
     using keys_view_t = st::immutable_splus_tree_view<typename key_slot_t::stored_key_t>;
 
@@ -347,7 +351,7 @@ class sorted_run_layout {
     /** Bytes the cells of @p key_slots_count key slots occupy, before the
      *  section's alignment padding. */
     [[nodiscard]] static constexpr std::uint64_t index_bytes(std::uint64_t key_slots_count) noexcept {
-        return key_slots_count * sizeof(key_slot_t);
+        return keeps_cells_k ? key_slots_count * sizeof(key_slot_t) : 0;
     }
 
     /** Bytes the index section occupies, which one read of it covers whole. */
@@ -371,6 +375,13 @@ class sorted_run_layout {
     /** First byte of the saved tree of the keys, right after the cells. */
     [[nodiscard]] static constexpr std::uint64_t keys_offset(std::uint64_t key_slots_count) noexcept {
         return index_offset() + index_section_bytes(key_slots_count);
+    }
+
+    /** Where the leaf rows of the saved tree of @p key_slots_count keys start in its section: the
+     *  last rows of the saved form, holding every key in sorted order. */
+    [[nodiscard]] static constexpr std::uint64_t keys_leaves_offset(std::uint64_t key_slots_count) noexcept {
+        std::uint64_t const leaves = divide_round_up(key_slots_count, branching_k);
+        return keys_saved_bytes(key_slots_count) - leaves * keys_view_t::format_t::bytes_per_row_k;
     }
 
     /** Bytes the section of the saved tree of the keys occupies. */
@@ -585,6 +596,9 @@ class lsm_sorted_run {
 
     /** Whether the run locates its values through a value offsets column, which only variable widths need. */
     static constexpr bool carries_value_offsets_k = sorted_run_layout_t::carries_value_offsets_k;
+
+    /** Whether the run keeps its cells, needed for inline values alone; the tree holds the keys. */
+    static constexpr bool keeps_cells_k = sorted_run_layout_t::keeps_cells_k;
 
     /** Whether the run holds strings: heads in an S+ tree, whole keys on a tape and layers
      *  under wide ties. */
@@ -804,7 +818,9 @@ class lsm_sorted_run {
             return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
         medium_extent_t const& extent = reservation.extent;
         sorted_run_header_t const& header = reservation.header;
-        write_pipeline_t writer {volume.disk(), channel, extent.medium};
+        auto [writer_lease, writer_lease_status] = channel.lease();
+        if (writer_lease_status.failed()) return writer_lease_status;
+        write_pipeline_t writer {volume.disk(), std::move(writer_lease), extent.medium};
 
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
         auto [head, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
@@ -888,8 +904,12 @@ class lsm_sorted_run {
     /** Where the run lies, which a manifest names and a volume deallocates. */
     [[nodiscard]] medium_extent_t const& extent() const noexcept { return extent_; }
 
-    /** The cells in sorted order, which a compaction reads in place. */
-    [[nodiscard]] std::span<key_slot_t const> cells() const noexcept { return std::span<key_slot_t const> {cells_}; }
+    /** The sorted cells of a run whose cells carry values, which a compaction reads in place. */
+    [[nodiscard]] std::span<key_slot_t const> cells() const noexcept
+        requires keeps_cells_k
+    {
+        return std::span<key_slot_t const> {cells_};
+    }
 
     /** Where each key slot's value starts inside the values section and one past the last, in sorted order, which a
      *  compaction reads in place; none for a run finding its values by stride or holding them inline. */
@@ -897,11 +917,16 @@ class lsm_sorted_run {
         return std::span<stored_value_offset_t const> {value_offsets_};
     }
 
-    /** The key slot at sorted @p position, which must be below @c population_count. */
-    [[nodiscard]] key_slot_t const& key_slot(std::uint64_t position) const noexcept
+    /** The key slot at sorted @p position, below @c population_count, from the cells or tree. */
+    [[nodiscard]] key_slot_t key_slot(std::uint64_t position) const noexcept
         requires(!tailed_k)
     {
-        return cells_[static_cast<std::size_t>(position)];
+        if constexpr (keeps_cells_k) return cells_[static_cast<std::size_t>(position)];
+        else {
+            key_slot_t slot {};
+            slot.stored_key = tree_.select(static_cast<std::size_t>(position));
+            return slot;
+        }
     }
 
     /** The stamp of the key slot at sorted @p position, which must be below @c population_count. */
@@ -1052,12 +1077,8 @@ class lsm_sorted_run {
         return tree_.rank(stored_key);
     }
 
-    /** The saved S+ tree of the keys every lookup of a run of fixed-width keys descends. */
-    [[nodiscard]] keys_view_t const& keys() const noexcept
-        requires(!tailed_k)
-    {
-        return tree_;
-    }
+    /** The saved S+ tree every lookup descends: of the keys, or of a run of strings' heads. */
+    [[nodiscard]] keys_view_t const& keys() const noexcept { return tree_; }
 
     /** Where @p stored_key sits in sorted order, or @c population_count when the run holds no such key. */
     [[nodiscard]] std::uint64_t position_of(stored_key_t stored_key) const noexcept
@@ -1342,7 +1363,9 @@ class lsm_sorted_run {
         if (pending.resize(depth) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A run could not track its reads in flight"};
 
-        read_pipeline_t reader {volume_->disk(), channel, extent_.medium};
+        auto [reader_lease, reader_lease_status] = channel.lease();
+        if (reader_lease_status.failed()) return reader_lease_status;
+        read_pipeline_t reader {volume_->disk(), std::move(reader_lease), extent_.medium};
         status_t first;
         auto adapter = [&](completed_buffer_t const& completed) noexcept {
             pending_read_t const& piece = pending[completed.tag % depth];
@@ -1747,7 +1770,9 @@ class lsm_sorted_run {
         extent_t const piece = extent_.slice(0, head_bytes);
         if (piece.length != head_bytes) return {status_code_t::malformed_k, "The run is shorter than its header"};
 
-        read_pipeline_t reader {volume_->disk(), channel, extent_.medium};
+        auto [reader_lease, reader_lease_status] = channel.lease();
+        if (reader_lease_status.failed()) return reader_lease_status;
+        read_pipeline_t reader {volume_->disk(), std::move(reader_lease), extent_.medium};
         if (status_t const offered = reader.enqueue_read(piece, 0); offered.failed()) return offered;
         if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
 
@@ -1791,7 +1816,8 @@ class lsm_sorted_run {
      *  makes a truncated run, refusing a tree its header or its cells disagree with. */
     status_t read_index_(io_channel_t& channel) noexcept {
         std::uint64_t const count = header_.key_slots_count;
-        if (status_t const cells = read_cells_(channel); cells.failed()) return cells;
+        if constexpr (keeps_cells_k)
+            if (status_t const cells = read_cells_(channel); cells.failed()) return cells;
         if (tree_words_.resize(static_cast<std::size_t>(sorted_run_layout_t::keys_section_bytes(count) /
                                                         sizeof(std::uint64_t))) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A run could not hold the tree of its keys"};
@@ -1802,10 +1828,11 @@ class lsm_sorted_run {
         st::expected<keys_view_t> const tree = keys_view_t::make(
             std::as_bytes(std::span<std::uint64_t const> {tree_words_}));
         if (!tree || tree->size() != count) return {status_code_t::malformed_k, "A run's tree disagrees with it"};
-        for (std::uint64_t position = 0; position != count; ++position)
-            if (!(tree->select(static_cast<std::size_t>(position)) ==
-                  cells_[static_cast<std::size_t>(position)].stored_key))
-                return {status_code_t::malformed_k, "A run's tree disagrees with its cells"};
+        if constexpr (keeps_cells_k)
+            for (std::uint64_t position = 0; position != count; ++position)
+                if (!(tree->select(static_cast<std::size_t>(position)) ==
+                      cells_[static_cast<std::size_t>(position)].stored_key))
+                    return {status_code_t::malformed_k, "A run's tree disagrees with its cells"};
         tree_ = *tree;
         return {};
     }
@@ -1860,7 +1887,9 @@ class lsm_sorted_run {
         std::uint64_t const section = into.size();
         std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
         if (block == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
-        read_pipeline_t reader {volume_->disk(), channel, extent_.medium};
+        auto [reader_lease, reader_lease_status] = channel.lease();
+        if (reader_lease_status.failed()) return reader_lease_status;
+        read_pipeline_t reader {volume_->disk(), std::move(reader_lease), extent_.medium};
         status_t moved;
         auto sink = [&](completed_buffer_t const& completed) noexcept {
             if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
@@ -2086,7 +2115,7 @@ class lsm_sorted_run {
     /** The header of the run, from which every offset inside the extent follows. */
     sorted_run_header_t header_ {};
 
-    /** The cells in sorted order, read whole at open and owned for the life of the run. */
+    /** The sorted cells, read whole at open for a run whose cells carry values, none otherwise. */
     st::vector<key_slot_t> cells_;
 
     /** One offset per key slot into the values section and one past the last, read whole at open, none for a run

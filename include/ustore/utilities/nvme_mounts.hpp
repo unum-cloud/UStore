@@ -28,6 +28,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
+#include <cstring> // `std::memcpy`
 
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::shared_ptr`, `std::make_shared`
@@ -42,6 +43,7 @@
 #include "ustore/utilities/nvme_channels.hpp" // `basic_io_channel_pool`, `io_channel_config_t`, `registered_memory_arena`
 #include "ustore/utilities/nvme_disks.hpp"    // `blocking_files_disk`, `memory_disk`
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
+#include "ustore/utilities/nvme_linux_spdk_disk.hpp"  // `linux_spdk_disk`, `linux_spdk_environment`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
 #include "ustore/utilities/nvme_ring.hpp"             // `queue_pair_t`, `request_t`, `completion_t`, `ring_concept`
 #include "ustore/utilities/nvme_volume.hpp"           // `any_volume`, `data_address_t`, `parse_data_address`
@@ -87,7 +89,8 @@ enum class io_transport_t : std::uint8_t {
      *  without a ring. */
     linux_aio_k,
 
-    /** SPDK's user-space driver, which no mount opens yet. */
+    /** SPDK's user-space driver over the namespaces of one controller, which @c spdk:// data
+     *  directories name and a build without SPDK refuses. */
     linux_spdk_k,
 
     /** Host memory, which a suite and a benchmark ask for and a database never does. */
@@ -154,7 +157,8 @@ inline expected<volume_addresses_t> addresses_of(resources_config_t const& confi
         auto [address, address_status] = parse_data_address(std::string_view {directory.path});
         if (address_status.failed()) return address_status;
         address.byte_limit = address.byte_limit != 0 ? address.byte_limit : directory.max_size;
-        if (address.location == first.location && address.byte_base == first.byte_base) {
+        if (address.location == first.location && address.namespace_id == first.namespace_id &&
+            address.byte_base == first.byte_base) {
             addresses.data_directories[0].byte_limit = address.byte_limit;
             continue;
         }
@@ -189,11 +193,11 @@ inline void raise_open_files_limit() noexcept {
 #pragma region Disk
 
 /**
- *  @brief The ring of a database on files: the blocking floor, AIO or io_uring, as
- *      the mount probed.
+ *  @brief The ring of a database on files or drives: the blocking floor, AIO or io_uring, as the
+ *      mount probed, or SPDK, as the data directories named.
  *
- *  The io_uring and AIO alternatives exist on every platform, as stubs that refuse off Linux, so
- *  the type is portable and only the mount's probe decides which alternative is built.
+ *  The io_uring, AIO and SPDK alternatives exist on every platform, as stubs that refuse where
+ *  they cannot run, so the type is portable and only the mount decides which alternative is built.
  *
  *  @tparam atomic_reference_ The reference every alternative owns its shared words through.
  *  @tparam waiter_type_ What a draining core does after a poll that moved nothing.
@@ -211,6 +215,9 @@ class any_files_disk {
     /** The Linux AIO transport. */
     using linux_aio_disk_t = linux_aio_files_disk<atomic_reference_, waiter_type_>;
 
+    /** The SPDK transport, over the namespaces of one controller. */
+    using linux_spdk_disk_t = linux_spdk_disk<atomic_reference_, waiter_type_>;
+
     /** Takes the blocking transport in, which a mount builds where the probe refused a ring. */
     explicit any_files_disk(blocking_disk_t&& disk) noexcept
         : held_(std::in_place_type<blocking_disk_t>, std::move(disk)) {}
@@ -224,6 +231,10 @@ class any_files_disk {
     explicit any_files_disk(linux_aio_disk_t&& disk) noexcept
         : held_(std::in_place_type<linux_aio_disk_t>, std::move(disk)) {}
 
+    /** Takes the SPDK transport in, which a mount builds for @c spdk:// data directories. */
+    explicit any_files_disk(linux_spdk_disk_t&& disk) noexcept
+        : held_(std::in_place_type<linux_spdk_disk_t>, std::move(disk)) {}
+
     any_files_disk(any_files_disk const&) = delete;
     any_files_disk& operator=(any_files_disk const&) = delete;
     any_files_disk(any_files_disk&&) noexcept = default;
@@ -233,6 +244,7 @@ class any_files_disk {
     [[nodiscard]] io_transport_t transport() const noexcept {
         if (std::holds_alternative<linux_uring_disk_t>(held_)) return io_transport_t::linux_uring_k;
         if (std::holds_alternative<linux_aio_disk_t>(held_)) return io_transport_t::linux_aio_k;
+        if (std::holds_alternative<linux_spdk_disk_t>(held_)) return io_transport_t::linux_spdk_k;
         return io_transport_t::blocking_k;
     }
 
@@ -319,12 +331,17 @@ class any_files_disk {
         return std::visit([&](auto& disk) noexcept { return disk.drain(queue_pair); }, held_);
     }
 
+    /** Gives back what the held transport shares with the process, which only SPDK does. */
+    void release() noexcept {
+        if (linux_spdk_disk_t* const spdk = std::get_if<linux_spdk_disk_t>(&held_)) spdk->release();
+    }
+
 #pragma endregion Ring
 
   private:
 
     /** The transport the probe chose, fixed for the life of the mount. */
-    std::variant<blocking_disk_t, linux_uring_disk_t, linux_aio_disk_t> held_;
+    std::variant<blocking_disk_t, linux_uring_disk_t, linux_aio_disk_t, linux_spdk_disk_t> held_;
 };
 
 #pragma endregion Disk
@@ -465,8 +482,8 @@ class basic_storage_mount {
         return {};
     }
 
-    /** Drains and releases the channels, unpins the arena, and closes every medium
-     *  of the volume. */
+    /** Drains and releases the channels, unpins the arena, closes every medium of the volume,
+     *  and gives back what the transport shares with the process. */
     status_t unmount() noexcept {
         status_t first;
         if (status_t const drained = channels_.release_all(); drained.failed() && first.succeeded()) first = drained;
@@ -478,6 +495,7 @@ class basic_storage_mount {
         arena_ = arena_t {};
 
         if (status_t const closed = volume_.unmount(); closed.failed() && first.succeeded()) first = closed;
+        if constexpr (requires { disk_.release(); }) disk_.release();
         return first;
     }
 
@@ -524,9 +542,9 @@ class basic_storage_mount {
  *
  *  The probe runs once and the alternative it picked is emplaced in place, so the dispatch a
  *  caller pays is one @c visit per operation rather than one virtual call per request. A mount on
- *  files holds whichever of the three file transports the probe settled on, so a database
- *  materializes over one disk type; SPDK is named by the configuration and refused here until its
- *  disk is ported.
+ *  files holds whichever of the three file transports the probe settled on, and a mount on
+ *  @c spdk:// data directories holds the SPDK disk of their one controller, so a database
+ *  materializes over one disk type.
  *
  *  @tparam atomic_reference_ The reference every transport, budget and channel owns
  *      its words through.
@@ -569,10 +587,24 @@ class mounted_storage {
         if (mounted()) return {status_code_t::already_exists_k, "This database has already mounted its storage"};
 
         report_ = mount_report_t {};
+        auto [addresses, addresses_status] = addresses_of(config);
+        if (addresses_status.failed()) return addresses_status;
+        bool const on_spdk = addresses.data_directories[0].kind == data_address_kind_t::spdk_k;
+        for (data_address_t const& address : addresses.data_directories)
+            if ((address.kind == data_address_kind_t::spdk_k) != on_spdk ||
+                (on_spdk && address.location != addresses.data_directories[0].location))
+                return {status_code_t::invalid_argument_k,
+                        "SPDK data directories name one controller and nothing else"};
+        if (on_spdk != (config.io_transport == io_transport_t::linux_spdk_k) &&
+            config.io_transport != io_transport_t::automatic_k)
+            return {status_code_t::invalid_argument_k,
+                    "SPDK and spdk:// data directories are taken together or not at all"};
+
         report_.linux_uring = files_disk_t::linux_uring_disk_t::probe();
         report_.linux_aio = files_disk_t::linux_aio_disk_t::probe();
-        auto [transport, transport_status] = probed_transport(config.io_transport, report_.linux_uring,
-                                                              report_.linux_aio);
+        auto [transport, transport_status] = on_spdk ? expected<io_transport_t> {io_transport_t::linux_spdk_k}
+                                                     : probed_transport(config.io_transport, report_.linux_uring,
+                                                                        report_.linux_aio);
         if (transport_status.failed()) return transport_status;
         report_.transport = transport;
 
@@ -596,7 +628,7 @@ class mounted_storage {
         case io_transport_t::linux_uring_k: return mount_linux_uring_(config, constraint, threads, owners, targets);
         case io_transport_t::linux_aio_k: return mount_linux_aio_(config, constraint, threads, owners, targets);
         case io_transport_t::linux_spdk_k:
-            return {status_code_t::unsupported_k, "The SPDK transport is not mounted by this build"};
+            return mount_linux_spdk_(config, constraint, threads, owners, addresses.data_directories[0].location);
         case io_transport_t::automatic_k: return {status_code_t::internal_k, "The probe left the transport unresolved"};
         }
         return {status_code_t::invalid_argument_k, "The configuration names no I/O transport"};
@@ -686,6 +718,44 @@ class mounted_storage {
         auto [disk, make_disk_status] = files_disk_t::linux_aio_disk_t::make(contexts);
         if (make_disk_status.failed()) return make_disk_status;
         return adopt_<files_disk_t>(files_disk_t {std::move(disk)}, config, constraint, threads, targets);
+    }
+
+    /**
+     *  @brief Mounts SPDK on the controller at @p controller, sharing the process's connection
+     *      to it, with @p owners queue pairs of its own.
+     *  @note The probe reads files alone and runs first, since the environment it guards calls
+     *      @c exit on the process when the machine is not ready for it.
+     */
+    status_t mount_linux_spdk_(resources_config_t const& config, constraint_t& constraint, std::size_t threads,
+                               std::uint16_t owners, std::string_view controller) noexcept {
+        using linux_spdk_disk_t = typename files_disk_t::linux_spdk_disk_t;
+        using environment_t = linux_spdk_environment<atomic_reference_, waiter_type_>;
+        char address[path_max_bytes_k];
+        if (controller.size() >= sizeof(address))
+            return {status_code_t::invalid_argument_k, "An SPDK controller's address is too long"};
+        std::memcpy(address, controller.data(), controller.size());
+        address[controller.size()] = '\0';
+        switch (environment_t::probe(address)) {
+        case linux_spdk_probe_t::available_k: break;
+        case linux_spdk_probe_t::without_hugepages_k:
+            return {status_code_t::unsupported_k, "The SPDK controller needs free hugepages"};
+        case linux_spdk_probe_t::without_permission_k:
+            return {status_code_t::unsupported_k, "The SPDK controller is not bound to a user-space driver"};
+        case linux_spdk_probe_t::not_found_k: return {status_code_t::not_found_k, "No SPDK controller at that address"};
+        }
+        linux_spdk_environment_config_t pages;
+        pages.memory = spdk_transport_named(address) == linux_spdk_transport_t::fabric_k
+                           ? linux_spdk_memory_t::plain_pages_k
+                           : linux_spdk_memory_t::hugepages_k;
+        auto [environment, environment_status] = environment_t::acquire(pages);
+        if (environment_status.failed()) return environment_status;
+        linux_spdk_disk_config_t ring;
+        ring.queue_pairs_limit = owners;
+        ring.depth_limit = config.channels.depth;
+        ring.registered_memory_limit = 1;
+        auto [disk, open_status] = linux_spdk_disk_t::open(std::move(environment), address, ring);
+        if (open_status.failed()) return open_status;
+        return adopt_<files_disk_t>(files_disk_t {std::move(disk)}, config, constraint, threads, 0);
     }
 
     /** @p wanted as the 16-bit count a ring names things by, or zero when @p reserved

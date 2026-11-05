@@ -52,7 +52,7 @@ using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
 
 using linux_spdk_disk_t = linux_spdk_disk<atomic_reference, waiter_t>;
-using linux_spdk_environment_t = linux_spdk_environment<atomic_reference>;
+using linux_spdk_environment_t = linux_spdk_environment<atomic_reference, waiter_t>;
 
 #pragma region Fixtures
 
@@ -354,7 +354,8 @@ class linux_spdk_rig_t {
     return failures;
 }
 
-/** What the disk reports is the namespace's sector, the queue pair shape the mount asked for, and one target. */
+/** What the disk reports is the namespace's sector, the queue pair shape the mount asked for,
+ *  and sixteen targets. */
 [[nodiscard]] std::size_t spdk_reports_the_namespace(linux_spdk_disk_t& disk) {
     std::size_t failures = 0;
     ring_capabilities_t const limits = disk.capabilities();
@@ -366,8 +367,61 @@ class linux_spdk_rig_t {
     failures += expect(limits.max_transfer_bytes >= block_bytes_k);
     failures += expect_eq(limits.depth_limit, queue_pair_depth_k);
     failures += expect(limits.queue_pairs_limit >= 1 && limits.queue_pairs_limit <= spdk_queue_pairs_k);
-    failures += expect_eq(limits.media_limit, std::uint16_t {1});
+    failures += expect_eq(limits.media_limit, std::uint16_t {16});
     failures += expect(!limits.reaches_gpu_memory);
+    return failures;
+}
+
+/** A second disk on @p address shares the process's connection, and a namespace one disk
+ *  registered is refused to the other until it is given back. */
+[[nodiscard]] std::size_t spdk_shares_the_controller(linux_spdk_disk_t& disk,
+                                                     linux_spdk_environment_t const& environment, char const* address,
+                                                     linux_spdk_disk_config_t const& config) {
+    std::size_t failures = 0;
+    expected<linux_spdk_disk_t> second = linux_spdk_disk_t::open(environment, address, config);
+    failures += expect_status(second, status_code_t::success_k);
+    if (!second) return failures;
+    expected<registered_medium_t> held = disk.register_medium(volume_request("1"));
+    failures += expect(held.has_value());
+    if (held) {
+        failures += expect_status(second->register_medium(volume_request("1")), status_code_t::contended_k);
+        failures += expect(disk.unregister_medium(*held).succeeded());
+        expected<registered_medium_t> taken = second->register_medium(volume_request("1"));
+        failures += expect(taken.has_value());
+        if (taken) failures += expect(second->unregister_medium(*taken).succeeded());
+    }
+    second->release();
+    return failures;
+}
+
+/** Connections the process holds, read while no other thread opens or closes one. */
+[[nodiscard]] std::size_t spdk_connections() noexcept {
+    std::size_t live = 0;
+    for (linux_spdk_attachment_t const& record : linux_spdk_process().attachments.records())
+        live += record.holders != 0;
+    return live;
+}
+
+/** Releasing the last disk on @p address detaches its controller, and a fresh open in the same
+ *  process connects it again and serves its namespace. */
+[[nodiscard]] std::size_t spdk_reconnects_after_release(linux_spdk_disk_t& disk,
+                                                        linux_spdk_environment_t const& environment,
+                                                        char const* address, linux_spdk_disk_config_t const& config,
+                                                        std::string_view serial) {
+    std::size_t failures = 0;
+    failures += expect_eq(spdk_connections(), std::size_t {1});
+    disk.release();
+    failures += expect_eq(spdk_connections(), std::size_t {0});
+    expected<linux_spdk_disk_t> fresh = linux_spdk_disk_t::open(environment, address, config);
+    failures += expect_status(fresh, status_code_t::success_k);
+    if (!fresh) return failures;
+    failures += expect_eq(spdk_connections(), std::size_t {1});
+    if (!serial.empty()) failures += expect(std::string_view {fresh->identity().serial} == serial);
+    expected<registered_medium_t> registered = fresh->register_medium(volume_request("1"));
+    failures += expect(registered.has_value());
+    if (registered) failures += expect(fresh->unregister_medium(*registered).succeeded());
+    fresh->release();
+    failures += expect_eq(spdk_connections(), std::size_t {0});
     return failures;
 }
 
@@ -388,7 +442,7 @@ void spdk_transport(suite_totals_t& totals, char const* address, std::string_vie
     report(totals, "linux-spdk.namespace", spdk_reports_the_namespace, *disk);
 
     std::size_t volume_failures = 0;
-    expected<registered_medium_t> registered = disk->register_medium(volume_request("namespace"));
+    expected<registered_medium_t> registered = disk->register_medium(volume_request("1"));
     volume_failures += expect(registered.has_value());
     if (registered) {
         registered_medium_t descriptor = std::move(*registered);
@@ -399,10 +453,15 @@ void spdk_transport(suite_totals_t& totals, char const* address, std::string_vie
     }
     report(totals, "linux-spdk.volume", volume_failures);
 
-    report(totals, "linux-spdk.target_in_flight", ring_holds_a_target_in_flight<linux_spdk_disk_t>, *disk,
-           volume_request("namespace"));
+    report(totals, "linux-spdk.medium_in_flight", ring_holds_a_medium_in_flight<linux_spdk_disk_t>, *disk,
+           volume_request("1"));
     report(totals, "linux-spdk.keeps_what_it_flushed", ring_keeps_what_it_flushed<linux_spdk_disk_t>, *disk,
-           volume_request("namespace"));
+           volume_request("1"));
+    report(totals, "linux-spdk.shares_the_controller", spdk_shares_the_controller, *disk, *environment, address,
+           config);
+    report(totals, "linux-spdk.reconnects_after_release", spdk_reconnects_after_release, *disk, *environment, address,
+           config, serial);
+    disk->release();
 }
 
 /** Runs the transport where the flags name a target, starting one through the rig when asked to. */

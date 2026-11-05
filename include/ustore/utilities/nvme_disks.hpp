@@ -54,8 +54,8 @@
 #include <span>     // `std::span`
 #include <utility>  // `std::move`
 
-#include <smashtable/basic_slot_pool.hpp> // `st::basic_slot_pool`
-#include <smashtable/basic_vector.hpp>    // `st::vector`
+#include <smashtable/basic_fixed_pool.hpp> // `st::basic_fixed_pool`
+#include <smashtable/basic_vector.hpp>     // `st::vector`
 
 #include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`, `is_address_aligned`
 #include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`, `constrained_allocator`, `resource_constraint`
@@ -462,9 +462,9 @@ class basic_disk {
     /** The allocator every pool of the disk is charged through. */
     using allocator_t = constrained_allocator<byte_t, atomic_reference_>;
 
-    using queue_pair_pool_t = st::basic_slot_pool<queue_pair_record_t, std::uint16_t, allocator_t>;
-    using registered_memory_pool_t = st::basic_slot_pool<registered_memory_record_t, std::uint16_t, allocator_t>;
-    using registered_medium_pool_t = st::basic_slot_pool<registered_medium_record_t, std::uint16_t, allocator_t>;
+    using queue_pair_pool_t = st::basic_fixed_pool<queue_pair_record_t, std::uint16_t, allocator_t>;
+    using registered_memory_pool_t = st::basic_fixed_pool<registered_memory_record_t, std::uint16_t, allocator_t>;
+    using registered_medium_pool_t = st::basic_fixed_pool<registered_medium_record_t, std::uint16_t, allocator_t>;
 
     basic_disk(device_type_&& device, disk_config_t const& config) noexcept
         : device_(std::move(device)), depth_limit_(config.depth_limit) {}
@@ -491,9 +491,9 @@ class basic_disk {
      *  and vacate there. */
     template <typename pool_type_>
     static std::uint16_t take_(pool_type_& pool, std::int32_t& claim) noexcept {
-        lock_(claim);
+        lock_claim<atomic_reference_, waiter_type_>(claim);
         std::uint16_t const index = pool.take();
-        unlock_(claim);
+        unlock_claim<atomic_reference_>(claim);
         return index;
     }
 
@@ -501,22 +501,9 @@ class basic_disk {
      *  handles go stale. */
     template <typename pool_type_>
     static void vacate_(pool_type_& pool, std::int32_t& claim, std::uint16_t index) noexcept {
-        lock_(claim);
+        lock_claim<atomic_reference_, waiter_type_>(claim);
         pool.vacate(index);
-        unlock_(claim);
-    }
-
-    static void lock_(std::int32_t& claim) noexcept {
-        atomic_reference_<std::int32_t> const word {claim};
-        std::int32_t expected_free = 0;
-        while (!word.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-            waiter_type_ {}(&claim, expected_free, std::size_t {0});
-            expected_free = 0;
-        }
-    }
-
-    static void unlock_(std::int32_t& claim) noexcept {
-        atomic_reference_<std::int32_t> {claim}.store(0, std::memory_order_release);
+        unlock_claim<atomic_reference_>(claim);
     }
 
     /** The handle a caller holds for record @p index of @p pool. */
