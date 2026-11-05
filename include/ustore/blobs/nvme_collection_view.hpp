@@ -118,10 +118,25 @@ class collection_view {
         return false;
     }
 
-    /** Whether a commit newer than @p from wrote @p stored_key, which only the key's newest version decides. */
+    /** The newest stamp at or below @p at of a range tombstone of any run hiding
+     *  @p stored_key, or @c unwritten_stamp_k for none; a version stamped below it is removed
+     *  for a reader at @p at. */
+    [[nodiscard]] transaction_stamp_t covering_stamp(stored_key_t const& stored_key,
+                                                     transaction_stamp_t at) const noexcept {
+        transaction_stamp_t covering = unwritten_stamp_k;
+        for (run_t const* run : runs_) {
+            transaction_stamp_t const stamp = run->range_tombstones().covering_stamp(stored_key, at);
+            if (stamp > covering) covering = stamp;
+        }
+        return covering;
+    }
+
+    /** Whether a commit newer than @p from wrote @p stored_key, which only the key's newest version
+     *  decides, or removed a range holding it. */
     [[nodiscard]] bool written_since(stored_key_t const& stored_key, transaction_stamp_t from) const noexcept {
         for (run_t const* run : runs_) {
             if (run->newest_stamp() <= from) return false;
+            if (removed_since_(*run, stored_key, stored_key, from)) return true;
             std::size_t const position = run->lower_bound(stored_key);
             if (position != run->size() && run->stored_key(position) == stored_key) return run->stamp(position) > from;
         }
@@ -135,6 +150,7 @@ class collection_view {
         if (upper < lower) return false;
         for (run_t const* run : runs_) {
             if (run->newest_stamp() <= from) return false;
+            if (removed_since_(*run, lower, upper, from)) return true;
             for (std::size_t position = run->lower_bound(lower);
                  position != run->size() && !(upper < run->stored_key(position)); ++position)
                 if (run->stamp(position) > from) return true;
@@ -144,6 +160,12 @@ class collection_view {
 
   private:
     explicit collection_view(typename runs_t::allocator_t allocator) noexcept : runs_(std::move(allocator)) {}
+
+    /** Whether a tombstone of @p run newer than @p from hides a key in [ @p lower, @p upper ]. */
+    [[nodiscard]] static bool removed_since_(run_t const& run, stored_key_t const& lower, stored_key_t const& upper,
+                                             transaction_stamp_t from) noexcept {
+        return run.range_tombstones().overlaps_since(lower, upper, from);
+    }
     explicit collection_view(runs_t&& runs) noexcept : runs_(std::move(runs)) {}
 
     /** The runs, newest first, borrowed from the collection, which frees them only once no reader can reach them. */

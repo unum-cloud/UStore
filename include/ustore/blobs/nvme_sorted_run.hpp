@@ -25,15 +25,21 @@
  *
  *  @code{.c}
  *  struct sorted_run {                       // every section starts on a 4096-byte boundary
- *      sorted_run_header_t header;           // 112 bytes, format_version = 1, branching = keys per tree row
+ *      sorted_run_header_t header;           // 120 bytes, format_version = 1, branching = keys per tree row
  *      key_slot cells[n];                    // sorted order, inline values only
  *      splus_tree keys;                      // saved immutable_splus_tree<stored key> over n keys
  *      u32 value_offsets[n + 1];             // variable width only; [0] = 0, [n] = stored_values_bytes
  *      byte_t values[stored_values_bytes];   // sorted order, fixed-width ones found by stride
  *      byte_t stamps[stamps_bytes];          // trailer: the saved stamps column
  *      byte_t kinds[kinds_bytes];            // and the saved kinds column right after it
+ *      range_tombstone ranges[t];            // t = range_tombstones_count, ascending by start
+ *      u64 range_stamps[t];                  // the raw stamp of each, never raised to the floor
  *  };
  *  @endcode
+ *
+ *  A range tombstone hides every key from its start up to its exclusive end for versions older than
+ *  it, and the run's key bounds cover its tombstones, so a level's runs stay disjoint and a merge
+ *  picks every run they reach.
  *
  *  A run of strings files every key under its 16-byte head, its leading 15 bytes and its length,
  *  and searches the heads as an S+ tree saved in the run. Keys are kept whole on an Arrow tape, and
@@ -43,7 +49,7 @@
  *
  *  @code{.c}
  *  struct strings_run {                      // every section starts on a 4096-byte boundary
- *      sorted_run_header_t header;           // 112 bytes, key_tape_bytes and layers_bytes size the rest
+ *      sorted_run_header_t header;           // 120 bytes, key_tape_bytes and layers_bytes size the rest
  *      splus_tree heads;                     // saved immutable_splus_tree<key128_t> over n heads
  *      uuid_t values[n];                     // Arrow fixed_size_binary(16), in sorted order
  *      u32 key_offsets[n + 1];               // Arrow string column of the whole keys
@@ -53,6 +59,9 @@
  *      head_layers_header_t layers_header;   // the layers, layers_bytes in all
  *      head_layer_t layers[layers_count];    // by first position, then by depth
  *      splus_tree layer_heads[layers_count]; // each word-aligned, where its layer names
+ *      u64 range_stamps[t];                  // t = range_tombstones_count, ascending by start
+ *      u32 range_offsets[2 * t + 1];         // tombstone i spans [2i, 2i + 1) and [2i + 1, 2i + 2) of the tape
+ *      char range_tape[];                    // start and end strings, an empty end reaching past the last string
  *  };
  *  @endcode
  *
@@ -163,14 +172,23 @@ struct sorted_run_header_t {
 
     /** The collection that wrote the run, so a run found without a manifest goes back to it. */
     uuid_t collection;
+
+    /** Range tombstones the section at the end of the run holds. */
+    std::uint32_t range_tombstones_count = 0;
+
+    /** Bytes that section takes, before its alignment padding. */
+    std::uint32_t range_tombstones_bytes = 0;
 };
 
 #pragma pack(pop)
 
-static_assert(sizeof(sorted_run_header_t) == 112, "A run's header is 112 packed bytes");
+static_assert(sizeof(sorted_run_header_t) == 120, "A run's header is 120 packed bytes");
 static_assert(offsetof(sorted_run_header_t, key_slots_count) == 16 && offsetof(sorted_run_header_t, content_id) == 40 &&
                   offsetof(sorted_run_header_t, key_tape_bytes) == 88 &&
-                  offsetof(sorted_run_header_t, layers_bytes) == 92 && offsetof(sorted_run_header_t, collection) == 96,
+                  offsetof(sorted_run_header_t, layers_bytes) == 92 &&
+                  offsetof(sorted_run_header_t, collection) == 96 &&
+                  offsetof(sorted_run_header_t, range_tombstones_count) == 112 &&
+                  offsetof(sorted_run_header_t, range_tombstones_bytes) == 116,
               "A run's header keeps its field offsets");
 
 /** Where one key slot's value sits inside its volume, as an unbuffered read has to ask for it. */
@@ -305,6 +323,9 @@ struct sorted_run_reservation_t {
 
     /** The saved S+ tree of a run of fixed-width keys. */
     st::vector<std::uint64_t> keys;
+
+    /** The range tombstones section, laid out as written, none for a run without any. */
+    st::vector<byte_t> range_tombstones;
 };
 
 #pragma endregion Vocabulary
@@ -420,7 +441,8 @@ class sorted_run_layout {
         return round_up_to_multiple(stamps_bytes + kinds_bytes, portable_alignment_k);
     }
 
-    /** Bytes the whole run occupies, which is the length its extent is allocated with. */
+    /** Bytes the whole run occupies but its range tombstones, which is the length the extent of a
+     *  run of none is allocated with. */
     [[nodiscard]] static constexpr std::uint64_t blob_bytes(std::uint64_t key_slots_count,
                                                             std::uint64_t stored_values_bytes,
                                                             std::uint64_t stamps_bytes,
@@ -428,9 +450,22 @@ class sorted_run_layout {
         return stamps_offset(key_slots_count, stored_values_bytes) + trailer_bytes(stamps_bytes, kinds_bytes);
     }
 
-    /** Bytes the whole run @p header opens occupies, which a walk over raw slots steps by. */
-    [[nodiscard]] static constexpr std::uint64_t blob_bytes(sorted_run_header_t const& header) noexcept {
+    /** Bytes @p count range tombstones take after the trailer, their bounds and then their stamps,
+     *  before the section's padding. */
+    [[nodiscard]] static constexpr std::uint64_t range_tombstones_bytes(std::uint64_t count) noexcept {
+        return count * (sizeof(range_tombstone<typename key_slot_t::stored_key_t>) + sizeof(std::uint64_t));
+    }
+
+    /** First byte of the range tombstones of the run @p header opens, right after its trailer. */
+    [[nodiscard]] static constexpr std::uint64_t range_tombstones_offset(sorted_run_header_t const& header) noexcept {
         return blob_bytes(header.key_slots_count, header.stored_values_bytes, header.stamps_bytes, header.kinds_bytes);
+    }
+
+    /** Bytes the whole run @p header opens occupies, its range tombstones included, which a walk
+     *  over raw slots steps by. */
+    [[nodiscard]] static constexpr std::uint64_t blob_bytes(sorted_run_header_t const& header) noexcept {
+        return range_tombstones_offset(header) +
+               round_up_to_multiple(header.range_tombstones_bytes, portable_alignment_k);
     }
 };
 
@@ -508,10 +543,17 @@ class strings_run_layout {
                round_up_to_multiple(layers_bytes, portable_alignment_k);
     }
 
-    /** Bytes the whole run @p header opens occupies, which a walk over raw slots steps by. */
-    [[nodiscard]] static constexpr std::uint64_t blob_bytes(sorted_run_header_t const& header) noexcept {
+    /** First byte of the range tombstones of the run @p header opens, right after its layers. */
+    [[nodiscard]] static constexpr std::uint64_t range_tombstones_offset(sorted_run_header_t const& header) noexcept {
         return blob_bytes(header.key_slots_count, header.key_tape_bytes, header.stamps_bytes, header.kinds_bytes,
                           header.layers_bytes);
+    }
+
+    /** Bytes the whole run @p header opens occupies, its range tombstones included, which a walk
+     *  over raw slots steps by. */
+    [[nodiscard]] static constexpr std::uint64_t blob_bytes(sorted_run_header_t const& header) noexcept {
+        return range_tombstones_offset(header) +
+               round_up_to_multiple(header.range_tombstones_bytes, portable_alignment_k);
     }
 };
 
@@ -576,6 +618,11 @@ class lsm_sorted_run {
     /** The key the run orders its key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
 
+    /** The range tombstones the run carries at its end, over whole strings for a run of strings. */
+    using range_tombstones_t =
+        std::conditional_t<tailed_key_slot_concept<key_slot_t>, blobs::range_tombstones<std::string_view>,
+                           blobs::range_tombstones<stored_key_t>>;
+
     /** The transport the volume moves bytes through. */
     using disk_t = std::remove_reference_t<decltype(std::declval<volume_type_&>().disk())>;
 
@@ -628,7 +675,8 @@ class lsm_sorted_run {
           stamps_(std::move(other.stamps_)), kinds_(std::move(other.kinds_)), tree_words_(std::move(other.tree_words_)),
           tree_(std::exchange(other.tree_, keys_view_t {})), values_(std::move(other.values_)),
           key_offsets_(std::move(other.key_offsets_)), keys_(std::move(other.keys_)), layers_(std::move(other.layers_)),
-          layer_words_(std::move(other.layer_words_)), assigned_stamp_(std::exchange(other.assigned_stamp_, 0)) {
+          layer_words_(std::move(other.layer_words_)), assigned_stamp_(std::exchange(other.assigned_stamp_, 0)),
+          range_tombstones_(std::move(other.range_tombstones_)) {
         other.extent_ = medium_extent_t {};
         other.header_ = sorted_run_header_t {};
     }
@@ -650,6 +698,7 @@ class lsm_sorted_run {
         layers_ = std::move(other.layers_);
         layer_words_ = std::move(other.layer_words_);
         assigned_stamp_ = std::exchange(other.assigned_stamp_, 0);
+        range_tombstones_ = std::move(other.range_tombstones_);
         other.extent_ = medium_extent_t {};
         other.header_ = sorted_run_header_t {};
         return *this;
@@ -698,6 +747,7 @@ class lsm_sorted_run {
      *      of a fixed-width run, kept for a reader.
      *  @param[in] tails The tails of the keys the key slots' heads cut short, in the same order, which key slots of
      *      one head order by; none for a run of whole keys.
+     *  @param[in] tombstones The range tombstones the run carries, none for a run of strings.
      *  @return The run, opened again from the volume, or the status that stopped the write with its
      *      extent given back.
      */
@@ -706,10 +756,11 @@ class lsm_sorted_run {
                                           std::span<std::uint64_t const> stamps, std::span<std::uint8_t const> kinds,
                                           std::uint64_t floor, std::span<byte_t const> stored_values,
                                           std::span<stored_value_offset_t const> value_offsets,
-                                          stored_value_size_t value_max_size,
-                                          key_tails_column_t const& tails = {}) noexcept {
+                                          stored_value_size_t value_max_size, key_tails_column_t const& tails = {},
+                                          range_tombstones_t const& tombstones = range_tombstones_t {}) noexcept {
         auto [reservation, reserve_status] = reserve(volume, channel, collection, content_id, key_slots, stamps, kinds,
-                                                     floor, stored_values, value_offsets, value_max_size, tails);
+                                                     floor, stored_values, value_offsets, value_max_size, tails,
+                                                     tombstones);
         if (reserve_status.failed()) return reserve_status;
         status_t const written = write_sections(volume, channel, reservation, key_slots, stored_values, value_offsets);
         expected<lsm_sorted_run> opened = written.failed() ? expected<lsm_sorted_run> {written}
@@ -729,7 +780,7 @@ class lsm_sorted_run {
         std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
         std::span<std::uint8_t const> kinds, std::uint64_t floor, std::span<byte_t const> stored_values,
         std::span<stored_value_offset_t const> value_offsets, stored_value_size_t value_max_size,
-        key_tails_column_t const& tails = {}) noexcept {
+        key_tails_column_t const& tails = {}, range_tombstones_t const& tombstones = range_tombstones_t {}) noexcept {
         if (!content_id.is_valid())
             return status_t {status_code_t::invalid_argument_k, "A run is named by a valid identifier"};
         if (status_t const checked = check_values_(stored_values, value_offsets, key_slots.size(), value_max_size);
@@ -772,6 +823,12 @@ class lsm_sorted_run {
         header.newest_stamp = newest;
         header.kinds_bytes = reservation.kinds.saved_bytes();
         header.collection = collection;
+        if (status_t const laid = lay_out_range_tombstones(tombstones, reservation.range_tombstones); laid.failed())
+            return laid;
+        if (reservation.range_tombstones.size() > std::numeric_limits<std::uint32_t>::max())
+            return status_t {status_code_t::capacity_exhausted_k, "A run's range tombstones outgrow its header"};
+        header.range_tombstones_count = static_cast<std::uint32_t>(tombstones.size());
+        header.range_tombstones_bytes = static_cast<std::uint32_t>(reservation.range_tombstones.size());
 
         std::uint64_t reserved_bytes = 0;
         if constexpr (tailed_k) {
@@ -837,6 +894,10 @@ class lsm_sorted_run {
             if (status_t const trailer = write_trailer(writer, extent, header, reservation.stamps, reservation.kinds);
                 trailer.failed())
                 return trailer;
+            if (status_t const ranges = write_range_tombstones(writer, extent, header,
+                                                               std::span<byte_t const> {reservation.range_tombstones});
+                ranges.failed())
+                return ranges;
             return writer.poll_all_completions();
         }
 
@@ -855,6 +916,10 @@ class lsm_sorted_run {
         if (status_t const trailer = write_trailer(writer, extent, header, reservation.stamps, reservation.kinds);
             trailer.failed())
             return trailer;
+        if (status_t const ranges = write_range_tombstones(writer, extent, header,
+                                                           std::span<byte_t const> {reservation.range_tombstones});
+            ranges.failed())
+            return ranges;
         return writer.poll_all_completions();
     }
 
@@ -882,6 +947,7 @@ class lsm_sorted_run {
             if (status_t const offsets = run.read_value_offsets_(channel); offsets.failed()) return offsets;
         }
         if (status_t const trailer = run.read_trailer_(channel); trailer.failed()) return trailer;
+        if (status_t const ranges = run.read_range_tombstones_(channel); ranges.failed()) return ranges;
         return run;
     }
 
@@ -945,8 +1011,19 @@ class lsm_sorted_run {
     /** The kind of every key slot in sorted order, which a compaction reads in place. */
     [[nodiscard]] kinds_column_t const& kinds() const noexcept { return kinds_; }
 
-    /** The newest stamp any key slot of the run carries, which a check of what changed since a stamp skips by. */
-    [[nodiscard]] std::uint64_t newest_stamp() const noexcept { return header_.newest_stamp; }
+    /** The newest stamp any key slot or range tombstone of the run carries, which a check of what
+     *  changed since a stamp skips by. */
+    [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
+        return std::max(header_.newest_stamp, range_tombstones_.newest_stamp());
+    }
+
+    /** The range tombstones the run carries, ascending by start. */
+    [[nodiscard]] range_tombstones_t const& range_tombstones() const noexcept { return range_tombstones_; }
+
+    /** Whether the run holds a key slot or a range tombstone, so its bounds name keys. */
+    [[nodiscard]] bool holds_keys() const noexcept {
+        return header_.key_slots_count != 0 || !range_tombstones_.empty();
+    }
 
     /** The stamp every stamp of the run was raised to at least. */
     [[nodiscard]] std::uint64_t stamps_floor() const noexcept { return header_.stamps_floor; }
@@ -958,26 +1035,63 @@ class lsm_sorted_run {
     /** Bytes the stamps column takes in memory, which is all a run spends on its stamps. */
     [[nodiscard]] std::uint64_t stamps_bytes() const noexcept { return stamps_.size_bytes(); }
 
-    /** The least key the run holds, or the greatest key of the type for an empty run. */
+    /** The least key the run holds or a range tombstone of it hides, by head for a run of strings,
+     *  or the greatest key of the type for an empty run. */
     [[nodiscard]] stored_key_t lower_stored_key() const noexcept {
-        if (header_.key_slots_count == 0) return limit<stored_key_t>::max();
-        if constexpr (tailed_k) return head(0);
-        else return key_slot(0).stored_key;
+        stored_key_t hidden = limit<stored_key_t>::max();
+        if constexpr (tailed_k) {
+            if (!range_tombstones_.empty()) hidden = strings::head_of(range_tombstones_.range(0).start);
+        }
+        else hidden = range_tombstones_.lower_stored_key();
+        if (header_.key_slots_count == 0) return hidden;
+        stored_key_t first {};
+        if constexpr (tailed_k) first = head(0);
+        else first = key_slot(0).stored_key;
+        return hidden < first ? hidden : first;
     }
 
-    /** The greatest key the run holds, or the least key of the type for an empty run. */
+    /** The greatest key the run holds or a range tombstone of it hides, by head for a run of
+     *  strings, the head of an exclusive end standing for every string below it, or the least key
+     *  of the type for an empty run. */
     [[nodiscard]] stored_key_t upper_stored_key() const noexcept {
-        if (header_.key_slots_count == 0) return limit<stored_key_t>::min();
-        if constexpr (tailed_k) return head(header_.key_slots_count - 1);
-        else return key_slot(header_.key_slots_count - 1).stored_key;
+        stored_key_t hidden = limit<stored_key_t>::min();
+        if constexpr (tailed_k) {
+            for (auto const& range : range_tombstones_.ranges()) {
+                stored_key_t const reach = range.end.empty() ? limit<stored_key_t>::max() : strings::head_of(range.end);
+                if (hidden < reach) hidden = reach;
+            }
+        }
+        else hidden = range_tombstones_.upper_stored_key();
+        if (header_.key_slots_count == 0) return hidden;
+        stored_key_t last {};
+        if constexpr (tailed_k) last = head(header_.key_slots_count - 1);
+        else last = key_slot(header_.key_slots_count - 1).stored_key;
+        return last < hidden ? hidden : last;
+    }
+
+    /** The least whole string a run of strings holds or hides. */
+    [[nodiscard]] std::string_view lower_string() const noexcept
+        requires tailed_k
+    {
+        std::string_view const hidden = range_tombstones_.empty() ? std::string_view {}
+                                                                  : range_tombstones_.range(0).start;
+        if (header_.key_slots_count == 0) return hidden;
+        return !range_tombstones_.empty() && hidden < key(0) ? hidden : key(0);
     }
 
     /** Whether every key of this run orders before every key of @p other, by whole keys for a run
      *  of strings, so two runs of one level may share a head where one's last key and the other's
      *  first differ past it. */
     [[nodiscard]] bool precedes(lsm_sorted_run const& other) const noexcept {
-        if (header_.key_slots_count == 0 || other.header_.key_slots_count == 0) return true;
-        if constexpr (tailed_k) return key(header_.key_slots_count - 1) < other.key(0);
+        if (!holds_keys() || !other.holds_keys()) return true;
+        if constexpr (tailed_k) {
+            // A tombstone's end is exclusive, so it may reach the first string of the next run.
+            std::string_view const next = other.lower_string();
+            if (header_.key_slots_count != 0 && !(key(header_.key_slots_count - 1) < next)) return false;
+            for (auto const& range : range_tombstones_.ranges())
+                if (range.end.empty() || next < range.end) return false;
+            return true;
+        }
         else return upper_stored_key() < other.lower_stored_key();
     }
 
@@ -1760,6 +1874,57 @@ class lsm_sorted_run {
                             std::span<byte_t const> {saved});
     }
 
+    /** Lays @p tombstones out into @p into as the section at the end of a run: the bounds and
+     *  then the stamps for fixed-width keys, and the stamps, the offsets and the tape of the
+     *  bounds for strings. */
+    static status_t lay_out_range_tombstones(range_tombstones_t const& tombstones, st::vector<byte_t>& into) noexcept {
+        using range_t = typename range_tombstones_t::range_t;
+        std::size_t const count = tombstones.size();
+        std::size_t const stamps_bytes = count * sizeof(std::uint64_t);
+        if constexpr (tailed_k) {
+            std::size_t tape_bytes = 0;
+            for (range_t const& range : tombstones.ranges()) tape_bytes += range.start.size() + range.end.size();
+            std::size_t const offsets_bytes = count == 0 ? 0 : (2 * count + 1) * sizeof(std::uint32_t);
+            if (into.resize(stamps_bytes + offsets_bytes + tape_bytes) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A run could not lay its range tombstones out"};
+            if (count == 0) return {};
+            std::memcpy(into.data(), tombstones.stamps().data(), stamps_bytes);
+            std::uint32_t offset = 0;
+            std::size_t written = stamps_bytes + offsets_bytes;
+            auto const placed = [&](std::size_t slot, std::string_view text) noexcept {
+                std::memcpy(into.data() + stamps_bytes + slot * sizeof(std::uint32_t), &offset, sizeof(offset));
+                if (!text.empty()) std::memcpy(into.data() + written, text.data(), text.size());
+                written += text.size();
+                offset += static_cast<std::uint32_t>(text.size());
+            };
+            for (std::size_t index = 0; index != count; ++index) {
+                placed(2 * index, tombstones.range(index).start);
+                placed(2 * index + 1, tombstones.range(index).end);
+            }
+            placed(2 * count, {});
+            return {};
+        }
+        else {
+            std::size_t const bounds_bytes = count * sizeof(range_t);
+            if (into.resize(bounds_bytes + stamps_bytes) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A run could not lay its range tombstones out"};
+            if (count == 0) return {};
+            std::memcpy(into.data(), tombstones.ranges().data(), bounds_bytes);
+            std::memcpy(into.data() + bounds_bytes, tombstones.stamps().data(), stamps_bytes);
+            return {};
+        }
+    }
+
+    /** Stages @p laid_out, the section @c lay_out_range_tombstones laid, at the end of the run
+     *  @p header describes, staging nothing for a run of none. */
+    static status_t write_range_tombstones(write_pipeline_t& writer, medium_extent_t const& extent,
+                                           sorted_run_header_t const& header,
+                                           std::span<byte_t const> laid_out) noexcept {
+        if (header.range_tombstones_count == 0) return {};
+        return write_bytes_(writer, extent, range_tombstones_offset_(header),
+                            round_up_to_multiple(header.range_tombstones_bytes, portable_alignment_k), laid_out);
+    }
+
   private:
 
     /** Reads the first page of the extent and accepts it only as a run this reader can serve. */
@@ -2102,6 +2267,71 @@ class lsm_sorted_run {
         return {};
     }
 
+    /** Reads the range tombstones at the end of the run into owned memory, refusing bounds that
+     *  disagree with the header or come out of order. */
+    status_t read_range_tombstones_(io_channel_t& channel) noexcept {
+        using range_t = typename range_tombstones_t::range_t;
+        std::size_t const count = header_.range_tombstones_count;
+        if (count == 0) return {};
+        st::vector<byte_t> saved;
+        if (saved.resize(static_cast<std::size_t>(
+                round_up_to_multiple(header_.range_tombstones_bytes, portable_alignment_k))) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A run could not hold its range tombstones"};
+        if (status_t const read = read_bytes_(channel, range_tombstones_offset_(header_), std::span<byte_t> {saved});
+            read.failed())
+            return read;
+        st::vector<range_t> ranges;
+        st::vector<std::uint64_t> stamps;
+        if (ranges.resize(count) != st::status_t::success_k || stamps.resize(count) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A run could not hold its range tombstones"};
+        std::size_t const stamps_bytes = count * sizeof(std::uint64_t);
+        if constexpr (tailed_k) {
+            std::size_t const offsets_bytes = (2 * count + 1) * sizeof(std::uint32_t);
+            if (stamps_bytes + offsets_bytes > header_.range_tombstones_bytes)
+                return {status_code_t::malformed_k, "A run's range tombstones outgrow their section"};
+            std::memcpy(stamps.data(), saved.data(), stamps_bytes);
+            std::size_t const tape_bytes = header_.range_tombstones_bytes - stamps_bytes - offsets_bytes;
+            char const* const tape = reinterpret_cast<char const*>(saved.data() + stamps_bytes + offsets_bytes);
+            auto const offset_of = [&](std::size_t slot) noexcept {
+                std::uint32_t offset = 0;
+                std::memcpy(&offset, saved.data() + stamps_bytes + slot * sizeof(std::uint32_t), sizeof(offset));
+                return std::size_t {offset};
+            };
+            for (std::size_t slot = 0; slot != 2 * count; ++slot)
+                if (offset_of(slot) > offset_of(slot + 1) || offset_of(slot + 1) > tape_bytes)
+                    return {status_code_t::malformed_k, "A run's range tombstones disagree with their tape"};
+            for (std::size_t index = 0; index != count; ++index)
+                ranges[index] = range_t {
+                    std::string_view {tape + offset_of(2 * index), offset_of(2 * index + 1) - offset_of(2 * index)},
+                    std::string_view {tape + offset_of(2 * index + 1),
+                                      offset_of(2 * index + 2) - offset_of(2 * index + 1)}};
+        }
+        else {
+            std::size_t const bounds_bytes = count * sizeof(range_t);
+            if (bounds_bytes + stamps_bytes != header_.range_tombstones_bytes)
+                return {status_code_t::malformed_k, "A run's range tombstones disagree with their section"};
+            std::memcpy(ranges.data(), saved.data(), bounds_bytes);
+            std::memcpy(stamps.data(), saved.data() + bounds_bytes, stamps_bytes);
+        }
+        for (std::size_t index = 1; index != ranges.size(); ++index)
+            if (ranges[index].start < ranges[index - 1].start)
+                return {status_code_t::malformed_k, "A run's range tombstones are out of order"};
+        auto [tombstones, tombstones_status] = range_tombstones_t::make(std::span<range_t const> {ranges},
+                                                                        std::span<std::uint64_t const> {stamps});
+        if (tombstones_status.failed())
+            return tombstones_status == status_code_t::out_of_memory_k
+                       ? tombstones_status
+                       : status_t {status_code_t::malformed_k, "A run's range tombstones end before they start"};
+        range_tombstones_ = std::move(tombstones);
+        return {};
+    }
+
+    /** Where the range tombstones of the run @p header describes start, for either shape of run. */
+    [[nodiscard]] static std::uint64_t range_tombstones_offset_(sorted_run_header_t const& header) noexcept {
+        if constexpr (tailed_k) return strings_layout_t::range_tombstones_offset(header);
+        else return sorted_run_layout_t::range_tombstones_offset(header);
+    }
+
 #pragma endregion Private Methods
 
 #pragma region Private Members
@@ -2154,6 +2384,9 @@ class lsm_sorted_run {
     /** The stamp @c assign_stamp gave the run, zero while its stamps are the ones
      *  its extent carries. */
     std::uint64_t assigned_stamp_ = 0;
+
+    /** The range tombstones the run carries, read whole at open. */
+    range_tombstones_t range_tombstones_;
 
 #pragma endregion Private Members
 };

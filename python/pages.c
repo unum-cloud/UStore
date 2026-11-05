@@ -157,6 +157,9 @@ typedef struct page_keywords_t {
     /** The siblings after which the elements land. */
     PyObject* anchors;
 
+    /** The keys the ranges of whole pages a removal takes stop before. */
+    PyObject* ends;
+
     /** The callable reporting progress. */
     PyObject* progress;
 
@@ -206,6 +209,7 @@ static int page_keywords_from_args(ustore_py_context_t const* context, char cons
         if (strcmp(*own, "elements") == 0) keywords->elements = given;
         else if (strcmp(*own, "parents") == 0) keywords->parents = given;
         else if (strcmp(*own, "anchors") == 0) keywords->anchors = given;
+        else if (strcmp(*own, "ends") == 0) keywords->ends = given;
         else if (strcmp(*own, "progress") == 0) parsed = ustore_py_progress_from_object(value, &keywords->progress);
         else if (strcmp(*own, "encoding") == 0)
             parsed = ustore_py_enum_from_object(value, *own, ustore_py_enum_page_encoding_k, &keywords->encoding);
@@ -222,6 +226,7 @@ static char const* const import_keywords[] = {"encoding", "progress", NULL};
 static char const* const insert_keywords[] = {"elements", "parents", "anchors", "encoding", NULL};
 static char const* const move_keywords[] = {"parents", "anchors", NULL};
 static char const* const read_keywords[] = {"elements", "outputs_encoding", NULL};
+static char const* const remove_keywords[] = {"ends", NULL};
 static char const* const no_keywords[] = {NULL};
 
 #pragma endregion Spread Arguments
@@ -248,6 +253,9 @@ typedef struct edit_call_t {
 
     /** The sibling after which every element lands. */
     spread_keys_t anchors;
+
+    /** The key every range of whole pages a removal takes stops before. */
+    spread_keys_t ends;
 
     /** The attribute names every task sets or removes. */
     ustore_py_texts_t fields;
@@ -298,6 +306,7 @@ static void edit_release(void* erased) {
     ustore_py_keys_release(&call->elements.batch);
     ustore_py_keys_release(&call->parents.batch);
     ustore_py_keys_release(&call->anchors.batch);
+    ustore_py_keys_release(&call->ends.batch);
     ustore_py_texts_release(&call->fields);
     ustore_py_texts_release(&call->values);
     PyMem_Free(call->text_starts.lengths);
@@ -475,15 +484,19 @@ PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments,
 }
 
 char const doc_pages_remove[] =                                                                //
-    "pages_remove(keys, elements, *, collection, durability=Durability.BUFFERED)\n"            //
-    "answers None.\n"                                                                          //
+    "pages_remove(keys, elements=None, *, collection, ends=None,\n"                            //
+    "             durability=Durability.BUFFERED) answers None.\n"                             //
     "\n"                                                                                       //
-    "Removes elements with their subtrees, where the page key removes the whole page.\n"       //
+    "Removes elements with their subtrees, where the page key or no elements at all removes\n" //
+    "the whole page. With `ends`, every key starts a range of whole pages removed up to its\n" //
+    "end, which takes no elements.\n"                                                          //
     "\n"                                                                                       //
     "Args:\n"                                                                                  //
     "  keys (KeyLike | Sequence[KeyLike] | buffer): The page of every task, or one for all.\n" //
-    "  elements (KeyLike | Sequence[KeyLike] | buffer): The elements to remove.\n"             //
+    "  elements (KeyLike | Sequence[KeyLike] | buffer, optional): The elements to remove.\n"   //
     "  collection (UUID | str): The pages collection, by identifier or by name.\n"             //
+    "  ends (KeyLike | Sequence[KeyLike] | buffer, optional): The key every range of pages\n"  //
+    "    stops before, one per key or one for all.\n"                                          //
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"     //
     "    returning.\n"                                                                         //
     "Raises:\n"                                                                                //
@@ -495,11 +508,30 @@ PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* arguments,
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
     edit_call_t stack;
+    if (positional_arguments_count != 1 && positional_arguments_count != 2) {
+        PyErr_Format(PyExc_TypeError, "pages_remove() takes the keys and the elements by position, received %zd",
+                     positional_arguments_count);
+        return NULL;
+    }
     edit_call_t* const call = edit_open(self, "pages_remove", &remove_verb, arguments, positional_arguments_count,
-                                        keyword_names_tuple, 2, no_keywords, &context, &options, &keywords, &stack);
+                                        keyword_names_tuple, positional_arguments_count, remove_keywords, &context,
+                                        &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0)
+    PyObject* const elements = positional_arguments_count == 2 && arguments[1] != Py_None ? arguments[1] : NULL;
+    if (elements && keywords.ends) {
+        PyErr_SetString(PyExc_TypeError, "A removal of page ranges removes whole pages, so it takes no elements");
         return ustore_py_call_discard(&context, &remove_verb, call);
+    }
+    if ((elements && spread_keys_from_object(elements, "elements", &call->tasks, &call->elements) != 0) ||
+        (keywords.ends && spread_keys_from_object(keywords.ends, "ends", &call->tasks, &call->ends) != 0))
+        return ustore_py_call_discard(&context, &remove_verb, call);
+    // Without elements every task names its page, which removes the whole page
+    ustore_keys_view_t removed_elements = spread_keys_view(elements ? &call->elements : &call->pages);
+    ustore_keys_view_t end_keys = {0};
+    if (keywords.ends) {
+        removed_elements = (ustore_keys_view_t) {0};
+        end_keys = spread_keys_view(&call->ends);
+    }
     ustore_pages_remove_t remove = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
@@ -509,7 +541,8 @@ PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* arguments,
         .count = call->tasks.count,
         .collections = {&call->call.collection, 0},
         .keys = spread_keys_view(&call->pages),
-        .elements = spread_keys_view(&call->elements),
+        .end_keys = end_keys,
+        .elements = removed_elements,
         .durability = options.durability,
         .watch = context.watch,
     };
@@ -813,33 +846,61 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
     return ustore_py_call_run(&context, &read_verb, call, &read);
 }
 
-char const doc_pages_scan[] =                                                                   //
-    "pages_scan(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None,\n"   //
-    "           filter=None, predicate=None, predicate_cost=PredicateCost.CHEAP)\n"             //
-    "answers a Keys tape.\n"                                                                    //
-    "\n"                                                                                        //
-    "Lists up to `wanted` page keys from `start` upwards, as `scan` lists the keys of blobs.\n" //
-    "Pages are not rendered, so a `pages_read` follows the scan.\n"                             //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  start (KeyLike): The smallest key the scan may return.\n"                                //
-    "  wanted (int): Most keys the scan returns.\n"                                             //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                             //
-    "  collection (UUID | str): The pages collection, by identifier or by name.\n"              //
-    "  mode (ScanMode, optional): In what order the keys come, as `scan` takes it.\n"           //
-    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"         //
-    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"     //
-    "  filter (str | bytes, optional): A path in StringZilla's XPath subset, such as\n"         //
-    "    '/doc/b[2]', that every listed page holds a node of.\n"                                //
-    "Returns:\n"                                                                                //
-    "  Keys: One run of keys, in ascending order.\n"                                            //
-    "Raises:\n"                                                                                 //
+char const doc_pages_scan[] =                                                                  //
+    "pages_scan(start, wanted, arena, *, collection, end=None,\n"                              //
+    "           direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None,\n"    //
+    "           filter=None, predicate=None, predicate_cost=PredicateCost.CHEAP)\n"            //
+    "answers a Keys tape.\n"                                                                   //
+    "\n"                                                                                       //
+    "Lists up to `wanted` page keys from `start` towards `end`, as `scan` lists the keys of\n" //
+    "blobs. Pages are not rendered, so a `pages_read` follows the scan.\n"                     //
+    "\n"                                                                                       //
+    "Args:\n"                                                                                  //
+    "  start (KeyLike | None): The first key the scan may return, or None for the first\n"     //
+    "    key in its direction.\n"                                                              //
+    "  wanted (int): Most keys the scan returns.\n"                                            //
+    "  arena (Arena): Where the keys land, rewound by this call.\n"                            //
+    "  collection (UUID | str): The pages collection, by identifier or by name.\n"             //
+    "  end (KeyLike, optional): The key the scan stops before, or None for no bound.\n"        //
+    "  direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.\n"   //
+    "  mode (ScanMode, optional): In what order the keys come, as `scan` takes it.\n"          //
+    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"        //
+    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"    //
+    "  filter (str | bytes, optional): A path in StringZilla's XPath subset, such as\n"        //
+    "    '/doc/b[2]', that every listed page holds a node of.\n"                               //
+    "Returns:\n"                                                                               //
+    "  Keys: One run of keys, in the order of the direction.\n"                                //
+    "Raises:\n"                                                                                //
     "  CancelledError: The progress callable stopped the scan.";
 
 PyObject* ustore_py_api_pages_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                    PyObject* keyword_names_tuple) {
     return ustore_py_api_scan_of(self, arguments, positional_arguments_count, keyword_names_tuple, "pages_scan",
                                  ustore_modality_pages_k);
+}
+
+char const doc_pages_sample[] =                                                                //
+    "pages_sample(wanted, arena, *, collection) answers a Keys tape.\n"                        //
+    "\n"                                                                                       //
+    "Draws page keys uniformly at random from one collection, as `sample` draws the keys of\n" //
+    "blobs. Pages are not rendered, so a `pages_read` follows.";
+
+PyObject* ustore_py_api_pages_sample(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
+    return ustore_py_api_sample_of(self, arguments, positional_arguments_count, keyword_names_tuple, "pages_sample",
+                                   ustore_modality_pages_k);
+}
+
+char const doc_pages_measure[] =                                                           //
+    "pages_measure(start, end, arena, *, collection, direction=ScanDirection.ASCENDING)\n" //
+    "answers a Measurement.\n"                                                             //
+    "\n"                                                                                   //
+    "Estimates what a range of page keys holds without walking it, as `measure` does for blobs.";
+
+PyObject* ustore_py_api_pages_measure(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                      PyObject* keyword_names_tuple) {
+    return ustore_py_api_measure_of(self, arguments, positional_arguments_count, keyword_names_tuple, "pages_measure",
+                                    ustore_modality_pages_k);
 }
 
 #pragma endregion Reads

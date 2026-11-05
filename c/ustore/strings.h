@@ -85,7 +85,8 @@ typedef struct ustore_strings_write_t {
  */
 USTORE_EXPORT void ustore_strings_write(ustore_strings_write_t* arguments);
 
-/** The arguments of @c ustore_strings_remove, which removes strings with their values in a batch. */
+/** The arguments of @c ustore_strings_remove, which removes strings with their values in a batch,
+ *  or every string of a range per task when @c end_strings are given. */
 typedef struct ustore_strings_remove_t {
 
     /** An open database. */
@@ -109,8 +110,12 @@ typedef struct ustore_strings_remove_t {
     /** Strings collections owning the strings. */
     ustore_collections_view_t collections;
 
-    /** Strings to remove, one per task. */
+    /** Strings to remove, one per task, or inclusive range starts when @c end_strings is given. */
     ustore_strings_view_t strings;
+
+    /** Exclusive ends of the ranges to remove, where an empty one bounds nothing, or a zeroed view
+     *  to remove @c strings alone. */
+    ustore_strings_view_t end_strings;
 
     /** How durable the removals are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -197,8 +202,6 @@ typedef struct ustore_strings_read_t {
  *    another call, the executor's deferred table is full, or a callback blocks on the executor
  *    running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  */
 USTORE_EXPORT void ustore_strings_read(ustore_strings_read_t* arguments);
@@ -206,8 +209,9 @@ USTORE_EXPORT void ustore_strings_read(ustore_strings_read_t* arguments);
 /**
  *  @brief The arguments of @c ustore_strings_scan, which lists up to @c wanted strings under every prefix.
  *
- *  Strings come in the order of their text. Values are not exported, so a read follows the scan, and a
- *  scan resumes from @c start_strings rather than holding an iterator over concurrent state.
+ *  Strings come in the order of their text, or the reverse of it when descending. Values are not
+ *  exported, so a read follows the scan, and a scan resumes from @c start_strings rather than
+ *  holding an iterator over concurrent state.
  */
 typedef struct ustore_strings_scan_t {
 
@@ -235,8 +239,15 @@ typedef struct ustore_strings_scan_t {
     /** Prefixes every scan matches, where a zeroed view matches every string. */
     ustore_strings_view_t prefixes;
 
-    /** Smallest string every scan may return, which paginates a walk of one prefix; a zeroed view starts first. */
+    /** String every scan starts from, inclusive, which paginates a walk of one prefix; a zeroed
+     *  view starts at the first string in the @c direction. */
     ustore_strings_view_t start_strings;
+
+    /** Exclusive string every scan stops before, where empty or zeroed views bound nothing. */
+    ustore_strings_view_t end_strings;
+
+    /** Ascending, the default, or descending from the start string. */
+    ustore_scan_direction_t direction;
 
     /** Optional patterns every listed string matches, shared by every scan of the call; zeroed lists every string. */
     ustore_patterns_t patterns;
@@ -277,9 +288,9 @@ typedef struct ustore_strings_scan_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is
- *  missing, the prefixes or start strings come in an unknown layout, a pattern kind, a case
- *  sensitivity or a predicate cost is unknown, the @c mode is unknown under @c patterns or a
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is missing,
+ *  the prefixes, start or end strings come in an unknown layout, the @c direction, a pattern kind,
+ *  a case sensitivity or a predicate cost is unknown, the @c mode is unknown under @c patterns or a
  *  predicate, the @c patterns do not compile, the @c view was made by neither view constructor or
  *  belongs to another engine, a watching scan goes through a staged transaction, or a collection
  *  holds a modality other than strings.
@@ -289,8 +300,8 @@ typedef struct ustore_strings_scan_t {
  *    another call, the executor's deferred table is full, or a callback blocks on the executor
  *    running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet, or on one matching no values, as AMD devices do, given @c patterns.
+ *  - @c ustore_status_unsupported_k The executor's device loaded no bundle of the library's kernels
+ *    and @c patterns are given.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  */
 USTORE_EXPORT void ustore_strings_scan(ustore_strings_scan_t* arguments);
@@ -330,8 +341,15 @@ typedef struct ustore_strings_cursor_init_t {
     /** Prefix every string the walk returns starts with, copied, where a zeroed view matches every string. */
     ustore_bytes_view_t prefix;
 
-    /** Smallest string the walk returns, copied, where a zeroed view starts at the first string of the prefix. */
+    /** String the walk starts from, inclusive, copied, where a zeroed view starts at the first
+     *  string of the prefix in the @c direction. */
     ustore_bytes_view_t start_string;
+
+    /** String the walk stops before, exclusive, copied, or a zeroed view for no bound. */
+    ustore_bytes_view_t end_string;
+
+    /** Ascending, the default, or descending from the start string. */
+    ustore_scan_direction_t direction;
 
     /** Optional patterns every string the walk hands out matches, compiled here once; zeroed walks every string. */
     ustore_patterns_t patterns;
@@ -347,10 +365,9 @@ typedef struct ustore_strings_cursor_init_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made by
- *    neither view constructor or reads another database, a pattern kind, a case sensitivity or a
- *    predicate cost is unknown, or the @c patterns do not compile.
+ *    neither view constructor or reads another database, the @c direction, a pattern kind, a case
+ *    sensitivity or a predicate cost is unknown, or the @c patterns do not compile.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
- *  - @c ustore_status_unsupported_k A device @c executor is given @c patterns.
  */
 USTORE_EXPORT void ustore_strings_cursor_init(ustore_strings_cursor_init_t* arguments);
 
@@ -411,7 +428,8 @@ typedef struct ustore_strings_cursor_next_t {
  *    another call, the executor's deferred table is full, or a callback blocks on the executor
  *    running it.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine walks yet.
+ *  - @c ustore_status_unsupported_k The pulling executor's device loaded no bundle of the library's
+ *    kernels and the walk has @c patterns.
  *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
  */
 USTORE_EXPORT void ustore_strings_cursor_next(ustore_strings_cursor_next_t* arguments);
@@ -422,6 +440,147 @@ USTORE_EXPORT void ustore_strings_cursor_next(ustore_strings_cursor_next_t* argu
  *  @param[in,out] cursor The cursor to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_strings_cursor_free(ustore_strings_cursor_t cursor);
+
+/** The arguments of @c ustore_strings_sample, which draws up to @c wanted strings uniformly at
+ *  random from every collection. */
+typedef struct ustore_strings_sample_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** What the call sees, where @c NULL is the head. */
+    ustore_view_t view;
+
+    /** Number of samples. */
+    ustore_size_t count;
+
+    /** Strings collections to sample. */
+    ustore_collections_view_t collections;
+
+    /** Output for @c count plus one offsets into @c strings, the last one closing the final sample,
+     *  inside @c arena. */
+    ustore_length_t const** offsets;
+
+    /** Output for the sampled strings as a tape, sample after sample, inside @c arena. */
+    ustore_strings_view_t* strings;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** Most strings every sample draws. */
+    ustore_size_t wanted;
+
+} ustore_strings_sample_t;
+
+/**
+ *  @brief Samples strings from a batch of collections.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing,
+ *    the @c view was made by neither view constructor or belongs to another engine, a watching
+ *    sample goes through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
+ */
+USTORE_EXPORT void ustore_strings_sample(ustore_strings_sample_t* arguments);
+
+/** The arguments of @c ustore_strings_measure, which estimates the strings and the space inside
+ *  string ranges, every output holding one bound per range. */
+typedef struct ustore_strings_measure_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** What the call sees, where @c NULL is the head. */
+    ustore_view_t view;
+
+    /** Number of measured ranges. */
+    ustore_size_t count;
+
+    /** Strings collections to measure. */
+    ustore_collections_view_t collections;
+
+    /** String every range starts from, inclusive, where a zeroed view starts at the first string in
+     *  the @c direction. */
+    ustore_strings_view_t start_strings;
+
+    /** String every range stops before, exclusive, where an empty one bounds nothing, or a zeroed
+     *  view for no bound. */
+    ustore_strings_view_t end_strings;
+
+    /** Ascending, the default, or descending from the start string. */
+    ustore_scan_direction_t direction;
+
+    /** Optional output for the lower bound on the strings in every range, inside @c arena. */
+    ustore_size_t const** min_cardinalities;
+
+    /** Optional output for the upper bound on the strings in every range, inside @c arena. */
+    ustore_size_t const** max_cardinalities;
+
+    /** Optional output for the lower bound on the bytes of the strings and their keys in every
+     *  range, inside @c arena. */
+    ustore_size_t const** min_value_bytes;
+
+    /** Optional output for the upper bound on the bytes of the strings and their keys in every
+     *  range, inside @c arena. */
+    ustore_size_t const** max_value_bytes;
+
+    /** Optional output for the lower bound on the disk space every range takes, inside @c arena. */
+    ustore_size_t const** min_space_usages;
+
+    /** Optional output for the upper bound on the disk space every range takes, inside @c arena. */
+    ustore_size_t const** max_space_usages;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+} ustore_strings_measure_t;
+
+/**
+ *  @brief Estimates the strings and the space inside a batch of string ranges.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c arena or the @c collections are missing, the
+ *  strings come in an unknown layout, the @c direction is unknown, the @c view was made by neither
+ *  view constructor or belongs to another engine, a watching measure goes through a staged
+ *  transaction, or a collection holds another modality.
+ */
+USTORE_EXPORT void ustore_strings_measure(ustore_strings_measure_t* arguments);
 
 #ifdef __cplusplus
 }

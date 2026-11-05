@@ -15,10 +15,10 @@ UStore's sources split into four folders:
 - `types.h`: statuses, outcomes, completions, progress callbacks, executors, arenas, string batches and the version.
 - `db.h`: databases, collections, snapshots, transactions, views, strided runs of keys and enum spellings.
 - `blobs.h`: binary values, through `ustore_blobs_write`, `_remove`, `_read`, `_scan`, `_sample`, `_measure` and cursors.
-- `strings.h`: string-keyed values, through `ustore_strings_write`, `_remove`, `_read`, `_scan` and cursors.
-- `docs.h`: JSON documents, through `ustore_docs_write`, `_read`, `_gist`, `_gather`, `_remove` and `_scan`.
-- `graph.h`: graph edges and vertices, and the scans of the vertices.
-- `pages.h`: ordered documents, through one verb per edit, `ustore_pages_read` and `ustore_pages_scan`.
+- `strings.h`: string-keyed values, through `ustore_strings_write`, `_remove`, `_read`, `_scan`, `_sample`, `_measure` and cursors.
+- `docs.h`: JSON documents, through `ustore_docs_write`, `_read`, `_gist`, `_gather`, `_remove`, `_scan`, `_sample` and `_measure`.
+- `graph.h`: graph edges and vertices, and the scans, samples and measures of the vertices.
+- `pages.h`: ordered documents, through one verb per edit, `ustore_pages_read`, `_scan`, `_sample` and `_measure`.
 
 Every verb serves only collections of its own modality, and answers `ustore_status_invalid_argument_k` for a collection holding another.
 
@@ -289,6 +289,7 @@ ustore_blobs_remove(&(ustore_blobs_remove_t){
 ```
 
 A batch is atomic: if one task fails, none is applied.
+With `end_keys`, every task removes the range from its key, inclusive, to its end key, exclusive, in the same atomic batch; graphs name the field `end_vertices`, strings `end_strings`, and a range of pages removes whole pages.
 `durability` chooses whether the call returns once the write is buffered or once it is flushed.
 
 ## Reads and Arenas
@@ -319,6 +320,7 @@ assert(memcmp(values.data.u32_tape.data + offsets[0], "meaning of life", 15) == 
 Values are joined into one tape as Apache Arrow lays them out: `count + 1` offsets, the last one closing the final value, and the bytes end to end.
 The offsets are 32 bits wide while the bytes fit in 4 GiB and 64 bits beyond, so a reader checks `layout` once per call, and a tape a read wrote is written back as it is, without a copy.
 Every output is optional: `.lengths` exports the length of every value without its bytes, `.presences` a bitmap of the keys that are present, and a missing key reads as an empty value.
+`offsets` and `limits` read the bytes of every value from its offset, at most its limit of them, and report that slice's length, where an offset past the end reads empty.
 The outputs stay valid until the next call given `arena`; to keep them past it, pass that call another arena.
 A `NULL` arena is refused with `ustore_status_invalid_argument_k`, an arena serves one call at a time, and a call that fails, is cancelled or has nothing to report leaves its outputs `NULL`.
 `ustore_arena_free` waits until every deferred call naming the arena is final.
@@ -344,9 +346,11 @@ ustore_blobs_scan(&(ustore_blobs_scan_t){
 });
 ```
 
-Start keys with `NULL` data start every scan at the first key.
-The next page starts from the key right after the last exported one, its 16 bytes incremented as one big-endian integer, and a `ustore_blobs_read` of the found keys fetches their values.
-`ustore_blobs_sample` draws up to `wanted` keys uniformly at random, and `ustore_blobs_measure` bounds the cardinality, value bytes and disk usage between two keys from below and above.
+Start keys with `NULL` data start every scan at the first key in its `direction`, and `end_keys` stop it before a key, where zeroed ones bound nothing.
+`ustore_scan_ascending_k` walks the keys in `[start, end)` smallest first, and `ustore_scan_descending_k` those in `(end, start]` largest first.
+The next ascending page starts from the key right after the last exported one, its 16 bytes incremented as one big-endian integer, a descending one from the key right before it, and a `ustore_blobs_read` of the found keys fetches their values.
+`ustore_blobs_sample` draws up to `wanted` keys uniformly at random, and `ustore_blobs_measure` bounds the cardinality, value bytes and disk usage of a range of keys from below and above, taking the same start, end and direction as a scan.
+Every other modality samples and measures through its own `_sample` and `_measure` verbs, where the strings modality samples strings and measures ranges of them.
 `ustore_scan_unordered_k` is reserved for scans that may hand keys over out of order, and no engine acts on it yet.
 
 ## Cursors
@@ -382,13 +386,18 @@ while (outcome.status == ustore_status_success_k && written == wanted) {
 ustore_blobs_cursor_free(cursor);
 ```
 
-`ustore_blobs_cursor_init` reads nothing, and its `view` and `start_key` choose what the walk sees and where it starts, the head and the first key when zeroed.
+`ustore_blobs_cursor_init` reads nothing, and its `view` and `start_key` choose what the walk sees and where it starts, the head and the first key when zeroed, while an `end_key` stops it before a key and `direction` walks it down from its start.
 A cursor keeps only the key its next pull starts at, so a key written behind it is never handed out and one written ahead of it is, while `ustore_blobs_scan` stays the batched listing of many ranges.
 A page shorter than `wanted` exhausts the walk for good: every later pull writes zero keys without reading, even after writes ahead of where it stopped.
 A pull that fails or is cancelled leaves the cursor where it was, and a pull at the head lists and reads at two moments, so a key removed between them reads as an empty value.
 The cursor holds its database open, and the transaction or snapshot it reads through, until `ustore_blobs_cursor_free`, so the caller may free those handles first.
 It serves one pull at a time, and a second pull naming it finishes `ustore_status_contended_k`.
-`ustore_strings_cursor_init` opens the same walk over the strings of one `prefix` from an optional `start_string`, copying both, and its pulls write the strings and their values as tapes.
+`ustore_strings_cursor_init` opens the same walk over the strings of one `prefix` from an optional `start_string` to an optional `end_string`, copying all three, and its pulls write the strings and their values as tapes.
+
+`ustore_changes_cursor_init` opens a feed of the changes committed to one collection after `since_stamp`, oldest first, pinning that stamp as a snapshot does.
+Every `ustore_changes_cursor_next` resumes past the last change the pull before it handed out, writing the key, the commit stamp and the `ustore_change_kind_t` of every change and, when asked, the bytes every change carries, where a range removal comes as the removal of every key it removed.
+A key changed twice comes twice, once per commit, an empty pull reached the newest commit, and later pulls see later commits.
+Versions already dropped refuse the init with `ustore_status_write_conflict_k`, and LevelDB, which keeps no stamps, with `ustore_status_unsupported_k`.
 
 ## Transactions and Views
 

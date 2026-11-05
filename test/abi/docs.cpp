@@ -20,7 +20,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "abi/fixture.hpp" // `as_text`, `json_equal`, `flat_documents_k`, `check_equalities`
+#include "abi/fixture.hpp" // `as_text`, `json_equal`, `flat_documents_k`, `check_equalities`, `open_compared`
 #include "harness.hpp"     // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
@@ -536,6 +536,82 @@ std::size_t database_docs_table(config_t const& config) {
 
 #pragma endregion Documents Modality
 
+#pragma region Bounded Ranges
+
+/** Writes a flat document under each integer key in [0, 20) into both @p compared collections. */
+std::size_t write_range_documents(compared_collections_t& compared) {
+    std::array<ustore_key_t, 20> const keys = keys_of_integers<20>(0);
+    std::string_view const document = flat_documents_k[0];
+    strided_strings<std::string_view> const documents {{&document, 0}};
+    std::size_t failures = 0;
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_outcome_t outcome {};
+        ustore_docs_write_t write {};
+        write.database = compared.databases[side];
+        write.outcome = &outcome;
+        write.count = keys.size();
+        write.collections = {&compared.collections[side], 0};
+        write.keys = {keys.data(), sizeof(ustore_key_t)};
+        write.values = documents.view();
+        ustore_docs_write(&write);
+        failures += expect_success(outcome);
+    }
+    return failures;
+}
+
+/** A documents scan stops before its end key. */
+std::size_t docs_range_end_bound(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_documents(compared);
+    ustore_key_t const start = key_from_integer(5), end = key_from_integer(9);
+    failures += expect_same_scan(ustore_docs_scan, compared, {&start, &end, ustore_scan_ascending_k, 10},
+                                 keys_of_integers<4>(5));
+    return failures;
+}
+
+/** A descending documents scan lists its range largest first. */
+std::size_t docs_range_descending(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_documents(compared);
+    ustore_key_t const start = key_from_integer(14), end = key_from_integer(4);
+    failures += expect_same_scan(ustore_docs_scan, compared, {&start, &end, ustore_scan_descending_k, 3},
+                                 keys_of_integers<3>(12, ustore_scan_descending_k));
+    return failures;
+}
+
+/** A documents range removal removes every document from the start key up to the end key. */
+std::size_t docs_range_remove(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_documents(compared);
+    ustore_key_t const start = key_from_integer(2), end = key_from_integer(18);
+    failures += remove_ranges(ustore_docs_remove, compared, {&start, 1}, {&end, 1});
+    std::array<ustore_key_t, 4> const remaining {key_from_integer(0), key_from_integer(1), key_from_integer(18),
+                                                 key_from_integer(19)};
+    failures += expect_same_scan(ustore_docs_scan, compared, {nullptr, nullptr, ustore_scan_ascending_k, 20},
+                                 remaining);
+    return failures;
+}
+
+/** A documents measure counts the documents of its range with the end excluded. */
+std::size_t docs_range_measure(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_documents(compared);
+    ustore_key_t const lower = key_from_integer(5), upper = key_from_integer(9);
+    failures += expect_measure_holds(ustore_docs_measure, compared, {&lower, &upper, ustore_scan_ascending_k}, 4);
+    failures += expect_measure_holds(ustore_docs_measure, compared, {&upper, nullptr, ustore_scan_descending_k}, 10);
+    return failures;
+}
+
+#pragma endregion Bounded Ranges
+
 int main(int argc, char** argv) {
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -555,5 +631,9 @@ int main(int argc, char** argv) {
     report(totals, "database.docs_modify", database_docs_modify, config);
     report(totals, "database.docs_merge_and_patch", database_docs_merge_and_patch, config);
     report(totals, "database.docs_table", database_docs_table, config);
+    report(totals, "docs.range_end_bound", docs_range_end_bound, config);
+    report(totals, "docs.range_descending", docs_range_descending, config);
+    report(totals, "docs.range_remove", docs_range_remove, config);
+    report(totals, "docs.range_measure", docs_range_measure, config);
     return suite_exit_code(totals);
 }

@@ -34,6 +34,7 @@
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
+#include <optional>    // `std::optional`
 #include <span>        // `std::span`, `std::as_bytes`
 #include <type_traits> // `std::integral_constant`, `std::remove_reference_t`
 #include <utility>     // `std::exchange`, `std::forward`, `std::index_sequence_for`, `std::move`
@@ -65,6 +66,7 @@ using utilities::manifest_no_collection_k;
 using utilities::manifest_t;
 using utilities::medium_extent_t;
 using utilities::path_max_bytes_k;
+using utilities::sha256_t;
 using utilities::volume_config_t;
 
 #pragma region Database Snapshot
@@ -299,6 +301,28 @@ class database_transaction {
             return checked;
         return core_.state().deltas.remove(named.id, named.widths, stored_key,
                                            core_.template watch_stamp_for<watch_schedule_>());
+    }
+
+    /** Removes every key of @p id from @p start up to @p end, exclusive, as one range this
+     *  transaction's commit lands as a range tombstone, watching the range for another commit
+     *  writing inside it as @p watch_schedule_ says. */
+    template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
+    status_t remove_range(any_collection_id_t const& id, stored_key_t start, stored_key_t end) noexcept {
+        if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        resolved_collection_t const named = resolve_(id);
+        if (named.id == collection_invalid_id_k)
+            return {status_code_t::not_found_k, "The store names no such collection"};
+        if (!(start < end)) return {status_code_t::invalid_argument_k, "A range ends at or before its start"};
+        if (status_t const removed = core_.state().deltas.remove_range(named.id, named.widths, start, end);
+            removed.failed())
+            return removed;
+        return core_.template watch_range<watch_schedule_>(named.id, start, stored_key_before(end));
+    }
+
+    /** The ranges this transaction's own deltas remove from @p collection_id, in removal order. */
+    [[nodiscard]] std::span<range_tombstone<stored_key_t> const> uncommitted_ranges(
+        collection_id_t collection_id) const noexcept {
+        return core_.state().deltas.ranges(collection_id);
     }
 
     /**
@@ -553,6 +577,9 @@ inline constexpr std::size_t collection_name_max_bytes_k = 64;
 
 #pragma region Database
 
+/** What a mount takes for a digester to check no run against the SHA-256 its manifest names. */
+struct unverified_runs_t {};
+
 /**
  *  @brief Named collections of one database, the manifest that names them and the
  *      transactions they share.
@@ -604,8 +631,11 @@ class basic_database {
     /** One pinned stamp, at which the whole database answers. */
     using snapshot_t = database_snapshot<basic_database>;
 
-    /** One stamp a snapshot, a transaction or a scan holds against the ledger. */
+    /** One stamp a snapshot, a transaction, a scan or a change feed holds against the ledger. */
     using pin_t = stamp_pin<atomic_reference_, waiter_type_>;
+
+    /** One change a feed of a collection hands out, which also marks where the feed stands. */
+    using stored_change_t = stored_change<stored_key_t>;
 
     /** One collection, held by the store its tag names. */
     using any_collection_t = std::variant<store_types_...>;
@@ -661,9 +691,17 @@ class basic_database {
      *  @param[in] config The delta bounds a transaction takes when its caller names none.
      *  @param[in] compactor What every merge runs on: the calling thread, or a device compactor the caller owns, which
      *      outlives the database.
+     *  @param[in] digester Steps a SHA-256 state, as @c save takes one, over every run the manifest
+     *      names a SHA-256 for; @c unverified_runs_t checks none.
+     *  @return Success, or @c malformed_k for a run whose bytes differ from the SHA-256 the
+     *      manifest names, as a corrupted archive's do, found before any merge reads it.
+     *
+     *  Every manifest the database publishes afterwards names no SHA-256, so only the first open
+     *  of a restored database hashes its runs; a save hashes them again as it copies them.
      */
+    template <typename digester_type_ = unverified_runs_t>
     status_t mount(volume_t& volume, channel_pool_t& channels, database_config_t const& config,
-                   compactor_ref_t compactor = {}) noexcept {
+                   compactor_ref_t compactor = {}, digester_type_ const& digester = {}) noexcept {
         if (volume_ != nullptr) return {status_code_t::already_exists_k, "This database has already mounted"};
         volume_ = &volume;
         channels_ = &channels;
@@ -674,7 +712,7 @@ class basic_database {
         entries_ = std::move(entries);
         status_t const opened = entries_status != st::status_t::success_k
                                     ? status_t {status_code_t::out_of_memory_k, "No room for the collections"}
-                                    : open_manifest_();
+                                    : open_manifest_(digester);
         if (opened.failed()) {
             // A manifest this database could not open stays as it lies, never published again
             // without what it missed.
@@ -1041,13 +1079,15 @@ class basic_database {
     }
 
     /**
-     *  @brief Hands @p visitor every key of @p id from @p from up in ascending order, memory runs included.
+     *  @brief Hands @p visitor every key of @p id from @p from up in ascending order, or down in
+     *      descending order as @p direction says, memory runs included.
      *  @param[in] id The collection to walk, named by its ID or by its name.
-     *  @param[in] from The smallest key the walk reports, which need not be in the collection.
+     *  @param[in] from The first key the walk reports, which need not be in the collection.
      *  @param[in] visitor Called as @c visitor(stored_key, state, size) for the newest version of every key at or
      *      below @p stamp, removals included, answering whether the walk carries on.
      *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
      *  @param[in] thread_index The executor thread walking, which announces on its own epoch slot.
+     *  @param[in] direction Whether the walk goes up or down, reading only the keys it hands out.
      *
      *  @note The walk reads one page of keys at a time inside the epochs, finding the collection again for each, and
      *      hands a page to @p visitor outside them, so a commit waits for one page at most; a collection dropped
@@ -1055,7 +1095,8 @@ class basic_database {
      */
     template <typename visitor_type_>
     status_t scan(any_collection_id_t const& id, stored_key_t from, visitor_type_&& visitor,
-                  transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = outside_executor_k) noexcept {
+                  transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = outside_executor_k,
+                  scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
         // A head walk pins the stamp it starts at, so every page reads the same commits.
         stamp_pin<atomic_reference_, waiter_type_> pin;
         if (stamp == head_stamp_k) stamp = ledger_.pin_reader(pin);
@@ -1074,7 +1115,8 @@ class basic_database {
                                 nvme_store_cursor<typename store_type_::key_slot_t, volume_t, atomic_reference_,
                                                   waiter_type_, typename store_type_::fold_t,
                                                   typename store_type_::device_fold_t>;
-                            auto [scanner, over_status] = scanner_t::over(collection, from, stamp, thread_index);
+                            auto [scanner, over_status] = scanner_t::over(collection, from, stamp, thread_index,
+                                                                          direction);
                             if (over_status.failed()) return over_status;
                             std::span<scan_entry<stored_key_t> const> const entries = scanner.page();
                             std::copy(entries.begin(), entries.end(), page.begin());
@@ -1147,6 +1189,50 @@ class basic_database {
                 if constexpr (keyed_by_database<store_type_>())
                     return collection.scan_run(counted, run_index, from, visitor, stamp, thread_index);
                 else return keyed_otherwise_();
+            },
+            found->held);
+    }
+
+    /**
+     *  @brief Pins @p pin at @p stamp for a feed of the changes committed to @p id after it, so no
+     *      merge of any collection folds a version above it until the pin is released.
+     *
+     *  @par Statuses:
+     *  - @c write_conflict_k A merge of @p id may have folded a version above @p stamp already.
+     *  - @c unsupported_k The collection is keyed otherwise, by whole strings.
+     */
+    status_t pin_feed(any_collection_id_t const& id, pin_t& pin, transaction_stamp_t stamp) noexcept {
+        reader_t const inside = ledger_.epochs().enter();
+        collection_entry_t* const found = entry_at_(id);
+        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+        return std::visit(
+            [&]<typename store_type_>(store_type_& collection) noexcept -> status_t {
+                if constexpr (keyed_by_database<store_type_>()) return collection.pin_feed(pin, stamp);
+                else return {status_code_t::unsupported_k, "A collection keyed by strings feeds no changes"};
+            },
+            found->held);
+    }
+
+    /**
+     *  @brief Hands @p visitor up to @p wanted changes committed to @p id after @p after, oldest
+     *      first and a commit's by key, as @c nvme_store::changes_after does, the version a merge
+     *      kept for a pinned feed included.
+     *  @param[in] visitor Called as <tt>visitor(change, value_bytes, read)</tt> inside the epochs, so it
+     *      must not block.
+     */
+    template <typename visitor_type_>
+    status_t changes_after(any_collection_id_t const& id, stored_change_t const& after, std::size_t wanted,
+                           visitor_type_&& visitor, std::size_t thread_index = outside_executor_k) noexcept {
+        reader_t const inside = ledger_.epochs().enter(thread_index);
+        collection_entry_t const* const found = entry_at_(id);
+        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+        auto [channel, acquire_status] = channels_->acquire(thread_index);
+        if (acquire_status.failed()) return acquire_status;
+        return std::visit(
+            [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
+                if constexpr (keyed_by_database<store_type_>())
+                    return collection.changes_after(channel.channel(), after, wanted, visitor, thread_index);
+                else return {status_code_t::unsupported_k, "A collection keyed by strings feeds no changes"};
             },
             found->held);
     }
@@ -1423,7 +1509,7 @@ class basic_database {
                 st::assume_reserved, keyed_delta<stored_key_t> {stored_key, delta});
         });
         return seal_into_(collection_id, sealed, [&](auto const& collection) noexcept {
-            return collection.seal(std::span<keyed_delta<stored_key_t>> {deltas});
+            return collection.seal(std::span<keyed_delta<stored_key_t>> {deltas}, written.ranges(collection_id));
         });
     }
 
@@ -1577,16 +1663,19 @@ class basic_database {
      *  @param[in] stamp A stamp a pinned snapshot holds, whose versions every merge keeps.
      *  @param[in] progress Called as <tt>progress(placed_bytes, total_bytes)</tt> after every run;
      *      @c false cancels the save, which gives back every run it placed and publishes nothing.
+     *  @param[in] digester Steps a SHA-256 state, as <tt>init(state)</tt>, <tt>update(state,
+     *      bytes)</tt> and <tt>digest(state)</tt>, over every run's bytes.
      *  @return What the save placed, or @c cancelled_k, or the status that stopped it, with the
      *      target as it was.
      *
      *  Runs the target holds already under the same ID and length are kept, so a second save of a
      *  database writes only the runs written since; runs the target's previous manifest named and
-     *  this one does not are given back after it.
+     *  this one does not are given back after it. The target's manifest names the SHA-256 of
+     *  every run, hashed as it is copied, or read back once it is linked or kept.
      */
-    template <typename progress_type_>
-    expected<archive_report_t> save(volume_config_t const& target, transaction_stamp_t stamp,
-                                    progress_type_&& progress) noexcept {
+    template <typename progress_type_, typename digester_type_>
+    expected<archive_report_t> save(volume_config_t const& target, transaction_stamp_t stamp, progress_type_&& progress,
+                                    digester_type_ const& digester) noexcept {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         io_channel_t& channel = claimed->channel();
@@ -1630,8 +1719,9 @@ class basic_database {
         archive_report_t report;
         status_t failure;
         for (placed_file_t const& source : sources) {
+            sha256_t digest {};
             auto [extent, place_status] = place_run_(into, channel, writing.channel(), source, held_by_run, report,
-                                                     placed);
+                                                     placed, digester, digest);
             if (place_status.failed()) {
                 failure = place_status;
                 break;
@@ -1639,6 +1729,7 @@ class basic_database {
             manifest_file_t file = source.file;
             file.offset = extent.extent.offset;
             file.medium = extent.data_directory;
+            file.sha256 = digest;
             [[maybe_unused]] st::status_t const named = manifest.files.push_back(st::assume_reserved, std::move(file));
             placed_bytes += source.extent.extent.length;
             if (!progress(placed_bytes, total_bytes)) {
@@ -2190,16 +2281,25 @@ class basic_database {
      *  @param[in,out] placed Every extent this save placed, which a cancelled or failed
      *      save gives back.
      */
+    template <typename digester_type_>
     expected<medium_extent_t> place_run_(volume_t& into, io_channel_t& reading, io_channel_t& writing,
                                          placed_file_t const& source,
                                          st::vector<manifest_file_t const*> const& held_by_run,
-                                         archive_report_t& report, st::vector<medium_extent_t>& placed) noexcept {
+                                         archive_report_t& report, st::vector<medium_extent_t>& placed,
+                                         digester_type_ const& digester, sha256_t& digest) noexcept {
         manifest_file_t const* const* const found = std::lower_bound(
             held_by_run.begin(), held_by_run.end(), source.file.run,
             [](manifest_file_t const* file, uuid_t const& run) noexcept { return file->run < run; });
         if (found != held_by_run.end() && (*found)->run == source.file.run && (*found)->bytes == source.file.bytes) {
             ++report.kept;
-            return into.open(**found);
+            auto [extent, open_status] = into.open(**found);
+            if (open_status.failed()) return open_status;
+            digest = (*found)->sha256;
+            if (!digest.empty()) return extent;
+            if (status_t const hashed = move_extent_(reading, nullptr, extent, nullptr, digester, digest);
+                hashed.failed())
+                return hashed;
+            return extent;
         }
         char from[path_max_bytes_k], to[path_max_bytes_k];
         if (volume_->file_path(source.extent.data_directory, source.file.run, from).succeeded() &&
@@ -2212,36 +2312,81 @@ class basic_database {
             if (open_status.failed()) return open_status;
             [[maybe_unused]] st::status_t const tracked = placed.push_back(st::assume_reserved,
                                                                            medium_extent_t {extent});
+            // A copy across filesystems is a copy all the same, so the landed bytes are hashed.
+            if (status_t const hashed = move_extent_(reading, nullptr, extent, nullptr, digester, digest);
+                hashed.failed())
+                return hashed;
             ++report.linked;
             return extent;
         }
         auto [extent, allocate_status] = into.allocate(source.file.run, source.extent.extent.length);
         if (allocate_status.failed()) return allocate_status;
         [[maybe_unused]] st::status_t const tracked = placed.push_back(st::assume_reserved, medium_extent_t {extent});
-        if (status_t const copied = copy_extent_(reading, writing, source.extent, extent); copied.failed())
+        if (status_t const copied = move_extent_(reading, &writing, source.extent, &extent, digester, digest);
+            copied.failed())
             return copied;
         ++report.written;
         return extent;
     }
 
-    /** Reads @p from on @p reading into @p into on @p writing, a block per request, each pipeline
-     *  at its channel's full depth; two channels, since a pipeline polling a shared queue pair
-     *  would reap the other's completions. */
-    status_t copy_extent_(io_channel_t& reading, io_channel_t& writing, medium_extent_t const& from,
-                          medium_extent_t const& into) noexcept {
+    /** Hashes the run @p file names, opened at @p extent, where the manifest names its SHA-256 and
+     *  @p digester checks runs, refusing one whose bytes differ. */
+    template <typename digester_type_>
+    status_t verify_run_(io_channel_t& channel, manifest_file_t const& file, medium_extent_t const& extent,
+                         digester_type_ const& digester) noexcept {
+        if constexpr (std::is_same_v<digester_type_, unverified_runs_t>) return {};
+        else {
+            if (file.sha256.empty()) return {};
+            sha256_t digest {};
+            if (status_t const hashed = move_extent_(channel, nullptr, extent, nullptr, digester, digest);
+                hashed.failed())
+                return hashed;
+            if (!(digest == file.sha256))
+                return {status_code_t::malformed_k, "A run's bytes differ from the SHA-256 its manifest names"};
+            return {};
+        }
+    }
+
+    /** Blocks a copy reads ahead of the oldest one not yet hashed, whose bytes wait in order. */
+    static constexpr std::size_t hashed_window_k = 32;
+
+    /**
+     *  @brief Reads @p from on @p reading, a block per request at the channel's full depth, into
+     *      @p into on @p writing where both are given, hashing the bytes in order into @p digest.
+     *
+     *  Two channels, since a pipeline polling a shared queue pair would reap the other's
+     *  completions. Blocks complete in any order, so one ahead of the oldest unhashed block waits
+     *  in a window of @c hashed_window_k blocks, which bounds how far the reads run ahead.
+     */
+    template <typename digester_type_>
+    status_t move_extent_(io_channel_t& reading, io_channel_t* writing, medium_extent_t const& from,
+                          medium_extent_t const* into, digester_type_ const& digester, sha256_t& digest) noexcept {
         disk_t& disk = volume_->disk();
         auto [reader_lease, reader_lease_status] = reading.lease();
         if (reader_lease_status.failed()) return reader_lease_status;
-        auto [writer_lease, writer_lease_status] = writing.lease();
-        if (writer_lease_status.failed()) return writer_lease_status;
         basic_read_pipeline<disk_t> reader {disk, std::move(reader_lease), from.medium};
-        basic_write_pipeline<disk_t, waiter_type_> writer {disk, std::move(writer_lease), into.medium};
-        std::uint64_t const reading_bytes = reading.requests().buffer_bytes();
-        std::uint64_t const writing_bytes = writing.requests().buffer_bytes();
-        std::uint64_t const block_bytes = round_down_to_multiple<std::uint64_t>(
-            reading_bytes < writing_bytes ? reading_bytes : writing_bytes, portable_alignment_k);
+        std::optional<basic_write_pipeline<disk_t, waiter_type_>> writer;
+        std::uint64_t block_bytes = reading.requests().buffer_bytes();
+        if (writing) {
+            auto [writer_lease, writer_lease_status] = writing->lease();
+            if (writer_lease_status.failed()) return writer_lease_status;
+            writer.emplace(disk, std::move(writer_lease), into->medium);
+            if (writing->requests().buffer_bytes() < block_bytes) block_bytes = writing->requests().buffer_bytes();
+        }
+        block_bytes = round_down_to_multiple<std::uint64_t>(block_bytes, portable_alignment_k);
         if (block_bytes == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
         std::uint64_t const blocks = divide_round_up(from.extent.length, block_bytes);
+
+        st::vector<byte_t, constrained_allocator<byte_t, atomic_reference_>> waiting {
+            constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint}};
+        st::vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>> waiting_bytes {
+            constrained_allocator<std::uint64_t, atomic_reference_> {resources_->memory_constraint}};
+        if (waiting.resize(hashed_window_k * block_bytes) != st::status_t::success_k ||
+            waiting_bytes.resize(hashed_window_k, 0) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room for the blocks a hash waits on"};
+        sz_sha256_state_t state;
+        digester.init(state);
+        std::uint64_t hashed = 0;
 
         status_t carried;
         auto sink = [&](utilities::completed_buffer_t const& completed) noexcept {
@@ -2250,21 +2395,38 @@ class basic_database {
                 carried = whole;
                 return;
             }
-            auto [block, acquire_status] = writer.acquire_buffer_or_poll();
+            std::uint64_t const block = completed.tag;
+            if (block == hashed) {
+                digester.update(state, completed.bytes);
+                ++hashed;
+                for (std::size_t slot = hashed % hashed_window_k; waiting_bytes[slot] != 0;
+                     slot = hashed % hashed_window_k) {
+                    digester.update(state,
+                                    std::span<byte_t const> {waiting.data() + slot * block_bytes, waiting_bytes[slot]});
+                    waiting_bytes[slot] = 0;
+                    ++hashed;
+                }
+            }
+            else {
+                std::size_t const slot = block % hashed_window_k;
+                std::memcpy(waiting.data() + slot * block_bytes, completed.bytes.data(), completed.bytes.size());
+                waiting_bytes[slot] = completed.bytes.size();
+            }
+            if (!writer) return;
+            auto [buffer, acquire_status] = writer->acquire_buffer_or_poll();
             if (acquire_status.failed()) {
                 carried = acquire_status;
                 return;
             }
-            std::memcpy(block.bytes().data(), completed.bytes.data(), completed.bytes.size());
-            std::uint64_t const offset = std::uint64_t {completed.tag} * block_bytes;
-            if (status_t const queued = writer.enqueue_write(std::move(block),
-                                                             into.slice(offset, completed.bytes.size()));
+            std::memcpy(buffer.bytes().data(), completed.bytes.data(), completed.bytes.size());
+            if (status_t const queued = writer->enqueue_write(std::move(buffer),
+                                                              into->slice(block * block_bytes, completed.bytes.size()));
                 queued.failed())
                 carried = queued;
-            else if (status_t const submitted = writer.submit(); submitted.failed()) carried = submitted;
+            else if (status_t const submitted = writer->submit(); submitted.failed()) carried = submitted;
         };
         for (std::uint64_t next = 0; next != blocks && carried.succeeded();) {
-            while (next != blocks && reader.can_enqueue()) {
+            while (next != blocks && next < hashed + hashed_window_k && reader.can_enqueue()) {
                 std::uint64_t const offset = next * block_bytes;
                 std::uint64_t const chunk = from.extent.length - offset < block_bytes ? from.extent.length - offset
                                                                                       : block_bytes;
@@ -2279,7 +2441,9 @@ class basic_database {
         }
         if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
         if (carried.failed()) return carried;
-        return writer.poll_all_completions();
+        if (hashed != blocks) return {status_code_t::internal_k, "A copy hashed fewer blocks than it read"};
+        digest = digester.digest(state);
+        return writer ? writer->poll_all_completions() : status_t {};
     }
 
     /** Lays the manifest out as JSON into @p json, promising every commit at or
@@ -2370,7 +2534,8 @@ class basic_database {
 
     /** Opens every collection the manifest names, drops the versions a crash tore and publishes the
      *  collections, which a mount does once, leaving nothing published when it fails. */
-    status_t open_manifest_() noexcept {
+    template <typename digester_type_>
+    status_t open_manifest_(digester_type_ const& digester) noexcept {
         // Every executor thread with a channel of its own reads on an epoch slot of its own too.
         if (status_t const reserved = ledger_.epochs().reserve_threads(channels_->executor_channels());
             reserved.failed())
@@ -2379,7 +2544,7 @@ class basic_database {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         std::uint64_t const durable_stamp = volume_->manifest().durable_stamp;
-        if (status_t const adopted = adopt_manifest_(claimed->channel()); adopted.failed()) return adopted;
+        if (status_t const adopted = adopt_manifest_(claimed->channel(), digester); adopted.failed()) return adopted;
 
         // The stamps continue above the durable stamp, and every version above it is a commit a
         // crash tore, which is dropped before anything draws a stamp; resuming first is what lets
@@ -2404,7 +2569,8 @@ class basic_database {
 
     /** Opens every collection and the user data the manifest the volume read names, each collection
      *  over its runs in the order the manifest lists them. */
-    status_t adopt_manifest_(io_channel_t& channel) noexcept {
+    template <typename digester_type_>
+    status_t adopt_manifest_(io_channel_t& channel, digester_type_ const& digester) noexcept {
         manifest_t const& loaded = volume_->manifest();
         std::size_t const collections = loaded.collections.size();
         // A counting sort by collection keeps every collection's runs in the manifest's order.
@@ -2421,6 +2587,8 @@ class basic_database {
                     return {status_code_t::malformed_k, "The manifest names the user data twice"};
                 auto [opened, open_status] = volume_->open(file);
                 if (open_status.failed()) return open_status;
+                if (status_t const verified = verify_run_(channel, file, opened, digester); verified.failed())
+                    return verified;
                 user_data_run_ = file.run;
                 user_data_ = opened;
                 user_data_bytes_ = file.bytes;
@@ -2434,6 +2602,8 @@ class basic_database {
             if (file.collection == manifest_no_collection_k) continue;
             auto [opened, open_status] = volume_->open(file);
             if (open_status.failed()) return open_status;
+            if (status_t const verified = verify_run_(channel, file, opened, digester); verified.failed())
+                return verified;
             lsm_tree_run_record_t& record = runs[starts[file.collection]++];
             record.level_number = file.level;
             record.content_id = file.run;

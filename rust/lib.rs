@@ -217,12 +217,13 @@ pub use arrow::{ArrowArray, ArrowArrayStream, ArrowSchema, IngestOrder};
 pub use blobs::{Cursor, Entry, Measurement, Page, Scanned, Values};
 pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{
-    gpu_devices, key_unknown, version, Admission, Arena, Blocking, CPUClass, CaseSensitivity, CollectionID,
+    gpu_devices, key_unknown, version, Admission, Arena, Blocking, CPUClass, CaseSensitivity, ChangeKind, Changes,
+    ChangesCursor, CollectionID,
     Collections, CommitStamp, DataDirectory, Database, Deferred, DeferredView, Deferring, Description, DropMode,
-    Durability, Engine, Error, Executor, Gds, GPUClass, GPUDevice, GPUVendor, IOOptions, Isolation, Key,
+    Durability, Engine, Error, Executor, Gds, GPUClass, GPUDevice, GPUVendor, IOOptions, Isolation, Key, KeyRange,
     LevelDBOptions, Matching, Modality, Mood, NVMEOptions, PatternKind, PredicateCallback, PredicateCost,
-    ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions, Snapshot, Status, Tape, Transaction, Transport,
-    View, Wait, Watch, UUID,
+    ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions, ScanDirection, Snapshot, Status, Tape,
+    Transaction, Transport, View, Wait, Watch, UUID,
 };
 pub use docs::{
     Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, Document, DocumentEntry, FieldAddress, FieldEntry,

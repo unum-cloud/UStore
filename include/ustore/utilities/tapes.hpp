@@ -74,4 +74,20 @@ void assemble_tape(std::size_t count, sources_type_ const& sources, std::span<of
     }
 }
 
+/** Fixed-width rows @c stride bytes apart, like the source, target and edge keys of an edge tape,
+ *  and the dense run a de-interleave copies them into, one row after another. */
+struct strided_rows_t {
+    std::byte const* source = nullptr;
+    std::uint64_t stride = 0;
+    std::uint64_t row_bytes = 0;
+    std::uint64_t rows = 0;
+    std::byte* dense = nullptr;
+};
+
+/** Copies row @p row of @p rows into its dense place, as host and devices de-interleave alike. */
+constexpr void densify_row(strided_rows_t const& rows, std::uint64_t row) noexcept {
+    for (std::uint64_t byte = 0; byte != rows.row_bytes; ++byte)
+        rows.dense[row * rows.row_bytes + byte] = rows.source[row * rows.stride + byte];
+}
+
 } // namespace unum::ustore::utilities

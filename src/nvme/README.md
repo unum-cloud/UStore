@@ -51,6 +51,11 @@ Levels differ by depth:
 - Intermediate levels keep their sorted runs sorted, and still hold remove deltas, whose kind shadows older values beneath them.
 - The bottom level is sorted too, and compaction into it drops remove deltas for good.
 
+A range removal lands as one range tombstone beside the run's deltas, never as a removal per key, as RocksDB's `DeleteRange` and ScyllaDB's range tombstones do.
+A tombstone hides every older version of the keys from its start up to its exclusive end: in memory runs by stamp, and in the levels by position, a tombstone hiding the versions of deeper levels, of older runs of level 0 and of its own run stamped below it, since merges raise version stamps to the floor and tombstones keep theirs.
+A read checks the tombstones of the runs above the version it found, a scan skips the keys they hide, and a run's key bounds cover its tombstones, so the runs of one level stay disjoint and a merge picks every run a tombstone reaches.
+A merge drops the versions a tombstone hides from every reader, keeping those a pinned reader still reads, cuts the tombstone at the bounds of the runs it writes, and drops it at the bottom once no reader reads below it; a merge carrying tombstones runs on the CPU.
+
 Level 0 admits `level_enlarge_factor` runs of one flush each, and every deeper level `level_enlarge_factor` times the bytes of the one above, so no level size is configured on its own.
 Level 0 is due for compaction at that many sorted runs or at that many flushes' worth of memory-run bytes, whichever comes first.
 A tree refuses to mount with a factor outside `[level_min_enlarge_factor_k, level_max_enlarge_factor_k]`, the bounds a collection's configuration is validated against.
@@ -127,7 +132,8 @@ Commits are ordered by the stamps the ledger issues, which keeps a transaction t
 - The executor of `ustore_executor_for_nvme` names the transport, the channels and their buffers, and the VRAM executor compactions run on, read once at the open; any other executor and none keep the defaults.
 - The `_collections` and `_names` system collections live under two UUIDs no UUIDv7 spells, which every call refuses as unknown, as it does the nil UUID; every other collection carries the UUIDv7 its create minted.
 - A read measures a key and copies its value into the call's scratch, measuring again when the value changed its width in between.
-- A scan, a sample and a measurement walk one collection's runs and memory runs under the database's claim, binary-searching each run for the start key, and merge a transaction's own writes over them.
+- A scan, a sample and a measurement walk one collection's runs and memory runs under the database's claim, binary-searching each run for the start key, and merge a transaction's own writes over them; a descending scan walks its range ascending and keeps the last keys of the page.
+- A range removal of blobs, documents, whole pages, graph vertices or strings is one range tombstone per range in the commit, a range of strings bounded by whole strings and reaching past the last one for an empty end.
 - A snapshot pins a stamp, holds no level set and stalls no writer; reads, scans and collection lookups through it answer at that stamp, a drop leaves the runs of a dropped collection until the last snapshot goes, and a save writes a database of this engine with every collection as the snapshot reads it.
 - With keys watched, committed transactions are strictly serializable in stamp order; with none watched they read one snapshot and the last writer wins; the description reports `ustore_isolation_snapshot_k`.
 - A write that leaves a level due compacts it on the writing thread, and `ustore_database_compact` flushes every collection before merging what is due.
@@ -168,6 +174,9 @@ The ring is exposed rather than hidden behind a blocking read because a blocking
   One thread at depth 256 reads about 500 K random 4 KB blocks a second on a 6.8 kernel, where `pread` reads 14 K.
 - __`linux_spdk_k`__ — `linux_spdk_disk_t`, the user-space NVMe driver behind `USTORE_WITH_SPDK`.
   Its probe reads `/proc/meminfo` and the driver binding first, because `rte_eal_init` can otherwise call `exit` on the whole process.
+  The environment comes up once per process and is never torn down, and a forked child must not touch it, since DPDK is not fork-safe.
+  Multi-process DPDK, with a primary and secondaries, is out of scope.
+  Queue pairs belong to the disk, which holds a controller share for its whole life. An unmount releases the channels' queue pairs first, and the disk's `release` then frees the rest before it gives back its namespaces and its share, so no queue pair outlives its controller.
 - __`memory_k`__ — `memory_disk_t`, volumes in memory for tests and benchmarks.
 - __`automatic_k`__ — io_uring where the kernel allows it, Linux AIO where it refuses a ring, the blocking floor where it offers neither.
   What the mount settled on is reported back rather than inferred.
@@ -200,6 +209,7 @@ A dispatch blocks until all its threads return and admits one caller at a time, 
 - An edge write appends one change delta per endpoint rather than rewriting either, so two transactions adding edges to one vertex both commit.
 - Reads, memory merges, flushes and compactions fold the deltas into the value through the fold path every store shares, and a merge holding a change runs on the CPU.
 - A removed vertex is a removal of its key, and its neighbors take a change removing the half-edges they filed of it.
+- A removed range of vertices is one range tombstone, and only the neighbors outside the range take those changes.
 
 Every store serves the modalities its fold folds, so a graph of variable-width values lands in this one, and a graph of any other width is refused, as no store keeps it.
 `src/nvme/graph.hpp` serves the graph calls of the C ABI over it, batching the vertices of a run of tasks on one collection into one select.

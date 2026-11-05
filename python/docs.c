@@ -646,14 +646,19 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* arguments, P
 }
 
 char const doc_docs_remove[] =                                                                  //
-    "docs_remove(keys, *, collection, durability=Durability.BUFFERED) answers None.\n"          //
+    "docs_remove(keys, *, collection, ends=None, durability=Durability.BUFFERED)\n"             //
+    "answers None.\n"                                                                           //
     "\n"                                                                                        //
     "Removes a batch of whole documents, or one given on its own; a patch or a merge removes\n" //
-    "fields inside them instead.\n"                                                             //
+    "fields inside them instead. With `ends`, every key starts a range of documents removed\n"  //
+    "up to its end, as `remove` takes them.\n"                                                  //
     "\n"                                                                                        //
     "Args:\n"                                                                                   //
-    "  keys (KeyLike | Sequence[KeyLike] | buffer): The keys of the documents to remove.\n"     //
+    "  keys (KeyLike | Sequence[KeyLike] | buffer): The keys of the documents to remove, or\n"  //
+    "    the first key of every range.\n"                                                       //
     "  collection (UUID | str): The docs collection, by identifier or by name.\n"               //
+    "  ends (KeyLike | Sequence[KeyLike] | buffer, optional): The key every range stops\n"      //
+    "    before, one per key.\n"                                                                //
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"      //
     "    returning.";
 
@@ -664,15 +669,18 @@ PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* arguments, 
     if (ustore_py_keyword_names_count_checked("docs_remove", positional_arguments_count, keyword_names_tuple, 1) < 0)
         return NULL;
 
+    static char const* const names[] = {"ends", NULL};
+    PyObject* ends = NULL;
     ustore_py_verb_options_t options;
-    if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
-                                             &options) != 0)
+    if (ustore_py_verb_keywords_from_arguments(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                               names, &options, &ends) != 0)
         return NULL;
 
     ustore_py_remove_call_t stack;
     ustore_py_remove_call_t* const call = ustore_py_call_open(&context, &ustore_py_remove_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_subscript(arguments[0], &call->keys) < 0)
+    if (ustore_py_keys_from_subscript(arguments[0], &call->keys) < 0 ||
+        ustore_py_ends_from_object(ends, &call->keys, &call->ends) != 0)
         return ustore_py_call_discard(&context, &ustore_py_remove_verb, call);
     return ustore_py_values_remove(&context, &options, ustore_modality_docs_k, call);
 }
@@ -929,22 +937,26 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py
 }
 
 char const doc_docs_scan[] =                                                                 //
-    "docs_scan(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)\n" //
+    "docs_scan(start, wanted, arena, *, collection, end=None,\n"                             //
+    "direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)\n"             //
     "answers a Keys tape.\n"                                                                 //
     "\n"                                                                                     //
-    "Lists up to `wanted` document keys from `start` upwards, as `scan` lists the keys of\n" //
-    "blobs. Documents are not exported, so a `docs_read` follows the scan.\n"                //
+    "Lists up to `wanted` document keys from `start` towards `end`, as `scan` lists the\n"   //
+    "keys of blobs. Documents are not exported, so a `docs_read` follows the scan.\n"        //
     "\n"                                                                                     //
     "Args:\n"                                                                                //
-    "  start (KeyLike): The smallest key the scan may return.\n"                             //
+    "  start (KeyLike | None): The first key the scan may return, or None for the first\n"   //
+    "    key in its direction.\n"                                                            //
     "  wanted (int): Most keys the scan returns.\n"                                          //
     "  arena (Arena): Where the keys land, rewound by this call.\n"                          //
     "  collection (UUID | str): The docs collection, by identifier or by name.\n"            //
+    "  end (KeyLike, optional): The key the scan stops before, or None for no bound.\n"      //
+    "  direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.\n" //
     "  mode (ScanMode, optional): In what order the keys come, as `scan` takes it.\n"        //
     "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"      //
     "    finished and the scans in all; a falsy answer other than None cancels the call.\n"  //
     "Returns:\n"                                                                             //
-    "  Keys: One run of keys, in ascending order.\n"                                         //
+    "  Keys: One run of keys, in the order of the direction.\n"                              //
     "Raises:\n"                                                                              //
     "  CancelledError: The progress callable stopped the scan.";
 
@@ -971,6 +983,19 @@ PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* arguments, 
                                     PyObject* keyword_names_tuple) {
     return ustore_py_api_sample_of(self, arguments, positional_arguments_count, keyword_names_tuple, "docs_sample",
                                    ustore_modality_docs_k);
+}
+
+char const doc_docs_measure[] =                                                                 //
+    "docs_measure(start, end, arena, *, collection, direction=ScanDirection.ASCENDING)\n"       //
+    "answers a Measurement.\n"                                                                  //
+    "\n"                                                                                        //
+    "Estimates what a range of document keys holds without walking it, as `measure` does for\n" //
+    "blobs.";
+
+PyObject* ustore_py_api_docs_measure(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple) {
+    return ustore_py_api_measure_of(self, arguments, positional_arguments_count, keyword_names_tuple, "docs_measure",
+                                    ustore_modality_docs_k);
 }
 
 #pragma endregion Reads

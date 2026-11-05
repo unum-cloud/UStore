@@ -19,6 +19,7 @@
 #include <optional>    // `std::optional`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
+#include <utility>     // `std::as_const`
 #include <vector>      // `std::vector`
 
 #include <fmt/format.h>
@@ -444,6 +445,92 @@ std::size_t arrow_converters(config_t const&) {
     return failures;
 }
 
+/** Gathered columns export with their validities: numbers and binary strings in place, booleans
+ *  packed into bits, and strings without the null byte ending every row. */
+std::size_t arrow_docs_columns_export(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t fixture {config};
+    if (!fixture.database) return failures + 1;
+    ustore_collection_id_t const collection = fixture.create("scientists", ustore_modality_docs_k);
+    std::array<ustore_key_t, 10> keys {};
+    std::array<char[64], 10> texts {};
+    std::array<std::string_view, 10> documents {};
+    for (std::size_t row = 0; row != keys.size(); ++row) {
+        keys[row] = key_from_integer(row + 1);
+        char* const end = row == 4 ? fmt::format_to(texts[row], R"({{"born": "unknown"}})")
+                                   : fmt::format_to(texts[row], R"({{"alive": {}, "born": {}, "name": "n{}"}})",
+                                                    row % 3 == 0, 1900 + row, row);
+        documents[row] = {texts[row], end};
+    }
+    strided_strings<std::string_view> const values {strided(std::as_const(documents)).begin()};
+    ustore_outcome_t outcome {};
+    ustore_docs_write_t write {.database = fixture.database,
+                               .outcome = &outcome,
+                               .count = keys.size(),
+                               .collections = {&collection, 0},
+                               .keys = {keys.data(), sizeof(ustore_key_t)},
+                               .values = values.view()};
+    ustore_docs_write(&write);
+    if ((failures += expect_success(outcome))) return failures;
+
+    std::array<std::string_view, 4> const fields {"alive", "born", "name", "name"};
+    strided_strings<std::string_view> const fields_strings {strided(fields).begin()};
+    std::array<ustore_docs_field_type_t, 4> const types {ustore_docs_field_type_bool_k, ustore_docs_field_type_u32_k,
+                                                         ustore_docs_field_type_string_k,
+                                                         ustore_docs_field_type_binary_k};
+    ustore_arena_t arena = nullptr;
+    ustore_arena_init_t made {.arena = &arena, .outcome = &outcome};
+    ustore_arena_init(&made);
+    ustore_docs_column_view_t const* columns = nullptr;
+    ustore_docs_gather_t gather {.database = fixture.database,
+                                 .outcome = &outcome,
+                                 .count = keys.size(),
+                                 .collections = {&collection, 0},
+                                 .keys = {keys.data(), sizeof(ustore_key_t)},
+                                 .fields_count = fields.size(),
+                                 .fields = fields_strings.view(),
+                                 .columns = &columns,
+                                 .arena = arena,
+                                 .outputs_types = types.data()};
+    ustore_docs_gather(&gather);
+    if ((failures += expect_success(outcome))) return failures;
+
+    std::array<ArrowSchema, 4> schemas {};
+    std::array<ArrowDeviceArray, 4> arrays {};
+    for (std::size_t field = 0; field != fields.size(); ++field) {
+        failures += expect_eq(ustore_docs_column_view_to_arrow(&columns[field], keys.size(), types[field], arena,
+                                                               &schemas[field], &arrays[field]),
+                              ustore_status_success_k);
+        failures += expect(arrays[field].array.buffers[0] == columns[field].validities);
+        failures += expect_eq(arrays[field].array.null_count, -1);
+    }
+    failures += expect_eq(std::string_view(schemas[0].format), std::string_view("b"));
+    failures += expect_eq(std::string_view(schemas[1].format), std::string_view("I"));
+    failures += expect_eq(std::string_view(schemas[2].format), std::string_view("u"));
+    failures += expect_eq(std::string_view(schemas[3].format), std::string_view("z"));
+    failures += expect(arrays[1].array.buffers[1] == columns[1].scalars);
+    auto const* const alive = static_cast<std::uint8_t const*>(arrays[0].array.buffers[1]);
+    auto const* const names = static_cast<std::uint32_t const*>(arrays[2].array.buffers[1]);
+    auto const* const name_bytes = static_cast<char const*>(arrays[2].array.buffers[2]);
+    for (std::size_t row = 0; row != keys.size(); ++row) {
+        if (row == 4) continue;
+        char name[8];
+        failures += expect_eq(((alive[row / 8] >> (row % 8)) & 1u) != 0, row % 3 == 0);
+        failures += expect_eq(std::string_view(name_bytes + names[row], names[row + 1] - names[row]),
+                              std::string_view(name, fmt::format_to(name, "n{}", row)));
+    }
+    failures += expect_eq(names[5] - names[4], 0u);
+    failures += expect_eq(ustore_docs_column_view_to_arrow(&columns[0], keys.size(), ustore_docs_field_type_json_k,
+                                                           arena, &schemas[0], &arrays[0]),
+                          ustore_status_invalid_argument_k);
+    for (std::size_t field = 0; field != fields.size(); ++field) {
+        arrays[field].array.release(&arrays[field].array);
+        schemas[field].release(&schemas[field]);
+    }
+    ustore_arena_free(arena);
+    return failures;
+}
+
 /** A cursor's keys and values export in place, read back through the converters, pin the arena against the next
  *  call until released, and outlive the arena's free. */
 std::size_t arrow_exports_pin_the_arena(config_t const& config) {
@@ -504,7 +591,8 @@ std::size_t arrow_exports_pin_the_arena(config_t const& config) {
                                                     &every_other_schema, &every_other_array),
                           ustore_status_success_k);
     auto const* const carved = static_cast<ustore_key_t const*>(every_other_array.array.buffers[1]);
-    failures += expect(cell_of(carved[3]) == cell_of(keys[6]));
+    for (std::size_t row = 0; row != written / 2; ++row)
+        failures += expect(cell_of(carved[row]) == cell_of(keys[2 * row]));
     every_other_array.array.release(&every_other_array.array);
     every_other_schema.release(&every_other_schema);
 
@@ -857,6 +945,7 @@ int main(int argc, char** argv) {
 
     report(totals, "arrow.converters", arrow_converters, config);
     report(totals, "arrow.exports_pin_the_arena", arrow_exports_pin_the_arena, config);
+    report(totals, "arrow.docs_columns_export", arrow_docs_columns_export, config);
     report(totals, "arrow.ingest_per_engine", arrow_ingest_per_engine, config);
     report(totals, "arrow.ingest_equals_writes", arrow_ingest_equals_writes, config);
     report(totals, "arrow.ingest_last_repeat_wins", arrow_ingest_last_repeat_wins, config);

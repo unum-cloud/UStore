@@ -42,7 +42,7 @@
 #include "ustore/strings/nvme_store.hpp"               // `strings::nvme_store`, `nvme_transaction`, `strings_page_t`
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`, `join_path`, `path_max_bytes_k`, `remove_file`
 #include "ustore/utilities/nvme_mounts.hpp" // `resources_config_t`, `open_resources`, `mounted_storage`, `addresses_of`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growth_status`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_copy`, `growing_strings`, `growth_status`
 
 #include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `state_of`, `view_t`, `nvme_placement_of`
 #include "lib.hpp"                // `cpu_class_t`, `atomic_ref_for_cpu_class`, `waiter_of`, `strings_kit_of`
@@ -801,6 +801,20 @@ status_t write_value(call_access<cpu_class_> const& access, collection_id_t coll
                    : transaction.template insert<watch_schedule_t::never_k>(collection, key, bytes);
 }
 
+/** Removes every key of @p collection from @p start up to @p end, exclusive, as one range tombstone
+ *  the transaction of @p access commits, watching the range when it watches; the system
+ *  collections, which no transaction reaches, take no range. */
+template <cpu_class_t cpu_class_>
+status_t remove_key_range(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t start,
+                          stored_key_t end) noexcept {
+    if (!access.transaction) return {status_code_t::invalid_argument_k, "A range removal lands through a transaction"};
+    if (!(start < end)) return {};
+    database_transaction_of<cpu_class_>& transaction = *access.transaction;
+    return access.schedule != watch_schedule_t::never_k
+               ? transaction.template remove_range<watch_schedule_t::on_commit_k>(collection, start, end)
+               : transaction.template remove_range<watch_schedule_t::never_k>(collection, start, end);
+}
+
 /** One write of a transaction to its own key, which a walk merges with the store. */
 struct own_write_t {
     stored_key_t key;
@@ -809,15 +823,16 @@ struct own_write_t {
 };
 
 /**
- *  @brief Hands @p visitor every present key of @p collection from @p from up, as @p access sees it, in ascending
- *      order, as @c visitor(key, size) answering whether the walk carries on.
+ *  @brief Hands @p visitor every present key of @p collection from @p from up, or down for
+ *      @p direction descending, as @p access sees it, in that order, as <tt>visitor(key, size)</tt>
+ *      answering whether the walk carries on.
  *
  *  The store's walk holds the view it loaded, which a flush waits for, so @p visitor collects and calls nothing of the
  *  database.
  */
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t walk(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t from,
-              visitor_type_&& visitor) noexcept {
+              visitor_type_&& visitor, scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
     basic_database_of<cpu_class_>& store = *access.state.store;
     if (!access.transaction)
         return store.scan(
@@ -825,13 +840,18 @@ status_t walk(call_access<cpu_class_> const& access, collection_id_t collection,
             [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
                 return state != lookup_result_t::written_k || visitor(key, size);
             },
-            access.stamp, access.thread_index);
+            access.stamp, access.thread_index, direction);
+
+    bool const descending = direction == scan_direction_t::descending_k;
+    auto const before = [descending](stored_key_t const& first, stored_key_t const& second) noexcept {
+        return descending ? second < first : first < second;
+    };
 
     st::vector<own_write_t, arena_allocator<own_write_t>> own_writes {{access.scratch}};
     status_t listed;
     access.transaction->for_each_uncommitted(
         collection, [&](stored_key_t key, delta_kind_t kind, stored_value_size_t size) noexcept {
-            if (key < from || listed.failed()) return;
+            if (before(key, from) || listed.failed()) return;
             listed = growth_status(own_writes.push_back(own_write_t {key, size, kind}));
         });
     if (listed.failed()) return listed;
@@ -843,51 +863,82 @@ status_t walk(call_access<cpu_class_> const& access, collection_id_t collection,
         write.kind = folded ? delta_kind_t::write_k : delta_kind_t::remove_k;
         write.size = static_cast<stored_value_size_t>(folded.size());
     }
-    std::sort(own_writes.begin(), own_writes.end(),
-              [](own_write_t const& first, own_write_t const& second) noexcept { return first.key < second.key; });
+    std::sort(own_writes.begin(), own_writes.end(), [&](own_write_t const& first, own_write_t const& second) noexcept {
+        return before(first.key, second.key);
+    });
 
-    // The transaction's writes outrank the store's version of the same key, and its removals hide it
+    // The transaction's writes outrank the store's version of the same key, and its removals, alone
+    // or of a range, hide it
+    std::span<range_tombstone<stored_key_t> const> const own_ranges = access.transaction->uncommitted_ranges(
+        collection);
     std::size_t next = 0;
     bool carries_on = true;
     auto const emit_own = [&](own_write_t const& write) noexcept {
         if (write.kind != delta_kind_t::remove_k) carries_on = visitor(write.key, write.size);
         return carries_on;
     };
+    auto const removed_in_range = [&](stored_key_t const& key) noexcept {
+        for (range_tombstone<stored_key_t> const& range : own_ranges)
+            if (range.covers(key)) return true;
+        return false;
+    };
     // The store's side is what the transaction started at, which its reads of single keys answer too
     status_t const walked = store.scan(
         collection, from,
         [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
-            for (; next != own_writes.size() && own_writes[next].key < key; ++next)
+            for (; next != own_writes.size() && before(own_writes[next].key, key); ++next)
                 if (!emit_own(own_writes[next])) return false;
             if (next != own_writes.size() && own_writes[next].key == key) return emit_own(own_writes[next++]);
-            if (state != lookup_result_t::written_k) return true;
+            if (state != lookup_result_t::written_k || removed_in_range(key)) return true;
             carries_on = visitor(key, size);
             return carries_on;
         },
-        access.transaction->start_stamp(), access.thread_index);
+        access.transaction->start_stamp(), access.thread_index, direction);
     if (walked.failed()) return walked;
     for (; carries_on && next != own_writes.size(); ++next) emit_own(own_writes[next]);
     return {};
 }
 
-/** Collects into @p keys up to @p limit present keys of @p collection from @p from up, as @p access sees them. */
+/** Collects into @p keys up to @p limit present keys of @p collection from @p lower up to @p upper
+ *  inclusive, as @p access sees them. */
 template <cpu_class_t cpu_class_, typename keys_type_>
-status_t collect_keys(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t from,
-                      std::size_t limit, keys_type_& keys) noexcept {
+status_t collect_keys(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t lower,
+                      stored_key_t upper, std::size_t limit, keys_type_& keys) noexcept {
     status_t room;
-    status_t const walked = walk(access, collection, from, [&](stored_key_t key, stored_value_size_t) noexcept {
+    status_t const walked = walk(access, collection, lower, [&](stored_key_t key, stored_value_size_t) noexcept {
+        if (upper < key) return false;
         room = growth_status(keys.push_back(stored_key_t {key}));
         return room.succeeded() && keys.size() < limit;
     });
     return walked.failed() ? walked : room;
 }
 
-/** Collects into @p keys up to @p limit keys of @p collection from @p from up, walking each run on its own with no
- *  merge across them, as an unordered scan may list a key another run removed or repeats. Answers @c contended_k when
- *  a flush, a compaction or a merge rearranged the runs meanwhile, so the caller walks in order instead. */
+/** Collects into @p keys up to @p limit present keys of @p collection from @p upper down to
+ *  @p lower inclusive, as @p access sees them, largest first, walking the runs downwards, so a page
+ *  reads about its own keys per run. */
 template <cpu_class_t cpu_class_, typename keys_type_>
-status_t collect_keys_unordered(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t from,
-                                std::size_t limit, keys_type_& keys) noexcept {
+status_t collect_keys_descending(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t lower,
+                                 stored_key_t upper, std::size_t limit, keys_type_& keys) noexcept {
+    if (limit == 0) return {};
+    status_t room;
+    status_t const walked = walk(
+        access, collection, upper,
+        [&](stored_key_t key, stored_value_size_t) noexcept {
+            if (key < lower) return false;
+            room = growth_status(keys.push_back(stored_key_t {key}));
+            return room.succeeded() && keys.size() < limit;
+        },
+        scan_direction_t::descending_k);
+    return walked.failed() ? walked : room;
+}
+
+/** Collects into @p keys up to @p limit keys of @p collection from @p lower up to @p upper
+ *  inclusive, walking each run on its own with no merge across them, as an unordered scan may list
+ *  a key another run removed or repeats. Answers @c contended_k when a flush, a compaction or a
+ *  merge rearranged the runs meanwhile, so the caller walks in order instead. */
+template <cpu_class_t cpu_class_, typename keys_type_>
+status_t collect_keys_unordered(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t lower,
+                                stored_key_t upper, std::size_t limit, keys_type_& keys) noexcept {
     basic_database_of<cpu_class_>& store = *access.state.store;
     typename basic_database_of<cpu_class_>::pin_t pin;
     transaction_stamp_t const stamp = access.stamp == head_stamp_k ? store.ledger().pin_reader(pin) : access.stamp;
@@ -896,8 +947,9 @@ status_t collect_keys_unordered(call_access<cpu_class_> const& access, collectio
     status_t room;
     for (std::uint64_t run = 0; run != counted.count && keys.size() < limit; ++run) {
         status_t const walked = store.scan_run(
-            collection, counted, run, from,
+            collection, counted, run, lower,
             [&](stored_key_t key, lookup_result_t state, stored_value_size_t) noexcept {
+                if (upper < key) return false;
                 if (state == lookup_result_t::removed_k) return true;
                 room = growth_status(keys.push_back(stored_key_t {key}));
                 return room.succeeded() && keys.size() < limit;
@@ -1233,20 +1285,90 @@ status_t walk_strings(call_access<cpu_class_> const& access, collection_id_t col
     }
 }
 
+/** Hands @p visitor every string of @p collection starting with @p prefix and below @p below, or
+ *  all of them for an empty @p below, largest first, as @c walk_strings does upwards, reading one
+ *  page per run at a time. */
+template <cpu_class_t cpu_class_, typename visitor_type_>
+status_t walk_strings_down(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view prefix,
+                           std::string_view below, transaction_stamp_t stamp, visitor_type_&& visitor) noexcept {
+    typename basic_database_of<cpu_class_>::pin_t pin;
+    if (stamp == head_stamp_k) stamp = access.state.store->ledger().pin_reader(pin);
+    strings_page_t page;
+    st::vector<char> until;
+    if (until.resize(below.size()) != st::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "A walk could not hold where it starts"};
+    if (!below.empty()) std::memcpy(until.data(), below.data(), below.size());
+    for (;;) {
+        std::string_view const resumed {until.begin(), until.end()};
+        if (status_t const read = visit_strings(access, collection,
+                                                [&](auto const& store) noexcept {
+                                                    return store.read_page_down(prefix, resumed, stamp,
+                                                                                access.thread_index, page);
+                                                });
+            read.failed())
+            return read;
+        for (std::size_t index = 0; index != page.size(); ++index)
+            if (!visitor(page.text(index), page.listed[index].state, page.listed[index].value)) return {};
+        if (page.size() != strings_page_k) return {};
+        // No string sits below the empty one, and an empty bound would mean none at all.
+        std::string_view const last = page.text(page.size() - 1);
+        if (last.empty()) return {};
+        if (until.resize(last.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A walk could not hold where it resumes"};
+        std::memcpy(until.data(), last.data(), last.size());
+    }
+}
+
+/** The strings one task of a strings call names: those starting with @c prefix, from @c start,
+ *  inclusive, towards @c end, exclusive, in @c direction, where an empty start begins at the first
+ *  string in the direction and an empty end bounds nothing. */
+struct strings_window_t {
+    std::string_view prefix;
+    std::string_view start;
+    std::string_view end;
+    ustore_scan_direction_t direction = ustore_scan_ascending_k;
+
+    /** The least string of the window, or of the prefix where the window names none. */
+    [[nodiscard]] std::string_view lower() const noexcept {
+        std::string_view const bound = direction == ustore_scan_descending_k ? end : start;
+        return std::max(bound, prefix);
+    }
+
+    /** The string the window stops at, exclusive for an ascending window and inclusive for a
+     *  descending one, or empty for none. */
+    [[nodiscard]] std::string_view upper() const noexcept {
+        return direction == ustore_scan_descending_k ? start : end;
+    }
+
+    /** Whether @p text, prefixed and not below @c lower, lies past the window's upper end. */
+    [[nodiscard]] bool past(std::string_view text) const noexcept {
+        std::string_view const bound = upper();
+        if (bound.empty()) return false;
+        return direction == ustore_scan_descending_k ? bound < text : !(text < bound);
+    }
+
+    /** Whether @p text is the exclusive end a descending window starts above. */
+    [[nodiscard]] bool skips(std::string_view text) const noexcept {
+        return direction == ustore_scan_descending_k && !end.empty() && text == end;
+    }
+};
+
 /**
- *  @brief Appends to @p outputs up to @p limit strings of @p collection starting with @p prefix,
- *      from @p start on, as @p access sees them: a transaction's own writes merged in, its removals
- *      hiding the store's strings.
- *
- *  A watching transaction watches what the walk covered, a range up to the last string listed for a full page and to
- *  the end of the prefix otherwise, so a commit landing a string inside it conflicts, the strings it found none of
- *  included.
+ *  @brief Hands @p visitor every present string of @p window in @p collection, smallest first, or
+ *      largest first in @p order descending, as @p access sees them: a transaction's own writes
+ *      merged in, its removals hiding the store's strings.
+ *  @param[in] visitor Called as @c visitor(text) answering whether the walk carries on; the text
+ *      lives until it returns.
  */
-template <cpu_class_t cpu_class_>
-status_t scan_strings(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view prefix,
-                      std::string_view start, std::size_t limit, strings_scan_outputs_t& outputs) noexcept {
-    if (limit == 0) return {};
-    std::string_view const lower = std::max(start, prefix);
+template <cpu_class_t cpu_class_, typename visitor_type_>
+status_t walk_window_strings(call_access<cpu_class_> const& access, collection_id_t collection,
+                             strings_window_t const& window, visitor_type_&& visitor,
+                             scan_direction_t order = scan_direction_t::ascending_k) noexcept {
+    std::string_view const lower = window.lower();
+    bool const descending = order == scan_direction_t::descending_k;
+    auto const before = [descending](std::string_view first, std::string_view second) noexcept {
+        return descending ? second < first : first < second;
+    };
 
     // The transaction's own strings inside the window, in order, which outrank the store's versions of them
     struct own_string_t {
@@ -1257,37 +1379,141 @@ status_t scan_strings(call_access<cpu_class_> const& access, collection_id_t col
     status_t listed;
     if (access.strings)
         access.strings->for_each_uncommitted(collection, [&](std::string_view text, delta_view_t delta) noexcept {
-            if (listed.failed() || text < lower || !text.starts_with(prefix)) return;
+            if (listed.failed() || text < lower || !text.starts_with(window.prefix) || window.past(text) ||
+                window.skips(text))
+                return;
             listed = growth_status(own_strings.push_back(own_string_t {text, delta.kind != delta_kind_t::remove_k}));
         });
     if (listed.failed()) return listed;
     std::sort(own_strings.begin(), own_strings.end(),
-              [](own_string_t const& first, own_string_t const& second) noexcept { return first.text < second.text; });
-
-    std::size_t found = 0;
-    std::size_t next = 0;
-    status_t pushed;
-    auto const emit = [&](std::string_view text) noexcept {
-        pushed = outputs.push(text);
-        return pushed.succeeded() && ++found != limit;
+              [&](own_string_t const& first, own_string_t const& second) noexcept {
+                  return before(first.text, second.text);
+              });
+    // The ranges the transaction removes hide the store's strings in them, bar its later writes.
+    st::vector<range_tombstone<std::string_view>, arena_allocator<range_tombstone<std::string_view>>> own_ranges {
+        {access.scratch}};
+    if (access.strings)
+        access.strings->for_each_removed_range(
+            collection, [&](range_tombstone<std::string_view> const& range) noexcept {
+                if (listed.succeeded())
+                    listed = growth_status(own_ranges.push_back(range_tombstone<std::string_view> {range}));
+            });
+    if (listed.failed()) return listed;
+    auto const removed_in_range = [&](std::string_view text) noexcept {
+        for (range_tombstone<std::string_view> const& range : own_ranges)
+            if (range.covers(text)) return true;
+        return false;
     };
-    auto const emit_own = [&](own_string_t const& written) noexcept { return !written.present || emit(written.text); };
-    status_t const walked = walk_strings(
-        access, collection, prefix, lower, read_stamp_of(access),
-        [&](std::string_view text, lookup_result_t state, ustore_key_t const&) noexcept {
-            for (; next != own_strings.size() && own_strings[next].text < text; ++next)
-                if (!emit_own(own_strings[next])) return false;
-            if (next != own_strings.size() && own_strings[next].text == text) return emit_own(own_strings[next++]);
-            return state != lookup_result_t::written_k || emit(text);
-        });
-    if (walked.failed()) return walked;
-    for (; found != limit && next != own_strings.size() && pushed.succeeded(); ++next) emit_own(own_strings[next]);
-    if (pushed.failed()) return pushed;
 
+    std::size_t next = 0;
+    bool carries_on = true;
+    auto const emit_own = [&](own_string_t const& written) noexcept {
+        if (written.present) carries_on = visitor(written.text);
+        return carries_on;
+    };
+    auto const merged = [&](std::string_view text, lookup_result_t state, ustore_key_t const&) noexcept {
+        // A descending walk ends below the window's least string, which an ascending one starts at.
+        if (descending ? text < lower : window.past(text)) return false;
+        for (; next != own_strings.size() && before(own_strings[next].text, text); ++next)
+            if (!emit_own(own_strings[next])) return false;
+        if (next != own_strings.size() && own_strings[next].text == text) return emit_own(own_strings[next++]);
+        if (state != lookup_result_t::written_k || window.skips(text) || removed_in_range(text)) return true;
+        carries_on = visitor(text);
+        return carries_on;
+    };
+    status_t walked;
+    if (!descending) walked = walk_strings(access, collection, window.prefix, lower, read_stamp_of(access), merged);
+    else {
+        // The window's start is inclusive, so the walk starts below the least string past it.
+        st::vector<char> below;
+        if (!window.upper().empty()) {
+            if (below.resize(window.upper().size() + 1) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A walk could not hold where it starts"};
+            std::memcpy(below.data(), window.upper().data(), window.upper().size());
+            below[window.upper().size()] = '\0';
+        }
+        walked = walk_strings_down(access, collection, window.prefix, std::string_view {below.begin(), below.end()},
+                                   read_stamp_of(access), merged);
+    }
+    if (walked.failed()) return walked;
+    for (; carries_on && next != own_strings.size(); ++next) emit_own(own_strings[next]);
+    return {};
+}
+
+/** Whether a walk listed as many strings as its page holds, so more may follow what it listed. */
+enum class page_fill_t : bool { short_k, full_k };
+
+/** Watches what a walk of @p window covered through a watching transaction of @p access: from the
+ *  window's start in its direction to @p smallest or @p largest listed for a full page, and the
+ *  whole window otherwise, so a commit landing a string inside it conflicts. */
+template <cpu_class_t cpu_class_>
+status_t watch_window_strings(call_access<cpu_class_> const& access, collection_id_t collection,
+                              strings_window_t const& window, std::string_view smallest, std::string_view largest,
+                              page_fill_t fill) noexcept {
     transaction_stamp_t const watch_stamp = watch_stamp_of(access);
     if (watch_stamp == invalid_transaction_stamp_k) return {};
-    if (found == limit) return access.strings->watch_range(collection, lower, outputs[outputs.size() - 1], watch_stamp);
-    return access.strings->watch_prefix(collection, prefix, lower, watch_stamp);
+    bool const descending = window.direction == ustore_scan_descending_k;
+    bool const full = fill == page_fill_t::full_k;
+    std::string_view const lower = full && descending ? smallest : window.lower();
+    if (full && !descending) return access.strings->watch_range(collection, lower, largest, watch_stamp);
+    if (!window.upper().empty()) return access.strings->watch_range(collection, lower, window.upper(), watch_stamp);
+    return access.strings->watch_prefix(collection, window.prefix, lower, watch_stamp);
+}
+
+/** One string a sample keeps past the visitor that saw it, in a room of its own. */
+using kept_string_t = st::vector<char>;
+
+/** Copies @p text into @p kept, reusing its room. */
+inline status_t keep_string(kept_string_t& kept, std::string_view text) noexcept {
+    if (kept.resize(text.size()) != st::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "No room to keep a string"};
+    if (!text.empty()) std::memcpy(kept.data(), text.data(), text.size());
+    return {};
+}
+
+/** The text @p kept holds. */
+inline std::string_view kept_text(kept_string_t const& kept) noexcept { return {kept.begin(), kept.end()}; }
+
+/** Appends to @p outputs up to @p limit strings of @p window in @p collection, in its direction, as
+ *  @p access sees them, and watches what the walk covered. */
+template <cpu_class_t cpu_class_>
+status_t scan_strings(call_access<cpu_class_> const& access, collection_id_t collection, strings_window_t const& window,
+                      std::size_t limit, strings_scan_outputs_t& outputs) noexcept {
+    if (limit == 0) return {};
+    std::size_t const first = outputs.size();
+    status_t pushed;
+    scan_direction_t const order = window.direction == ustore_scan_descending_k ? scan_direction_t::descending_k
+                                                                                : scan_direction_t::ascending_k;
+    status_t const walked = walk_window_strings(
+        access, collection, window,
+        [&](std::string_view text) noexcept {
+            pushed = outputs.push(text);
+            return pushed.succeeded() && outputs.size() - first != limit;
+        },
+        order);
+    if (walked.failed()) return walked;
+    if (pushed.failed()) return pushed;
+    std::size_t const found = outputs.size() - first;
+    if (found == 0) return watch_window_strings(access, collection, window, {}, {}, page_fill_t::short_k);
+    std::string_view const head = outputs[first];
+    std::string_view const tail = outputs[outputs.size() - 1];
+    bool const descending = window.direction == ustore_scan_descending_k;
+    return watch_window_strings(access, collection, window, descending ? tail : head, descending ? head : tail,
+                                found == limit ? page_fill_t::full_k : page_fill_t::short_k);
+}
+
+/** Removes every string of @p collection from @p start up to @p end, exclusive, or to the last
+ *  string for an empty @p end, as one range tombstone the strings of @p access's transaction land,
+ *  watching the range when it watches. */
+template <cpu_class_t cpu_class_>
+status_t remove_string_range(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view start,
+                             std::string_view end) noexcept {
+    if (!end.empty() && !(start < end)) return {};
+    if (status_t const removed = access.strings->remove_range(collection, start, end); removed.failed()) return removed;
+    transaction_stamp_t const watch_stamp = watch_stamp_of(access);
+    if (watch_stamp == invalid_transaction_stamp_k) return {};
+    if (end.empty()) return access.strings->watch_prefix(collection, {}, start, watch_stamp);
+    return access.strings->watch_range(collection, start, end, watch_stamp);
 }
 
 /** Commits @p tasks as a transaction of their own, which watches nothing, so the last writer wins. */
@@ -1393,7 +1619,8 @@ status_t empty_collection(database_state<cpu_class_>& state, ustore_arena_t scra
     value_view_t const emptied = mode == ustore_drop_values_k ? value_view_t::make_empty() : value_view_t {};
     for (;;) {
         keys.clear();
-        if (status_t const collected = collect_keys(head, collection, from, clear_window_keys_k, keys);
+        if (status_t const collected = collect_keys(head, collection, from, limit<stored_key_t>::max(),
+                                                    clear_window_keys_k, keys);
             collected.failed())
             return collected;
         if (keys.empty()) return {};
@@ -1426,7 +1653,8 @@ status_t list_collections(database_state<cpu_class_>& state, ustore_arena_t scra
     call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch, stamp};
     st::vector<stored_key_t, arena_allocator<stored_key_t>> keys {{scratch}};
     if (status_t const collected = collect_keys(head, collections_collection_k, limit<stored_key_t>::min(),
-                                                std::numeric_limits<std::size_t>::max(), keys);
+                                                limit<stored_key_t>::max(), std::numeric_limits<std::size_t>::max(),
+                                                keys);
         collected.failed())
         return collected;
     for (std::size_t index = 0; index != keys.size(); ++index) {
@@ -1907,7 +2135,8 @@ status_t mount_store(database_state<cpu_class_>& state, database_config_t const&
     return state.resources->storage.visit([&](auto& mount) noexcept -> status_t {
         using mount_t = std::remove_reference_t<decltype(mount)>;
         if constexpr (std::is_same_v<mount_t, storage_mount_of<cpu_class_>>)
-            return state.store->mount(mount.volume(), mount.channels(), transactions, compactor);
+            return state.store->mount(mount.volume(), mount.channels(), transactions, compactor,
+                                      strings_kit_sha256<strings_kit_of<cpu_class_>> {});
         else return {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     });
 }
@@ -2092,7 +2321,9 @@ status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t
     stored_key_t from = limit<stored_key_t>::min();
     for (;;) {
         keys.clear();
-        if (status_t const collected = collect_keys(access, collection.id, from, window, keys); collected.failed())
+        if (status_t const collected = collect_keys(access, collection.id, from, limit<stored_key_t>::max(), window,
+                                                    keys);
+            collected.failed())
             return collected;
         for (stored_key_t const& key : keys) {
             stored_value_size_t size = 0;
@@ -2162,7 +2393,8 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     auto report = [&](std::uint64_t placed, std::uint64_t total) noexcept {
         return !arguments.progress || arguments.progress(placed, total, arguments.progress_state) != ustore_cancel_k;
     };
-    status_t const saved = source.store->save(target, access.stamp, report).status();
+    status_t const saved =
+        source.store->save(target, access.stamp, report, strings_kit_sha256<strings_kit_of<cpu_class_>> {}).status();
     // A cancelled or failed save gave back every run it placed, and the directory it made
     // goes with them
     if (saved.failed() && !existed) [[maybe_unused]]
@@ -2181,5 +2413,116 @@ void snapshot_free(ustore_snapshot_t handle) noexcept {
 }
 
 #pragma endregion Snapshot Calls
+
+#pragma region Change Feed Calls
+
+/** What a change feed holds, behind its cursor handle of the C ABI. */
+template <cpu_class_t cpu_class_>
+struct changes_state {
+
+    /** The pin keeping versions above the feed's stamp from merges until the feed is freed. */
+    typename basic_database_of<cpu_class_>::pin_t pin;
+
+    /** The last change the feed handed out, or one at its stamp past all keys before a pull. */
+    typename basic_database_of<cpu_class_>::stored_change_t handed;
+};
+
+/** What the C ABI calls a change of @p kind. */
+constexpr ustore_change_kind_t change_kind_of(delta_kind_t kind) noexcept {
+    switch (kind) {
+    case delta_kind_t::remove_k: return ustore_change_removal_k;
+    case delta_kind_t::change_k: return ustore_change_change_k;
+    default: return ustore_change_write_k;
+    }
+}
+
+/** Implements @c ustore_changes_cursor_init, pinning the stamp in the store's ledger, for every
+ *  collection but a strings one, whose runs keep no version of a string apart from the next. */
+template <cpu_class_t cpu_class_>
+status_t changes_cursor_init(ustore_changes_cursor_init_t const& arguments, ustore_changes_cursor_t cursor,
+                             view_t const& view) noexcept {
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
+    auto [entry, look_up_status] = look_up(state, view.scratch, arguments.collection);
+    if (look_up_status.failed()) return look_up_status;
+    if (entry_layout_of(entry.modality) == entry_layout_t::strings_to_uuids_k)
+        return {status_code_t::unsupported_k, "A strings collection feeds no changes"};
+    auto* const feed = new (std::nothrow) changes_state<cpu_class_> {};
+    if (!feed) return {status_code_t::out_of_memory_k, "Failed to allocate the change feed"};
+    feed->handed.stamp = static_cast<transaction_stamp_t>(arguments.since_stamp);
+    feed->handed.stored_key = limit<stored_key_t>::max();
+    status_t const pinned = state.store->pin_feed(arguments.collection, feed->pin, feed->handed.stamp);
+    if (pinned.failed()) {
+        delete feed;
+        return pinned;
+    }
+    cursor->state = feed;
+    return {};
+}
+
+/** Implements @c ustore_changes_cursor_next, advancing once every output reached the arena. */
+template <cpu_class_t cpu_class_>
+status_t changes_cursor_next(ustore_changes_cursor_next_t const& arguments, view_t const& view) noexcept {
+    using stored_change_t = typename basic_database_of<cpu_class_>::stored_change_t;
+    changes_state<cpu_class_>& feed = *static_cast<changes_state<cpu_class_>*>(arguments.cursor->state);
+    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
+    ustore_collection_id_t const collection = arguments.cursor->cursor.collection;
+    // A dropped collection lingers while a snapshot may read it, so the listing tells if it is gone
+    if (status_t const listed = look_up(state, view.scratch, collection).status(); listed.failed()) return listed;
+
+    st::vector<ustore_key_t, arena_allocator<ustore_key_t>> keys {{view.scratch}};
+    st::vector<ustore_stamp_t, arena_allocator<ustore_stamp_t>> stamps {{view.scratch}};
+    st::vector<ustore_change_kind_t, arena_allocator<ustore_change_kind_t>> kinds {{view.scratch}};
+    growing_strings<arena_allocator<byte_t>> values {view.scratch};
+    st::vector<byte_t, arena_allocator<byte_t>> value {{view.scratch}};
+    stored_change_t handed = feed.handed;
+    auto take = [&]<typename read_type_>(stored_change_t const& change, std::uint64_t value_bytes,
+                                         read_type_&& read) noexcept -> status_t {
+        if (status_t const grown = growth_status(keys.push_back(key_of(change.stored_key))); grown.failed())
+            return grown;
+        if (status_t const grown = growth_status(stamps.push_back(static_cast<ustore_stamp_t>(change.stamp)));
+            grown.failed())
+            return grown;
+        if (status_t const grown = growth_status(kinds.push_back(change_kind_of(change.kind))); grown.failed())
+            return grown;
+        if (arguments.values) {
+            if (status_t const grown = growth_status(value.resize(value_bytes)); grown.failed()) return grown;
+            if (status_t const copied = read(std::span<byte_t> {value}); copied.failed()) return copied;
+            if (status_t const grown = values.push_back(value_view_t {std::span<byte_t const> {value}}.bytes());
+                grown.failed())
+                return grown;
+        }
+        handed = change;
+        return {};
+    };
+    if (status_t const pulled = state.store->changes_after(collection, feed.handed, arguments.wanted, take,
+                                                           thread_index_of(state, view));
+        pulled.failed())
+        return pulled;
+
+    auto [exported_keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, keys);
+    if (keys_status.failed()) return keys_status;
+    auto [exported_stamps, stamps_status] = arena_copy<ustore_stamp_t>(arguments.arena, stamps);
+    if (stamps_status.failed()) return stamps_status;
+    auto [exported_kinds, kinds_status] = arena_copy<ustore_change_kind_t>(arguments.arena, kinds);
+    if (kinds_status.failed()) return kinds_status;
+    if (arguments.values)
+        if (status_t const exported = values.export_into(arguments.arena, *arguments.values); exported.failed())
+            return exported;
+    *arguments.keys = exported_keys.data();
+    *arguments.stamps = exported_stamps.data();
+    *arguments.kinds = exported_kinds.data();
+    *arguments.count = static_cast<ustore_size_t>(keys.size());
+    feed.handed = handed;
+    return {};
+}
+
+/** Frees the feed behind @p cursor, letting go of the stamp it pinned. */
+template <cpu_class_t cpu_class_>
+void changes_cursor_free(ustore_changes_cursor_t cursor) noexcept {
+    delete static_cast<changes_state<cpu_class_>*>(cursor->state);
+    cursor->state = nullptr;
+}
+
+#pragma endregion Change Feed Calls
 
 } // namespace unum::ustore::nvme

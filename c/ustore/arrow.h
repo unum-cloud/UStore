@@ -9,10 +9,10 @@
  *  whole collections, record batches and schemas belong to their callers: a cursor and the exporters move a collection
  *  out, and the converters and the writes, or an ingest of @c ustore/db.h, move one in.
  *
- *  Keys are @c fixed_size_binary(16), tagged as the @c arrow.uuid extension or not, whose
- *  bytes are those of @c ustore_key_t, and byte strings are @c binary or @c large_binary,
- *  or @c utf8 and @c large_utf8, which share their layout. No column may hold a null, a
- *  dictionary or a view.
+ *  Keys are @c fixed_size_binary(16), tagged as the @c arrow.uuid extension or not, whose bytes are
+ *  those of @c ustore_key_t, and byte strings are @c binary or @c large_binary, or @c utf8 and
+ *  @c large_utf8, which share their layout. No column a converter reads may hold a null, a
+ *  dictionary or a view, while a gathered column of documents exports with its nulls.
  *
  *  The structures of the Arrow C data, stream and device interfaces follow verbatim, under the guards Arrow defines, so
  *  a program including another copy compiles either.
@@ -22,6 +22,7 @@
 #define UNUM_USTORE_ARROW_H
 
 #include "ustore/db.h"
+#include "ustore/docs.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -253,12 +254,12 @@ USTORE_EXPORT ustore_status_t ustore_strings_view_from_arrow(struct ArrowSchema 
  *
  *  Keys of another stride, like the triples of edges, are copied dense into @p arena first, under
  *  the claim a call takes, so no other call or carving export runs on @p arena meanwhile; a device
- *  arena refuses them.
+ *  arena's are copied on its device, through an executor the export spawns there.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k An output is missing, or dense keys lie outside @p arena.
  *  - @c ustore_status_contended_k A call fills @p arena, or another export carves it.
- *  - @c ustore_status_unsupported_k Strided keys are given in a device arena.
+ *  - @c ustore_status_device_k No executor spawns on the arena's device, or it has no kernels.
  *  - @c ustore_status_out_of_memory_k An allocation failed.
  */
 USTORE_EXPORT ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys, ustore_size_t count,
@@ -280,6 +281,31 @@ USTORE_EXPORT ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys,
 USTORE_EXPORT ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, ustore_size_t count,
                                                            ustore_strings_layout_t layout, ustore_arena_t arena,
                                                            struct ArrowSchema* schema, struct ArrowDeviceArray* array);
+
+/**
+ *  @brief Exports one column of @p count rows a @c ustore_docs_gather of @p type wrote into
+ *      @p arena as an Arrow column whose validity buffer is the column's validities, in place where
+ *      Arrow lays the column out alike.
+ *
+ *  Scalars export as the Arrow type of their width, UUIDs as @c fixed_size_binary(16) tagged as
+ *  @c arrow.uuid, and binary strings as @c binary or @c large_binary by the width of their offsets,
+ *  all in place. Booleans are packed into bits, and strings copied without the null byte ending
+ *  every row into @c utf8 or @c large_utf8, behind the call's outputs in @p arena under the claim a
+ *  call takes, on the arena's device for a device arena, through an executor the export spawns
+ *  there, which also reads a @p column the gather left on the device. The array pins @p arena as
+ *  @c ustore_keys_view_to_arrow does, and leaves its null count unknown.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k An output or the @p column is missing, @p type is no
+ *    column type, or the column names memory outside @p arena.
+ *  - @c ustore_status_contended_k A call fills @p arena, or another export carves it.
+ *  - @c ustore_status_device_k No executor spawns on the arena's device, or it has no kernels.
+ *  - @c ustore_status_out_of_memory_k An allocation failed.
+ */
+USTORE_EXPORT ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const* column,
+                                                               ustore_size_t count, ustore_docs_field_type_t type,
+                                                               ustore_arena_t arena, struct ArrowSchema* schema,
+                                                               struct ArrowDeviceArray* array);
 
 #ifdef __cplusplus
 }

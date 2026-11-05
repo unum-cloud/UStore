@@ -74,7 +74,9 @@ static ustore_vertex_degree_t const ustore_vertex_degree_missing_k = 0xFFFFFFFFu
  *  edges of vertex @c i span from edge @c edges_offsets[i] up to edge @c edges_offsets[i + 1]. Edges
  *  of one vertex in one role come sorted by neighbor; with both roles the outgoing edges, sorted by
  *  target, precede the incoming ones, sorted by source. Whether a vertex exists is cheaper to ask
- *  from @c ustore_blobs_read on the same collection.
+ *  from @c ustore_blobs_read on the same collection. On a VRAM executor every output lands in the
+ *  call's device arena as it is, and each key of the edges exports as its own Arrow column through
+ *  @c ustore_keys_view_to_arrow, strided by three keys, which copies it dense on the device.
  */
 typedef struct ustore_graph_read_edges_t {
 
@@ -135,9 +137,7 @@ typedef struct ustore_graph_read_edges_t {
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A stored value is no vertex.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
@@ -193,7 +193,7 @@ typedef struct ustore_graph_write_edges_t {
  *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
  *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
  *    size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c collections, @c sources or @c targets are missing,
  *    the @c transaction belongs to another engine or is staged, the @c durability or @c watch is
@@ -259,7 +259,7 @@ typedef struct ustore_graph_remove_edges_t {
  *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
  *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
  *    size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c collections, @c sources or @c targets are missing,
  *    the @c transaction belongs to another engine or is staged, the @c durability or @c watch is
@@ -319,7 +319,7 @@ typedef struct ustore_graph_write_vertices_t {
  *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
  *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
  *    size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
  *  @c ustore_status_invalid_argument_k means the @c collections or @c vertices are missing, the
@@ -361,8 +361,12 @@ typedef struct ustore_graph_remove_vertices_t {
     /** Graph collections. */
     ustore_collections_view_t collections;
 
-    /** Vertices to remove. */
+    /** Vertices to remove, or the inclusive starts of ranges when @c end_vertices is given. */
     ustore_keys_view_t vertices;
+
+    /** Exclusive ends of the ranges of vertices to remove with their edges, or a zeroed view to
+     *  remove @c vertices alone. */
+    ustore_keys_view_t end_vertices;
 
     /** Roles of the vertices, needed only by joining graphs. */
     ustore_vertex_roles_view_t roles;
@@ -383,7 +387,7 @@ typedef struct ustore_graph_remove_vertices_t {
  *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
  *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
  *    size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
  *  @c ustore_status_invalid_argument_k means the @c collections or @c vertices are missing, the
@@ -432,8 +436,15 @@ typedef struct ustore_graph_scan_vertices_t {
     /** Graph collections. */
     ustore_collections_view_t collections;
 
-    /** Smallest vertex every scan may return, where @c NULL data starts at the first vertex. */
+    /** Vertex every scan starts from, inclusive, where @c NULL data starts at the first vertex in
+     *  the @c direction. */
     ustore_keys_view_t start_keys;
+
+    /** Key every scan stops before, exclusive, or a zeroed view for no bound. */
+    ustore_keys_view_t end_keys;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
 
     /** Optional verdict on the listed vertices, asked on the host once per page as its @c cost says. */
     ustore_predicate_t predicate;
@@ -467,17 +478,15 @@ typedef struct ustore_graph_scan_vertices_t {
  *
  *  @par Statuses:
  *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is missing,
- *  the @c mode or a predicate cost is unknown, the @c view was made by neither view constructor or
- *  belongs to another engine, a watching scan goes through a staged transaction, or a collection
- *  holds another modality.
+ *  the @c mode, @c direction or a predicate cost is unknown, the @c view was made by neither view
+ *  constructor or belongs to another engine, a watching scan goes through a staged transaction, or
+ *  a collection holds another modality.
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
@@ -516,8 +525,14 @@ typedef struct ustore_graph_vertices_cursor_init_t {
     /** Graph collection whose vertices to walk. */
     ustore_collection_id_t collection;
 
-    /** Smallest key the walk returns. */
+    /** Key the walk starts from, inclusive. */
     ustore_key_t start_key;
+
+    /** Key the walk stops before, exclusive, or @c NULL for no bound. */
+    ustore_key_t const* end_key;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
 
     /** Optional verdict on the keys of every page, asked as its @c cost says; host executors only. */
     ustore_predicate_t predicate;
@@ -588,8 +603,7 @@ typedef struct ustore_graph_vertices_cursor_next_t {
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine walks yet.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
@@ -601,6 +615,142 @@ USTORE_EXPORT void ustore_graph_vertices_cursor_next(ustore_graph_vertices_curso
  *  @param[in,out] cursor The cursor to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_graph_vertices_cursor_free(ustore_graph_vertices_cursor_t cursor);
+
+/** The arguments of @c ustore_graph_sample_vertices, which draws up to @c wanted vertices uniformly
+ *  at random from every graph collection. */
+typedef struct ustore_graph_sample_vertices_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** What the call sees, where @c NULL is the head. */
+    ustore_view_t view;
+
+    /** Number of samples. */
+    ustore_size_t count;
+
+    /** Collections to sample. */
+    ustore_collections_view_t collections;
+
+    /** Output in @c arena for @c count plus one offsets into @c keys, the last closing them. */
+    ustore_length_t const** offsets;
+
+    /** Output for the sampled keys, sample after sample, inside @c arena. */
+    ustore_key_t const** keys;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** Most keys every sample draws. */
+    ustore_size_t wanted;
+
+} ustore_graph_sample_vertices_t;
+
+/**
+ *  @brief Samples vertices from a batch of collections.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or an output is missing,
+ *    the @c view was made by neither view constructor or belongs to another engine, a watching
+ *    sample goes through a staged transaction, or a collection holds another modality.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
+ */
+USTORE_EXPORT void ustore_graph_sample_vertices(ustore_graph_sample_vertices_t* arguments);
+
+/** The arguments of @c ustore_graph_measure_vertices, which estimates the vertices and the space
+ *  inside key ranges, every output holding one bound per range. */
+typedef struct ustore_graph_measure_vertices_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** What the call sees, where @c NULL is the head. */
+    ustore_view_t view;
+
+    /** Number of measured ranges. */
+    ustore_size_t count;
+
+    /** Collections to measure. */
+    ustore_collections_view_t collections;
+
+    /** Inclusive start of every range, @c NULL data starting at the first key in @c direction. */
+    ustore_keys_view_t start_keys;
+
+    /** Key every range stops before, exclusive, or a zeroed view for no bound. */
+    ustore_keys_view_t end_keys;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
+
+    /** Optional output for the lower bound on the vertices in every range, inside @c arena. */
+    ustore_size_t const** min_cardinalities;
+
+    /** Optional output for the upper bound on the vertices in every range, inside @c arena. */
+    ustore_size_t const** max_cardinalities;
+
+    /** Optional output for the lower bound on the value bytes in every range, inside @c arena. */
+    ustore_size_t const** min_value_bytes;
+
+    /** Optional output for the upper bound on the value bytes in every range, inside @c arena. */
+    ustore_size_t const** max_value_bytes;
+
+    /** Optional output for the lower bound on the disk space every range takes, inside @c arena. */
+    ustore_size_t const** min_space_usages;
+
+    /** Optional output for the upper bound on the disk space every range takes, inside @c arena. */
+    ustore_size_t const** max_space_usages;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+} ustore_graph_measure_vertices_t;
+
+/**
+ *  @brief Estimates the vertices and the space inside a batch of key ranges.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c arena or the @c collections are missing,
+ *  the @c direction is unknown, the @c view was made by neither view constructor or belongs
+ *  to another engine, a watching measure goes through a staged transaction, or a collection
+ *  holds another modality.
+ */
+USTORE_EXPORT void ustore_graph_measure_vertices(ustore_graph_measure_vertices_t* arguments);
 
 #ifdef __cplusplus
 }

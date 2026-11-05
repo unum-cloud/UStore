@@ -16,6 +16,7 @@
 #include <chrono>       // `std::chrono::milliseconds`
 #include <filesystem>   // `std::filesystem::exists`, `std::filesystem::is_empty`, `std::filesystem::remove_all`
 #include <limits>       // `std::numeric_limits`
+#include <random>       // `std::mt19937_64`
 #include <span>         // `std::span`
 #include <string>       // `std::string`
 #include <string_view>  // `std::string_view`
@@ -1290,6 +1291,8 @@ std::size_t closed_set_names(config_t const&) {
     failures += expect_spellings(ustore_durability_name, ustore_durability_from_name, 2);
     failures += expect_spellings(ustore_watch_name, ustore_watch_from_name, 2);
     failures += expect_spellings(ustore_scan_mode_name, ustore_scan_mode_from_name, 2);
+    failures += expect_spellings(ustore_scan_direction_name, ustore_scan_direction_from_name, 2);
+    failures += expect_spellings(ustore_change_kind_name, ustore_change_kind_from_name, 3);
     failures += expect_spellings(ustore_drop_mode_name, ustore_drop_mode_from_name, 3);
     failures += expect_spellings(ustore_isolation_name, ustore_isolation_from_name, 2);
     failures += expect_spellings(ustore_transport_name, ustore_transport_from_name, 5);
@@ -1911,6 +1914,243 @@ case_result_t snapshot_save_recorded(config_t const& config) {
     return failures;
 }
 
+#pragma region Change Feeds
+
+/** One change a test committed, as a feed must hand it back: a write carries its round. */
+struct logged_change_t {
+    ustore_stamp_t stamp = 0;
+    ustore_key_t key {};
+    ustore_change_kind_t kind = ustore_change_write_k;
+    std::size_t round = 0;
+};
+
+/** An open feed and how many logged changes it handed out, after those at or below its stamp. */
+struct open_feed_t {
+    ustore_changes_cursor_t cursor = nullptr;
+    ustore_stamp_t since_stamp = 0;
+    std::size_t handed = 0;
+};
+
+/** Opens a feed of @p collection after @p since_stamp, answering the outcome's status. */
+status_t open_feed(ustore_database_t database, ustore_collection_id_t const& collection, ustore_stamp_t since_stamp,
+                   ustore_changes_cursor_t& cursor) noexcept {
+    ustore_outcome_t outcome {};
+    ustore_changes_cursor_init_t init {
+        .database = database,
+        .outcome = &outcome,
+        .collection = collection,
+        .since_stamp = since_stamp,
+        .cursor = &cursor,
+    };
+    ustore_changes_cursor_init(&init);
+    return status_t {outcome};
+}
+
+/** Pulls up to @p wanted changes of @p feed with their values, checking each against the logged
+ *  changes after its stamp in @p log, and advances it past them. */
+std::size_t pull_feed(open_feed_t& feed, std::span<logged_change_t const> log, std::size_t wanted, arena_t& arena) {
+    std::size_t failures = 0;
+    std::size_t first = 0;
+    while (first != log.size() && log[first].stamp <= feed.since_stamp) ++first;
+    std::size_t const remaining = log.size() - first - feed.handed;
+    ustore_outcome_t outcome {};
+    ustore_size_t count = 0;
+    ustore_key_t const* keys = nullptr;
+    ustore_stamp_t const* stamps = nullptr;
+    ustore_change_kind_t const* kinds = nullptr;
+    ustore_strings_view_t values {};
+    ustore_changes_cursor_next_t next {
+        .cursor = feed.cursor,
+        .outcome = &outcome,
+        .wanted = wanted,
+        .count = &count,
+        .keys = &keys,
+        .stamps = &stamps,
+        .kinds = &kinds,
+        .values = &values,
+        .arena = arena,
+    };
+    ustore_changes_cursor_next(&next);
+    failures += expect_success(outcome);
+    failures += expect_eq(std::size_t {count}, remaining < wanted ? remaining : wanted);
+    if (failures != 0) return failures;
+    for (std::size_t index = 0; index != count; ++index) {
+        logged_change_t const& logged = log[first + feed.handed + index];
+        failures += expect(keys[index] == logged.key && stamps[index] == logged.stamp && kinds[index] == logged.kind);
+        std::string const value = logged.kind == ustore_change_write_k ? fmt::format("v{}", logged.round) : "";
+        failures += expect(string_of(tape_string(values, index)) == value);
+    }
+    feed.handed += count;
+    return failures;
+}
+
+/**
+ *  @brief A randomized history of commits to one collection beside another, range removals at the
+ *      head and compactions between them, read back through feeds opened at random stamps against
+ *      the log of what was committed, a range removal as the removal of every key it covered.
+ *
+ *  A feed is refused only below every stamp an open feed pins and below the newest commit, and,
+ *  on the engines that keep their own versions, a feed below what a compaction with no pins
+ *  dropped is refused.
+ */
+case_result_t changes_randomized_history(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    auto [watched, watched_status] = create_collection(database, "changes_history.watched", ustore_modality_blobs_k);
+    auto [beside, beside_status] = create_collection(database, "changes_history.beside", ustore_modality_blobs_k);
+    failures += expect(watched_status.succeeded() && beside_status.succeeded());
+    if (failures != 0) return failures;
+    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
+
+    ustore_outcome_t outcome {};
+    ustore_snapshot_t snapshot = nullptr;
+    ustore_stamp_t head = 0;
+    ustore_snapshot_init_t pin {.snapshot = &snapshot, .database = database, .outcome = &outcome, .read_stamp = &head};
+    ustore_snapshot_init(&pin);
+    failures += expect_success(outcome);
+    ustore_snapshot_free(snapshot);
+    ustore_changes_cursor_t probe = nullptr;
+    if (open_feed(database, watched, head, probe) == status_code_t::unsupported_k)
+        return case_result_t::skipped("the engine keeps no stamps to read changes by", failures);
+    ustore_changes_cursor_free(probe);
+
+    constexpr std::size_t keys_count_k = 16, rounds_k = 160, feeds_max_k = 6;
+    std::array<bool, keys_count_k> present {};
+    st::vector<logged_change_t> log;
+    st::vector<ustore_stamp_t> stamps;
+    failures += expect(stamps.push_back(ustore_stamp_t {head}) == st::status_t::success_k);
+    std::array<open_feed_t, feeds_max_k> feeds {};
+    std::mt19937_64 generator {42};
+    auto draw = [&](std::size_t below) noexcept { return static_cast<std::size_t>(generator() % below); };
+
+    for (std::size_t round = 1; round <= rounds_k && failures == 0; ++round) {
+        std::size_t const action = draw(22);
+        if (action < 10) {
+            expected<transaction_t> maybe_transaction = database.transaction();
+            failures += expect(maybe_transaction.has_value());
+            if (failures != 0) break;
+            ustore_transaction_t const transaction = maybe_transaction->transaction();
+            std::size_t const first_key = draw(keys_count_k), touched = 1 + draw(4);
+            std::array<logged_change_t, 4> staged {};
+            for (std::size_t offset = 0; offset != touched; ++offset) {
+                std::size_t const index = (first_key + offset) % keys_count_k;
+                ustore_key_t const key = key_from_integer(index);
+                bool const removing = present[index] && draw(3) == 0;
+                if (removing) {
+                    ustore_blobs_remove_t remove {.database = database,
+                                                  .outcome = &outcome,
+                                                  .transaction = transaction,
+                                                  .count = 1,
+                                                  .collections = {&watched, 0},
+                                                  .keys = {&key, 0}};
+                    ustore_blobs_remove(&remove);
+                    failures += expect_success(outcome);
+                }
+                else failures += write_text(database, watched, {&key, 1}, fmt::format("v{}", round), transaction);
+                failures += write_text(database, beside, {&key, 1}, "beside", transaction);
+                staged[offset] = {0, key, removing ? ustore_change_removal_k : ustore_change_write_k, round};
+                present[index] = !removing;
+            }
+            ustore_stamp_t commit_stamp = 0;
+            ustore_transaction_commit_t commit {.database = database,
+                                                .outcome = &outcome,
+                                                .transaction = transaction,
+                                                .commit_stamp = &commit_stamp};
+            ustore_transaction_commit(&commit);
+            failures += expect_success(outcome);
+            std::sort(staged.begin(), staged.begin() + touched,
+                      [](logged_change_t const& first, logged_change_t const& second) noexcept {
+                          return first.key < second.key;
+                      });
+            for (std::size_t offset = 0; offset != touched; ++offset) {
+                staged[offset].stamp = commit_stamp;
+                failures += expect(log.push_back(logged_change_t {staged[offset]}) == st::status_t::success_k);
+            }
+            failures += expect(stamps.push_back(ustore_stamp_t {commit_stamp}) == st::status_t::success_k);
+            head = commit_stamp;
+        }
+        else if (action < 12) {
+            // A range removal at the head comes back as the removal of every key it covered
+            std::size_t const lower = draw(keys_count_k), upper = lower + 1 + draw(keys_count_k - lower);
+            ustore_key_t const start = key_from_integer(lower), end = key_from_integer(upper);
+            ustore_blobs_remove_t remove {.database = database,
+                                          .outcome = &outcome,
+                                          .count = 1,
+                                          .collections = {&watched, 0},
+                                          .keys = {&start, 0},
+                                          .end_keys = {&end, 0}};
+            ustore_blobs_remove(&remove);
+            failures += expect_success(outcome);
+            ustore_snapshot_init(&pin);
+            failures += expect_success(outcome);
+            ustore_snapshot_free(snapshot);
+            for (std::size_t index = lower; index != upper; ++index) {
+                if (!present[index]) continue;
+                present[index] = false;
+                failures += expect(
+                    log.push_back(logged_change_t {head, key_from_integer(index), ustore_change_removal_k, round}) ==
+                    st::status_t::success_k);
+            }
+            failures += expect(stamps.push_back(ustore_stamp_t {head}) == st::status_t::success_k);
+        }
+        else if (action < 14) {
+            ustore_database_compact_t compact {.database = database, .outcome = &outcome};
+            ustore_database_compact(&compact);
+            failures += expect_success(outcome);
+        }
+        else if (action < 17) {
+            open_feed_t* const slot = &feeds[draw(feeds_max_k)];
+            if (slot->cursor) continue;
+            ustore_stamp_t const since = draw(2) ? head : stamps[draw(stamps.size())];
+            status_t const opened = open_feed(database, watched, since, slot->cursor);
+            bool pinned_below = since == head;
+            for (open_feed_t const& feed : feeds)
+                pinned_below = pinned_below ||
+                               (feed.cursor && feed.cursor != slot->cursor && feed.since_stamp <= since);
+            if (opened.failed()) {
+                failures += expect(opened == status_code_t::write_conflict_k && !pinned_below);
+                slot->cursor = nullptr;
+                continue;
+            }
+            slot->since_stamp = since;
+            slot->handed = 0;
+        }
+        else if (action < 21) {
+            open_feed_t& feed = feeds[draw(feeds_max_k)];
+            if (feed.cursor) failures += pull_feed(feed, log, 1 + draw(6), arena);
+        }
+        else {
+            open_feed_t& feed = feeds[draw(feeds_max_k)];
+            ustore_changes_cursor_free(feed.cursor);
+            feed = {};
+        }
+    }
+    for (open_feed_t& feed : feeds) {
+        if (feed.cursor) failures += pull_feed(feed, log, log.size() + 1, arena);
+        ustore_changes_cursor_free(feed.cursor);
+        feed = {};
+    }
+
+    // Two overwrites and a compaction with no feed open drop the versions between them
+    if (config.engine() == "ram" || config.engine() == "nvme") {
+        ustore_key_t const key = key_from_integer(0);
+        failures += write_text(database, watched, {&key, 1}, "first");
+        failures += write_text(database, watched, {&key, 1}, "second");
+        ustore_database_compact_t compact {.database = database, .outcome = &outcome};
+        ustore_database_compact(&compact);
+        failures += expect_success(outcome);
+        ustore_changes_cursor_t dropped = nullptr;
+        failures += expect_status(open_feed(database, watched, stamps[0], dropped), status_code_t::write_conflict_k);
+        failures += expect(dropped == nullptr);
+    }
+    return failures;
+}
+
+#pragma endregion Change Feeds
+
 int main(int argc, char** argv) {
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -1958,5 +2198,6 @@ int main(int argc, char** argv) {
     report(totals, "progress.cancel_compact", progress_cancel_compact, config);
     report(totals, "progress.serialized", progress_serialized, config);
     report(totals, "snapshot.save_recorded", snapshot_save_recorded, config);
+    report(totals, "changes.randomized_history", changes_randomized_history, config);
     return suite_exit_code(totals);
 }

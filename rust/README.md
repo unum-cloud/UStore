@@ -390,11 +390,18 @@ database.head().write(people, &entries, Durability::Buffered)?;
 database.head().remove(people, &[grace], Durability::Buffered)?;
 
 let first = database.head().scan(people, Key::from(0u64), 100, Matching::default(), &mut arena)?.keys;
-let measured = database.head().measure(people, ada, kent, &mut arena)?;
+let measured = database.head().measure(people, ada..kent, &mut arena)?;
+let largest = KeyRange { direction: ScanDirection::Descending, ..KeyRange::default() };
+let last = database.head().scan(people, largest, 10, Matching::default(), &mut arena)?.keys;
+let headers = database.head().read_slices(people, &[ada, kent], ..64, &mut arena)?;
+database.head().remove_range(people, ada..kent, Durability::Buffered)?;
 ```
 
 `View::remove` removes whole documents the same way, while a field goes with a merge that carries a JSON `null` for it.
 `scan` lists up to the count it wants from a start key, `sample` draws keys at random, and `measure` bounds the keys and the bytes a range of keys holds.
+Scans, cursors and measures take a `KeyRange`: a start key, inclusive, an end key, exclusive, and a `ScanDirection`, where a key alone walks up from it and `start..end` walks up between them.
+`read_slices` reads one byte range of every value, and `remove_range`, `docs_remove_range` and `graph_remove_vertices_range` remove every key of a range in one atomic call.
+`docs_sample`, `pages_sample` and `graph_sample_vertices` draw keys from the other modalities, as `docs_measure`, `pages_measure` and `graph_measure_vertices` measure them.
 
 A `Cursor` walks one collection page by page, each pull landing in the arena it is given, with the values of its keys when it asks for them:
 
@@ -413,6 +420,20 @@ Every pull resumes past the last key the pull before it handed out, so a key wri
 `next` pulls the keys alone, and `next_pairs` reads their values in the same call, where a key removed at the head between the listing and the read of one pull reads as an empty value.
 A page shorter than the count it wanted exhausts the walk for good, so every pull after it hands out nothing, even once more keys are written, and a pull that fails leaves the cursor where it was.
 A cursor opens from a blocking view, sees what that view sees pull by pull, and pulls on its executor; it holds the database open, and the transaction or snapshot it reads through, until it is dropped.
+
+`Database::changes_cursor` opens a feed of the changes committed to one collection after a `CommitStamp`, oldest first, pinning that stamp as a snapshot does:
+
+```rust
+let mut feed = database.changes_cursor(people, stamp)?;
+let changes = feed.next_pairs(1024, &mut arena)?;
+for (index, (key, kind)) in changes.keys().iter().zip(changes.kinds()).enumerate() {
+    println!("{key} {kind} at {:?}: {:?}", changes.stamps()[index], changes.value(index));
+}
+```
+
+Every pull resumes past the last change the one before it handed out, and an empty one reached the newest commit.
+A `ChangeKind` is a write, a removal or a partial change, and a range removal comes as the removal of every key it removed.
+A feed whose history is already gone is refused with `Status::WriteConflict`, and LevelDB, which keeps no stamps, refuses it with `Status::Unsupported`.
 
 ## Documents
 
@@ -556,7 +577,7 @@ Every call through a `Collection`, and `Executor::drain`, block as well.
 
 The crate binds none of these:
 
-- The verbs of the strings modality of `strings.h` and of the pages of `pages.h`, beyond the pages cursor and what Arrow reaches: `export_arrow`, `import_arrow` and `ingest_arrow` move collections of either modality whole, through their cursors, `ustore_strings_write` and `ustore_pages_import`.
+- The verbs of the strings modality of `strings.h` and of the pages of `pages.h`, beyond the pages cursor, sample and measure and what Arrow reaches: `export_arrow`, `import_arrow` and `ingest_arrow` move collections of either modality whole, through their cursors, `ustore_strings_write` and `ustore_pages_import`.
 - The progress of a scan and of a cursor pull, since the crate scans one range at a time and each reports a single unit once its work is done.
 - Unordered scans and the lengths a read writes beside its values.
 

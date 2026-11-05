@@ -15,7 +15,9 @@
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
 #include <algorithm>       // `std::upper_bound`
+#include <array>           // `std::array`
 #include <map>             // `std::map`
+#include <memory>          // `std::addressof`
 #include <random>          // `std::mt19937_64`, `std::uniform_int_distribution`
 #include <source_location> // `std::source_location`
 #include <span>            // `std::span`
@@ -156,6 +158,73 @@ static std::size_t removal_and_empty_value_differ() {
     failures += check(!view->find(10, 4, found) && !view->find(30, 5, found));
     failures += check(view->written_since(20, 4) && !view->written_since(20, 5) && !view->written_since(30, 0));
     failures += check(view->range_written_since(11, 20, 4) && !view->range_written_since(11, 19, 4));
+    return failures;
+}
+
+/** A range tombstone hides the older versions of its keys from a reader at or past its stamp,
+ *  conflicts with a watch below it, and a merge of the runs drops the versions it hides from
+ *  every reader while a pinned reader keeps its own; a write the same commit lands inside the
+ *  range survives it. */
+static std::size_t range_tombstones_hide_older_runs() {
+    using range_t = sealed_t::range_t;
+    using versions_t = st::vector<stamped_delta<stored_key_t>>;
+    std::size_t failures = 0;
+    std::array<byte_t, 3> const payload {byte_t {5}, byte_t {5}, byte_t {5}};
+    std::array<keyed_delta_t, 3> oldest {keyed_delta_t {10, {delta_kind_t::write_k, payload}},
+                                         keyed_delta_t {20, {delta_kind_t::write_k, payload}},
+                                         keyed_delta_t {30, {delta_kind_t::write_k, payload}}};
+    std::array<keyed_delta_t, 1> ranged {keyed_delta_t {25, {delta_kind_t::write_k, payload}}};
+    std::array<keyed_delta_t, 1> newest {keyed_delta_t {30, {delta_kind_t::write_k, payload}}};
+    range_t const range {15, 35};
+    failures += check(sealed_t::seal(std::span<keyed_delta_t> {}, std::span<range_t const> {&range, 1}).has_value());
+    range_t const backwards {35, 15};
+    failures += check(sealed_t::seal(ranged, std::span<range_t const> {&backwards, 1}).code() ==
+                      status_code_t::invalid_argument_k);
+    expected<run_t> first = run_t::stamped(*sealed_t::seal(oldest), 5);
+    expected<run_t> second = run_t::stamped(*sealed_t::seal(ranged, std::span<range_t const> {&range, 1}), 7);
+    expected<run_t> third = run_t::stamped(*sealed_t::seal(newest), 9);
+    if (check(first.has_value() && second.has_value() && third.has_value())) return failures + 1;
+    failures += check(second->newest_stamp() == 7 && second->range_tombstones().size() == 1);
+
+    view_t const empty;
+    expected<view_t> one = view_t::extended(empty, *first);
+    if (check(one.has_value())) return failures + 1;
+    expected<view_t> two = view_t::extended(*one, *second);
+    if (check(two.has_value())) return failures + 1;
+    expected<view_t> view = view_t::extended(*two, *third);
+    if (check(view.has_value())) return failures + 1;
+    failures += check(view->covering_stamp(20, 9) == 7 && view->covering_stamp(20, 6) == unwritten_stamp_k);
+    failures += check(view->covering_stamp(10, 9) == unwritten_stamp_k && view->covering_stamp(35, 9) == 0);
+    failures += check(view->written_since(20, 6) && !view->written_since(20, 7) && !view->written_since(10, 5));
+    failures += check(view->range_written_since(16, 18, 6) && !view->range_written_since(16, 18, 7));
+
+    run_t const* const runs[3] {std::addressof(*third), std::addressof(*second), std::addressof(*first)};
+    auto const kept_keys = [&](compaction_stamps_t const& survival, std::span<stored_key_t const> wanted) {
+        versions_t versions;
+        // The last-write fold composes nothing, so it never allocates from the arena it is given.
+        utilities::arena_allocator<byte_t> folded_bytes;
+        if (check(kept_versions(std::span<run_t const* const> {runs}, survival, utilities::last_write_fold_t {},
+                                versions, folded_bytes)
+                      .succeeded()))
+            return std::size_t {1};
+        std::size_t mismatches = check(versions.size() == wanted.size());
+        for (std::size_t index = 0; index != versions.size() && index != wanted.size(); ++index)
+            mismatches += check(versions[index].stored_key == wanted[index]);
+        return mismatches;
+    };
+    // With no reader, key 20 and the older 30 drop; a reader at 6 still reads both.
+    std::array<stored_key_t, 3> const newest_kept {10, 25, 30};
+    failures += kept_keys(compaction_stamps_t {}, newest_kept);
+    std::uint64_t const pinned[1] {6};
+    compaction_stamps_t survival;
+    survival.pinned = pinned;
+    survival.pinned_count = 1;
+    std::array<stored_key_t, 5> const pinned_kept {10, 20, 25, 30, 30};
+    failures += kept_keys(survival, pinned_kept);
+
+    auto [tombstones, tombstones_status] = gathered_range_tombstones(std::span<run_t const* const> {runs},
+                                                                     st::default_allocator<byte_t> {});
+    failures += check(tombstones_status.succeeded() && tombstones.size() == 1 && tombstones.stamp(0) == 7);
     return failures;
 }
 
@@ -400,6 +469,7 @@ int main() {
     auto counted = [&](char const* name, auto body) { run(name, body, failed), ++total; };
     counted("memory_run.refusals", refusals);
     counted("memory_run.removal_and_empty_value_differ", removal_and_empty_value_differ);
+    counted("memory_run.range_tombstones_hide_older_runs", range_tombstones_hide_older_runs);
     counted("collection_view.random_streams_match_model", random_streams_match_model);
     counted("collection_view.readers_against_one_publisher", readers_against_one_publisher);
     fmt::println("total {} passed, {} failed", total - failed, failed);

@@ -350,6 +350,40 @@ def test_measure(view, blobs, arena):
     assert bounds.max_value_bytes >= bounds.min_value_bytes
 
 
+def test_scan_bounds_and_directions(view, blobs, arena):
+    view.write([10, 20, 30, 40], b"v", collection=blobs)
+    descending = ustore.ScanDirection.DESCENDING
+    assert list(view.scan(10, 8, arena, collection=blobs, end=30)[0]) == keys([10, 20])
+    assert list(view.scan(None, 8, arena, collection=blobs, direction=descending)[0]) == keys([40, 30, 20, 10])
+    assert list(view.scan(30, 8, arena, collection=blobs, end=10, direction=descending)[0]) == keys([30, 20])
+    with view.cursor(collection=blobs, end=20, direction=descending) as cursor:
+        assert list(cursor.next(8, arena)) == keys([40, 30])
+
+
+def test_ranges_remove_and_values_read_in_slices(view, blobs, arena):
+    view.write([1, 2, 3], [b"alpha", b"beta", b"gamma"], collection=blobs)
+    sliced = view.read([1, 3], arena, collection=blobs, offset=1, limit=2)
+    assert [bytes(value) for value in sliced] == [b"lp", b"am"]
+    view.remove(1, ends=3, collection=blobs)
+    assert list(view.scan(0, 8, arena, collection=blobs)[0]) == keys([3])
+
+
+def test_change_feeds_yield_writes_then_removals(engine, database, blobs, arena):
+    if engine == "leveldb":
+        with pytest.raises(ustore.UnsupportedError):
+            database.changes_cursor(collection=blobs)
+        return
+    with database.changes_cursor(collection=blobs) as feed:
+        database.set(1, b"a", collection=blobs)
+        database.remove(1, collection=blobs)
+        changes = feed.next(8, arena, values=True)
+        assert list(changes.keys) == keys([1, 1])
+        assert changes.kinds == (ustore.ChangeKind.WRITE, ustore.ChangeKind.REMOVAL)
+        assert changes.stamps[0] < changes.stamps[1]
+        assert bytes(changes.values[0]) == b"a"
+        assert not feed.next(8, arena).keys
+
+
 def test_scan_patterns_predicates_and_scores(view, blobs, arena):
     """Patterns narrow a scan by value, weighted substrings score BM25, and a predicate admits keys page by page."""
     view.write([1, 2, 3, 4], [b"Apple", b"banana", b"cherry", b"avocado"], collection=blobs)

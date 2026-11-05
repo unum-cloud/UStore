@@ -89,7 +89,8 @@ typedef struct ustore_blobs_write_t {
  */
 USTORE_EXPORT void ustore_blobs_write(ustore_blobs_write_t* arguments);
 
-/** The arguments of @c ustore_blobs_remove, which removes keys with their values in a batch. */
+/** The arguments of @c ustore_blobs_remove, which removes keys with their values in a batch, or
+ *  every key of a range per task when @c end_keys are given. */
 typedef struct ustore_blobs_remove_t {
 
     /** An open database. */
@@ -113,8 +114,11 @@ typedef struct ustore_blobs_remove_t {
     /** Collections owning the keys. */
     ustore_collections_view_t collections;
 
-    /** Keys to remove. */
+    /** Keys to remove, or the inclusive starts of ranges when @c end_keys is given. */
     ustore_keys_view_t keys;
+
+    /** Exclusive ends of the ranges to remove, or a zeroed view to remove @c keys alone. */
+    ustore_keys_view_t end_keys;
 
     /** How durable the removals are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -151,8 +155,10 @@ USTORE_EXPORT void ustore_blobs_remove(ustore_blobs_remove_t* arguments);
 /**
  *  @brief The arguments of @c ustore_blobs_read, which reads values, their lengths or their presence in a batch.
  *
- *  The outputs form an Apache Arrow binary array inside @c arena: presence bits and the tape of values, in the order
- *  of the keys. A missing key reads as an unset presence bit and an empty value.
+ *  The outputs form an Apache Arrow binary array inside @c arena: presence bits and the tape of
+ *  values, in the order of the keys. A missing key reads as an unset presence bit and an empty
+ *  value. With @c offsets or @c limits, every value reads as the bytes of its range, and its
+ *  length as theirs.
  */
 typedef struct ustore_blobs_read_t {
 
@@ -180,6 +186,12 @@ typedef struct ustore_blobs_read_t {
     /** Keys to read. */
     ustore_keys_view_t keys;
 
+    /** Byte offset into each value the read starts at, or a zeroed view for whole values. */
+    ustore_lengths_view_t offsets;
+
+    /** Bytes to read of each value from its offset, clipped, or a zeroed view for the rest. */
+    ustore_lengths_view_t limits;
+
     /** Optional output for a bitset of @c count bits marking present keys, inside @c arena. */
     ustore_octet_t const** presences;
 
@@ -206,7 +218,7 @@ typedef struct ustore_blobs_read_t {
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
  *    call yet.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
@@ -215,8 +227,8 @@ typedef struct ustore_blobs_read_t {
 USTORE_EXPORT void ustore_blobs_read(ustore_blobs_read_t* arguments);
 
 /**
- *  @brief The arguments of @c ustore_blobs_scan, which lists up to @c wanted keys from a start key in
- *      every collection.
+ *  @brief The arguments of @c ustore_blobs_scan, which lists up to @c wanted keys of a range in
+ *      every collection, from its start key towards its end key.
  *
  *  Values are not exported, so a read or a modality follows the scan, or a @c ustore_blobs_cursor_t walks one
  *  collection with its values. Consistent iterators over concurrent state are costly, so scans paginate instead.
@@ -244,8 +256,14 @@ typedef struct ustore_blobs_scan_t {
     /** Collections to scan. */
     ustore_collections_view_t collections;
 
-    /** Smallest key every scan may return, where @c NULL data starts at the first key. */
+    /** Inclusive start of every scan, @c NULL data starting at the first key in @c direction. */
     ustore_keys_view_t start_keys;
+
+    /** Key every scan stops before, exclusive, or a zeroed view for no bound. */
+    ustore_keys_view_t end_keys;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
 
     /** Optional patterns the value of every listed key matches, shared by every scan; zeroed lists every key. */
     ustore_patterns_t patterns;
@@ -285,16 +303,17 @@ typedef struct ustore_blobs_scan_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is missing,
- *  the @c mode, a pattern kind, a case sensitivity or a predicate cost is unknown, the @c patterns
- *  do not compile, the @c view was made by neither view constructor or belongs to another engine,
- *  a watching scan goes through a staged transaction, or a collection holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is
+ *  missing, the @c mode, @c direction, a pattern kind, a case sensitivity or a predicate cost is
+ *  unknown, the @c patterns do not compile, the @c view was made by neither view constructor or
+ *  belongs to another engine, a watching scan goes through a staged transaction, or a collection
+ *  holds another modality.
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
  *    call yet, or on one matching no values, as AMD devices do, given @c patterns.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
@@ -335,8 +354,14 @@ typedef struct ustore_blobs_cursor_init_t {
     /** Collection to walk, which holds keys rather than strings. */
     ustore_collection_id_t collection;
 
-    /** Smallest key the walk returns. */
+    /** Key the walk starts from, inclusive. */
     ustore_key_t start_key;
+
+    /** Key the walk stops before, exclusive, or @c NULL for no bound. */
+    ustore_key_t const* end_key;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
 
     /** Optional patterns every value the walk hands out matches, compiled here once; zeroed walks every key. */
     ustore_patterns_t patterns;
@@ -352,10 +377,9 @@ typedef struct ustore_blobs_cursor_init_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made by
- *    neither view constructor or reads another database, a pattern kind, a case sensitivity or a
- *    predicate cost is unknown, or the @c patterns do not compile.
+ *    neither view constructor or reads another database, the @c direction, a pattern kind, a case
+ *    sensitivity or a predicate cost is unknown, or the @c patterns do not compile.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
- *  - @c ustore_status_unsupported_k A device @c executor is given @c patterns.
  */
 USTORE_EXPORT void ustore_blobs_cursor_init(ustore_blobs_cursor_init_t* arguments);
 
@@ -415,8 +439,9 @@ typedef struct ustore_blobs_cursor_next_t {
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine walks yet.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The pulling executor's device loaded no bundle of the library's
+ *    kernels and the walk has @c patterns.
  *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
@@ -480,7 +505,7 @@ typedef struct ustore_blobs_sample_t {
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
  *    call yet.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
@@ -513,11 +538,14 @@ typedef struct ustore_blobs_measure_t {
     /** Collections to measure. */
     ustore_collections_view_t collections;
 
-    /** First key of every range, where @c NULL data starts at the first key. */
+    /** Inclusive start of every range, @c NULL data starting at the first key in @c direction. */
     ustore_keys_view_t start_keys;
 
-    /** Last key of every range, where @c NULL data ends at the last key. */
+    /** Key every range stops before, exclusive, or a zeroed view for no bound. */
     ustore_keys_view_t end_keys;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
 
     /** Optional output for the lower bound on the entries in every range, inside @c arena. */
     ustore_size_t const** min_cardinalities;
@@ -547,15 +575,16 @@ typedef struct ustore_blobs_measure_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  @c ustore_status_invalid_argument_k means the @c arena or the @c collections are missing, the
- *  @c view was made by neither view constructor or belongs to another engine, a watching measure
- *  goes through a staged transaction, or a collection holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena or the @c collections are missing,
+ *  the @c direction is unknown, the @c view was made by neither view constructor or belongs
+ *  to another engine, a watching measure goes through a staged transaction, or a collection
+ *  holds another modality.
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, or a callback blocks on the executor
  *    running it.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
  *    call yet.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.

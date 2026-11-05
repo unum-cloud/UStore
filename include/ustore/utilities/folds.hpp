@@ -33,7 +33,17 @@ enum class delta_kind_t : std::uint8_t {
 
     /** Changes part of the value, which only the modality's fold reads. */
     change_k = 2,
+
+    /** Removes every key from its own up to an exclusive end key at once, closing every older
+     *  delta of each; runs keep it beside their deltas, so a fold meets it only as the removal a
+     *  chain closes with. */
+    remove_range_k = 3,
 };
+
+/** Whether a delta of @p kind removes its key, alone or with a range of keys. */
+constexpr bool removes(delta_kind_t kind) noexcept {
+    return kind == delta_kind_t::remove_k || kind == delta_kind_t::remove_range_k;
+}
 
 /** One delta of a key: its kind and the bytes it carries. */
 struct delta_view_t {
@@ -69,7 +79,7 @@ struct last_write_fold_t {
                                             arena_allocator<byte_t>&) const noexcept {
         if (deltas.empty()) return base;
         delta_view_t const& newest = deltas.back();
-        if (newest.kind == delta_kind_t::remove_k) return status_t {status_code_t::not_found_k, "The key was removed"};
+        if (removes(newest.kind)) return status_t {status_code_t::not_found_k, "The key was removed"};
         return newest.bytes;
     }
 

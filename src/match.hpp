@@ -28,7 +28,7 @@
 #include <stringzilla/subdocuments.h>  // `sz_subdocuments_engine_t`, `sz_subdocuments_contains`
 #include <stringzilla/substrings.h>    // `sz_substrings_engine_t`, `sz_substrings_contains`
 
-#include "ustore/types.hpp"                 // `key_after`, `largest_key_k`
+#include "ustore/types.hpp"                 // `key_after`, `key_before`, `largest_key_k`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_rewind`
 #include "ustore/utilities/types.hpp"       // `stringzilla_refusal`
 
@@ -431,18 +431,19 @@ using scores_sink_t = st::vector<float, arena_allocator<float>>;
 using keyed_survivors_t = st::vector<ustore_key_t, arena_allocator<ustore_key_t>>;
 
 /**
- *  @brief Appends to @p survivors up to @p wanted keys of @p collection from @p start on that @p match keeps, listing
- *      pages through the host scan verb of @p scan_type_ in @p page, which every page rewinds.
+ *  @brief Appends to @p survivors up to @p wanted keys of @p collection from @p start on in
+ *      @p direction, stopping before @p end where given, that @p match keeps, listing pages through
+ *      the host scan verb of @p scan_type_ in @p page, which every page rewinds.
  *
  *  The pages are ordered, whatever the scan's mode, as each resumes past the last key of the one before. Answers the
- *  key the next listing resumes at, or nothing once the collection ends.
+ *  key the next listing resumes at, or nothing once the range ends.
  */
 template <typename scan_type_, typename match_type_>
 status_t list_matched_keys(home_tables<home_t::host_k> const& engine, ustore_database_t database,
-                           ustore_collection_id_t const& collection, ustore_key_t start, std::size_t wanted,
-                           match_type_ const& match, ustore_arena_t page, view_t const& view,
-                           keyed_survivors_t& survivors, std::variant<ustore_key_t, exhausted_t>& resume,
-                           scores_sink_t* scores = nullptr) noexcept {
+                           ustore_collection_id_t const& collection, ustore_key_t start, ustore_key_t const* end,
+                           ustore_scan_direction_t direction, std::size_t wanted, match_type_ const& match,
+                           ustore_arena_t page, view_t const& view, keyed_survivors_t& survivors,
+                           std::variant<ustore_key_t, exhausted_t>& resume, scores_sink_t* scores = nullptr) noexcept {
     auto const* const verbs = engine.*verb_slot<scan_type_>::template table<home_t::host_k>;
     auto const scan_verb = verbs->*verb_slot<scan_type_>::template verb<home_t::host_k>;
     view_t page_view = view;
@@ -457,6 +458,8 @@ status_t list_matched_keys(home_tables<home_t::host_k> const& engine, ustore_dat
                                .count = 1,
                                .collections = {&collection, 0},
                                .start_keys = {&start, 0},
+                               .end_keys = {end, 0},
+                               .direction = direction,
                                .offsets = &offsets,
                                .keys = &listed,
                                .arena = page,
@@ -502,14 +505,17 @@ status_t list_matched_keys(home_tables<home_t::host_k> const& engine, ustore_dat
                     return status;
         }
 
-        // A page short of what it wanted reached the end of the collection, and so did one ending at the last key
+        // A page short of what it wanted reached the range's end, as did one ending at the last key
+        bool const descending = direction == ustore_scan_descending_k;
+        ustore_key_t const& edge = descending ? smallest_key_k : largest_key_k;
         ustore_key_t const* const last = listed_count ? listed + listed_count - 1 : nullptr;
-        if (listed_count < wanted || (last && *last == largest_key_k)) {
+        if (listed_count < wanted || (last && *last == edge)) {
             resume = exhausted_t {};
             break;
         }
-        // A page cut short by the room left resumes after the last key handed out, never after the page
-        start = taken < candidates.count ? key_after(keys[indices[taken - 1]]) : key_after(*last);
+        // A page cut short by the room left resumes past the last key it handed out, not the page
+        ustore_key_t const& consumed = taken < candidates.count ? keys[indices[taken - 1]] : *last;
+        start = descending ? key_before(consumed) : key_after(consumed);
         resume = start;
     }
     return {};
@@ -536,11 +542,15 @@ struct keyed_scan_plan {
         offsets[task] = static_cast<ustore_length_t>(survivors.size());
         auto const signed_task = static_cast<std::ptrdiff_t>(task);
         strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
+        strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
         strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-        ustore_key_t const start = start_keys ? start_keys[signed_task] : smallest_key_k;
+        bool const descending = arguments.direction == ustore_scan_descending_k;
+        ustore_key_t const start = start_keys ? start_keys[signed_task] : descending ? largest_key_k : smallest_key_k;
+        ustore_key_t const* const end = end_keys ? &end_keys[signed_task] : nullptr;
         std::variant<ustore_key_t, exhausted_t> resume;
-        return list_matched_keys<scan_type_>(engine, arguments.database, collections[signed_task], start,
-                                             arguments.wanted, match, arguments.arena, view, survivors, resume, scores);
+        return list_matched_keys<scan_type_>(engine, arguments.database, collections[signed_task], start, end,
+                                             arguments.direction, arguments.wanted, match, arguments.arena, view,
+                                             survivors, resume, scores);
     }
 };
 
@@ -584,18 +594,33 @@ status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ con
 
 #pragma region Strings Listings
 
+/** Whether a strings listing hands out its starting string, or skips it as descending ones do. */
+enum class start_bound_t : std::uint8_t {
+    inclusive_k,
+    exclusive_k,
+};
+
+/** Where a listing of strings resumes: ascending at the last string followed by a zero byte, the
+ *  smallest string after it, and descending at the last string itself, past which it starts. */
+constexpr start_bound_t resume_bound_of(ustore_scan_direction_t direction) noexcept {
+    return direction == ustore_scan_descending_k ? start_bound_t::exclusive_k : start_bound_t::inclusive_k;
+}
+
 /**
  *  @brief Appends to @p survivors up to @p wanted strings of @p collection under @p prefix
- *      from @p start on that @p match keeps, listing pages through the host strings scan
- *      of @p engine in @p page, which every page rewinds.
+ *      from @p start on in @p direction, stopping before @p end where it is not empty, that
+ *      @p match keeps, listing pages through the host strings scan of @p engine in @p page,
+ *      which every page rewinds.
  *
- *  The predicate sees the keys the strings map onto, which a read of every page's strings finds. Answers the string
- *  the next listing resumes at in @p resume, kept in @p resume_bytes, or nothing once the prefix ends.
+ *  The predicate sees the keys the strings map onto, which a read of every page's strings finds.
+ *  Answers the string the next listing resumes at in @p resume, kept in @p resume_bytes, or nothing
+ *  once the range ends; the next listing starts there as @c resume_bound_of says.
  */
 template <typename match_type_, typename survivors_type_, typename resume_bytes_type_>
 status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_database_t database,
                               ustore_collection_id_t const& collection, ustore_bytes_view_t prefix,
-                              ustore_bytes_view_t start, std::size_t wanted, match_type_ const& match,
+                              ustore_bytes_view_t start, start_bound_t start_bound, ustore_bytes_view_t end,
+                              ustore_scan_direction_t direction, std::size_t wanted, match_type_ const& match,
                               ustore_arena_t page, view_t const& view, survivors_type_& survivors,
                               resume_bytes_type_& resume_bytes, std::variant<ustore_bytes_view_t, exhausted_t>& resume,
                               scores_sink_t* scores = nullptr) noexcept {
@@ -608,19 +633,24 @@ status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_
         match.rewind_page(page);
         ustore_length_t const* offsets = nullptr;
         ustore_strings_view_t listed_view {};
+        std::size_t const page_wanted = wanted + (start_bound == start_bound_t::exclusive_k);
         ustore_strings_scan_t const scan {.database = database,
                                           .count = 1,
                                           .collections = {&collection, 0},
+                                          .direction = direction,
                                           .offsets = &offsets,
                                           .strings = &listed_view,
                                           .arena = page,
-                                          .wanted = wanted};
+                                          .wanted = page_wanted};
         if (status_t const status = verbs.scan(scan, strings_arg_t::from_views(&prefix),
-                                               strings_arg_t::from_views(&start), page_view);
+                                               strings_arg_t::from_views(&start), strings_arg_t::from_views(&end),
+                                               page_view);
             status.failed())
             return status;
         std::size_t const listed_count = offsets ? offsets[1] : 0;
         strings_arg_t const listed {listed_view};
+        std::size_t const skipped = start_bound == start_bound_t::exclusive_k && listed_count &&
+                                    string_of(listed[0]) == string_of(start);
 
         ustore_key_t const* keys = nullptr;
         if (match.asks() && listed_count) {
@@ -633,15 +663,16 @@ status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_
         }
         std::span<ustore_key_t const> const listed_keys {keys, keys ? listed_count : 0};
 
-        auto [indices, indices_status] = arena_allocate<std::uint32_t>(page, listed_count);
+        auto [indices, indices_status] = arena_allocate<std::uint32_t>(page, listed_count - skipped);
         if (indices_status.failed()) return indices_status;
-        candidates_t candidates {indices, {}, listed_count};
+        candidates_t candidates {indices, {}, listed_count - skipped};
         if (scores && match.scores()) {
-            auto [scored, scored_status] = arena_allocate<float>(page, listed_count);
+            auto [scored, scored_status] = arena_allocate<float>(page, listed_count - skipped);
             if (scored_status.failed()) return scored_status;
             candidates.scores = scored;
         }
-        for (std::size_t index = 0; index != listed_count; ++index) indices[index] = static_cast<std::uint32_t>(index);
+        for (std::size_t index = skipped; index != listed_count; ++index)
+            indices[index - skipped] = static_cast<std::uint32_t>(index);
         if (status_t const status = match.ask(ustore_predicate_cheap_k, listed_keys, candidates, page); status.failed())
             return status;
         if (match.reads_values() && candidates.count) {
@@ -666,17 +697,18 @@ status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_
                     return status;
         }
 
-        if (listed_count < wanted) {
+        if (listed_count < page_wanted || listed_count == skipped) {
             resume = exhausted_t {};
             break;
         }
-        // The smallest string after the last one consumed is that string followed by a zero byte
         ustore_bytes_view_t const last = taken < candidates.count ? listed[indices[taken - 1]]
                                                                   : listed[listed_count - 1];
-        if (status_t const status = growth_status(resume_bytes.resize(last.length + 1)); status.failed()) return status;
+        start_bound = resume_bound_of(direction);
+        std::size_t const resume_length = last.length + (start_bound == start_bound_t::inclusive_k);
+        if (status_t const status = growth_status(resume_bytes.resize(resume_length)); status.failed()) return status;
         if (last.length) std::memcpy(resume_bytes.data(), last.data, last.length);
-        resume_bytes[last.length] = byte_t {0};
-        start = {reinterpret_cast<ustore_byte_t const*>(resume_bytes.data()), last.length + 1};
+        if (start_bound == start_bound_t::inclusive_k) resume_bytes[last.length] = byte_t {0};
+        start = {reinterpret_cast<ustore_byte_t const*>(resume_bytes.data()), resume_length};
         resume = start;
     }
     return {};
@@ -687,9 +719,10 @@ status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_
 template <typename match_type_>
 status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ const& match,
                       ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
-                      strings_arg_t const& starts, view_t const& view) noexcept {
+                      strings_arg_t const& starts, strings_arg_t const& ends, view_t const& view) noexcept {
     if (arguments.mode != ustore_scan_ordered_k && arguments.mode != ustore_scan_unordered_k)
         return {status_code_t::invalid_argument_k, "Unknown scan mode"};
+    if (status_t const status = validate_direction(arguments.direction); status.failed()) return status;
     if (!arguments.offsets || !arguments.strings)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
     if (!arguments.count) return {};
@@ -705,11 +738,12 @@ status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ con
         offsets[task] = static_cast<ustore_length_t>(survivors.size());
         ustore_bytes_view_t const prefix = prefixes ? prefixes[task] : ustore_bytes_view_t {};
         ustore_bytes_view_t const start = starts ? starts[task] : ustore_bytes_view_t {};
+        ustore_bytes_view_t const end = ends ? ends[task] : ustore_bytes_view_t {};
         std::variant<ustore_bytes_view_t, exhausted_t> resume;
-        if (status_t const status = list_matched_strings(engine, arguments.database,
-                                                         collections[static_cast<std::ptrdiff_t>(task)], prefix, start,
-                                                         arguments.wanted, match, arguments.arena, view, survivors,
-                                                         resume_bytes, resume, scored ? &scores : nullptr);
+        if (status_t const status = list_matched_strings(
+                engine, arguments.database, collections[static_cast<std::ptrdiff_t>(task)], prefix, start,
+                start_bound_t::inclusive_k, end, arguments.direction, arguments.wanted, match, arguments.arena, view,
+                survivors, resume_bytes, resume, scored ? &scores : nullptr);
             status.failed())
             return status;
         if (!progress.advance(1)) return progress_cancelled_k;

@@ -132,6 +132,13 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_sample
     return sample_keys<docs::document_pair_t>(state, arguments, view);
 }
 
+/** Implements @c ustore_docs_measure, exact for documents and their bytes at the view it reads. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_measure_t const& arguments,
+               view_t const& view) noexcept {
+    return measure_keys<docs::document_pair_t>(state, arguments, view);
+}
+
 #pragma endregion Document Calls
 
 #pragma region Table
@@ -145,6 +152,7 @@ docs_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::docs_verbs
     .remove = &serve_database<cpu_class_, isolation_, ustore_docs_remove_t>,
     .scan = &serve_database<cpu_class_, isolation_, ustore_docs_scan_t>,
     .sample = &serve_database<cpu_class_, isolation_, ustore_docs_sample_t>,
+    .measure = &serve_database<cpu_class_, isolation_, ustore_docs_measure_t>,
 };
 
 #pragma endregion Table

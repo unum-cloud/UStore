@@ -197,6 +197,53 @@ struct json_cells_t {
     }
 };
 
+/** The index a field holds in place of a path when an invalid JSON Pointer, matching nothing. */
+inline constexpr std::size_t no_path_k = static_cast<std::size_t>(-1);
+
+/** The JSONPath of every field of a call, which fields spelling the same path share. */
+struct field_paths_t {
+
+    /** Every distinct path, in the order the fields first spell them. */
+    std::span<sz_string_view_t> paths;
+
+    /** The index into @c paths of every field's path, or @c no_path_k. */
+    std::span<std::size_t> path_of_field;
+};
+
+/** Compiles each of @p fields into its JSONPath once, in @p scratch, kept until it rewinds. */
+inline expected<field_paths_t> compile_field_paths(std::span<std::string_view const> fields,
+                                                   ustore_arena_t scratch) noexcept {
+    auto [paths, paths_status] = arena_allocate<sz_string_view_t>(scratch, fields.size());
+    if (paths_status.failed()) return paths_status;
+    auto [path_of_field, map_status] = arena_allocate<std::size_t>(scratch, fields.size());
+    if (map_status.failed()) return map_status;
+    std::size_t paths_count = 0;
+    st::hash_map<std::string_view, std::size_t, st::default_hash_t, st::equal_to_t, arena_allocator<std::byte>>
+        known_paths {{}, {}, arena_allocator<std::byte> {scratch}};
+    st::vector<char, arena_allocator<char>> path {{scratch}};
+    for (std::size_t field_index = 0; field_index != fields.size(); ++field_index) {
+        auto [valid, path_status] = json_path_of(fields[field_index], path);
+        if (path_status.failed()) return path_status;
+        path_of_field[field_index] = no_path_k;
+        if (!valid) continue;
+        std::string_view const spelled {path.begin(), path.end()};
+        known_paths.probe_to_find(spelled,
+                                  [&](auto const& slot) noexcept { path_of_field[field_index] = slot.value(); });
+        if (path_of_field[field_index] != no_path_k) continue;
+        // The scratch path is respelled for every field, so a new path moves into bytes of its own
+        auto [kept, kept_status] = arena_allocate<char>(scratch, spelled.size());
+        if (kept_status.failed()) return kept_status;
+        std::memcpy(kept.data(), spelled.data(), spelled.size());
+        std::string_view const stable {kept.begin(), kept.end()};
+        if (known_paths.reserve_more(1) == decltype(known_paths)::reserve_result_t::failed_k)
+            return status_t {status_code_t::out_of_memory_k, "No room to compile another path"};
+        known_paths.emplace(stable, std::size_t {paths_count}, st::assume_reserved);
+        path_of_field[field_index] = paths_count;
+        paths[paths_count++] = stringzilla_view(stable);
+    }
+    return field_paths_t {paths.first(paths_count), path_of_field};
+}
+
 /** A compiled subdocuments engine, freed with the call that compiled it. */
 class subdocuments_engine_t {
     sz_subdocuments_engine_t engine_ {};
@@ -264,35 +311,10 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
         return {status_code_t::invalid_argument_k, "Documents arrive on a tape"};
     std::size_t const documents_count = documents.count;
     constexpr std::size_t no_index_k = static_cast<std::size_t>(-1);
-
-    // Every field compiles into one path, which fields spelling the same path share
-    auto [path_of_field, map_status] = arena_allocate<std::size_t>(scratch, fields.size());
-    if (map_status.failed()) return map_status;
-    st::vector<sz_string_view_t, arena_allocator<sz_string_view_t>> paths {{scratch}};
-    st::hash_map<std::string_view, std::size_t, st::default_hash_t, st::equal_to_t, arena_allocator<std::byte>>
-        known_paths {{}, {}, arena_allocator<std::byte> {scratch}};
-    st::vector<char, arena_allocator<char>> path {{scratch}};
-    for (std::size_t field_index = 0; field_index != fields.size(); ++field_index) {
-        auto [valid, path_status] = json_path_of(fields[field_index], path);
-        if (path_status.failed()) return path_status;
-        path_of_field[field_index] = no_index_k;
-        if (!valid) continue;
-        std::string_view const spelled {path.begin(), path.end()};
-        known_paths.probe_to_find(spelled,
-                                  [&](auto const& slot) noexcept { path_of_field[field_index] = slot.value(); });
-        if (path_of_field[field_index] != no_index_k) continue;
-        // The scratch path is respelled for every field, so a new path moves into bytes of its own
-        auto [kept, kept_status] = arena_allocate<char>(scratch, spelled.size());
-        if (kept_status.failed()) return kept_status;
-        std::memcpy(kept.data(), spelled.data(), spelled.size());
-        std::string_view const stable {kept.begin(), kept.end()};
-        if (known_paths.reserve_more(1) == decltype(known_paths)::reserve_result_t::failed_k)
-            return {status_code_t::out_of_memory_k, "No room to compile another path"};
-        known_paths.emplace(stable, std::size_t {paths.size()}, st::assume_reserved);
-        path_of_field[field_index] = paths.size();
-        if (status_t const status = growth_status(paths.push_back(stringzilla_view(stable))); status.failed())
-            return status;
-    }
+    auto [compiled_paths, paths_status] = compile_field_paths(fields, scratch);
+    if (paths_status.failed()) return paths_status;
+    std::span<sz_string_view_t const> const paths = compiled_paths.paths;
+    std::span<std::size_t const> const path_of_field = compiled_paths.path_of_field;
 
     // Only the documents some cell reads are walked, so a missing or empty one asks the engine nothing
     auto [walked_of_document, walked_status] = arena_allocate<std::size_t>(scratch, documents_count);
@@ -301,7 +323,7 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     st::vector<sz_string_view_t, arena_allocator<sz_string_view_t>> walked {{scratch}};
     for (std::size_t cell_index = 0; cell_index != cells_count; ++cell_index) {
         field_cell_t const cell = cell_of(cell_index);
-        if (path_of_field[cell.field] == no_index_k || walked_of_document[cell.document] != no_index_k) continue;
+        if (path_of_field[cell.field] == no_path_k || walked_of_document[cell.document] != no_index_k) continue;
         std::string_view const document = documents[cell.document];
         if (document.empty()) continue;
         walked_of_document[cell.document] = walked.size();
@@ -344,7 +366,7 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     for (std::size_t cell_index = 0; cell_index != cells_count; ++cell_index) {
         field_cell_t const cell = cell_of(cell_index);
         std::size_t const path_index = path_of_field[cell.field];
-        std::size_t const walked_index = path_index == no_index_k ? no_index_k : walked_of_document[cell.document];
+        std::size_t const walked_index = path_index == no_path_k ? no_index_k : walked_of_document[cell.document];
         if (walked_index == no_index_k) continue;
         std::size_t const match_index = match_of_slot[walked_index * paths.size() + path_index];
         if (match_index == no_index_k) continue;

@@ -87,4 +87,10 @@ __device__ inline void tape_gather_block(tape_source_t const* sources, tape_segm
     }
 }
 
+/** Copies one row of @p rows into its dense place per thread of the launch. */
+__device__ inline void densify_rows(strided_rows_t const& rows) noexcept {
+    std::uint64_t const row = std::uint64_t {blockIdx.x} * blockDim.x + threadIdx.x;
+    if (row < rows.rows) densify_row(rows, row);
+}
+
 } // namespace unum::ustore::utilities

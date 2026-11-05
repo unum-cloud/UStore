@@ -22,7 +22,7 @@
 #include <shared_mutex> // `std::shared_lock`, `std::shared_mutex`
 #include <new>          // `std::nothrow`
 #include <span>         // `std::span`
-#include <string>       // `std::string`, `std::to_string`, the path and name type RocksDB takes
+#include <string>       // `std::string`, the path and name type RocksDB takes
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::error_code`
 #include <utility>      // `std::pair`
@@ -132,8 +132,9 @@ struct database_t {
      *  families, which a drop holds exclusively. */
     std::mutex retired_mutex;
 
-    /** Writes the log's buffer out and closes, whether the database opened fully or failed halfway. A snapshot the
-     *  caller never freed makes `Close` refuse, which is the caller's error, so the database goes regardless. */
+    /** Syncs the log and closes, whether the database opened fully or failed halfway. A snapshot
+     *  the caller never freed makes @c Close refuse, which is the caller's error, so the
+     *  database goes regardless. */
     ~database_t() noexcept {
         if (!native) return;
         [[maybe_unused]] native_status_t const flushed = native->FlushWAL(true);
@@ -177,10 +178,10 @@ enum class staging_t : std::uint8_t {
     /** Buffering writes and watched reads, holding no locks. */
     buffering_k,
 
-    /** Prepared into the log, with every key it touched locked and validated. */
+    /** Every key it touched locked and validated, its writes replayed in RocksDB's transaction. */
     staged_k,
 
-    /** A prepare failed after RocksDB left the transaction unusable, so only a reset brings it back. */
+    /** A stage or a commit failed in a way RocksDB could not undo, so only a reset recovers it. */
     broken_k,
 };
 
@@ -366,8 +367,8 @@ void use_snapshot(view_t const& view, ::rocksdb::ReadOptions& options) noexcept 
 /** An upper bound on the bytes a batch record spends beyond its key and value. */
 constexpr std::size_t record_overhead_k = 16;
 
-/** The options of a write or a commit, syncing when @p durability asks for a flush, which writes the log's buffer out
- *  first, so a flushed write keeps every write before it too. */
+/** The options of a write or a commit, syncing every log file when @p durability asks for a flush,
+ *  so a flushed write keeps every write before it too. */
 ::rocksdb::WriteOptions write_options_for(ustore_durability_t durability) noexcept {
     ::rocksdb::WriteOptions write_options;
     write_options.sync = durability == ustore_durability_flushed_k;
@@ -524,6 +525,18 @@ transaction_t* reading_transaction(view_t const& view, ::rocksdb::ReadOptions& r
     return transaction->batch.NewIteratorWithBase(column, base, &read_options);
 }
 
+/** Points @p iterator at @p key, or at the nearest key past it in @p direction. */
+void seek_towards(::rocksdb::Iterator& iterator, ::rocksdb::Slice key, ustore_scan_direction_t direction) {
+    if (direction == ustore_scan_descending_k) iterator.SeekForPrev(key);
+    else iterator.Seek(key);
+}
+
+/** Moves @p iterator one key on in @p direction. */
+void step_towards(::rocksdb::Iterator& iterator, ustore_scan_direction_t direction) {
+    if (direction == ustore_scan_descending_k) iterator.Prev();
+    else iterator.Next();
+}
+
 #pragma endregion Reads and Writes
 
 #pragma region Snapshots
@@ -624,9 +637,10 @@ status_t open_database(arguments_type_ const& arguments, access_t access) {
     // An export persists `error_if_exists`, which would refuse every reopening of it
     options.create_if_missing = true;
     options.error_if_exists = false;
-    // Every write reaches the log, which stays in memory until a flushed write, a full buffer or a clean close; set
-    // after the options files, so a database created before keeps no other setting
-    options.manual_wal_flush = true;
+    // A log buffered in memory keeps the writes before a memtable switch out of its file,
+    // where change feeds read; set after the options files, so a database created before keeps
+    // no other setting
+    options.manual_wal_flush = false;
     for (ustore_data_directory_t const& directory :
          std::span {arguments.data_directories, static_cast<std::size_t>(arguments.data_directories_count)}) {
         if (!directory.path.length) return {status_code_t::invalid_argument_k, "A data directory needs a path"};
@@ -1136,23 +1150,20 @@ status_t begin(database_t& database, transaction_t& transaction) {
 }
 
 /**
- *  @brief Stages @p transaction unless it already is: locks and validates every watched read and buffered write
- *      against the snapshot its first read or write took, then prepares the writes into the log.
+ *  @brief Stages @p transaction unless it already is: locks and validates every watched read and
+ *      buffered write against the snapshot its first read or write took, then replays the writes
+ *      into RocksDB's transaction.
  *
- *  A refused key rolls back to the save point taken before the first lock, leaving the transaction buffering and
- *  retryable as on the reference engine, unless RocksDB's prepare itself failed and left it needing a reset.
+ *  A refused key rolls back to the save point taken before the first lock, leaving the transaction
+ *  buffering and retryable as on the reference engine, unless the rollback itself failed and left
+ *  it needing a reset. Nothing is prepared into the log, whose two-phase records RocksDB's log
+ *  iterator cannot read, so the commit writes it whole.
  */
 status_t stage(database_t& database, transaction_t& transaction) {
     if (transaction.staging == staging_t::staged_k) return {};
     if (transaction.staging == staging_t::broken_k)
-        return {status_code_t::invalid_argument_k, "A failed prepare left the transaction needing a reset"};
-
-    // A prepare needs a name unique among open transactions only, as the database rolls back every older one it opens
+        return {status_code_t::invalid_argument_k, "A failed stage left the transaction needing a reset"};
     ::rocksdb::Transaction& native = *transaction.native;
-    if (native.GetName().empty()) {
-        native_status_t const named = native.SetName(std::to_string(native.GetID()));
-        if (!named.ok()) return status_of(named);
-    }
 
     // Sorted keys lock in one order across transactions and group by collection, and a key read twice locks once
     st::vector<watched_key_t>& watched = transaction.watched;
@@ -1201,7 +1212,6 @@ status_t stage(database_t& database, transaction_t& transaction) {
         }
         if (status.ok()) status = entries->status();
     }
-    if (status.ok()) status = native.Prepare();
     if (status.ok()) {
         transaction.staging = staging_t::staged_k;
         return {};
@@ -1229,7 +1239,7 @@ status_t transaction_init(ustore_transaction_init_t const& arguments, view_t con
         made = std::move(fresh);
         transaction = made.state.get();
     }
-    // A prepare left behind would pin the log and come back after a crash
+    // A staged transaction holds its locks until it rolls back
     else if (transaction->staging == staging_t::staged_k) {
         native_status_t const rolled_back = transaction->native->Rollback();
         if (!rolled_back.ok()) return status_of(rolled_back);
@@ -1263,12 +1273,17 @@ status_t transaction_commit(ustore_transaction_commit_t const& arguments, view_t
     if (status_t const status = stage(database, transaction); status.failed()) return status;
 
     // A flushed commit syncs the log within its own write, so no reader sees it before it is durable, and any other
-    // commit waits in the log's buffer until a flushed one, a full buffer or a clean close writes it out
+    // commit reaches the log file unsynced until a flushed one or a clean close syncs it
     ::rocksdb::Transaction& native = *transaction.native;
     native.SetWriteOptions(write_options_for(arguments.durability));
+    std::uint32_t const written = native.GetWriteBatch()->GetWriteBatch()->Count();
     native_status_t const committed = native.Commit();
-    if (!committed.ok()) return status_of(committed);
-    if (arguments.commit_stamp) *arguments.commit_stamp = native.GetId();
+    if (!committed.ok()) {
+        transaction.staging = staging_t::broken_k;
+        return status_of(committed);
+    }
+    // The stamp is the last sequence the commit wrote, where a snapshot taken right after it reads
+    if (arguments.commit_stamp) *arguments.commit_stamp = native.GetId() + written - 1;
 
     // The handle carries on as a new transaction, as a reset would leave it
     return begin(database, transaction);
@@ -1279,7 +1294,7 @@ status_t transaction_rollback(ustore_transaction_rollback_t const& arguments, vi
     if (state_status.failed()) return state_status;
     transaction_t& transaction = *state;
     if (transaction.staging == staging_t::broken_k)
-        return {status_code_t::invalid_argument_k, "A failed prepare left the transaction needing a reset"};
+        return {status_code_t::invalid_argument_k, "A failed stage left the transaction needing a reset"};
     if (transaction.staging == staging_t::buffering_k) return {};
 
     // The successor takes its snapshot while the stage still locks every key it read or wrote, so staging again
@@ -1301,7 +1316,7 @@ status_t transaction_rollback(ustore_transaction_rollback_t const& arguments, vi
 
 void transaction_free(ustore_transaction_t handle) noexcept {
     transaction_t* const transaction = state_of<transaction_t>(handle);
-    // A prepare left behind would pin the log and come back after a crash
+    // A staged transaction holds its locks until it rolls back
     if (transaction->staging == staging_t::staged_k) {
         [[maybe_unused]] native_status_t const rolled_back = transaction->native->Rollback();
     }

@@ -25,6 +25,7 @@
 #include <cstring> // `std::memcpy`
 
 #include <algorithm> // `std::sort`
+#include <limits>    // `std::numeric_limits`
 #include <span>      // `std::span`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
@@ -105,9 +106,9 @@ bool committed_vertex(call_access<cpu_class_> const& access, collection_id_t col
 /** Whether @p key of @p collection holds a vertex as @p access sees it, its own writes included. */
 template <cpu_class_t cpu_class_>
 bool visible_vertex(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t key) noexcept {
-    delta_view_t own_delta;
-    if (access.transaction && access.transaction->uncommitted_delta(collection, key, own_delta))
-        return own_delta.kind != delta_kind_t::remove_k;
+    lookup_result_t const own = access.transaction ? access.transaction->lookup_uncommitted(collection, key)
+                                                   : lookup_result_t::missing_k;
+    if (own != lookup_result_t::missing_k) return own == lookup_result_t::written_k;
     return committed_vertex(access, collection, key);
 }
 
@@ -449,8 +450,15 @@ status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, vi
         });
 }
 
-/** Implements @c ustore_graph_remove_vertices: the removal of every half-edge the other ends of its edges in its role
- *  file of it, then of the vertex itself, watching the adjacency it read and the ends it changes. */
+/**
+ *  @brief Implements @c ustore_graph_remove_vertices: the removal of every half-edge the other ends
+ *      of its edges in its role file of it, then of the vertex itself, watching the adjacency it
+ *      read and the ends it changes.
+ *
+ *  A range removes every vertex it holds as one range tombstone, after the half-edges the vertices
+ *  outside the range file of the vertices inside it are removed one by one; a vertex inside the
+ *  range takes no change, as the tombstone hides it whole.
+ */
 template <cpu_class_t cpu_class_>
 status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, view_t const& view) noexcept {
     if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
@@ -464,34 +472,66 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
         resolved.failed())
         return resolved;
     strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
+    strided_iterator<ustore_key_t const> const end_vertices = strided(arguments.end_vertices);
     strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
-    auto [keys, keys_status] = arena_allocate<stored_key_t>(view.scratch, count);
-    if (keys_status.failed()) return keys_status;
-    auto [reads, reads_status] = arena_allocate<vertex_read_t>(view.scratch, count);
-    if (reads_status.failed()) return reads_status;
-    for (std::size_t index = 0; index != count; ++index) keys[index] = stored_of(vertices[index].uuid);
+    auto const inside_ranges = [&](ustore_collection_id_t const& collection, ustore_key_t const& vertex) noexcept {
+        if (!end_vertices) return false;
+        for (std::size_t task = 0; task != count; ++task)
+            if (collections[task] == collection && !(vertex < vertices[task]) && vertex < end_vertices[task])
+                return true;
+        return false;
+    };
+    auto [firsts, firsts_status] = arena_allocate<std::size_t>(view.scratch, count + 1);
+    if (firsts_status.failed()) return firsts_status;
 
     // Every attempt reads the adjacency again through its own transaction, so a retry finds the edges as they now are
     return serve_write(
         state, view, arguments.durability, count, count * graph::half_edge_delta_bytes_k, graph_write_schedule(view),
         [&](call_access<cpu_class_> const& access) noexcept -> status_t {
-            if (status_t const read = read_task_vertices(access, collections, keys, reads); read.failed()) return read;
+            // A task's keys start at its entry of firsts: its vertex, or those present in range.
+            st::vector<stored_key_t, arena_allocator<stored_key_t>> keys {{access.scratch}};
+            for (std::size_t task = 0; task != count; ++task) {
+                firsts[task] = keys.size();
+                status_t listed;
+                if (!end_vertices) listed = growth_status(keys.push_back(stored_of(vertices[task].uuid)));
+                else if (vertices[task] < end_vertices[task])
+                    listed = collect_keys(access, collections[task], stored_of(vertices[task].uuid),
+                                          stored_of(key_before(end_vertices[task]).uuid),
+                                          std::numeric_limits<std::size_t>::max(), keys);
+                if (listed.failed()) return listed;
+            }
+            firsts[count] = keys.size();
+            auto [reads, reads_status] = arena_allocate<vertex_read_t>(access.scratch, keys.size());
+            if (reads_status.failed()) return reads_status;
+            for (std::size_t task = 0; task != count; ++task) {
+                std::size_t const listed = firsts[task + 1] - firsts[task];
+                if (status_t const read = read_vertices(
+                        access, collections[task], std::span<stored_key_t const> {keys}.subspan(firsts[task], listed),
+                        reads.subspan(firsts[task], listed));
+                    read.failed())
+                    return read;
+            }
             st::vector<vertex_delta_t, arena_allocator<vertex_delta_t>> deltas {{access.scratch}};
-            for (std::size_t index = 0; index != count; ++index) {
-                if (!reads[index].present) continue;
-                ustore_key_t const vertex = vertices[index];
-                role_t const wanted = half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k);
-                expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertex, reads[index].base,
-                                                                                        reads[index].pending);
-                if (!adjacency) return adjacency.status();
-                for (half_edge_cursor_t cursor = adjacency->half_edges(); cursor.valid(); cursor.next()) {
-                    graph::labeled_half_edge_t const half_edge = cursor.current();
-                    if (!(half_edge.role & wanted) || half_edge.neighbor_id == vertex) continue;
-                    half_edge_delta_t const removal = half_edge_delta_t::remove(vertex, half_edge.edge_id,
-                                                                                mirrored_role(half_edge.role));
-                    vertex_delta_t const filed {collections[index], half_edge.neighbor_id, removal, deltas.size()};
-                    if (status_t const kept = growth_status(deltas.push_back(vertex_delta_t {filed})); kept.failed())
-                        return kept;
+            for (std::size_t task = 0; task != count; ++task) {
+                role_t const wanted = half_edge_roles_of(roles ? roles[task] : ustore_vertex_role_any_k);
+                for (std::size_t index = firsts[task]; index != firsts[task + 1]; ++index) {
+                    if (!reads[index].present) continue;
+                    ustore_key_t const vertex = key_of(keys[index]);
+                    expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertex, reads[index].base,
+                                                                                            reads[index].pending);
+                    if (!adjacency) return adjacency.status();
+                    for (half_edge_cursor_t cursor = adjacency->half_edges(); cursor.valid(); cursor.next()) {
+                        graph::labeled_half_edge_t const half_edge = cursor.current();
+                        if (!(half_edge.role & wanted) || half_edge.neighbor_id == vertex ||
+                            inside_ranges(collections[task], half_edge.neighbor_id))
+                            continue;
+                        half_edge_delta_t const removal = half_edge_delta_t::remove(vertex, half_edge.edge_id,
+                                                                                    mirrored_role(half_edge.role));
+                        vertex_delta_t const filed {collections[task], half_edge.neighbor_id, removal, deltas.size()};
+                        if (status_t const kept = growth_status(deltas.push_back(vertex_delta_t {filed}));
+                            kept.failed())
+                            return kept;
+                    }
                 }
             }
             st::vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{access.scratch}};
@@ -506,11 +546,14 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
                 if (status_t const appended = append_chain(access, chain); appended.failed()) return appended;
             }
             // The removals go last, so one outranks a change this batch appended to a vertex it also removes
-            for (std::size_t index = 0; index != count; ++index) {
-                if (!reads[index].present) continue;
-                if (status_t const removed = write_value(access, collections[index], keys[index], value_view_t {});
-                    removed.failed())
-                    return removed;
+            for (std::size_t task = 0; task != count; ++task) {
+                status_t removed;
+                if (end_vertices)
+                    removed = remove_key_range(access, collections[task], stored_of(vertices[task].uuid),
+                                               stored_of(end_vertices[task].uuid));
+                else if (reads[firsts[task]].present)
+                    removed = write_value(access, collections[task], keys[firsts[task]], value_view_t {});
+                if (removed.failed()) return removed;
             }
             return {};
         });

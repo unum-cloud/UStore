@@ -113,6 +113,7 @@ inline std::size_t list_gpu_devices(gpu_drivers_t const& drivers, std::span<gpu_
 inline constexpr char const* vram_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                       "ustore_tape_offsets_u64",
                                                       "ustore_tape_gather",
+                                                      "ustore_tape_densify",
                                                       "ustore_merge_rank_inline_12",
                                                       "ustore_merge_pack_inline_12",
                                                       "ustore_merge_place_inline_12",
@@ -138,7 +139,15 @@ inline constexpr char const* vram_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                       "ustore_regex_contains_per_chunk",
                                                       "ustore_subdocuments_contains_per_thread",
                                                       "ustore_subdocuments_contains_per_group",
-                                                      "ustore_subdocuments_contains_per_chunk"};
+                                                      "ustore_subdocuments_contains_per_chunk",
+                                                      "ustore_subdocuments_find_per_group",
+                                                      "ustore_subdocuments_find_per_chunk",
+                                                      "ustore_docs_gather_scalars",
+                                                      "ustore_docs_measure_texts",
+                                                      "ustore_docs_write_texts",
+                                                      "ustore_docs_pack_bools",
+                                                      "ustore_docs_drop_terminators_u32",
+                                                      "ustore_docs_drop_terminators_u64"};
 
 /** The bundle of NVIDIA kernels the library embeds, empty when its build named no CUDA codes. */
 std::span<byte_t const> vram_nvidia_bundle() noexcept;

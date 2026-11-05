@@ -18,7 +18,6 @@
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint32_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <bit>          // `std::bit_cast`
 #include <charconv>     // `std::from_chars`
 #include <limits>       // `std::numeric_limits`
 #include <span>         // `std::span`
@@ -31,6 +30,7 @@
 #include <fmt/format.h> // `fmt::format_to_n`
 #include <yyjson.h>     // `yyjson_read_opts`, `yyjson_mut_doc`, `yyjson_read_number`
 
+#include "ustore/docs/json_cells.hpp"       // `conversion_t`, `json_token_t`, `half_of`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`
 #include "ustore/utilities/types.hpp"       // `value_view_t`, `expected`, `status_t`
 
@@ -49,9 +49,6 @@ using utilities::value_view_t;
 
 /** Longest text a printed number takes, including the null terminator. */
 constexpr std::size_t printed_number_length_limit_k = 32;
-
-/** Bytes of a UUID. */
-constexpr std::size_t uuid_bytes_k = 16;
 
 using printed_number_buffer_t = char[printed_number_length_limit_k];
 
@@ -221,29 +218,6 @@ inline expected<value_view_t> json_dump(json_value_t value, ustore_arena_t arena
 
 #pragma region Conversions
 
-/** How faithfully a value under a field converts into the requested type. */
-enum class conversion_t {
-    missing_k,
-    exact_k,
-    converted_k,
-    collides_k,
-};
-
-/** Whether @p conversion produced a value the column holds. */
-inline bool is_valid(conversion_t conversion) noexcept {
-    return conversion == conversion_t::exact_k || conversion == conversion_t::converted_k;
-}
-
-/** Records @p conversion of one cell, setting the validity bit last since the other bitmaps may alias it. */
-inline void record_conversion(conversion_t conversion, ustore_octet_t mask, ustore_octet_t& valid,
-                              ustore_octet_t& converted, ustore_octet_t& collides) noexcept {
-    ustore_octet_t const cleared = static_cast<ustore_octet_t>(~mask);
-    converted = static_cast<ustore_octet_t>((converted & cleared) |
-                                            (conversion == conversion_t::converted_k ? mask : 0));
-    collides = static_cast<ustore_octet_t>((collides & cleared) | (conversion == conversion_t::collides_k ? mask : 0));
-    valid = static_cast<ustore_octet_t>((valid & cleared) | (is_valid(conversion) ? mask : 0));
-}
-
 /** Whether @p real, with its fraction dropped, fits the range of @p scalar_type_, where NaN fits
  *  only a float. */
 template <typename scalar_type_>
@@ -265,37 +239,6 @@ bool integer_fits(integer_type_ integer) noexcept {
     if constexpr (std::is_same_v<scalar_type_, bool> || std::is_floating_point_v<scalar_type_>) return true;
     else return std::in_range<scalar_type_>(integer);
 }
-
-/** What one field of one document holds, told by the first byte of its JSON token. */
-enum class json_token_t : std::uint8_t {
-
-    /** No member of the document has the field, so the cell is null. */
-    missing_k = 0,
-
-    /** A JSON @c null. */
-    null_k = 1,
-
-    /** A JSON @c false. */
-    false_k = 2,
-
-    /** A JSON @c true. */
-    true_k = 3,
-
-    /** A JSON number. */
-    number_k = 4,
-
-    /** A JSON string. */
-    string_k = 5,
-
-    /** A JSON object, as its raw bytes. */
-    object_k = 6,
-
-    /** A JSON array, as its raw bytes. */
-    array_k = 7,
-
-    /** A token of a malformed document, or a string whose escapes do not decode, which is null. */
-    malformed_k = 8,
-};
 
 /** The number a JSON number spells, as yyjson reads it: unsigned, signed, or real. */
 using json_number_t = std::variant<std::uint64_t, std::int64_t, double>;
@@ -338,16 +281,8 @@ inline json_cell_t json_read_number(std::string_view token) noexcept {
 
 /** What @p token holds, told by its first byte; a string keeps its quotes for the caller to unescape. */
 inline json_cell_t json_classify(std::string_view token) noexcept {
-    if (token.empty()) return {json_token_t::malformed_k, token};
-    switch (token.front()) {
-    case '"': return {json_token_t::string_k, token};
-    case '{': return {json_token_t::object_k, token};
-    case '[': return {json_token_t::array_k, token};
-    case 't': return {json_token_t::true_k, token};
-    case 'f': return {json_token_t::false_k, token};
-    case 'n': return {json_token_t::null_k, token};
-    default: return json_read_number(token);
-    }
+    json_token_t const kind = json_token_of(token);
+    return kind == json_token_t::number_k ? json_read_number(token) : json_cell_t {kind, token};
 }
 
 /** Converts @p value into @p scalar, where a value outside the range of the scalar collides. */
@@ -467,26 +402,6 @@ inline expected<json_t> any_parse(value_view_t bytes, ustore_docs_field_type_t t
 
 #pragma region Gather
 
-/** Bytes of the scalar a column of @p type holds per document, or zero for a column of strings or of JSON. */
-inline std::size_t field_size_bytes(ustore_docs_field_type_t type) noexcept {
-    switch (type) {
-    case ustore_docs_field_type_bool_k: return sizeof(bool);
-    case ustore_docs_field_type_uuid_k: return uuid_bytes_k;
-    case ustore_docs_field_type_f64_k: return sizeof(double);
-    case ustore_docs_field_type_f32_k: return sizeof(float);
-    case ustore_docs_field_type_f16_k: return sizeof(std::uint16_t);
-    case ustore_docs_field_type_i64_k: return sizeof(std::int64_t);
-    case ustore_docs_field_type_i32_k: return sizeof(std::int32_t);
-    case ustore_docs_field_type_i16_k: return sizeof(std::int16_t);
-    case ustore_docs_field_type_i8_k: return sizeof(std::int8_t);
-    case ustore_docs_field_type_u64_k: return sizeof(std::uint64_t);
-    case ustore_docs_field_type_u32_k: return sizeof(std::uint32_t);
-    case ustore_docs_field_type_u16_k: return sizeof(std::uint16_t);
-    case ustore_docs_field_type_u8_k: return sizeof(std::uint8_t);
-    default: return 0;
-    }
-}
-
 /** Converts @p value into the scalar at @p index of @p column, zeroing a cell that holds no valid value. */
 template <typename scalar_type_>
 conversion_t gather_scalar(json_cell_t const& value, ustore_byte_t* column, std::size_t index) noexcept {
@@ -495,30 +410,6 @@ conversion_t gather_scalar(json_cell_t const& value, ustore_byte_t* column, std:
     if (!is_valid(conversion)) scalar = {};
     std::memcpy(column + index * sizeof(scalar_type_), &scalar, sizeof(scalar_type_));
     return conversion;
-}
-
-/** Smallest magnitude that rounds past the largest finite half-precision float. */
-constexpr float half_overflow_k = 65520.0f;
-
-/** Encodes a finite @p single below @c half_overflow_k as IEEE 754 binary16, rounding to nearest. */
-inline std::uint16_t half_of(float single) noexcept {
-    auto const bits = std::bit_cast<std::uint32_t>(single);
-    auto const sign = static_cast<std::uint16_t>((bits >> 16) & 0x8000u);
-    int const exponent = static_cast<int>((bits >> 23) & 0xffu) - 127 + 15;
-    std::uint32_t mantissa = bits & 0x7fffffu;
-
-    if (((bits >> 23) & 0xffu) == 0xffu) return static_cast<std::uint16_t>(sign | 0x7c00u | (mantissa ? 0x200u : 0u));
-    if (exponent >= 1) {
-        auto const half = static_cast<std::uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
-        return static_cast<std::uint16_t>(half + ((mantissa >> 12) & 1u));
-    }
-    if (exponent < -10) return sign;
-
-    // Subnormal halves shift the implicit leading bit into the mantissa
-    mantissa |= 0x800000u;
-    auto const shift = static_cast<unsigned>(14 - exponent);
-    auto const half = static_cast<std::uint16_t>(sign | (mantissa >> shift));
-    return static_cast<std::uint16_t>(half + ((mantissa >> (shift - 1)) & 1u));
 }
 
 /** Converts @p value into the half-precision float at @p index of @p column, where a magnitude past its range

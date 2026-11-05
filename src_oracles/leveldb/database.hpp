@@ -298,6 +298,31 @@ status_t append_staged(read_outputs_t& outputs, value_view_t value, ustore_arena
     return {};
 }
 
+/** Moves @p iterator from the key a seek found to the one before it, or to the last key if none. */
+void step_back_from_seek_(::leveldb::Iterator& iterator) {
+    if (iterator.Valid()) iterator.Prev();
+    else if (iterator.status().ok()) iterator.SeekToLast();
+}
+
+/** Points @p iterator at the last key before @p key. */
+void seek_before(::leveldb::Iterator& iterator, ::leveldb::Slice key) {
+    iterator.Seek(key);
+    step_back_from_seek_(iterator);
+}
+
+/** Points @p iterator at @p key, or at the nearest key past it in @p direction. */
+void seek_towards(::leveldb::Iterator& iterator, ::leveldb::Slice key, ustore_scan_direction_t direction) {
+    iterator.Seek(key);
+    if (direction != ustore_scan_descending_k || (iterator.Valid() && iterator.key() == key)) return;
+    step_back_from_seek_(iterator);
+}
+
+/** Moves @p iterator one key on in @p direction. */
+void step_towards(::leveldb::Iterator& iterator, ustore_scan_direction_t direction) {
+    if (direction == ustore_scan_descending_k) iterator.Prev();
+    else iterator.Next();
+}
+
 /** Reads every place with its own `Get`, handing each value to @p enumerator with its index. */
 template <typename value_enumerator_type_>
 status_t get_each(database_t& database, place_batch_t const& places, ::leveldb::ReadOptions const& options,

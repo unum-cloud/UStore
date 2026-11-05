@@ -80,23 +80,24 @@ use std::borrow::Cow;
 use std::ffi::{c_char, c_int, c_void};
 use std::fmt;
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::ptr;
 use std::str::FromStr;
 
 use stringtape::CharsTape;
 
-use crate::blobs::{Page, Values};
+use crate::blobs::{Bounds, Found, Measurement, Page, Values};
 use crate::db::ffi::{
     ustore_arena_t, ustore_byte_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t,
     ustore_completion_t, ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_key_t,
     ustore_keys_view_t, ustore_length_t, ustore_octet_t, ustore_outcome_t, ustore_predicate_t,
-    ustore_progress_callback_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t, ustore_transaction_t,
-    ustore_view_t, ustore_watch_t,
+    ustore_progress_callback_t, ustore_scan_direction_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t,
+    ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
 use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
     check, exported_slice, fail, read_spelling, spelling, Address, Arena, CollectionID, Collections, Durability, Error,
-    Key, Matched, Matching, Result, Rows, Status, Strings, View, UUID,
+    Key, KeyRange, Matched, Matching, Result, Rows, Status, Strings, View, UUID,
 };
 
 // region: Raw Declarations
@@ -136,6 +137,7 @@ pub(crate) mod ffi {
         pub count: ustore_size_t,
         pub collections: ustore_collections_view_t,
         pub keys: ustore_keys_view_t,
+        pub end_keys: ustore_keys_view_t,
         pub durability: ustore_durability_t,
         pub watch: ustore_watch_t,
     }
@@ -216,6 +218,8 @@ pub(crate) mod ffi {
         pub view: ustore_view_t,
         pub collection: ustore_collection_id_t,
         pub start_key: ustore_key_t,
+        pub end_key: *const ustore_key_t,
+        pub direction: ustore_scan_direction_t,
         pub filter: ustore_bytes_view_t,
         pub predicate: ustore_predicate_t,
     }
@@ -236,6 +240,42 @@ pub(crate) mod ffi {
         pub progress_state: *mut c_void,
     }
 
+    #[repr(C)]
+    pub struct ustore_docs_sample_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub offsets: *mut *const ustore_length_t,
+        pub keys: *mut *const ustore_key_t,
+        pub arena: ustore_arena_t,
+        pub wanted: ustore_size_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_docs_measure_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub start_keys: ustore_keys_view_t,
+        pub end_keys: ustore_keys_view_t,
+        pub direction: ustore_scan_direction_t,
+        pub min_cardinalities: *mut *const ustore_size_t,
+        pub max_cardinalities: *mut *const ustore_size_t,
+        pub min_value_bytes: *mut *const ustore_size_t,
+        pub max_value_bytes: *mut *const ustore_size_t,
+        pub min_space_usages: *mut *const ustore_size_t,
+        pub max_space_usages: *mut *const ustore_size_t,
+        pub arena: ustore_arena_t,
+    }
+
     extern "C" {
         pub fn ustore_docs_cursor_init(arguments: *mut ustore_docs_cursor_init_t);
         pub fn ustore_docs_cursor_next(arguments: *mut ustore_docs_cursor_next_t);
@@ -245,6 +285,8 @@ pub(crate) mod ffi {
         pub fn ustore_docs_read(arguments: *mut ustore_docs_read_t);
         pub fn ustore_docs_gist(arguments: *mut ustore_docs_gist_t);
         pub fn ustore_docs_gather(arguments: *mut ustore_docs_gather_t);
+        pub fn ustore_docs_sample(arguments: *mut ustore_docs_sample_t);
+        pub fn ustore_docs_measure(arguments: *mut ustore_docs_measure_t);
         pub fn ustore_docs_modification_name(modification: ustore_enum_t) -> *const c_char;
         pub fn ustore_docs_modification_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
     }
@@ -1124,9 +1166,60 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Paren
         };
         Completion::answer(self, verb)
     }
+
+    /// Removes every document of one collection from `range.start`, inclusive, to `range.end`,
+    /// exclusive, in one atomic call.
+    pub fn docs_remove_range(
+        &self,
+        collection: CollectionID,
+        range: Range<Key>,
+        durability: Durability,
+    ) -> Completion::Answer<DocsRemoveRange> {
+        let verb = DocsRemoveRange {
+            collection,
+            range,
+            durability,
+        };
+        Completion::answer(self, verb)
+    }
 }
 
 impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
+    /// Draws up to `wanted` document keys uniformly at random from one collection into the arena.
+    pub fn docs_sample<'arena>(
+        &self,
+        collection: CollectionID,
+        wanted: usize,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<DocsSample<'arena>> {
+        let verb = DocsSample {
+            collection,
+            arena,
+            wanted,
+            found: Found::default(),
+        };
+        Completion::answer(self, verb)
+    }
+
+    /// Estimates the documents and the space a range of keys takes in one collection, through the
+    /// arena its bounds land in.
+    pub fn docs_measure<'arena>(
+        &self,
+        collection: CollectionID,
+        range: impl Into<KeyRange>,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<DocsMeasure<'arena>> {
+        let range = range.into();
+        let verb = DocsMeasure {
+            collection,
+            start: range.start_key(),
+            range,
+            arena,
+            bounds: Bounds::default(),
+        };
+        Completion::answer(self, verb)
+    }
+
     /// Reads whole documents or fields inside them into the arena in `format`, [`Json`] or [`Text`], reporting a
     /// missing document or field as absent.
     ///
@@ -1289,6 +1382,7 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
+            end_keys: ustore_keys_view_t::default(),
             durability: self.durability,
             watch: view.watch(),
         }))
@@ -1300,6 +1394,145 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
 
     fn finish(self) -> Result<Keys> {
         Ok(self.keys)
+    }
+}
+
+/// A removal of one range of documents; see [`View::docs_remove_range`].
+#[derive(Debug)]
+pub struct DocsRemoveRange {
+    collection: CollectionID,
+    range: Range<Key>,
+    durability: Durability,
+}
+
+impl Calling for DocsRemoveRange {
+    type Arguments = ffi::ustore_docs_remove_t;
+    type Output = ();
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        Ok(Some(ffi::ustore_docs_remove_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            transaction: view.transaction(),
+            count: 1,
+            collections: ustore_strided_view_t::repeated(&self.collection),
+            keys: ustore_strided_view_t::repeated(&self.range.start),
+            end_keys: ustore_strided_view_t::repeated(&self.range.end),
+            durability: self.durability,
+            watch: view.watch(),
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_remove(arguments)
+    }
+
+    fn finish(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A random draw of document keys from one collection; see [`View::docs_sample`].
+#[derive(Debug)]
+pub struct DocsSample<'arena> {
+    collection: CollectionID,
+    arena: &'arena mut Arena,
+    wanted: usize,
+    found: Found,
+}
+
+impl<'arena> Calling for DocsSample<'arena> {
+    type Arguments = ffi::ustore_docs_sample_t;
+    type Output = &'arena [Key];
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        Ok(Some(ffi::ustore_docs_sample_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: 1,
+            collections: ustore_strided_view_t::repeated(&self.collection),
+            offsets: &mut self.found.offsets.0,
+            keys: &mut self.found.keys.0,
+            arena: self.arena.handle,
+            wanted: self.wanted as ustore_size_t,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_sample(arguments)
+    }
+
+    fn finish(self) -> Result<&'arena [Key]> {
+        // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
+        Ok(unsafe { self.found.keys() })
+    }
+}
+
+/// An estimate of what a range of documents holds; see [`View::docs_measure`].
+#[derive(Debug)]
+pub struct DocsMeasure<'arena> {
+    collection: CollectionID,
+    start: Key,
+    range: KeyRange,
+    arena: &'arena mut Arena,
+    bounds: Bounds,
+}
+
+impl Calling for DocsMeasure<'_> {
+    type Arguments = ffi::ustore_docs_measure_t;
+    type Output = Measurement;
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let [min_cardinalities, max_cardinalities, min_value_bytes, max_value_bytes, min_space_usages, max_space_usages] =
+            &mut self.bounds.0;
+        Ok(Some(ffi::ustore_docs_measure_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: 1,
+            collections: ustore_strided_view_t::repeated(&self.collection),
+            start_keys: ustore_strided_view_t::repeated(&self.start),
+            end_keys: self.range.end_keys(),
+            direction: self.range.direction,
+            min_cardinalities: &mut min_cardinalities.0,
+            max_cardinalities: &mut max_cardinalities.0,
+            min_value_bytes: &mut min_value_bytes.0,
+            max_value_bytes: &mut max_value_bytes.0,
+            min_space_usages: &mut min_space_usages.0,
+            max_space_usages: &mut max_space_usages.0,
+            arena: self.arena.handle,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_measure(arguments)
+    }
+
+    fn finish(self) -> Result<Measurement> {
+        // SAFETY: the measurement of one range succeeded.
+        Ok(unsafe { self.bounds.measurement() })
     }
 }
 
@@ -1517,6 +1750,19 @@ mod tests {
             .unwrap()
             .contains("Rear Admiral"));
         assert!(cursor.next(8, &mut arena).unwrap().is_empty());
+    }
+
+    #[test]
+    fn document_ranges_sample_measure_and_remove() {
+        let (database, docs, mut arena) = populated();
+        let head = database.head();
+        assert_eq!(head.docs_sample(docs, 8, &mut arena).unwrap().len(), 2);
+        let measured = head.docs_measure(docs, key(1)..key(2), &mut arena).unwrap();
+        assert!(measured.min_cardinality <= 1 && measured.max_cardinality >= measured.min_cardinality);
+        head.docs_remove_range(docs, key(1)..key(2), Durability::Buffered)
+            .unwrap();
+        let mut cursor = head.docs_cursor(docs, key(0), Matching::default()).unwrap();
+        assert_eq!(cursor.next(8, &mut arena).unwrap(), &keys([2]));
     }
 
     /// The text of the field at `index`, or `None` when it is absent.
@@ -2250,16 +2496,17 @@ pub struct DocsCursor<'view> {
 }
 
 impl<'view, Parent> View<'view, Parent> {
-    /// Opens a walk over the keys of one documents collection from `start`, compiling what `matching` names once, whose predicate lives
-    /// as long as the cursor.
+    /// Opens a walk over the keys of one documents collection's `range`, compiling what `matching`
+    /// names once, whose predicate lives as long as the cursor.
     ///
     /// Calls `ustore_docs_cursor_init`.
     pub fn docs_cursor(
         &self,
         collection: CollectionID,
-        start: Key,
+        range: impl Into<KeyRange>,
         matching: Matching<'view>,
     ) -> Result<DocsCursor<'view>> {
+        let range: KeyRange = range.into();
         let mut cursor = DocsCursor {
             handle: ptr::null_mut(),
             database: self.database(),
@@ -2275,7 +2522,9 @@ impl<'view, Parent> View<'view, Parent> {
             outcome: &mut outcome,
             view: self.view(),
             collection,
-            start_key: start,
+            start_key: range.start_key(),
+            end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
+            direction: range.direction,
             filter: cursor.matched.filter(),
             predicate: cursor.matched.predicate(),
         };

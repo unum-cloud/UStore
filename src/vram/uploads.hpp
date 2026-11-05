@@ -4,10 +4,12 @@
  *  @date October 29, 2026
  *  @brief The upload tower: the device verbs of every engine without device kernels, served by its host verbs.
  *
- *  A call on a VRAM executor runs the engine's host verb with its outputs in the executor's pinned bounce, then carves
- *  every output column off the call's device arena and queues one copy to the device per column, repointing the
- *  caller's outputs there, and waits once. Its inputs reach the host through @c stage_inputs before the verb runs.
- *  Cursors keep refusing devices.
+ *  A call on a VRAM executor runs the engine's host verb with its outputs in the executor's pinned
+ *  bounce, then carves every output column off the call's device arena and queues one copy to the
+ *  device per column, repointing the caller's outputs there, and waits once. Its inputs reach the
+ *  host through @c stage_inputs before the verb runs. Document gathers and field reads run on the
+ *  device first, through @c vram/gathers.hpp, and only a call their kernels leave to the host
+ *  takes the tower.
  */
 
 #pragma once
@@ -23,6 +25,7 @@
 #include "engine.hpp"       // `home_tables`, `home_executor`, `engine_of`, `database_of`
 #include "lib.hpp"          // `verb_slot`
 #include "vram/columns.hpp" // `upload_output_columns`
+#include "vram/gathers.hpp" // `gather_documents_on_device`, `read_documents_on_device`, `device_answer_t`
 
 namespace unum::ustore {
 
@@ -56,6 +59,16 @@ status_t upload_through_host(arguments_type_ const& arguments, rest_types_&... r
     return upload_output_columns(hosted, *blocks, executor);
 }
 
+/** Serves a device verb of @p home_ through @p on_device_, and through the upload tower when that
+ *  verb leaves the call to the host. */
+template <home_t home_, auto on_device_, typename arguments_type_, typename... rest_types_>
+status_t serve_on_device(arguments_type_ const& arguments, rest_types_&... rest) noexcept {
+    auto [answer, status] = on_device_(arguments, rest...);
+    if (status.failed()) return status;
+    if (answer == device_answer_t::served_k) return {};
+    return upload_through_host<home_>(arguments, rest...);
+}
+
 template <home_t home_>
 inline constexpr blobs_verbs<home_> uploading_vram_blobs {
     .read = &upload_through_host<home_, ustore_blobs_read_t>,
@@ -71,8 +84,8 @@ inline constexpr strings_verbs<home_> uploading_vram_strings {
 
 template <home_t home_>
 inline constexpr docs_verbs<home_> uploading_vram_docs {
-    .read = &upload_through_host<home_, ustore_docs_read_t>,
-    .gather = &upload_through_host<home_, ustore_docs_gather_t>,
+    .read = &serve_on_device<home_, &read_documents_on_device<home_>, ustore_docs_read_t>,
+    .gather = &serve_on_device<home_, &gather_documents_on_device<home_>, ustore_docs_gather_t>,
     .scan = &upload_through_host<home_, ustore_docs_scan_t>,
     .sample = &upload_through_host<home_, ustore_docs_sample_t>,
 };

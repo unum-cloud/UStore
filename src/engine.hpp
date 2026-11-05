@@ -143,6 +143,10 @@ struct database_verbs_t {
     void (*transaction_free)(ustore_transaction_t) noexcept;
     void (*snapshot_free)(ustore_snapshot_t) noexcept;
     void (*database_free)(ustore_database_t) noexcept;
+    status_t (*changes_cursor_init)(ustore_changes_cursor_init_t const&, ustore_changes_cursor_t,
+                                    view_t const&) noexcept;
+    status_t (*changes_cursor_next)(ustore_changes_cursor_next_t const&, view_t const&) noexcept;
+    void (*changes_cursor_free)(ustore_changes_cursor_t) noexcept;
 };
 
 /** The verbs of blobs collections served at one home. */
@@ -177,10 +181,14 @@ struct strings_verbs;
 template <>
 struct strings_verbs<home_t::host_k> {
     status_t (*write)(ustore_strings_write_t const&, strings_arg_t const& strings, view_t const&) noexcept;
-    status_t (*remove)(ustore_strings_remove_t const&, strings_arg_t const& strings, view_t const&) noexcept;
+    status_t (*remove)(ustore_strings_remove_t const&, strings_arg_t const& strings, strings_arg_t const& end_strings,
+                       view_t const&) noexcept;
     status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&) noexcept;
     status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes, strings_arg_t const& start_strings,
-                     view_t const&) noexcept;
+                     strings_arg_t const& end_strings, view_t const&) noexcept;
+    status_t (*sample)(ustore_strings_sample_t const&, view_t const&) noexcept;
+    status_t (*measure)(ustore_strings_measure_t const&, strings_arg_t const& start_strings,
+                        strings_arg_t const& end_strings, view_t const&) noexcept;
 };
 
 /** The verbs of strings collections on a device, whose strings a host index resolves. */
@@ -190,7 +198,7 @@ struct strings_verbs<home_> {
     status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&,
                      home_executor<home_>&) noexcept;
     status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes, strings_arg_t const& start_strings,
-                     view_t const&, home_executor<home_>&) noexcept;
+                     strings_arg_t const& end_strings, view_t const&, home_executor<home_>&) noexcept;
 };
 
 /** The verbs of documents collections served at one home. */
@@ -208,6 +216,7 @@ struct docs_verbs<home_t::host_k> {
     status_t (*remove)(ustore_docs_remove_t const&, view_t const&) noexcept;
     status_t (*scan)(ustore_docs_scan_t const&, view_t const&) noexcept;
     status_t (*sample)(ustore_docs_sample_t const&, view_t const&) noexcept;
+    status_t (*measure)(ustore_docs_measure_t const&, view_t const&) noexcept;
 };
 
 /** The verbs of documents collections on a device, whose field paths the host compiles. */
@@ -235,6 +244,8 @@ struct graph_verbs<home_t::host_k> {
     status_t (*write_vertices)(ustore_graph_write_vertices_t const&, view_t const&) noexcept;
     status_t (*remove_vertices)(ustore_graph_remove_vertices_t const&, view_t const&) noexcept;
     status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&) noexcept;
+    status_t (*sample_vertices)(ustore_graph_sample_vertices_t const&, view_t const&) noexcept;
+    status_t (*measure_vertices)(ustore_graph_measure_vertices_t const&, view_t const&) noexcept;
 };
 
 /** The verbs of graph collections on a device. */
@@ -263,6 +274,8 @@ struct pages_verbs<home_t::host_k> {
                                   view_t const&) noexcept;
     status_t (*read)(ustore_pages_read_t const&, view_t const&) noexcept;
     status_t (*scan)(ustore_pages_scan_t const&, view_t const&) noexcept;
+    status_t (*sample)(ustore_pages_sample_t const&, view_t const&) noexcept;
+    status_t (*measure)(ustore_pages_measure_t const&, view_t const&) noexcept;
 };
 
 /** The verbs of pages collections on a device. */
@@ -433,6 +446,8 @@ expected<made_handle<handle_type_, state_type_>> make_handle(engine_t const& eng
 template <typename arguments_type_>
 ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
     if constexpr (requires { arguments.database; }) return arguments.database;
+    else if constexpr (requires { arguments.cursor->cursor.database; })
+        return arguments.cursor ? arguments.cursor->cursor.database : nullptr;
     else return arguments.snapshot ? arguments.snapshot->database : nullptr;
 }
 
@@ -483,6 +498,7 @@ status_t remove_over_blobs(arguments_type_ const& arguments, view_t const& view)
         .count = arguments.count,
         .collections = arguments.collections,
         .keys = arguments.keys,
+        .end_keys = arguments.end_keys,
         .durability = arguments.durability,
         .watch = arguments.watch,
     };
@@ -505,6 +521,8 @@ status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) n
         .count = arguments.count,
         .collections = arguments.collections,
         .start_keys = arguments.start_keys,
+        .end_keys = arguments.end_keys,
+        .direction = arguments.direction,
         .offsets = arguments.offsets,
         .keys = arguments.keys,
         .arena = arguments.arena,
@@ -516,8 +534,9 @@ status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) n
     return values_verbs_.scan(scan, view);
 }
 
-/** Samples the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_ refuses every
- *  collection holding another modality: the documents of @c ustore_docs_sample. */
+/** Samples the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_
+ *  refuses every collection holding another modality: the documents, vertices and pages of the
+ *  samples of those modalities. */
 template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
 status_t sample_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
@@ -537,6 +556,36 @@ status_t sample_over_blobs(arguments_type_ const& arguments, view_t const& view)
         .wanted = arguments.wanted,
     };
     return values_verbs_.sample(sample, view);
+}
+
+/** Measures the key ranges of collections holding @p modality_ through @p values_verbs_, after
+ *  @p resolve_ refuses every collection holding another modality: the documents, vertices and pages
+ *  of the measures of those modalities. */
+template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
+          typename arguments_type_>
+status_t measure_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+    if (resolved.failed()) return resolved;
+    ustore_blobs_measure_t const measure {
+        .database = arguments.database,
+        .executor = arguments.executor,
+        .outcome = arguments.outcome,
+        .completion = arguments.completion,
+        .view = arguments.view,
+        .count = arguments.count,
+        .collections = arguments.collections,
+        .start_keys = arguments.start_keys,
+        .end_keys = arguments.end_keys,
+        .direction = arguments.direction,
+        .min_cardinalities = arguments.min_cardinalities,
+        .max_cardinalities = arguments.max_cardinalities,
+        .min_value_bytes = arguments.min_value_bytes,
+        .max_value_bytes = arguments.max_value_bytes,
+        .min_space_usages = arguments.min_space_usages,
+        .max_space_usages = arguments.max_space_usages,
+        .arena = arguments.arena,
+    };
+    return values_verbs_.measure(measure, view);
 }
 
 /** Mints a UUIDv7 for a new collection, refusing when the system gives no entropy. */
@@ -603,23 +652,24 @@ constexpr std::size_t parked_check_micros_k = 1000;
 
 /** Every argument struct that names an executor, the inits, opens and views of the engines included, so a deferred
  *  submission keeps its call by value. */
-using deferred_arguments_t =
-    std::variant<ustore_database_describe_t, ustore_database_clear_t, ustore_database_compact_t, ustore_snapshot_init_t,
-                 ustore_snapshot_save_t, ustore_collection_list_t, ustore_collection_create_t, ustore_collection_find_t,
-                 ustore_collection_drop_t, ustore_transaction_init_t, ustore_transaction_stage_t,
-                 ustore_transaction_commit_t, ustore_transaction_rollback_t, ustore_blobs_write_t,
-                 ustore_blobs_remove_t, ustore_blobs_read_t, ustore_blobs_scan_t, ustore_blobs_sample_t,
-                 ustore_blobs_measure_t, ustore_docs_write_t, ustore_docs_read_t, ustore_docs_gist_t,
-                 ustore_docs_gather_t, ustore_docs_remove_t, ustore_docs_scan_t, ustore_docs_sample_t,
-                 ustore_graph_read_edges_t, ustore_graph_write_edges_t, ustore_graph_remove_edges_t,
-                 ustore_graph_write_vertices_t, ustore_graph_remove_vertices_t, ustore_graph_scan_vertices_t,
-                 ustore_pages_import_t, ustore_pages_insert_t, ustore_pages_remove_t, ustore_pages_move_t,
-                 ustore_pages_splice_t, ustore_pages_set_attributes_t, ustore_pages_remove_attributes_t,
-                 ustore_pages_read_t, ustore_pages_scan_t, ustore_strings_write_t, ustore_strings_remove_t,
-                 ustore_strings_read_t, ustore_strings_scan_t, ustore_blobs_cursor_next_t, ustore_strings_cursor_next_t,
-                 ustore_docs_cursor_next_t, ustore_pages_cursor_next_t, ustore_graph_vertices_cursor_next_t,
-                 ustore_database_init_ram_t, ustore_database_open_ram_t, ustore_database_open_rocksdb_t,
-                 ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t, ustore_database_open_nvme_t>;
+using deferred_arguments_t = std::variant<
+    ustore_database_describe_t, ustore_database_clear_t, ustore_database_compact_t, ustore_snapshot_init_t,
+    ustore_snapshot_save_t, ustore_collection_list_t, ustore_collection_create_t, ustore_collection_find_t,
+    ustore_collection_drop_t, ustore_transaction_init_t, ustore_transaction_stage_t, ustore_transaction_commit_t,
+    ustore_transaction_rollback_t, ustore_blobs_write_t, ustore_blobs_remove_t, ustore_blobs_read_t,
+    ustore_blobs_scan_t, ustore_blobs_sample_t, ustore_blobs_measure_t, ustore_strings_sample_t,
+    ustore_strings_measure_t, ustore_docs_measure_t, ustore_graph_sample_vertices_t, ustore_graph_measure_vertices_t,
+    ustore_pages_sample_t, ustore_pages_measure_t, ustore_docs_write_t, ustore_docs_read_t, ustore_docs_gist_t,
+    ustore_docs_gather_t, ustore_docs_remove_t, ustore_docs_scan_t, ustore_docs_sample_t, ustore_graph_read_edges_t,
+    ustore_graph_write_edges_t, ustore_graph_remove_edges_t, ustore_graph_write_vertices_t,
+    ustore_graph_remove_vertices_t, ustore_graph_scan_vertices_t, ustore_pages_import_t, ustore_pages_insert_t,
+    ustore_pages_remove_t, ustore_pages_move_t, ustore_pages_splice_t, ustore_pages_set_attributes_t,
+    ustore_pages_remove_attributes_t, ustore_pages_read_t, ustore_pages_scan_t, ustore_strings_write_t,
+    ustore_strings_remove_t, ustore_strings_read_t, ustore_strings_scan_t, ustore_blobs_cursor_next_t,
+    ustore_strings_cursor_next_t, ustore_docs_cursor_next_t, ustore_pages_cursor_next_t,
+    ustore_graph_vertices_cursor_next_t, ustore_changes_cursor_init_t, ustore_changes_cursor_next_t,
+    ustore_database_init_ram_t, ustore_database_open_ram_t, ustore_database_open_rocksdb_t,
+    ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t, ustore_database_open_nvme_t>;
 
 /** What a deferred call leaves its driver, which publishes it once the call's table position is free again. */
 struct deferred_result_t {

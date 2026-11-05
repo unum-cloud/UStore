@@ -15,7 +15,7 @@
 
 #include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `SIZE_MAX`, `std::int64_t`, `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
-#include <cstring> // `std::memcpy`, `std::strlen`
+#include <cstring> // `std::memcpy`, `std::memcmp`, `std::strlen`
 
 #include "ustore/types.h" // `USTORE_OS_WINDOWS_`
 
@@ -365,6 +365,14 @@ constexpr ustore_key_t key_after(ustore_key_t key) noexcept {
     return key;
 }
 
+/** The key right before @p key in their order, where a descending scan resuming past @p key starts;
+ *  the first key has none and wraps to the last. */
+constexpr ustore_key_t key_before(ustore_key_t key) noexcept {
+    for (unsigned index = 16; index != 0; --index)
+        if (key.uuid.bytes[index - 1]-- != 0) break;
+    return key;
+}
+
 /** Orders keys and collection IDs by their bytes, as every engine does. */
 struct uuid_order_t {
     template <typename uuid_type_>
@@ -458,6 +466,21 @@ enum class uuid_variant_t : std::uint8_t {
 
     /** The @c 111x pattern, which no specification claims. */
     reserved_k,
+};
+
+/** A SHA-256 digest, all zeros where none was taken. */
+struct sha256_t {
+    std::uint8_t bytes[32] = {};
+
+    [[nodiscard]] bool empty() const noexcept {
+        for (std::uint8_t const byte : bytes)
+            if (byte != 0) return false;
+        return true;
+    }
+
+    friend bool operator==(sha256_t const& first, sha256_t const& second) noexcept {
+        return std::memcmp(first.bytes, second.bytes, sizeof(first.bytes)) == 0;
+    }
 };
 
 /**

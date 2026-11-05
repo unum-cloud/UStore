@@ -28,6 +28,8 @@
 
 #include "ustore/arrow.h" // `ustore_keys_view_from_arrow`, `ustore_strings_view_to_arrow`
 
+#include "ustore/docs/vram_gather.cuh" // `pack_bools`, `terminated_texts`, `drop_terminator`
+
 #include "lib.hpp" // `take`, `release`, `arena_allocate`, `host_blocks_of`, `strided`, `gpu_runtime`, `carve`
 
 namespace unum::ustore {
@@ -241,12 +243,10 @@ ustore_status_t convert_through(executor_type_& executor, device_blocks_t& block
     return ustore_status_success_k;
 }
 
-/** Converts the device tape @p strings of @p rows strings as @c convert_on_host does, through an
- *  executor spawned on the arena's device for this export alone, as the C call names none: the
- *  offsets come down into its bounce, convert there and go back up behind the call's outputs. */
-ustore_status_t convert_on_device(ustore_arena_t arena, ustore_strings_view_t const& strings, std::size_t rows,
-                                  void const*& converted, ustore_byte_t const*& data) noexcept {
-    if (!arena_holds_tape(arena, strings, rows)) return ustore_status_invalid_argument_k;
+/** Spawns an executor on the device @p arena lives on for one export, as the C call names none, and
+ *  hands @p visitor the executor and the arena's runs on its device. */
+template <typename visitor_type_>
+ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visitor) noexcept {
     device_arena_t const device = device_arena_of(arena);
     gpu_vendor_t const vendor = device.type == ARROW_DEVICE_CUDA ? gpu_vendor_t::nvidia_k : gpu_vendor_t::amd_k;
     gpu_device_t const* listed = nullptr;
@@ -267,19 +267,59 @@ ustore_status_t convert_on_device(ustore_arena_t arena, ustore_strings_view_t co
             else {
                 device_blocks_t* const blocks = device_blocks_of(arena, executor);
                 if (!blocks) return ustore_status_device_k;
-                std::uint64_t first = 0;
-                ustore_status_t const status = strings.layout == ustore_strings_u64_tape_k
-                                                   ? convert_through<std::uint32_t>(executor, *blocks,
-                                                                                    strings.data.u64_tape.offsets, rows,
-                                                                                    converted, first)
-                                                   : convert_through<std::uint64_t>(executor, *blocks,
-                                                                                    strings.data.u32_tape.offsets, rows,
-                                                                                    converted, first);
-                data += first;
-                return status;
+                return visitor(executor, *blocks);
             }
         },
         spawned);
+}
+
+/** Converts the device tape @p strings of @p rows strings as @c convert_on_host does, through an
+ *  executor spawned on the arena's device for this export alone: the offsets come down into its
+ *  bounce, convert there and go back up behind the call's outputs. */
+ustore_status_t convert_on_device(ustore_arena_t arena, ustore_strings_view_t const& strings, std::size_t rows,
+                                  void const*& converted, ustore_byte_t const*& data) noexcept {
+    if (!arena_holds_tape(arena, strings, rows)) return ustore_status_invalid_argument_k;
+    return visit_export_executor(
+        arena, [&]<typename executor_type_>(executor_type_& executor, device_blocks_t& blocks) noexcept {
+            std::uint64_t first = 0;
+            ustore_status_t const status = strings.layout == ustore_strings_u64_tape_k
+                                               ? convert_through<std::uint32_t>(executor, blocks,
+                                                                                strings.data.u64_tape.offsets, rows,
+                                                                                converted, first)
+                                               : convert_through<std::uint64_t>(executor, blocks,
+                                                                                strings.data.u32_tape.offsets, rows,
+                                                                                converted, first);
+            data += first;
+            return status;
+        });
+}
+
+/** Densely copies strided @p rows past the call's outputs in host @p arena, pointing them at it. */
+ustore_status_t densify_on_host(ustore_arena_t arena, strided_rows_t& rows) noexcept {
+    auto [dense, carve_status] = arena_allocate<ustore_key_t>(arena, static_cast<std::size_t>(rows.rows));
+    if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
+    rows.dense = reinterpret_cast<std::byte*>(dense.data());
+    for (std::uint64_t row = 0; row != rows.rows; ++row) densify_row(rows, row);
+    return ustore_status_success_k;
+}
+
+/** Copies the strided @p rows of a device arena dense behind the call's outputs, through an
+ *  executor spawned on the arena's device for this export alone, pointing them at the copy. */
+ustore_status_t densify_on_device(ustore_arena_t arena, strided_rows_t& rows) noexcept {
+    std::size_t const spanned = static_cast<std::size_t>((rows.rows - 1) * rows.stride + rows.row_bytes);
+    if (!arena_holds(arena, rows.source, spanned)) return ustore_status_invalid_argument_k;
+    return visit_export_executor(arena, [&]<typename executor_type_>(executor_type_& executor,
+                                                                     device_blocks_t& blocks) noexcept {
+        if (!executor.kernels()) return ustore_status_device_k;
+        auto [dense, carve_status] = carve<ustore_key_t>(blocks, executor, static_cast<std::size_t>(rows.rows));
+        if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
+        rows.dense = reinterpret_cast<std::byte*>(dense.data());
+        status_t status = launch(executor, executor.kernels()->function("ustore_tape_densify"),
+                                 static_cast<unsigned>(divide_round_up<std::size_t>(rows.rows, tape_block_threads_k)),
+                                 tape_block_threads_k, 0u, rows);
+        if (status.succeeded()) status = executor.wait();
+        return static_cast<ustore_status_t>(status.code);
+    });
 }
 
 void release_exported_schema(ArrowSchema* schema) noexcept { schema->release = nullptr; }
@@ -311,8 +351,9 @@ ustore_status_t export_column(ustore_arena_t arena, std::size_t rows, std::array
                .release = &release_exported_schema,
                .private_data = nullptr};
     *array = {};
+    // A validity buffer leaves the count of nulls unknown, as no export counts them
     array->array = {.length = static_cast<std::int64_t>(rows),
-                    .null_count = 0,
+                    .null_count = buffers[0] ? -1 : 0,
                     .offset = 0,
                     .n_buffers = buffers_count,
                     .n_children = 0,
@@ -330,6 +371,145 @@ ustore_status_t export_column(ustore_arena_t arena, std::size_t rows, std::array
 }
 
 #pragma endregion Exporters
+
+#pragma region Gathered Columns
+
+/** The Arrow format of a gathered @p type column of @p layout, or null for a type no column has. */
+char const* docs_column_format(ustore_docs_field_type_t type, ustore_strings_layout_t layout) noexcept {
+    bool const wide = layout == ustore_strings_u64_tape_k;
+    switch (type) {
+    case ustore_docs_field_type_bool_k: return "b";
+    case ustore_docs_field_type_uuid_k: return "w:16";
+    case ustore_docs_field_type_f64_k: return "g";
+    case ustore_docs_field_type_f32_k: return "f";
+    case ustore_docs_field_type_f16_k: return "e";
+    case ustore_docs_field_type_i64_k: return "l";
+    case ustore_docs_field_type_i32_k: return "i";
+    case ustore_docs_field_type_i16_k: return "s";
+    case ustore_docs_field_type_i8_k: return "c";
+    case ustore_docs_field_type_u64_k: return "L";
+    case ustore_docs_field_type_u32_k: return "I";
+    case ustore_docs_field_type_u16_k: return "S";
+    case ustore_docs_field_type_u8_k: return "C";
+    case ustore_docs_field_type_binary_k: return wide ? "Z" : "z";
+    case ustore_docs_field_type_string_k: return wide ? "U" : "u";
+    default: return nullptr;
+    }
+}
+
+/** The buffers an exported gathered column points at: validities, values or offsets, then bytes. */
+using column_buffers_t = std::array<void const*, 3>;
+
+/** Packs the @p rows booleans at @p bools into bits past the call's outputs in host @p arena. */
+ustore_status_t pack_on_host(ustore_arena_t arena, ustore_byte_t const* bools, std::size_t rows,
+                             void const*& packed) noexcept {
+    auto [bits, bits_status] = arena_allocate<ustore_octet_t>(arena, divide_round_up(rows, bits_in_byte_k));
+    if (bits_status.failed()) return static_cast<ustore_status_t>(bits_status.code);
+    for (std::size_t first = 0; first < rows; first += bits_in_byte_k)
+        bits[first / bits_in_byte_k] = docs::pack_bools(bools, rows, first);
+    packed = bits.data();
+    return ustore_status_success_k;
+}
+
+/** Copies the text tape of @p rows rows at @p offsets and @p bytes without the null byte
+ *  ending every row, behind the call's outputs in the host @p arena, its offsets counted from
+ *  its first row. */
+template <typename offset_type_>
+ustore_status_t drop_on_host(ustore_arena_t arena, offset_type_ const* offsets, ustore_byte_t const* bytes,
+                             std::size_t rows, column_buffers_t& buffers) noexcept {
+    auto [bare_offsets, offsets_status] = arena_allocate<offset_type_>(arena, rows + 1);
+    if (offsets_status.failed()) return static_cast<ustore_status_t>(offsets_status.code);
+    auto [bare_bytes, bytes_status] = arena_allocate<ustore_byte_t>(
+        arena, static_cast<std::size_t>(offsets[rows] - offsets[0]) - rows);
+    if (bytes_status.failed()) return static_cast<ustore_status_t>(bytes_status.code);
+    docs::terminated_texts<offset_type_> const texts {bytes, offsets, bare_bytes.data(), bare_offsets.data(), rows};
+    for (std::size_t row = 0; row != rows; ++row) docs::drop_terminator(texts, row);
+    buffers[1] = bare_offsets.data(), buffers[2] = bare_bytes.data();
+    return ustore_status_success_k;
+}
+
+/** Packs the @p rows booleans at @p bools on @p executor's device into bits cut from @p blocks. */
+template <gpu_executor_concept executor_type_>
+ustore_status_t pack_on_device(executor_type_& executor, device_blocks_t& blocks, ustore_byte_t const* bools,
+                               std::size_t rows, void const*& packed) noexcept {
+    if (!executor.kernels()) return ustore_status_device_k;
+    std::size_t const bytes = divide_round_up(rows, bits_in_byte_k);
+    auto [bits, bits_status] = carve<ustore_octet_t>(blocks, executor, bytes);
+    if (bits_status.failed()) return static_cast<ustore_status_t>(bits_status.code);
+    status_t status = launch(executor, executor.kernels()->function("ustore_docs_pack_bools"),
+                             static_cast<unsigned>(divide_round_up<std::size_t>(bytes, docs::gather_block_threads_k)),
+                             docs::gather_block_threads_k, 0u, bools, std::uint64_t {rows}, bits.data());
+    if (status.succeeded()) status = executor.wait();
+    if (status.failed()) return static_cast<ustore_status_t>(status.code);
+    packed = bits.data();
+    return ustore_status_success_k;
+}
+
+/** Copies the device text tape of @p rows rows at @p offsets and @p bytes without the null byte
+ *  ending every row, on @p executor's device into @p blocks, learning its length from its first and
+ *  last offsets through the bounce. */
+template <typename offset_type_, gpu_executor_concept executor_type_>
+ustore_status_t drop_on_device(executor_type_& executor, device_blocks_t& blocks, offset_type_ const* offsets,
+                               ustore_byte_t const* bytes, std::size_t rows, column_buffers_t& buffers) noexcept {
+    if (!executor.kernels()) return ustore_status_device_k;
+    auto [ends, ends_status] = arena_allocate<offset_type_>(executor.bounce(), 2);
+    if (ends_status.failed()) return static_cast<ustore_status_t>(ends_status.code);
+    status_t status = executor.pin_bounce();
+    if (status.succeeded())
+        status = executor.download_async(std::as_writable_bytes(ends.first(1)),
+                                         reinterpret_cast<std::uintptr_t>(offsets));
+    if (status.succeeded())
+        status = executor.download_async(std::as_writable_bytes(ends.last(1)),
+                                         reinterpret_cast<std::uintptr_t>(offsets + rows));
+    if (status.succeeded()) status = executor.wait();
+    if (status.failed()) return static_cast<ustore_status_t>(status.code);
+    if (ends[1] < ends[0] || static_cast<std::uint64_t>(ends[1] - ends[0]) < rows)
+        return ustore_status_invalid_argument_k;
+    auto [bare_offsets, offsets_status] = carve<offset_type_>(blocks, executor, rows + 1);
+    if (offsets_status.failed()) return static_cast<ustore_status_t>(offsets_status.code);
+    auto [bare_bytes, bytes_status] = carve<ustore_byte_t>(blocks, executor,
+                                                           static_cast<std::size_t>(ends[1] - ends[0]) - rows);
+    if (bytes_status.failed()) return static_cast<ustore_status_t>(bytes_status.code);
+    docs::terminated_texts<offset_type_> const texts {bytes, offsets, bare_bytes.data(), bare_offsets.data(), rows};
+    char const* const kernel = sizeof(offset_type_) == sizeof(std::uint64_t) ? "ustore_docs_drop_terminators_u64"
+                                                                             : "ustore_docs_drop_terminators_u32";
+    status = launch(executor, executor.kernels()->function(kernel),
+                    static_cast<unsigned>(divide_round_up<std::size_t>(rows, docs::gather_block_threads_k)),
+                    docs::gather_block_threads_k, 0u, texts);
+    if (status.succeeded()) status = executor.wait();
+    if (status.failed()) return static_cast<ustore_status_t>(status.code);
+    buffers[1] = bare_offsets.data(), buffers[2] = bare_bytes.data();
+    return ustore_status_success_k;
+}
+
+/** Fills @p buffers with the Arrow layout of @p column, of @p rows rows of @p type in @p arena,
+ *  after checking the arena holds what it names: in place where Arrow lays it out alike, and
+ *  through @p pack and @p drop otherwise. */
+template <typename pack_type_, typename drop_type_>
+ustore_status_t lay_out_column(ustore_docs_column_view_t const& column, std::size_t rows, ustore_docs_field_type_t type,
+                               ustore_arena_t arena, pack_type_&& pack, drop_type_&& drop,
+                               column_buffers_t& buffers) noexcept {
+    buffers = {column.validities, column.scalars, nullptr};
+    if (!arena_holds(arena, column.validities, divide_round_up(rows, bits_in_byte_k)))
+        return ustore_status_invalid_argument_k;
+    if (std::size_t const width = docs::field_size_bytes(type); width) {
+        if (!arena_holds(arena, column.scalars, rows * width)) return ustore_status_invalid_argument_k;
+        return type == ustore_docs_field_type_bool_k ? pack(column.scalars, rows, buffers[1]) : ustore_status_success_k;
+    }
+    ustore_strings_view_t const& strings = column.strings;
+    bool const wide = strings.layout == ustore_strings_u64_tape_k;
+    if (!wide && strings.layout != ustore_strings_u32_tape_k) return ustore_status_invalid_argument_k;
+    if (!arena_holds_tape(arena, strings, rows)) return ustore_status_invalid_argument_k;
+    ustore_byte_t const* const bytes = wide ? strings.data.u64_tape.data : strings.data.u32_tape.data;
+    if (type == ustore_docs_field_type_string_k)
+        return wide ? drop(strings.data.u64_tape.offsets, bytes, rows, buffers)
+                    : drop(strings.data.u32_tape.offsets, bytes, rows, buffers);
+    buffers[1] = wide ? static_cast<void const*>(strings.data.u64_tape.offsets) : strings.data.u32_tape.offsets;
+    buffers[2] = bytes;
+    return ustore_status_success_k;
+}
+
+#pragma endregion Gathered Columns
 
 } // namespace unum::ustore
 
@@ -371,19 +551,17 @@ ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys, ustore_size_t
     if (!arena || !schema || !array || (count && !keys.data)) return ustore_status_invalid_argument_k;
     void const* data = count ? static_cast<void const*>(keys.data) : no_rows_k;
     if (count > 1 && keys.stride != sizeof(ustore_key_t)) {
-        if (device_arena_of(arena).blocks) return ustore_status_unsupported_k;
         // Strided keys, like the triples of edges, are carved dense behind the call's outputs under the claim
         if (!take(arena->claim)) return ustore_status_contended_k;
-        auto [dense, carve_status] = arena_allocate<ustore_key_t>(arena, static_cast<std::size_t>(count));
-        if (carve_status.succeeded()) {
-            strided_iterator<ustore_key_t const> const source = strided(keys);
-            for (std::size_t index = 0; index != dense.size(); ++index)
-                dense[index] = source[static_cast<std::ptrdiff_t>(index)];
-            count_export(arena);
-        }
+        std::size_t const rows = static_cast<std::size_t>(count);
+        strided_rows_t strided_keys {reinterpret_cast<std::byte const*>(keys.data), keys.stride, sizeof(ustore_key_t),
+                                     rows, nullptr};
+        ustore_status_t const status = device_arena_of(arena).blocks ? densify_on_device(arena, strided_keys)
+                                                                     : densify_on_host(arena, strided_keys);
+        if (status == ustore_status_success_k) count_export(arena);
         release(arena->claim);
-        if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
-        data = dense.data();
+        if (status != ustore_status_success_k) return status;
+        data = strided_keys.dense;
     }
     else {
         if (ustore_status_t const pinned = pin_arena(arena); pinned != ustore_status_success_k) return pinned;
@@ -432,4 +610,68 @@ ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, usto
     if (status != ustore_status_success_k) return status;
     void const* const exported_data = data ? static_cast<void const*>(data) : no_rows_k;
     return export_column(arena, count, {nullptr, converted, exported_data}, 3, format, nullptr, schema, array);
+}
+
+ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const* column, ustore_size_t count,
+                                                 ustore_docs_field_type_t type, ustore_arena_t arena,
+                                                 ArrowSchema* schema, ArrowDeviceArray* array) {
+    if (!column || !arena || !schema || !array) return ustore_status_invalid_argument_k;
+    if (!docs_column_format(type, ustore_strings_u64_tape_k)) return ustore_status_invalid_argument_k;
+    std::size_t const rows = static_cast<std::size_t>(count);
+    bool const device = device_arena_of(arena).blocks != nullptr;
+    ustore_docs_column_view_t view = device ? ustore_docs_column_view_t {} : *column;
+
+    // Every column takes the claim, as a boolean or text one carves its conversion past the outputs
+    if (!take(arena->claim)) return ustore_status_contended_k;
+    column_buffers_t buffers {};
+    ustore_status_t status = ustore_status_success_k;
+    if (!device && rows)
+        status = lay_out_column(
+            view, rows, type, arena,
+            [&](ustore_byte_t const* bools, std::size_t bools_count, void const*& packed) noexcept {
+                return pack_on_host(arena, bools, bools_count, packed);
+            },
+            [&]<typename offset_type_>(offset_type_ const* offsets, ustore_byte_t const* bytes, std::size_t texts,
+                                       column_buffers_t& laid_out) noexcept {
+                return drop_on_host(arena, offsets, bytes, texts, laid_out);
+            },
+            buffers);
+    if (device)
+        status = visit_export_executor(
+            arena, [&]<typename executor_type_>(executor_type_& executor, device_blocks_t& blocks) noexcept {
+                // A view the gather left on the device comes down through the bounce first
+                if (executor.device_of(column) < 0) view = *column;
+                else {
+                    auto [copy, copy_status] = arena_allocate<ustore_docs_column_view_t>(executor.bounce(), 1);
+                    status_t loaded = copy_status;
+                    if (loaded.succeeded()) loaded = executor.pin_bounce();
+                    if (loaded.succeeded())
+                        loaded = executor.download_async(std::as_writable_bytes(copy),
+                                                         reinterpret_cast<std::uintptr_t>(column));
+                    if (loaded.succeeded()) loaded = executor.wait();
+                    if (loaded.failed()) return static_cast<ustore_status_t>(loaded.code);
+                    view = copy[0];
+                }
+                if (!rows) return ustore_status_success_k;
+                return lay_out_column(
+                    view, rows, type, arena,
+                    [&](ustore_byte_t const* bools, std::size_t bools_count, void const*& packed) noexcept {
+                        return pack_on_device(executor, blocks, bools, bools_count, packed);
+                    },
+                    [&]<typename offset_type_>(offset_type_ const* offsets, ustore_byte_t const* bytes,
+                                               std::size_t texts, column_buffers_t& laid_out) noexcept {
+                        return drop_on_device(executor, blocks, offsets, bytes, texts, laid_out);
+                    },
+                    buffers);
+            });
+    if (status == ustore_status_success_k) count_export(arena);
+    release(arena->claim);
+    if (status != ustore_status_success_k) return status;
+
+    bool const texts = !docs::field_size_bytes(type);
+    if (!rows) buffers = {nullptr, no_rows_k, nullptr};
+    if (texts && !buffers[2]) buffers[2] = no_rows_k;
+    char const* const format = docs_column_format(type, view.strings.layout);
+    char const* const metadata = type == ustore_docs_field_type_uuid_k ? uuid_metadata_k.data() : nullptr;
+    return export_column(arena, rows, buffers, texts ? 3 : 2, format, metadata, schema, array);
 }

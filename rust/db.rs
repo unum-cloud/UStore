@@ -82,6 +82,7 @@ pub(crate) mod ffi {
     pub type ustore_watch_t = super::Watch;
     pub type ustore_mood_t = super::Mood;
     pub type ustore_gds_t = super::Gds;
+    pub type ustore_scan_direction_t = super::ScanDirection;
     pub type ustore_key_t = super::Key;
     pub type ustore_byte_t = u8;
     pub type ustore_length_t = u64;
@@ -166,6 +167,7 @@ pub(crate) mod ffi {
 
     pub type ustore_keys_view_t = ustore_strided_view_t<ustore_key_t>;
     pub type ustore_collections_view_t = ustore_strided_view_t<ustore_collection_id_t>;
+    pub type ustore_lengths_view_t = ustore_strided_view_t<ustore_length_t>;
 
     /// Writes the views of the strings at `indices` into `views`, for a batch no tape holds.
     pub type ustore_strings_get_t = unsafe extern "C" fn(
@@ -358,6 +360,39 @@ pub(crate) mod ffi {
     pub const USTORE_CANCEL_K: ustore_enum_t = 1;
 
     pub const USTORE_CAPABILITIES_TRANSACTIONS_K: ustore_enum_t = 1;
+
+    #[repr(C)]
+    pub struct ustore_changes_cursor_handle_t {
+        _private: [u8; 0],
+    }
+
+    pub type ustore_changes_cursor_t = *mut ustore_changes_cursor_handle_t;
+
+    #[repr(C)]
+    pub struct ustore_changes_cursor_init_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub collection: ustore_collection_id_t,
+        pub since_stamp: ustore_stamp_t,
+        pub cursor: *mut ustore_changes_cursor_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_changes_cursor_next_t {
+        pub cursor: ustore_changes_cursor_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub wanted: ustore_size_t,
+        pub count: *mut ustore_size_t,
+        pub keys: *mut *const ustore_key_t,
+        pub stamps: *mut *const ustore_stamp_t,
+        pub kinds: *mut *const ustore_enum_t,
+        pub values: *mut ustore_strings_view_t,
+        pub arena: ustore_arena_t,
+    }
     pub const USTORE_CAPABILITIES_SNAPSHOTS_K: ustore_enum_t = 4;
 
     #[repr(C)]
@@ -689,6 +724,10 @@ pub(crate) mod ffi {
         pub fn ustore_watch_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_drop_mode_name(drop_mode: ustore_enum_t) -> *const c_char;
         pub fn ustore_drop_mode_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_scan_direction_name(scan_direction: ustore_enum_t) -> *const c_char;
+        pub fn ustore_change_kind_name(change_kind: ustore_enum_t) -> *const c_char;
+        pub fn ustore_change_kind_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_scan_direction_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_isolation_name(isolation: ustore_enum_t) -> *const c_char;
         pub fn ustore_isolation_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_pattern_kind_name(kind: ustore_enum_t) -> *const c_char;
@@ -749,6 +788,10 @@ pub(crate) mod ffi {
         pub fn ustore_arena_free(arena: ustore_arena_t);
         pub fn ustore_transaction_free(transaction: ustore_transaction_t);
         pub fn ustore_snapshot_free(snapshot: ustore_snapshot_t);
+
+        pub fn ustore_changes_cursor_init(arguments: *mut ustore_changes_cursor_init_t);
+        pub fn ustore_changes_cursor_next(arguments: *mut ustore_changes_cursor_next_t);
+        pub fn ustore_changes_cursor_free(cursor: ustore_changes_cursor_t);
         pub fn ustore_database_free(database: ustore_database_t);
     }
 }
@@ -1276,6 +1319,100 @@ impl FromStr for DropMode {
             ffi::ustore_drop_mode_name,
             DropMode::from_raw,
         )
+    }
+}
+
+/// Which way a scan, a cursor or a measure walks its range from the start key.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum ScanDirection {
+    /// Up from the start key, smallest key first.
+    #[default]
+    Ascending = 0,
+    /// Down from the start key, largest key first.
+    Descending = 1,
+}
+
+impl ScanDirection {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(ScanDirection::Ascending),
+            1 => Some(ScanDirection::Descending),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ScanDirection {
+    /// Spells the direction as "ascending" or "descending".
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_scan_direction_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for ScanDirection {
+    type Err = Error;
+
+    /// Reads "ascending" or "descending" back.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_scan_direction_from_name,
+            ffi::ustore_scan_direction_name,
+            ScanDirection::from_raw,
+        )
+    }
+}
+
+/// The keys a scan, a cursor or a measure walks: from `start`, inclusive, towards `end`, exclusive,
+/// in the order `direction` names.
+///
+/// A key converts into the ascending range from it, and `start..end` into the one between them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct KeyRange {
+    /// The key the walk starts from, or `None` for the first key in its direction.
+    pub start: Option<Key>,
+    /// The key the walk stops before, or `None` to walk to the last key in its direction.
+    pub end: Option<Key>,
+    /// Which way the walk goes from `start`.
+    pub direction: ScanDirection,
+}
+
+impl KeyRange {
+    /// The key the walk starts from, the smallest or the largest one when no start is given.
+    pub(crate) fn start_key(&self) -> Key {
+        match (self.start, self.direction) {
+            (Some(start), _) => start,
+            (None, ScanDirection::Ascending) => Key::default(),
+            (None, ScanDirection::Descending) => key_unknown(),
+        }
+    }
+
+    /// The view of the end key, or a zeroed one when the walk has no end.
+    pub(crate) fn end_keys(&self) -> ffi::ustore_keys_view_t {
+        match &self.end {
+            Some(end) => ffi::ustore_strided_view_t::repeated(end),
+            None => ffi::ustore_strided_view_t::default(),
+        }
+    }
+}
+
+impl From<Key> for KeyRange {
+    fn from(start: Key) -> Self {
+        KeyRange {
+            start: Some(start),
+            ..KeyRange::default()
+        }
+    }
+}
+
+impl From<Range<Key>> for KeyRange {
+    fn from(range: Range<Key>) -> Self {
+        KeyRange {
+            start: Some(range.start),
+            end: Some(range.end),
+            direction: ScanDirection::Ascending,
+        }
     }
 }
 
@@ -4076,6 +4213,203 @@ impl<Path: AsRef<str>> sealed::Calling for Save<'_, Path> {
 
 // endregion: Snapshots
 
+// region: Change Feeds
+
+/// What one committed change did to its key.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ChangeKind {
+    /// Wrote the whole value.
+    Write = 0,
+    /// Removed the key.
+    Removal = 1,
+    /// Changed part of the value, as a document patch or a page edit does.
+    Change = 2,
+}
+
+impl ChangeKind {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(ChangeKind::Write),
+            1 => Some(ChangeKind::Removal),
+            2 => Some(ChangeKind::Change),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ChangeKind {
+    /// Spells the kind as "write", "removal" or "change".
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_change_kind_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for ChangeKind {
+    type Err = Error;
+
+    /// Reads "write", "removal" or "change" back.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_change_kind_from_name,
+            ffi::ustore_change_kind_name,
+            ChangeKind::from_raw,
+        )
+    }
+}
+
+impl Database {
+    /// Opens a feed of the changes committed to `collection` after `since`, oldest first, reading
+    /// nothing until its first pull.
+    ///
+    /// A feed whose history is already gone is refused with [`Status::WriteConflict`], and an
+    /// engine that keeps no stamps, as LevelDB does, refuses it with [`Status::Unsupported`].
+    pub fn changes_cursor(&self, collection: CollectionID, since: CommitStamp) -> Result<ChangesCursor<'_>> {
+        let mut cursor = ChangesCursor {
+            handle: ptr::null_mut(),
+            marker: PhantomData,
+        };
+        let mut outcome = ffi::ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_changes_cursor_init_t {
+            database: self.handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
+            collection,
+            since_stamp: since.0,
+            cursor: &mut cursor.handle,
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
+        unsafe { ffi::ustore_changes_cursor_init(&mut arguments) };
+        check(outcome).map(|()| cursor)
+    }
+}
+
+/// A feed of the changes committed to one collection after a stamp, oldest first, which every pull
+/// resumes past the last change the pull before it handed out; see [`Database::changes_cursor`].
+///
+/// It pins the stamp it reads from, as a snapshot does, and holds its database open until it is
+/// dropped. A pull that fails leaves it where it was.
+#[derive(Debug)]
+pub struct ChangesCursor<'database> {
+    handle: ffi::ustore_changes_cursor_t,
+    marker: PhantomData<&'database Database>,
+}
+
+impl ChangesCursor<'_> {
+    /// Pulls up to `wanted` next changes into `arena`, none once the feed is at its newest commit.
+    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Changes<'arena>> {
+        self.pull(wanted, arena, ptr::null_mut())
+    }
+
+    /// Pulls up to `wanted` next changes with the bytes every one carries into `arena` in one call.
+    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Changes<'arena>> {
+        let mut values = ffi::ustore_strings_view_t::default();
+        let mut changes = self.pull(wanted, arena, &mut values)?;
+        // SAFETY: the pull succeeded, writing each change's value as a tape into the `'arena` one.
+        changes.values = unsafe { Strings::exported(values, changes.keys.len())? };
+        Ok(changes)
+    }
+
+    /// Pulls a page of changes into `arena`, with their values into `values` unless it is null.
+    fn pull<'arena>(
+        &mut self,
+        wanted: usize,
+        arena: &'arena mut Arena,
+        values: *mut ffi::ustore_strings_view_t,
+    ) -> Result<Changes<'arena>> {
+        let mut count: ffi::ustore_size_t = 0;
+        let mut keys: *const Key = ptr::null();
+        let mut stamps: *const ffi::ustore_stamp_t = ptr::null();
+        let mut kinds: *const ffi::ustore_enum_t = ptr::null();
+        let mut outcome = ffi::ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_changes_cursor_next_t {
+            cursor: self.handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
+            wanted: wanted as ffi::ustore_size_t,
+            count: &mut count,
+            keys: &mut keys,
+            stamps: &mut stamps,
+            kinds: &mut kinds,
+            values,
+            arena: arena.handle,
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
+        unsafe { ffi::ustore_changes_cursor_next(&mut arguments) };
+        check(outcome)?;
+        let count = count as usize;
+        // SAFETY: a successful pull wrote `count` of each output to the arena borrowed for `'arena`
+        let raw_kinds = unsafe { exported_slice(kinds, count) };
+        if raw_kinds.iter().any(|&kind| ChangeKind::from_raw(kind).is_none()) {
+            return Err(fail(Status::Malformed, "the library wrote an unknown change kind"));
+        }
+        // SAFETY: every kind was just checked to be a `ChangeKind`, which has the layout of the C
+        // enum, and a `CommitStamp` is a transparent stamp.
+        unsafe {
+            Ok(Changes {
+                keys: exported_slice(keys, count),
+                stamps: exported_slice(stamps.cast::<CommitStamp>(), count),
+                kinds: exported_slice(kinds.cast::<ChangeKind>(), count),
+                values: Strings::empty(),
+            })
+        }
+    }
+}
+
+impl Drop for ChangesCursor<'_> {
+    fn drop(&mut self) {
+        // SAFETY: a successful init made the handle, or a failed one left null, which free ignores.
+        unsafe { ffi::ustore_changes_cursor_free(self.handle) };
+    }
+}
+
+/// The changes one pull of a [`ChangesCursor`] handed out, oldest first, in the arena it filled.
+#[derive(Clone, Copy, Debug)]
+pub struct Changes<'arena> {
+    keys: &'arena [Key],
+    stamps: &'arena [CommitStamp],
+    kinds: &'arena [ChangeKind],
+    values: Strings<'arena>,
+}
+
+impl<'arena> Changes<'arena> {
+    /// How many changes the pull handed out.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the feed reached the newest commit.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The key of every change.
+    pub fn keys(&self) -> &'arena [Key] {
+        self.keys
+    }
+
+    /// The stamp every change was committed at.
+    pub fn stamps(&self) -> &'arena [CommitStamp] {
+        self.stamps
+    }
+
+    /// What every change did.
+    pub fn kinds(&self) -> &'arena [ChangeKind] {
+        self.kinds
+    }
+
+    /// The bytes the change at `index` carries, empty for a removal, or `None` past the end or when
+    /// the pull read no values.
+    pub fn value(&self, index: usize) -> Option<&'arena [u8]> {
+        self.values.get(index)
+    }
+}
+
+// endregion: Change Feeds
+
 // region: Tests
 
 #[cfg(test)]
@@ -4083,6 +4417,23 @@ mod tests {
     use super::*;
     use crate::testing::temporary_directory;
     use crate::testing::{block_on, created, key, keys};
+
+    #[test]
+    fn change_feeds_hand_out_writes_and_removals_oldest_first() {
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
+        let mut feed = database.changes_cursor(blobs, CommitStamp::default()).unwrap();
+        let entries = [crate::blobs::Entry::new(key(1), b"a")];
+        database.head().write(blobs, &entries, Durability::Buffered).unwrap();
+        database.head().remove(blobs, [key(1)], Durability::Buffered).unwrap();
+        let mut arena = Arena::new().unwrap();
+        let changes = feed.next_pairs(8, &mut arena).unwrap();
+        assert_eq!(changes.keys(), &keys([1, 1]));
+        assert_eq!(changes.kinds(), &[ChangeKind::Write, ChangeKind::Removal]);
+        assert_eq!(changes.value(0), Some(b"a".as_slice()));
+        assert!(changes.stamps()[0] < changes.stamps()[1]);
+        assert!(feed.next(8, &mut arena).unwrap().is_empty());
+    }
 
     #[test]
     fn databases_describe_their_engine_and_what_they_hold() {
@@ -4921,7 +5272,7 @@ mod tests {
         let scan = head
             .scan(blobs, key(0), 100_000, Matching::default(), &mut scanned)
             .unwrap();
-        let refused = head.measure(blobs, key(0), key(9), &mut measured).unwrap();
+        let refused = head.measure(blobs, key(0)..key(9), &mut measured).unwrap();
         assert_eq!(
             refused.status(),
             Err(Status::Contended),
@@ -4929,7 +5280,7 @@ mod tests {
         );
         assert_eq!(refused.wait().unwrap_err().status, Status::Contended);
         assert_eq!(scan.wait().unwrap().keys.len(), 100_000);
-        head.measure(blobs, key(0), key(9), &mut measured)
+        head.measure(blobs, key(0)..key(9), &mut measured)
             .unwrap()
             .wait()
             .unwrap();

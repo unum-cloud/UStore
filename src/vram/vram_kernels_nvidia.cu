@@ -8,6 +8,7 @@
 #include <stringzilla/cuda.cuh> // `sz_lanes_any_cuda_`, `sz_shuffle_up_cuda_` & kin
 
 #include "ustore/blobs/vram_nvidia_compaction.cuh"     // `merge_rank`, `merge_pack`, `merge_place`
+#include "ustore/docs/vram_gather.cuh"                 // `gather_scalars`, `measure_texts`, `write_texts`
 #include "ustore/graph/vram_nvidia_adjacency_fold.cuh" // `fold_chains`, `fold_write`
 #include "ustore/utilities/tapes.cuh"                  // `tape_offsets_block`, `tape_gather_block`
 #include "ustore/utilities/vram_matching.cuh"          // `substrings_per_thread`, `matching_page_t` & kin
@@ -34,6 +35,11 @@ extern "C" __global__ void __launch_bounds__(tape_block_threads_k)
 extern "C" __global__ void __launch_bounds__(tape_block_threads_k)
     ustore_tape_gather(tape_source_t const* sources, tape_segment_t const* segments, std::byte* bytes) {
     tape_gather_block(sources, segments, bytes);
+}
+
+/** Copies fixed-width rows a stride apart into one dense run, one row per thread. */
+extern "C" __global__ void __launch_bounds__(tape_block_threads_k) ustore_tape_densify(strided_rows_t rows) {
+    densify_rows(rows);
 }
 
 #pragma region Merge Kernels
@@ -304,4 +310,61 @@ extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
     subdocuments_per_group(engine, page, walkers, chunk_bytes, matching_group());
 }
 
+/** Stores the nodes @p engine's paths select in @p page's JSON values into @p found, per group. */
+extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
+    ustore_subdocuments_find_per_group(sz_subdocuments_engine_t engine, matching_page_t page,
+                                       matching_walkers_t walkers, matching_found_t found) {
+    subdocuments_find_per_group(engine, page, walkers, found, 0, matching_group());
+}
+
+/** Stores the nodes the paths of @p engine select in the long JSON values of @p page into @p found,
+ *  a group each walking them in chunks of @p chunk_bytes. */
+extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
+    ustore_subdocuments_find_per_chunk(sz_subdocuments_engine_t engine, matching_page_t page,
+                                       matching_walkers_t walkers, matching_found_t found, std::uint64_t chunk_bytes) {
+    subdocuments_find_per_group(engine, page, walkers, found, chunk_bytes, matching_group());
+}
+
 #pragma endregion Matching Kernels
+
+#pragma region Gather Kernels
+
+using namespace unum::ustore::docs;
+
+/** Converts the rows of one scalar column of a gather, eight per lane. */
+extern "C" __global__ void __launch_bounds__(gather_block_threads_k)
+    ustore_docs_gather_scalars(gather_page_t page, gather_scalars_t column) {
+    gather_scalars(page, column);
+}
+
+/** Measures the rows of one text output of a gather or a read, eight per lane. */
+extern "C" __global__ void __launch_bounds__(gather_block_threads_k)
+    ustore_docs_measure_texts(gather_page_t page, gather_texts_t texts) {
+    measure_texts(page, texts);
+}
+
+/** Writes the rows of one measured and scanned text output, one per lane. */
+extern "C" __global__ void __launch_bounds__(gather_block_threads_k)
+    ustore_docs_write_texts(gather_page_t page, gather_texts_t texts) {
+    write_texts(page, texts);
+}
+
+/** Packs a boolean column into Arrow's bits, eight rows per lane. */
+extern "C" __global__ void __launch_bounds__(gather_block_threads_k)
+    ustore_docs_pack_bools(ustore_byte_t const* bools, std::uint64_t rows, ustore_octet_t* packed) {
+    pack_bool_bytes(bools, rows, packed);
+}
+
+/** Copies a text column of 32-bit offsets without the null byte ending each row, a row per lane. */
+extern "C" __global__ void __launch_bounds__(gather_block_threads_k)
+    ustore_docs_drop_terminators_u32(terminated_texts<std::uint32_t> texts) {
+    drop_terminators(texts);
+}
+
+/** Copies a text column of 64-bit offsets without the null byte ending each row, a row per lane. */
+extern "C" __global__ void __launch_bounds__(gather_block_threads_k)
+    ustore_docs_drop_terminators_u64(terminated_texts<std::uint64_t> texts) {
+    drop_terminators(texts);
+}
+
+#pragma endregion Gather Kernels

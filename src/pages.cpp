@@ -24,8 +24,11 @@ constexpr enumerator_spelling<ustore_page_encoding_t> page_encoding_names_k[] {
 
 #pragma endregion Names
 
-status_t pull(engine_t const& engine, ustore_pages_cursor_next_t const& arguments, ustore_pages_cursor_handle_t& cursor,
-              view_t const& view) noexcept {
+/** Pulls the next page of @p cursor as @c pull does, narrowing through @p match, the walk's own
+ *  match or the face a device pull shows it. */
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_pages_cursor_next_t const& arguments,
+                      ustore_pages_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept {
     if (!arguments.keys || !arguments.written)
         return {status_code_t::invalid_argument_k, "Need outputs for the keys and the count written"};
     if (arguments.values && !engine.host.pages->read)
@@ -33,10 +36,10 @@ status_t pull(engine_t const& engine, ustore_pages_cursor_next_t const& argument
     keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
     std::variant<ustore_key_t, exhausted_t> resume;
     if (status_t const status = list_cursor_keys<ustore_pages_scan_t>(
-            engine, arguments.database, cursor, arguments.wanted, arguments.arena, view, survivors, resume);
+            engine, arguments.database, cursor, match, arguments.wanted, arguments.arena, view, survivors, resume);
         status.failed())
         return status;
-    arena_rewind(arguments.arena);
+    match.rewind_page(arguments.arena);
     std::size_t const written = survivors.size();
     if (written && arguments.values) {
         ustore_pages_read_t const read {.database = arguments.database,
@@ -57,6 +60,13 @@ status_t pull(engine_t const& engine, ustore_pages_cursor_next_t const& argument
     return {};
 }
 
+status_t pull(engine_t const& engine, ustore_pages_cursor_next_t const& arguments, ustore_pages_cursor_handle_t& cursor,
+              view_t const& view) noexcept {
+    auto const* const walker = host_engine_of(cursor);
+    if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
+    return pull_through(engine, arguments, cursor, walker->match, view);
+}
+
 } // namespace unum::ustore
 
 void ustore_pages_import(ustore_pages_import_t* arguments) { route(arguments); }
@@ -68,6 +78,8 @@ void ustore_pages_set_attributes(ustore_pages_set_attributes_t* arguments) { rou
 void ustore_pages_remove_attributes(ustore_pages_remove_attributes_t* arguments) { route(arguments); }
 void ustore_pages_read(ustore_pages_read_t* arguments) { route(arguments); }
 void ustore_pages_scan(ustore_pages_scan_t* arguments) { route(arguments); }
+void ustore_pages_sample(ustore_pages_sample_t* arguments) { route(arguments); }
+void ustore_pages_measure(ustore_pages_measure_t* arguments) { route(arguments); }
 
 void ustore_pages_cursor_next(ustore_pages_cursor_next_t* arguments) { route(arguments); }
 

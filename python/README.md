@@ -277,11 +277,22 @@ A tape is an Arrow `binary`, `large_binary`, `string` or `large_string` array, o
 It reaches the C ABI as the u32 or u64 tape it already is, so nothing is copied or gathered, and an Arrow null is refused, since `remove` removes keys.
 A read answers the tape the engine wrote, with 32-bit offsets while its bytes fit in 4 GiB and 64-bit ones beyond, and `Values` exports it through the Arrow C data interface as `binary` or `large_binary` to match.
 
-`scan(start, wanted, arena)` lists up to `wanted` keys from `start` upwards.
-`scan_batch(starts, wanted, arena)` runs one scan per start in one call, and `sample_batch(count, wanted, arena)` draws `count` samples, all from the one collection `collection=` names, every one held to the same `wanted`, which is what the C ABI takes; `scan` and `sample` remain the single forms.
-`measure(start, end, arena)` answers a `Measurement` of the bounds on the entries, the bytes of their values and the space they take, without walking the range.
+`scan(start, wanted, arena)` lists up to `wanted` keys from `start` upwards, and `end=` stops it before a key.
+`direction=ScanDirection.DESCENDING` walks down from `start` instead, largest key first, and a `start` of None begins at the first key in the direction:
 
-`cursor(start=0, *, collection)` opens a walk over the keys of one collection, and its `next(wanted, arena, *, values=False)` pulls the next page into the arena that pull names, with the values of its keys in the same call when asked:
+```python
+database.scan(10, 8, arena, collection=posters, end=30)                          # keys in [10, 30)
+database.scan(None, 8, arena, collection=posters, direction=ScanDirection.DESCENDING)  # the 8 largest keys
+database.scan(30, 8, arena, collection=posters, end=10, direction=ScanDirection.DESCENDING)  # keys in (10, 30]
+```
+
+`scan_batch(starts, wanted, arena)` runs one scan per start in one call, and `sample_batch(count, wanted, arena)` draws `count` samples, all from the one collection `collection=` names, every one held to the same `wanted`, which is what the C ABI takes; `scan` and `sample` remain the single forms.
+`measure(start, end, arena)` answers a `Measurement` of the bounds on the entries, the bytes of their values and the space they take, without walking the range, which stops before `end` and takes the same `direction=`.
+`docs_measure`, `pages_measure` and `graph_measure_vertices` measure the other modalities, as `docs_sample`, `pages_sample` and `graph_sample_vertices` sample them.
+`read(keys, arena, offset=16, limit=64)` reads up to 64 bytes of every value from its 16th, where an offset past the end reads empty.
+`remove(keys, ends=ends)` removes every key from each of `keys` up to its end in one atomic call, and so do `docs_remove`, `graph_remove_vertices` and `pages_remove`, whose ranges remove whole pages.
+
+`cursor(start=None, *, collection, end=None, direction=ScanDirection.ASCENDING)` opens a walk over the keys of one collection, and its `next(wanted, arena, *, values=False)` pulls the next page into the arena that pull names, with the values of its keys in the same call when asked:
 
 ```python
 arena = ustore.Arena()
@@ -314,7 +325,7 @@ An edge is a source, a target and an optional identifier, so distinct identifier
 
 ## Collections, Modes & Stamps
 
-Every C enum a caller meets is an `enum.IntEnum` of `ustore`: `Status`, `Mood`, `CPUClass`, `Watch`, `Durability`, `DropMode`, `ScanMode`, `Modality`, `Isolation`, `Transport`, `Engine`, `Role`, `FieldType` and `Modification`.
+Every C enum a caller meets is an `enum.IntEnum` of `ustore`: `Status`, `Mood`, `CPUClass`, `Watch`, `Durability`, `DropMode`, `ScanMode`, `ScanDirection`, `Modality`, `Isolation`, `Transport`, `Engine`, `Role`, `FieldType` and `Modification`.
 The module builds each one at import through the C `_name` functions, valued as the enumerators and named by their canonical spellings in upper case, dashes as underscores, so "strict-serializable" is `Isolation.STRICT_SERIALIZABLE` and "read-only" is `Status.READ_ONLY`.
 A verb takes any `int` that is an enumerator, refusing a bool, which would read as zero or one, and text.
 `Error.status` and `Deferred.status` are `Status` members, `measure()` answers a `Measurement` struct sequence, `database.capabilities` a `Capabilities` one of `transactions` and `snapshots`, and `Columns.types` holds `FieldType` members.
@@ -345,6 +356,18 @@ Stamps are plain `int`s of two kinds.
 `commit()` answers the commit stamp, the commit's position in commit order, which every snapshot whose read stamp is at or above it sees.
 `Snapshot.read_stamp` is the stamp a snapshot reads at, so `before.read_stamp < commit_stamp <= after.read_stamp` for snapshots taken around a commit.
 Staging reserves no position in commit order, so a read stamp is never greater than the commit stamp that follows it.
+
+`changes_cursor(since, *, collection)` opens a feed of the changes committed to one collection after a commit stamp, oldest first, pinning that stamp as a snapshot does:
+
+```python
+with database.changes_cursor(commit_stamp, collection="movies") as feed:
+    while (changes := feed.next(1024, arena, values=True)).keys:  # an empty pull reached the newest commit
+        for key, stamp, kind in zip(changes.keys, changes.stamps, changes.kinds):
+            consume(key, stamp, kind)  # a ChangeKind: WRITE, REMOVAL or CHANGE
+```
+
+A `Changes` tuple carries the keys as a `Page`, their `Values` when asked, and tuples of commit stamps and `ChangeKind` members, where a range removal comes as the removal of every key it removed.
+A feed whose history is already gone raises `WriteConflictError`, and LevelDB, which keeps no stamps, raises `UnsupportedError`.
 
 ## Layout
 
@@ -389,8 +412,9 @@ The binding is a thin layer over the C ABI in `c/ustore/`, and every rule below 
 - __Every verb is one C call, so every verb defers.__
   Through `db.deferred(executor)`, these answer a `Deferred`:
   - `read`, `get`, `contains`, `write`, `set`, `remove`, `scan`, `scan_batch`, `sample`, `sample_batch` and `measure`;
-  - `docs_read`, `docs_write`, `docs_gist` and `docs_gather`;
-  - `graph_read_edges`, `graph_degrees`, `graph_write_edges`, `graph_remove_edges`, `graph_write_vertices` and `graph_remove_vertices`;
+  - `docs_read`, `docs_write`, `docs_gist`, `docs_gather`, `docs_scan`, `docs_sample`, `docs_measure` and `docs_remove`;
+  - `pages_scan`, `pages_sample`, `pages_measure` and `pages_remove`;
+  - `graph_scan_vertices`, `graph_sample_vertices`, `graph_measure_vertices`, `graph_read_edges`, `graph_degrees`, `graph_write_edges`, `graph_remove_edges`, `graph_write_vertices` and `graph_remove_vertices`;
   - `collection_find`, `collection_list`, `commit`, `stage` and a snapshot's `save`;
   - `clear`, `compact` and `describe` of a database;
   - `view[name].blobs[key]`, `view[name].docs[key]`, `view[name].docs_json[key]`, `view[name].scan`, `view[name].sample_keys`, and `has_node` and `read_edges` of `view[name].graph`.

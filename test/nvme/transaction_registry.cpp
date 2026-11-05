@@ -132,10 +132,10 @@ class test_store_t {
         written.for_each_delta(collection_id, [&](stored_key_t stored_key, delta_view_t delta) noexcept {
             [[maybe_unused]] st::status_t const kept = deltas.push_back(keyed_delta<stored_key_t> {stored_key, delta});
         });
-        if (deltas.empty()) return {};
+        if (deltas.empty() && written.ranges(collection_id).empty()) return {};
         auto [sealed_deltas, seal_status] =
             blobs::sealed_deltas<stored_key_t, constrained_allocator<byte_t, atomic_reference>>::seal(
-                std::span<keyed_delta<stored_key_t>> {deltas},
+                std::span<keyed_delta<stored_key_t>> {deltas}, written.ranges(collection_id),
                 constrained_allocator<byte_t, atomic_reference> {budget_});
         if (seal_status.failed()) return seal_status;
         sealed.deltas = std::move(sealed_deltas);

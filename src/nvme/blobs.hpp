@@ -53,21 +53,27 @@ status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const&
                        });
 }
 
-/** Removes whole values through the store of each collection, committing a batch outside a transaction atomically,
- *  for a caller whose resolver checked the collections. */
+/** Removes whole values through the store of each collection, or every key of each range as one
+ *  range tombstone when the call names end keys, committing a batch outside a transaction
+ *  atomically, for a caller whose resolver checked the collections. */
 template <cpu_class_t cpu_class_>
 status_t remove_values(ustore_blobs_remove_t const& arguments, view_t const& view) noexcept {
     place_batch_t const places = places_of(arguments);
     if (status_t const status = validate_remove(view.transaction, places, arguments.durability, view.watch);
         status.failed() || !arguments.count)
         return status;
+    strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     return serve_write(state, view, arguments.durability, places.size(), 1, watch_schedule_t::never_k,
                        [&](call_access<cpu_class_> const& access) noexcept -> status_t {
                            for (std::size_t index = 0; index != places.size(); ++index) {
                                place_t const place = places[index];
-                               status_t const removed = write_value(access, place.collection, stored_of(place.key.uuid),
-                                                                    value_view_t {});
+                               stored_key_t const key = stored_of(place.key.uuid);
+                               status_t const removed =
+                                   end_keys
+                                       ? remove_key_range(access, place.collection, key,
+                                                          stored_of(end_keys[static_cast<std::ptrdiff_t>(index)].uuid))
+                                       : write_value(access, place.collection, key, value_view_t {});
                                if (removed.failed()) return removed;
                            }
                            return {};
@@ -138,14 +144,15 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) no
     return read_values<cpu_class_>(arguments, view);
 }
 
-/** Scans keys as ordered walks of the store of each collection, or run by run for an unordered scan outside a
- *  transaction, a graph's being its vertices, watching what a transaction hands out, for a caller whose resolver
- *  checked the collections. */
+/** Scans keys as ordered walks of the store of each collection between the bounds of each
+ *  task, in its direction, or run by run for an unordered scan outside a transaction, a
+ *  graph's being its vertices, watching what a transaction hands out, for a caller whose
+ *  resolver checked the collections. A descending walk passes every key of its range, as the
+ *  runs walk ascending alone. */
 template <cpu_class_t cpu_class_>
 status_t scan_values(ustore_blobs_scan_t const& arguments, view_t const& view) noexcept {
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    scan_batch_t const scans {collections, strided(arguments.start_keys), arguments.wanted, arguments.count};
+    scan_batch_t const scans = scans_of(arguments);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
@@ -156,15 +163,18 @@ status_t scan_values(ustore_blobs_scan_t const& arguments, view_t const& view) n
         scan_task_t const scan = scans[task];
         outputs.open_task(task);
         found.clear();
-        stored_key_t const from = stored_of(scan.start_key.uuid);
+        stored_key_t const lower = stored_of(scan.keys.lower.uuid);
+        stored_key_t const upper = stored_of(scan.keys.upper.uuid);
+        bool const descending = scan.direction == ustore_scan_descending_k;
         // An unordered scan walks each run alone outside a transaction, whose own deltas merge only in order
         status_t collected;
         if (scan.limit != 0 && arguments.mode == ustore_scan_unordered_k && !access.transaction)
-            collected = collect_keys_unordered(access, scan.collection, from, scan.limit, found);
+            collected = collect_keys_unordered(access, scan.collection, lower, upper, scan.limit, found);
         if (scan.limit != 0 && (arguments.mode != ustore_scan_unordered_k || access.transaction ||
                                 collected == status_code_t::contended_k)) {
             found.clear();
-            collected = collect_keys(access, scan.collection, from, scan.limit, found);
+            collected = descending ? collect_keys_descending(access, scan.collection, lower, upper, scan.limit, found)
+                                   : collect_keys(access, scan.collection, lower, upper, scan.limit, found);
         }
         if (collected.failed()) return collected;
         for (std::size_t index = 0; index != found.size(); ++index)
@@ -172,11 +182,12 @@ status_t scan_values(ustore_blobs_scan_t const& arguments, view_t const& view) n
         if (status_t const watched = watch_keys(access, scan.collection, std::span<stored_key_t const> {found});
             watched.failed())
             return watched;
-        // A full page covered the keys up to its last, and a short one every key up to the largest
-        stored_key_t const upper = found.size() == scan.limit && !found.empty() ? found[found.size() - 1]
-                                                                                : limit<stored_key_t>::max();
+        // A full page covered the keys up to its last in its direction, a short one the whole range
+        bool const full = found.size() == scan.limit && !found.empty();
+        stored_key_t const watched_lower = full && descending ? found[found.size() - 1] : lower;
+        stored_key_t const watched_upper = full && !descending ? found[found.size() - 1] : upper;
         if (scan.limit != 0)
-            if (status_t const watched = watch_range(access, scan.collection, stored_of(scan.start_key.uuid), upper);
+            if (status_t const watched = watch_range(access, scan.collection, watched_lower, watched_upper);
                 watched.failed())
                 return watched;
         if (!progress.advance(1)) return progress_cancelled_k;
@@ -250,39 +261,49 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
     return sample_values<cpu_class_>(arguments, view);
 }
 
-/** Implements @c ustore_blobs_measure, exact for keys and value bytes at the view it reads. */
+/** Measures the keys and value bytes of each task's range, exact at the view it reads, through the
+ *  store of each collection, for a caller whose resolver checked the collections. */
 template <cpu_class_t cpu_class_>
-status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& view) noexcept {
-    if (!arguments.count) return {};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
-    strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
+status_t measure_values(ustore_blobs_measure_t const& arguments, view_t const& view) noexcept {
+    if (status_t const direction = validate_direction(arguments.direction); direction.failed() || !arguments.count)
+        return direction;
+    scan_batch_t const measures = measures_of(arguments);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_blobs_k);
-        resolved.failed())
-        return resolved;
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
-    for (std::size_t task = 0; task != arguments.count; ++task) {
-        stored_key_t const lower = stored_of((start_keys ? start_keys[task] : smallest_key_k).uuid);
-        stored_key_t const last = stored_of((end_keys ? end_keys[task] : largest_key_k).uuid);
+    for (std::size_t task = 0; task != measures.size(); ++task) {
+        scan_task_t const measure = measures[task];
         std::size_t cardinality = 0;
         std::size_t value_bytes = 0;
-        status_t const walked = walk(access, collections[task], lower,
-                                     [&](stored_key_t key, stored_value_size_t size) noexcept {
-                                         if (last < key) return false;
-                                         ++cardinality;
-                                         value_bytes += size;
-                                         return true;
-                                     });
-        if (walked.failed()) return walked;
-        if (status_t const watched = watch_range(access, collections[task], lower, last); watched.failed())
-            return watched;
+        stored_key_t const lower = stored_of(measure.keys.lower.uuid);
+        stored_key_t const upper = stored_of(measure.keys.upper.uuid);
+        if (measure.limit != 0) {
+            status_t const walked = walk(access, measure.collection, lower,
+                                         [&](stored_key_t key, stored_value_size_t size) noexcept {
+                                             if (upper < key) return false;
+                                             ++cardinality;
+                                             value_bytes += size;
+                                             return true;
+                                         });
+            if (walked.failed()) return walked;
+            if (status_t const watched = watch_range(access, measure.collection, lower, upper); watched.failed())
+                return watched;
+        }
         outputs.assign(task, cardinality, value_bytes, value_bytes + cardinality * sizeof(stored_key_t));
     }
     outputs.finish(arguments);
     return {};
+}
+
+/** Implements @c ustore_blobs_measure over the collections holding blobs. */
+template <cpu_class_t cpu_class_>
+status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& view) noexcept {
+    if (status_t const resolved = resolve_modality<cpu_class_>(arguments.database, arguments.collections,
+                                                               arguments.count, ustore_modality_blobs_k, view);
+        resolved.failed())
+        return resolved;
+    return measure_values<cpu_class_>(arguments, view);
 }
 
 #pragma endregion Blob Calls

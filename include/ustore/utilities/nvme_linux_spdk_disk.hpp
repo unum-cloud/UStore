@@ -511,9 +511,6 @@ struct linux_spdk_attachment_t {
     /** Held while a share connects the controller or finds it failed. */
     std::int32_t claim = 0;
 
-    /** Whether a later open passes this connection by, as its controller failed. */
-    bool dropped = false;
-
     /** Namespaces some disk on the controller registered, which no second disk may register. */
     st::vector<std::uint32_t> claimed;
 };
@@ -616,7 +613,6 @@ void linux_spdk_detach(linux_spdk_attachment_t& attachment) noexcept {
     spdk_nvme_ctrlr* detached = nullptr;
     if (--attachment.holders == 0) {
         detached = std::exchange(attachment.controller, nullptr);
-        attachment.dropped = false;
         attachment.claimed.clear();
         process.attachments.vacate(process.attachments.index_of(attachment));
     }
@@ -630,13 +626,12 @@ expected<linux_spdk_attachment_t*> linux_spdk_attach(spdk_nvme_transport_id cons
                                                      spdk_nvme_ctrlr_opts const& options) noexcept {
     using records_t = st::basic_growing_pool<linux_spdk_attachment_t>;
     linux_spdk_process_t& process = linux_spdk_process();
-    for (;;) {
+    {
         lock_claim<atomic_reference_, waiter_type_>(process.attachments_claim);
         linux_spdk_attachment_t* attached = nullptr;
         status_t refused;
         for (linux_spdk_attachment_t& record : process.attachments.records())
-            if (record.holders != 0 && !record.dropped &&
-                spdk_nvme_transport_id_compare(&record.transport, &transport) == 0) {
+            if (record.holders != 0 && spdk_nvme_transport_id_compare(&record.transport, &transport) == 0) {
                 attached = &record;
                 break;
             }
@@ -659,16 +654,18 @@ expected<linux_spdk_attachment_t*> linux_spdk_attach(spdk_nvme_transport_id cons
         unlock_claim<atomic_reference_>(process.attachments_claim);
         if (refused.failed()) return refused;
 
-        // A pulled or reset drive leaves a failed controller, which a fresh connection replaces.
+        // `spdk_nvme_connect` hands back a cached failed controller, so a pulled or reset drive is
+        // refused until its last holder detaches it, and only then can a connect reach a new one.
         lock_claim<atomic_reference_, waiter_type_>(attached->claim);
         bool const failed = attached->controller && spdk_nvme_ctrlr_is_failed(attached->controller);
-        if (failed) attached->dropped = true;
-        else if (!attached->controller) attached->controller = spdk_nvme_connect(&transport, &options, sizeof(options));
+        if (!failed && !attached->controller)
+            attached->controller = spdk_nvme_connect(&transport, &options, sizeof(options));
         bool const connected = attached->controller != nullptr;
         unlock_claim<atomic_reference_>(attached->claim);
         if (!failed && connected) return attached;
         linux_spdk_detach<atomic_reference_, waiter_type_>(*attached);
-        if (!failed) return status_t {status_code_t::not_found_k, "No controller answered at that address"};
+        if (failed) return status_t {status_code_t::io_k, "The controller failed and its holders have not let go"};
+        return status_t {status_code_t::not_found_k, "No controller answered at that address"};
     }
 }
 

@@ -30,8 +30,8 @@ pub(crate) mod ffi {
     use crate::db::ffi::{
         ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t, ustore_completion_t,
         ustore_database_t, ustore_durability_t, ustore_executor_t, ustore_key_t, ustore_keys_view_t, ustore_outcome_t,
-        ustore_patterns_t, ustore_predicate_t, ustore_progress_callback_t, ustore_size_t, ustore_strings_view_t,
-        ustore_transaction_t, ustore_view_t, ustore_watch_t,
+        ustore_patterns_t, ustore_predicate_t, ustore_progress_callback_t, ustore_scan_direction_t, ustore_size_t,
+        ustore_strings_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
     };
 
     #[repr(C)]
@@ -66,6 +66,8 @@ pub(crate) mod ffi {
         pub collection: ustore_collection_id_t,
         pub prefix: ustore_bytes_view_t,
         pub start_string: ustore_bytes_view_t,
+        pub end_string: ustore_bytes_view_t,
+        pub direction: ustore_scan_direction_t,
         pub patterns: ustore_patterns_t,
         pub predicate: ustore_predicate_t,
     }

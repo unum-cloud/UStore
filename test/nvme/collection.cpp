@@ -935,6 +935,158 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     return failures;
 }
 
+/** Reads each key of @p wanted one at a time at @p stamp, counting where the model disagrees. */
+template <typename store_type_>
+[[nodiscard]] std::size_t check_model_as_of(store_type_& store, io_channel_t& channel,
+                                            std::span<expectation_t const> wanted, transaction_stamp_t stamp) {
+    std::size_t failures = 0;
+    st::vector<byte_t> into;
+    for (expectation_t const& entry : wanted) {
+        stored_value_size_t size = 0;
+        failures += expect(into.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
+        status_t const read = store.select(channel, entry.stored_key, std::span<byte_t> {into}, size, stamp);
+        if (entry.state != lookup_result_t::written_k) {
+            failures += expect(read == status_code_t::not_found_k);
+            continue;
+        }
+        failures += expect(read.succeeded());
+        failures += expect_eq(static_cast<std::uint64_t>(size), entry.bytes);
+        for (std::uint64_t position = 0; position != size; ++position)
+            failures += expect(into[static_cast<std::size_t>(position)] == painted(entry.seed, position));
+    }
+    return failures;
+}
+
+/** Walks @p store at its head both ways and counts the keys each walk hands out, in its order,
+ *  against what @p wanted says is written. */
+template <typename cursor_type_, typename store_type_>
+[[nodiscard]] std::size_t check_scan(store_type_ const& store, std::span<expectation_t const> wanted) {
+    std::size_t failures = 0;
+    std::size_t present = 0;
+    for (expectation_t const& entry : wanted) present += entry.state == lookup_result_t::written_k;
+    for (scan_direction_t const direction : {scan_direction_t::ascending_k, scan_direction_t::descending_k}) {
+        bool const descending = direction == scan_direction_t::descending_k;
+        expected<cursor_type_> scan = cursor_type_::over(
+            store, descending ? limit<stored_key_t>::max() : limit<stored_key_t>::min(), head_stamp_k,
+            outside_executor_k, direction);
+        failures += expect(scan.has_value());
+        if (!scan) return failures;
+        std::size_t listed = 0;
+        stored_key_t previous = 0;
+        for (; !scan->reached_end(); failures += expect(scan->advance().succeeded())) {
+            if (scan->state() != lookup_result_t::written_k) continue;
+            stored_key_t const key = scan->stored_key();
+            if (listed != 0) failures += expect(descending ? key < previous : previous < key);
+            previous = key;
+            ++listed;
+            failures += expect(key < wanted.size() &&
+                               wanted[static_cast<std::size_t>(key)].state == lookup_result_t::written_k);
+        }
+        failures += expect_eq(listed, present);
+    }
+    return failures;
+}
+
+/** A range removal hides every older version of its keys, in memory runs, after the flush that
+ *  writes it out and after merges carry it down, while a snapshot pinned before it keeps reading
+ *  them and a write after it survives. */
+template <typename mount_type_>
+std::size_t range_removal_hides_older_runs(mount_type_ const& mount) {
+    using types_t = collection_types<typename mount_type_::fixture_t>;
+    using guard_t = typename types_t::guard_t;
+    using variable_store_t = typename types_t::variable_store_t;
+    using variable_cursor_t = typename types_t::variable_cursor_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    constexpr std::size_t keys_k = 300;
+    constexpr stored_key_t start_k = 50;
+    constexpr stored_key_t end_k = 250;
+    constexpr stored_key_t rewritten_k = 100;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+
+    // Two runs fill level zero, so every second flush leaves a merge due.
+    collection_config_t config = test_config(0, value_max_size_k);
+    config.lsm_tree.level_enlarge_factor = 2;
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<variable_store_t> store = variable_store_t::mount(
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
+    failures += expect(store.has_value());
+    expected<guard_t> writing = (*stack)->fixture->channels.acquire();
+    failures += expect(writing.has_value());
+    if (!store || !writing) return failures;
+
+    st::vector<expectation_t> before;
+    failures += expect(before.resize(keys_k) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    for (std::size_t index = 0; index != keys_k; ++index)
+        before[index] = expectation_t {static_cast<stored_key_t>(index), lookup_result_t::written_k, 9 + index % 31,
+                                       index * 13 + 1};
+    // The lower keys sink a level below the upper ones, so the tombstone hides runs of two levels.
+    std::span<expectation_t const> const all {before};
+    failures += write_model(*store, (*stack)->channel(), all.first(100));
+    failures += expect(store->flush((*stack)->channel()).succeeded());
+    failures += write_model(*store, (*stack)->channel(), all.subspan(100, 100));
+    failures += expect(store->flush((*stack)->channel()).succeeded());
+    expected<compaction_outcome_t> const sunk = store->compact((*stack)->channel(), writing->channel(), {});
+    failures += expect(sunk.has_value() && *sunk == compaction_outcome_t::published_k);
+    failures += write_model(*store, (*stack)->channel(), all.subspan(200));
+    failures += expect(store->flush((*stack)->channel()).succeeded());
+
+    stamp_pin_t pin;
+    transaction_stamp_t const pinned = (*stack)->ledger.pin_reader(pin);
+    failures += expect(store->remove_range((*stack)->channel(), start_k, end_k).succeeded());
+    st::vector<expectation_t> after;
+    failures += expect(after.resize(keys_k) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    for (std::size_t index = 0; index != keys_k; ++index) {
+        after[index] = before[index];
+        if (index >= start_k && index < end_k) after[index] = expectation_t {before[index].stored_key};
+        if (after[index].state == lookup_result_t::missing_k) after[index].state = lookup_result_t::removed_k;
+    }
+    expectation_t const rewritten {rewritten_k, lookup_result_t::written_k, 17, 77};
+    failures += write_model(*store, (*stack)->channel(), std::span<expectation_t const> {&rewritten, 1});
+    after[rewritten_k] = rewritten;
+
+    auto const check = [&]() {
+        std::size_t checked = 0;
+        checked += check_model(*store, (*stack)->channel(), std::span<expectation_t const> {after});
+        checked += check_model_as_of(*store, (*stack)->channel(), std::span<expectation_t const> {after}, head_stamp_k);
+        checked += check_model_as_of(*store, (*stack)->channel(), std::span<expectation_t const> {before}, pinned);
+        checked += check_scan<variable_cursor_t>(*store, std::span<expectation_t const> {after});
+        return checked;
+    };
+    failures += check();
+    failures += expect(store->flush((*stack)->channel()).succeeded());
+    failures += check();
+    for (std::size_t pass = 0; pass != 4 && store->tree().levels().level(0).size() != 0; ++pass) {
+        expected<compaction_outcome_t> const merged = store->compact((*stack)->channel(), writing->channel(), {});
+        failures += expect(merged.has_value() && *merged == compaction_outcome_t::published_k);
+        failures += check();
+    }
+
+    // With the pin gone, a merge into the bottom drops the tombstone with every version it hid.
+    pin.release();
+    for (std::size_t flush = 0; flush != 2; ++flush) {
+        failures += write_model(*store, (*stack)->channel(), std::span<expectation_t const> {&rewritten, 1});
+        failures += expect(store->flush((*stack)->channel()).succeeded());
+    }
+    expected<compaction_outcome_t> const dropped = store->compact((*stack)->channel(), writing->channel(), {});
+    failures += expect(dropped.has_value() && *dropped == compaction_outcome_t::published_k);
+    std::uint64_t tombstones = 0;
+    for (std::size_t number = 0; number != store->tree().levels().size(); ++number)
+        tombstones += store->tree().levels().level(number).range_tombstones_count();
+    failures += expect_eq(tombstones, std::uint64_t {0});
+    for (expectation_t& entry : after)
+        if (entry.state == lookup_result_t::removed_k) entry.state = lookup_result_t::missing_k;
+    failures += check_model(*store, (*stack)->channel(), std::span<expectation_t const> {after});
+    failures += check_scan<variable_cursor_t>(*store, std::span<expectation_t const> {after});
+    return failures;
+}
+
 #pragma endregion Snapshot Cases
 
 #pragma region Scan Cases
@@ -1258,6 +1410,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "widest_and_empty", widest_and_empty_values);
         report(totals, mount, "holds_its_depth", batched_select_holds_its_depth);
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
+        report(totals, mount, "range_removal_hides_older_runs", range_removal_hides_older_runs);
         report(totals, mount, "scan_in_order", scan_visits_every_key_in_order);
         report(totals, mount, "counter_fold", counter_fold_reads_alike_everywhere);
     };

@@ -15,9 +15,8 @@
 #include "ustore/blobs.h"
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 
-#include "database.hpp"          // `database_state`, `read_values`, `remove_keys`, `scan_keys`, `sample_keys`
+#include "database.hpp"          // `database_state`, `read_values`, `remove_keys`, `scan_keys`, `measure_keys`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
-#include "utilities/outputs.hpp" // `measure_outputs_t`
 
 namespace unum::ustore::ram {
 
@@ -94,38 +93,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_blobs_sampl
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_blobs_measure_t const& arguments,
                view_t const& view) noexcept {
-    if (!arguments.count) return {};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
-    strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
-    auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
-    if (outputs_status.failed()) return outputs_status;
-
-    status_t outcome;
-    store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(
-            source, collections, arguments.count, outcome,
-            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                using entry_t = entry_of<decltype(entries)>;
-                if constexpr (!std::is_same_v<entry_t, value_pair_t>) return refused_modality(outcome);
-                else {
-                    auto store = source.view(entries);
-                    if (!store) return store.status();
-                    for (std::size_t task = first; task != end; ++task) {
-                        window_measure_t measured;
-                        ustore_key_t const lower = start_keys ? start_keys[task] : smallest_key_k;
-                        ustore_key_t const last = end_keys ? end_keys[task] : largest_key_k;
-                        store_status_t const measuring = measure_window<entry_t>(*store, lower, last, measured);
-                        if (st::failed(measuring)) return measuring;
-                        outputs.assign(task, measured.cardinality, measured.value_bytes, measured.space_bytes);
-                    }
-                    return store_status_t::success_k;
-                }
-            });
-    });
-    if (status_t const status = reported(walked, outcome); status.failed()) return status;
-    outputs.finish(arguments);
-    return {};
+    return measure_keys<value_pair_t>(state, arguments, view);
 }
 
 #pragma endregion Blob Calls

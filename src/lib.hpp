@@ -46,8 +46,10 @@
 #include <algorithm>   // `std::min`
 #include <array>       // `std::array`
 #include <bit>         // `std::bit_cast`
+#include <memory>      // `std::addressof`
 #include <new>         // `std::nothrow`, placement `new`
 #include <numeric>     // `std::iota`
+#include <optional>    // `std::optional`
 #include <string_view> // `std::string_view`
 #include <thread>      // `std::this_thread::get_id`, `std::thread::id`
 #include <tuple>       // `std::apply`
@@ -88,6 +90,9 @@ struct cursor_t {
 
     /** The collection the walk reads. */
     ustore_collection_id_t collection {};
+
+    /** Which way the walk goes from its start. */
+    ustore_scan_direction_t direction = ustore_scan_ascending_k;
 };
 
 /** The verbs a walk lists and reads through at one home, and the match it compiled once at init. */
@@ -390,9 +395,24 @@ inline void clear_outputs(ustore_blobs_sample_t const& arguments) noexcept {
     clear(arguments.offsets), clear(arguments.keys);
 }
 
-inline void clear_outputs(ustore_blobs_measure_t const& arguments) noexcept {
+/** Clears the six bounds of a measure of any modality. */
+template <typename arguments_type_>
+    requires requires(arguments_type_ const& arguments) { arguments.max_space_usages; }
+void clear_outputs(arguments_type_ const& arguments) noexcept {
     clear(arguments.min_cardinalities), clear(arguments.max_cardinalities), clear(arguments.min_value_bytes);
     clear(arguments.max_value_bytes), clear(arguments.min_space_usages), clear(arguments.max_space_usages);
+}
+
+inline void clear_outputs(ustore_strings_sample_t const& arguments) noexcept {
+    clear(arguments.offsets), clear(arguments.strings);
+}
+
+inline void clear_outputs(ustore_graph_sample_vertices_t const& arguments) noexcept {
+    clear(arguments.offsets), clear(arguments.keys);
+}
+
+inline void clear_outputs(ustore_pages_sample_t const& arguments) noexcept {
+    clear(arguments.offsets), clear(arguments.keys);
 }
 
 inline void clear_outputs(ustore_docs_read_t const& arguments) noexcept {
@@ -459,6 +479,13 @@ inline void clear_outputs(ustore_graph_vertices_cursor_next_t const& arguments) 
     clear(arguments.keys), clear(arguments.written);
 }
 
+inline void clear_outputs(ustore_changes_cursor_init_t const& arguments) noexcept { clear(arguments.cursor); }
+
+inline void clear_outputs(ustore_changes_cursor_next_t const& arguments) noexcept {
+    clear(arguments.count), clear(arguments.keys), clear(arguments.stamps), clear(arguments.kinds);
+    clear(arguments.values);
+}
+
 #pragma endregion Outputs
 
 #pragma region Ragged Inputs
@@ -517,16 +544,22 @@ inline std::array<ragged_input_t, 1> ragged_inputs(ustore_strings_write_t const&
     return {{{arguments.strings, arguments.count}}};
 }
 
-inline std::array<ragged_input_t, 1> ragged_inputs(ustore_strings_remove_t const& arguments) noexcept {
-    return {{{arguments.strings, arguments.count}}};
+inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_remove_t const& arguments) noexcept {
+    return {{{arguments.strings, arguments.count}, {arguments.end_strings, arguments.count}}};
 }
 
 inline std::array<ragged_input_t, 1> ragged_inputs(ustore_strings_read_t const& arguments) noexcept {
     return {{{arguments.strings, arguments.count}}};
 }
 
-inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_scan_t const& arguments) noexcept {
-    return {{{arguments.prefixes, arguments.count}, {arguments.start_strings, arguments.count}}};
+inline std::array<ragged_input_t, 3> ragged_inputs(ustore_strings_scan_t const& arguments) noexcept {
+    return {{{arguments.prefixes, arguments.count},
+             {arguments.start_strings, arguments.count},
+             {arguments.end_strings, arguments.count}}};
+}
+
+inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_measure_t const& arguments) noexcept {
+    return {{{arguments.start_strings, arguments.count}, {arguments.end_strings, arguments.count}}};
 }
 
 /** Strings an accessor writes per block, so the indices it reads fit on the stack of the thread running the call. */
@@ -596,33 +629,90 @@ status_t pull(engine_t const& engine, ustore_graph_vertices_cursor_next_t const&
 status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& arguments,
               ustore_strings_cursor_handle_t& cursor, view_t const& view) noexcept;
 
+/** The bodies of the pulls above, narrowing through @p match, the walk's own or the face a device
+ *  pull shows it, each defined beside its pull. */
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_blobs_cursor_next_t const& arguments,
+                      ustore_blobs_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept;
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_docs_cursor_next_t const& arguments,
+                      ustore_docs_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept;
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_pages_cursor_next_t const& arguments,
+                      ustore_pages_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept;
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_graph_vertices_cursor_next_t const& arguments,
+                      ustore_graph_vertices_cursor_handle_t& cursor, match_type_ const& match,
+                      view_t const& view) noexcept;
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_strings_cursor_next_t const& arguments,
+                      ustore_strings_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept;
+
+/** Opens the change feed @p arguments ask for through @p engine, which pins its stamp, holding the
+ *  database open until the feed is freed. */
+status_t open_changes_cursor(engine_t const& engine, ustore_changes_cursor_init_t const& arguments,
+                             view_t const& view) noexcept;
+
+/** Pulls the next changes of the feed @p arguments name through @p engine. */
+status_t pull(engine_t const& engine, ustore_changes_cursor_next_t const& arguments,
+              ustore_changes_cursor_handle_t& cursor, view_t const& view) noexcept;
+
+/** Refuses a feed pulled on a device, as change feeds read host runs alone. */
+template <gpu_executor_concept executor_type_>
+status_t pull(engine_t const&, ustore_changes_cursor_next_t const&, ustore_changes_cursor_handle_t&, view_t const&,
+              executor_type_&) noexcept {
+    return {status_code_t::unsupported_k, "Change feeds run on host executors"};
+}
+
 /** The host engine of @p cursor, or null for one opened for a device. */
 template <typename cursor_type_>
 auto host_engine_of(cursor_type_& cursor) noexcept {
     return std::get_if<0>(&cursor.engine);
 }
 
-/** Refuses a pull on a device: a cursor opened on the host walks there alone, and no engine walks
- *  on devices yet. */
+/**
+ *  @brief Pulls the next page of the walk @p cursor computes on @p executor's device, as
+ *      @c scan_matched_on_device serves a filtered scan.
+ *
+ *  The host lists every page into the executor's bounce, the device matches its values, and every
+ *  output moves into the call's device arena once. The cursor's engine compiled at its init into
+ *  the cursor's own arena, which outlives every call, and each pull rebases it onto a copy of its
+ *  tables in the managed runs the call rewinds. A cursor opened on the host walks there alone. The
+ *  pull body of every walk, @c pull_through, is defined where its modality's pull is.
+ */
 template <typename arguments_type_, typename cursor_type_, gpu_executor_concept executor_type_>
-status_t pull(engine_t const&, arguments_type_ const&, cursor_type_& cursor, view_t const&, executor_type_&) noexcept {
-    if (host_engine_of(cursor)) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
-    return {status_code_t::unsupported_k, "No engine walks on devices yet"};
+status_t pull(engine_t const& engine, arguments_type_ const& arguments, cursor_type_& cursor, view_t const& view,
+              executor_type_& executor) noexcept {
+    constexpr home_t home_k = home_of_executors<executor_type_>;
+    constexpr std::size_t home_index_k = home_k == home_t::vram_nvidia_k ? 1 : 2;
+    auto const* const walker = std::get_if<home_index_k>(&cursor.engine);
+    if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
+    device_blocks_t* const blocks = device_blocks_of(arguments.arena, executor);
+    if (!blocks) return {status_code_t::device_k, "The arena lives where another executor computes"};
+    compiled_match<home_k> match = walker->match;
+    if (match.reads_values() && !executor.kernels())
+        return {status_code_t::unsupported_k, "The device loaded no bundle of the library's kernels"};
+    if (status_t const status = rebase_on_device(match, executor); status.failed()) return status;
+    device_match<home_k> const matching {match, executor, *blocks};
+    arguments_type_ hosted = arguments;
+    hosted.arena = executor.bounce();
+    if (status_t const status = pull_through(engine, hosted, cursor, matching, view); status.failed()) return status;
+    return upload_output_columns(hosted, *blocks, executor);
 }
 
-/** The keys @p cursor walks, pulled into @p survivors through @p engine as one page of @p wanted,
- *  advancing @p resume past them, for every pull over keys. */
-template <typename scan_type_, typename cursor_type_>
-status_t list_cursor_keys(engine_t const& engine, ustore_database_t database, cursor_type_& cursor, std::size_t wanted,
-                          ustore_arena_t arena, view_t const& view, keyed_survivors_t& survivors,
-                          std::variant<ustore_key_t, exhausted_t>& resume) noexcept {
-    auto const* const walker = host_engine_of(cursor);
-    if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
+/** The keys @p cursor walks, pulled into @p survivors through @p engine and @p match, the walk's
+ *  own or its device face, as one page of @p wanted, advancing @p resume past them, for every
+ *  pull over keys. */
+template <typename scan_type_, typename cursor_type_, typename match_type_>
+status_t list_cursor_keys(engine_t const& engine, ustore_database_t database, cursor_type_& cursor,
+                          match_type_ const& match, std::size_t wanted, ustore_arena_t arena, view_t const& view,
+                          keyed_survivors_t& survivors, std::variant<ustore_key_t, exhausted_t>& resume) noexcept {
     resume = cursor.position;
     ustore_key_t const* const start = std::get_if<ustore_key_t>(&cursor.position);
     if (!start || !wanted) return {};
-    return list_matched_keys<scan_type_>(engine.host, database, cursor.cursor.collection, *start, wanted, walker->match,
-                                         arena, view, survivors, resume);
+    return list_matched_keys<scan_type_>(engine.host, database, cursor.cursor.collection, *start,
+                                         cursor.end_key ? std::addressof(*cursor.end_key) : nullptr,
+                                         cursor.cursor.direction, wanted, match, arena, view, survivors, resume);
 }
 
 #pragma endregion Cursors
@@ -660,7 +750,7 @@ ustore_transaction_t transaction_of(arguments_type_ const& arguments) noexcept {
  *  through, or null for none, as the cursor's holds keep what it reads through alive. */
 template <typename arguments_type_>
 std::uint32_t* named_calls_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (requires { arguments.cursor; }) return &arguments.cursor->cursor.deferred_calls;
+    if constexpr (requires { arguments.cursor->cursor; }) return &arguments.cursor->cursor.deferred_calls;
     else {
         view_t view;
         decode_call(arguments, view);
@@ -691,7 +781,7 @@ std::array<std::uint32_t*, 3> deferred_counts_of(arguments_type_ const&) noexcep
 /** The claim of the cursor @p arguments pull, or null for a call naming none. */
 template <typename arguments_type_>
 claim_t* cursor_claim_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (requires { arguments.cursor; }) return &arguments.cursor->cursor.claim;
+    if constexpr (requires { arguments.cursor->cursor; }) return &arguments.cursor->cursor.claim;
     else return nullptr;
 }
 
@@ -836,6 +926,10 @@ struct verb_slot<ustore_transaction_commit_t> {
 template <>
 struct verb_slot<ustore_transaction_rollback_t> {
     static constexpr auto database = &database_verbs_t::transaction_rollback;
+};
+template <>
+struct verb_slot<ustore_changes_cursor_init_t> {
+    static constexpr auto database = &database_verbs_t::changes_cursor_init;
 };
 template <>
 struct verb_slot<ustore_blobs_write_t> {
@@ -1093,6 +1187,62 @@ struct verb_slot<ustore_pages_scan_t> {
         requires requires { &pages_verbs<home_>::scan; }
     static constexpr auto verb = &pages_verbs<home_>::scan;
 };
+template <>
+struct verb_slot<ustore_strings_sample_t> {
+    template <home_t home_>
+    static constexpr auto table = &home_tables<home_>::strings;
+    template <home_t home_>
+        requires requires { &strings_verbs<home_>::sample; }
+    static constexpr auto verb = &strings_verbs<home_>::sample;
+};
+template <>
+struct verb_slot<ustore_strings_measure_t> {
+    template <home_t home_>
+    static constexpr auto table = &home_tables<home_>::strings;
+    template <home_t home_>
+        requires requires { &strings_verbs<home_>::measure; }
+    static constexpr auto verb = &strings_verbs<home_>::measure;
+};
+template <>
+struct verb_slot<ustore_docs_measure_t> {
+    template <home_t home_>
+    static constexpr auto table = &home_tables<home_>::docs;
+    template <home_t home_>
+        requires requires { &docs_verbs<home_>::measure; }
+    static constexpr auto verb = &docs_verbs<home_>::measure;
+};
+template <>
+struct verb_slot<ustore_graph_sample_vertices_t> {
+    template <home_t home_>
+    static constexpr auto table = &home_tables<home_>::graph;
+    template <home_t home_>
+        requires requires { &graph_verbs<home_>::sample_vertices; }
+    static constexpr auto verb = &graph_verbs<home_>::sample_vertices;
+};
+template <>
+struct verb_slot<ustore_graph_measure_vertices_t> {
+    template <home_t home_>
+    static constexpr auto table = &home_tables<home_>::graph;
+    template <home_t home_>
+        requires requires { &graph_verbs<home_>::measure_vertices; }
+    static constexpr auto verb = &graph_verbs<home_>::measure_vertices;
+};
+template <>
+struct verb_slot<ustore_pages_sample_t> {
+    template <home_t home_>
+    static constexpr auto table = &home_tables<home_>::pages;
+    template <home_t home_>
+        requires requires { &pages_verbs<home_>::sample; }
+    static constexpr auto verb = &pages_verbs<home_>::sample;
+};
+template <>
+struct verb_slot<ustore_pages_measure_t> {
+    template <home_t home_>
+    static constexpr auto table = &home_tables<home_>::pages;
+    template <home_t home_>
+        requires requires { &pages_verbs<home_>::measure; }
+    static constexpr auto verb = &pages_verbs<home_>::measure;
+};
 
 #pragma endregion Verb Slots
 
@@ -1167,7 +1317,7 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
     if constexpr (changes_database<arguments_type_>)
         if (database->access == access_t::read_only_k)
             return {status_code_t::read_only_k, "The database was opened read-only"};
-    if constexpr (requires { arguments.cursor; })
+    if constexpr (requires { arguments.cursor->cursor; })
         if (arguments.cursor->cursor.database != database)
             return {status_code_t::invalid_argument_k, "The cursor walks another database"};
     if constexpr (requires { arguments.collections.data; })
@@ -1192,7 +1342,7 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
         constexpr home_t home_k = home_of_executors<executors_types_...>;
         if constexpr (home_k != home_t::host_k)
             if (status_t const opened = open_device_call(arguments, executor...); opened.failed()) return opened;
-        if constexpr (requires { arguments.cursor; })
+        if constexpr (requires { arguments.cursor->cursor; })
             return pull(engine, arguments, *arguments.cursor, view, executor...);
         else if constexpr (home_k != home_t::host_k && !requires { verb_slot<arguments_type_>::template verb<home_k>; })
             return status_t {status_code_t::unsupported_k, "Changes and the control plane run on host executors"};
@@ -1212,6 +1362,8 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
                 if (!status.failed()) hold(arguments.database, *arguments.snapshot);
                 return status;
             }
+            else if constexpr (std::is_same_v<arguments_type_, ustore_changes_cursor_init_t>)
+                return open_changes_cursor(engine, arguments, view);
             else return call_staged(verb, arguments, view);
         }
         else {
@@ -1443,16 +1595,17 @@ expected<cursor_engines<verbs_type_>> open_cursor_home(engine_t const& engine, a
                                             verb_slot<scan_type_>::template table<home_>;
     if (!verbs || !(verbs->*verb_slot<scan_type_>::template verb<home_>))
         return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
-    // A walk outlives the call opening it, so its engines cannot live in the managed runs every call rewinds
-    if constexpr (home_ != home_t::host_k)
-        if (reads_values(arguments)) return status_t {status_code_t::unsupported_k, "No engine walks on devices yet"};
     auto [match, match_status] = compile_match(arguments, compiled, arguments.database->ceiling.strings);
     if (match_status.failed()) return match_status;
     if constexpr (home_ == home_t::host_k)
         return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, home_> {verbs, match}};
-    else
-        return cursor_engines<verbs_type_> {
-            cursor_engine<verbs_type_, home_> {verbs, compiled_match<home_> {match_everything_t {}, match}}};
+    else {
+        // A walk outlives the call opening it, so its engine stays in the cursor's arena, and every
+        // pull rebases it onto the managed runs that call rewinds
+        compiled_match<home_> on_device {match.matcher, match};
+        on_device.host.matcher = match_everything_t {};
+        return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, home_> {verbs, on_device}};
+    }
 }
 
 /** Opens the engine of a walk over @p scan_type_ at the home of @p executor. */
@@ -1481,6 +1634,7 @@ expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noexcept {
     *arguments.cursor = nullptr;
     ustore_database_t const database = arguments.database;
     if (!database) return status_t {status_code_t::uninitialized_k, "The database is uninitialized"};
+    if (status_t const status = validate_direction(arguments.direction); status.failed()) return status;
     view_t view;
     if (!decode_view(arguments.view, view))
         return status_t {status_code_t::invalid_argument_k, "The view was made by neither view constructor"};
@@ -1501,6 +1655,9 @@ expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noexcept {
     cursor->cursor.database = database;
     cursor->cursor.view = arguments.view;
     cursor->cursor.collection = arguments.collection;
+    cursor->cursor.direction = arguments.direction;
+    if constexpr (requires { arguments.end_key; })
+        if (arguments.end_key) cursor->end_key = *arguments.end_key;
     take_hold(database);
     if (view.transaction) take_hold(view.transaction);
     if (view.snapshot) take_hold(view.snapshot);
@@ -1532,8 +1689,11 @@ using namespace unum::ustore;
 struct ustore_blobs_cursor_handle_t {
     cursor_t cursor;
 
-    /** The smallest key the next pull may hand out, or the end of the walk. */
+    /** The first key in the walk's direction the next pull may hand out, or the end of the walk. */
     std::variant<ustore_key_t, exhausted_t> position;
+
+    /** The key the walk stops before, if any. */
+    std::optional<ustore_key_t> end_key;
 
     /** The verbs and the match of the home the walk computes at. */
     cursor_engines<blobs_verbs> engine;
@@ -1544,8 +1704,11 @@ struct ustore_blobs_cursor_handle_t {
 struct ustore_docs_cursor_handle_t {
     cursor_t cursor;
 
-    /** The smallest key the next pull may hand out, or the end of the walk. */
+    /** The first key in the walk's direction the next pull may hand out, or the end of the walk. */
     std::variant<ustore_key_t, exhausted_t> position;
+
+    /** The key the walk stops before, if any. */
+    std::optional<ustore_key_t> end_key;
 
     /** The verbs and the match of the home the walk computes at. */
     cursor_engines<docs_verbs> engine;
@@ -1556,8 +1719,11 @@ struct ustore_docs_cursor_handle_t {
 struct ustore_pages_cursor_handle_t {
     cursor_t cursor;
 
-    /** The smallest key the next pull may hand out, or the end of the walk. */
+    /** The first key in the walk's direction the next pull may hand out, or the end of the walk. */
     std::variant<ustore_key_t, exhausted_t> position;
+
+    /** The key the walk stops before, if any. */
+    std::optional<ustore_key_t> end_key;
 
     /** The verbs and the match of the home the walk computes at. */
     cursor_engines<pages_verbs> engine;
@@ -1568,8 +1734,11 @@ struct ustore_pages_cursor_handle_t {
 struct ustore_graph_vertices_cursor_handle_t {
     cursor_t cursor;
 
-    /** The smallest key the next pull may hand out, or the end of the walk. */
+    /** The first key in the walk's direction the next pull may hand out, or the end of the walk. */
     std::variant<ustore_key_t, exhausted_t> position;
+
+    /** The key the walk stops before, if any. */
+    std::optional<ustore_key_t> end_key;
 
     /** The verbs and the match of the home the walk computes at. */
     cursor_engines<graph_verbs> engine;
@@ -1585,9 +1754,23 @@ struct ustore_strings_cursor_handle_t {
     /** The prefix every string the walk hands out starts with. */
     sz::string_t prefix;
 
-    /** The smallest string the next pull may hand out, or the end of the walk. */
+    /** The string the next pull starts at, or the end of the walk. */
     std::variant<sz::string_t, exhausted_t> position;
+
+    /** Whether the next pull hands out the string it starts at, which a descending walk skips. */
+    start_bound_t position_bound = start_bound_t::inclusive_k;
+
+    /** The string the walk stops before, where an empty one bounds nothing. */
+    sz::string_t end_string;
 
     /** The verbs and the match of the home the walk computes at. */
     cursor_engines<strings_verbs> engine;
+};
+
+/** What @c ustore_changes_cursor_t points to: the claim of the pull filling it, the database and
+ *  collection it reads, and its engine's state, which holds the pinned stamp and the position of
+ *  the next pull. */
+struct ustore_changes_cursor_handle_t {
+    cursor_t cursor;
+    void* state = nullptr;
 };

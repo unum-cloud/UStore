@@ -31,7 +31,9 @@ use crate::db::ffi::{
     ustore_status_t, ustore_strings_view_t, ustore_transaction_t, ustore_view_t, USTORE_STRINGS_U32_TAPE_K,
     USTORE_STRINGS_U64_TAPE_K,
 };
-use crate::db::{check, fail, Arena, CollectionID, Durability, Error, Key, Modality, Result, Status, View, Watch};
+use crate::db::{
+    check, fail, Arena, CollectionID, Durability, Error, Key, Modality, Result, ScanDirection, Status, View, Watch,
+};
 use crate::docs::ffi as docs_ffi;
 use crate::docs::sealed::Format;
 use crate::docs::{Json, Modification};
@@ -633,6 +635,8 @@ impl ExportStream {
                     view: self.view,
                     collection: self.collection,
                     start_key: Key::default(),
+                    end_key: ptr::null(),
+                    direction: ScanDirection::Ascending,
                     filter: Default::default(),
                     predicate: Default::default(),
                 }),
@@ -644,6 +648,8 @@ impl ExportStream {
                     view: self.view,
                     collection: self.collection,
                     start_key: Key::default(),
+                    end_key: ptr::null(),
+                    direction: ScanDirection::Ascending,
                     filter: Default::default(),
                     predicate: Default::default(),
                 }),
@@ -657,6 +663,8 @@ impl ExportStream {
                         collection: self.collection,
                         prefix: Default::default(),
                         start_string: Default::default(),
+                        end_string: Default::default(),
+                        direction: ScanDirection::Ascending,
                         patterns: Default::default(),
                         predicate: Default::default(),
                     })
@@ -671,6 +679,8 @@ impl ExportStream {
                         view: self.view,
                         collection: self.collection,
                         start_key: Key::default(),
+                        end_key: ptr::null(),
+                        direction: ScanDirection::Ascending,
                         predicate: Default::default(),
                     })
                 }
@@ -682,6 +692,8 @@ impl ExportStream {
                     view: self.view,
                     collection: self.collection,
                     start_key: Key::default(),
+                    end_key: ptr::null(),
+                    direction: ScanDirection::Ascending,
                     patterns: Default::default(),
                     predicate: Default::default(),
                 }),

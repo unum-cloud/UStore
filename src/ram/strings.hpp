@@ -19,8 +19,8 @@
 #include "ustore/strings/ram_store.hpp" // `string_pair_t`
 
 #include "database.hpp"           // `database_state`, `with_source`, `serve_write`, `read_strings`, `scan_strings`
-#include "utilities/batches.hpp"  // `strings_arg_t`, `validate_choices`
-#include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`
+#include "utilities/batches.hpp"  // `strings_arg_t`, `validate_choices`, `validate_direction`, `samples_of`
+#include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
 namespace unum::ustore::ram {
@@ -63,10 +63,10 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_wri
 }
 
 /** Implements @c ustore_strings_remove, committing a batch outside a transaction atomically, where a string already
- *  gone stays gone. */
+ *  gone stays gone, and every string of a range goes when the batch gives end strings. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_remove_t const& arguments,
-               strings_arg_t const& texts, view_t const& view) noexcept {
+               strings_arg_t const& texts, strings_arg_t const& end_texts, view_t const& view) noexcept {
     if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
         return status;
     if (!arguments.count) return {};
@@ -75,6 +75,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_rem
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_string_runs(source, collections, arguments.count, outcome,
                                  [&](auto& part, std::size_t first, std::size_t end) noexcept {
+                                     if (end_texts)
+                                         return stage_string_range_removals(part, texts, end_texts, first, end);
                                      return stage_string_removals(part, texts, first, end, source.watch_mode);
                                  });
     });
@@ -108,11 +110,13 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_rea
     return {};
 }
 
-/** Implements @c ustore_strings_scan as ordered walks of each collection's strings. */
+/** Implements @c ustore_strings_scan as ordered walks of each collection's strings either way. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_scan_t const& arguments,
-               strings_arg_t const& prefixes, strings_arg_t const& starts, view_t const& view) noexcept {
-    if (!arguments.count) return {};
+               strings_arg_t const& prefixes, strings_arg_t const& starts, strings_arg_t const& ends,
+               view_t const& view) noexcept {
+    if (status_t const status = validate_direction(arguments.direction); status.failed() || !arguments.count)
+        return status;
     if (!arguments.offsets || !arguments.strings)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
@@ -122,29 +126,107 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_sca
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(
-            source, collections, arguments.count, outcome,
-            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                using entry_t = entry_of<decltype(entries)>;
-                if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
-                else {
-                    auto store = source.view(entries);
-                    if (!store) return store.status();
-                    for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
-                        std::string_view const prefix = prefixes ? string_of(prefixes[task]) : std::string_view {};
-                        std::string_view const start = starts ? string_of(starts[task]) : std::string_view {};
-                        outputs.open_task(task);
-                        store_status_t const scanned = scan_strings(*store, prefix, start, arguments.wanted, outputs,
-                                                                    outcome);
-                        if (st::failed(scanned) || outcome.failed()) return scanned;
-                        if (!progress.advance(1)) outcome = progress_cancelled_k;
-                    }
-                    return store_status_t::success_k;
-                }
-            });
+        return for_each_run(source, collections, arguments.count, outcome,
+                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                                using entry_t = entry_of<decltype(entries)>;
+                                if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
+                                else {
+                                    auto store = source.view(entries);
+                                    if (!store) return store.status();
+                                    for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
+                                        strings_window_t const window {
+                                            .prefix = prefixes ? string_of(prefixes[task]) : std::string_view {},
+                                            .start = starts ? string_of(starts[task]) : std::string_view {},
+                                            .end = ends ? string_of(ends[task]) : std::string_view {},
+                                            .direction = arguments.direction,
+                                        };
+                                        outputs.open_task(task);
+                                        store_status_t const scanned = scan_strings(*store, window, arguments.wanted,
+                                                                                    view.scratch, outputs, outcome);
+                                        if (st::failed(scanned) || outcome.failed()) return scanned;
+                                        if (!progress.advance(1)) outcome = progress_cancelled_k;
+                                    }
+                                    return store_status_t::success_k;
+                                }
+                            });
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
     return outputs.finish(arguments);
+}
+
+/** Implements @c ustore_strings_sample as a reservoir filled walking each collection's strings. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_sample_t const& arguments,
+               view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!arguments.offsets || !arguments.strings)
+        return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
+    sample_batch_t const samples = samples_of(arguments);
+    auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
+    sample_generator_t generator = sample_generator_t::seeded(&outputs);
+
+    status_t outcome;
+    store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
+        return for_each_run(source, samples.collections, samples.size(), outcome,
+                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                                using entry_t = entry_of<decltype(entries)>;
+                                if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
+                                else {
+                                    auto store = source.view(entries);
+                                    if (!store) return store.status();
+                                    for (std::size_t task = first; task != end; ++task) {
+                                        outputs.open_task(task);
+                                        store_status_t const sampled = sample_strings(
+                                            *store, samples[task].limit, generator, view.scratch, outputs, outcome);
+                                        if (st::failed(sampled) || outcome.failed()) return sampled;
+                                    }
+                                    return store_status_t::success_k;
+                                }
+                            });
+    });
+    if (status_t const status = reported(walked, outcome); status.failed()) return status;
+    return outputs.finish(arguments);
+}
+
+/** Implements @c ustore_strings_measure, exact for strings and their keys at the view it reads. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_measure_t const& arguments,
+               strings_arg_t const& starts, strings_arg_t const& ends, view_t const& view) noexcept {
+    if (status_t const status = validate_direction(arguments.direction); status.failed() || !arguments.count)
+        return status;
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
+    if (outputs_status.failed()) return outputs_status;
+
+    status_t outcome;
+    store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
+        return for_each_run(source, collections, arguments.count, outcome,
+                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                                using entry_t = entry_of<decltype(entries)>;
+                                if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
+                                else {
+                                    auto store = source.view(entries);
+                                    if (!store) return store.status();
+                                    for (std::size_t task = first; task != end; ++task) {
+                                        strings_window_t const window {
+                                            .start = starts ? string_of(starts[task]) : std::string_view {},
+                                            .end = ends ? string_of(ends[task]) : std::string_view {},
+                                            .direction = arguments.direction,
+                                        };
+                                        window_measure_t measured;
+                                        store_status_t const measuring = measure_strings(*store, window, measured);
+                                        if (st::failed(measuring)) return measuring;
+                                        outputs.assign(task, measured.cardinality, measured.value_bytes,
+                                                       measured.space_bytes);
+                                    }
+                                    return store_status_t::success_k;
+                                }
+                            });
+    });
+    if (status_t const status = reported(walked, outcome); status.failed()) return status;
+    outputs.finish(arguments);
+    return {};
 }
 
 #pragma endregion Strings Calls
@@ -154,9 +236,11 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_sca
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 strings_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::strings_verbs_k {
     .write = &serve_database<cpu_class_, isolation_, ustore_strings_write_t, strings_arg_t>,
-    .remove = &serve_database<cpu_class_, isolation_, ustore_strings_remove_t, strings_arg_t>,
+    .remove = &serve_database<cpu_class_, isolation_, ustore_strings_remove_t, strings_arg_t, strings_arg_t>,
     .read = &serve_database<cpu_class_, isolation_, ustore_strings_read_t, strings_arg_t>,
-    .scan = &serve_database<cpu_class_, isolation_, ustore_strings_scan_t, strings_arg_t, strings_arg_t>,
+    .scan = &serve_database<cpu_class_, isolation_, ustore_strings_scan_t, strings_arg_t, strings_arg_t, strings_arg_t>,
+    .sample = &serve_database<cpu_class_, isolation_, ustore_strings_sample_t>,
+    .measure = &serve_database<cpu_class_, isolation_, ustore_strings_measure_t, strings_arg_t, strings_arg_t>,
 };
 
 #pragma endregion Table

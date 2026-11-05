@@ -124,10 +124,15 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_inser
     });
 }
 
-/** Implements @c ustore_pages_remove, where a Nil element removes the whole page. */
+/** Implements @c ustore_pages_remove, where a Nil element or a range removes whole pages. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_remove_t const& arguments,
                view_t const& view) noexcept {
+    if (arguments.end_keys.data) {
+        if (arguments.elements.data)
+            return {status_code_t::invalid_argument_k, "A range removes whole pages, naming no elements"};
+        return remove_keys<pages::page_pair_t>(state, arguments, view);
+    }
     return edit_in_store(state, arguments, view, [&](pages_in_store<cpu_class_, isolation_> const& land) noexcept {
         return serve_remove(arguments, view, land);
     });
@@ -187,6 +192,20 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_scan_
     return scan_keys<pages::page_pair_t>(state, arguments, view);
 }
 
+/** Implements @c ustore_pages_sample as a reservoir filled by walking each collection's keys. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_sample_t const& arguments,
+               view_t const& view) noexcept {
+    return sample_keys<pages::page_pair_t>(state, arguments, view);
+}
+
+/** Implements @c ustore_pages_measure, exact for pages and their trees' bytes at its view. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_measure_t const& arguments,
+               view_t const& view) noexcept {
+    return measure_keys<pages::page_pair_t>(state, arguments, view);
+}
+
 #pragma endregion Page Calls
 
 #pragma region Table
@@ -203,6 +222,8 @@ pages_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::pages_ver
     .remove_attributes = &serve_database<cpu_class_, isolation_, ustore_pages_remove_attributes_t, strings_arg_t>,
     .read = &serve_database<cpu_class_, isolation_, ustore_pages_read_t>,
     .scan = &serve_database<cpu_class_, isolation_, ustore_pages_scan_t>,
+    .sample = &serve_database<cpu_class_, isolation_, ustore_pages_sample_t>,
+    .measure = &serve_database<cpu_class_, isolation_, ustore_pages_measure_t>,
 };
 
 #pragma endregion Table

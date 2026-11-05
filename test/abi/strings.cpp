@@ -13,6 +13,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdio>  // `stderr`
 
+#include <algorithm>   // `std::find`
 #include <array>       // `std::array`
 #include <span>        // `std::span`
 #include <string>      // `std::string`
@@ -24,7 +25,8 @@
 #include "ustore/ranges.hpp" // `bits_view_t`, `strided_strings`, `tape_string`, `tape_slice`
 #include "ustore/ustore.h"
 
-#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
+#include "abi/fixture.hpp" // `open_reference`
+#include "harness.hpp"     // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -70,8 +72,11 @@ struct fixture_t {
     fixture_t(fixture_t const&) = delete;
     fixture_t& operator=(fixture_t const&) = delete;
 
-    explicit fixture_t(config_t const& config) noexcept {
-        auto [opened, open_status] = open_raw(config);
+    explicit fixture_t(config_t const& config) noexcept : fixture_t(open_raw(config)) {}
+
+    /** Takes over the database @p opening answers and creates a strings collection in it. */
+    explicit fixture_t(expected<ustore_database_t> const& opening) noexcept {
+        auto [opened, open_status] = opening;
         if (open_status.failed()) {
             fmt::println(stderr, "  failed to open the database: {}", open_status.message);
             return;
@@ -250,12 +255,15 @@ struct scan_results_t {
     }
 };
 
-/** Walks @p prefix from @p start, at most @c batch_capacity_k strings, counting a failure when the scan is refused. */
+/** Walks @p prefix from @p start towards @p end in @p direction, at most @p limit strings, counting
+ *  a failure when the scan is refused. */
 [[nodiscard]] std::size_t scan_prefix(fixture_t& fixture, std::string_view prefix, ustore_length_t limit,
                                       scan_results_t& results, std::string_view start = {},
-                                      ustore_view_t view = nullptr) noexcept {
+                                      ustore_view_t view = nullptr, std::string_view end = {},
+                                      ustore_scan_direction_t direction = ustore_scan_ascending_k) noexcept {
     strided_strings<std::string_view> const prefixes {{&prefix, 0}};
     strided_strings<std::string_view> const starts {{&start, 0}};
+    strided_strings<std::string_view> const ends {{&end, 0}};
     ustore_length_t const* scan_offsets = nullptr;
     ustore_outcome_t outcome {};
     ustore_strings_scan_t scan {};
@@ -266,6 +274,8 @@ struct scan_results_t {
     scan.collections = {&fixture.collection, 0};
     scan.prefixes = prefixes.view();
     if (!start.empty()) scan.start_strings = starts.view();
+    if (!end.empty()) scan.end_strings = ends.view();
+    scan.direction = direction;
     scan.offsets = &scan_offsets;
     scan.strings = &results.strings;
     scan.arena = fixture.arena;
@@ -278,12 +288,16 @@ struct scan_results_t {
     return 0;
 }
 
-/** Whether a scan of @p prefix returns exactly @p wanted, in that order. */
+/** Whether a scan of @p prefix from @p start towards @p end in @p direction, at most @p limit
+ *  strings, returns exactly @p wanted, in that order. */
 [[nodiscard]] std::size_t expect_scan(fixture_t& fixture, std::string_view prefix,
-                                      std::span<std::string_view const> wanted) noexcept {
+                                      std::span<std::string_view const> wanted, std::string_view start = {},
+                                      std::string_view end = {},
+                                      ustore_scan_direction_t direction = ustore_scan_ascending_k,
+                                      ustore_length_t limit = batch_capacity_k) noexcept {
     std::size_t failures = 0;
     scan_results_t results;
-    failures += scan_prefix(fixture, prefix, static_cast<ustore_length_t>(batch_capacity_k), results);
+    failures += scan_prefix(fixture, prefix, limit, results, start, nullptr, end, direction);
     failures += expect_eq(static_cast<std::size_t>(results.count), wanted.size());
     if (results.count != wanted.size()) return failures;
     for (std::size_t index = 0; index != wanted.size(); ++index) failures += expect_eq(results[index], wanted[index]);
@@ -683,6 +697,227 @@ std::size_t strings_scan_pagination(config_t const& config) {
     return failures;
 }
 
+#pragma region Bounded Ranges
+
+/** The strings every range case writes, in order, each mapping onto the key of its position. */
+constexpr std::array<std::string_view, 6> range_strings_k {"a", "ab", "abc", "b", "ba", "c"};
+
+/** Writes @c range_strings_k into @p fixture. */
+[[nodiscard]] std::size_t write_range_strings(fixture_t& fixture) noexcept {
+    strings_batch_t batch;
+    for (std::size_t index = 0; index != range_strings_k.size(); ++index)
+        batch.assign(range_strings_k[index], key_from_integer(index));
+    return write_batch(fixture, batch);
+}
+
+/** A scan stops before its end string, which an empty one leaves unbounded, inside its prefix. */
+std::size_t strings_range_end_bound(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t tested {config};
+    fixture_t reference {abi::open_reference<ustore_database_t>(config)};
+    if (!tested.ready() || !reference.ready()) return failures + 1;
+    for (fixture_t* fixture : {&tested, &reference}) {
+        failures += write_range_strings(*fixture);
+        std::array<std::string_view, 2> const middle {"ab", "abc"};
+        failures += expect_scan(*fixture, "", middle, "ab", "b");
+        std::array<std::string_view, 2> const prefixed {"a", "ab"};
+        failures += expect_scan(*fixture, "a", prefixed, {}, "abc");
+        std::array<std::string_view, 3> const unbounded {"b", "ba", "c"};
+        failures += expect_scan(*fixture, "", unbounded, "b", {});
+        failures += expect_scan(*fixture, "", {}, "b", "ab");
+    }
+    return failures;
+}
+
+/** A descending scan lists from its start string down to past its end string, or from the last
+ *  string of its prefix when it names no start. */
+std::size_t strings_range_descending(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t tested {config};
+    fixture_t reference {abi::open_reference<ustore_database_t>(config)};
+    if (!tested.ready() || !reference.ready()) return failures + 1;
+    for (fixture_t* fixture : {&tested, &reference}) {
+        failures += write_range_strings(*fixture);
+        std::array<std::string_view, 4> const bounded {"ba", "b", "abc", "ab"};
+        failures += expect_scan(*fixture, "", bounded, "ba", "a", ustore_scan_descending_k);
+        std::array<std::string_view, 3> const prefixed {"abc", "ab", "a"};
+        failures += expect_scan(*fixture, "a", prefixed, {}, {}, ustore_scan_descending_k);
+        std::array<std::string_view, 2> const limited {"c", "ba"};
+        failures += expect_scan(*fixture, "", limited, {}, {}, ustore_scan_descending_k, 2);
+    }
+    return failures;
+}
+
+/** A descending cursor with an end string pages down from its start, stopping before the end. */
+std::size_t strings_cursor_descending_end(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t tested {config};
+    fixture_t reference {abi::open_reference<ustore_database_t>(config)};
+    if (!tested.ready() || !reference.ready()) return failures + 1;
+    std::array<std::string_view, 4> const pinned {"c", "ba", "b", "abc"};
+    for (fixture_t* fixture : {&tested, &reference}) {
+        failures += write_range_strings(*fixture);
+        ustore_strings_cursor_t cursor = nullptr;
+        ustore_outcome_t outcome {};
+        ustore_strings_cursor_init_t init {};
+        init.cursor = &cursor;
+        init.database = fixture->database;
+        init.outcome = &outcome;
+        init.collection = fixture->collection;
+        init.start_string = bytes_of("c");
+        init.end_string = bytes_of("ab");
+        init.direction = ustore_scan_descending_k;
+        ustore_strings_cursor_init(&init);
+        failures += expect_success(outcome);
+        if (outcome.status != ustore_status_success_k) continue;
+        std::size_t first = 0;
+        for (std::size_t const count : {2, 2, 0}) {
+            ustore_strings_view_t found {};
+            ustore_key_t const* values = nullptr;
+            ustore_size_t written = 0;
+            ustore_strings_cursor_next_t next {};
+            next.database = fixture->database;
+            next.outcome = &outcome;
+            next.cursor = cursor;
+            next.strings = &found;
+            next.values = &values;
+            next.written = &written;
+            next.arena = fixture->arena;
+            next.wanted = 2;
+            ustore_strings_cursor_next(&next);
+            failures += expect_success(outcome);
+            failures += expect_eq(static_cast<std::size_t>(written), count);
+            for (std::size_t index = 0; index != written && index != count; ++index)
+                failures += expect_eq(string_of(tape_string(found, index)), pinned[first + index]);
+            first += count;
+        }
+        ustore_strings_cursor_free(cursor);
+    }
+    return failures;
+}
+
+/** A range removal removes every string from each start string up to its end string, or to the last
+ *  string past an empty one. */
+std::size_t strings_range_remove(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t tested {config};
+    fixture_t reference {abi::open_reference<ustore_database_t>(config)};
+    if (!tested.ready() || !reference.ready()) return failures + 1;
+    std::array<std::string_view, 2> const starts {"ab", "c"};
+    std::array<std::string_view, 2> const ends {"b", ""};
+    strided_strings<std::string_view> const strided_starts {{starts.data(), sizeof(std::string_view)}};
+    strided_strings<std::string_view> const strided_ends {{ends.data(), sizeof(std::string_view)}};
+    for (fixture_t* fixture : {&tested, &reference}) {
+        failures += write_range_strings(*fixture);
+        ustore_outcome_t outcome {};
+        ustore_strings_remove_t remove {};
+        remove.database = fixture->database;
+        remove.outcome = &outcome;
+        remove.count = starts.size();
+        remove.collections = {&fixture->collection, 0};
+        remove.strings = strided_starts.view();
+        remove.end_strings = strided_ends.view();
+        ustore_strings_remove(&remove);
+        failures += expect_success(outcome);
+        std::array<std::string_view, 3> const remaining {"a", "b", "ba"};
+        failures += expect_scan(*fixture, "", remaining);
+    }
+    return failures;
+}
+
+/** A measure counts the strings of its range, each holding the key it maps onto, which the engine
+ *  under test bounds around the exact count of the reference. */
+std::size_t strings_range_measure(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t tested {config};
+    fixture_t reference {abi::open_reference<ustore_database_t>(config)};
+    if (!tested.ready() || !reference.ready()) return failures + 1;
+    struct measured_range_t {
+        std::string_view start;
+        std::string_view end;
+        ustore_scan_direction_t direction;
+        std::size_t cardinality;
+    };
+    std::array<measured_range_t, 3> const ranges {measured_range_t {"ab", "b", ustore_scan_ascending_k, 2},
+                                                  measured_range_t {"ba", "a", ustore_scan_descending_k, 4},
+                                                  measured_range_t {{}, {}, ustore_scan_ascending_k, 6}};
+    for (fixture_t* fixture : {&tested, &reference}) {
+        failures += write_range_strings(*fixture);
+        for (measured_range_t const& range : ranges) {
+            strided_strings<std::string_view> const starts {{&range.start, 0}};
+            strided_strings<std::string_view> const ends {{&range.end, 0}};
+            ustore_size_t const *min_cardinalities = nullptr, *max_cardinalities = nullptr;
+            ustore_size_t const *min_value_bytes = nullptr, *max_value_bytes = nullptr;
+            ustore_outcome_t outcome {};
+            ustore_strings_measure_t measure {};
+            measure.database = fixture->database;
+            measure.outcome = &outcome;
+            measure.count = 1;
+            measure.collections = {&fixture->collection, 0};
+            if (!range.start.empty()) measure.start_strings = starts.view();
+            if (!range.end.empty()) measure.end_strings = ends.view();
+            measure.direction = range.direction;
+            measure.min_cardinalities = &min_cardinalities;
+            measure.max_cardinalities = &max_cardinalities;
+            measure.min_value_bytes = &min_value_bytes;
+            measure.max_value_bytes = &max_value_bytes;
+            measure.arena = fixture->arena;
+            ustore_strings_measure(&measure);
+            failures += expect_success(outcome);
+            if (outcome.status != ustore_status_success_k) continue;
+            failures += expect(min_cardinalities && max_cardinalities && min_value_bytes && max_value_bytes);
+            if (!min_cardinalities || !max_cardinalities || !min_value_bytes || !max_value_bytes) continue;
+            std::size_t const key_bytes = range.cardinality * sizeof(ustore_key_t);
+            failures += expect(min_cardinalities[0] <= range.cardinality && range.cardinality <= max_cardinalities[0]);
+            failures += expect(min_value_bytes[0] <= key_bytes && key_bytes <= max_value_bytes[0]);
+            if (fixture == &reference) failures += expect_eq(min_cardinalities[0], max_cardinalities[0]);
+        }
+    }
+    return failures;
+}
+
+/** A sample draws distinct written strings, as many as asked for or every one when fewer exist. */
+std::size_t strings_sample(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t tested {config};
+    fixture_t reference {abi::open_reference<ustore_database_t>(config)};
+    if (!tested.ready() || !reference.ready()) return failures + 1;
+    for (fixture_t* fixture : {&tested, &reference}) {
+        failures += write_range_strings(*fixture);
+        for (std::size_t const wanted : {4, 10}) {
+            ustore_length_t const* offsets = nullptr;
+            ustore_strings_view_t drawn {};
+            ustore_outcome_t outcome {};
+            ustore_strings_sample_t sample {};
+            sample.database = fixture->database;
+            sample.outcome = &outcome;
+            sample.count = 1;
+            sample.collections = {&fixture->collection, 0};
+            sample.offsets = &offsets;
+            sample.strings = &drawn;
+            sample.arena = fixture->arena;
+            sample.wanted = wanted;
+            ustore_strings_sample(&sample);
+            failures += expect_success(outcome);
+            if (outcome.status != ustore_status_success_k) continue;
+            failures += expect(offsets != nullptr);
+            if (!offsets) continue;
+            std::size_t const count = offsets[1] - offsets[0];
+            failures += expect_eq(count, wanted < range_strings_k.size() ? wanted : range_strings_k.size());
+            for (std::size_t index = 0; index != count; ++index) {
+                std::string_view const text = string_of(tape_string(drawn, offsets[0] + index));
+                failures += expect(std::find(range_strings_k.begin(), range_strings_k.end(), text) !=
+                                   range_strings_k.end());
+                for (std::size_t earlier = 0; earlier != index; ++earlier)
+                    failures += expect(string_of(tape_string(drawn, offsets[0] + earlier)) != text);
+            }
+        }
+    }
+    return failures;
+}
+
+#pragma endregion Bounded Ranges
+
 } // namespace unum::ustore::test
 
 int main(int argc, char** argv) {
@@ -712,6 +947,12 @@ int main(int argc, char** argv) {
     report(totals, "strings.one_head_two_writers", strings_one_head_two_writers, config);
     report(totals, "strings.long_string", strings_long_string, config);
     report(totals, "strings.scan_pagination", strings_scan_pagination, config);
+    report(totals, "strings.range_end_bound", strings_range_end_bound, config);
+    report(totals, "strings.range_descending", strings_range_descending, config);
+    report(totals, "strings.cursor_descending_end", strings_cursor_descending_end, config);
+    report(totals, "strings.range_remove", strings_range_remove, config);
+    report(totals, "strings.range_measure", strings_range_measure, config);
+    report(totals, "strings.sample", strings_sample, config);
 
     return suite_exit_code(totals);
 }

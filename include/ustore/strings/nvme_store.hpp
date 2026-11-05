@@ -244,9 +244,12 @@ class nvme_store {
          *  once it draws the stamp. */
         sealed_deltas_t deltas;
 
-        /** Whether the commit carries no string for this store, so it adds no run. */
-        [[nodiscard]] bool empty() const noexcept { return deltas.size() == 0; }
+        /** Whether the commit has no string or range tombstone for this store, adding no run. */
+        [[nodiscard]] bool empty() const noexcept { return deltas.size() == 0 && deltas.range_tombstones().empty(); }
     };
+
+    /** The strings one range removal hides. */
+    using range_t = range_tombstone<std::string_view>;
 
 #pragma endregion Types
 
@@ -320,7 +323,8 @@ class nvme_store {
         reading_t const read = runs_.reading(stamp);
         found_t found;
         if (!newest_(*read.view, text, read.stamp, found)) return lookup_result_t::missing_k;
-        if (found.delta.kind == delta_kind_t::remove_k) return lookup_result_t::removed_k;
+        if (found.delta.kind == delta_kind_t::remove_k || hidden_(*read.view, text, read.stamp, found))
+            return lookup_result_t::removed_k;
         std::memcpy(value.data(), found.run ? found.run->value(found.position).data() : found.delta.bytes.data(),
                     key_slot_t::size);
         return lookup_result_t::written_k;
@@ -395,6 +399,8 @@ class nvme_store {
                 sorted_run_t const& run = level.run(index);
                 cursor_t cursor;
                 cursor.level = &run;
+                cursor.level_number = static_cast<std::uint32_t>(number);
+                cursor.run_index = static_cast<std::uint32_t>(index);
                 auto [end, end_status] = prefix_end_in_(run, prefix);
                 if (end_status.failed()) return end_status;
                 cursor.end = end;
@@ -417,41 +423,97 @@ class nvme_store {
 
             st::key128_t const head = cursor_head_(cursors[smallest]);
             std::string_view const tail = cursor_tail_(cursors[smallest]);
-            listed_string_t listed;
-            bool taken = false;
-            // Cursors sit newest first with disjoint stamps, so the first version at or below the stamp is the newest.
-            for (cursor_t& cursor : cursors)
-                for (; cursor.position != cursor.end &&
-                       order_keys(cursor_head_(cursor), cursor_tail_(cursor), head, tail) == 0;
-                     ++cursor.position) {
-                    if (taken) continue;
-                    transaction_stamp_t const version = cursor.memory ? cursor.memory->stamp(cursor.position)
-                                                                      : cursor.level->stamp(cursor.position);
-                    if (version > stamp) continue;
-                    taken = true;
-                    delta_kind_t const kind = cursor.memory ? cursor.memory->delta(cursor.position).kind
-                                                            : cursor.level->kind(cursor.position);
-                    if (kind == delta_kind_t::remove_k) {
-                        listed.state = lookup_result_t::removed_k;
-                        continue;
-                    }
-                    listed.state = lookup_result_t::written_k;
-                    std::memcpy(&listed.value,
-                                cursor.memory ? cursor.memory->delta(cursor.position).bytes.data()
-                                              : cursor.level->value(cursor.position).data(),
-                                key_slot_t::size);
-                }
-            if (!taken) continue;
+            if (status_t const listed = list_key_(std::span<cursor_t> {cursors}, head, tail, stamp, view, page);
+                listed.failed())
+                return listed;
+        }
+        return {};
+    }
 
-            std::string_view text;
-            if (status_t const joined = string_of_key(head, tail, page.whole, text); joined.failed()) return joined;
-            listed.offset = page.texts.size();
-            listed.length = text.size();
-            if (page.texts.resize(listed.offset + listed.length) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A walk could not hold its page"};
-            if (!text.empty()) std::memcpy(page.texts.data() + listed.offset, text.data(), text.size());
-            if (page.listed.push_back(std::move(listed)) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A walk could not hold its page"};
+    /**
+     *  @brief Reads into @p page up to @c strings_page_k strings starting with @p prefix and below
+     *      @p below, or every one of the prefix for an empty @p below, largest first, as
+     *      @c read_page reads them upwards.
+     *
+     *  Every cursor walks its window down from its end: the largest string any cursor ends at is
+     *  listed from the first version of it each run holds, newest first, and every cursor holding
+     *  it then ends below it, so a page reads about its own strings per run. A walk passes the
+     *  page's last string as the next one's @p below.
+     */
+    status_t read_page_down(std::string_view prefix, std::string_view below, transaction_stamp_t stamp,
+                            std::size_t thread_index, strings_page_t& page) const noexcept {
+        page.texts.clear();
+        page.listed.clear();
+        reader_t const inside = runs_.enter(thread_index);
+        view_t const& view = *runs_.view();
+        level_set_t const& levels = *view.levels;
+        std::size_t runs = view.memory_runs.runs().size();
+        for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
+        st::vector<cursor_t> cursors;
+        st::vector<std::uint64_t> starts;
+        if (cursors.reserve(runs) != st::status_t::success_k || starts.resize(runs) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A walk could not hold a cursor per run"};
+        for (memory_run_t const* run : view.memory_runs.runs()) {
+            cursor_t cursor;
+            cursor.memory = run;
+            cursor.begin = run->lower_bound(prefix);
+            cursor.end = run->prefix_end(prefix);
+            if (!below.empty()) cursor.end = std::min<std::uint64_t>(cursor.end, run->lower_bound(below));
+            [[maybe_unused]] st::status_t const placed = cursors.push_back(std::move(cursor));
+        }
+        for (std::size_t number = 0; number != levels.size(); ++number) {
+            auto const& level = levels.level(number);
+            for (std::size_t index = level.size(); index-- != 0;) {
+                sorted_run_t const& run = level.run(index);
+                cursor_t cursor;
+                cursor.level = &run;
+                cursor.level_number = static_cast<std::uint32_t>(number);
+                cursor.run_index = static_cast<std::uint32_t>(index);
+                auto [end, end_status] = prefix_end_in_(run, prefix);
+                if (end_status.failed()) return end_status;
+                cursor.begin = run.lower_bound(prefix);
+                cursor.end = below.empty() ? end : std::min(end, run.lower_bound(below));
+                [[maybe_unused]] st::status_t const placed = cursors.push_back(std::move(cursor));
+            }
+        }
+
+        auto const head_below = [](cursor_t const& cursor, std::uint64_t position) noexcept {
+            return cursor.memory ? head_at_(*cursor.memory, position) : head_at_(*cursor.level, position);
+        };
+        auto const tail_below = [](cursor_t const& cursor, std::uint64_t position) noexcept {
+            return cursor.memory ? tail_at_(*cursor.memory, position) : tail_at_(*cursor.level, position);
+        };
+        while (page.listed.size() != strings_page_k) {
+            std::size_t largest = cursors.size();
+            for (std::size_t index = 0; index != cursors.size(); ++index) {
+                cursor_t const& cursor = cursors[index];
+                if (cursor.end <= cursor.begin) continue;
+                if (largest != cursors.size() &&
+                    order_keys(head_below(cursor, cursor.end - 1), tail_below(cursor, cursor.end - 1),
+                               head_below(cursors[largest], cursors[largest].end - 1),
+                               tail_below(cursors[largest], cursors[largest].end - 1)) <= 0)
+                    continue;
+                largest = index;
+            }
+            if (largest == cursors.size()) return {};
+
+            cursor_t const& top = cursors[largest];
+            st::key128_t const head = head_below(top, top.end - 1);
+            std::string_view const tail = tail_below(top, top.end - 1);
+            // Each run holding the string starts at its first version, the listing reading on.
+            for (std::size_t index = 0; index != cursors.size(); ++index) {
+                cursor_t& cursor = cursors[index];
+                std::uint64_t start = cursor.end;
+                while (start > cursor.begin &&
+                       order_keys(head_below(cursor, start - 1), tail_below(cursor, start - 1), head, tail) == 0)
+                    --start;
+                starts[index] = start;
+                cursor.position = start;
+            }
+            if (status_t const listed = list_key_(std::span<cursor_t> {cursors}, head, tail, stamp, view, page);
+                listed.failed())
+                return listed;
+            for (std::size_t index = 0; index != cursors.size(); ++index) cursors[index].end = starts[index];
         }
         return {};
     }
@@ -467,8 +529,10 @@ class nvme_store {
      *  @brief Sorts and copies @p deltas into one commit's sealed deltas for this store, on the committer's thread and
      *      off every shared path, and allocates the run they become; no deltas seal into no run.
      *  @param[in] deltas One delta per string, which this sorts in place: writes of one 16-byte key and removals.
+     *  @param[in] ranges The ranges of strings the commit removes, each hiding every older version.
      */
-    expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas) const noexcept {
+    expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas,
+                                   std::span<range_t const> ranges = {}) const noexcept {
         for (keyed_delta_t const& each : deltas) {
             if (each.delta.kind == delta_kind_t::change_k)
                 return status_t {status_code_t::invalid_argument_k, "A string takes whole values and removals"};
@@ -476,8 +540,8 @@ class nvme_store {
                 return status_t {status_code_t::malformed_k, "A string maps onto one 16-byte key"};
         }
         sealed_commit_t sealed;
-        if (deltas.empty()) return sealed;
-        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, strings_kit_type_::sort_order,
+        if (deltas.empty() && ranges.empty()) return sealed;
+        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, strings_kit_type_::sort_order, ranges,
                                                                   allocator_t {runs_.constraint()});
         if (seal_status.failed()) return seal_status;
         sealed.deltas = std::move(sealed_deltas);
@@ -516,7 +580,8 @@ class nvme_store {
 
     /** How full the memory runs of the published view would be with @p sealed beside them. */
     [[nodiscard]] memory_pressure_t memory_pressure(sealed_commit_t const& sealed) const noexcept {
-        return runs_.memory_pressure(sealed.deltas.size(), sealed.deltas.keys_bytes() + sealed.deltas.values_bytes());
+        return runs_.memory_pressure(sealed.deltas.size(), sealed.deltas.keys_bytes() + sealed.deltas.values_bytes() +
+                                                               sealed.deltas.range_tombstones().bytes());
     }
 
     /**
@@ -551,9 +616,14 @@ class nvme_store {
         // Memory runs sit newest first and above every level, so one no newer than the watch ends the search.
         for (memory_run_t const* run : view.memory_runs.runs()) {
             if (run->newest_stamp() <= from) return false;
+            if (run->range_tombstones().overlaps_since(text, text, from)) return true;
             std::size_t const position = run->lower_bound(text);
             if (position != run->size() && run->stored_key(position) == text) return run->stamp(position) > from;
         }
+        if (any_level_run_(*view.levels, [&](sorted_run_t const& run) noexcept {
+                return run.range_tombstones().overlaps_since(text, text, from);
+            }))
+            return true;
         found_t found;
         if (!newest_in_levels_(*view.levels, text, head_stamp_k, found)) return false;
         return found.run->stamp(found.position) > from;
@@ -569,6 +639,7 @@ class nvme_store {
         if (view.memory_runs.range_written_since(lower, upper, from)) return true;
         return any_level_run_(*view.levels, [&](sorted_run_t const& run) noexcept {
             if (run.newest_stamp() <= from) return false;
+            if (run.range_tombstones().overlaps_since(lower, upper, from)) return true;
             for (std::uint64_t position = run.lower_bound(lower);
                  position != run.population_count() && run.key(position) <= upper; ++position)
                 if (run.stamp(position) > from) return true;
@@ -585,12 +656,14 @@ class nvme_store {
         view_t const& view = *runs_.view();
         for (memory_run_t const* run : view.memory_runs.runs()) {
             if (run->newest_stamp() <= from) break;
+            if (prefix_removed_since_(run->range_tombstones(), prefix, first, from)) return true;
             std::size_t const end = run->prefix_end(prefix);
             for (std::size_t position = run->lower_bound(first); position < end; ++position)
                 if (run->stamp(position) > from) return true;
         }
         return any_level_run_(*view.levels, [&](sorted_run_t const& run) noexcept {
             if (run.newest_stamp() <= from) return false;
+            if (prefix_removed_since_(run.range_tombstones(), prefix, first, from)) return true;
             auto [end, end_status] = prefix_end_in_(run, prefix);
             // Without room to bound the prefix, the commit is told it conflicts, which
             // a retry clears.
@@ -647,10 +720,12 @@ class nvme_store {
                                                  : key_tails_column_t {
                                                        std::span<std::uint32_t const> {drained.tail_offsets},
                                                        std::span<byte_t const> {drained.tails}};
+            auto [tombstones, tombstones_status] = gathered_range_tombstones(flushed, st::default_allocator<byte_t> {});
+            if (tombstones_status.failed()) return tombstones_status;
             return tree.flush(channel, std::span<key_slot_t const> {drained.key_slots},
                               std::span<std::uint64_t const> {drained.stamps},
                               std::span<std::uint8_t const> {drained.kinds}, survival.floor, {}, {}, key_slot_t::size,
-                              published, tails);
+                              published, tails, tombstones);
         });
     }
 
@@ -785,6 +860,15 @@ class nvme_store {
 
         /** Its sorted position inside @c run. */
         std::uint64_t position = 0;
+
+        /** The level holding @c run. */
+        std::uint32_t level_number = 0;
+
+        /** Where @c run sits inside that level. */
+        std::uint32_t run_index = 0;
+
+        /** The stamp of the version. */
+        transaction_stamp_t stamp = unwritten_stamp_k;
     };
 
     /** Where one run a walk merges has got to, and where its window ends. */
@@ -796,11 +880,20 @@ class nvme_store {
         /** The run of a level, or null for a memory run. */
         sorted_run_t const* level = nullptr;
 
+        /** The level holding @c level. */
+        std::uint32_t level_number = 0;
+
+        /** Where @c level sits inside that level. */
+        std::uint32_t run_index = 0;
+
         /** The next sorted position inside the run. */
         std::uint64_t position = 0;
 
-        /** The first sorted position past the window. */
+        /** The first position past the window, below which a descending walk is yet to visit. */
         std::uint64_t end = 0;
+
+        /** The first sorted position of the window, which a descending walk stops at. */
+        std::uint64_t begin = 0;
     };
 
     /** The columns one flush writes: cells holding the values in ascending order, their stamps, kinds, and tails. */
@@ -891,8 +984,12 @@ class nvme_store {
             std::size_t const middle = low + (high - low) / 2;
             sorted_run_t const& run = level.run(middle);
             std::uint64_t const count = run.population_count();
-            if (count == 0 || run.upper_stored_key() < head ||
-                (run.upper_stored_key() == head && run.key(count - 1) < text))
+            // A run of tombstones alone holds no string; no other level run has one it hides.
+            if (count == 0) {
+                if (text < run.lower_string()) high = middle;
+                else low = middle + 1;
+            }
+            else if (run.upper_stored_key() < head || (run.upper_stored_key() == head && run.key(count - 1) < text))
                 low = middle + 1;
             else if (head < run.lower_stored_key() || (run.lower_stored_key() == head && text < run.key(0)))
                 high = middle;
@@ -910,7 +1007,7 @@ class nvme_store {
         key_positions_t const range = run.key_range(text);
         for (std::uint64_t position = range.first; position != range.last; ++position)
             if (run.stamp(position) <= at && run.key(position) == text) {
-                found = found_t {delta_view_t {run.kind(position), {}}, &run, position};
+                found = found_t {delta_view_t {run.kind(position), {}}, &run, position, 0, 0, run.stamp(position)};
                 return true;
             }
         return false;
@@ -925,11 +1022,60 @@ class nvme_store {
             auto const& level = levels.level(number);
             if (level.order() == lsm_level_order_t::overlapping_k) {
                 for (std::size_t index = level.size(); index-- != 0;)
-                    if (version_in_(level.run(index), text, head, at, found)) return true;
+                    if (version_in_(level.run(index), text, head, at, found)) {
+                        found.level_number = static_cast<std::uint32_t>(number);
+                        found.run_index = static_cast<std::uint32_t>(index);
+                        return true;
+                    }
                 continue;
             }
             if (sorted_run_t const* const run = run_holding_(level, text, head))
-                if (version_in_(*run, text, head, at, found)) return true;
+                if (version_in_(*run, text, head, at, found)) {
+                    found.level_number = static_cast<std::uint32_t>(number);
+                    return true;
+                }
+        }
+        return false;
+    }
+
+    /** Whether a range tombstone @p view shows a reader at @p at hides the version @p found of
+     *  @p text: one of a newer memory run for a memory run's version, and for a level's one of a
+     *  memory run, a shallower level, a younger run of level zero, or of its own run stamped above
+     *  it, as merges raise version stamps and tombstones keep theirs. */
+    [[nodiscard]] static bool hidden_(view_t const& view, std::string_view text, transaction_stamp_t at,
+                                      found_t const& found) noexcept {
+        transaction_stamp_t const in_memory = view.memory_runs.covering_stamp(text, at);
+        if (!found.run) return in_memory > found.stamp;
+        if (in_memory != unwritten_stamp_k) return true;
+        level_set_t const& levels = *view.levels;
+        for (std::size_t number = 0; number <= found.level_number; ++number) {
+            auto const& level = levels.level(number);
+            if (level.range_tombstones_count() == 0) continue;
+            bool const shallower = number != found.level_number;
+            for (std::size_t index = 0; index != level.size(); ++index) {
+                sorted_run_t const& run = level.run(index);
+                bool const own = !shallower && &run == found.run;
+                bool const younger = !shallower && level.order() == lsm_level_order_t::overlapping_k &&
+                                     index > found.run_index;
+                if (!shallower && !younger && !own) continue;
+                transaction_stamp_t const covering = run.range_tombstones().covering_stamp(text, at);
+                if (covering == unwritten_stamp_k) continue;
+                if (!own || covering > found.stamp) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether a tombstone of @p tombstones stamped after @p from hides a string starting with
+     *  @p prefix and not below @p first. */
+    template <typename tombstones_type_>
+    [[nodiscard]] static bool prefix_removed_since_(tombstones_type_ const& tombstones, std::string_view prefix,
+                                                    std::string_view first, transaction_stamp_t from) noexcept {
+        for (std::size_t index = 0; index != tombstones.size(); ++index) {
+            range_t const& range = tombstones.range(index);
+            bool const reaches_prefix = range.start < prefix || range.start.starts_with(prefix);
+            bool const reaches_first = range.end.empty() || first < range.end;
+            if (reaches_prefix && reaches_first && tombstones.stamp(index) > from) return true;
         }
         return false;
     }
@@ -938,8 +1084,61 @@ class nvme_store {
      *  @p found. */
     [[nodiscard]] static bool newest_(view_t const& view, std::string_view text, transaction_stamp_t at,
                                       found_t& found) noexcept {
-        if (view.memory_runs.find(text, at, found.delta)) return true;
+        if (view.memory_runs.find(text, at, found.delta, found.stamp)) return true;
         return newest_in_levels_(*view.levels, text, at, found);
+    }
+
+    /**
+     *  @brief Lists into @p page the string of @p head and @p tail with what its newest version at
+     *      or below @p stamp carries, moving every cursor of @p cursors sitting on it past its
+     *      versions, and lists nothing when no version is old enough.
+     *
+     *  Cursors sit newest first with disjoint stamps, so the first version at or below the stamp is
+     *  the newest; a range tombstone hiding it lists a removal.
+     */
+    static status_t list_key_(std::span<cursor_t> cursors, st::key128_t const& head, std::string_view tail,
+                              transaction_stamp_t stamp, view_t const& view, strings_page_t& page) noexcept {
+        listed_string_t listed;
+        found_t version_found;
+        bool taken = false;
+        // Cursors sit newest first with disjoint stamps, so the first version within the stamp wins
+        for (cursor_t& cursor : cursors)
+            for (; cursor.position != cursor.end &&
+                   order_keys(cursor_head_(cursor), cursor_tail_(cursor), head, tail) == 0;
+                 ++cursor.position) {
+                if (taken) continue;
+                transaction_stamp_t const version = cursor.memory ? cursor.memory->stamp(cursor.position)
+                                                                  : cursor.level->stamp(cursor.position);
+                if (version > stamp) continue;
+                taken = true;
+                version_found = found_t {{},     cursor.level, cursor.position, cursor.level_number, cursor.run_index,
+                                         version};
+                delta_kind_t const kind = cursor.memory ? cursor.memory->delta(cursor.position).kind
+                                                        : cursor.level->kind(cursor.position);
+                if (kind == delta_kind_t::remove_k) {
+                    listed.state = lookup_result_t::removed_k;
+                    continue;
+                }
+                listed.state = lookup_result_t::written_k;
+                std::memcpy(&listed.value,
+                            cursor.memory ? cursor.memory->delta(cursor.position).bytes.data()
+                                          : cursor.level->value(cursor.position).data(),
+                            key_slot_t::size);
+            }
+        if (!taken) return {};
+
+        std::string_view text;
+        if (status_t const joined = string_of_key(head, tail, page.whole, text); joined.failed()) return joined;
+        if (listed.state == lookup_result_t::written_k && hidden_(view, text, stamp, version_found))
+            listed.state = lookup_result_t::removed_k;
+        listed.offset = page.texts.size();
+        listed.length = text.size();
+        if (page.texts.resize(listed.offset + listed.length) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A walk could not hold its page"};
+        if (!text.empty()) std::memcpy(page.texts.data() + listed.offset, text.data(), text.size());
+        if (page.listed.push_back(std::move(listed)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A walk could not hold its page"};
+        return {};
     }
 
     /** Whether @p check answers true for any run of any level of @p levels. */
@@ -1114,6 +1313,9 @@ class nvme_transaction {
     /** One delta a commit hands a store over. */
     using keyed_delta_t = keyed_delta<std::string_view>;
 
+    /** The strings one range removal hides. */
+    using range_t = range_tombstone<std::string_view>;
+
     /** A transaction of @p database writing and watching nothing yet, joined to none. */
     explicit nvme_transaction(database_t& database) noexcept
         : database_(&database), writes_(place_hash_t {&tape_}, place_equals_t {&tape_}) {
@@ -1159,8 +1361,43 @@ class nvme_transaction {
         return {};
     }
 
-    /** What this transaction wrote under @p text of @p collection, viewing its value until the next write, and
-     *  whether it wrote anything there. */
+    /** Removes every string of @p collection from @p start up to @p end, exclusive, or to the
+     *  last string for an empty @p end, as one range landing with the commit, dropping every
+     *  string this transaction wrote inside it, as the range hides only older versions; a later
+     *  write survives it. */
+    status_t remove_range(collection_id_t collection, std::string_view start, std::string_view end) noexcept {
+        if (!end.empty() && !(start < end))
+            return {status_code_t::invalid_argument_k, "A range ends at or before its start"};
+        range_t const range {start, end};
+        st::vector<std::string_view> inside;
+        status_t listed;
+        [[maybe_unused]] st::status_t const walked = writes_.for_each([&](auto const& slot) noexcept {
+            if (listed.succeeded() && slot.key_ref().collection == collection && range.covers(text_of_(slot.key_ref())))
+                listed = growth_status_(inside.push_back(text_of_(slot.key_ref())));
+        });
+        if (listed.failed()) return listed;
+        for (std::string_view const text : inside) [[maybe_unused]]
+            bool const erased = writes_.erase(probe_t {collection, text});
+        auto [first, first_status] = append_(start);
+        if (first_status.failed()) return first_status;
+        auto [last, last_status] = append_(end);
+        if (last_status.failed()) return last_status;
+        first.collection = collection;
+        return growth_status_(removed_ranges_.push_back(range_watch_t {first, last, invalid_transaction_stamp_k}));
+    }
+
+    /** Hands @p callback every range this transaction removes from @p collection, in the order
+     *  removed, as @c callback(range), viewing this transaction until the next write. */
+    template <typename callback_type_>
+    void for_each_removed_range(collection_id_t collection, callback_type_&& callback) const noexcept {
+        for (range_watch_t const& removed : removed_ranges_)
+            if (removed.first.collection == collection)
+                callback(range_t {text_of_(removed.first), text_of_(removed.second)});
+    }
+
+    /** What this transaction wrote under @p text of @p collection, viewing its value until
+     *  the next write, a removal for a string inside a range it removed, and whether it
+     *  did anything there. */
     [[nodiscard]] bool uncommitted(collection_id_t collection, std::string_view text,
                                    delta_view_t& found) const noexcept {
         bool written = false;
@@ -1168,6 +1405,11 @@ class nvme_transaction {
             found = delta_of_(slot.value_ref());
             written = true;
         });
+        if (written) return true;
+        for_each_removed_range(collection, [&](range_t const& range) noexcept {
+            if (range.covers(text)) written = true;
+        });
+        if (written) found = delta_view_t {delta_kind_t::remove_k, {}};
         return written;
     }
 
@@ -1241,6 +1483,7 @@ class nvme_transaction {
         reads_.clear();
         ranges_.clear();
         prefixes_.clear();
+        removed_ranges_.clear();
         sealed_.clear();
         tape_.clear();
     }
@@ -1374,12 +1617,23 @@ class nvme_transaction {
                 if (seen == collection) return;
             listed = growth_status_(collections.push_back(collection_id_t {collection}));
         });
+        for (range_watch_t const& removed : removed_ranges_) {
+            bool seen = false;
+            for (collection_id_t const& held : collections) seen |= held == removed.first.collection;
+            if (!seen && listed.succeeded())
+                listed = growth_status_(collections.push_back(collection_id_t {removed.first.collection}));
+        }
         if (listed.failed()) return listed;
+        st::vector<range_t> ranges;
 
         for (collection_id_t const& collection : collections) {
             deltas.clear();
             for_each_uncommitted(collection, [&](std::string_view text, delta_view_t delta) noexcept {
                 if (listed.succeeded()) listed = growth_status_(deltas.push_back(keyed_delta_t {text, delta}));
+            });
+            ranges.clear();
+            for_each_removed_range(collection, [&](range_t const& range) noexcept {
+                if (listed.succeeded()) listed = growth_status_(ranges.push_back(range_t {range}));
             });
             if (listed.failed()) return listed;
             sealed_collection_t sealed;
@@ -1387,7 +1641,8 @@ class nvme_transaction {
             if (status_t const made = with_store_(collection,
                                                   [&](store_t& store) noexcept -> status_t {
                                                       auto [commit, seal_status] = store.seal(
-                                                          std::span<keyed_delta_t> {deltas});
+                                                          std::span<keyed_delta_t> {deltas},
+                                                          std::span<range_t const> {ranges});
                                                       if (seal_status.failed()) return seal_status;
                                                       sealed.commit = std::move(commit);
                                                       return {};
@@ -1489,6 +1744,9 @@ class nvme_transaction {
 
     /** Every prefix a walk passed the end of, beside the string it walked from. */
     st::vector<range_watch_t> prefixes_;
+
+    /** Every range of strings removed, its start and its end, empty for none, in removal order. */
+    st::vector<range_watch_t> removed_ranges_;
 
     /** The strings sealed per written collection, between a stage or a commit and its landing. */
     st::vector<sealed_collection_t> sealed_;

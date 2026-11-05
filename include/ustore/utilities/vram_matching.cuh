@@ -98,6 +98,14 @@ struct matching_walkers_t {
     std::uint32_t* refused = nullptr;
 };
 
+/** Where a subdocuments launch stores the nodes it finds: @c capacity match slots per value of its
+ *  page, and how many of them every value filled. */
+struct matching_found_t {
+    sz_match_t* matches = nullptr;
+    std::uint32_t* counts = nullptr;
+    std::uint64_t capacity = 0;
+};
+
 /** Threads of every matching kernel's block, eight groups of 32 lanes. */
 inline constexpr unsigned matching_block_threads_k = 256;
 
@@ -250,33 +258,67 @@ __device__ inline void subdocuments_per_thread(sz_subdocuments_engine_t const& e
     else mark_contained(page.contained, value, emitted != 0 ? sz_true_k : sz_false_k);
 }
 
+/** Walks the JSON value @p value of @p page on the lanes of @p group with the stack and key buffer
+ *  of walker @p walker, in chunks of @p chunk_bytes where it is not zero, so a long value's steps
+ *  stay bounded per call, storing the first @p matches_capacity of its matches at @p matches and
+ *  counting every one into @p emitted. */
+__device__ inline sz_status_t subdocuments_walk_group(sz_subdocuments_engine_t const& engine,
+                                                      matching_page_t const& page, matching_walkers_t const& walkers,
+                                                      std::uint32_t walker, std::uint32_t value,
+                                                      std::uint64_t chunk_bytes, sz_match_t* matches,
+                                                      sz_size_t matches_capacity, sz_size_t& emitted,
+                                                      sz_simt_group_t const& group) noexcept {
+    sz_u8_t const* const text = reinterpret_cast<sz_u8_t const*>(page.start(value));
+    sz_size_t const length = page.length(value);
+    sz_u64_t* const stack = walkers.stacks + walker * walkers.stack_words;
+    sz_u8_t* const key = walkers.keys + walker * walkers.key_bytes;
+    sz_size_t const frames = walkers.stack_words / walkers.frame_words;
+    sz_subdocuments_progress_simt_t carried;
+    sz_subdocuments_prime_simt_(&engine, text, length, stack, &carried);
+    sz_status_t status = sz_success_k;
+    sz_size_t const step = chunk_bytes ? chunk_bytes : length;
+    for (sz_size_t end = 0; status == sz_success_k && end != length;) {
+        end = length - end > step ? end + step : length;
+        status = sz_subdocuments_first_chunk_simt_(&engine, text, length, value, stack, frames, walkers.frame_words,
+                                                   key, walkers.key_bytes, matches, matches_capacity, &emitted, end,
+                                                   &group, &carried);
+    }
+    return status;
+}
+
 /** Marks the JSON values of @p page a path of @p engine selects in, a group each walking with its
- *  own stack, in chunks of @p chunk_bytes where it is not zero, so a long value's steps stay
- *  bounded per call. */
+ *  own stack, in chunks of @p chunk_bytes where it is not zero. */
 __device__ inline void subdocuments_per_group(sz_subdocuments_engine_t const& engine, matching_page_t const& page,
                                               matching_walkers_t const& walkers, std::uint64_t chunk_bytes,
                                               sz_simt_group_t const& group) noexcept {
     std::uint32_t const slot = matching_group_slot();
     if (slot >= page.picked_count) return;
     std::uint32_t const value = page.picked[slot];
-    sz_u8_t const* const text = reinterpret_cast<sz_u8_t const*>(page.start(value));
-    sz_size_t const length = page.length(value);
-    sz_u64_t* const stack = walkers.stacks + slot * walkers.stack_words;
-    sz_u8_t* const key = walkers.keys + slot * walkers.key_bytes;
-    sz_size_t const frames = walkers.stack_words / walkers.frame_words;
-    sz_subdocuments_progress_simt_t carried;
-    sz_subdocuments_prime_simt_(&engine, text, length, stack, &carried);
     sz_size_t emitted = 0;
-    sz_status_t status = sz_success_k;
-    sz_size_t const step = chunk_bytes ? chunk_bytes : length;
-    for (sz_size_t end = 0; status == sz_success_k && end != length;) {
-        end = length - end > step ? end + step : length;
-        status = sz_subdocuments_first_chunk_simt_(&engine, text, length, value, stack, frames, walkers.frame_words,
-                                                   key, walkers.key_bytes, nullptr, 0, &emitted, end, &group, &carried);
-    }
+    sz_status_t const status = subdocuments_walk_group(engine, page, walkers, slot, value, chunk_bytes, nullptr, 0,
+                                                       emitted, group);
     if (group.lane != 0) return;
     if (status != sz_success_k) atomicOr(walkers.refused, 1u);
     else mark_contained(page.contained, value, emitted != 0 ? sz_true_k : sz_false_k);
+}
+
+/** Stores the nodes the paths of @p engine select in the JSON values of @p page into @p found, a
+ *  group each walking with its own stack, in chunks of @p chunk_bytes where it is not zero; a value
+ *  with more nodes than its slots raises the walkers' refusal, as a path entering first members
+ *  alone selects one node at most. */
+__device__ inline void subdocuments_find_per_group(sz_subdocuments_engine_t const& engine, matching_page_t const& page,
+                                                   matching_walkers_t const& walkers, matching_found_t const& found,
+                                                   std::uint64_t chunk_bytes, sz_simt_group_t const& group) noexcept {
+    std::uint32_t const slot = matching_group_slot();
+    if (slot >= page.picked_count) return;
+    std::uint32_t const value = page.picked[slot];
+    sz_size_t emitted = 0;
+    sz_status_t const status = subdocuments_walk_group(engine, page, walkers, slot, value, chunk_bytes,
+                                                       found.matches + value * found.capacity, found.capacity, emitted,
+                                                       group);
+    if (group.lane != 0) return;
+    if (status != sz_success_k || emitted > found.capacity) atomicOr(walkers.refused, 1u);
+    else found.counts[value] = static_cast<std::uint32_t>(emitted);
 }
 
 #endif

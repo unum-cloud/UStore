@@ -198,6 +198,17 @@ typedef enum ustore_scan_mode_t {
 
 } ustore_scan_mode_t;
 
+/** Which way a scan, a cursor or a measure walks a range from its start key. */
+typedef enum ustore_scan_direction_t {
+
+    /** Up from the start key, inclusive, to the end key, exclusive, smallest key first. */
+    ustore_scan_ascending_k = 0,
+
+    /** Down from the start key, inclusive, to the end key, exclusive, largest key first. */
+    ustore_scan_descending_k = 1,
+
+} ustore_scan_direction_t;
+
 /** What dropping a collection removes. */
 typedef enum ustore_drop_mode_t {
 
@@ -566,8 +577,8 @@ typedef struct ustore_database_open_nvme_t {
  *  - @c ustore_status_already_exists_k The first slot of a raw medium belongs to something else.
  *  - @c ustore_status_capacity_exhausted_k The drives need more queue pairs than a disk holds,
  *    the @c memory_limit leaves no block per channel, or every shared channel is taken.
- *  - @c ustore_status_malformed_k The manifest is corrupt, or raw data directories are listed in
- *    another order than the database was created with.
+ *  - @c ustore_status_malformed_k The manifest is corrupt or names a SHA-256 a run's bytes miss,
+ *    or raw data directories are listed in another order than the database was created with.
  */
 USTORE_EXPORT void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments);
 
@@ -781,10 +792,12 @@ typedef struct ustore_snapshot_save_t {
  *  @brief Writes a snapshot out as a new database of the same engine, which that engine's open then serves.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  The copy holds exactly the collections and names the snapshot records, whatever changed since. RocksDB and LevelDB
- *  create @c path, while the RAM engine writes its image into the directory @c path names. Its progress counts the
- *  bytes of the keys and values saved, and a save its progress callback cancels removes what it wrote, as a failed
- *  one does.
+ *  The copy holds exactly the collections and names the snapshot records, whatever changed since.
+ *  RocksDB and LevelDB create @c path, while the RAM engine writes its image into the directory
+ *  @c path names. Its progress counts the bytes of the keys and values saved, and a save its
+ *  progress callback cancels removes what it wrote, as a failed one does. The NVMe engine names the
+ *  SHA-256 of every run in the saved manifest, which the first open of the copy checks before it
+ *  reads and then drops from every manifest it publishes.
  *
  *  @par Statuses:
  *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
@@ -842,6 +855,13 @@ USTORE_EXPORT char const* ustore_scan_mode_name(ustore_scan_mode_t scan_mode);
 
 /** Reads a scan mode back from its canonical spelling; @c ustore_scan_ordered_k when unrecognized. */
 USTORE_EXPORT ustore_scan_mode_t ustore_scan_mode_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of a scan direction, as @c ustore_scan_descending_k spells
+ *  "descending", or "unrecognized". */
+USTORE_EXPORT char const* ustore_scan_direction_name(ustore_scan_direction_t scan_direction);
+
+/** Reads a scan direction from its canonical spelling, @c ustore_scan_ascending_k if unknown. */
+USTORE_EXPORT ustore_scan_direction_t ustore_scan_direction_from_name(ustore_bytes_view_t name);
 
 /** The canonical spelling of a drop mode, as @c ustore_drop_pairs_k spells "pairs", or "unrecognized". */
 USTORE_EXPORT char const* ustore_drop_mode_name(ustore_drop_mode_t drop_mode);
@@ -1287,6 +1307,149 @@ USTORE_EXPORT void ustore_transaction_free(ustore_transaction_t transaction);
  *  @param[in,out] snapshot The snapshot to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_snapshot_free(ustore_snapshot_t snapshot);
+
+/** What one committed change did to its key. */
+typedef enum ustore_change_kind_t {
+
+    /** Wrote the whole value. */
+    ustore_change_write_k = 0,
+
+    /** Removed the key. */
+    ustore_change_removal_k = 1,
+
+    /** Changed part of the value, as a document patch or a page edit does. */
+    ustore_change_change_k = 2,
+
+} ustore_change_kind_t;
+
+/** A change kind's canonical name, "removal" for @c ustore_change_removal_k, or "unrecognized". */
+USTORE_EXPORT char const* ustore_change_kind_name(ustore_change_kind_t change_kind);
+
+/** Reads a change kind from its canonical spelling; @c ustore_change_write_k if unrecognized. */
+USTORE_EXPORT ustore_change_kind_t ustore_change_kind_from_name(ustore_bytes_view_t name);
+
+/**
+ *  @brief An opaque feed of the changes committed to one collection after a stamp, oldest first.
+ *
+ *  It pins the stamp it reads from the way a snapshot does, so no compaction drops a version above
+ *  it, and every pull resumes past the last change the pull before it handed out. Nothing reads
+ *  ahead of the caller: a pull costs what it hands out. It serves one pull at a time and holds its
+ *  database open until @c ustore_changes_cursor_free.
+ */
+typedef struct ustore_changes_cursor_handle_t* ustore_changes_cursor_t;
+
+/** The arguments of @c ustore_changes_cursor_init. */
+typedef struct ustore_changes_cursor_init_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** The collection whose changes the cursor yields. */
+    ustore_collection_id_t collection;
+
+    /** Changes committed after this stamp are yielded, oldest first. */
+    ustore_stamp_t since_stamp;
+
+    /** Output for the new cursor, which pins @c since_stamp until @c ustore_changes_cursor_free,
+     *  or @c NULL on failure. */
+    ustore_changes_cursor_t* cursor;
+
+} ustore_changes_cursor_init_t;
+
+/**
+ *  @brief Opens a feed of one collection's changes committed after a stamp, reading nothing yet.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on
+ *    the executor running it.
+ *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine keeps no
+ *    stamps, as LevelDB does.
+ *
+ *  @c ustore_status_write_conflict_k means the versions after @c since_stamp are already gone, as
+ *  no pin kept them, which a starved snapshot reader is refused with too. The RAM engine also
+ *  refuses a stamp below the head unless an open feed already pins one at or below it, while NVMe
+ *  and RocksDB serve any stamp their history still holds.
+ */
+USTORE_EXPORT void ustore_changes_cursor_init(ustore_changes_cursor_init_t* arguments);
+
+/** The arguments of @c ustore_changes_cursor_next, which pulls the next changes of a feed, with
+ *  their values when asked, in one call. */
+typedef struct ustore_changes_cursor_next_t {
+
+    /** The feed to advance, which a pull that fails leaves where it was. */
+    ustore_changes_cursor_t cursor;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** Most changes the pull yields, where fewer reach the newest commit. */
+    ustore_size_t wanted;
+
+    /** Output for the changes yielded, zero at the newest commit or on failure. */
+    ustore_size_t* count;
+
+    /** Output for the keys of the changes, oldest change first, inside @c arena. */
+    ustore_key_t const** keys;
+
+    /** Output for the stamp every change was committed at, inside @c arena. */
+    ustore_stamp_t const** stamps;
+
+    /** Output for what every change did, inside @c arena. */
+    ustore_change_kind_t const** kinds;
+
+    /** Optional output for the bytes every change carries as a tape inside @c arena, empty for a
+     *  removal; @c NULL skips them. */
+    ustore_strings_view_t* values;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+} ustore_changes_cursor_next_t;
+
+/**
+ *  @brief Pulls the next changes of a feed, oldest first, and their values when asked.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  A pull yields every change committed after the last one it handed out, up to @c wanted; a key
+ *  changed twice comes twice, once per commit, and the changes of one commit come by key. A range
+ *  removal comes as the removal of every key it covered.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or an output is @c NULL.
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the cursor serves another call, the executor's
+ *    deferred table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_not_found_k The collection was dropped meanwhile.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
+ */
+USTORE_EXPORT void ustore_changes_cursor_next(ustore_changes_cursor_next_t* arguments);
+
+/**
+ *  @brief Waits until every deferred call naming the feed finishes, then frees it, releasing the
+ *      stamp it pinned and the hold it kept on its database.
+ *  @param[in,out] cursor The feed to be freed; @c NULL is safe.
+ */
+USTORE_EXPORT void ustore_changes_cursor_free(ustore_changes_cursor_t cursor);
 
 /**
  *  @brief Waits until every deferred call naming the database finishes, then closes it and frees its memory once

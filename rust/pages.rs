@@ -1,7 +1,8 @@
 //! Pages - the Rust twin of the cursors of `c/ustore/pages.h`.
 //!
-//! The pages modality is reached through its walk alone: a [`PagesCursor`] lists the keys of one pages collection,
-//! keeping those its filter, an XPath in StringZilla's subset, matches, with the pages rendered when asked.
+//! The pages modality is reached through its walk, its samples and its measures: a [`PagesCursor`]
+//! lists the keys of one pages collection, keeping those its filter, an XPath in StringZilla's
+//! subset, matches, with the pages rendered when asked.
 //!
 //! File: rust/pages.rs
 //! Author: Ash Vardanian
@@ -10,13 +11,14 @@
 use std::marker::PhantomData;
 use std::ptr;
 
-use crate::blobs::Page;
+use crate::blobs::{Bounds, Found, Measurement, Page};
 use crate::db::ffi::{
     ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_completion_t, ustore_database_t, ustore_enum_t,
-    ustore_executor_t, ustore_key_t, ustore_outcome_t, ustore_predicate_t, ustore_progress_callback_t, ustore_size_t,
-    ustore_strings_view_t, ustore_view_t,
+    ustore_executor_t, ustore_key_t, ustore_outcome_t, ustore_predicate_t, ustore_progress_callback_t,
+    ustore_scan_direction_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t, ustore_view_t,
 };
-use crate::db::{check, exported_slice, Arena, CollectionID, Key, Matched, Matching, Result, Strings, View};
+use crate::db::sealed::Calling;
+use crate::db::{check, exported_slice, Arena, CollectionID, Key, KeyRange, Matched, Matching, Result, Strings, View};
 
 /// The encoding pages render in, as `ustore_page_encoding_t` spells it.
 #[repr(C)]
@@ -37,7 +39,7 @@ pub enum PageEncoding {
 
 // region: Raw Declarations
 
-/// One-to-one mirror of the cursors and the import of `c/ustore/pages.h`.
+/// One-to-one mirror of the cursors, samples, measures and import of `c/ustore/pages.h`.
 pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 
@@ -46,10 +48,11 @@ pub(crate) mod ffi {
     use super::{
         ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_completion_t, ustore_database_t,
         ustore_enum_t, ustore_executor_t, ustore_key_t, ustore_outcome_t, ustore_predicate_t,
-        ustore_progress_callback_t, ustore_size_t, ustore_strings_view_t, ustore_view_t,
+        ustore_progress_callback_t, ustore_scan_direction_t, ustore_size_t, ustore_strings_view_t, ustore_view_t,
     };
     use crate::db::ffi::{
-        ustore_collections_view_t, ustore_durability_t, ustore_keys_view_t, ustore_transaction_t, ustore_watch_t,
+        ustore_collections_view_t, ustore_durability_t, ustore_keys_view_t, ustore_length_t, ustore_transaction_t,
+        ustore_watch_t,
     };
 
     #[repr(C)]
@@ -68,6 +71,8 @@ pub(crate) mod ffi {
         pub view: ustore_view_t,
         pub collection: ustore_collection_id_t,
         pub start_key: ustore_key_t,
+        pub end_key: *const ustore_key_t,
+        pub direction: ustore_scan_direction_t,
         pub filter: ustore_bytes_view_t,
         pub predicate: ustore_predicate_t,
     }
@@ -107,15 +112,191 @@ pub(crate) mod ffi {
         pub progress_state: *mut c_void,
     }
 
+    #[repr(C)]
+    pub struct ustore_pages_sample_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub offsets: *mut *const ustore_length_t,
+        pub keys: *mut *const ustore_key_t,
+        pub arena: ustore_arena_t,
+        pub wanted: ustore_size_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_pages_measure_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub start_keys: ustore_keys_view_t,
+        pub end_keys: ustore_keys_view_t,
+        pub direction: ustore_scan_direction_t,
+        pub min_cardinalities: *mut *const ustore_size_t,
+        pub max_cardinalities: *mut *const ustore_size_t,
+        pub min_value_bytes: *mut *const ustore_size_t,
+        pub max_value_bytes: *mut *const ustore_size_t,
+        pub min_space_usages: *mut *const ustore_size_t,
+        pub max_space_usages: *mut *const ustore_size_t,
+        pub arena: ustore_arena_t,
+    }
+
     extern "C" {
         pub fn ustore_pages_cursor_init(arguments: *mut ustore_pages_cursor_init_t);
         pub fn ustore_pages_cursor_next(arguments: *mut ustore_pages_cursor_next_t);
         pub fn ustore_pages_cursor_free(cursor: ustore_pages_cursor_t);
         pub fn ustore_pages_import(arguments: *mut ustore_pages_import_t);
+        pub fn ustore_pages_sample(arguments: *mut ustore_pages_sample_t);
+        pub fn ustore_pages_measure(arguments: *mut ustore_pages_measure_t);
     }
 }
 
 // endregion: Raw Declarations
+
+// region: Verbs
+
+impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
+    /// Draws up to `wanted` page keys uniformly at random from one pages collection into the arena.
+    pub fn pages_sample<'arena>(
+        &self,
+        collection: CollectionID,
+        wanted: usize,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<PagesSample<'arena>> {
+        let verb = PagesSample {
+            collection,
+            arena,
+            wanted,
+            found: Found::default(),
+        };
+        Completion::answer(self, verb)
+    }
+
+    /// Estimates the pages and the space a range of page keys takes in one collection, through the
+    /// arena its bounds land in.
+    pub fn pages_measure<'arena>(
+        &self,
+        collection: CollectionID,
+        range: impl Into<KeyRange>,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<PagesMeasure<'arena>> {
+        let range = range.into();
+        let verb = PagesMeasure {
+            collection,
+            start: range.start_key(),
+            range,
+            arena,
+            bounds: Bounds::default(),
+        };
+        Completion::answer(self, verb)
+    }
+}
+
+/// A random draw of page keys from one collection; see [`View::pages_sample`].
+#[derive(Debug)]
+pub struct PagesSample<'arena> {
+    collection: CollectionID,
+    arena: &'arena mut Arena,
+    wanted: usize,
+    found: Found,
+}
+
+impl<'arena> Calling for PagesSample<'arena> {
+    type Arguments = ffi::ustore_pages_sample_t;
+    type Output = &'arena [Key];
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        Ok(Some(ffi::ustore_pages_sample_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: 1,
+            collections: ustore_strided_view_t::repeated(&self.collection),
+            offsets: &mut self.found.offsets.0,
+            keys: &mut self.found.keys.0,
+            arena: self.arena.handle,
+            wanted: self.wanted as ustore_size_t,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_pages_sample(arguments)
+    }
+
+    fn finish(self) -> Result<&'arena [Key]> {
+        // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
+        Ok(unsafe { self.found.keys() })
+    }
+}
+
+/// An estimate of what a range of pages holds; see [`View::pages_measure`].
+#[derive(Debug)]
+pub struct PagesMeasure<'arena> {
+    collection: CollectionID,
+    start: Key,
+    range: KeyRange,
+    arena: &'arena mut Arena,
+    bounds: Bounds,
+}
+
+impl Calling for PagesMeasure<'_> {
+    type Arguments = ffi::ustore_pages_measure_t;
+    type Output = Measurement;
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let [min_cardinalities, max_cardinalities, min_value_bytes, max_value_bytes, min_space_usages, max_space_usages] =
+            &mut self.bounds.0;
+        Ok(Some(ffi::ustore_pages_measure_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: 1,
+            collections: ustore_strided_view_t::repeated(&self.collection),
+            start_keys: ustore_strided_view_t::repeated(&self.start),
+            end_keys: self.range.end_keys(),
+            direction: self.range.direction,
+            min_cardinalities: &mut min_cardinalities.0,
+            max_cardinalities: &mut max_cardinalities.0,
+            min_value_bytes: &mut min_value_bytes.0,
+            max_value_bytes: &mut max_value_bytes.0,
+            min_space_usages: &mut min_space_usages.0,
+            max_space_usages: &mut max_space_usages.0,
+            arena: self.arena.handle,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_pages_measure(arguments)
+    }
+
+    fn finish(self) -> Result<Measurement> {
+        // SAFETY: the measurement of one range succeeded.
+        Ok(unsafe { self.bounds.measurement() })
+    }
+}
+
+// endregion: Verbs
 
 // region: Cursors
 
@@ -133,16 +314,17 @@ pub struct PagesCursor<'view> {
 }
 
 impl<'view, Parent> View<'view, Parent> {
-    /// Opens a walk over the keys of one pages collection from `start`, compiling what `matching` names once, whose predicate lives
-    /// as long as the cursor.
+    /// Opens a walk over the keys of one pages collection's `range`, compiling what `matching`
+    /// names once, whose predicate lives as long as the cursor.
     ///
     /// Calls `ustore_pages_cursor_init`.
     pub fn pages_cursor(
         &self,
         collection: CollectionID,
-        start: Key,
+        range: impl Into<KeyRange>,
         matching: Matching<'view>,
     ) -> Result<PagesCursor<'view>> {
+        let range: KeyRange = range.into();
         let mut cursor = PagesCursor {
             handle: ptr::null_mut(),
             database: self.database(),
@@ -158,7 +340,9 @@ impl<'view, Parent> View<'view, Parent> {
             outcome: &mut outcome,
             view: self.view(),
             collection,
-            start_key: start,
+            start_key: range.start_key(),
+            end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
+            direction: range.direction,
             filter: cursor.matched.filter(),
             predicate: cursor.matched.predicate(),
         };

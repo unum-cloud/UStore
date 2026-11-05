@@ -51,8 +51,8 @@
 #include "vram/uploads.hpp" // `uploading_vram_tables`
 
 #include "database.hpp" // `nvme_variant`, `database_describe`, `resolve_modality`, `transaction_free`
-#include "blobs.hpp"    // `blobs_write`, `remove_values`, `read_values`, `scan_values`, `sample_values`
-#include "strings.hpp"  // `strings_write`, `strings_remove`, `strings_read`, `strings_scan`
+#include "blobs.hpp"    // `blobs_write`, `remove_values`, `scan_values`, `sample_values`, `measure_values`
+#include "strings.hpp"  // `strings_write`, `strings_remove`, `strings_read`, `strings_scan`, `strings_sample`
 #include "docs.hpp"     // `docs_write`
 #include "graph.hpp"    // `graph_read_edges`, `graph_write_edges`, `graph_remove_vertices`
 #include "ingest.hpp"   // `ingest_init`, `ingest_append`, `ingest_finish`, `ingest_free`
@@ -84,6 +84,9 @@ database_verbs_t const nvme_variant<cpu_class_>::database_verbs_k {
     .transaction_free = &transaction_free<cpu_class_>,
     .snapshot_free = &snapshot_free<cpu_class_>,
     .database_free = &database_free<cpu_class_>,
+    .changes_cursor_init = &changes_cursor_init<cpu_class_>,
+    .changes_cursor_next = &changes_cursor_next<cpu_class_>,
+    .changes_cursor_free = &changes_cursor_free<cpu_class_>,
 };
 
 template <cpu_class_t cpu_class_>
@@ -92,6 +95,7 @@ blobs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::values_verbs_k {
     .read = &read_values<cpu_class_>,
     .scan = &scan_values<cpu_class_>,
     .sample = &sample_values<cpu_class_>,
+    .measure = &measure_values<cpu_class_>,
 };
 
 template <cpu_class_t cpu_class_>
@@ -110,6 +114,8 @@ strings_verbs<home_t::host_k> const nvme_variant<cpu_class_>::strings_verbs_k {
     .remove = &strings_remove<cpu_class_>,
     .read = &strings_read<cpu_class_>,
     .scan = &strings_scan<cpu_class_>,
+    .sample = &strings_sample<cpu_class_>,
+    .measure = &strings_measure<cpu_class_>,
 };
 
 template <cpu_class_t cpu_class_>
@@ -121,6 +127,7 @@ docs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::docs_verbs_k {
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
     .sample = &sample_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
+    .measure = &measure_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
 };
 
 template <cpu_class_t cpu_class_>
@@ -131,6 +138,8 @@ graph_verbs<home_t::host_k> const nvme_variant<cpu_class_>::graph_verbs_k {
     .write_vertices = &graph_write_vertices<cpu_class_>,
     .remove_vertices = &graph_remove_vertices<cpu_class_>,
     .scan_vertices = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_graph_k>,
+    .sample_vertices = &sample_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_graph_k>,
+    .measure_vertices = &measure_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_graph_k>,
 };
 
 template <cpu_class_t cpu_class_>
@@ -144,6 +153,8 @@ pages_verbs<home_t::host_k> const nvme_variant<cpu_class_>::pages_verbs_k {
     .remove_attributes = &pages_remove_attributes<cpu_class_>,
     .read = &pages_read_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality<cpu_class_>>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_pages_k>,
+    .sample = &sample_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_pages_k>,
+    .measure = &measure_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_pages_k>,
 };
 
 template <cpu_class_t cpu_class_>

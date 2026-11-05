@@ -15,8 +15,10 @@
  *   "database": "molecules", "id": "0193f1c0-...", "generation": 42, "durable_stamp": 918273,
  *   "collections": [{"id": "...", "name": "_collections", "store": 0, "value_size": 0, ...}],
  *   "files": [{"path": "molecules-0193f1c2-....ustore", "bytes": 3211264, "collection": 0, "level": 0,
- *              "stamp": 0}, {"path": "molecules-0193f1c3-....ustore", "bytes": 1832}]}
+ *              "stamp": 0, "sha256": "9f86d08..."}, {"path": "molecules-0193f1c3-....ustore", "bytes": 1832}]}
  *  @endcode
+ *
+ *  An archive names the SHA-256 of every run's bytes, which a restore checks every run against.
  */
 
 #pragma once
@@ -260,6 +262,9 @@ struct manifest_file_t {
 
     /** The data directory holding the file. */
     std::uint16_t medium = 0;
+
+    /** The SHA-256 of the file's bytes, which an archive names and a restore checks. */
+    sha256_t sha256 {};
 };
 
 /**
@@ -422,6 +427,15 @@ struct manifest_t {
                 laid = yyjson_mut_obj_add_uint(document, object, "collection", file.collection) &&
                        yyjson_mut_obj_add_uint(document, object, "level", file.level) &&
                        yyjson_mut_obj_add_uint(document, object, "stamp", file.stamp);
+            if (laid && !file.sha256.empty()) {
+                char printed_digest[sizeof(file.sha256.bytes) * 2];
+                constexpr char digits[] = "0123456789abcdef";
+                for (std::size_t byte = 0; byte != sizeof(file.sha256.bytes); ++byte) {
+                    printed_digest[byte * 2] = digits[file.sha256.bytes[byte] >> 4];
+                    printed_digest[byte * 2 + 1] = digits[file.sha256.bytes[byte] & 15];
+                }
+                laid = yyjson_mut_obj_add_strncpy(document, object, "sha256", printed_digest, sizeof(printed_digest));
+            }
         }
         if (!laid) return {status_code_t::out_of_memory_k, "No room to print the manifest"};
 
@@ -498,6 +512,8 @@ struct manifest_t {
                     !read_(yyjson_obj_get(object, "stamp"), file.stamp))
                     return malformed_();
             }
+            if (yyjson_val* const digest = yyjson_obj_get(object, "sha256"); digest && !read_(digest, file.sha256))
+                return malformed_();
             [[maybe_unused]] st::status_t const placed = files.push_back(st::assume_reserved, std::move(file));
         }
         if (paths != 0 && offsets != 0) return {status_code_t::malformed_k, "A manifest mixes paths and offsets"};
@@ -533,6 +549,22 @@ struct manifest_t {
         if (!uuid_t::parses(printed)) return false;
         identifier = uuid_t::parse(printed);
         return true;
+    }
+
+    static bool read_(yyjson_val* value, sha256_t& digest) noexcept {
+        std::string_view const text = text_of_(value);
+        if (text.size() != sizeof(digest.bytes) * 2) return false;
+        auto const nibble = [](char digit) noexcept -> int {
+            if (digit >= '0' && digit <= '9') return digit - '0';
+            if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+            return -1;
+        };
+        for (std::size_t byte = 0; byte != sizeof(digest.bytes); ++byte) {
+            int const high = nibble(text[byte * 2]), low = nibble(text[byte * 2 + 1]);
+            if (high < 0 || low < 0) return false;
+            digest.bytes[byte] = static_cast<std::uint8_t>(high << 4 | low);
+        }
+        return !digest.empty();
     }
 
     /** Room for one file name on the stack, which a database name past it refuses. */

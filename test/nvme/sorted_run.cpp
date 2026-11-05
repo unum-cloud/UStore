@@ -1075,6 +1075,76 @@ std::size_t remove_deltas_read_back_as_removals(mount_type_ const& mount) {
     return failures;
 }
 
+/** A run's range tombstones read back with their raw stamps and widen its key bounds, and a run of
+ *  tombstones alone, which a merge leaves when it keeps tombstones past every key, opens with
+ *  bounds of its own. */
+template <typename mount_type_>
+std::size_t range_tombstones_read_back(mount_type_ const& mount) {
+    using types_t = run_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename types_t::fixture_t;
+    using guard_t = typename types_t::guard_t;
+    using volume_t = typename types_t::volume_t;
+    using variable_run_t = typename types_t::variable_run_t;
+    using range_tombstones_t = typename variable_run_t::range_tombstones_t;
+    using range_t = typename range_tombstones_t::range_t;
+    std::size_t failures = 0;
+    constexpr std::size_t count_k = 10;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    failures += expect(guard.has_value());
+    if (!guard) return failures;
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
+    failures += expect(volume.has_value());
+    if (!volume) return failures;
+
+    // Keys 1 to 19 sit inside the tombstones' reach of 0 up to 40, stamped past every key slot.
+    variable_data_t data;
+    failures += build_variable(
+        count_k, [](std::size_t index) { return std::int64_t {static_cast<std::int64_t>(index)}; }, data);
+    std::array<range_t, 2> const ranges {range_t {25, 40}, range_t {0, 6}};
+    std::array<std::uint64_t, 2> const stamps {count_k + 7, 3};
+    auto [tombstones, tombstones_status] = range_tombstones_t::make(std::span<range_t const> {ranges},
+                                                                    std::span<std::uint64_t const> {stamps});
+    failures += expect(tombstones_status.succeeded());
+    if (failures != 0) return failures;
+
+    std::array<medium_extent_t, 2> extents;
+    for (std::size_t shape = 0; shape != extents.size(); ++shape) {
+        std::size_t const slots = shape == 0 ? count_k : 0;
+        expected<variable_run_t> written = variable_run_t::write(
+            *volume, guard->channel(), uuid_t {}, uuid_generator(),
+            std::span<variable_slot_t const> {data.key_slots}.first(slots),
+            std::span<std::uint64_t const> {ascending_stamps(count_k)}.first(slots),
+            std::span<std::uint8_t const> {data.kinds}.first(slots), 0,
+            std::span<byte_t const> {data.values}.first(shape == 0 ? data.values.size() : 0),
+            std::span<stored_value_offset_t const> {data.offsets}.first(slots + 1), 4096, {}, tombstones);
+        failures += expect(written.has_value());
+        if (!written) return failures;
+        extents[shape] = written->extent();
+    }
+    for (std::size_t shape = 0; shape != extents.size(); ++shape) {
+        expected<variable_run_t> run = variable_run_t::open(*volume, guard->channel(), extents[shape]);
+        failures += expect(run.has_value());
+        if (!run) return failures;
+        range_tombstones_t const& read = run->range_tombstones();
+        failures += expect_eq(read.size(), std::size_t {2});
+        if (read.size() != 2) continue;
+        failures += expect(read.range(0).start == 0 && read.range(0).end == 6 && read.stamp(0) == 3);
+        failures += expect(read.range(1).start == 25 && read.range(1).end == 40 && read.stamp(1) == count_k + 7);
+        failures += expect(run->holds_keys());
+        failures += expect_eq(run->lower_stored_key(), stored_key_t {0});
+        failures += expect_eq(run->upper_stored_key(), stored_key_t {39});
+        failures += expect_eq(run->newest_stamp(), std::uint64_t {count_k + 7});
+        failures += expect_eq(run->size_bytes(), variable_layout_t::blob_bytes(run->header()));
+        failures += expect_eq(read.covering_stamp(30, count_k + 7), std::uint64_t {count_k + 7});
+        failures += expect_eq(read.covering_stamp(30, count_k), std::uint64_t {0});
+        failures += expect_eq(read.covering_stamp(6, count_k + 7), std::uint64_t {0});
+    }
+    return failures;
+}
+
 #pragma endregion Lookup Cases
 
 #pragma region Depth Cases
@@ -1514,6 +1584,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "smallest_sizes", runs_at_the_smallest_sizes);
         report(totals, mount, "value_size_extremes", values_section_the_size_extremes);
         report(totals, mount, "remove_deltas", remove_deltas_read_back_as_removals);
+        report(totals, mount, "range_tombstones_read_back", range_tombstones_read_back);
         report(totals, mount, "holds_its_depth", batched_read_holds_its_depth);
         report(totals, mount, "tails_read_back", tails_read_back);
         report(totals, mount, "layers_narrow_every_lookup", layers_narrow_every_lookup);

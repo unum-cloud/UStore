@@ -10,6 +10,11 @@
  *  indices, escapes and invalid tokens alike, extracts and resolves through both, and every value converts into every
  *  column type, so a difference in presence, type, payload, conversion or printed text fails the case. A container
  *  prints minified with its strings and numbers as written, so it is compared once yyjson reads it back.
+ *
+ *  The row steps of the device gather in @c ustore/docs/vram_gather.cuh run host-compiled over the
+ *  same batches, on a page laid out from the same subdocuments pass a device walk makes, and every
+ *  row they do not leave to the host must match what the host gather and read export, while a batch
+ *  the host refuses must be left to it.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -29,6 +34,7 @@
 #include <stringzilla/capabilities.h> // `sz_capabilities_compiled_cpu_mask`, `sz_capabilities_enabled_cpu`
 
 #include "ustore/docs/json_paths.hpp"       // `extract_fields`, `json_path_of`, `json_text_of`
+#include "ustore/docs/vram_gather.cuh"      // `gather_page_t`, `gather_scalar_rows`, `measure_text_rows`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `json_lookup`, `gather_scalar`, `json_to_string`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_free`, `arena_allocator`, `strings_ladder`
 
@@ -330,6 +336,248 @@ std::size_t compare_values(yyjson_val* oracle, json_cell_t const& candidate, ust
     return failures;
 }
 
+/** Rows the device steps converted and rows they left to the host, over all the suite's batches. */
+struct device_rows_tally_t {
+    std::size_t compared = 0;
+    std::size_t left_to_host = 0;
+};
+
+device_rows_tally_t device_rows_tally;
+
+/** Every column type a gather converts into. */
+constexpr ustore_docs_field_type_t gathered_types_k[] = {
+    ustore_docs_field_type_f64_k,  ustore_docs_field_type_f32_k,    ustore_docs_field_type_f16_k,
+    ustore_docs_field_type_i64_k,  ustore_docs_field_type_i32_k,    ustore_docs_field_type_i16_k,
+    ustore_docs_field_type_i8_k,   ustore_docs_field_type_u64_k,    ustore_docs_field_type_u32_k,
+    ustore_docs_field_type_u16_k,  ustore_docs_field_type_u8_k,     ustore_docs_field_type_bool_k,
+    ustore_docs_field_type_uuid_k, ustore_docs_field_type_binary_k, ustore_docs_field_type_string_k,
+};
+
+/** Converts @p value into one cell of @p type as the host gather does. */
+conversion_t gather_on_host(ustore_docs_field_type_t type, json_cell_t const& value, ustore_byte_t* cell) noexcept {
+    switch (type) {
+    case ustore_docs_field_type_bool_k: return gather_scalar<bool>(value, cell, 0);
+    case ustore_docs_field_type_uuid_k: return gather_uuid(value, cell, 0);
+    case ustore_docs_field_type_f64_k: return gather_scalar<double>(value, cell, 0);
+    case ustore_docs_field_type_f32_k: return gather_scalar<float>(value, cell, 0);
+    case ustore_docs_field_type_f16_k: return gather_half(value, cell, 0);
+    case ustore_docs_field_type_i64_k: return gather_scalar<std::int64_t>(value, cell, 0);
+    case ustore_docs_field_type_i32_k: return gather_scalar<std::int32_t>(value, cell, 0);
+    case ustore_docs_field_type_i16_k: return gather_scalar<std::int16_t>(value, cell, 0);
+    case ustore_docs_field_type_i8_k: return gather_scalar<std::int8_t>(value, cell, 0);
+    case ustore_docs_field_type_u64_k: return gather_scalar<std::uint64_t>(value, cell, 0);
+    case ustore_docs_field_type_u32_k: return gather_scalar<std::uint32_t>(value, cell, 0);
+    case ustore_docs_field_type_u16_k: return gather_scalar<std::uint16_t>(value, cell, 0);
+    case ustore_docs_field_type_u8_k: return gather_scalar<std::uint8_t>(value, cell, 0);
+    default: return conversion_t::collides_k;
+    }
+}
+
+/** The conversion a column's three bits record for @p row. */
+conversion_t recorded_conversion(ustore_octet_t const* bitmaps, std::size_t stride, std::size_t row) noexcept {
+    auto const bit = [&](std::size_t bitmap) noexcept {
+        return (bitmaps[bitmap * stride + row / 8] >> (row % 8)) & 1u;
+    };
+    if (bit(0)) return bit(1) ? conversion_t::converted_k : conversion_t::exact_k;
+    return bit(2) ? conversion_t::collides_k : conversion_t::missing_k;
+}
+
+/** The text the host exports for @p value as @p text prints it, and its conversion, in @p arena. */
+conversion_t print_on_host(cell_text_t text, json_cell_t const& value, ustore_arena_t arena,
+                           std::string_view& printed) noexcept {
+    bool const container = value.token == json_token_t::object_k || value.token == json_token_t::array_k;
+    if (text == cell_text_t::field_json_k || (text == cell_text_t::field_text_k && container)) {
+        auto [json, json_status] = json_text_of<strings_kit_t>(value, arena);
+        printed = json_status.failed() ? std::string_view {} : std::string_view {json.c_str(), json.size()};
+        return conversion_t::exact_k;
+    }
+    auto [buffer, buffer_status] = arena_allocate<char>(arena, printed_number_length_limit_k);
+    printed_number_buffer_t number;
+    std::string_view printed_text;
+    conversion_t const conversion = json_to_string(value, number, printed_text);
+    if (buffer_status.failed()) return conversion;
+    if (printed_text.data() == number) {
+        std::memcpy(buffer.data(), number, printed_text.size());
+        printed_text = {buffer.data(), printed_text.size()};
+    }
+    printed = printed_text;
+    return conversion;
+}
+
+/** Runs the device gather's row steps host-compiled over @p documents, on a page laid out from one
+ *  subdocuments pass as a device walk stores it, and compares every row they convert with @p cells,
+ *  which the host extracted for @p fields, the host's @p status refusing the batch. */
+std::size_t compare_device_rows(json_documents_t const& documents, std::span<std::string_view const> fields,
+                                json_cells_t const& cells, status_t const& status, ustore_arena_t arena) {
+    std::size_t failures = 0;
+    std::uint32_t const rows = static_cast<std::uint32_t>(documents.count);
+    auto [compiled, compiled_status] = compile_field_paths(fields, arena);
+    failures += expect(compiled_status.succeeded());
+    if (compiled_status.failed()) return failures;
+    std::size_t const paths_count = compiled.paths.size();
+
+    // The page as a walk leaves it: the documents back to back, each document's nodes in its slots
+    auto [offsets, offsets_status] = arena_allocate<std::uint64_t>(arena, rows + 1);
+    auto [found, found_status] = arena_allocate<std::uint32_t>(arena, rows);
+    auto [matches, matches_status] = arena_allocate<sz_match_t>(arena, std::size_t {rows} * paths_count + 1);
+    auto [walked, walked_status] = arena_allocate<sz_string_view_t>(arena, rows);
+    auto [walked_rows, walked_rows_status] = arena_allocate<std::size_t>(arena, rows);
+    failures += expect(offsets_status.succeeded() && found_status.succeeded() && matches_status.succeeded() &&
+                       walked_status.succeeded() && walked_rows_status.succeeded());
+    if (failures) return failures;
+    offsets[0] = 0;
+    std::size_t walked_count = 0;
+    for (std::uint32_t row = 0; row != rows; ++row) {
+        found[row] = 0;
+        offsets[row + 1] = offsets[row] + documents[row].size();
+        if (documents[row].empty()) continue;
+        walked[walked_count] = stringzilla_view(documents[row]);
+        walked_rows[walked_count++] = row;
+    }
+    auto [bytes, bytes_status] = arena_allocate<char>(arena, static_cast<std::size_t>(offsets[rows]));
+    failures += expect(bytes_status.succeeded());
+    if (failures) return failures;
+    for (std::uint32_t row = 0; row != rows; ++row)
+        if (!documents[row].empty())
+            std::memcpy(bytes.data() + offsets[row], documents[row].data(), documents[row].size());
+
+    std::uint32_t walk_refused = 0, any_refused = 0;
+    if (paths_count && walked_count) {
+        sz_strings_view_t paths_view {};
+        sz_strings_from_string_views(compiled.paths.data(), paths_count, &paths_view);
+        sz_allocator_t allocator = stringzilla_allocator(arena);
+        subdocuments_engine_t engine;
+        failures += expect(engine.compile(paths_view, allocator, strings_capabilities()) == sz_success_k);
+        auto [walk_matches, walk_matches_status] = arena_allocate<sz_match_t>(arena, walked_count * paths_count + 1);
+        auto [walk_offsets, walk_offsets_status] = arena_allocate<sz_size_t>(arena, walked_count + 1);
+        failures += expect(walk_matches_status.succeeded() && walk_offsets_status.succeeded());
+        if (failures) return failures;
+        sz_strings_view_t walked_view {};
+        sz_strings_from_string_views(walked.data(), walked_count, &walked_view);
+        // A walk failing on a malformed document leaves the call to the host
+        if (engine.find(walked_view, walk_matches, walk_offsets) != sz_success_k) walk_refused = 1;
+        for (std::size_t walk = 0; !walk_refused && walk != walked_count; ++walk) {
+            std::size_t const row = walked_rows[walk];
+            for (std::size_t match = walk_offsets[walk]; match != walk_offsets[walk + 1]; ++match) {
+                if (found[row] == paths_count) {
+                    walk_refused = 1;
+                    break;
+                }
+                matches[row * paths_count + found[row]++] = walk_matches[match];
+            }
+        }
+    }
+    gather_page_t const page {
+        bytes.data(), offsets.data(), matches.data(), found.data(), static_cast<std::uint32_t>(paths_count),
+        rows,         nullptr};
+    auto const path_of = [&](std::size_t field) noexcept {
+        std::size_t const path = compiled.path_of_field[field];
+        return path == no_path_k ? no_cell_path_k : static_cast<std::uint32_t>(path);
+    };
+
+    std::size_t const stride = (rows + 7) / 8;
+    auto [bitmaps, bitmaps_status] = arena_allocate<ustore_octet_t>(arena, 3 * stride);
+    auto [presences, presences_status] = arena_allocate<ustore_octet_t>(arena, stride);
+    auto [lengths, lengths_status] = arena_allocate<ustore_length_t>(arena, rows);
+    auto [scalars, scalars_status] = arena_allocate<ustore_byte_t>(arena, std::size_t {rows} * uuid_bytes_k);
+    auto [measured, measured_status] = arena_allocate<tape_source_t>(arena, rows);
+    auto [text_offsets, text_offsets_status] = arena_allocate<std::uint64_t>(arena, rows + 1);
+    failures += expect(bitmaps_status.succeeded() && presences_status.succeeded() && lengths_status.succeeded() &&
+                       scalars_status.succeeded() && measured_status.succeeded() && text_offsets_status.succeeded());
+    if (failures) return failures;
+
+    for (std::size_t field = 0; field != fields.size(); ++field) {
+        auto const host_cell = [&](std::size_t row) noexcept { return cells[field * rows + row]; };
+        auto const report_row = [&](char const* what, std::size_t row) {
+            fmt::println(stderr, "  device {} differs for field '{}' of document {}: {}", what, fields[field], row,
+                         documents[row]);
+            ++failures;
+        };
+        // An output a lane refused leaves the whole call to the host, while others still compare
+        auto const settle = [&](std::uint32_t lane_refused) {
+            any_refused |= lane_refused;
+            if (walk_refused || lane_refused) ++device_rows_tally.left_to_host;
+            return !walk_refused && !lane_refused && status.succeeded();
+        };
+        for (ustore_docs_field_type_t const type : gathered_types_k) {
+            std::uint32_t lane_refused = 0;
+            std::size_t const width = field_size_bytes(type);
+            std::memset(bitmaps.data(), 0xA5, bitmaps.size());
+            if (width) {
+                gather_scalars_t const column {bitmaps.data(), scalars.data(), stride, type, path_of(field)};
+                for (std::uint32_t first = 0; first < rows; first += gather_lane_rows_k)
+                    lane_refused |= gather_scalar_rows(page, column, first);
+                if (!settle(lane_refused)) continue;
+                for (std::size_t row = 0; row != rows; ++row) {
+                    ustore_byte_t expected_cell[uuid_bytes_k] = {};
+                    conversion_t const expected = gather_on_host(type, host_cell(row), expected_cell);
+                    if (recorded_conversion(bitmaps.data(), stride, row) != expected) report_row("conversion", row);
+                    if (std::memcmp(expected_cell, scalars.data() + row * width, width) != 0) report_row("scalar", row);
+                    ++device_rows_tally.compared;
+                }
+                continue;
+            }
+            for (cell_text_t const text :
+                 {type == ustore_docs_field_type_string_k ? cell_text_t::column_text_k : cell_text_t::column_binary_k,
+                  type == ustore_docs_field_type_string_k ? cell_text_t::field_json_k : cell_text_t::field_text_k}) {
+                bool const column = text == cell_text_t::column_text_k || text == cell_text_t::column_binary_k;
+                gather_texts_t texts;
+                texts.text = text;
+                texts.path = path_of(field);
+                texts.bitmaps = column ? bitmaps.data() : nullptr;
+                texts.bitmap_stride = stride;
+                texts.presences = column ? nullptr : presences.data();
+                texts.lengths = column ? nullptr : lengths.data();
+                texts.measured = measured.data();
+                lane_refused = 0;
+                for (std::uint32_t first = 0; first < rows; first += gather_lane_rows_k)
+                    lane_refused |= measure_text_rows(page, texts, first);
+                if (!settle(lane_refused)) continue;
+                // The tape kernels' scan, on the host
+                text_offsets[0] = 0;
+                for (std::size_t row = 0; row != rows; ++row)
+                    text_offsets[row + 1] = text_offsets[row] + measured[row].length;
+                auto [text_bytes, text_bytes_status] = arena_allocate<char>(
+                    arena, static_cast<std::size_t>(text_offsets[rows]));
+                failures += expect(text_bytes_status.succeeded());
+                texts.offsets = text_offsets.data();
+                texts.bytes = text_bytes.data();
+                for (std::uint32_t row = 0; row != rows; ++row) write_text_row(page, texts, row);
+                for (std::size_t row = 0; row != rows; ++row) {
+                    json_cell_t const value = host_cell(row);
+                    std::string_view expected_text;
+                    conversion_t const expected = print_on_host(text, value, arena, expected_text);
+                    std::string_view const written {
+                        text_bytes.data() + text_offsets[row],
+                        static_cast<std::size_t>(text_offsets[row + 1] - text_offsets[row])};
+                    if (column) {
+                        if (recorded_conversion(bitmaps.data(), stride, row) != expected) report_row("conversion", row);
+                        bool const terminated = text == cell_text_t::column_text_k;
+                        if (written.size() != expected_text.size() + terminated ||
+                            written.substr(0, expected_text.size()) != expected_text ||
+                            (terminated && written.back() != '\0'))
+                            report_row("text", row);
+                    }
+                    else {
+                        bool const present = value.token != json_token_t::missing_k;
+                        if (((presences[row / 8] >> (row % 8)) & 1u) != present) report_row("presence", row);
+                        if (lengths[row] != written.size()) report_row("length", row);
+                        if (present && written != expected_text) report_row("read text", row);
+                        if (!present && !written.empty()) report_row("missing text", row);
+                    }
+                    ++device_rows_tally.compared;
+                }
+            }
+        }
+    }
+    // A batch the host refuses must never convert on a device
+    if (status.failed() && !walk_refused && !any_refused) {
+        fmt::println(stderr, "  device converted a batch the host refused: {}", status.message);
+        ++failures;
+    }
+    return failures;
+}
+
 /** Extracts every field of @p fields over @p batch and compares it with yyjson's lookup, answering the status of the
  *  extraction in @p status, which a batch of lenient documents may leave malformed. */
 std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view const> fields, status_t& status) {
@@ -343,6 +591,7 @@ std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view c
     json_cells_t cells;
     status = extract_fields<strings_kit_t>(documents, fields, cells_count, cell_of, strings_capabilities(), arena,
                                            cells);
+    failures += compare_device_rows(documents, fields, cells, status, arena);
     if (status.failed()) return failures;
     for (std::size_t document_index = 0; document_index != documents.count; ++document_index) {
         std::string_view const document = documents[document_index];
@@ -554,6 +803,10 @@ std::size_t json_paths_random(std::uint64_t seed) {
         failures += compare_batch(batch, fields_k, status);
         failures += expect(status.succeeded());
     }
+    // The device steps must convert most rows themselves, or the comparison above checks nothing
+    fmt::println("  device rows: {} compared, {} outputs left to the host", device_rows_tally.compared,
+                 device_rows_tally.left_to_host);
+    failures += expect(device_rows_tally.compared > device_rows_tally.left_to_host);
     return failures;
 }
 

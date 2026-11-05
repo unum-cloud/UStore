@@ -37,7 +37,7 @@
 #include <smashtable/basic_vector.hpp>     // `st::vector`
 #include <smashtable/shared.hpp>           // `st::walk_control_t`
 
-#include "ustore/blobs/nvme_compaction.hpp"     // `compactor_ref_t`
+#include "ustore/blobs/nvme_compaction.hpp"     // `compactor_ref_t`, `range_tombstone`
 #include "ustore/blobs/nvme_key_slot.hpp"       // `lookup_result_t`, `stored_value_size_t`, `transaction_stamp_t`
 #include "ustore/blobs/nvme_memory_run.hpp"     // `delta_view_t`
 #include "ustore/blobs/nvme_published_runs.hpp" // `commit_ledger`, `stamp_pin`, `commit_request_t`, `memory_shape_t`
@@ -115,6 +115,12 @@ class transaction_deltas {
 
     static_assert(sizeof(stored_value_place_t) == 24, "A delta's kind takes the padding before its watch, not a word");
 
+    /** The keys one range removal hides. */
+    using range_t = range_tombstone<stored_key_t>;
+
+    /** The ranges one collection's deltas remove, in the order the transaction removed them. */
+    using ranges_t = st::vector<range_t, constrained_allocator<range_t, atomic_reference_>>;
+
     /** The deltas of one collection. */
     struct collection_deltas_t {
         using stored_values_t = st::hash_map<stored_key_t, stored_value_place_t, stored_key_hash_t, st::equal_to_t,
@@ -128,6 +134,9 @@ class transaction_deltas {
 
         /** The bytes those values occupy. */
         std::size_t elements_size_bytes;
+
+        /** The ranges removed, each landing as one range tombstone with the commit. */
+        ranges_t ranges;
     };
 
     using collections_t = st::hash_map<collection_id_t, collection_deltas_t, collection_id_hash_t, st::equal_to_t,
@@ -172,7 +181,7 @@ class transaction_deltas {
     template <typename callback_type_>
     inline void for_each_collection(callback_type_&& callback) const noexcept;
 
-    /** What the deltas did to @p stored_key of @p id: wrote it, removed it, or neither. */
+    /** What the deltas did to @p stored_key of @p id: wrote, removed it or its range, or none. */
     inline lookup_result_t lookup(collection_id_t id, stored_key_t stored_key) const noexcept;
 
     inline status_t stored_value_size(collection_id_t id, stored_key_t stored_key,
@@ -198,6 +207,15 @@ class transaction_deltas {
     /** Writes a removal of @p stored_key of @p id, watched from @p watch_stamp as @c write is. */
     inline status_t remove(collection_id_t id, value_widths_t widths, stored_key_t stored_key,
                            transaction_stamp_t watch_stamp = invalid_transaction_stamp_k) noexcept;
+
+    /** Removes every key of @p id from @p start up to @p end, exclusive, as one range, dropping
+     *  every delta the deltas hold inside it, as the range lands with them and hides only older
+     *  versions; a later write survives. */
+    inline status_t remove_range(collection_id_t id, value_widths_t widths, stored_key_t start,
+                                 stored_key_t end) noexcept;
+
+    /** The ranges the deltas remove from @p id, in the order they were removed. */
+    inline std::span<range_t const> ranges(collection_id_t id) const noexcept;
 
     /** Writes @p change, a change delta of @p fold, under @p stored_key of @p id, folded
      *  after whatever the deltas hold for the key, keeping that delta's watch and taking none
@@ -339,7 +357,9 @@ inline lookup_result_t transaction_deltas<stored_key_type_, atomic_reference_, w
         };
         result = results[entry.value().kind == delta_kind_t::remove_k];
     });
-
+    if (result != lookup_result_t::missing_k) return result;
+    for (range_t const& range : iterator.value().ranges)
+        if (range.covers(stored_key)) return lookup_result_t::removed_k;
     return result;
 }
 
@@ -462,7 +482,8 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
         collection_deltas_t fresh {
             widths,
             {{}, {}, constrained_allocator<std::byte, atomic_reference_> {resources_->memory_constraint}},
-            0};
+            0,
+            ranges_t {constrained_allocator<range_t, atomic_reference_> {resources_->memory_constraint}}};
         if (collections_by_id.reserve_more(1) == collections_t::reserve_result_t::failed_k)
             return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
         collections_by_id.emplace(id, std::move(fresh), st::assume_reserved);
@@ -556,6 +577,48 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
 }
 
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::remove_range(
+    collection_id_t id, value_widths_t widths, stored_key_t start, stored_key_t end) noexcept {
+
+    if (!(start < end)) return status_t {status_code_t::invalid_argument_k, "A range ends at or before its start"};
+    collection_deltas_t* collection = nullptr;
+    auto status = reach_collection_(id, widths, collection);
+    if (status.failed()) return status;
+
+    if (!can_fit(1, 0)) [[unlikely]]
+        return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
+    if (collection->ranges.reserve(collection->ranges.size() + 1) != st::status_t::success_k)
+        return status_t {status_code_t::out_of_memory_k, "No room for another range"};
+
+    range_t const range {start, end};
+    st::vector<stored_key_t, constrained_allocator<stored_key_t, atomic_reference_>> inside {
+        constrained_allocator<stored_key_t, atomic_reference_> {resources_->memory_constraint}};
+    status_t listed;
+    [[maybe_unused]] st::status_t const walked = collection->stored_values.for_each([&](auto const& entry) noexcept {
+        if (listed.succeeded() && range.covers(entry.key()))
+            listed = utilities::growth_status(inside.push_back(stored_key_t {entry.key()}));
+    });
+    if (listed.failed()) return listed;
+    for (stored_key_t const& stored_key : inside) {
+        collection->stored_values.probe_to_find(
+            stored_key, [&](auto const& entry) noexcept { collection->elements_size_bytes -= entry.value().size; });
+        [[maybe_unused]] bool const erased = collection->stored_values.erase(stored_key);
+        --elements_count_;
+    }
+    [[maybe_unused]] st::status_t const placed = collection->ranges.push_back(st::assume_reserved, range_t {range});
+    ++elements_count_;
+    return status_t {};
+}
+
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline std::span<typename transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::range_t const>
+transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::ranges(collection_id_t id) const noexcept {
+    auto iterator = collections_by_id.find(id);
+    if (iterator == collections_by_id.end()) return {};
+    return std::span<range_t const> {iterator.value().ranges};
+}
+
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <utilities::fold_concept fold_type_>
 inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::change(
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, stored_value_view_t change,
@@ -576,8 +639,11 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     delta_view_t const newer {delta_kind_t::change_k, change};
     delta_view_t older;
     bool const held = delta(id, stored_key, older);
+    // A key inside a range the deltas remove takes the change over that removal.
+    bool const removed_in_range = !held && lookup(id, stored_key) == lookup_result_t::removed_k;
+    if (removed_in_range) older = delta_view_t {delta_kind_t::remove_k, {}};
     delta_view_t folded {delta_kind_t::change_k, {}};
-    if (held) {
+    if (held || removed_in_range) {
         auto [paired, pair_status] = utilities::fold_delta_pair(fold, newer, older, arena);
         if (pair_status.failed()) return pair_status;
         folded = paired;

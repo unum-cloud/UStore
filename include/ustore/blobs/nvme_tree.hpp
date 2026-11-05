@@ -1245,7 +1245,8 @@ class lsm_level {
           size_bytes_(std::exchange(other.size_bytes_, 0)),
           population_count_(std::exchange(other.population_count_, 0)),
           lower_(std::exchange(other.lower_, limit<stored_key_t>::max())),
-          upper_(std::exchange(other.upper_, limit<stored_key_t>::min())) {}
+          upper_(std::exchange(other.upper_, limit<stored_key_t>::min())),
+          range_tombstones_count_(std::exchange(other.range_tombstones_count_, 0)) {}
 
     lsm_level& operator=(lsm_level&& other) noexcept {
         if (this == &other) return *this;
@@ -1257,6 +1258,7 @@ class lsm_level {
         population_count_ = std::exchange(other.population_count_, 0);
         lower_ = std::exchange(other.lower_, limit<stored_key_t>::max());
         upper_ = std::exchange(other.upper_, limit<stored_key_t>::min());
+        range_tombstones_count_ = std::exchange(other.range_tombstones_count_, 0);
         return *this;
     }
 
@@ -1324,6 +1326,7 @@ class lsm_level {
         population_count_ = 0;
         lower_ = limit<stored_key_t>::max();
         upper_ = limit<stored_key_t>::min();
+        range_tombstones_count_ = 0;
     }
 
 #pragma endregion Construction
@@ -1347,6 +1350,9 @@ class lsm_level {
 
     /** Bytes every run of the level takes on its volume. */
     [[nodiscard]] std::uint64_t size_bytes() const noexcept { return size_bytes_; }
+
+    /** Range tombstones all runs of the level carry; a read skips them when there are none. */
+    [[nodiscard]] std::uint64_t range_tombstones_count() const noexcept { return range_tombstones_count_; }
 
     /** The least key any run of the level holds, or the greatest key of the type for an empty level. */
     [[nodiscard]] stored_key_t lower_stored_key() const noexcept { return lower_; }
@@ -1478,6 +1484,7 @@ class lsm_level {
     void note_(sorted_run_t const& run) noexcept {
         size_bytes_ += run.size_bytes();
         population_count_ += run.population_count();
+        range_tombstones_count_ += run.range_tombstones().size();
         if (run.lower_stored_key() < lower_) lower_ = run.lower_stored_key();
         if (upper_ < run.upper_stored_key()) upper_ = run.upper_stored_key();
     }
@@ -1509,6 +1516,9 @@ class lsm_level {
 
     /** The greatest key any run holds. */
     stored_key_t upper_ = limit<stored_key_t>::min();
+
+    /** Range tombstones every run carries, kept as runs are named rather than recounted. */
+    std::uint64_t range_tombstones_count_ = 0;
 
 #pragma endregion Private Members
 };
@@ -1657,6 +1667,12 @@ class lsm_level_merger {
     /** One immutable run of a level. */
     using sorted_run_t = typename level_t::sorted_run_t;
 
+    /** The range tombstones one run carries. */
+    using range_tombstones_t = typename sorted_run_t::range_tombstones_t;
+
+    /** The keys one range tombstone hides. */
+    using range_t = typename range_tombstones_t::range_t;
+
     /** The pool the new runs are taken into. */
     using run_pool_t = typename level_t::run_pool_t;
 
@@ -1800,23 +1816,49 @@ class lsm_level_merger {
             compacted.failed())
             return compacted;
 
+        st::vector<range_t> kept_ranges;
+        st::vector<std::uint64_t> kept_stamps;
+        if (status_t const kept = kept_range_tombstones_(std::span<sorted_run_t const* const> {sources}, request,
+                                                         kept_ranges, kept_stamps);
+            kept.failed())
+            return kept;
+        // Tombstones outliving every key of the merge still need a run, holding no key slot.
+        std::size_t const runs_count = output.sorted_runs.empty() && !kept_ranges.empty() ? 1
+                                                                                          : output.sorted_runs.size();
+
         merged_runs_t merged;
-        if (merged.reserve(output.sorted_runs.size()) != st::status_t::success_k)
+        if (merged.reserve(runs_count) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "A merge could not track the runs it writes"};
 
         std::uint64_t first_key_slot = 0;
         std::uint64_t first_copy_range = 0;
-        for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
+        for (std::size_t index = 0; index != runs_count; ++index) {
             planned_run_t planned;
-            planned.key_slots_count = output.sorted_runs[index].key_slots_count;
-            planned.stored_values_bytes = output.sorted_runs[index].stored_values_bytes;
+            if (index != output.sorted_runs.size()) {
+                planned.key_slots_count = output.sorted_runs[index].key_slots_count;
+                planned.stored_values_bytes = output.sorted_runs[index].stored_values_bytes;
+                planned.copy_ranges_count = output.sorted_runs[index].value_copy_ranges_count;
+            }
             planned.first_key_slot = first_key_slot;
             planned.first_copy_range = first_copy_range;
-            planned.copy_ranges_count = output.sorted_runs[index].value_copy_ranges_count;
 
-            auto [written, write_run_status] = write_run_(
-                volume, reading_channel, writing_channel, std::span<sorted_run_t const* const> {sources}, output,
-                planned, request.collection, request.value_max_size, request.stamps.floor, request.cancellation);
+            // Each run keeps the pieces of the tombstones between its first key and the next run's,
+            // so the runs' bounds stay disjoint; the first run takes every piece below and the last
+            // every piece above.
+            std::uint64_t const next_key_slot = first_key_slot + planned.key_slots_count;
+            auto [pieces, pieces_status] = clipped_range_tombstones_(
+                std::span<range_t const> {kept_ranges}, std::span<std::uint64_t const> {kept_stamps},
+                index == 0 ? limit<stored_key_t>::min() : output.cells[first_key_slot].stored_key,
+                index + 1 == runs_count ? limit<stored_key_t>::max() : output.cells[next_key_slot].stored_key);
+            if (pieces_status.failed()) {
+                runs.discard(volume, std::span<run_handle_t const> {merged});
+                return pieces_status;
+            }
+
+            auto [written, write_run_status] = write_run_(volume, reading_channel, writing_channel,
+                                                          std::span<sorted_run_t const* const> {sources}, output,
+                                                          planned, request.collection, request.value_max_size,
+                                                          request.stamps.floor, pieces, request.cancellation);
             if (write_run_status.failed()) {
                 runs.discard(volume, std::span<run_handle_t const> {merged});
                 return write_run_status;
@@ -1951,7 +1993,11 @@ class lsm_level_merger {
         std::uint64_t records = 0;
         for (sorted_run_t const* source : sources) records += source->population_count();
         cuda_compactor_t* const* const device = std::get_if<cuda_compactor_t*>(&request.compactor);
-        if (choose_compactor(request.placement, device != nullptr ? 1 : 0, records) == compactor_choice_t::device_k) {
+        bool tombstoned = false;
+        for (sorted_run_t const* source : sources) tombstoned |= !source->range_tombstones().empty();
+        // No device compaction reads range tombstones, so a merge carrying one runs here.
+        if (!tombstoned &&
+            choose_compactor(request.placement, device != nullptr ? 1 : 0, records) == compactor_choice_t::device_k) {
             if (device == nullptr) return {status_code_t::unsupported_k, "No device compactor serves this database"};
             st::vector<strings_run_view> views;
             if (views.resize(sources.size()) != st::status_t::success_k)
@@ -2014,7 +2060,9 @@ class lsm_level_merger {
                 current.kind = source.kind(version.position);
                 current.stamp = source.stamp(version.position);
                 current.position = version.position;
-                if (survives(index != begin ? &previous : nullptr, current, kind, stamps)) [[maybe_unused]]
+                bool const hidden = hidden_string_(sources, upper_count, key_of_(sources, version), version.source,
+                                                   current.stamp, stamps);
+                if (!hidden && survives(index != begin ? &previous : nullptr, current, kind, stamps)) [[maybe_unused]]
                     st::status_t const kept = survivors.push_back(st::assume_reserved, strings_version_t {version});
                 previous = current;
             }
@@ -2067,12 +2115,21 @@ class lsm_level_merger {
                                                                   shares_key, cuts);
             cut != st::status_t::success_k)
             return compaction_status(cut);
+        st::vector<range_t> kept_ranges;
+        st::vector<std::uint64_t> kept_stamps;
+        if (status_t const kept = kept_range_tombstones_(sources, request, kept_ranges, kept_stamps); kept.failed())
+            return kept;
+        // Tombstones outliving every string of the merge still need a run, holding no string.
+        if (cuts.empty() && !kept_ranges.empty())
+            if (cuts.push_back(compacted_sorted_run_t {}) != st::status_t::success_k)
+                return status_t {status_code_t::out_of_memory_k, "A merge could not plan its runs"};
 
         merged_runs_t merged;
         if (merged.reserve(cuts.size()) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "A merge could not track the runs it writes"};
         std::size_t first = 0;
-        for (compacted_sorted_run_t const& cut : cuts) {
+        for (std::size_t index = 0; index != cuts.size(); ++index) {
+            compacted_sorted_run_t const& cut = cuts[index];
             if (stopped_(request.cancellation)) {
                 runs.discard(volume, std::span<run_handle_t const> {merged});
                 return cancelled_status_();
@@ -2080,7 +2137,18 @@ class lsm_level_merger {
             std::span<strings_version_t const> const run_versions =
                 std::span<strings_version_t const> {survivors}.subspan(first,
                                                                        static_cast<std::size_t>(cut.key_slots_count));
-            auto [written, write_status] = write_strings_run_(volume, writing_channel, sources, run_versions, request);
+            // Each run keeps the tombstone pieces between its first string and the next run's.
+            std::size_t const next = first + static_cast<std::size_t>(cut.key_slots_count);
+            auto [pieces, pieces_status] = clipped_string_tombstones_(
+                std::span<range_t const> {kept_ranges}, std::span<std::uint64_t const> {kept_stamps},
+                index == 0 ? std::string_view {} : key_of_(sources, survivors[first]),
+                index + 1 == cuts.size() ? std::string_view {} : key_of_(sources, survivors[next]));
+            if (pieces_status.failed()) {
+                runs.discard(volume, std::span<run_handle_t const> {merged});
+                return pieces_status;
+            }
+            auto [written, write_status] = write_strings_run_(volume, writing_channel, sources, run_versions, request,
+                                                              pieces);
             if (write_status.failed()) {
                 runs.discard(volume, std::span<run_handle_t const> {merged});
                 return write_status;
@@ -2102,7 +2170,8 @@ class lsm_level_merger {
     static expected<sorted_run_t> write_strings_run_(volume_t& volume, io_channel_t& writing_channel,
                                                      std::span<sorted_run_t const* const> sources,
                                                      std::span<strings_version_t const> versions,
-                                                     merge_request_t const& request) noexcept {
+                                                     merge_request_t const& request,
+                                                     range_tombstones_t const& tombstones) noexcept {
         std::size_t const count = versions.size();
         std::uint64_t tails_bytes = 0;
         for (strings_version_t const version : versions)
@@ -2142,7 +2211,54 @@ class lsm_level_merger {
         return sorted_run_t::write(volume, writing_channel, request.collection, uuid_generator(),
                                    std::span<key_slot_t const> {key_slots}, std::span<std::uint64_t const> {stamps},
                                    std::span<std::uint8_t const> {kinds}, request.stamps.floor, {}, {},
-                                   request.value_max_size, column);
+                                   request.value_max_size, column, tombstones);
+    }
+
+    /** Whether a range tombstone of @p sources hides the version of @p text stamped @p stamp that
+     *  source @p source holds from every reader of @p stamps, as @c hidden_by_range decides it
+     *  for fixed-width keys. */
+    static bool hidden_string_(std::span<sorted_run_t const* const> sources, std::size_t upper_count,
+                               std::string_view text, std::uint32_t source, std::uint64_t stamp,
+                               compaction_stamps_t const& stamps) noexcept {
+        for (std::size_t holder = 0; holder != sources.size(); ++holder) {
+            range_tombstones_t const& tombstones = sources[holder]->range_tombstones();
+            bool const own = holder == source;
+            bool const newer = holder < upper_count && (source >= upper_count || holder > source);
+            if (tombstones.empty() || (!own && !newer)) continue;
+            for (std::size_t index = 0; index != tombstones.size(); ++index) {
+                std::uint64_t const removed = tombstones.stamp(index);
+                if (!tombstones.range(index).covers(text) || removed > stamps.ceiling || removed > stamps.horizon)
+                    continue;
+                if (own && removed <= stamp) continue;
+                if (stamp >= removed || reader_interval(stamps, stamp) == reader_interval(stamps, removed)) return true;
+            }
+        }
+        return false;
+    }
+
+    /** The pieces of @p ranges, stamped by @p stamps, that fall from @p lower up to @p upper,
+     *  exclusive: what one run of strings a merge writes carries, where an empty bound leaves
+     *  its side open. */
+    static expected<range_tombstones_t> clipped_string_tombstones_(std::span<range_t const> ranges,
+                                                                   std::span<std::uint64_t const> stamps,
+                                                                   std::string_view lower,
+                                                                   std::string_view upper) noexcept {
+        st::vector<range_t> pieces;
+        st::vector<std::uint64_t> pieces_stamps;
+        if (pieces.reserve(ranges.size()) != st::status_t::success_k ||
+            pieces_stamps.reserve(ranges.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge could not cut its range tombstones"};
+        for (std::size_t index = 0; index != ranges.size(); ++index) {
+            range_t piece = ranges[index];
+            if (piece.start < lower) piece.start = lower;
+            if (!upper.empty() && (piece.end.empty() || upper < piece.end)) piece.end = upper;
+            if (!piece.end.empty() && !(piece.start < piece.end)) continue;
+            [[maybe_unused]] st::status_t const cut = pieces.push_back(st::assume_reserved, range_t {piece});
+            [[maybe_unused]] st::status_t const stamped = pieces_stamps.push_back(st::assume_reserved,
+                                                                                  std::uint64_t {stamps[index]});
+        }
+        return range_tombstones_t::make(std::span<range_t const> {pieces},
+                                        std::span<std::uint64_t const> {pieces_stamps});
     }
 
 #pragma endregion Strings Merge
@@ -2228,7 +2344,8 @@ class lsm_level_merger {
             key_slot_t const* cells = nullptr;
             if constexpr (sorted_run_t::keeps_cells_k) cells = run.cells().data();
             views[index] = sorted_run_index_view<key_slot_t> {
-                cells, run.population_count(), &run.stamps(), &run.kinds(), {}, run.value_offsets(), &run.keys()};
+                cells, run.population_count(), &run.stamps(), &run.kinds(),
+                {},    run.value_offsets(),    &run.keys(),   &run.range_tombstones()};
         }
         return {};
     }
@@ -2287,7 +2404,9 @@ class lsm_level_merger {
         bool changes = false;
         std::uint64_t const merged = merged_count_(upper, lower, changes);
         cuda_compactor_t* const* const device = std::get_if<cuda_compactor_t*>(&compactor);
-        if (choose_compactor(placement, device != nullptr ? 1 : 0, merged) == compactor_choice_t::device_k) {
+        // No device compaction reads range tombstones, so a merge carrying one runs here.
+        if (!carries_range_tombstones(upper, lower) &&
+            choose_compactor(placement, device != nullptr ? 1 : 0, merged) == compactor_choice_t::device_k) {
             if (device == nullptr) return {status_code_t::unsupported_k, "No device compactor serves this database"};
             // No device compaction is compiled for key slots carrying tails.
             if constexpr (!tailed_key_slot_concept<key_slot_t>) {
@@ -2335,13 +2454,54 @@ class lsm_level_merger {
         return {status_code_t::uninitialized_k, "The caller cancelled this compaction"};
     }
 
+    /** Lists into @p ranges and @p stamps the range tombstones of @p sources @p request keeps. */
+    static status_t kept_range_tombstones_(std::span<sorted_run_t const* const> sources, merge_request_t const& request,
+                                           st::vector<range_t>& ranges, st::vector<std::uint64_t>& stamps) noexcept {
+        compaction_kind_t const kind = kind_of_(request.upper_order, request.depth);
+        for (sorted_run_t const* source : sources) {
+            range_tombstones_t const& tombstones = source->range_tombstones();
+            for (std::size_t index = 0; index != tombstones.size(); ++index) {
+                if (drops_range_tombstone(kind, request.stamps, tombstones.stamp(index))) continue;
+                if (ranges.push_back(range_t {tombstones.range(index)}) != st::status_t::success_k ||
+                    stamps.push_back(std::uint64_t {tombstones.stamp(index)}) != st::status_t::success_k)
+                    return {status_code_t::out_of_memory_k, "A merge could not keep its range tombstones"};
+            }
+        }
+        return {};
+    }
+
+    /** The pieces of @p ranges, stamped by @p stamps, that fall from @p lower up to @p upper,
+     *  exclusive: what one run of a merge carries, where the least and the greatest key of the type
+     *  leave a side open. */
+    static expected<range_tombstones_t> clipped_range_tombstones_(std::span<range_t const> ranges,
+                                                                  std::span<std::uint64_t const> stamps,
+                                                                  stored_key_t lower, stored_key_t upper) noexcept {
+        st::vector<range_t> pieces;
+        st::vector<std::uint64_t> pieces_stamps;
+        if (pieces.reserve(ranges.size()) != st::status_t::success_k ||
+            pieces_stamps.reserve(ranges.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A merge could not cut its range tombstones"};
+        for (std::size_t index = 0; index != ranges.size(); ++index) {
+            range_t piece = ranges[index];
+            if (piece.start < lower) piece.start = lower;
+            if (upper < piece.end) piece.end = upper;
+            if (!(piece.start < piece.end)) continue;
+            [[maybe_unused]] st::status_t const cut = pieces.push_back(st::assume_reserved, range_t {piece});
+            [[maybe_unused]] st::status_t const stamped = pieces_stamps.push_back(st::assume_reserved,
+                                                                                  std::uint64_t {stamps[index]});
+        }
+        return range_tombstones_t::make(std::span<range_t const> {pieces},
+                                        std::span<std::uint64_t const> {pieces_stamps});
+    }
+
     /** Allocates an extent for the run @p planned describes, writes its sections, and opens it. */
     static expected<sorted_run_t> write_run_(volume_t& volume, io_channel_t& reading_channel,
                                              io_channel_t& writing_channel,
                                              std::span<sorted_run_t const* const> sources,
                                              compaction_output_t const& output, planned_run_t const& planned,
                                              uuid_t const& collection, stored_value_size_t value_max_size,
-                                             std::uint64_t floor, cancellation_t const* cancellation) noexcept {
+                                             std::uint64_t floor, range_tombstones_t const& tombstones,
+                                             cancellation_t const* cancellation) noexcept {
         uuid_t const content_id = uuid_generator();
         if (!content_id.is_valid())
             return status_t {status_code_t::internal_k, "A merge could not name the run it writes"};
@@ -2372,6 +2532,11 @@ class lsm_level_merger {
         header.stamps_floor = floor;
         header.newest_stamp = newest;
         header.kinds_bytes = kinds.saved_bytes();
+        st::vector<byte_t> laid_tombstones;
+        if (status_t const laid = sorted_run_t::lay_out_range_tombstones(tombstones, laid_tombstones); laid.failed())
+            return laid;
+        header.range_tombstones_count = static_cast<std::uint32_t>(tombstones.size());
+        header.range_tombstones_bytes = static_cast<std::uint32_t>(laid_tombstones.size());
 
         // The run's own value offsets from its first key slot on, none but for a variable width.
         st::vector<stored_value_offset_t> value_offsets;
@@ -2394,8 +2559,8 @@ class lsm_level_merger {
 
         if (status_t const written = write_sections_(
                 volume, reading_channel, writing_channel, sources, output, planned, header, column, kinds, cells,
-                std::span<std::uint64_t const> {keys}, std::span<stored_value_offset_t const> {value_offsets}, extent,
-                cancellation);
+                std::span<std::uint64_t const> {keys}, std::span<stored_value_offset_t const> {value_offsets},
+                std::span<byte_t const> {laid_tombstones}, extent, cancellation);
             written.failed()) {
             volume.deallocate(extent);
             return written;
@@ -2413,7 +2578,8 @@ class lsm_level_merger {
                                     planned_run_t const& planned, sorted_run_header_t const& header,
                                     stamps_column_t const& column, kinds_column_t const& kinds,
                                     std::span<key_slot_t const> cells, std::span<std::uint64_t const> keys,
-                                    std::span<stored_value_offset_t const> value_offsets, medium_extent_t const& blob,
+                                    std::span<stored_value_offset_t const> value_offsets,
+                                    std::span<byte_t const> tombstones, medium_extent_t const& blob,
                                     cancellation_t const* cancellation) noexcept {
         std::uint64_t const block_bytes = round_down_to_multiple(writing_channel.streams().buffer_bytes(),
                                                                  portable_alignment_k);
@@ -2446,6 +2612,9 @@ class lsm_level_merger {
             return values;
         if (status_t const trailer = sorted_run_t::write_trailer(writer, blob, header, column, kinds); trailer.failed())
             return trailer;
+        if (status_t const ranges = sorted_run_t::write_range_tombstones(writer, blob, header, tombstones);
+            ranges.failed())
+            return ranges;
         return writer.poll_all_completions();
     }
 
@@ -2694,6 +2863,9 @@ class lsm_tree {
 
     /** One immutable run of a level. */
     using sorted_run_t = typename level_t::sorted_run_t;
+
+    /** The range tombstones one run carries. */
+    using range_tombstones_t = typename sorted_run_t::range_tombstones_t;
 
     /** The database's pool every run of this tree lives in. */
     using run_pool_t = typename level_t::run_pool_t;
@@ -2985,15 +3157,17 @@ class lsm_tree {
      *  @param[in] value_max_size The largest value the collection admits, kept in the run's header.
      *  @param[in] published What to call once the new set is current, which returns once no reader holds the old one.
      *  @param[in] tails The tails of the keys the key slots' heads cut short, in the same order, none for whole keys.
+     *  @param[in] tombstones The flushed commits' range tombstones, which the run keeps whole.
      */
     status_t flush(io_channel_t& channel, std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
                    std::span<std::uint8_t const> kinds, std::uint64_t floor, std::span<byte_t const> stored_values,
                    std::span<stored_value_offset_t const> value_offsets, stored_value_size_t value_max_size,
                    lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
-                   key_tails_column_t const& tails = {}) noexcept {
+                   key_tails_column_t const& tails = {},
+                   range_tombstones_t const& tombstones = range_tombstones_t {}) noexcept {
         auto [written, write_sorted_run_status] = sorted_run_t::write(
             *volume_, channel, config_.collection, uuid_generator(), key_slots, stamps, kinds, floor, stored_values,
-            value_offsets, value_max_size, tails);
+            value_offsets, value_max_size, tails, tombstones);
         if (write_sorted_run_status.failed()) return write_sorted_run_status;
         auto [flushed, take_status] = runs_->take(std::move(written));
         if (take_status.failed()) {
@@ -3439,9 +3613,9 @@ class lsm_tree {
         return levels.size();
     }
 
-    /** Whether @p run holds a key between @p lower and @p upper. */
+    /** Whether @p run holds or hides a key between @p lower and @p upper. */
     [[nodiscard]] static bool overlaps_(sorted_run_t const& run, stored_key_t lower, stored_key_t upper) noexcept {
-        return run.population_count() != 0 && !(run.upper_stored_key() < lower || upper < run.lower_stored_key());
+        return run.holds_keys() && !(run.upper_stored_key() < lower || upper < run.lower_stored_key());
     }
 
     /**
@@ -3492,7 +3666,7 @@ class lsm_tree {
         stored_key_t range_lower = limit<stored_key_t>::max();
         stored_key_t range_upper = limit<stored_key_t>::min();
         for (sorted_run_t const* run : picked.upper()) {
-            if (run->population_count() == 0) continue;
+            if (!run->holds_keys()) continue;
             if (run->lower_stored_key() < range_lower) range_lower = run->lower_stored_key();
             if (range_upper < run->upper_stored_key()) range_upper = run->upper_stored_key();
         }

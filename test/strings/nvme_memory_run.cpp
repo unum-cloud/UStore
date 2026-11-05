@@ -18,8 +18,9 @@
 #include <cstring> // `std::memcmp`
 
 #include <algorithm>       // `std::max`, `std::min`
+#include <array>           // `std::array`
 #include <map>             // `std::map`
-#include <memory>          // `std::unique_ptr`
+#include <memory>          // `std::unique_ptr`, `std::addressof`
 #include <random>          // `std::mt19937_64`, `std::uniform_int_distribution`
 #include <set>             // `std::set`
 #include <source_location> // `std::source_location`
@@ -330,6 +331,59 @@ static std::size_t refusals() {
     return failures;
 }
 
+/** A range of strings removed, with an empty end reaching past the last string, hides the older
+ *  versions inside it from a reader at or past its stamp, conflicts with a watch below it, and a
+ *  merge drops what it hides from every reader while a pinned reader keeps its own; a string
+ *  written in the same commit survives it. */
+static std::size_t range_tombstones_hide_older_runs() {
+    using range_t = sealed_t::range_t;
+    std::size_t failures = 0;
+    std::array<byte_t, sizeof(ustore_key_t)> payload {};
+    std::array<keyed_delta_t, 3> oldest {keyed_delta_t {"apple", {delta_kind_t::write_k, payload}},
+                                         keyed_delta_t {"melon", {delta_kind_t::write_k, payload}},
+                                         keyed_delta_t {"plum", {delta_kind_t::write_k, payload}}};
+    std::array<keyed_delta_t, 1> ranged {keyed_delta_t {"mango", {delta_kind_t::write_k, payload}}};
+    std::array<range_t, 2> const ranges {range_t {"m", "n"}, range_t {"pear", {}}};
+    expected<run_t> first = run_t::stamped(*sealed_t::seal(oldest, &sz_sort_order_serial), 5);
+    expected<run_t> second = run_t::stamped(
+        *sealed_t::seal(ranged, &sz_sort_order_serial, std::span<range_t const> {ranges}), 7);
+    if (check(first.has_value() && second.has_value())) return failures + 1;
+    failures += check(second->range_tombstones().size() == 2 && second->newest_stamp() == 7);
+
+    view_t const empty;
+    expected<view_t> one = view_t::extended(empty, *first);
+    if (check(one.has_value())) return failures + 1;
+    expected<view_t> view = view_t::extended(*one, *second);
+    if (check(view.has_value())) return failures + 1;
+    failures += check(view->covering_stamp("melon", 9) == 7 && view->covering_stamp("melon", 6) == 0);
+    failures += check(view->covering_stamp("zebra", 9) == 7 && view->covering_stamp("apple", 9) == 0);
+    failures += check(view->written_since("plum", 6) && !view->written_since("apple", 6));
+    failures += check(view->range_written_since("q", "z", 6) && !view->range_written_since("b", "c", 6));
+
+    run_t const* const runs[2] {std::addressof(*second), std::addressof(*first)};
+    auto const kept_strings = [&](compaction_stamps_t const& survival, std::span<std::string_view const> wanted) {
+        st::vector<stamped_delta_t> versions;
+        utilities::arena_allocator<byte_t> folded_bytes;
+        if (check(kept_versions(std::span<run_t const* const> {runs}, survival, utilities::last_write_fold_t {},
+                                versions, folded_bytes)
+                      .succeeded()))
+            return std::size_t {1};
+        std::size_t mismatches = check(versions.size() == wanted.size());
+        for (std::size_t index = 0; index != versions.size() && index != wanted.size(); ++index)
+            mismatches += check(versions[index].stored_key == wanted[index]);
+        return mismatches;
+    };
+    std::array<std::string_view, 2> const newest_kept {"apple", "mango"};
+    failures += kept_strings(compaction_stamps_t {}, newest_kept);
+    std::uint64_t const pinned[1] {6};
+    compaction_stamps_t survival;
+    survival.pinned = pinned;
+    survival.pinned_count = 1;
+    std::array<std::string_view, 4> const pinned_kept {"apple", "mango", "melon", "plum"};
+    failures += kept_strings(survival, pinned_kept);
+    return failures;
+}
+
 /** Random commits, each one run on top of the last view, read at random stamps, checked for conflicts and listed by
  *  prefix cursors against the model; every older view keeps answering at its own stamp. */
 static std::size_t random_streams_match_model() {
@@ -445,6 +499,7 @@ static std::size_t merges_keep_visible_versions() {
             failures += check(
                 kept_versions(group, survival, utilities::last_write_fold_t {}, versions, folded_bytes).succeeded());
             expected<run_t> merged = run_t::merged(std::span<stamped_delta_t const> {versions},
+                                                   *gathered_range_tombstones(group, st::default_allocator<byte_t> {}),
                                                    group.back()->oldest_stamp(), group.back()->tier());
             if (check(merged.has_value())) return failures + 1;
             std::size_t replaced = 0;
@@ -501,6 +556,7 @@ int main() {
     auto counted = [&](char const* name, auto body) { run(name, body, failed), ++total; };
     counted("strings_memory_run.heads_order_as_strings", heads_order_as_strings);
     counted("strings_memory_run.refusals", refusals);
+    counted("strings_memory_run.range_tombstones_hide_older_runs", range_tombstones_hide_older_runs);
     counted("strings_memory_run.random_streams_match_model", random_streams_match_model);
     counted("strings_memory_run.merges_keep_visible_versions", merges_keep_visible_versions);
     fmt::println("total {} passed, {} failed", total - failed, failed);

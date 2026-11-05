@@ -6,7 +6,8 @@
 set -euo pipefail
 version=$1 core=${1%%-*}
 branch=$(git branch --show-current)
-previous=$(git describe --tags --abbrev=0)
+# The first release has no tag before it, so its notes start at the root commit.
+previous=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
 git diff --quiet HEAD || { echo "mint-release: commit or stash your changes first"; exit 1; }
 
 IFS=. read -r major minor patch <<< "$core"

@@ -18,7 +18,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 
-#include <concepts>    // `std::convertible_to`, `std::same_as`
+#include <concepts>    // `std::convertible_to`, `std::same_as`, `std::unsigned_integral`
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -295,6 +295,19 @@ struct limit<value_type_> {
     /** The greatest value. */
     static constexpr value_type_ max() noexcept { return value_type_::max(); }
 };
+
+/** The key right before @p key of an unsigned type, which must not be the least: the inclusive
+ *  bound of a range ending before @p key. */
+template <std::unsigned_integral value_type_>
+constexpr value_type_ stored_key_before(value_type_ key) noexcept {
+    return static_cast<value_type_>(key - 1);
+}
+
+/** The 16-byte key right before @p key, which is not the least, borrowing across both words. */
+constexpr st::key128_t stored_key_before(st::key128_t key) noexcept {
+    if (key.low != 0) return {key.high, key.low - 1};
+    return {key.high - 1, ~std::uint64_t {0}};
+}
 
 /** Hashes a key a key slot carries through SmashTable's own hash. */
 struct stored_key_hash_t {

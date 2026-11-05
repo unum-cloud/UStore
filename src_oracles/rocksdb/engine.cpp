@@ -20,22 +20,26 @@
  *  left, which a read-write open drops and a read-only open refuses. Tables stay block-based, since the plain-table
  *  format lacks non-prefix seeks that scans need.
  *
- *  Every write reaches RocksDB's log, which stays in memory until a flushed write or commit, a full buffer or a clean
- *  close writes it out, so a crash recovers a consistent prefix of the commits across every collection. Transactions
- *  buffer their writes and watched reads and lock nothing until they stage, when RocksDB's pessimistic transaction
- *  locks and validates every key against the snapshot its first read or write took, and prepares it into the log.
+ *  Every write reaches RocksDB's log file, which a flushed write or commit, or a clean close,
+ *  syncs, so a crash recovers a consistent prefix of the commits across every collection.
+ *  Transactions buffer their writes and watched reads and lock nothing until they stage, when
+ *  RocksDB's pessimistic transaction locks and validates every key against the snapshot its first
+ *  read or write took, holding the locks until the commit writes the transaction into the log as
+ *  one batch. The log is the change feed: a feed reads the batches committed after its stamp
+ *  through @c GetUpdatesSince, keeping the log files alive while it is open.
  */
 
 #include "docs_layer.hpp"   // `docs_write_over_blobs`, `docs_read_over_blobs`, `docs_gist_over_blobs`
 #include "graph_layer.hpp"  // `graph_read_edges_over_blobs`, `graph_write_edges_over_blobs`
 #include "pages_layer.hpp"  // `pages_import_over_blobs`, `pages_read_over_blobs`
-#include "engine.hpp"       // `engine_t`, `guarded`, `remove_over_blobs`, `scan_over_blobs`
+#include "engine.hpp"       // `engine_t`, `guarded`, `remove_over_blobs`, `scan_over_blobs`, `measure_over_blobs`
 #include "lib.hpp"          // `route_init`
 #include "vram/uploads.hpp" // `uploading_vram_tables`
 
 #include "database.hpp" // `database_open`, `database_describe`, `collection_create`, `transaction_init`
 #include "blobs.hpp"    // `blobs_write`, `blobs_remove`, `blobs_read`, `blobs_scan`, `blobs_sample`
-#include "strings.hpp"  // `strings_write`, `strings_remove`, `strings_read`, `strings_scan`
+#include "strings.hpp"  // `strings_write`, `strings_remove`, `strings_scan`, `strings_sample`, `strings_measure`
+#include "changes.hpp"  // `changes_cursor_init`, `changes_cursor_next`, `changes_cursor_free`
 
 namespace unum::ustore::oracles::rocksdb {
 
@@ -61,6 +65,9 @@ database_verbs_t const database_verbs_k {
     .transaction_free = &transaction_free,
     .snapshot_free = &snapshot_free,
     .database_free = &database_free,
+    .changes_cursor_init = &changes_cursor_init,
+    .changes_cursor_next = &guarded<&changes_cursor_next>,
+    .changes_cursor_free = &changes_cursor_free,
 };
 
 /** The unchecked whole-value verbs of every collection keyed by UUIDs, which the layers over blobs reach. */
@@ -89,6 +96,8 @@ strings_verbs<home_t::host_k> const strings_verbs_k {
     .remove = &guarded<&strings_remove>,
     .read = &guarded<&strings_read>,
     .scan = &guarded<&strings_scan>,
+    .sample = &guarded<&strings_sample>,
+    .measure = &guarded<&strings_measure>,
 };
 
 /** The verbs of this engine's documents collections. */
@@ -100,6 +109,7 @@ docs_verbs<home_t::host_k> const docs_verbs_k {
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
     .sample = &sample_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
+    .measure = &measure_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
 };
 
 /** The verbs of this engine's graph collections. */
@@ -110,6 +120,8 @@ graph_verbs<home_t::host_k> const graph_verbs_k {
     .write_vertices = &graph_write_vertices_over_blobs<values_verbs_k, &resolve_modality>,
     .remove_vertices = &graph_remove_vertices_over_blobs<values_verbs_k, &resolve_modality>,
     .scan_vertices = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_graph_k>,
+    .sample_vertices = &sample_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_graph_k>,
+    .measure_vertices = &measure_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_graph_k>,
 };
 
 /** The verbs of this engine's pages collections. */
@@ -123,6 +135,8 @@ pages_verbs<home_t::host_k> const pages_verbs_k {
     .remove_attributes = &pages_remove_attributes_over_blobs<values_verbs_k, &resolve_modality>,
     .read = &pages_read_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_pages_k>,
+    .sample = &sample_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_pages_k>,
+    .measure = &measure_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_pages_k>,
 };
 
 engine_t const engine_k {

@@ -25,17 +25,21 @@ constexpr enumerator_spelling<ustore_vertex_role_t> vertex_role_names_k[] {
 
 #pragma endregion Names
 
-status_t pull(engine_t const& engine, ustore_graph_vertices_cursor_next_t const& arguments,
-              ustore_graph_vertices_cursor_handle_t& cursor, view_t const& view) noexcept {
+/** Pulls the next page of @p cursor as @c pull does, narrowing through @p match, the walk's own
+ *  match or the face a device pull shows it. */
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_graph_vertices_cursor_next_t const& arguments,
+                      ustore_graph_vertices_cursor_handle_t& cursor, match_type_ const& match,
+                      view_t const& view) noexcept {
     if (!arguments.keys || !arguments.written)
         return {status_code_t::invalid_argument_k, "Need outputs for the keys and the count written"};
     keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
     std::variant<ustore_key_t, exhausted_t> resume;
     if (status_t const status = list_cursor_keys<ustore_graph_scan_vertices_t>(
-            engine, arguments.database, cursor, arguments.wanted, arguments.arena, view, survivors, resume);
+            engine, arguments.database, cursor, match, arguments.wanted, arguments.arena, view, survivors, resume);
         status.failed())
         return status;
-    arena_rewind(arguments.arena);
+    match.rewind_page(arguments.arena);
     std::size_t const written = survivors.size();
     auto [keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, survivors);
     if (keys_status.failed()) return keys_status;
@@ -46,6 +50,13 @@ status_t pull(engine_t const& engine, ustore_graph_vertices_cursor_next_t const&
     return {};
 }
 
+status_t pull(engine_t const& engine, ustore_graph_vertices_cursor_next_t const& arguments,
+              ustore_graph_vertices_cursor_handle_t& cursor, view_t const& view) noexcept {
+    auto const* const walker = host_engine_of(cursor);
+    if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
+    return pull_through(engine, arguments, cursor, walker->match, view);
+}
+
 } // namespace unum::ustore
 
 void ustore_graph_read_edges(ustore_graph_read_edges_t* arguments) { route(arguments); }
@@ -54,6 +65,8 @@ void ustore_graph_remove_edges(ustore_graph_remove_edges_t* arguments) { route(a
 void ustore_graph_write_vertices(ustore_graph_write_vertices_t* arguments) { route(arguments); }
 void ustore_graph_remove_vertices(ustore_graph_remove_vertices_t* arguments) { route(arguments); }
 void ustore_graph_scan_vertices(ustore_graph_scan_vertices_t* arguments) { route(arguments); }
+void ustore_graph_sample_vertices(ustore_graph_sample_vertices_t* arguments) { route(arguments); }
+void ustore_graph_measure_vertices(ustore_graph_measure_vertices_t* arguments) { route(arguments); }
 
 void ustore_graph_vertices_cursor_next(ustore_graph_vertices_cursor_next_t* arguments) { route(arguments); }
 

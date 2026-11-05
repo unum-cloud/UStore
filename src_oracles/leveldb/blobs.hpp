@@ -7,8 +7,9 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
+#include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 #include <cstdint> // `std::uint64_t`
+#include <cstring> // `std::memcpy`
 
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
@@ -17,8 +18,8 @@
 
 #include "ustore/utilities/algorithm.hpp" // `reservoir_sample_iterator`
 
-#include "database.hpp"           // `database_t`, `resolve_collections`, `collection_walk_t`, `get_each`, `write_many`
-#include "utilities/batches.hpp"  // `validate_write`, `places_of`
+#include "database.hpp"          // `database_t`, `resolve_collections`, `seek_towards`, `step_towards`, `get_each`
+#include "utilities/batches.hpp" // `validate_write`, `places_of`, `scans_of`, `measures_of`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -52,9 +53,24 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteBatch batch;
+    strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
+    if (!end_keys) {
+        for (std::size_t task_index = 0; task_index != places.count; ++task_index) {
+            place_t const place = places[task_index];
+            batch.Delete(uuid_key(place.collection, place.key.uuid).slice());
+        }
+        return status_of(database.native->Write(write_options_for(arguments.durability), &batch));
+    }
+
+    // LevelDB has no range tombstones, so the ranges' keys are listed into a batch from one version
+    iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
     for (std::size_t task_index = 0; task_index != places.count; ++task_index) {
         place_t const place = places[task_index];
-        batch.Delete(uuid_key(place.collection, place.key.uuid).slice());
+        uuid_key_t const end = uuid_key(place.collection, end_keys[static_cast<std::ptrdiff_t>(task_index)].uuid);
+        for (iterator->Seek(uuid_key(place.collection, place.key.uuid).slice());
+             iterator->Valid() && iterator->key().compare(end.slice()) < 0; iterator->Next())
+            batch.Delete(iterator->key());
+        if (!iterator->status().ok()) return status_of(iterator->status());
     }
     return status_of(database.native->Write(write_options_for(arguments.durability), &batch));
 }
@@ -90,7 +106,7 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
 status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) {
     database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    scan_batch_t const scans {collections, strided(arguments.start_keys), arguments.wanted, arguments.count};
+    scan_batch_t const scans = scans_of(arguments);
 
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
     status_t const resolved = resolve_collections(database, collections, arguments.count,
@@ -107,14 +123,17 @@ status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) {
     progress_t progress {arguments.progress, arguments.progress_state, scans.count};
     for (std::size_t task_index = 0; task_index != scans.count; ++task_index) {
         scan_task_t const task = scans[task_index];
-        uuid_key_t const start = uuid_key(task.collection, task.start_key.uuid);
+        uuid_key_t const start = uuid_key(task.collection, task.start_key().uuid);
         ::leveldb::Slice const prefix = prefix_of(task.collection);
         outputs.open_task(task_index);
         std::size_t const scan_end = outputs.size() + task.limit;
-        for (iterator->Seek(start.slice());
-             iterator->Valid() && iterator->key().starts_with(prefix) && outputs.size() != scan_end; iterator->Next())
-            if (status_t const status = outputs.push(ustore_key_t {tail_uuid_of(iterator->key())}); status.failed())
-                return status;
+        for (seek_towards(*iterator, start.slice(), task.direction);
+             iterator->Valid() && iterator->key().starts_with(prefix) && outputs.size() != scan_end;
+             step_towards(*iterator, task.direction)) {
+            ustore_key_t const key {tail_uuid_of(iterator->key())};
+            if (!task.keys.contains(key)) break;
+            if (status_t const status = outputs.push(key); status.failed()) return status;
+        }
         if (!iterator->status().ok()) return status_of(iterator->status());
         if (!progress.advance(1)) return progress_cancelled_k;
     }
@@ -153,36 +172,46 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
     return outputs.finish(arguments);
 }
 
-status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const&) {
-    if (!arguments.count) return {};
+/** Measures every range by walking its keys at the view it reads, exactly, with the space LevelDB
+ *  estimates the range takes in its files. */
+status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& view) {
+    if (status_t const status = validate_direction(arguments.direction); status.failed() || !arguments.count)
+        return status;
     database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
-    strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
+    scan_batch_t const tasks = measures_of(arguments);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
                                                   entry_layout_t::uuids_to_bytes_k);
     if (resolved.failed()) return resolved;
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
 
-    // Memory usage describes the whole database, so one property read serves every task
-    auto [memory_bytes, memory_status] = memory_usage(database);
-    if (memory_status.failed()) return memory_status;
-
-    for (std::size_t task_index = 0; task_index != arguments.count; ++task_index) {
-        outputs.min_cardinalities[task_index] = static_cast<ustore_size_t>(0);
-        outputs.max_cardinalities[task_index] = static_cast<ustore_size_t>(0);
-        outputs.min_value_bytes[task_index] = static_cast<ustore_size_t>(0);
-        outputs.max_value_bytes[task_index] = static_cast<ustore_size_t>(0);
-
-        ustore_collection_id_t const collection = collections[task_index];
-        uuid_key_t const start_key = uuid_key(collection, (start_keys ? start_keys[task_index] : smallest_key_k).uuid);
-        uuid_key_t const end_key = uuid_key(collection, (end_keys ? end_keys[task_index] : largest_key_k).uuid);
-        ::leveldb::Range const range(start_key.slice(), end_key.slice());
+    ::leveldb::ReadOptions options;
+    options.fill_cache = false;
+    use_snapshot(view, options);
+    iterator_pointer_t iterator {database.native->NewIterator(options)};
+    for (std::size_t task_index = 0; task_index != tasks.count; ++task_index) {
+        scan_task_t const task = tasks[task_index];
+        ustore_size_t cardinality = 0;
+        ustore_size_t value_bytes = 0;
         std::uint64_t approximate_size = 0;
-        database.native->GetApproximateSizes(&range, 1, &approximate_size);
-        outputs.min_space_usages[task_index] = approximate_size;
-        outputs.max_space_usages[task_index] = memory_bytes;
+        if (task.limit) {
+            uuid_key_t const lower = uuid_key(task.collection, task.keys.lower.uuid);
+            uuid_key_t const upper = uuid_key(task.collection, task.keys.upper.uuid);
+            for (iterator->Seek(lower.slice()); iterator->Valid() && iterator->key().compare(upper.slice()) <= 0;
+                 iterator->Next()) {
+                ++cardinality;
+                value_bytes += iterator->value().size();
+            }
+            if (!iterator->status().ok()) return status_of(iterator->status());
+
+            // The least key past the upper bound adds a zero byte, closing the range LevelDB sizes
+            char past_upper[sizeof(upper.bytes) + 1] {};
+            std::memcpy(past_upper, upper.bytes, sizeof(upper.bytes));
+            ::leveldb::Range const range(lower.slice(), {past_upper, sizeof(past_upper)});
+            database.native->GetApproximateSizes(&range, 1, &approximate_size);
+        }
+        outputs.assign(task_index, cardinality, value_bytes, approximate_size);
     }
     outputs.finish(arguments);
     return {};

@@ -254,13 +254,13 @@ typedef struct ustore_docs_read_t {
  *  - @c ustore_status_invalid_argument_k The @c arena, @c collections or @c keys are missing, the
  *    fields come in an unknown layout, the @c view is none of the engine's, a watching read goes
  *    through a staged transaction, or a collection holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, or the device
+ *    refused a copy or a launch.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet, or fields are read as neither JSON nor strings.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k Fields are read as neither JSON nor strings.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A document does not parse.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
@@ -318,7 +318,7 @@ typedef struct ustore_docs_gist_t {
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A document does not parse.
@@ -413,13 +413,12 @@ typedef struct ustore_docs_gather_t {
  *  - @c ustore_status_invalid_argument_k The @c arena, @c collections, @c keys or @c columns are
  *    missing, the @c fields or their types are missing or unknown, the @c view is foreign, a
  *    watching read goes through a staged transaction, or a collection holds another modality.
- *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_device_k The arena lives where another executor computes, or the device
+ *    refused a copy or a launch.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A document does not parse.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
@@ -450,8 +449,11 @@ typedef struct ustore_docs_remove_t {
     /** Collections of the documents. */
     ustore_collections_view_t collections;
 
-    /** Keys of the documents to remove. */
+    /** Keys of the documents to remove, or inclusive starts of ranges when @c end_keys is given. */
     ustore_keys_view_t keys;
+
+    /** Exclusive ends of the ranges to remove, or a zeroed view to remove @c keys alone. */
+    ustore_keys_view_t end_keys;
 
     /** How durable the removals are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -515,8 +517,14 @@ typedef struct ustore_docs_scan_t {
     /** Collections to scan. */
     ustore_collections_view_t collections;
 
-    /** Smallest key every scan may return, where @c NULL data starts at the first key. */
+    /** Inclusive start of every scan, @c NULL data starting at the first key in @c direction. */
     ustore_keys_view_t start_keys;
+
+    /** Key every scan stops before, exclusive, or a zeroed view for no bound. */
+    ustore_keys_view_t end_keys;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
 
     /** Optional JSONPath, or a bare root filter such as @c ?@.age>30, that every listed document matches, shared by
      *  every scan; a zeroed view lists every key. */
@@ -554,18 +562,17 @@ typedef struct ustore_docs_scan_t {
  *
  *  @par Statuses:
  *  @c ustore_status_invalid_argument_k means the @c arena, @c collections or an output is missing,
- *  the @c mode or a predicate cost is unknown, the @c filter does not compile, the @c view was made
- *  by neither view constructor or belongs to another engine, a watching scan goes through a staged
- *  transaction, or a collection holds another modality.
+ *  the @c mode, @c direction or a predicate cost is unknown, the @c filter does not compile, the
+ *  @c view was made by neither view constructor or belongs to another engine, a watching scan goes
+ *  through a staged transaction, or a collection holds another modality.
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet, or on one matching no values, as AMD devices do, given a @c filter, or on any given a
- *    bare root filter, which no GPU walk evaluates.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor's device loaded no bundle of the library's kernels
+ *    and a @c filter is given.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A document the @c filter reads does not parse.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
@@ -603,8 +610,14 @@ typedef struct ustore_docs_cursor_init_t {
     /** Docs collection to walk. */
     ustore_collection_id_t collection;
 
-    /** Smallest key the walk returns. */
+    /** Key the walk starts from, inclusive. */
     ustore_key_t start_key;
+
+    /** Key the walk stops before, exclusive, or @c NULL for no bound. */
+    ustore_key_t const* end_key;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
 
     /** Optional JSONPath or bare root filter every document the walk hands out matches, copied and compiled here
      *  once; a zeroed view walks every key. */
@@ -625,7 +638,6 @@ typedef struct ustore_docs_cursor_init_t {
  *    by neither view constructor or reads another database, a predicate cost is unknown, or
  *    the @c filter does not compile.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
- *  - @c ustore_status_unsupported_k A device @c executor is given a @c filter.
  */
 USTORE_EXPORT void ustore_docs_cursor_init(ustore_docs_cursor_init_t* arguments);
 
@@ -685,8 +697,9 @@ typedef struct ustore_docs_cursor_next_t {
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine walks yet.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The pulling executor's device loaded no bundle of the library's
+ *    kernels and the walk has a @c filter.
  *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A document the filter reads does not parse.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
@@ -751,13 +764,89 @@ typedef struct ustore_docs_sample_t {
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
  *    another call, the executor's deferred table is full, a callback blocks on the executor running
  *    it, or an NVMe value keeps changing size across reads.
- *  - @c ustore_status_uninitialized_k The @c database is @c NULL, or an NVMe transfer was cancelled.
- *  - @c ustore_status_unsupported_k The executor computes on a device, where no engine serves the
- *    call yet.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_docs_sample(ustore_docs_sample_t* arguments);
+
+/** The arguments of @c ustore_docs_measure, which estimates the documents and the space inside key
+ *  ranges, every output holding one bound per range. */
+typedef struct ustore_docs_measure_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** What the call sees, where @c NULL is the head. */
+    ustore_view_t view;
+
+    /** Number of measured ranges. */
+    ustore_size_t count;
+
+    /** Collections to measure. */
+    ustore_collections_view_t collections;
+
+    /** Inclusive start of every range, @c NULL data starting at the first key in @c direction. */
+    ustore_keys_view_t start_keys;
+
+    /** Key every range stops before, exclusive, or a zeroed view for no bound. */
+    ustore_keys_view_t end_keys;
+
+    /** Ascending, the default, or descending from the start key. */
+    ustore_scan_direction_t direction;
+
+    /** Optional output for the lower bound on the documents in every range, inside @c arena. */
+    ustore_size_t const** min_cardinalities;
+
+    /** Optional output for the upper bound on the documents in every range, inside @c arena. */
+    ustore_size_t const** max_cardinalities;
+
+    /** Optional output for the lower bound on the value bytes in every range, inside @c arena. */
+    ustore_size_t const** min_value_bytes;
+
+    /** Optional output for the upper bound on the value bytes in every range, inside @c arena. */
+    ustore_size_t const** max_value_bytes;
+
+    /** Optional output for the lower bound on the disk space every range takes, inside @c arena. */
+    ustore_size_t const** min_space_usages;
+
+    /** Optional output for the upper bound on the disk space every range takes, inside @c arena. */
+    ustore_size_t const** max_space_usages;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+} ustore_docs_measure_t;
+
+/**
+ *  @brief Estimates the documents and the space inside a batch of key ranges.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_device_k The arena lives where another executor computes.
+ *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
+ *    another call, the executor's deferred table is full, or a callback blocks on the executor
+ *    running it.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
+ *
+ *  @c ustore_status_invalid_argument_k means the @c arena or the @c collections are missing,
+ *  the @c direction is unknown, the @c view was made by neither view constructor or belongs
+ *  to another engine, a watching measure goes through a staged transaction, or a collection
+ *  holds another modality.
+ */
+USTORE_EXPORT void ustore_docs_measure(ustore_docs_measure_t* arguments);
 
 #ifdef __cplusplus
 }

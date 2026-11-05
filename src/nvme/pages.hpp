@@ -95,9 +95,16 @@ status_t pages_insert(ustore_pages_insert_t const& arguments, strings_arg_t cons
     });
 }
 
-/** Implements @c ustore_pages_remove, appending the removals of every page, or removing the pages Nil names. */
+/** Implements @c ustore_pages_remove, appending the removals of every page, removing the pages Nil
+ *  names, or every whole page of each range as one range tombstone. */
 template <cpu_class_t cpu_class_>
 status_t pages_remove(ustore_pages_remove_t const& arguments, view_t const& view) noexcept {
+    if (arguments.end_keys.data) {
+        if (arguments.elements.data)
+            return {status_code_t::invalid_argument_k, "A range removes whole pages, naming no elements"};
+        return remove_over_blobs<nvme_variant<cpu_class_>::values_verbs_k, &resolve_modality<cpu_class_>,
+                                 ustore_modality_pages_k>(arguments, view);
+    }
     return commit_page_edits<cpu_class_>(arguments, view, [&]() noexcept {
         return pages_remove_edits(nvme_variant<cpu_class_>::values_verbs_k, arguments, view);
     });

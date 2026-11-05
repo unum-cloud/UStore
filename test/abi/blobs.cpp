@@ -1166,6 +1166,156 @@ case_result_t database_freed_first(config_t const& config) {
 
 #pragma endregion Binary Modality
 
+#pragma region Bounded Ranges
+
+/** Writes the keys of the integers [0, 20) under "value" into both collections of @p compared. */
+std::size_t write_range_keys(compared_collections_t& compared) {
+    std::array<ustore_key_t, 20> const keys = keys_of_integers<20>(0);
+    std::size_t failures = 0;
+    for (std::size_t side = 0; side != 2; ++side)
+        failures += write_text(compared.databases[side], compared.collections[side], keys, "value");
+    return failures;
+}
+
+/** A scan stops before its end key and lists nothing when the end is not past the start. */
+std::size_t blobs_range_end_bound(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_keys(compared);
+    ustore_key_t const start = key_from_integer(5), end = key_from_integer(9), early = key_from_integer(3);
+    failures += expect_same_scan(ustore_blobs_scan, compared, {&start, &end, ustore_scan_ascending_k, 10},
+                                 keys_of_integers<4>(5));
+    failures += expect_same_scan(ustore_blobs_scan, compared, {&start, &end, ustore_scan_ascending_k, 3},
+                                 keys_of_integers<3>(5));
+    failures += expect_same_scan(ustore_blobs_scan, compared, {nullptr, &early, ustore_scan_ascending_k, 10},
+                                 keys_of_integers<3>(0));
+    failures += expect_same_scan(ustore_blobs_scan, compared, {&end, &start, ustore_scan_ascending_k, 10}, {});
+    return failures;
+}
+
+/** A descending scan lists its range largest first from the start key down to past the end key. */
+std::size_t blobs_range_descending(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_keys(compared);
+    ustore_key_t const start = key_from_integer(14), end = key_from_integer(4), late = key_from_integer(17);
+    failures += expect_same_scan(ustore_blobs_scan, compared, {&start, &end, ustore_scan_descending_k, 20},
+                                 keys_of_integers<10>(5, ustore_scan_descending_k));
+    failures += expect_same_scan(ustore_blobs_scan, compared, {&start, &end, ustore_scan_descending_k, 3},
+                                 keys_of_integers<3>(12, ustore_scan_descending_k));
+    failures += expect_same_scan(ustore_blobs_scan, compared, {nullptr, &late, ustore_scan_descending_k, 5},
+                                 keys_of_integers<2>(18, ustore_scan_descending_k));
+    failures += expect_same_scan(ustore_blobs_scan, compared, {&end, &start, ustore_scan_descending_k, 5}, {});
+    return failures;
+}
+
+/** A range removal removes the keys from each start up to its end, atomically with other ranges. */
+std::size_t blobs_range_remove(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_keys(compared);
+    std::array<ustore_key_t, 2> const starts {key_from_integer(3), key_from_integer(12)};
+    std::array<ustore_key_t, 2> const ends {key_from_integer(7), key_from_integer(14)};
+    failures += remove_ranges(ustore_blobs_remove, compared, starts, ends);
+    std::array<ustore_key_t, 14> const remaining {
+        key_from_integer(0),  key_from_integer(1),  key_from_integer(2),  key_from_integer(7),  key_from_integer(8),
+        key_from_integer(9),  key_from_integer(10), key_from_integer(11), key_from_integer(14), key_from_integer(15),
+        key_from_integer(16), key_from_integer(17), key_from_integer(18), key_from_integer(19)};
+    failures += expect_same_scan(ustore_blobs_scan, compared, {nullptr, nullptr, ustore_scan_ascending_k, 20},
+                                 remaining);
+    return failures;
+}
+
+/** A measure counts the keys of its range with the end excluded, in either direction. */
+std::size_t blobs_range_measure(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_keys(compared);
+    ustore_key_t const lower = key_from_integer(5), upper = key_from_integer(9);
+    failures += expect_measure_holds(ustore_blobs_measure, compared, {&lower, &upper, ustore_scan_ascending_k}, 4);
+    failures += expect_measure_holds(ustore_blobs_measure, compared, {&upper, &lower, ustore_scan_descending_k}, 4);
+    failures += expect_measure_holds(ustore_blobs_measure, compared, {&upper, nullptr, ustore_scan_descending_k}, 10);
+    failures += expect_measure_holds(ustore_blobs_measure, compared, {&upper, &lower, ustore_scan_ascending_k}, 0);
+    return failures;
+}
+
+/** A read with offsets and limits answers each value's byte range, clipped, and its length. */
+std::size_t blobs_byte_range_read(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_keys(compared);
+    std::array<ustore_key_t, 5> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3),
+                                            key_from_integer(4), key_from_integer(40)};
+    std::array<ustore_length_t, 5> const offsets {1, 0, 4, 9, 0};
+    std::array<ustore_length_t, 5> const limits {3, 2, 10, 1, 4};
+    std::array<std::string_view, 5> const pinned {"alu", "va", "e", "", ""};
+    for (std::size_t side = 0; side != 2; ++side) {
+        read_columns_t columns;
+        ustore_length_t const* lengths = nullptr;
+        ustore_outcome_t outcome {};
+        ustore_blobs_read_t read = read_of(compared.databases[side], compared.collections[side], keys, columns,
+                                           compared.arenas[side], outcome);
+        read.offsets = {offsets.data(), sizeof(ustore_length_t)};
+        read.limits = {limits.data(), sizeof(ustore_length_t)};
+        read.lengths = &lengths;
+        ustore_blobs_read(&read);
+        failures += expect_success(outcome);
+        if (outcome.status != ustore_status_success_k) continue;
+        failures += expect(lengths && columns.presences && tape_written(columns.values));
+        if (!lengths || !columns.presences || !tape_written(columns.values)) continue;
+        for (std::size_t index = 0; index != keys.size(); ++index) {
+            failures += expect_eq(columns.value(index), pinned[index]);
+            failures += expect_eq(static_cast<std::size_t>(lengths[index]), pinned[index].size());
+        }
+        failures += expect(!bits_view_t {columns.presences}[4]);
+    }
+    return failures;
+}
+
+/** A descending cursor with an end key pages its range largest first and stops past the end key. */
+std::size_t blobs_cursor_descending_end(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_keys(compared);
+    ustore_key_t const end = key_from_integer(8);
+    std::array<ustore_key_t, 9> const pinned = keys_of_integers<9>(9, ustore_scan_descending_k);
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_blobs_cursor_t cursor = nullptr;
+        ustore_outcome_t outcome {};
+        ustore_blobs_cursor_init_t init {};
+        init.cursor = &cursor;
+        init.database = compared.databases[side];
+        init.outcome = &outcome;
+        init.collection = compared.collections[side];
+        init.start_key = key_from_integer(17);
+        init.end_key = &end;
+        init.direction = ustore_scan_descending_k;
+        ustore_blobs_cursor_init(&init);
+        failures += expect_success(outcome);
+        if (outcome.status != ustore_status_success_k) continue;
+        std::size_t first = 0;
+        for (std::size_t const count : {4, 4, 1, 0}) {
+            pulled_keys_t pulled;
+            ustore_blobs_cursor_next_t next = pull_of(compared.databases[side], cursor, pulled, compared.arenas[side],
+                                                      4, outcome);
+            ustore_blobs_cursor_next(&next);
+            failures += expect_success(outcome);
+            failures += expect_page(pulled, std::span {pinned}.subspan(first, count), "value");
+            first += count;
+        }
+        ustore_blobs_cursor_free(cursor);
+    }
+    return failures;
+}
+
+#pragma endregion Bounded Ranges
+
 int main(int argc, char** argv) {
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -1212,5 +1362,11 @@ int main(int argc, char** argv) {
     report(totals, "database.write_conflicting", database_transaction_write_conflicting, config);
     report(totals, "database.transaction_stamps", database_transaction_stamps, config);
     report(totals, "database.freed_first", database_freed_first, config);
+    report(totals, "blobs.range_end_bound", blobs_range_end_bound, config);
+    report(totals, "blobs.range_descending", blobs_range_descending, config);
+    report(totals, "blobs.range_remove", blobs_range_remove, config);
+    report(totals, "blobs.range_measure", blobs_range_measure, config);
+    report(totals, "blobs.byte_range_read", blobs_byte_range_read, config);
+    report(totals, "blobs.cursor_descending_end", blobs_cursor_descending_end, config);
     return suite_exit_code(totals);
 }

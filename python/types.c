@@ -1447,6 +1447,7 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
     [ustore_py_enum_durability_k] = "Durability",
     [ustore_py_enum_drop_mode_k] = "DropMode",
     [ustore_py_enum_scan_mode_k] = "ScanMode",
+    [ustore_py_enum_scan_direction_k] = "ScanDirection",
     [ustore_py_enum_modality_k] = "Modality",
     [ustore_py_enum_isolation_k] = "Isolation",
     [ustore_py_enum_transport_k] = "Transport",
@@ -1461,6 +1462,7 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
     [ustore_py_enum_field_type_k] = "FieldType",
     [ustore_py_enum_modification_k] = "Modification",
     [ustore_py_enum_page_encoding_k] = "PageEncoding",
+    [ustore_py_enum_change_kind_k] = "ChangeKind",
 };
 
 /** Every enumerator of every closed set lies below this, as the C suite checks, so a walk up to it finds them all. */
@@ -1479,6 +1481,7 @@ static char const* enum_spelling(ustore_py_enum_t kind, int value) {
     case ustore_py_enum_durability_k: return ustore_durability_name((ustore_durability_t)value);
     case ustore_py_enum_drop_mode_k: return ustore_drop_mode_name((ustore_drop_mode_t)value);
     case ustore_py_enum_scan_mode_k: return ustore_scan_mode_name((ustore_scan_mode_t)value);
+    case ustore_py_enum_scan_direction_k: return ustore_scan_direction_name((ustore_scan_direction_t)value);
     case ustore_py_enum_modality_k: return ustore_modality_name((ustore_modality_t)value);
     case ustore_py_enum_isolation_k: return ustore_isolation_name((ustore_isolation_t)value);
     case ustore_py_enum_transport_k: return ustore_transport_name((ustore_transport_t)value);
@@ -1493,6 +1496,7 @@ static char const* enum_spelling(ustore_py_enum_t kind, int value) {
     case ustore_py_enum_field_type_k: return ustore_docs_field_type_name((ustore_docs_field_type_t)value);
     case ustore_py_enum_modification_k: return ustore_docs_modification_name((ustore_docs_modification_t)value);
     case ustore_py_enum_page_encoding_k: return ustore_page_encoding_name((ustore_page_encoding_t)value);
+    case ustore_py_enum_change_kind_k: return ustore_change_kind_name((ustore_change_kind_t)value);
     case ustore_py_enums_count_k: break;
     }
     return enum_unrecognized_k;
@@ -1600,6 +1604,31 @@ int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyO
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
             return -1;
         }
+    }
+    return 0;
+}
+
+int ustore_py_verb_keywords_from_arguments(ustore_py_context_t const* context, PyObject* const* arguments,
+                                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
+                                           char const* const* names, ustore_py_verb_options_t* options,
+                                           PyObject** values) {
+    ustore_py_verb_options_init(options);
+    for (size_t index = 0; names[index]; ++index) values[index] = NULL;
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    for (Py_ssize_t names_progress = 0, arguments_progress = positional_arguments_count;
+         names_progress != keyword_names_count; ++arguments_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[arguments_progress];
+        int const consumed = ustore_py_verb_option_from_keyword(context, name, value, options);
+        if (consumed < 0) return -1;
+        if (consumed > 0) continue;
+        size_t index = 0;
+        while (names[index] && PyUnicode_CompareWithASCIIString(name, names[index]) != 0) ++index;
+        if (!names[index]) {
+            PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
+            return -1;
+        }
+        values[index] = value == Py_None ? NULL : value;
     }
     return 0;
 }
@@ -2470,6 +2499,23 @@ static PyStructSequence_Desc measurement_description = {
     6,
 };
 
+PyTypeObject* ChangesType = NULL;
+
+static PyStructSequence_Field changes_fields[] = {
+    {"keys", "The Page of the key of every change, oldest change first."},
+    {"values", "The Values of the bytes every change carries when the pull asked for them, or None."},
+    {"stamps", "The stamp every change was committed at."},
+    {"kinds", "What every change did, as a ChangeKind."},
+    {NULL, NULL},
+};
+
+static PyStructSequence_Desc changes_description = {
+    "ustore.Changes",
+    "The changes one pull of a ChangesCursor answers, oldest first.",
+    changes_fields,
+    4,
+};
+
 PyTypeObject* DescriptionType = NULL;
 
 static PyStructSequence_Field description_fields[] = {
@@ -2561,9 +2607,10 @@ PyObject* ustore_py_gpu_devices(PyObject* Py_UNUSED(module), PyObject* Py_UNUSED
 int ustore_py_types_import(void) {
     if (!CapabilitiesType) CapabilitiesType = PyStructSequence_NewType(&capabilities_description);
     if (!MeasurementType) MeasurementType = PyStructSequence_NewType(&measurement_description);
+    if (!ChangesType) ChangesType = PyStructSequence_NewType(&changes_description);
     if (!DescriptionType) DescriptionType = PyStructSequence_NewType(&description_description);
     if (!GPUDeviceType) GPUDeviceType = PyStructSequence_NewType(&gpu_device_description);
-    return CapabilitiesType && MeasurementType && DescriptionType && GPUDeviceType ? 0 : -1;
+    return CapabilitiesType && MeasurementType && ChangesType && DescriptionType && GPUDeviceType ? 0 : -1;
 }
 
 #pragma endregion Module Types

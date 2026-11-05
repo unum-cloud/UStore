@@ -61,6 +61,7 @@ static struct {
     {"DocsJSONView", &DocsJSONViewType},
     {"Cursor", &CursorType},
     {"Page", &PageType},
+    {"ChangesCursor", &ChangesCursorType},
     {NULL, &SpanType},
 };
 
@@ -142,6 +143,7 @@ PyMODINIT_FUNC PyInit_lib(void) {
     if (PyModule_AddStringConstant(module, "__version__", USTORE_VERSION) < 0) goto failed;
     if (PyModule_AddObjectRef(module, "Capabilities", (PyObject*)CapabilitiesType) < 0) goto failed;
     if (PyModule_AddObjectRef(module, "Measurement", (PyObject*)MeasurementType) < 0) goto failed;
+    if (PyModule_AddObjectRef(module, "Changes", (PyObject*)ChangesType) < 0) goto failed;
     if (PyModule_AddObjectRef(module, "Description", (PyObject*)DescriptionType) < 0) goto failed;
     if (PyModule_AddObjectRef(module, "GPUDevice", (PyObject*)GPUDeviceType) < 0) goto failed;
     PyObject* const edge_id_default = ustore_py_uuid_to_object(&ustore_edge_id_default_k.uuid);

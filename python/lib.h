@@ -173,12 +173,16 @@ extern PyTypeObject DocsViewType;
 extern PyTypeObject DocsJSONViewType;
 extern PyTypeObject CursorType;
 extern PyTypeObject PageType;
+extern PyTypeObject ChangesCursorType;
 
 /** The named tuple of what an engine supports, built at module init as `ustore.Capabilities`. */
 extern PyTypeObject* CapabilitiesType;
 
 /** The named tuple of the bounds a measurement answers, built at module init as `ustore.Measurement`. */
 extern PyTypeObject* MeasurementType;
+
+/** The named tuple of one feed pull's changes, built at module init as @c ustore.Changes. */
+extern PyTypeObject* ChangesType;
 
 /** The named tuple of what an open database reports about itself, built at module init as `ustore.Description`. */
 extern PyTypeObject* DescriptionType;
@@ -194,7 +198,8 @@ PyObject* ustore_py_gpu_devices(PyObject* module, PyObject* arguments);
 extern char const ustore_py_gpu_devices_doc[];
 
 /**
- *  @brief Builds @c CapabilitiesType, @c MeasurementType, @c DescriptionType and @c GPUDeviceType.
+ *  @brief Builds @c CapabilitiesType, @c MeasurementType, @c ChangesType,
+ *      @c DescriptionType and @c GPUDeviceType.
  *  @return 0 on success, or -1 with an exception set.
  */
 int ustore_py_types_import(void);
@@ -208,6 +213,7 @@ typedef enum ustore_py_enum_t {
     ustore_py_enum_durability_k,
     ustore_py_enum_drop_mode_k,
     ustore_py_enum_scan_mode_k,
+    ustore_py_enum_scan_direction_k,
     ustore_py_enum_modality_k,
     ustore_py_enum_isolation_k,
     ustore_py_enum_transport_k,
@@ -222,6 +228,7 @@ typedef enum ustore_py_enum_t {
     ustore_py_enum_field_type_k,
     ustore_py_enum_modification_k,
     ustore_py_enum_page_encoding_k,
+    ustore_py_enum_change_kind_k,
     ustore_py_enums_count_k,
 } ustore_py_enum_t;
 
@@ -833,6 +840,18 @@ int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyO
                                          Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
                                          ustore_py_verb_options_t* options);
 
+/**
+ *  @brief Walks a verb's keywords, reading shared ones and borrowing those its own @p names lists.
+ *  @param[in] names The keywords of the verb's own, ended by NULL.
+ *  @param[out] options Where every shared keyword lands.
+ *  @param[out] values One borrowed value per name, NULL where it is missing or None.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+int ustore_py_verb_keywords_from_arguments(ustore_py_context_t const* context, PyObject* const* arguments,
+                                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple,
+                                           char const* const* names, ustore_py_verb_options_t* options,
+                                           PyObject** values);
+
 #pragma endregion Verb Options
 
 #pragma region Shared Helpers
@@ -1178,6 +1197,16 @@ PyObject* ustore_py_collection_subscript(PyObject* view, PyObject* name);
 
 #pragma region Verb Cores
 
+/** Whether a read runs to the end of every value or stops after a limit. */
+typedef enum ustore_py_read_extent_t {
+
+    /** Every value reads to its end. */
+    ustore_py_read_to_end_k = 0,
+
+    /** Every value reads at most the limit. */
+    ustore_py_read_limited_k = 1,
+} ustore_py_read_extent_t;
+
 /** A read of the values or the documents of a batch of keys, which its caller gathers in place. */
 typedef struct ustore_py_read_call_t {
 
@@ -1192,6 +1221,15 @@ typedef struct ustore_py_read_call_t {
 
     /** The UTF-8 bytes @c field caches, which the accessor repeats for every key. */
     ustore_bytes_view_t field_view;
+
+    /** Byte offset into every value the read starts at, which zero leaves whole. */
+    ustore_length_t offset;
+
+    /** Bytes of every value to read from @c offset, used when @c extent says it is limited. */
+    ustore_length_t limit;
+
+    /** Whether @c limit clips every value, or the read runs to the end of each. */
+    ustore_py_read_extent_t extent;
 
     /** The one key a subscript named, held, whose absence raises @c KeyError, or NULL for a batch. */
     PyObject* subscript;
@@ -1292,12 +1330,25 @@ typedef struct ustore_py_remove_call_t {
     /** What the call keeps until it finishes. */
     ustore_py_call_t call;
 
-    /** The keys to remove. */
+    /** The keys to remove, or the inclusive starts of ranges when @c ends holds any. */
     ustore_py_keys_t keys;
+
+    /** The exclusive ends of the ranges to remove, one per key, or empty to remove keys alone. */
+    ustore_py_keys_t ends;
 } ustore_py_remove_call_t;
 
 /** How a removal runs. */
 extern ustore_py_verb_t const ustore_py_remove_verb;
+
+/**
+ *  @brief Gathers a batch's exclusive range ends, one key or one per start, as @p starts were.
+ *  @param[in] object The ends, or NULL for none, which leaves @p ends empty.
+ *  @return 0 on success, -1 with an exception set when they fail to read or count unlike @p starts.
+ */
+int ustore_py_ends_from_object(PyObject* object, ustore_py_keys_t const* starts, ustore_py_keys_t* ends);
+
+/** The view of @p ends, or a zeroed one when it holds none. */
+ustore_keys_view_t ustore_py_ends_view(ustore_py_keys_t const* ends);
 
 /**
  *  @brief Removes the keys gathered into @p call with their values, or the documents when @p modality is docs: the
@@ -1337,6 +1388,12 @@ PyObject* ustore_py_keys_sample(ustore_py_context_t const* context, ustore_py_ve
  *  body of `sample` and `docs_sample`, whose name @p name spells. */
 PyObject* ustore_py_api_sample_of(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                   PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality);
+
+/** Parses the arguments of one measurement, as @c measure takes them, and runs it through the
+ *  measurement of @p modality: the body of @c measure, @c docs_measure, @c pages_measure and
+ *  @c graph_measure_vertices, whose name @p name spells. */
+PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality);
 
 /** How a write takes its documents. */
 typedef enum ustore_py_documents_spelling_t {
@@ -1421,6 +1478,7 @@ extern char const doc_docs_gather[];
 extern char const doc_docs_remove[];
 extern char const doc_docs_scan[];
 extern char const doc_docs_sample[];
+extern char const doc_docs_measure[];
 extern char const doc_graph_read_edges[];
 extern char const doc_graph_degrees[];
 extern char const doc_graph_contains[];
@@ -1429,6 +1487,8 @@ extern char const doc_graph_remove_edges[];
 extern char const doc_graph_write_vertices[];
 extern char const doc_graph_remove_vertices[];
 extern char const doc_graph_scan_vertices[];
+extern char const doc_graph_sample_vertices[];
+extern char const doc_graph_measure_vertices[];
 extern char const doc_pages_import[];
 extern char const doc_pages_insert[];
 extern char const doc_pages_remove[];
@@ -1438,7 +1498,10 @@ extern char const doc_pages_set_attributes[];
 extern char const doc_pages_remove_attributes[];
 extern char const doc_pages_read[];
 extern char const doc_pages_scan[];
+extern char const doc_pages_sample[];
+extern char const doc_pages_measure[];
 extern char const doc_pages_cursor[];
+extern char const doc_changes_cursor[];
 extern char const doc_import_arrow[];
 extern char const doc_ingest_arrow[];
 
@@ -1462,6 +1525,8 @@ PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* a
                                               Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_cursor(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_changes_cursor(PyObject* self, PyObject* const* arguments,
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_get(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                             PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_set(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -1484,6 +1549,8 @@ PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* arguments, Py
                                   PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_docs_measure(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* arguments,
                                          Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -1500,6 +1567,10 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
                                               Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* arguments,
                                             Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_sample_vertices(PyObject* self, PyObject* const* arguments,
+                                              Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_graph_measure_vertices(PyObject* self, PyObject* const* arguments,
+                                               Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_pages_import(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                      PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -1518,6 +1589,10 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
                                    PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_pages_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                    PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_sample(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_pages_measure(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                      PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_pages_cursor(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                      PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,

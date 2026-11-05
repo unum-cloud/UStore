@@ -496,8 +496,11 @@ typedef struct vertices_write_call_t {
     /** What the call keeps until it finishes. */
     ustore_py_call_t call;
 
-    /** The vertices to write or remove. */
+    /** The vertices to write or remove, or inclusive starts of ranges when @c ends holds any. */
     ustore_py_keys_t vertices;
+
+    /** Exclusive ends of vertex ranges to remove, one per vertex, or empty for vertices alone. */
+    ustore_py_keys_t ends;
 
     /** The role every removed vertex plays. */
     ustore_vertex_role_t role;
@@ -514,6 +517,7 @@ static void vertices_remove_submit(void* arguments) {
 static void vertices_write_release(void* erased) {
     vertices_write_call_t* const call = (vertices_write_call_t*)erased;
     ustore_py_keys_release(&call->vertices);
+    ustore_py_keys_release(&call->ends);
     ustore_py_call_release(&call->call);
 }
 
@@ -557,13 +561,17 @@ PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* ar
 }
 
 char const doc_graph_remove_vertices[] =                                                         //
-    "graph_remove_vertices(vertices, *, role=Role.ANY, collection,\n"                            //
+    "graph_remove_vertices(vertices, *, role=Role.ANY, collection, ends=None,\n"                 //
     "                      durability=Durability.BUFFERED) answers None.\n"                      //
     "\n"                                                                                         //
-    "Removes a batch of vertices together with every edge they take part in.\n"                  //
+    "Removes a batch of vertices together with every edge they take part in. With `ends`,\n"     //
+    "every vertex starts a range removed up to its end, as `remove` takes them.\n"               //
     "\n"                                                                                         //
     "Args:\n"                                                                                    //
-    "  vertices (Sequence[KeyLike] | buffer): The vertices to remove.\n"                         //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices to remove, or the first vertex of\n"  //
+    "    every range.\n"                                                                         //
+    "  ends (Sequence[KeyLike] | buffer, optional): The vertex every range stops before, one\n"  //
+    "    per vertex.\n"                                                                          //
     "  role (Role, optional): The role every vertex plays, which only a joining graph between\n" //
     "    two collections needs; `Role.ANY` otherwise.\n"                                         //
     "  collection (UUID | str): The graph collection, by identifier or by name.\n"               //
@@ -574,18 +582,25 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
                                               Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
-    ustore_py_verb_options_t options;
-    ustore_vertex_role_t role = ustore_vertex_role_any_k;
-    if (role_options_from_keywords(&context, "graph_remove_vertices", arguments, positional_arguments_count,
-                                   keyword_names_tuple, 1, &options, &role) != 0)
+    if (ustore_py_keyword_names_count_checked("graph_remove_vertices", positional_arguments_count, keyword_names_tuple,
+                                              1) < 0)
         return NULL;
+    static char const* const names[] = {"role", "ends", NULL};
+    PyObject* given[2];
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_keywords_from_arguments(&context, arguments, positional_arguments_count, keyword_names_tuple,
+                                               names, &options, given) != 0)
+        return NULL;
+    int role = ustore_vertex_role_any_k;
+    if (given[0] && ustore_py_enum_from_object(given[0], "role", ustore_py_enum_role_k, &role) != 0) return NULL;
 
     vertices_write_call_t stack;
     vertices_write_call_t* const call = ustore_py_call_open(&context, &vertices_remove_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0)
+    if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0 ||
+        ustore_py_ends_from_object(given[1], &call->vertices, &call->ends) != 0)
         return ustore_py_call_discard(&context, &vertices_remove_verb, call);
-    call->role = role;
+    call->role = (ustore_vertex_role_t)role;
     call->call.collection = options.collection;
     ustore_graph_remove_vertices_t remove = {
         .database = context.database_handle,
@@ -596,6 +611,7 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
         .count = call->vertices.count,
         .collections = {&call->call.collection, 0},
         .vertices = {call->vertices.keys, sizeof(ustore_key_t)},
+        .end_vertices = ustore_py_ends_view(&call->ends),
         .roles = {&call->role, 0},
         .durability = options.durability,
         .watch = context.watch,
@@ -603,30 +619,58 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
     return ustore_py_call_run(&context, &vertices_remove_verb, call, &remove);
 }
 
-char const doc_graph_scan_vertices[] =                                                                 //
-    "graph_scan_vertices(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)\n" //
-    "answers a Keys tape.\n"                                                                           //
-    "\n"                                                                                               //
-    "Lists up to `wanted` vertices from `start` upwards, those without edges included.\n"              //
-    "Edges are not exported, so a `graph_read_edges` follows the scan.\n"                              //
-    "\n"                                                                                               //
-    "Args:\n"                                                                                          //
-    "  start (KeyLike): The smallest vertex the scan may return.\n"                                    //
-    "  wanted (int): Most vertices the scan returns.\n"                                                //
-    "  arena (Arena): Where the vertices land, rewound by this call.\n"                                //
-    "  collection (UUID | str): The graph collection, by identifier or by name.\n"                     //
-    "  mode (ScanMode, optional): In what order the vertices come, as `scan` takes it.\n"              //
-    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"                //
-    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"            //
-    "Returns:\n"                                                                                       //
-    "  Keys: One run of vertices, in ascending order.\n"                                               //
-    "Raises:\n"                                                                                        //
+char const doc_graph_scan_vertices[] =                                                          //
+    "graph_scan_vertices(start, wanted, arena, *, collection, end=None,\n"                      //
+    "direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)\n"                //
+    "answers a Keys tape.\n"                                                                    //
+    "\n"                                                                                        //
+    "Lists up to `wanted` vertices from `start` towards `end`, those without edges included.\n" //
+    "Edges are not exported, so a `graph_read_edges` follows the scan.\n"                       //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  start (KeyLike | None): The first vertex the scan may return, or None for the first\n"   //
+    "    vertex in its direction.\n"                                                            //
+    "  wanted (int): Most vertices the scan returns.\n"                                         //
+    "  arena (Arena): Where the vertices land, rewound by this call.\n"                         //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"              //
+    "  end (KeyLike, optional): The vertex the scan stops before, or None for no bound.\n"      //
+    "  direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.\n"    //
+    "  mode (ScanMode, optional): In what order the vertices come, as `scan` takes it.\n"       //
+    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"         //
+    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"     //
+    "Returns:\n"                                                                                //
+    "  Keys: One run of vertices, in the order of the direction.\n"                             //
+    "Raises:\n"                                                                                 //
     "  CancelledError: The progress callable stopped the scan.";
 
 PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* arguments,
                                             Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     return ustore_py_api_scan_of(self, arguments, positional_arguments_count, keyword_names_tuple,
                                  "graph_scan_vertices", ustore_modality_graph_k);
+}
+
+char const doc_graph_sample_vertices[] =                                                  //
+    "graph_sample_vertices(wanted, arena, *, collection) answers a Keys tape.\n"          //
+    "\n"                                                                                  //
+    "Draws vertices uniformly at random from one graph collection, those without edges\n" //
+    "included, as `sample` draws the keys of blobs.";
+
+PyObject* ustore_py_api_graph_sample_vertices(PyObject* self, PyObject* const* arguments,
+                                              Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    return ustore_py_api_sample_of(self, arguments, positional_arguments_count, keyword_names_tuple,
+                                   "graph_sample_vertices", ustore_modality_graph_k);
+}
+
+char const doc_graph_measure_vertices[] =                                                           //
+    "graph_measure_vertices(start, end, arena, *, collection, direction=ScanDirection.ASCENDING)\n" //
+    "answers a Measurement.\n"                                                                      //
+    "\n"                                                                                            //
+    "Estimates what a range of vertices holds without walking it, as `measure` does for blobs.";
+
+PyObject* ustore_py_api_graph_measure_vertices(PyObject* self, PyObject* const* arguments,
+                                               Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    return ustore_py_api_measure_of(self, arguments, positional_arguments_count, keyword_names_tuple,
+                                    "graph_measure_vertices", ustore_modality_graph_k);
 }
 
 #pragma endregion Vertices

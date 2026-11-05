@@ -54,7 +54,7 @@
 #include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`
 
-#include "engine.hpp"             // `blobs_verbs<home_t::host_k>`, `view_t`
+#include "engine.hpp"             // `blobs_verbs<home_t::host_k>`, `view_t`, `remove_over_blobs`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `places_of`, `validate_remove`
 #include "utilities/outputs.hpp"  // `read_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
@@ -707,6 +707,11 @@ status_t pages_insert_over_blobs(ustore_pages_insert_t const& arguments, strings
 
 template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
 status_t pages_remove_over_blobs(ustore_pages_remove_t const& arguments, view_t const& view) noexcept {
+    if (arguments.end_keys.data) {
+        if (arguments.elements.data)
+            return {status_code_t::invalid_argument_k, "A range of pages is removed whole, with no elements"};
+        return remove_over_blobs<values_verbs_, resolve_, ustore_modality_pages_k>(arguments, view);
+    }
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_pages_k, view);
     if (resolved.failed()) return resolved;

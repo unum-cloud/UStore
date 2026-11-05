@@ -157,6 +157,332 @@ struct sorted_run_extents_t {
     utilities::uuid_t run {};
 };
 
+/** The keys from @c start up to @c end, exclusive, which one range removal hides. */
+template <typename stored_key_type_>
+struct range_tombstone {
+
+    /** The first key hidden. */
+    stored_key_type_ start {};
+
+    /** The key past the last one hidden. */
+    stored_key_type_ end {};
+
+    /** Whether @p stored_key falls between the bounds. */
+    [[nodiscard]] constexpr bool covers(stored_key_type_ const& stored_key) const noexcept {
+        return !(stored_key < start) && stored_key < end;
+    }
+};
+
+/**
+ *  @brief The range tombstones of one run, ascending by start: each one's bounds and the stamp of
+ *      the commit that removed them, two columns beside the run's deltas.
+ *
+ *  A run holds few of them, so a lookup scans every tombstone starting at or below its key. Every
+ *  stamp is raw, never raised to a floor, as a reader compares it to the stamp it reads at.
+ */
+template <typename stored_key_type_, typename allocator_type_ = st::default_allocator<byte_t>>
+class range_tombstones {
+  public:
+    using stored_key_t = stored_key_type_;
+    using allocator_t = allocator_type_;
+    using range_t = range_tombstone<stored_key_t>;
+
+    range_tombstones() noexcept = default;
+    range_tombstones(range_tombstones&&) noexcept = default;
+    range_tombstones& operator=(range_tombstones&&) noexcept = default;
+    range_tombstones(range_tombstones const&) = delete;
+    range_tombstones& operator=(range_tombstones const&) = delete;
+
+    /**
+     *  @brief Copies @p ranges sorted by start, each stamped by its entry of @p stamps.
+     *
+     *  @par Statuses:
+     *  - @c invalid_argument_k Spans of unequal lengths, or a range ending at or before its start.
+     *  - @c out_of_memory_k A column could not be allocated.
+     */
+    static expected<range_tombstones> make(std::span<range_t const> ranges, std::span<std::uint64_t const> stamps,
+                                           allocator_t allocator = {}) noexcept {
+        if (ranges.size() != stamps.size())
+            return status_t {status_code_t::invalid_argument_k, "One stamp per range tombstone"};
+        range_tombstones made {allocator};
+        if (made.ranges_.resize(ranges.size()) != st::status_t::success_k ||
+            made.stamps_.resize(ranges.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for range tombstones"};
+        for (std::size_t index = 0; index != ranges.size(); ++index) {
+            if (!(ranges[index].start < ranges[index].end))
+                return status_t {status_code_t::invalid_argument_k, "A range tombstone ends at or before its start"};
+            // Few tombstones arrive at once, so an insertion keeps both columns in step.
+            std::size_t at = index;
+            for (; at != 0 && ranges[index].start < made.ranges_[at - 1].start; --at) {
+                made.ranges_[at] = made.ranges_[at - 1];
+                made.stamps_[at] = made.stamps_[at - 1];
+            }
+            made.ranges_[at] = ranges[index];
+            made.stamps_[at] = stamps[index];
+        }
+        return made;
+    }
+
+    /** Tombstones held. */
+    [[nodiscard]] std::size_t size() const noexcept { return ranges_.size(); }
+
+    /** Whether no tombstone is held. */
+    [[nodiscard]] bool empty() const noexcept { return ranges_.empty(); }
+
+    /** Every tombstone's bounds, ascending by start. */
+    [[nodiscard]] std::span<range_t const> ranges() const noexcept { return ranges_; }
+
+    /** The stamp of every tombstone, in the order of @c ranges. */
+    [[nodiscard]] std::span<std::uint64_t const> stamps() const noexcept { return stamps_; }
+
+    /** The bounds of tombstone @p index. */
+    [[nodiscard]] range_t const& range(std::size_t index) const noexcept { return ranges_[index]; }
+
+    /** The stamp of tombstone @p index. */
+    [[nodiscard]] std::uint64_t stamp(std::size_t index) const noexcept { return stamps_[index]; }
+
+    /** Bytes both columns take. */
+    [[nodiscard]] std::uint64_t bytes() const noexcept {
+        return std::uint64_t {ranges_.size()} * (sizeof(range_t) + sizeof(std::uint64_t));
+    }
+
+    /** Stamps every tombstone with the commit's @p stamp, into columns already allocated. */
+    void assign_stamp(std::uint64_t stamp) noexcept {
+        for (std::uint64_t& held : stamps_) held = stamp;
+    }
+
+    /** The newest stamp a tombstone carries, or zero for none. */
+    [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
+        std::uint64_t newest = 0;
+        for (std::uint64_t const stamp : stamps_) newest = stamp > newest ? stamp : newest;
+        return newest;
+    }
+
+    /** The least stamp above @p stamp of a tombstone covering @p stored_key, or zero for
+     *  none, which decides whether any reader still tells a version stamped @p stamp apart
+     *  from its removal. */
+    [[nodiscard]] std::uint64_t covering_stamp_above(stored_key_t const& stored_key,
+                                                     std::uint64_t stamp) const noexcept {
+        std::uint64_t covering = 0;
+        for (std::size_t index = 0; index != ranges_.size() && !(stored_key < ranges_[index].start); ++index)
+            if (stored_key < ranges_[index].end && stamps_[index] > stamp &&
+                (covering == 0 || stamps_[index] < covering))
+                covering = stamps_[index];
+        return covering;
+    }
+
+    /** The newest stamp up to @p at of a tombstone covering @p stored_key, or zero for none. */
+    [[nodiscard]] std::uint64_t covering_stamp(stored_key_t const& stored_key, std::uint64_t at) const noexcept {
+        std::uint64_t covering = 0;
+        for (std::size_t index = 0; index != ranges_.size() && !(stored_key < ranges_[index].start); ++index)
+            if (stored_key < ranges_[index].end && stamps_[index] <= at && stamps_[index] > covering)
+                covering = stamps_[index];
+        return covering;
+    }
+
+    /** Whether a tombstone newer than @p from hides a key from @p lower to @p upper inclusive. */
+    [[nodiscard]] bool overlaps_since(stored_key_t const& lower, stored_key_t const& upper,
+                                      std::uint64_t from) const noexcept {
+        for (std::size_t index = 0; index != ranges_.size() && !(upper < ranges_[index].start); ++index)
+            if (lower < ranges_[index].end && stamps_[index] > from) return true;
+        return false;
+    }
+
+    /** The least key a tombstone hides, or the greatest key of the type for none. */
+    [[nodiscard]] stored_key_t lower_stored_key() const noexcept {
+        return ranges_.empty() ? limit<stored_key_t>::max() : ranges_[0].start;
+    }
+
+    /** The greatest key a tombstone hides, or the least key of the type for none. */
+    [[nodiscard]] stored_key_t upper_stored_key() const noexcept {
+        stored_key_t upper = limit<stored_key_t>::min();
+        for (range_t const& range : ranges_)
+            if (upper < stored_key_before(range.end)) upper = stored_key_before(range.end);
+        return upper;
+    }
+
+  private:
+    using ranges_column_t =
+        st::vector<range_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<range_t>>;
+    using stamps_column_t =
+        st::vector<std::uint64_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint64_t>>;
+
+    explicit range_tombstones(allocator_t const& allocator) noexcept
+        : ranges_(typename ranges_column_t::allocator_t(allocator)),
+          stamps_(typename stamps_column_t::allocator_t(allocator)) {}
+
+    /** The bounds, ascending by start. */
+    ranges_column_t ranges_;
+
+    /** The stamp of every tombstone, in the order of @c ranges_. */
+    stamps_column_t stamps_;
+};
+
+/** The strings from @c start up to @c end, exclusive, which one range removal hides, an empty
+ *  @c end reaching past the last string; both view the bytes of whoever holds the tombstone. */
+template <>
+struct range_tombstone<std::string_view> {
+
+    /** The first string hidden. */
+    std::string_view start;
+
+    /** The string past the last one hidden, or empty for none. */
+    std::string_view end;
+
+    /** Whether @p text falls between the bounds. */
+    [[nodiscard]] constexpr bool covers(std::string_view text) const noexcept {
+        return !(text < start) && (end.empty() || text < end);
+    }
+
+    /** Whether the bounds hide a string from @p lower to @p upper inclusive. */
+    [[nodiscard]] constexpr bool overlaps(std::string_view lower, std::string_view upper) const noexcept {
+        return !(upper < start) && (end.empty() || lower < end);
+    }
+};
+
+/**
+ *  @brief The range tombstones of one run of strings, ascending by start: each one's bounds, copied
+ *      onto a tape the tombstones own, and the raw stamp of the commit that removed them.
+ *
+ *  A run holds few of them, so a lookup scans every tombstone starting at or below its string.
+ */
+template <typename allocator_type_>
+class range_tombstones<std::string_view, allocator_type_> {
+  public:
+    using stored_key_t = std::string_view;
+    using allocator_t = allocator_type_;
+    using range_t = range_tombstone<std::string_view>;
+
+    range_tombstones() noexcept = default;
+    range_tombstones(range_tombstones&&) noexcept = default;
+    range_tombstones& operator=(range_tombstones&&) noexcept = default;
+    range_tombstones(range_tombstones const&) = delete;
+    range_tombstones& operator=(range_tombstones const&) = delete;
+
+    /**
+     *  @brief Copies @p ranges and their bytes, the one at each index stamped by @p stamps at the
+     *      same index, sorted by start.
+     *
+     *  @par Statuses:
+     *  - @c invalid_argument_k Spans of unequal lengths, or a range ending at or before its start.
+     *  - @c out_of_memory_k A column could not be allocated.
+     */
+    static expected<range_tombstones> make(std::span<range_t const> ranges, std::span<std::uint64_t const> stamps,
+                                           allocator_t allocator = {}) noexcept {
+        if (ranges.size() != stamps.size())
+            return status_t {status_code_t::invalid_argument_k, "One stamp per range tombstone"};
+        std::size_t tape_bytes = 0;
+        for (range_t const& range : ranges) {
+            if (!range.end.empty() && !(range.start < range.end))
+                return status_t {status_code_t::invalid_argument_k, "A range tombstone ends at or before its start"};
+            tape_bytes += range.start.size() + range.end.size();
+        }
+        range_tombstones made {allocator};
+        if (made.ranges_.resize(ranges.size()) != st::status_t::success_k ||
+            made.stamps_.resize(ranges.size()) != st::status_t::success_k ||
+            made.tape_.resize(tape_bytes) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for range tombstones"};
+        std::size_t written = 0;
+        auto const copied = [&](std::string_view text) noexcept {
+            if (!text.empty()) std::memcpy(made.tape_.data() + written, text.data(), text.size());
+            std::string_view const kept {made.tape_.data() + written, text.size()};
+            written += text.size();
+            return kept;
+        };
+        for (std::size_t index = 0; index != ranges.size(); ++index) {
+            range_t const range {copied(ranges[index].start), copied(ranges[index].end)};
+            std::size_t at = index;
+            for (; at != 0 && range.start < made.ranges_[at - 1].start; --at) {
+                made.ranges_[at] = made.ranges_[at - 1];
+                made.stamps_[at] = made.stamps_[at - 1];
+            }
+            made.ranges_[at] = range;
+            made.stamps_[at] = stamps[index];
+        }
+        return made;
+    }
+
+    /** Tombstones held. */
+    [[nodiscard]] std::size_t size() const noexcept { return ranges_.size(); }
+
+    /** Whether no tombstone is held. */
+    [[nodiscard]] bool empty() const noexcept { return ranges_.empty(); }
+
+    /** Every tombstone's bounds, ascending by start, viewing the tape. */
+    [[nodiscard]] std::span<range_t const> ranges() const noexcept { return ranges_; }
+
+    /** The stamp of every tombstone, in the order of @c ranges. */
+    [[nodiscard]] std::span<std::uint64_t const> stamps() const noexcept { return stamps_; }
+
+    /** The bounds of tombstone @p index. */
+    [[nodiscard]] range_t const& range(std::size_t index) const noexcept { return ranges_[index]; }
+
+    /** The stamp of tombstone @p index. */
+    [[nodiscard]] std::uint64_t stamp(std::size_t index) const noexcept { return stamps_[index]; }
+
+    /** Bytes the bounds and the stamps take, the tape's included. */
+    [[nodiscard]] std::uint64_t bytes() const noexcept {
+        return std::uint64_t {ranges_.size()} * (sizeof(range_t) + sizeof(std::uint64_t)) + tape_.size();
+    }
+
+    /** Stamps every tombstone with @p stamp, the commit's, into columns already allocated. */
+    void assign_stamp(std::uint64_t stamp) noexcept {
+        for (std::uint64_t& held : stamps_) held = stamp;
+    }
+
+    /** The newest stamp a tombstone carries, or zero for none. */
+    [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
+        std::uint64_t newest = 0;
+        for (std::uint64_t const stamp : stamps_) newest = stamp > newest ? stamp : newest;
+        return newest;
+    }
+
+    /** The least stamp above @p stamp of a tombstone covering @p text, or zero for none. */
+    [[nodiscard]] std::uint64_t covering_stamp_above(std::string_view text, std::uint64_t stamp) const noexcept {
+        std::uint64_t covering = 0;
+        for (std::size_t index = 0; index != ranges_.size() && !(text < ranges_[index].start); ++index)
+            if (ranges_[index].covers(text) && stamps_[index] > stamp && (covering == 0 || stamps_[index] < covering))
+                covering = stamps_[index];
+        return covering;
+    }
+
+    /** The newest stamp at or below @p at of a tombstone covering @p text, or zero for none. */
+    [[nodiscard]] std::uint64_t covering_stamp(std::string_view text, std::uint64_t at) const noexcept {
+        std::uint64_t covering = 0;
+        for (std::size_t index = 0; index != ranges_.size() && !(text < ranges_[index].start); ++index)
+            if (ranges_[index].covers(text) && stamps_[index] <= at && stamps_[index] > covering)
+                covering = stamps_[index];
+        return covering;
+    }
+
+    /** Whether a tombstone newer than @p from hides a string in @p lower to @p upper inclusive. */
+    [[nodiscard]] bool overlaps_since(std::string_view lower, std::string_view upper,
+                                      std::uint64_t from) const noexcept {
+        for (std::size_t index = 0; index != ranges_.size(); ++index)
+            if (ranges_[index].overlaps(lower, upper) && stamps_[index] > from) return true;
+        return false;
+    }
+
+  private:
+    template <typename value_type_>
+    using column =
+        st::vector<value_type_, typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>>;
+
+    explicit range_tombstones(allocator_t const& allocator) noexcept
+        : ranges_(typename column<range_t>::allocator_t(allocator)),
+          stamps_(typename column<std::uint64_t>::allocator_t(allocator)),
+          tape_(typename column<char>::allocator_t(allocator)) {}
+
+    /** The bounds, ascending by start, viewing @c tape_. */
+    column<range_t> ranges_;
+
+    /** The stamp of every tombstone, in the order of @c ranges_. */
+    column<std::uint64_t> stamps_;
+
+    /** The bytes of every bound, which a move hands over unmoved. */
+    column<char> tape_;
+};
+
 /** The key slots of one sorted run in sorted order, and the stamp and kind of every one. */
 template <typename key_slot_type_>
 struct sorted_run_index_view {
@@ -182,6 +508,9 @@ struct sorted_run_index_view {
 
     /** The saved tree of the run's keys, which a view without @c cells reads key slots through. */
     st::immutable_splus_tree_view<typename key_slot_type_::stored_key_t> const* keys = nullptr;
+
+    /** The run's range tombstones, or null for none, which only the host compactor reads. */
+    blobs::range_tombstones<typename key_slot_type_::stored_key_t> const* range_tombstones = nullptr;
 };
 
 /** One version a merge of strings carries: its source run and its sorted position there. */
@@ -534,6 +863,63 @@ constexpr bool survives(located_tailed_key_slot<key_slot_type_> const* previous,
                         compaction_stamps_t const& stamps) noexcept {
     bool const shares_key = previous != nullptr && same_key(*previous, current);
     return survives(shares_key ? &previous->located : nullptr, current.located, kind, stamps);
+}
+
+/** Whether a source of @p upper or @p lower has a range tombstone, keeping a merge on the host. */
+template <typename key_slot_type_>
+bool carries_range_tombstones(std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                              std::span<sorted_run_index_view<key_slot_type_> const> lower) noexcept {
+    for (sorted_run_index_view<key_slot_type_> const& view : upper)
+        if (view.range_tombstones != nullptr && !view.range_tombstones->empty()) return true;
+    for (sorted_run_index_view<key_slot_type_> const& view : lower)
+        if (view.range_tombstones != nullptr && !view.range_tombstones->empty()) return true;
+    return false;
+}
+
+/**
+ *  @brief Whether a range tombstone of the sources @p upper and @p lower hides @p record from every
+ *      reader of @p stamps, so a merge drops it.
+ *
+ *  A tombstone of a newer source, or of the record's own source stamped above it, hides the
+ *  record. A merge raises a version's stamp to its floor while a tombstone keeps its own, so a
+ *  record of an older source stamped at or above the tombstone was raised past it, where no reader
+ *  tells the two apart; any other the tombstone hides from every reader once none reads between
+ *  them. A tombstone above the horizon, which a mount may drop, or above the ceiling, which this
+ *  merge drops, hides nothing.
+ */
+template <typename key_slot_type_>
+bool hidden_by_range(std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                     std::span<sorted_run_index_view<key_slot_type_> const> lower,
+                     located_key_slot<key_slot_type_> const& record, compaction_stamps_t const& stamps) noexcept {
+    std::size_t const upper_count = upper.size();
+    for (std::size_t source = 0; source != upper.size() + lower.size(); ++source) {
+        auto const* const tombstones = source < upper_count ? upper[source].range_tombstones
+                                                            : lower[source - upper_count].range_tombstones;
+        if (tombstones == nullptr || tombstones->empty()) continue;
+        bool const own = source == record.sorted_run;
+        bool const newer = source < upper_count && (record.sorted_run >= upper_count || source > record.sorted_run);
+        if (!own && !newer) continue;
+        auto const ranges = tombstones->ranges();
+        for (std::size_t index = 0; index != ranges.size() && !(record.key_slot.stored_key < ranges[index].start);
+             ++index) {
+            std::uint64_t const stamp = tombstones->stamp(index);
+            if (!ranges[index].covers(record.key_slot.stored_key) || stamp > stamps.ceiling || stamp > stamps.horizon)
+                continue;
+            if (own && stamp <= record.stamp) continue;
+            if (record.stamp >= stamp || reader_interval(stamps, record.stamp) == reader_interval(stamps, stamp))
+                return true;
+        }
+    }
+    return false;
+}
+
+/** Whether a merge of @p kind writing @p stamps drops a range tombstone stamped @p stamp: one above
+ *  the ceiling, or one at the bottom that every reader reads at or above, once nothing older is
+ *  left for it to hide. */
+constexpr bool drops_range_tombstone(compaction_kind_t kind, compaction_stamps_t const& stamps,
+                                     std::uint64_t stamp) noexcept {
+    if (stamp > stamps.ceiling) return true;
+    return writes_bottom(kind) && stamp <= stamps.horizon && reader_interval(stamps, stamp) == stamps.pinned_count;
 }
 
 /** Bytes the value at sorted @p position takes in its run's values section: through @p value_offsets where the run
@@ -1089,6 +1475,20 @@ struct host_compactor_t {
         // One merge path joins the upper and lower runs, and the survivors move back
         merge_ranges(records.data(), 0, upper_key_slots, merged_count, scratch.data(), order);
 
+        // A version a range tombstone hides turns into a removal, so the versions below drop
+        // and a change folds onto nothing, and then drops itself, as the tombstone stays with
+        // the new runs.
+        vector<std::uint8_t> hidden;
+        if (carries_range_tombstones(upper, lower)) {
+            status = hidden.resize(merged_count);
+            if (status != status_t::success_k) return status;
+            for (std::uint64_t index = 0; index != merged_count; ++index) {
+                located_key_slot<key_slot_type_>& record = located_of(scratch[index]);
+                hidden[index] = hidden_by_range(upper, lower, record, stamps) ? 1 : 0;
+                if (hidden[index]) record.kind = delta_kind_t::remove_k;
+            }
+        }
+
         // Survival settles before any fold, so a fold sees every version dropped behind its change
         vector<std::uint8_t> kept;
         status = kept.resize(merged_count);
@@ -1111,7 +1511,7 @@ struct host_compactor_t {
         };
         std::uint64_t survivors = 0;
         for (std::uint64_t index = 0; index != merged_count; ++index) {
-            if (!kept[index]) continue;
+            if (!kept[index] || (!hidden.empty() && hidden[index])) continue;
             record_t& survivor = records[survivors++];
             survivor = scratch[index];
             if (located_of(survivor).kind != delta_kind_t::change_k) continue;

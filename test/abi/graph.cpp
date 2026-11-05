@@ -19,7 +19,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "abi/fixture.hpp" // `edge_of`
+#include "abi/fixture.hpp" // `edge_of`, `open_compared`, `expect_same_scan`
 #include "harness.hpp"     // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
@@ -521,6 +521,132 @@ std::size_t database_graph_neighbors(config_t const& config) {
 
 #pragma endregion Graph Modality
 
+#pragma region Bounded Ranges
+
+/** Writes integer vertices [0, 20) into both graphs of @p compared, each linked to the next. */
+std::size_t write_range_vertices(compared_collections_t& compared) {
+    std::array<ustore_key_t, 20> const vertices = keys_of_integers<20>(0);
+    std::array<ustore_key_t, 19> const targets = keys_of_integers<19>(1);
+    std::array<ustore_key_t, 19> const edges = keys_of_integers<19>(100);
+    std::size_t failures = 0;
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_outcome_t outcome {};
+        ustore_graph_write_vertices_t write {};
+        write.database = compared.databases[side];
+        write.outcome = &outcome;
+        write.count = vertices.size();
+        write.collections = {&compared.collections[side], 0};
+        write.vertices = {vertices.data(), sizeof(ustore_key_t)};
+        ustore_graph_write_vertices(&write);
+        failures += expect_success(outcome);
+        ustore_graph_write_edges_t connect {};
+        connect.database = compared.databases[side];
+        connect.outcome = &outcome;
+        connect.count = edges.size();
+        connect.collections = {&compared.collections[side], 0};
+        connect.edges = {edges.data(), sizeof(ustore_key_t)};
+        connect.sources = {vertices.data(), sizeof(ustore_key_t)};
+        connect.targets = {targets.data(), sizeof(ustore_key_t)};
+        ustore_graph_write_edges(&connect);
+        failures += expect_success(outcome);
+    }
+    return failures;
+}
+
+/** A vertices scan stops before its end key. */
+std::size_t graph_range_end_bound(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_graph_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_vertices(compared);
+    ustore_key_t const start = key_from_integer(5), end = key_from_integer(9);
+    failures += expect_same_scan(ustore_graph_scan_vertices, compared, {&start, &end, ustore_scan_ascending_k, 10},
+                                 keys_of_integers<4>(5));
+    return failures;
+}
+
+/** A descending vertices scan lists its range largest first, past every half-edge between them. */
+std::size_t graph_range_descending(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_graph_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_vertices(compared);
+    ustore_key_t const start = key_from_integer(14), end = key_from_integer(4);
+    failures += expect_same_scan(ustore_graph_scan_vertices, compared, {&start, &end, ustore_scan_descending_k, 3},
+                                 keys_of_integers<3>(12, ustore_scan_descending_k));
+    return failures;
+}
+
+/** A range removal of vertices removes every vertex of the range with its edges, so its neighbors
+ *  outside keep only their other edges. */
+std::size_t graph_range_remove(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_graph_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_vertices(compared);
+    ustore_key_t const start = key_from_integer(3), end = key_from_integer(17);
+    std::array<ustore_key_t, 2> const neighbors {key_from_integer(2), key_from_integer(17)};
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_outcome_t outcome {};
+        ustore_graph_remove_vertices_t remove {};
+        remove.database = compared.databases[side];
+        remove.outcome = &outcome;
+        remove.count = 1;
+        remove.collections = {&compared.collections[side], 0};
+        remove.vertices = {&start, 0};
+        remove.end_vertices = {&end, 0};
+        ustore_graph_remove_vertices(&remove);
+        failures += expect_success(outcome);
+
+        ustore_vertex_degree_t const* degrees = nullptr;
+        ustore_graph_read_edges_t read {};
+        read.database = compared.databases[side];
+        read.outcome = &outcome;
+        read.count = neighbors.size();
+        read.collections = {&compared.collections[side], 0};
+        read.vertices = {neighbors.data(), sizeof(ustore_key_t)};
+        read.degrees_per_vertex = &degrees;
+        read.arena = compared.arenas[side];
+        ustore_graph_read_edges(&read);
+        failures += expect_success(outcome);
+        if (outcome.status == ustore_status_success_k)
+            failures += expect(degrees && degrees[0] == 1 && degrees[1] == 1);
+    }
+    std::array<ustore_key_t, 6> const remaining {key_from_integer(0),  key_from_integer(1),  key_from_integer(2),
+                                                 key_from_integer(17), key_from_integer(18), key_from_integer(19)};
+    failures += expect_same_scan(ustore_graph_scan_vertices, compared, {nullptr, nullptr, ustore_scan_ascending_k, 20},
+                                 remaining);
+    return failures;
+}
+
+/** A vertices measure counts the vertices of its range, end excluded, whatever their edges. */
+std::size_t graph_range_measure(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_graph_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_vertices(compared);
+    ustore_key_t const lower = key_from_integer(5), upper = key_from_integer(9);
+    failures += expect_measure_holds(ustore_graph_measure_vertices, compared, {&lower, &upper, ustore_scan_ascending_k},
+                                     4);
+    failures += expect_measure_holds(ustore_graph_measure_vertices, compared,
+                                     {&upper, nullptr, ustore_scan_descending_k}, 10);
+    return failures;
+}
+
+/** A vertices sample draws distinct written vertices, as many as asked or all when fewer exist. */
+std::size_t graph_sample_vertices(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_graph_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    failures += write_range_vertices(compared);
+    std::array<ustore_key_t, 20> const written = keys_of_integers<20>(0);
+    failures += expect_samples_of(ustore_graph_sample_vertices, compared, written, 5, 5);
+    failures += expect_samples_of(ustore_graph_sample_vertices, compared, written, 30, 20);
+    return failures;
+}
+
+#pragma endregion Bounded Ranges
+
 int main(int argc, char** argv) {
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -548,5 +674,10 @@ int main(int argc, char** argv) {
     report(totals, "database.graph_get_vertex_edges", database_graph_get_vertex_edges, config);
     report(totals, "database.graph_degrees", database_graph_degrees, config);
     report(totals, "database.graph_neighbors", database_graph_neighbors, config);
+    report(totals, "graph.range_end_bound", graph_range_end_bound, config);
+    report(totals, "graph.range_descending", graph_range_descending, config);
+    report(totals, "graph.range_remove", graph_range_remove, config);
+    report(totals, "graph.range_measure", graph_range_measure, config);
+    report(totals, "graph.sample_vertices", graph_sample_vertices, config);
     return suite_exit_code(totals);
 }

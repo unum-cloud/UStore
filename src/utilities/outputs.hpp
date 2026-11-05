@@ -24,16 +24,30 @@
 
 namespace unum::ustore::utilities {
 
-/** The columns of a batched read in its arena: presences and lengths sized by the batch, then the values, copied in
- *  once all are found and their length is known, so the arena holds exactly the outputs. A value appended must stay
- *  where it lies until @c finish copies it. */
+/** The columns of a batched read in its arena: presences and lengths sized by the batch, then the
+ *  values, copied in once all are found and their length is known, so the arena holds exactly the
+ *  outputs. A value appended must stay where it lies until @c finish copies it, and reads as the
+ *  byte range a blobs read names for it. */
 class read_outputs_t {
     ustore_arena_t arena_ = nullptr;
     bits_span_t presences_ {};
     ustore_length_t* lengths_ = nullptr;
     value_view_t* found_ = nullptr;
+    strided_iterator<ustore_length_t const> offsets_ {};
+    strided_iterator<ustore_length_t const> limits_ {};
     std::size_t index_ = 0;
     std::size_t length_ = 0;
+
+    /** The bytes of @p value that task @c index_ reads: from its offset, at most its limit. */
+    value_view_t ranged_(value_view_t value) const noexcept {
+        auto const task = static_cast<std::ptrdiff_t>(index_);
+        std::size_t const size = value.size();
+        std::size_t offset = offsets_ ? static_cast<std::size_t>(offsets_[task]) : 0;
+        if (offset > size) offset = size;
+        std::size_t const rest = size - offset;
+        std::size_t const length = limits_ && limits_[task] < rest ? static_cast<std::size_t>(limits_[task]) : rest;
+        return value_view_t {value.data() + offset, length};
+    }
 
   public:
 
@@ -54,11 +68,16 @@ class read_outputs_t {
         outputs.presences_ = presences.data();
         outputs.lengths_ = lengths.data();
         outputs.found_ = found.data();
+        if constexpr (requires { arguments.limits; }) {
+            outputs.offsets_ = strided(arguments.offsets);
+            outputs.limits_ = strided(arguments.limits);
+        }
         return outputs;
     }
 
     /** Appends a found value, which stays where it lies until @c finish copies it. */
     void append(value_view_t value) noexcept {
+        if (offsets_ || limits_) value = ranged_(value);
         if (presences_) presences_[index_] = true;
         if (lengths_) lengths_[index_] = static_cast<ustore_length_t>(value.size());
         if (found_) found_[index_] = value;
@@ -183,8 +202,8 @@ class strings_scan_outputs_t {
   public:
 
     /** Opens the offsets of every task of @p arguments in their arena, and the strings in @p scratch. */
-    static expected<strings_scan_outputs_t> make(ustore_strings_scan_t const& arguments,
-                                                 ustore_arena_t scratch) noexcept {
+    template <typename arguments_type_>
+    static expected<strings_scan_outputs_t> make(arguments_type_ const& arguments, ustore_arena_t scratch) noexcept {
         auto [tasks_offsets, status] = arena_allocate<ustore_length_t>(arguments.arena, arguments.count + 1);
         if (status.failed()) return status;
         strings_scan_outputs_t outputs;
@@ -207,7 +226,8 @@ class strings_scan_outputs_t {
 
     /** Closes the offsets of the tasks, copies the strings into the arena of @p arguments as a tape and exports both
      *  columns. */
-    status_t finish(ustore_strings_scan_t const& arguments) noexcept {
+    template <typename arguments_type_>
+    status_t finish(arguments_type_ const& arguments) noexcept {
         if (status_t const status = strings_.export_into(arguments.arena, *arguments.strings); status.failed())
             return status;
         tasks_offsets_.back() = static_cast<ustore_length_t>(size());
@@ -264,7 +284,8 @@ struct measure_outputs_t {
 
     /** Opens the six columns of @p arguments in their arena as one block, column after column, each starting aligned
      *  as every output does. */
-    static expected<measure_outputs_t> make(ustore_blobs_measure_t const& arguments) noexcept {
+    template <typename arguments_type_>
+    static expected<measure_outputs_t> make(arguments_type_ const& arguments) noexcept {
         std::size_t const stride = round_up_to_multiple(static_cast<std::size_t>(arguments.count),
                                                         arena_alignment_k / sizeof(ustore_size_t));
         auto [bounds, status] = arena_allocate<ustore_size_t>(arguments.arena, 6 * stride);
@@ -287,7 +308,8 @@ struct measure_outputs_t {
     }
 
     /** Exports every column @p arguments ask for. */
-    void finish(ustore_blobs_measure_t const& arguments) const noexcept {
+    template <typename arguments_type_>
+    void finish(arguments_type_ const& arguments) const noexcept {
         if (arguments.min_cardinalities) *arguments.min_cardinalities = min_cardinalities;
         if (arguments.max_cardinalities) *arguments.max_cardinalities = max_cardinalities;
         if (arguments.min_value_bytes) *arguments.min_value_bytes = min_value_bytes;

@@ -20,11 +20,12 @@
 
 namespace unum::ustore {
 
-status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& arguments,
-              ustore_strings_cursor_handle_t& cursor, view_t const& view) noexcept {
-    auto const* const walker = host_engine_of(cursor);
-    if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
-    strings_verbs<home_t::host_k> const& verbs = *walker->verbs;
+/** Pulls the next page of @p cursor as @c pull does, narrowing through @p match, the walk's own
+ *  match or the face a device pull shows it. */
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_strings_cursor_next_t const& arguments,
+                      ustore_strings_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept {
+    strings_verbs<home_t::host_k> const& verbs = *engine.host.strings;
     if (!arguments.strings || !arguments.written)
         return {status_code_t::invalid_argument_k, "Need outputs for the strings and the count written"};
     if (arguments.values && !verbs.read)
@@ -36,13 +37,14 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
         ustore_bytes_view_t const prefix = bytes_of(std::string_view {cursor.prefix});
         if (status_t const status = list_matched_strings(
                 engine.host, arguments.database, cursor.cursor.collection, prefix, bytes_of(std::string_view {*start}),
-                arguments.wanted, walker->match, arguments.arena, view, survivors, resume_bytes, resume);
+                cursor.position_bound, bytes_of(std::string_view {cursor.end_string}), cursor.cursor.direction,
+                arguments.wanted, match, arguments.arena, view, survivors, resume_bytes, resume);
             status.failed())
             return status;
     }
     else if (std::holds_alternative<sz::string_t>(cursor.position)) resume = bytes_of(std::string_view {});
 
-    arena_rewind(arguments.arena);
+    match.rewind_page(arguments.arena);
     std::size_t const written = survivors.size();
     if (written && arguments.values) {
         ustore_strings_view_t const listed = survivors.tape();
@@ -63,10 +65,19 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
 
     // Reserved above, so the resize allocates nothing once the callback let the pull finish
     if (!next) cursor.position = exhausted_t {};
-    else if (kept && arguments.wanted && kept->resize(next->length) == sz::status_t::success_k && next->length)
-        std::memcpy(kept->data(), next->data, next->length);
+    else if (kept && arguments.wanted && kept->resize(next->length) == sz::status_t::success_k) {
+        if (next->length) std::memcpy(kept->data(), next->data, next->length);
+        if (written) cursor.position_bound = resume_bound_of(cursor.cursor.direction);
+    }
     *arguments.written = written;
     return {};
+}
+
+status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& arguments,
+              ustore_strings_cursor_handle_t& cursor, view_t const& view) noexcept {
+    auto const* const walker = host_engine_of(cursor);
+    if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
+    return pull_through(engine, arguments, cursor, walker->match, view);
 }
 
 /** Copies @p bytes into @p copy, answering whether they fit in memory. */
@@ -80,6 +91,8 @@ void ustore_strings_write(ustore_strings_write_t* arguments) { route(arguments);
 void ustore_strings_remove(ustore_strings_remove_t* arguments) { route(arguments); }
 void ustore_strings_read(ustore_strings_read_t* arguments) { route(arguments); }
 void ustore_strings_scan(ustore_strings_scan_t* arguments) { route(arguments); }
+void ustore_strings_sample(ustore_strings_sample_t* arguments) { route(arguments); }
+void ustore_strings_measure(ustore_strings_measure_t* arguments) { route(arguments); }
 void ustore_strings_cursor_next(ustore_strings_cursor_next_t* arguments) { route(arguments); }
 
 void ustore_strings_cursor_init(ustore_strings_cursor_init_t* arguments) {
@@ -87,7 +100,8 @@ void ustore_strings_cursor_init(ustore_strings_cursor_init_t* arguments) {
           status] = open_cursor<ustore_strings_cursor_handle_t, strings_verbs, ustore_strings_scan_t>(*arguments);
     if (status.failed()) return finish(*arguments->outcome, status);
     if (!copy_bytes(arguments->prefix, cursor->prefix) ||
-        !copy_bytes(arguments->start_string, std::get<sz::string_t>(cursor->position))) {
+        !copy_bytes(arguments->start_string, std::get<sz::string_t>(cursor->position)) ||
+        !copy_bytes(arguments->end_string, cursor->end_string)) {
         free_cursor(cursor);
         return finish(*arguments->outcome,
                       {status_code_t::out_of_memory_k, "Failed to copy the prefix and the start of the walk"});

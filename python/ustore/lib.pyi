@@ -127,6 +127,12 @@ class ScanMode(IntEnum):
     ORDERED = 0
     UNORDERED = 1
 
+class ScanDirection(IntEnum):
+    """Which way a scan, a cursor or a measurement walks its range from the start key."""
+
+    ASCENDING = 0
+    DESCENDING = 1
+
 class Modality(IntEnum):
     """What a collection holds, valued as `ustore_modality_t`."""
 
@@ -268,6 +274,13 @@ class PageEncoding(IntEnum):
     TEXT = 3
     JSON = 4
 
+class ChangeKind(IntEnum):
+    """What one committed change did to its key."""
+
+    WRITE = 0
+    REMOVAL = 1
+    CHANGE = 2
+
 # endregion: Statuses and Modes
 
 # region: Failures
@@ -401,6 +414,26 @@ class Cursor:
 
     def close(self) -> None:
         """Frees the walk with the holds it kept on its database and the transaction or snapshot it reads through."""
+
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        kind: type[BaseException] | None = None,
+        value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None: ...
+
+@final
+class ChangesCursor:
+    """A feed of the changes committed to one collection after a stamp, oldest first, which pins that stamp and
+    resumes every pull past the last change the pull before it handed out."""
+
+    def next(self, wanted: int, arena: Arena, /, *, values: bool = False) -> Changes:
+        """The next up to `wanted` changes in `arena`, with the bytes every one carries when asked; an empty pull
+        reached the newest commit."""
+
+    def close(self) -> None:
+        """Frees the feed, releasing the stamp it pinned and the hold it kept on its database."""
 
     def __enter__(self) -> Self: ...
     def __exit__(
@@ -600,6 +633,28 @@ class Capabilities(structseq[bool], tuple[bool, bool]):
         """Whether the engine pins point-in-time states."""
 
 @final
+class Changes(
+    structseq[Any], tuple[Page, Values | None, tuple[int, ...], tuple[ChangeKind, ...]]
+):
+    """The changes one pull of a ChangesCursor answers, oldest first."""
+
+    @property
+    def keys(self) -> Page:
+        """The Page of the key of every change, oldest change first."""
+
+    @property
+    def values(self) -> Values | None:
+        """The Values of the bytes every change carries when the pull asked for them, or None."""
+
+    @property
+    def stamps(self) -> tuple[int, ...]:
+        """The stamp every change was committed at."""
+
+    @property
+    def kinds(self) -> tuple[ChangeKind, ...]:
+        """What every change did."""
+
+@final
 class Measurement(structseq[int], tuple[int, int, int, int, int, int]):
     """The bounds on what a key range holds, as `measure()` estimates them without walking it."""
 
@@ -694,7 +749,16 @@ class _Reads:
     def __getitem__(self, name: str) -> Collection:
         """The collection `name` addresses."""
 
-    def read(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> Values: ...
+    def read(
+        self,
+        keys: KeysLike,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> Values: ...
     def get(self, key: KeyLike, *, collection: CollectionLike) -> bytes | None:
         """Copies one value out of a one-off arena, which `read` with an arena of yours avoids."""
 
@@ -703,10 +767,12 @@ class _Reads:
 
     def cursor(
         self,
-        start: KeyLike = 0,
+        start: KeyLike | None = None,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         patterns: Sequence[str | bytes] | None = None,
         pattern_kind: PatternKind = PatternKind.REGEX,
         sensitivity: CaseSensitivity = CaseSensitivity.CASED,
@@ -718,10 +784,12 @@ class _Reads:
 
     def docs_cursor(
         self,
-        start: KeyLike = 0,
+        start: KeyLike | None = None,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
@@ -730,10 +798,12 @@ class _Reads:
 
     def pages_cursor(
         self,
-        start: KeyLike = 0,
+        start: KeyLike | None = None,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
@@ -744,10 +814,12 @@ class _Reads:
 
     def graph_vertices_cursor(
         self,
-        start: KeyLike = 0,
+        start: KeyLike | None = None,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Cursor:
@@ -755,12 +827,14 @@ class _Reads:
 
     def scan(
         self,
-        start: KeyLike,
+        start: KeyLike | None,
         wanted: int,
         arena: Arena,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         patterns: Sequence[str | bytes] | None = None,
@@ -778,6 +852,8 @@ class _Reads:
         /,
         *,
         collection: CollectionLike,
+        ends: KeysLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         patterns: Sequence[str | bytes] | None = None,
@@ -791,7 +867,16 @@ class _Reads:
     def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys: ...
     def sample_batch(self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
         """`count` samples of up to `wanted` keys each, all drawn from the one collection named."""
-    def measure(self, start: KeyLike, end: KeyLike, arena: Arena, /, *, collection: CollectionLike) -> Measurement: ...
+    def measure(
+        self,
+        start: KeyLike | None,
+        end: KeyLike | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Measurement: ...
     def docs_read(
         self,
         keys: KeysLike,
@@ -815,12 +900,14 @@ class _Reads:
     ) -> Columns: ...
     def docs_scan(
         self,
-        start: KeyLike,
+        start: KeyLike | None,
         wanted: int,
         arena: Arena,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         filter: str | bytes | None = None,
@@ -829,6 +916,17 @@ class _Reads:
     ) -> Keys: ...
     def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
         """Up to `wanted` document keys drawn at random, which a `docs_read` or a `docs_gather` follows."""
+    def docs_measure(
+        self,
+        start: KeyLike | None,
+        end: KeyLike | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Measurement:
+        """Bounds on what a range of document keys holds, as `measure` reads them for blobs."""
     def pages_read(
         self,
         keys: KeyLike | KeysLike,
@@ -843,12 +941,14 @@ class _Reads:
         absent."""
     def pages_scan(
         self,
-        start: KeyLike,
+        start: KeyLike | None,
         wanted: int,
         arena: Arena,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         filter: str | bytes | None = None,
@@ -856,6 +956,19 @@ class _Reads:
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys:
         """Up to `wanted` page keys from `start`, keeping those holding a node of the XPath `filter`."""
+    def pages_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+        """Up to `wanted` page keys drawn at random, which a `pages_read` follows."""
+    def pages_measure(
+        self,
+        start: KeyLike | None,
+        end: KeyLike | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Measurement:
+        """Bounds on what a range of page keys holds, as `measure` reads them for blobs."""
     def graph_read_edges(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Neighborhoods: ...
@@ -866,17 +979,32 @@ class _Reads:
         """Whether the vertex is present, read as its degree through a one-off arena."""
     def graph_scan_vertices(
         self,
-        start: KeyLike,
+        start: KeyLike | None,
         wanted: int,
         arena: Arena,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys: ...
+    def graph_sample_vertices(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+        """Up to `wanted` vertices drawn at random, those without edges included."""
+    def graph_measure_vertices(
+        self,
+        start: KeyLike | None,
+        end: KeyLike | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Measurement:
+        """Bounds on what a range of vertices holds, as `measure` reads them for blobs."""
 
 @type_check_only
 class _Receivers:
@@ -913,9 +1041,10 @@ class _Writes(_Reads):
         keys: KeyLike | KeysLike,
         *,
         collection: CollectionLike,
+        ends: KeyLike | KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> None:
-        """Removes keys with their values."""
+        """Removes keys with their values, or every key of a range up to its key in `ends`."""
     def docs_write(
         self,
         keys: KeysLike | None,
@@ -933,9 +1062,10 @@ class _Writes(_Reads):
         keys: KeyLike | KeysLike,
         *,
         collection: CollectionLike,
+        ends: KeyLike | KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> None:
-        """Removes whole documents."""
+        """Removes whole documents, or every document of a range up to its key in `ends`."""
     def pages_import(
         self,
         keys: KeyLike | KeysLike,
@@ -969,12 +1099,14 @@ class _Writes(_Reads):
     def pages_remove(
         self,
         keys: KeyLike | KeysLike,
-        elements: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike | None = None,
         *,
         collection: CollectionLike,
+        ends: KeyLike | KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> None:
-        """Removes elements with their subtrees, where the page key removes the whole page."""
+        """Removes elements with their subtrees, where the page key or no elements removes the whole page, and every
+        page of a range up to its key in `ends`."""
     def pages_move(
         self,
         keys: KeyLike | KeysLike,
@@ -1046,6 +1178,7 @@ class _Writes(_Reads):
         *,
         role: Role = Role.ANY,
         collection: CollectionLike,
+        ends: KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> None: ...
 
@@ -1166,6 +1299,9 @@ class Database(_Writes, _Receivers):
 
     def snapshot(self) -> Snapshot:
         """Pins a point-in-time state of the whole database, which the snapshot's read verbs see."""
+
+    def changes_cursor(self, since: int = 0, /, *, collection: CollectionLike) -> ChangesCursor:
+        """A feed of the changes committed to `collection` after the commit stamp `since`, oldest first."""
 
     def transaction(self, watch: Watch = Watch.KEYS) -> Transaction:
         """Begins a transaction over this database, recording the keys its verbs touch unless `Watch.NONE`."""
@@ -1315,8 +1451,17 @@ class DeferredView:
     def unwatched(self) -> DeferredView:
         """unwatched() answers a view of the transaction whose calls record nothing, so they never fail its commit."""
 
-    def read(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Values]:
-        """read(keys, arena, *, collection) answers a Values tape.
+    def read(
+        self,
+        keys: KeysLike,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> Deferred[Values]:
+        """read(keys, arena, *, collection, offset=0, limit=None) answers a Values tape.
 
         Reads a batch of binary values in one call, which no sequence of single reads
         matches for throughput. Nothing is copied: the tape sits in the arena, and indexing
@@ -1327,6 +1472,10 @@ class DeferredView:
             buffer of 16-byte keys, which is read in place, or one of 64-bit integers.
           arena (Arena): Where the tape lands, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
+          offset (int, optional): Byte of every value the read starts at, where an offset
+            past the end reads empty.
+          limit (int, optional): Most bytes of every value to read from the offset, or None
+            for the rest of it.
         Returns:
           Values: One entry per key, in the order they were asked for.
         Raises:
@@ -1342,12 +1491,14 @@ class DeferredView:
 
     def scan(
         self,
-        start: KeyLike,
+        start: KeyLike | None,
         wanted: int,
         arena: Arena,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         patterns: Sequence[str | bytes] | None = None,
@@ -1357,23 +1508,27 @@ class DeferredView:
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
-        """scan(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)
-        answers a Keys tape.
+        """scan(start, wanted, arena, *, collection, end=None, direction=ScanDirection.ASCENDING,
+        mode=ScanMode.ORDERED, progress=None) answers a Keys tape.
 
-        Lists up to `wanted` keys from `start` upwards. Values are not exported, so a read
-        follows the scan, or a `cursor()` walks a collection with its values instead.
+        Lists up to `wanted` keys from `start` towards `end`. Values are not exported, so a
+        read follows the scan, or a `cursor()` walks a collection with its values instead.
 
         Args:
-          start (KeyLike): The smallest key the scan may return.
+          start (KeyLike | None): The first key the scan may return, or None for the first
+            key in its direction.
           wanted (int): Most keys the scan returns.
           arena (Arena): Where the keys land, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
+          end (KeyLike, optional): The key the scan stops before, or None for no bound.
+          direction (ScanDirection, optional): `ScanDirection.DESCENDING` walks down from
+            `start`, largest key first.
           mode (ScanMode, optional): `ScanMode.UNORDERED` lets keys come out of order,
             removed or repeated, to speed up the read after the scan; no engine uses it yet.
           progress (Callable[[int, int], bool | None], optional): Called with the scans
             finished and the scans in all; a falsy answer other than None cancels the call.
         Returns:
-          Keys: One run of keys, in ascending order.
+          Keys: One run of keys, in the order of the direction.
         Raises:
           CancelledError: The progress callable stopped the scan.
         """
@@ -1386,6 +1541,8 @@ class DeferredView:
         /,
         *,
         collection: CollectionLike,
+        ends: KeysLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         patterns: Sequence[str | bytes] | None = None,
@@ -1427,19 +1584,30 @@ class DeferredView:
         """
 
     def measure(
-        self, start: KeyLike, end: KeyLike, arena: Arena, /, *, collection: CollectionLike
+        self,
+        start: KeyLike | None,
+        end: KeyLike | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Deferred[Measurement]:
-        """measure(start, end, arena, *, collection) answers a Measurement.
+        """measure(start, end, arena, *, collection, direction=ScanDirection.ASCENDING)
+        answers a Measurement.
 
         Estimates what a key range holds without walking it, so the answers are bounds
         rather than counts.
 
         Args:
-          start (KeyLike): First key of the range.
-          end (KeyLike): Last key of the range.
+          start (KeyLike | None): First key of the range, or None for the first key in the
+            direction.
+          end (KeyLike | None): The key the range stops before, or None for no bound.
           arena (Arena): Where the bounds land before they are copied out, rewound by this
             call.
           collection (UUID | str): The collection, by identifier or by name.
+          direction (ScanDirection, optional): `ScanDirection.DESCENDING` ranges down from
+            `start`.
         Returns:
           Measurement: The lower and upper bounds on the entries, the bytes of their values,
           and the space they take on disk.
@@ -1519,34 +1687,40 @@ class DeferredView:
 
     def docs_scan(
         self,
-        start: KeyLike,
+        start: KeyLike | None,
         wanted: int,
         arena: Arena,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
-        """docs_scan(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)
+        """docs_scan(start, wanted, arena, *, collection, end=None,
+        direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)
         answers a Keys tape.
 
-        Lists up to `wanted` document keys from `start` upwards, as `scan` lists the keys of
-        blobs. Documents are not exported, so a `docs_read` follows the scan.
+        Lists up to `wanted` document keys from `start` towards `end`, as `scan` lists the
+        keys of blobs. Documents are not exported, so a `docs_read` follows the scan.
 
         Args:
-          start (KeyLike): The smallest key the scan may return.
+          start (KeyLike | None): The first key the scan may return, or None for the first
+            key in its direction.
           wanted (int): Most keys the scan returns.
           arena (Arena): Where the keys land, rewound by this call.
           collection (UUID | str): The docs collection, by identifier or by name.
+          end (KeyLike, optional): The key the scan stops before, or None for no bound.
+          direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.
           mode (ScanMode, optional): In what order the keys come, as `scan` takes it.
           progress (Callable[[int, int], bool | None], optional): Called with the scans
             finished and the scans in all; a falsy answer other than None cancels the call.
         Returns:
-          Keys: One run of keys, in ascending order.
+          Keys: One run of keys, in the order of the direction.
         Raises:
           CancelledError: The progress callable stopped the scan.
         """
@@ -1565,6 +1739,18 @@ class DeferredView:
           Keys: One run of keys, in no particular order.
         """
 
+    def docs_measure(
+        self,
+        start: KeyLike | None,
+        end: KeyLike | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Deferred[Measurement]:
+        """The `Deferred` of bounds on what a range of document keys holds."""
+
     def pages_read(
         self,
         keys: KeyLike | KeysLike,
@@ -1580,12 +1766,14 @@ class DeferredView:
 
     def pages_scan(
         self,
-        start: KeyLike,
+        start: KeyLike | None,
         wanted: int,
         arena: Arena,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         filter: str | bytes | None = None,
@@ -1593,6 +1781,21 @@ class DeferredView:
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
         """Up to `wanted` page keys from `start`, keeping those holding a node of the XPath `filter`."""
+
+    def pages_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+        """The `Deferred` of up to `wanted` page keys drawn at random."""
+
+    def pages_measure(
+        self,
+        start: KeyLike | None,
+        end: KeyLike | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Deferred[Measurement]:
+        """The `Deferred` of bounds on what a range of page keys holds."""
 
     def graph_read_edges(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
@@ -1646,36 +1849,57 @@ class DeferredView:
 
     def graph_scan_vertices(
         self,
-        start: KeyLike,
+        start: KeyLike | None,
         wanted: int,
         arena: Arena,
         /,
         *,
         collection: CollectionLike,
+        end: KeyLike | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
-        """graph_scan_vertices(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)
+        """graph_scan_vertices(start, wanted, arena, *, collection, end=None,
+        direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)
         answers a Keys tape.
 
-        Lists up to `wanted` vertices from `start` upwards, those without edges included.
+        Lists up to `wanted` vertices from `start` towards `end`, those without edges included.
         Edges are not exported, so a `graph_read_edges` follows the scan.
 
         Args:
-          start (KeyLike): The smallest vertex the scan may return.
+          start (KeyLike | None): The first vertex the scan may return, or None for the first
+            vertex in its direction.
           wanted (int): Most vertices the scan returns.
           arena (Arena): Where the vertices land, rewound by this call.
           collection (UUID | str): The graph collection, by identifier or by name.
+          end (KeyLike, optional): The vertex the scan stops before, or None for no bound.
+          direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.
           mode (ScanMode, optional): In what order the vertices come, as `scan` takes it.
           progress (Callable[[int, int], bool | None], optional): Called with the scans
             finished and the scans in all; a falsy answer other than None cancels the call.
         Returns:
-          Keys: One run of vertices, in ascending order.
+          Keys: One run of vertices, in the order of the direction.
         Raises:
           CancelledError: The progress callable stopped the scan.
         """
+
+    def graph_sample_vertices(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+        """The `Deferred` of up to `wanted` vertices drawn at random."""
+
+    def graph_measure_vertices(
+        self,
+        start: KeyLike | None,
+        end: KeyLike | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Deferred[Measurement]:
+        """The `Deferred` of bounds on what a range of vertices holds."""
 
     def collection_find(self, name: str, arena: Arena, /) -> Deferred[UUID]:
         """collection_find(name, arena) answers the identifier the name addresses.
@@ -1827,16 +2051,21 @@ class DeferredView:
         keys: KeyLike | KeysLike,
         *,
         collection: CollectionLike,
+        ends: KeyLike | KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]:
-        """remove(keys, *, collection, durability=Durability.BUFFERED) answers None.
+        """remove(keys, *, collection, ends=None, durability=Durability.BUFFERED) answers None.
 
         Removes a batch of keys with their values, or one key given on its own, while
-        `docs_remove` removes documents.
+        `docs_remove` removes documents. With `ends`, every key starts a range reaching up to
+        its end, and every key of the range goes, all in one atomic call.
 
         Args:
-          keys (KeyLike | Sequence[KeyLike] | buffer): The keys to remove.
+          keys (KeyLike | Sequence[KeyLike] | buffer): The keys to remove, or the first key
+            of every range.
           collection (UUID | str): The collection, by identifier or by name.
+          ends (KeyLike | Sequence[KeyLike] | buffer, optional): The key every range stops
+            before, one per key.
           durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
             returning.
         """
@@ -1893,16 +2122,22 @@ class DeferredView:
         keys: KeyLike | KeysLike,
         *,
         collection: CollectionLike,
+        ends: KeyLike | KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]:
-        """docs_remove(keys, *, collection, durability=Durability.BUFFERED) answers None.
+        """docs_remove(keys, *, collection, ends=None, durability=Durability.BUFFERED)
+        answers None.
 
         Removes a batch of whole documents, or one given on its own; a patch or a merge removes
-        fields inside them instead.
+        fields inside them instead. With `ends`, every key starts a range of documents removed
+        up to its end, as `remove` takes them.
 
         Args:
-          keys (KeyLike | Sequence[KeyLike] | buffer): The keys of the documents to remove.
+          keys (KeyLike | Sequence[KeyLike] | buffer): The keys of the documents to remove, or
+            the first key of every range.
           collection (UUID | str): The docs collection, by identifier or by name.
+          ends (KeyLike | Sequence[KeyLike] | buffer, optional): The key every range stops
+            before, one per key.
           durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
             returning.
         """
@@ -1948,12 +2183,14 @@ class DeferredView:
     def pages_remove(
         self,
         keys: KeyLike | KeysLike,
-        elements: KeyLike | KeysLike,
+        elements: KeyLike | KeysLike | None = None,
         *,
         collection: CollectionLike,
+        ends: KeyLike | KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]:
-        """Removes elements with their subtrees, where the page key removes the whole page."""
+        """Removes elements with their subtrees, where the page key or no elements removes the whole page, and every
+        page of a range up to its key in `ends`."""
     def pages_move(
         self,
         keys: KeyLike | KeysLike,
@@ -2069,15 +2306,20 @@ class DeferredView:
         *,
         role: Role = Role.ANY,
         collection: CollectionLike,
+        ends: KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]:
-        """graph_remove_vertices(vertices, *, role=Role.ANY, collection,
+        """graph_remove_vertices(vertices, *, role=Role.ANY, collection, ends=None,
                               durability=Durability.BUFFERED) answers None.
 
-        Removes a batch of vertices together with every edge they take part in.
+        Removes a batch of vertices together with every edge they take part in. With `ends`,
+        every vertex starts a range removed up to its end, as `remove` takes them.
 
         Args:
-          vertices (Sequence[KeyLike] | buffer): The vertices to remove.
+          vertices (Sequence[KeyLike] | buffer): The vertices to remove, or the first vertex of
+            every range.
+          ends (Sequence[KeyLike] | buffer, optional): The vertex every range stops before, one
+            per vertex.
           role (Role, optional): The role every vertex plays, which only a joining graph between
             two collections needs; `Role.ANY` otherwise.
           collection (UUID | str): The graph collection, by identifier or by name.

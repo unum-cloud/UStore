@@ -55,8 +55,10 @@
 namespace unum::ustore::strings {
 
 using blobs::compaction_stamps_t;
+using blobs::gathered_range_tombstones;
 using blobs::kept_versions;
 using blobs::keyed_delta;
+using blobs::range_tombstone;
 using blobs::stamped_delta;
 using blobs::storage_limits_t;
 using blobs::stored_value_offset_t;
@@ -164,6 +166,12 @@ class sealed_deltas {
     using keyed_delta_t = keyed_delta<stored_key_t>;
     using stamped_delta_t = stamped_delta<stored_key_t>;
 
+    /** The range tombstones the deltas carry beside them, stamped with the deltas. */
+    using range_tombstones_t = blobs::range_tombstones<std::string_view, allocator_t>;
+
+    /** The strings one range tombstone hides. */
+    using range_t = range_tombstone<std::string_view>;
+
     /** The kind of every delta, packed from the least kind present, so a run of writes alone spends no bits. */
     using kinds_t =
         st::immutable_packed_array<std::uint8_t,
@@ -180,25 +188,45 @@ class sealed_deltas {
      *      columns on @p allocator.
      *  @param[in,out] deltas The deltas to seal, which end up sorted.
      *  @param[in] sort_order The StringZilla sort kernel src/ picked for the CPU.
+     *  @param[in] ranges The ranges the commit removes, whose bytes are copied; a delta inside one
+     *      lands with it, so the range hides none of them.
      *  @param[in] allocator Where the columns are allocated.
-     *  @retval invalid_argument_k No deltas, two deltas of one string, a removal carrying bytes, or a write carrying
-     *      anything but one 16-byte value.
-     *  @retval capacity_exhausted_k More string and value bytes than one sorted run file holds.
-     *  @retval out_of_memory_k A column could not be allocated.
+     *
+     *  @par Statuses:
+     *  - @c invalid_argument_k No delta and no range, two deltas of one string, a removal
+     *    carrying bytes, a write carrying anything but one 16-byte value, or a range ending at or
+     *    before its start.
+     *  - @c capacity_exhausted_k More string and value bytes than one sorted run file holds.
+     *  - @c out_of_memory_k A column could not be allocated.
      */
     static expected<sealed_deltas> seal(std::span<keyed_delta_t> deltas, sz_kernel_sort_order_t sort_order,
-                                        allocator_t allocator = {}) noexcept {
-        if (deltas.empty()) return status_t {status_code_t::invalid_argument_k, "A seal takes at least one delta"};
-        auto [kept, sort_status] = sort_unique_strings(deltas, sort_order, keep_t::first_k, allocator);
-        if (sort_status.failed()) return sort_status;
-        if (kept != deltas.size())
-            return status_t {status_code_t::invalid_argument_k, "A seal takes one delta per string"};
+                                        std::span<range_t const> ranges = {}, allocator_t allocator = {}) noexcept {
+        if (deltas.empty() && ranges.empty())
+            return status_t {status_code_t::invalid_argument_k, "A seal takes at least one delta or range"};
+        if (!deltas.empty()) {
+            auto [kept, sort_status] = sort_unique_strings(deltas, sort_order, keep_t::first_k, allocator);
+            if (sort_status.failed()) return sort_status;
+            if (kept != deltas.size())
+                return status_t {status_code_t::invalid_argument_k, "A seal takes one delta per string"};
+        }
         for (std::size_t index = 0; index != deltas.size(); ++index) {
             std::size_t const carried = deltas[index].delta.kind == delta_kind_t::remove_k ? 0 : value_bytes_k;
             if (deltas[index].delta.bytes.size() != carried)
                 return status_t {status_code_t::invalid_argument_k, "A write carries one key and a removal none"};
         }
-        return columns_of_<keyed_delta_t>(deltas, allocator);
+        auto [sealed, sealed_status] = columns_of_<keyed_delta_t>(deltas, allocator);
+        if (sealed_status.failed()) return sealed_status;
+        // The commit's stamp lands in the column allocated here, so stamping allocates nothing.
+        st::vector<std::uint64_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint64_t>>
+            unstamped {typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint64_t>(allocator)};
+        if (unstamped.resize(ranges.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room to seal the range tombstones"};
+        for (std::uint64_t& stamp : unstamped) stamp = unwritten_stamp_k;
+        auto [tombstones, tombstones_status] = range_tombstones_t::make(
+            ranges, std::span<std::uint64_t const> {unstamped}, allocator);
+        if (tombstones_status.failed()) return tombstones_status;
+        sealed.tombstones_ = std::move(tombstones);
+        return std::move(sealed);
     }
 
     /**
@@ -207,10 +235,19 @@ class sealed_deltas {
      *  @retval capacity_exhausted_k More string and value bytes than one sorted run file holds.
      *  @retval out_of_memory_k A column could not be allocated.
      */
-    static expected<sealed_deltas> merged(std::span<stamped_delta_t const> versions,
+    static expected<sealed_deltas> merged(std::span<stamped_delta_t const> versions, range_tombstones_t&& tombstones,
                                           allocator_t allocator = {}) noexcept {
-        return columns_of_(versions, allocator);
+        auto [sealed, sealed_status] = columns_of_(versions, allocator);
+        if (sealed_status.failed()) return sealed_status;
+        sealed.tombstones_ = std::move(tombstones);
+        return std::move(sealed);
     }
+
+    /** The range tombstones sealed beside the deltas. */
+    [[nodiscard]] range_tombstones_t const& range_tombstones() const noexcept { return tombstones_; }
+
+    /** Stamps every range tombstone with the commit's @p stamp, which allocates nothing. */
+    void stamp_range_tombstones(transaction_stamp_t stamp) noexcept { tombstones_.assign_stamp(stamp); }
 
     /** Deltas sealed. */
     [[nodiscard]] std::size_t size() const noexcept { return heads_.size(); }
@@ -356,6 +393,9 @@ class sealed_deltas {
 
     /** Every delta's @c delta_kind_t, packed. */
     kinds_t kinds_;
+
+    /** The range tombstones, ascending by start. */
+    range_tombstones_t tombstones_;
 };
 
 /**
@@ -373,6 +413,7 @@ class memory_run {
     using allocator_t = allocator_type_;
     using sealed_deltas_t = sealed_deltas<allocator_t>;
     using stamped_delta_t = stamped_delta<stored_key_t>;
+    using range_tombstones_t = typename sealed_deltas_t::range_tombstones_t;
     using stamps_t =
         st::immutable_packed_array<std::uint64_t,
                                    typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint64_t>>;
@@ -394,6 +435,7 @@ class memory_run {
         st::expected<stamps_t> stamps = stamps_t::make(deltas.size(), stamp, typename stamps_t::allocator_t(allocator));
         if (!stamps) return status_t {status_code_t::out_of_memory_k, "No room to stamp the deltas of strings"};
         memory_run run;
+        deltas.stamp_range_tombstones(stamp);
         run.deltas_ = std::move(deltas);
         run.stamps_ = std::move(*stamps);
         run.newest_stamp_ = stamp;
@@ -404,16 +446,18 @@ class memory_run {
      *  @brief The run one merge makes of @p versions, which come in string order with the versions of a string newest
      *      first, for runs of one tier it replaces.
      *  @param[in] versions The versions to merge, in string order with the versions of a string newest first.
+     *  @param[in] tombstones The range tombstones the merged run keeps.
      *  @param[in] oldest_stamp The oldest stamp of the runs it replaces, which the run keeps covering where that
      *      version did not survive, so neighbouring runs still never overlap.
      *  @param[in] tier The tier of the runs it replaces, which the run is one above.
      *  @param[in] allocator Where the merged run's columns are allocated.
      */
-    static expected<memory_run> merged(std::span<stamped_delta_t const> versions, transaction_stamp_t oldest_stamp,
-                                       std::uint32_t tier, allocator_t allocator = {}) noexcept {
-        transaction_stamp_t newest_stamp = oldest_stamp;
+    static expected<memory_run> merged(std::span<stamped_delta_t const> versions, range_tombstones_t&& tombstones,
+                                       transaction_stamp_t oldest_stamp, std::uint32_t tier,
+                                       allocator_t allocator = {}) noexcept {
+        transaction_stamp_t newest_stamp = std::max(oldest_stamp, tombstones.newest_stamp());
         for (stamped_delta_t const& version : versions) newest_stamp = std::max(newest_stamp, version.stamp);
-        auto [deltas, merged_status] = sealed_deltas_t::merged(versions, allocator);
+        auto [deltas, merged_status] = sealed_deltas_t::merged(versions, std::move(tombstones), allocator);
         if (merged_status.failed()) return merged_status;
         transaction_stamp_t pulled = unwritten_stamp_k;
         auto fill = [&](std::size_t position) noexcept {
@@ -444,8 +488,10 @@ class memory_run {
     /** Bytes every delta's value takes together, 16 per delta. */
     [[nodiscard]] std::size_t values_bytes() const noexcept { return deltas_.values_bytes(); }
 
-    /** Bytes the run charges against its store's memory bounds: its strings and its values. */
-    [[nodiscard]] std::uint64_t memory_bytes() const noexcept { return keys_bytes() + values_bytes(); }
+    /** Bytes the run charges to its store's memory bounds: strings, values and range tombstones. */
+    [[nodiscard]] std::uint64_t memory_bytes() const noexcept {
+        return keys_bytes() + values_bytes() + deltas_.range_tombstones().bytes();
+    }
 
     /** The string at sorted @p position. */
     [[nodiscard]] std::string_view stored_key(std::size_t position) const noexcept {
@@ -467,7 +513,10 @@ class memory_run {
     /** The first sorted position past every string starting with @p prefix. */
     [[nodiscard]] std::size_t prefix_end(std::string_view prefix) const noexcept { return deltas_.prefix_end(prefix); }
 
-    /** The newest stamp any delta carries. */
+    /** The range tombstones the run carries beside its deltas, every one stamped. */
+    [[nodiscard]] range_tombstones_t const& range_tombstones() const noexcept { return deltas_.range_tombstones(); }
+
+    /** The newest stamp any delta or range tombstone carries. */
     [[nodiscard]] transaction_stamp_t newest_stamp() const noexcept { return newest_stamp_; }
 
     /** The oldest stamp any delta carries, which the stamps column is based at. */

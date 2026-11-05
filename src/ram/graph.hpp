@@ -130,8 +130,34 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_write
     });
 }
 
-/** Implements @c ustore_graph_remove_vertices, erasing the edges every neighbor files of each vertex in its role,
- *  then every entry of the vertex. */
+/** Stages removing every vertex in [ @p lower, @p upper ) from @p part of a graph with its edges in
+ *  @p role, listing the vertices into @p vertices first, as a walk holds its partitions. */
+template <typename transaction_type_>
+store_status_t stage_vertex_range_removal(transaction_type_& part, ustore_key_t const& lower, ustore_key_t const& upper,
+                                          ustore_vertex_role_t role,
+                                          st::vector<ustore_key_t, arena_allocator<ustore_key_t>>& vertices,
+                                          st::vector<half_edge_t, arena_allocator<half_edge_t>>& walked) noexcept {
+    vertices.clear();
+    store_status_t listed = store_status_t::success_k;
+    store_status_t const walked_range = part.range(half_edge_t::vertex_entry(lower), half_edge_t::vertex_entry(upper),
+                                                   [&](half_edge_t const& entry) noexcept -> walk_control_t {
+                                                       if (entry.direction != half_edge_direction_t::vertex_k)
+                                                           return walk_control_t::resume_k;
+                                                       listed = vertices.emplace_back(entry.vertex);
+                                                       return st::failed(listed) ? walk_control_t::halt_k
+                                                                                 : walk_control_t::resume_k;
+                                                   });
+    if (st::failed(walked_range)) return walked_range;
+    if (st::failed(listed)) return listed;
+    for (std::size_t index = 0; index != vertices.size(); ++index) {
+        store_status_t const removed = stage_vertex_removal(part, vertices[index], role, walked);
+        if (st::failed(removed)) return removed;
+    }
+    return store_status_t::success_k;
+}
+
+/** Implements @c ustore_graph_remove_vertices, erasing the edges every neighbor files of each
+ *  vertex, or of every vertex of its range, in its role, then every entry of the vertex. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_remove_vertices_t const& arguments,
                view_t const& view) noexcept {
@@ -139,7 +165,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_remov
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
+    strided_iterator<ustore_key_t const> const end_vertices = strided(arguments.end_vertices);
     strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
+    st::vector<ustore_key_t, arena_allocator<ustore_key_t>> listed {{view.scratch}};
     st::vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_runs_of<half_edge_t>(
@@ -147,7 +175,11 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_remov
             [&](auto& part, std::size_t first, std::size_t end) noexcept {
                 for (std::size_t index = first; index != end; ++index) {
                     ustore_vertex_role_t const role = roles ? roles[index] : ustore_vertex_role_any_k;
-                    store_status_t const removed = stage_vertex_removal(part, vertices[index], role, walked);
+                    store_status_t const removed = end_vertices
+                                                       ? stage_vertex_range_removal(part, vertices[index],
+                                                                                    end_vertices[index], role, listed,
+                                                                                    walked)
+                                                       : stage_vertex_removal(part, vertices[index], role, walked);
                     if (st::failed(removed)) return removed;
                 }
                 return store_status_t::success_k;
@@ -162,6 +194,21 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_scan_
     return scan_keys<half_edge_t>(state, arguments, view);
 }
 
+/** Implements @c ustore_graph_sample_vertices as a reservoir over each graph's vertices. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_sample_vertices_t const& arguments,
+               view_t const& view) noexcept {
+    return sample_keys<half_edge_t>(state, arguments, view);
+}
+
+/** Implements @c ustore_graph_measure_vertices, exact for vertices at the view it reads, whose
+ *  half-edges hold no value bytes but take space. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_measure_vertices_t const& arguments,
+               view_t const& view) noexcept {
+    return measure_keys<half_edge_t>(state, arguments, view);
+}
+
 #pragma endregion Graph Calls
 
 #pragma region Table
@@ -174,6 +221,8 @@ graph_verbs<home_t::host_k> const ram_variant<cpu_class_, isolation_>::graph_ver
     .write_vertices = &serve_database<cpu_class_, isolation_, ustore_graph_write_vertices_t>,
     .remove_vertices = &serve_database<cpu_class_, isolation_, ustore_graph_remove_vertices_t>,
     .scan_vertices = &serve_database<cpu_class_, isolation_, ustore_graph_scan_vertices_t>,
+    .sample_vertices = &serve_database<cpu_class_, isolation_, ustore_graph_sample_vertices_t>,
+    .measure_vertices = &serve_database<cpu_class_, isolation_, ustore_graph_measure_vertices_t>,
 };
 
 #pragma endregion Table

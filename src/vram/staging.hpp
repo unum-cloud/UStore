@@ -132,6 +132,10 @@ status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor, ar
         stager.stage(arguments.roles.data, arguments.roles.stride, count);
     if constexpr (requires { arguments.elements.stride; })
         stager.stage(arguments.elements.data, arguments.elements.stride, count);
+    if constexpr (requires { arguments.offsets.stride; })
+        stager.stage(arguments.offsets.data, arguments.offsets.stride, count);
+    if constexpr (requires { arguments.limits.stride; })
+        stager.stage(arguments.limits.data, arguments.limits.stride, count);
     if constexpr (requires { arguments.strings.layout; }) stager.stage(arguments.strings, count);
     if constexpr (requires { arguments.prefixes.layout; }) stager.stage(arguments.prefixes, count);
     if constexpr (requires { arguments.start_strings.layout; }) stager.stage(arguments.start_strings, count);

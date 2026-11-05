@@ -23,7 +23,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "abi/fixture.hpp" // `create_collection`, `tape_written`
+#include "abi/fixture.hpp" // `create_collection`, `tape_written`, `open_compared`, `expect_same_scan`
 #include "harness.hpp"     // `suite_exit_code`, `expect`, `expect_eq`, `expect_status`
 #include "pages/model.hpp" // `model_page_t`, `model_edit_t`, `node_spec_t`
 
@@ -723,6 +723,117 @@ case_result_t pages_refusals(config_t const& config) {
 
 #pragma endregion Pages Refusals
 
+#pragma region Bounded Ranges
+
+/** Imports a one-element page under each key of the integers [0, 20) into both collections of
+ *  @p compared, answering whether the engine under test serves pages at all. */
+expected<bool> import_range_pages(compared_collections_t& compared) {
+    std::array<ustore_key_t, 20> const keys = keys_of_integers<20>(0);
+    std::string_view const markup = "<a/>";
+    strided_strings<std::string_view> const values {{&markup, 0}};
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_outcome_t outcome {};
+        ustore_pages_import_t import {};
+        import.database = compared.databases[side], import.outcome = &outcome, import.count = keys.size();
+        import.collections = {&compared.collections[side], 0}, import.keys = {keys.data(), sizeof(ustore_key_t)};
+        import.values = values.view(), import.encoding = ustore_page_encoding_xml_k;
+        ustore_pages_import(&import);
+        status_t const imported {outcome};
+        if (side == 0 && imported.code == status_code_t::unsupported_k) return false;
+        if (imported.failed()) return imported;
+    }
+    return true;
+}
+
+/** A pages scan stops before its end key. */
+case_result_t pages_range_end_bound(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    auto [served, import_status] = import_range_pages(compared);
+    failures += expect(import_status.succeeded());
+    if (failures != 0) return failures;
+    if (!served) return case_result_t::skipped("the engine serves no pages yet", failures);
+    ustore_key_t const start = key_from_integer(5), end = key_from_integer(9);
+    failures += expect_same_scan(ustore_pages_scan, compared, {&start, &end, ustore_scan_ascending_k, 10},
+                                 keys_of_integers<4>(5));
+    return failures;
+}
+
+/** A descending pages scan lists its range largest first. */
+case_result_t pages_range_descending(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    auto [served, import_status] = import_range_pages(compared);
+    failures += expect(import_status.succeeded());
+    if (failures != 0) return failures;
+    if (!served) return case_result_t::skipped("the engine serves no pages yet", failures);
+    ustore_key_t const start = key_from_integer(14), end = key_from_integer(4);
+    failures += expect_same_scan(ustore_pages_scan, compared, {&start, &end, ustore_scan_descending_k, 3},
+                                 keys_of_integers<3>(12, ustore_scan_descending_k));
+    return failures;
+}
+
+/** A range removal removes whole pages from the start key up to the end key, refusing elements. */
+case_result_t pages_range_remove(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    auto [served, import_status] = import_range_pages(compared);
+    failures += expect(import_status.succeeded());
+    if (failures != 0) return failures;
+    if (!served) return case_result_t::skipped("the engine serves no pages yet", failures);
+    ustore_key_t const start = key_from_integer(2), end = key_from_integer(18);
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_outcome_t outcome {};
+        ustore_pages_remove_t remove {};
+        remove.database = compared.databases[side], remove.outcome = &outcome, remove.count = 1;
+        remove.collections = {&compared.collections[side], 0}, remove.keys = {&start, 0};
+        remove.end_keys = {&end, 0}, remove.elements = {&start, 0};
+        ustore_pages_remove(&remove);
+        failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+    }
+    failures += remove_ranges(ustore_pages_remove, compared, {&start, 1}, {&end, 1});
+    std::array<ustore_key_t, 4> const remaining {key_from_integer(0), key_from_integer(1), key_from_integer(18),
+                                                 key_from_integer(19)};
+    failures += expect_same_scan(ustore_pages_scan, compared, {nullptr, nullptr, ustore_scan_ascending_k, 20},
+                                 remaining);
+    return failures;
+}
+
+/** A pages measure counts the pages of its range with the end excluded. */
+case_result_t pages_range_measure(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    auto [served, import_status] = import_range_pages(compared);
+    failures += expect(import_status.succeeded());
+    if (failures != 0) return failures;
+    if (!served) return case_result_t::skipped("the engine serves no pages yet", failures);
+    ustore_key_t const lower = key_from_integer(5), upper = key_from_integer(9);
+    failures += expect_measure_holds(ustore_pages_measure, compared, {&lower, &upper, ustore_scan_ascending_k}, 4);
+    failures += expect_measure_holds(ustore_pages_measure, compared, {&upper, nullptr, ustore_scan_descending_k}, 10);
+    return failures;
+}
+
+/** A pages sample draws distinct written pages, as many as asked or all when fewer exist. */
+case_result_t pages_sample(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
+    std::size_t failures = expect(compared_status.succeeded());
+    if (failures != 0) return failures;
+    auto [served, import_status] = import_range_pages(compared);
+    failures += expect(import_status.succeeded());
+    if (failures != 0) return failures;
+    if (!served) return case_result_t::skipped("the engine serves no pages yet", failures);
+    std::array<ustore_key_t, 20> const written = keys_of_integers<20>(0);
+    failures += expect_samples_of(ustore_pages_sample, compared, written, 5, 5);
+    failures += expect_samples_of(ustore_pages_sample, compared, written, 30, 20);
+    return failures;
+}
+
+#pragma endregion Bounded Ranges
+
 int main(int argc, char** argv) {
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -741,5 +852,10 @@ int main(int argc, char** argv) {
     report(totals, "database.pages_transactions", database_pages_transactions, config);
     report(totals, "database.pages_all_or_nothing", database_pages_all_or_nothing, config);
     report(totals, "pages.refusals", pages_refusals, config);
+    report(totals, "pages.range_end_bound", pages_range_end_bound, config);
+    report(totals, "pages.range_descending", pages_range_descending, config);
+    report(totals, "pages.range_remove", pages_range_remove, config);
+    report(totals, "pages.range_measure", pages_range_measure, config);
+    report(totals, "pages.sample", pages_sample, config);
     return suite_exit_code(totals);
 }

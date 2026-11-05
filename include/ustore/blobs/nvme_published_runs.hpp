@@ -84,6 +84,9 @@ enum class pin_kind_t : std::uint8_t {
 
     /** A collection's view, every commit at or below whose stamp the collection holds in runs and not in memory. */
     view_k,
+
+    /** A change feed, which reads every version above the stamp it holds. */
+    feed_k,
 };
 
 /**
@@ -214,11 +217,15 @@ class commit_ledger {
     /** One commit between drawing its stamp and landing it. */
     using commit_in_flight_t = typename order_t::commit_in_flight_t;
 
-    commit_ledger() noexcept { views_.kind_ = pin_kind_t::view_k; }
+    commit_ledger() noexcept {
+        views_.kind_ = pin_kind_t::view_k;
+        feeds_.kind_ = pin_kind_t::feed_k;
+    }
     commit_ledger(commit_ledger const&) = delete;
     commit_ledger& operator=(commit_ledger const&) = delete;
     ~commit_ledger() noexcept {
-        assert(readers_.next_ == &readers_ && views_.next_ == &views_ && "Pins outlive their ledger");
+        assert(readers_.next_ == &readers_ && views_.next_ == &views_ && feeds_.next_ == &feeds_ &&
+               "Pins outlive their ledger");
     }
 
     /** The newest stamp every commit at or below which has landed, which a fresh read answers at; acquired, so the
@@ -348,6 +355,32 @@ class commit_ledger {
     /** Records that the view @p pin registers holds in memory no commit at or below @p stamp, or no commit at all
      *  for @c head_stamp_k; called by whoever publishes that view, holding the leader word, before the stamp. */
     void bound_view(pin_t& pin, transaction_stamp_t stamp) noexcept { store_(pin.stamp_, stamp); }
+
+    /**
+     *  @brief Pins @p pin at @p stamp for a feed of a collection whose merges may have folded every
+     *      version at or below @p folded, giving back what it held.
+     *  @return Success, or @c write_conflict_k for a stamp below @p folded, leaving @p pin empty.
+     */
+    status_t pin_feed(pin_t& pin, transaction_stamp_t stamp, transaction_stamp_t const& folded) noexcept {
+        pin.release();
+        guard_t const held {claim_};
+        if (stamp < folded) return {status_code_t::write_conflict_k, "A merge folded the versions after that stamp"};
+        pin.stamp_ = stamp;
+        pin.kind_ = pin_kind_t::feed_k;
+        link_(feeds_, pin);
+        return {};
+    }
+
+    /** @p horizon lowered to the oldest stamp a feed pins, which a merge of a collection keeps
+     *  every version above, raising the stamp @p folded that collection's merges may have folded up
+     *  to; one claim covers both, so a feed either bounds the merge or finds its fold. */
+    [[nodiscard]] transaction_stamp_t fold_horizon(transaction_stamp_t horizon, transaction_stamp_t& folded) noexcept {
+        guard_t const held {claim_};
+        for (pin_t const* pin = feeds_.next_; pin != &feeds_; pin = pin->next_)
+            horizon = std::min(horizon, pin->stamp_);
+        if (folded < horizon) folded = horizon;
+        return horizon;
+    }
 
     /** The newest stamp any reader pins, or @c unwritten_stamp_k while none does. */
     [[nodiscard]] transaction_stamp_t newest_reader() const noexcept { return load_(newest_reader_); }
@@ -497,7 +530,7 @@ class commit_ledger {
         pin.next_->previous_ = pin.previous_;
         pin.previous_ = pin.next_ = &pin;
         pin.ledger_ = nullptr;
-        if (pin.kind_ == pin_kind_t::view_k) return;
+        if (pin.kind_ != pin_kind_t::reader_k) return;
         transaction_stamp_t newest = unwritten_stamp_k;
         for (pin_t const* other = readers_.next_; other != &readers_; other = other->next_)
             if (newest < other->stamp_) newest = other->stamp_;
@@ -526,6 +559,9 @@ class commit_ledger {
 
     /** The head of the list of views' pins. */
     pin_t views_;
+
+    /** The head of the list of feeds' pins. */
+    pin_t feeds_;
 
     /** Held by whoever links, unlinks or walks a pin list. */
     std::int32_t claim_ = 0;
@@ -906,7 +942,7 @@ class published_runs {
           current_(std::exchange(other.current_, nullptr)), memory_runs_(std::move(other.memory_runs_)),
           memory_order_(std::exchange(other.memory_order_, memory_order_t {})),
           prepared_view_(std::exchange(other.prepared_view_, nullptr)),
-          prepared_run_(std::exchange(other.prepared_run_, absent_run_k)) {}
+          prepared_run_(std::exchange(other.prepared_run_, absent_run_k)), folded_floor_(other.folded_floor_) {}
 
     published_runs& operator=(published_runs&& other) noexcept {
         if (this == &other) return *this;
@@ -922,6 +958,7 @@ class published_runs {
         memory_order_ = std::exchange(other.memory_order_, memory_order_t {});
         prepared_view_ = std::exchange(other.prepared_view_, nullptr);
         prepared_run_ = std::exchange(other.prepared_run_, absent_run_k);
+        folded_floor_ = other.folded_floor_;
         return *this;
     }
 
@@ -1013,6 +1050,12 @@ class published_runs {
             view_t const* const view = view_.load();
             if (stamp != head_stamp_k || at >= view->oldest_readable) return reading_t {view, at};
         }
+    }
+
+    /** Pins @p pin at @p stamp for a feed of the store's changes, so no merge folds a version above
+     *  it, refusing with @c write_conflict_k a stamp a merge already folded past. */
+    status_t pin_feed(pin_t& pin, transaction_stamp_t stamp) noexcept {
+        return ledger_->pin_feed(pin, stamp, folded_floor_);
     }
 
     /** Deltas the memory runs hold, which no flush has written yet. */
@@ -1179,7 +1222,7 @@ class published_runs {
             survival.pinned = readers.data();
             survival.pinned_count = readers.size();
             // Nothing a memory run holds is durable, so no mount needs a version; a head reader needs those above this.
-            survival.horizon = ledger_->published();
+            survival.horizon = ledger_->fold_horizon(ledger_->published(), folded_floor_);
             stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {*constraint_}};
             // The changes a merge folds sit here until the merged run copies them.
             utilities::local_arena_t folded;
@@ -1188,9 +1231,8 @@ class published_runs {
                                                     versions, folded_bytes);
                 kept.failed())
                 return kept;
-            auto [merged, merged_status] = memory_run_t::merged(std::span<stamped_delta_t const> {versions},
-                                                                group.back()->oldest_stamp(), group.back()->tier(),
-                                                                typename memory_run_t::allocator_t {*constraint_});
+            auto [merged, merged_status] = merged_run_(std::span<memory_run_t const* const> {group},
+                                                       std::span<stamped_delta_t const> {versions});
             if (merged_status.failed()) return merged_status;
             // The replaced runs, freed here once the publication waited out every reader that could hold one.
             st::vector<memory_run_handle_t> away;
@@ -1243,8 +1285,8 @@ class published_runs {
         compaction_stamps_t survival;
         survival.pinned = readers.data();
         survival.pinned_count = readers.size();
-        survival.horizon = ledger_->horizon_besides(view_pin_);
-        survival.floor = ledger_->floor_besides(view_pin_);
+        survival.horizon = ledger_->fold_horizon(ledger_->horizon_besides(view_pin_), folded_floor_);
+        survival.floor = std::min(ledger_->floor_besides(view_pin_), survival.horizon);
         publication.oldest_readable = survival.horizon;
         return drain(tree_, std::span<memory_run_t const* const> {publication.flushed}, survival, publication.hook());
     }
@@ -1271,8 +1313,8 @@ class published_runs {
         compaction_stamps_t stamps;
         stamps.pinned = readers.data();
         stamps.pinned_count = readers.size();
-        stamps.horizon = ledger_->durable_stamp();
-        stamps.floor = ledger_->floor();
+        stamps.horizon = ledger_->fold_horizon(ledger_->durable_stamp(), folded_floor_);
+        stamps.floor = std::min(ledger_->floor(), stamps.horizon);
         publication_t publication;
         publication.owner = this;
         publication.oldest_readable = stamps.horizon;
@@ -1323,6 +1365,8 @@ class published_runs {
     template <utilities::fold_concept fold_type_>
     status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel, transaction_stamp_t ceiling,
                             fold_type_ const& fold, lsm_tree_publication_hook_t const& published) noexcept {
+        // Merges before the mount may have folded anything at or below the stamp it resumes from.
+        folded_floor_ = std::max(folded_floor_, ceiling);
         {
             reader_t const inside = enter();
             view_t const& taken = *view_.load();
@@ -1474,6 +1518,17 @@ class published_runs {
         // Letting the leader word go waited out every reader of the replaced view, so the replaced set is unreachable.
         tree_.retire();
         return landed;
+    }
+
+    /** The run of the next tier that @p versions, kept of the runs of @p group, make with every
+     *  range tombstone of @p group. */
+    expected<memory_run_t> merged_run_(std::span<memory_run_t const* const> group,
+                                       std::span<stamped_delta_t const> versions) const noexcept {
+        typename memory_run_t::allocator_t const allocator {*constraint_};
+        auto [tombstones, tombstones_status] = gathered_range_tombstones(group, allocator);
+        if (tombstones_status.failed()) return tombstones_status;
+        return memory_run_t::merged(versions, std::move(tombstones), group.back()->oldest_stamp(), group.back()->tier(),
+                                    allocator);
     }
 
     /** Deltas every memory run of @p view holds. */
@@ -1747,6 +1802,10 @@ class published_runs {
     /** The record that view names for the commit's run, taken by @c prepare and linked
      *  by @c publish. */
     memory_run_handle_t prepared_run_ = absent_run_k;
+
+    /** The stamp at or below which a merge of the store may have folded or dropped versions, so a
+     *  feed below it is refused; touched under the ledger's claim. */
+    transaction_stamp_t folded_floor_ = 0;
 
 #pragma endregion Private Members
 };

@@ -410,7 +410,9 @@ std::size_t vram_exports(std::size_t ordinal, ustore_gpu_device_t listed, config
 
 /** A cursor opened on host threads walks there alone, so pulling it on a device is refused with
  *  @c ustore_status_device_k. */
-std::size_t vram_cursors(std::size_t ordinal, config_t config) {
+std::size_t vram_cursors(std::size_t ordinal, ustore_gpu_device_t listed, config_t config) {
+    mover_t mover;
+    if (expect(mover.open(listed).succeeded())) return 1;
     device_call_t call {ordinal};
     if (expect(call.status.succeeded())) return 1;
     fixture_t fixture {config, "cursors"};
@@ -429,6 +431,32 @@ std::size_t vram_cursors(std::size_t ordinal, config_t config) {
     pull.cursor = cursor, pull.keys = &found, pull.written = &written, pull.arena = call.arena, pull.wanted = 1;
     ustore_blobs_cursor_next(&pull);
     failures += expect(outcome.status == ustore_status_device_k);
+
+    // A device cursor walks there, its keys and values landing in the device arena as a host pull's
+    ustore_blobs_cursor_t on_device = nullptr;
+    ustore_blobs_cursor_init_t device_opened = opened;
+    device_opened.cursor = &on_device, device_opened.executor = call.executor;
+    ustore_blobs_cursor_init(&device_opened);
+    failures += expect_success(outcome);
+    if (failures) return failures;
+    ustore_key_t const *host_keys = nullptr, *device_keys = nullptr;
+    ustore_strings_view_t host_values {}, device_values {};
+    ustore_size_t host_written = 0, device_written = 0;
+    host_arena_t const reference;
+    ustore_blobs_cursor_next_t host_pull {.database = fixture.database, .outcome = &outcome};
+    host_pull.cursor = cursor, host_pull.keys = &host_keys, host_pull.values = &host_values;
+    host_pull.written = &host_written, host_pull.arena = reference.arena, host_pull.wanted = entries_k / 2;
+    ustore_blobs_cursor_next(&host_pull);
+    failures += expect_success(outcome);
+    ustore_blobs_cursor_next_t device_pull = host_pull;
+    device_pull.executor = call.executor, device_pull.cursor = on_device, device_pull.keys = &device_keys;
+    device_pull.values = &device_values, device_pull.written = &device_written, device_pull.arena = call.arena;
+    ustore_blobs_cursor_next(&device_pull);
+    failures += expect_success(outcome);
+    failures += expect_eq(device_written, host_written);
+    failures += expect_column(mover, host_keys, device_keys, host_written);
+    failures += expect_tape(mover, host_values, device_values, host_written);
+    ustore_blobs_cursor_free(on_device);
     ustore_blobs_cursor_free(cursor);
     return failures;
 }
@@ -1008,7 +1036,7 @@ int main(int argc, char** argv) {
         std::string const prefix = fmt::format("vram.{}{}.", ustore_gpu_vendor_name(listed.vendor), ordinal);
         report(totals, (prefix + "listing").c_str(), vram_listing, listed);
         report(totals, (prefix + "arenas").c_str(), vram_arenas, ordinal, config);
-        report(totals, (prefix + "cursors").c_str(), vram_cursors, ordinal, config);
+        report(totals, (prefix + "cursors").c_str(), vram_cursors, ordinal, listed, config);
         report(totals, (prefix + "exports").c_str(), vram_exports, ordinal, listed, config);
         report(totals, (prefix + "reads").c_str(), vram_reads, ordinal, listed, config);
         report(totals, (prefix + "staging").c_str(), vram_staging, ordinal, listed, devices, config);

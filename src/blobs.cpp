@@ -16,8 +16,11 @@
 
 namespace unum::ustore {
 
-status_t pull(engine_t const& engine, ustore_blobs_cursor_next_t const& arguments, ustore_blobs_cursor_handle_t& cursor,
-              view_t const& view) noexcept {
+/** Pulls the next page of @p cursor as @c pull does, narrowing through @p match, the walk's own
+ *  match or the face a device pull shows it. */
+template <typename match_type_>
+status_t pull_through(engine_t const& engine, ustore_blobs_cursor_next_t const& arguments,
+                      ustore_blobs_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept {
     if (!arguments.keys || !arguments.written)
         return {status_code_t::invalid_argument_k, "Need outputs for the keys and the count written"};
     if (arguments.values && !engine.host.blobs->read)
@@ -25,10 +28,10 @@ status_t pull(engine_t const& engine, ustore_blobs_cursor_next_t const& argument
     keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
     std::variant<ustore_key_t, exhausted_t> resume;
     if (status_t const status = list_cursor_keys<ustore_blobs_scan_t>(
-            engine, arguments.database, cursor, arguments.wanted, arguments.arena, view, survivors, resume);
+            engine, arguments.database, cursor, match, arguments.wanted, arguments.arena, view, survivors, resume);
         status.failed())
         return status;
-    arena_rewind(arguments.arena);
+    match.rewind_page(arguments.arena);
     std::size_t const written = survivors.size();
     if (written && arguments.values) {
         ustore_blobs_read_t const read {.database = arguments.database,
@@ -46,6 +49,13 @@ status_t pull(engine_t const& engine, ustore_blobs_cursor_next_t const& argument
     *arguments.keys = keys.data();
     *arguments.written = written;
     return {};
+}
+
+status_t pull(engine_t const& engine, ustore_blobs_cursor_next_t const& arguments, ustore_blobs_cursor_handle_t& cursor,
+              view_t const& view) noexcept {
+    auto const* const walker = host_engine_of(cursor);
+    if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
+    return pull_through(engine, arguments, cursor, walker->match, view);
 }
 
 } // namespace unum::ustore

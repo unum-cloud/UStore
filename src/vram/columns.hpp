@@ -14,9 +14,10 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uintptr_t`
 
-#include <span> // `std::span`, `std::as_bytes`
+#include <concepts> // `std::convertible_to`
+#include <span>     // `std::span`, `std::as_bytes`
 
-#include "ustore/docs/json_values.hpp"      // `field_size_bytes`
+#include "ustore/docs/json_cells.hpp"       // `field_size_bytes`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_copy`, `device_blocks_t`, `divide_round_up`
 #include "ustore/utilities/vram_device.hpp" // `carve`, `gpu_executor_concept`
 
@@ -105,7 +106,7 @@ void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) 
 /** The output columns of a listing: offsets per task, and the keys, with their scores where asked, they split. */
 template <typename arguments_type_, typename uploader_type_>
     requires requires(arguments_type_ const& arguments) {
-        arguments.offsets;
+        { *arguments.offsets } -> std::convertible_to<ustore_length_t const*>;
         arguments.keys;
     }
 void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) noexcept {
@@ -113,6 +114,22 @@ void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) 
     uploader.move_output(arguments.keys, listed);
     if constexpr (requires { arguments.scores; }) uploader.move_output(arguments.scores, listed);
     uploader.move_output(arguments.offsets, static_cast<std::size_t>(arguments.count) + 1);
+}
+
+/** A pull's output columns: the keys or strings walked and values read, as many as it wrote. */
+template <typename arguments_type_, typename uploader_type_>
+    requires requires(arguments_type_ const& arguments) {
+        arguments.cursor;
+        *arguments.written;
+    }
+void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) noexcept {
+    std::size_t const written = static_cast<std::size_t>(*arguments.written);
+    if constexpr (requires { arguments.keys; }) uploader.move_output(arguments.keys, written);
+    if constexpr (requires { arguments.strings; }) uploader.move(*arguments.strings, written);
+    if constexpr (requires { arguments.values->layout; }) {
+        if (arguments.values) uploader.move(*arguments.values, written);
+    }
+    else if constexpr (requires { arguments.values; }) uploader.move_output(arguments.values, written);
 }
 
 /** The output columns of a strings read: presence bits and one key per string. */

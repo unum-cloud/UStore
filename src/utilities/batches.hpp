@@ -53,25 +53,75 @@ struct strings_arg_t {
     }
 };
 
-/** One task of a batched scan. */
-struct scan_task_t {
-    ustore_collection_id_t collection;
-    ustore_key_t start_key;
-    ustore_size_t limit;
+/** One range's keys, both bounds inclusive, entered at @c lower or @c upper by walk direction. */
+struct key_range_t {
+    ustore_key_t lower = smallest_key_k;
+    ustore_key_t upper = largest_key_k;
+
+    bool contains(ustore_key_t const& key) const noexcept { return !(key < lower) && !(upper < key); }
 };
 
-/** The arguments of @c ustore_blobs_scan gathered into a structure of arrays for validation. */
+/** Whether a range a call names holds any key, as an end at or behind its start leaves none. */
+enum class range_extent_t : std::uint8_t {
+    empty_k,
+    keys_k,
+};
+
+/** A range named by inclusive @p start, exclusive @p end and @p direction, as inclusive bounds. */
+struct named_range_t {
+    key_range_t keys;
+    range_extent_t extent = range_extent_t::keys_k;
+};
+
+/** The inclusive bounds of the keys from @p start, or the first key in @p direction when null, to
+ *  @p end, exclusive, or the last key in @p direction when null. */
+inline named_range_t range_of(ustore_key_t const* start, ustore_key_t const* end,
+                              ustore_scan_direction_t direction) noexcept {
+    named_range_t named;
+    if (direction == ustore_scan_descending_k) {
+        if (start) named.keys.upper = *start;
+        if (!end) return named;
+        if (!(*end < named.keys.upper)) named.extent = range_extent_t::empty_k;
+        else named.keys.lower = key_after(*end);
+        return named;
+    }
+    if (start) named.keys.lower = *start;
+    if (!end) return named;
+    if (!(named.keys.lower < *end)) named.extent = range_extent_t::empty_k;
+    else named.keys.upper = key_before(*end);
+    return named;
+}
+
+/** One task of a batched scan: up to @c limit keys of @c keys, walked in @c direction, where an
+ *  empty range leaves @c limit zero. */
+struct scan_task_t {
+    ustore_collection_id_t collection;
+    key_range_t keys;
+    ustore_scan_direction_t direction;
+    ustore_size_t limit;
+
+    /** The key the walk enters the range at. */
+    ustore_key_t const& start_key() const noexcept {
+        return direction == ustore_scan_descending_k ? keys.upper : keys.lower;
+    }
+};
+
+/** The arguments of a scan or a measure gathered into a structure of arrays for validation. */
 struct scan_batch_t {
     strided_iterator<ustore_collection_id_t const> collections;
     strided_iterator<ustore_key_t const> start_keys;
+    strided_iterator<ustore_key_t const> end_keys;
+    ustore_scan_direction_t direction = ustore_scan_ascending_k;
     ustore_size_t wanted = 0;
     ustore_size_t count = 0;
 
     std::size_t size() const noexcept { return count; }
     scan_task_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_key_t start_key = start_keys ? start_keys[signed_index] : smallest_key_k;
-        return {collections[signed_index], start_key, wanted};
+        named_range_t const named = range_of(start_keys ? &start_keys[signed_index] : nullptr,
+                                             end_keys ? &end_keys[signed_index] : nullptr, direction);
+        return {collections[signed_index], named.keys, direction,
+                named.extent == range_extent_t::empty_k ? ustore_size_t {0} : wanted};
     }
 };
 
@@ -96,7 +146,30 @@ struct sample_batch_t {
 /** The tasks of a scan of any modality. */
 template <typename arguments_type_>
 scan_batch_t scans_of(arguments_type_ const& arguments) noexcept {
-    return {strided(arguments.collections), strided(arguments.start_keys), arguments.wanted, arguments.count};
+    return {strided(arguments.collections),
+            strided(arguments.start_keys),
+            strided(arguments.end_keys),
+            arguments.direction,
+            arguments.wanted,
+            arguments.count};
+}
+
+/** The ranges of a measure of any modality, each a task of no limit unless it is empty. */
+template <typename arguments_type_>
+scan_batch_t measures_of(arguments_type_ const& arguments) noexcept {
+    return {strided(arguments.collections),
+            strided(arguments.start_keys),
+            strided(arguments.end_keys),
+            arguments.direction,
+            std::numeric_limits<ustore_size_t>::max(),
+            arguments.count};
+}
+
+/** Checks the direction a scan, a cursor or a measure walks in. */
+inline status_t validate_direction(ustore_scan_direction_t direction) noexcept {
+    if (direction != ustore_scan_ascending_k && direction != ustore_scan_descending_k)
+        return {status_code_t::invalid_argument_k, "Unknown scan direction"};
+    return {};
 }
 
 /** The tasks of a sample of any modality. */
@@ -245,6 +318,7 @@ status_t validate_scan(arguments_type_ const& arguments) noexcept {
 
     if (arguments.mode != ustore_scan_ordered_k && arguments.mode != ustore_scan_unordered_k)
         return {status_code_t::invalid_argument_k, "Unknown scan mode"};
+    if (status_t const status = validate_direction(arguments.direction); status.failed()) return status;
     if (!arguments.offsets || !arguments.keys)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
     return {};

@@ -11,6 +11,7 @@
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::ops::{Bound, Range, RangeBounds};
 use std::ptr;
 
 use stringtape::BytesTape;
@@ -18,14 +19,14 @@ use stringtape::BytesTape;
 use crate::db::ffi::{
     ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t, ustore_completion_t,
     ustore_database_t, ustore_durability_t, ustore_executor_t, ustore_key_t, ustore_keys_view_t, ustore_length_t,
-    ustore_octet_t, ustore_outcome_t, ustore_patterns_t, ustore_predicate_t, ustore_progress_callback_t,
-    ustore_scan_mode_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t, ustore_transaction_t,
-    ustore_view_t, ustore_watch_t,
+    ustore_lengths_view_t, ustore_octet_t, ustore_outcome_t, ustore_patterns_t, ustore_predicate_t,
+    ustore_progress_callback_t, ustore_scan_direction_t, ustore_scan_mode_t, ustore_size_t, ustore_strided_view_t,
+    ustore_strings_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
 use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
-    check, exported_slice, fail, Address, Arena, CollectionID, Collections, Durability, Key, Matched, Matching, Result,
-    Rows, Status, Strings, Tape, View,
+    check, exported_slice, fail, Address, Arena, CollectionID, Collections, Durability, Key, KeyRange, Matched,
+    Matching, Result, Rows, Status, Strings, Tape, View,
 };
 use crate::docs::Bitmap;
 
@@ -62,6 +63,7 @@ pub(crate) mod ffi {
         pub count: ustore_size_t,
         pub collections: ustore_collections_view_t,
         pub keys: ustore_keys_view_t,
+        pub end_keys: ustore_keys_view_t,
         pub durability: ustore_durability_t,
         pub watch: ustore_watch_t,
     }
@@ -76,6 +78,8 @@ pub(crate) mod ffi {
         pub count: ustore_size_t,
         pub collections: ustore_collections_view_t,
         pub keys: ustore_keys_view_t,
+        pub offsets: ustore_lengths_view_t,
+        pub limits: ustore_lengths_view_t,
         pub presences: *mut *const ustore_octet_t,
         pub lengths: *mut *const ustore_length_t,
         pub values: *mut ustore_strings_view_t,
@@ -92,6 +96,8 @@ pub(crate) mod ffi {
         pub count: ustore_size_t,
         pub collections: ustore_collections_view_t,
         pub start_keys: ustore_keys_view_t,
+        pub end_keys: ustore_keys_view_t,
+        pub direction: ustore_scan_direction_t,
         pub patterns: ustore_patterns_t,
         pub predicate: ustore_predicate_t,
         pub offsets: *mut *const ustore_length_t,
@@ -120,6 +126,8 @@ pub(crate) mod ffi {
         pub view: ustore_view_t,
         pub collection: ustore_collection_id_t,
         pub start_key: ustore_key_t,
+        pub end_key: *const ustore_key_t,
+        pub direction: ustore_scan_direction_t,
         pub patterns: ustore_patterns_t,
         pub predicate: ustore_predicate_t,
     }
@@ -166,6 +174,7 @@ pub(crate) mod ffi {
         pub collections: ustore_collections_view_t,
         pub start_keys: ustore_keys_view_t,
         pub end_keys: ustore_keys_view_t,
+        pub direction: ustore_scan_direction_t,
         pub min_cardinalities: *mut *const ustore_size_t,
         pub max_cardinalities: *mut *const ustore_size_t,
         pub min_value_bytes: *mut *const ustore_size_t,
@@ -440,6 +449,22 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Paren
         };
         Completion::answer(self, verb)
     }
+
+    /// Removes every key of one collection from `range.start`, inclusive, to `range.end`,
+    /// exclusive, with its value, in one atomic call.
+    pub fn remove_range(
+        &self,
+        collection: CollectionID,
+        range: Range<Key>,
+        durability: Durability,
+    ) -> Completion::Answer<RemoveRange> {
+        let verb = RemoveRange {
+            collection,
+            range,
+            durability,
+        };
+        Completion::answer(self, verb)
+    }
 }
 
 impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
@@ -460,20 +485,58 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
             collections: collections.into(),
             keys,
             arena,
+            offset: 0,
+            limit: None,
             presences: Address::default(),
             values: ustore_strings_view_t::default(),
         };
         Completion::answer(self, verb)
     }
 
-    /// Lists up to `wanted` keys of one collection from `start` into the arena, keeping those `matching` admits, while
-    /// a [`Cursor`] walks one with its values. Weighted patterns write one BM25 score per key beside them.
+    /// Reads the same byte range of every value of a batch into the arena, as [`View::read`]
+    /// reads whole values, where a range past the end of a value reads empty and one running past
+    /// it stops there.
+    pub fn read_slices<'arena, 'collections, Keys: AsRef<[Key]>>(
+        &self,
+        collections: impl Into<Collections<'collections>>,
+        keys: Keys,
+        bytes: impl RangeBounds<u64>,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<Read<'arena, 'collections, Keys>>
+    where
+        Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
+    {
+        let offset = match bytes.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start.saturating_add(1),
+            Bound::Unbounded => 0,
+        };
+        let limit = match bytes.end_bound() {
+            Bound::Included(&end) => Some(end.saturating_add(1).saturating_sub(offset)),
+            Bound::Excluded(&end) => Some(end.saturating_sub(offset)),
+            Bound::Unbounded => None,
+        };
+        let verb = Read {
+            collections: collections.into(),
+            keys,
+            arena,
+            offset,
+            limit,
+            presences: Address::default(),
+            values: ustore_strings_view_t::default(),
+        };
+        Completion::answer(self, verb)
+    }
+
+    /// Lists up to `wanted` keys of one collection's `range` into the arena, keeping those
+    /// `matching` admits, while a [`Cursor`] walks one with its values. Weighted patterns write one
+    /// BM25 score per key beside them.
     ///
     /// Calls `ustore_blobs_scan`.
     pub fn scan<'arena, 'matching>(
         &self,
         collection: CollectionID,
-        start: Key,
+        range: impl Into<KeyRange>,
         wanted: usize,
         matching: Matching<'matching>,
         arena: &'arena mut Arena,
@@ -481,9 +544,11 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
     where
         Completion: Accepts<Matching<'matching>>,
     {
+        let range = range.into();
         let verb = Scan {
             collection,
-            start,
+            start: range.start_key(),
+            range,
             arena,
             wanted,
             matched: Matched::new(matching),
@@ -517,14 +582,14 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
     pub fn measure<'arena>(
         &self,
         collection: CollectionID,
-        start: Key,
-        end: Key,
+        range: impl Into<KeyRange>,
         arena: &'arena mut Arena,
     ) -> Completion::Answer<Measure<'arena>> {
+        let range = range.into();
         let verb = Measure {
             collection,
-            start,
-            end,
+            start: range.start_key(),
+            range,
             arena,
             bounds: Default::default(),
         };
@@ -533,8 +598,8 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
 }
 
 impl<'view, Parent> View<'view, Parent> {
-    /// Opens a walk over the keys of one collection from `start`, reading nothing until its first pull, which then
-    /// sees what this view sees, pull by pull, on this view's executor.
+    /// Opens a walk over the keys of one collection's `range`, reading nothing until its first
+    /// pull, which then sees what this view sees, pull by pull, on this view's executor.
     ///
     /// The cursor holds the database open, and the transaction or snapshot this view reads through, until it is
     /// dropped.
@@ -543,7 +608,13 @@ impl<'view, Parent> View<'view, Parent> {
     /// as the cursor.
     ///
     /// Calls `ustore_blobs_cursor_init`.
-    pub fn cursor(&self, collection: CollectionID, start: Key, matching: Matching<'view>) -> Result<Cursor<'view>> {
+    pub fn cursor(
+        &self,
+        collection: CollectionID,
+        range: impl Into<KeyRange>,
+        matching: Matching<'view>,
+    ) -> Result<Cursor<'view>> {
+        let range: KeyRange = range.into();
         let mut cursor = Cursor {
             handle: ptr::null_mut(),
             database: self.database(),
@@ -559,7 +630,9 @@ impl<'view, Parent> View<'view, Parent> {
             outcome: &mut outcome,
             view: self.view(),
             collection,
-            start_key: start,
+            start_key: range.start_key(),
+            end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
+            direction: range.direction,
             patterns: cursor.matched.patterns(),
             predicate: cursor.matched.predicate(),
         };
@@ -569,7 +642,7 @@ impl<'view, Parent> View<'view, Parent> {
     }
 
     /// Which of `keys` one collection holds, exporting no value.
-    pub(crate) fn contains<'arena>(
+    pub fn contains<'arena>(
         &self,
         collection: CollectionID,
         keys: &[Key],
@@ -586,6 +659,8 @@ impl<'view, Parent> View<'view, Parent> {
             count: keys.len() as ustore_size_t,
             collections: ustore_strided_view_t::repeated(&collection),
             keys: ustore_strided_view_t::packed(keys),
+            offsets: ustore_lengths_view_t::default(),
+            limits: ustore_lengths_view_t::default(),
             presences: &mut presences,
             lengths: ptr::null_mut(),
             values: ptr::null_mut(),
@@ -676,6 +751,7 @@ impl<Keys: AsRef<[Key]>> Calling for Remove<'_, Keys> {
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
+            end_keys: ustore_keys_view_t::default(),
             durability: self.durability,
             watch: view.watch(),
         }))
@@ -690,12 +766,56 @@ impl<Keys: AsRef<[Key]>> Calling for Remove<'_, Keys> {
     }
 }
 
+/// A removal of one range of keys; see [`View::remove_range`].
+#[derive(Debug)]
+pub struct RemoveRange {
+    collection: CollectionID,
+    range: Range<Key>,
+    durability: Durability,
+}
+
+impl Calling for RemoveRange {
+    type Arguments = ffi::ustore_blobs_remove_t;
+    type Output = ();
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        Ok(Some(ffi::ustore_blobs_remove_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            transaction: view.transaction(),
+            count: 1,
+            collections: ustore_strided_view_t::repeated(&self.collection),
+            keys: ustore_strided_view_t::repeated(&self.range.start),
+            end_keys: ustore_strided_view_t::repeated(&self.range.end),
+            durability: self.durability,
+            watch: view.watch(),
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_blobs_remove(arguments)
+    }
+
+    fn finish(self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A read of a batch of keys; see [`View::read`].
 #[derive(Debug)]
 pub struct Read<'arena, 'collections, Keys> {
     collections: Collections<'collections>,
     keys: Keys,
     arena: &'arena mut Arena,
+    offset: ustore_length_t,
+    limit: Option<ustore_length_t>,
     presences: Address<ustore_octet_t>,
     values: ustore_strings_view_t,
 }
@@ -723,6 +843,14 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for Read<'arena, '_, Keys> {
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
+            offsets: match self.offset {
+                0 => ustore_lengths_view_t::default(),
+                _ => ustore_strided_view_t::repeated(&self.offset),
+            },
+            limits: match &self.limit {
+                Some(limit) => ustore_strided_view_t::repeated(limit),
+                None => ustore_lengths_view_t::default(),
+            },
             presences: &mut self.presences.0,
             lengths: ptr::null_mut(),
             values: &mut self.values,
@@ -742,9 +870,9 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for Read<'arena, '_, Keys> {
 
 /// Where one scan or sample exports the two offsets around its keys, and the keys between them.
 #[derive(Debug, Default)]
-struct Found {
-    offsets: Address<ustore_length_t>,
-    keys: Address<Key>,
+pub(crate) struct Found {
+    pub(crate) offsets: Address<ustore_length_t>,
+    pub(crate) keys: Address<Key>,
 }
 
 impl Found {
@@ -752,7 +880,7 @@ impl Found {
     ///
     /// # Safety
     /// The call succeeded, exporting two offsets and the keys between them into an arena alive for `'arena`.
-    unsafe fn keys<'arena>(&self) -> &'arena [Key] {
+    pub(crate) unsafe fn keys<'arena>(&self) -> &'arena [Key] {
         let offsets = exported_slice(self.offsets.0, 2);
         let (begin, end) = (offsets[0] as usize, offsets[1] as usize);
         exported_slice(self.keys.0.wrapping_add(begin), end - begin)
@@ -764,6 +892,7 @@ impl Found {
 pub struct Scan<'arena, 'matching> {
     collection: CollectionID,
     start: Key,
+    range: KeyRange,
     arena: &'arena mut Arena,
     wanted: usize,
     matched: Matched<'matching>,
@@ -774,7 +903,7 @@ pub struct Scan<'arena, 'matching> {
 /// The keys one scan listed, and their BM25 scores when its patterns carried weights; see [`View::scan`].
 #[derive(Clone, Copy, Debug)]
 pub struct Scanned<'arena> {
-    /// The keys, in ascending order.
+    /// The keys, in the order of the scan's direction.
     pub keys: &'arena [Key],
     /// One score per key when the patterns carried weights.
     pub scores: Option<&'arena [f32]>,
@@ -799,6 +928,8 @@ impl<'arena> Calling for Scan<'arena, '_> {
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
+            end_keys: self.range.end_keys(),
+            direction: self.range.direction,
             patterns: self.matched.patterns(),
             predicate: self.matched.predicate(),
             offsets: &mut self.found.offsets.0,
@@ -884,10 +1015,9 @@ impl<'arena> Calling for Sample<'arena> {
 pub struct Measure<'arena> {
     collection: CollectionID,
     start: Key,
-    end: Key,
+    range: KeyRange,
     arena: &'arena mut Arena,
-    /// Where the six bounds land, in the order [`Measurement`] lists them.
-    bounds: [Address<ustore_size_t>; 6],
+    bounds: Bounds,
 }
 
 impl Calling for Measure<'_> {
@@ -901,7 +1031,7 @@ impl Calling for Measure<'_> {
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let [min_cardinalities, max_cardinalities, min_value_bytes, max_value_bytes, min_space_usages, max_space_usages] =
-            &mut self.bounds;
+            &mut self.bounds.0;
         Ok(Some(ffi::ustore_blobs_measure_t {
             database: view.database(),
             executor: view.executor(),
@@ -911,7 +1041,8 @@ impl Calling for Measure<'_> {
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
-            end_keys: ustore_strided_view_t::repeated(&self.end),
+            end_keys: self.range.end_keys(),
+            direction: self.range.direction,
             min_cardinalities: &mut min_cardinalities.0,
             max_cardinalities: &mut max_cardinalities.0,
             min_value_bytes: &mut min_value_bytes.0,
@@ -927,17 +1058,31 @@ impl Calling for Measure<'_> {
     }
 
     fn finish(self) -> Result<Measurement> {
-        // SAFETY: a successful measurement of one range exported every bound it was asked for into the arena.
+        // SAFETY: the measurement of one range succeeded.
+        Ok(unsafe { self.bounds.measurement() })
+    }
+}
+
+/// Where the six bounds of one range's measurement land, in the order [`Measurement`] lists them.
+#[derive(Debug, Default)]
+pub(crate) struct Bounds(pub(crate) [Address<ustore_size_t>; 6]);
+
+impl Bounds {
+    /// The bounds a measurement exported.
+    ///
+    /// # Safety
+    /// A measurement of one range succeeded, exporting every bound into an arena still alive.
+    pub(crate) unsafe fn measurement(&self) -> Measurement {
         let [min_cardinality, max_cardinality, min_value_bytes, max_value_bytes, min_space_usage, max_space_usage] =
-            self.bounds.map(|bound| unsafe { *bound.0 });
-        Ok(Measurement {
+            self.0.each_ref().map(|bound| *bound.0);
+        Measurement {
             min_cardinality: min_cardinality as usize,
             max_cardinality: max_cardinality as usize,
             min_value_bytes,
             max_value_bytes,
             min_space_usage,
             max_space_usage,
-        })
+        }
     }
 }
 
@@ -1061,7 +1206,7 @@ mod tests {
     use super::*;
     use crate::db::{
         Admission, CollectionID, Collections, Database, DropMode, Executor, Modality, PatternKind, PredicateCost,
-        RAMOptions, Status, UUID,
+        RAMOptions, ScanDirection, Status, UUID,
     };
     use crate::testing::{created, key, keys};
 
@@ -1239,12 +1384,12 @@ mod tests {
         assert_eq!(sampled.len(), 2);
         assert_eq!(blocking.sample(blobs, 1, &mut arena).unwrap().len(), 1);
         let measured = deferred
-            .measure(blobs, key(1), key(3), &mut arena)
+            .measure(blobs, key(1)..key(3), &mut arena)
             .unwrap()
             .wait()
             .unwrap();
         assert!(measured.max_cardinality >= measured.min_cardinality);
-        let measured = blocking.measure(blobs, key(1), key(3), &mut arena).unwrap();
+        let measured = blocking.measure(blobs, key(1)..key(3), &mut arena).unwrap();
         assert!(measured.max_value_bytes >= measured.min_value_bytes);
     }
 
@@ -1379,6 +1524,36 @@ mod tests {
             .unwrap()
             .keys
             .is_empty());
+
+        // A descending walk starts at the largest key and stops before its end.
+        let descending = KeyRange {
+            start: None,
+            end: Some(key(1)),
+            direction: ScanDirection::Descending,
+        };
+        let found = database
+            .head()
+            .scan(blobs, descending, 8, Matching::default(), &mut arena)
+            .unwrap()
+            .keys;
+        assert_eq!(found, &keys([3, 2]));
+    }
+
+    #[test]
+    fn values_read_in_slices_and_ranges_remove_at_once() {
+        let (database, blobs, mut arena) = populated();
+        let head = database.head();
+        let sliced = head.read_slices(blobs, keys([1, 3]), 1..3, &mut arena).unwrap();
+        assert_eq!(
+            (sliced.get(0), sliced.get(1)),
+            (Some(b"lp".as_slice()), Some(b"am".as_slice()))
+        );
+        head.remove_range(blobs, key(1)..key(3), Durability::Buffered).unwrap();
+        let left = head
+            .scan(blobs, key(0), 8, Matching::default(), &mut arena)
+            .unwrap()
+            .keys;
+        assert_eq!(left, &keys([3]));
     }
 
     #[test]
@@ -1447,7 +1622,7 @@ mod tests {
     #[test]
     fn measurements_bound_what_a_range_holds() {
         let (database, blobs, mut arena) = populated();
-        let measured = database.head().measure(blobs, key(1), key(3), &mut arena).unwrap();
+        let measured = database.head().measure(blobs, key(1)..key(3), &mut arena).unwrap();
         assert!(measured.min_cardinality <= 3 && measured.max_cardinality >= measured.min_cardinality);
         assert!(measured.max_value_bytes >= measured.min_value_bytes);
         assert!(measured.max_space_usage >= measured.min_space_usage);

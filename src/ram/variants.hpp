@@ -48,6 +48,9 @@ database_verbs_t const ram_variant<cpu_class_, isolation_>::database_verbs_k {
     .transaction_free = &transaction_free<cpu_class_, isolation_>,
     .snapshot_free = &snapshot_free<cpu_class_, isolation_>,
     .database_free = &database_free<cpu_class_, isolation_>,
+    .changes_cursor_init = &changes_cursor_init<cpu_class_, isolation_>,
+    .changes_cursor_next = &changes_cursor_next<cpu_class_, isolation_>,
+    .changes_cursor_free = &changes_cursor_free<cpu_class_, isolation_>,
 };
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>

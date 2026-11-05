@@ -45,6 +45,19 @@ constexpr enumerator_spelling<ustore_scan_mode_t> scan_mode_names_k[] {
     {ustore_scan_unordered_k, "unordered"},
 };
 
+/** The canonical spelling of every change kind. */
+constexpr enumerator_spelling<ustore_change_kind_t> change_kind_names_k[] {
+    {ustore_change_write_k, "write"},
+    {ustore_change_removal_k, "removal"},
+    {ustore_change_change_k, "change"},
+};
+
+/** The canonical spelling of every scan direction. */
+constexpr enumerator_spelling<ustore_scan_direction_t> scan_direction_names_k[] {
+    {ustore_scan_ascending_k, "ascending"},
+    {ustore_scan_descending_k, "descending"},
+};
+
 /** The canonical spelling of every ingest order. */
 constexpr enumerator_spelling<ustore_ingest_order_t> ingest_order_names_k[] {
     {ustore_ingest_sorted_k, "sorted"},
@@ -98,6 +111,30 @@ expected<ustore_collection_id_t> mint_collection_id() noexcept {
     bytes[6] = static_cast<std::uint8_t>(0x70 | (bytes[6] & 0x0F));
     bytes[8] = static_cast<std::uint8_t>(0x80 | (bytes[8] & 0x3F));
     return id;
+}
+
+status_t open_changes_cursor(engine_t const& engine, ustore_changes_cursor_init_t const& arguments,
+                             view_t const& view) noexcept {
+    if (!engine.database->changes_cursor_init)
+        return {status_code_t::unsupported_k, "The engine keeps no stamps to read changes by"};
+    auto* const cursor = new (std::nothrow) ustore_changes_cursor_handle_t {};
+    if (!cursor) return {status_code_t::out_of_memory_k, "Failed to allocate the change feed"};
+    cursor->cursor.database = arguments.database;
+    cursor->cursor.collection = arguments.collection;
+    if (status_t const opened = engine.database->changes_cursor_init(arguments, cursor, view); opened.failed()) {
+        delete cursor;
+        return opened;
+    }
+    take_hold(arguments.database);
+    *arguments.cursor = cursor;
+    return {};
+}
+
+status_t pull(engine_t const& engine, ustore_changes_cursor_next_t const& arguments, ustore_changes_cursor_handle_t&,
+              view_t const& view) noexcept {
+    if (!arguments.count || !arguments.keys || !arguments.stamps || !arguments.kinds)
+        return {status_code_t::invalid_argument_k, "Need outputs for the count, the keys, the stamps and the kinds"};
+    return engine.database->changes_cursor_next(arguments, view);
 }
 
 } // namespace unum::ustore
@@ -180,6 +217,18 @@ char const* ustore_watch_name(ustore_watch_t watch) { return name_in(watch_names
 ustore_watch_t ustore_watch_from_name(ustore_bytes_view_t name) { return value_in(watch_names_k, name); }
 char const* ustore_scan_mode_name(ustore_scan_mode_t scan_mode) { return name_in(scan_mode_names_k, scan_mode); }
 ustore_scan_mode_t ustore_scan_mode_from_name(ustore_bytes_view_t name) { return value_in(scan_mode_names_k, name); }
+char const* ustore_scan_direction_name(ustore_scan_direction_t scan_direction) {
+    return name_in(scan_direction_names_k, scan_direction);
+}
+ustore_scan_direction_t ustore_scan_direction_from_name(ustore_bytes_view_t name) {
+    return value_in(scan_direction_names_k, name);
+}
+char const* ustore_change_kind_name(ustore_change_kind_t change_kind) {
+    return name_in(change_kind_names_k, change_kind);
+}
+ustore_change_kind_t ustore_change_kind_from_name(ustore_bytes_view_t name) {
+    return value_in(change_kind_names_k, name);
+}
 char const* ustore_drop_mode_name(ustore_drop_mode_t drop_mode) { return name_in(drop_mode_names_k, drop_mode); }
 ustore_drop_mode_t ustore_drop_mode_from_name(ustore_bytes_view_t name) { return value_in(drop_mode_names_k, name); }
 char const* ustore_isolation_name(ustore_isolation_t isolation) { return name_in(isolation_names_k, isolation); }
@@ -206,6 +255,18 @@ void ustore_ingest_free(ustore_ingest_t ingest) {
     ustore_database_t const database = ingest->database;
     arena_free_blocks(ingest->scratch);
     delete ingest;
+    release_hold(database);
+}
+
+void ustore_changes_cursor_init(ustore_changes_cursor_init_t* arguments) { route(arguments); }
+void ustore_changes_cursor_next(ustore_changes_cursor_next_t* arguments) { route(arguments); }
+
+void ustore_changes_cursor_free(ustore_changes_cursor_t cursor) {
+    if (!cursor) return;
+    wait_deferred_calls(cursor->cursor.deferred_calls);
+    ustore_database_t const database = cursor->cursor.database;
+    if (cursor->state) engine_of(database).database->changes_cursor_free(cursor);
+    delete cursor;
     release_hold(database);
 }
 

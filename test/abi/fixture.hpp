@@ -9,6 +9,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
+#include <algorithm>   // `std::find`
 #include <array>       // `std::array`
 #include <chrono>      // `std::chrono::milliseconds`
 #include <span>        // `std::span`
@@ -428,5 +429,219 @@ constexpr edge_t edge_of(std::uint64_t source, std::uint64_t target, std::uint64
 }
 
 #pragma endregion Modality Samples
+
+#pragma region Ranges Against The Reference
+
+/** Opens the reference RAM database a case checks the engine under test against with identical
+ *  writes: in a fresh directory beside the one @p config works in, or in memory when the suite
+ *  runs without one. */
+template <typename database_type_>
+expected<database_type_> open_reference(config_t const& config) noexcept {
+    engine_options_t const ram;
+    if (!config.directory()) return open_database<database_type_>(config_t {ram, nullptr});
+    path_t const directory {config.directory(), "reference"};
+    if (!recreate_directory(directory.c_str()))
+        return status_t {status_code_t::io_k, "Cannot empty the directory of the reference database"};
+    return open_database<database_type_>(config_t {ram, directory.c_str()});
+}
+
+/** One fresh collection of the engine under test and one of the reference beside it,
+ *  holding the same modality, which a case writes alike and compares, the engine under test
+ *  first in every array. */
+struct compared_collections_t {
+    std::array<database_t, 2> databases;
+    std::array<ustore_collection_id_t, 2> collections {};
+    std::array<arena_t, 2> arenas;
+};
+
+/** Opens the engine @p config names and the reference, each with an empty @p modality one. */
+inline expected<compared_collections_t> open_compared(config_t const& config, ustore_modality_t modality) noexcept {
+    compared_collections_t compared;
+    auto [tested, tested_status] = open_database<database_t>(config);
+    if (tested_status.failed()) return tested_status;
+    auto [reference, reference_status] = open_reference<database_t>(config);
+    if (reference_status.failed()) return reference_status;
+    compared.databases = {std::move(tested), std::move(reference)};
+    for (std::size_t side = 0; side != 2; ++side) {
+        if (status_t const status = compared.databases[side].clear(ustore_drop_collection_k); status.failed())
+            return status;
+        auto [collection, collection_status] = create_collection(compared.databases[side], "ranges", modality);
+        if (collection_status.failed()) return collection_status;
+        auto [arena, arena_status] = arena_t::make();
+        if (arena_status.failed()) return arena_status;
+        compared.collections[side] = collection;
+        compared.arenas[side] = std::move(arena);
+    }
+    return compared;
+}
+
+/** A range a case lists or measures: from @c start, inclusive, or the first key in @c direction
+ *  when null, to @c end, exclusive, or no bound when null, at most @c wanted keys. */
+struct key_bounds_t {
+    ustore_key_t const* start = nullptr;
+    ustore_key_t const* end = nullptr;
+    ustore_scan_direction_t direction = ustore_scan_ascending_k;
+    ustore_size_t wanted = 0;
+};
+
+/** Lists the keys of @p bounds in @p side of @p compared via @p call, into that side's arena. */
+template <typename arguments_type_>
+expected<std::span<ustore_key_t const>> scan_bounds(void (*call)(arguments_type_*), compared_collections_t& compared,
+                                                    std::size_t side, key_bounds_t const& bounds) noexcept {
+    ustore_length_t const* offsets = nullptr;
+    ustore_key_t const* keys = nullptr;
+    ustore_outcome_t outcome {};
+    arguments_type_ scan {};
+    scan.database = compared.databases[side];
+    scan.outcome = &outcome;
+    scan.count = 1;
+    scan.collections = {&compared.collections[side], 0};
+    if (bounds.start) scan.start_keys = {bounds.start, 0};
+    if (bounds.end) scan.end_keys = {bounds.end, 0};
+    scan.direction = bounds.direction;
+    scan.offsets = &offsets;
+    scan.keys = &keys;
+    scan.arena = compared.arenas[side];
+    scan.wanted = bounds.wanted;
+    call(&scan);
+    if (status_t const status {outcome}; status.failed()) return status;
+    if (!offsets) return status_t {status_code_t::internal_k, "The scan exported no offsets"};
+    return std::span<ustore_key_t const> {keys + offsets[0], keys + offsets[1]};
+}
+
+/** Counts a failure for every key the engine under test lists over @p bounds through @p call apart
+ *  from the reference, and for every key the reference lists apart from @p pinned. */
+template <typename arguments_type_>
+std::size_t expect_same_scan(void (*call)(arguments_type_*), compared_collections_t& compared,
+                             key_bounds_t const& bounds, std::span<ustore_key_t const> pinned) {
+    auto [tested, tested_status] = scan_bounds(call, compared, 0, bounds);
+    auto [reference, reference_status] = scan_bounds(call, compared, 1, bounds);
+    std::size_t failures = expect(tested_status.succeeded()) + expect(reference_status.succeeded());
+    if (failures != 0) return failures;
+    failures += expect_eq(tested.size(), reference.size());
+    for (std::size_t index = 0; index != tested.size() && index != reference.size(); ++index)
+        failures += expect_eq(tested[index], reference[index]);
+    failures += expect_eq(reference.size(), pinned.size());
+    for (std::size_t index = 0; index != reference.size() && index != pinned.size(); ++index)
+        failures += expect_eq(reference[index], pinned[index]);
+    return failures;
+}
+
+/** Removes every key in [ start, end ) of each pair of @p starts and @p ends from both sides of
+ *  @p compared through @p call, counting a failure for each side that refuses. */
+template <typename arguments_type_>
+std::size_t remove_ranges(void (*call)(arguments_type_*), compared_collections_t& compared,
+                          std::span<ustore_key_t const> starts, std::span<ustore_key_t const> ends) {
+    std::size_t failures = 0;
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_outcome_t outcome {};
+        arguments_type_ remove {};
+        remove.database = compared.databases[side];
+        remove.outcome = &outcome;
+        remove.count = starts.size();
+        remove.collections = {&compared.collections[side], 0};
+        remove.keys = {starts.data(), sizeof(ustore_key_t)};
+        remove.end_keys = {ends.data(), sizeof(ustore_key_t)};
+        call(&remove);
+        failures += expect_success(outcome);
+    }
+    return failures;
+}
+
+/** The bounds one measure reported of one range. */
+struct measured_bounds_t {
+    ustore_size_t min_cardinality = 0;
+    ustore_size_t max_cardinality = 0;
+    ustore_size_t min_value_bytes = 0;
+    ustore_size_t max_value_bytes = 0;
+};
+
+/** Measures @p bounds in collection @p side of @p compared via @p call, into that side's arena. */
+template <typename arguments_type_>
+expected<measured_bounds_t> measure_bounds(void (*call)(arguments_type_*), compared_collections_t& compared,
+                                           std::size_t side, key_bounds_t const& bounds) noexcept {
+    ustore_size_t const *min_cardinalities = nullptr, *max_cardinalities = nullptr;
+    ustore_size_t const *min_value_bytes = nullptr, *max_value_bytes = nullptr;
+    ustore_outcome_t outcome {};
+    arguments_type_ measure {};
+    measure.database = compared.databases[side];
+    measure.outcome = &outcome;
+    measure.count = 1;
+    measure.collections = {&compared.collections[side], 0};
+    if (bounds.start) measure.start_keys = {bounds.start, 0};
+    if (bounds.end) measure.end_keys = {bounds.end, 0};
+    measure.direction = bounds.direction;
+    measure.min_cardinalities = &min_cardinalities;
+    measure.max_cardinalities = &max_cardinalities;
+    measure.min_value_bytes = &min_value_bytes;
+    measure.max_value_bytes = &max_value_bytes;
+    measure.arena = compared.arenas[side];
+    call(&measure);
+    if (status_t const status {outcome}; status.failed()) return status;
+    if (!min_cardinalities || !max_cardinalities || !min_value_bytes || !max_value_bytes)
+        return status_t {status_code_t::internal_k, "The measure exported no bounds"};
+    return measured_bounds_t {min_cardinalities[0], max_cardinalities[0], min_value_bytes[0], max_value_bytes[0]};
+}
+
+/** Counts a failure unless the reference measures exactly @p cardinality entries in @p bounds
+ *  through @p call, and the bounds of the engine under test hold that count. */
+template <typename arguments_type_>
+std::size_t expect_measure_holds(void (*call)(arguments_type_*), compared_collections_t& compared,
+                                 key_bounds_t const& bounds, ustore_size_t cardinality) {
+    auto [tested, tested_status] = measure_bounds(call, compared, 0, bounds);
+    auto [reference, reference_status] = measure_bounds(call, compared, 1, bounds);
+    std::size_t failures = expect(tested_status.succeeded()) + expect(reference_status.succeeded());
+    if (failures != 0) return failures;
+    failures += expect_eq(reference.min_cardinality, cardinality);
+    failures += expect_eq(reference.max_cardinality, cardinality);
+    failures += expect(tested.min_cardinality <= cardinality && cardinality <= tested.max_cardinality);
+    return failures;
+}
+
+/** Counts a failure unless both sides of @p compared draw @p drawn distinct keys of @p written
+ *  through @p call when asked for @p wanted. */
+template <typename arguments_type_>
+std::size_t expect_samples_of(void (*call)(arguments_type_*), compared_collections_t& compared,
+                              std::span<ustore_key_t const> written, ustore_size_t wanted, std::size_t drawn) {
+    std::size_t failures = 0;
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* keys = nullptr;
+        ustore_outcome_t outcome {};
+        arguments_type_ sample {};
+        sample.database = compared.databases[side];
+        sample.outcome = &outcome;
+        sample.count = 1;
+        sample.collections = {&compared.collections[side], 0};
+        sample.offsets = &offsets;
+        sample.keys = &keys;
+        sample.arena = compared.arenas[side];
+        sample.wanted = wanted;
+        call(&sample);
+        failures += expect_success(outcome);
+        if (outcome.status != ustore_status_success_k) continue;
+        failures += expect(offsets != nullptr);
+        if (!offsets) continue;
+        failures += expect_eq(static_cast<std::size_t>(offsets[1] - offsets[0]), drawn);
+        for (ustore_length_t index = offsets[0]; index != offsets[1]; ++index) {
+            failures += expect(std::find(written.begin(), written.end(), keys[index]) != written.end());
+            failures += expect(std::find(keys + offsets[0], keys + index, keys[index]) == keys + index);
+        }
+    }
+    return failures;
+}
+
+/** The keys of @p count_ integers from @p first on, in the order @p direction lists them. */
+template <std::size_t count_>
+std::array<ustore_key_t, count_> keys_of_integers(
+    std::uint64_t first, ustore_scan_direction_t direction = ustore_scan_ascending_k) noexcept {
+    std::array<ustore_key_t, count_> keys;
+    for (std::size_t index = 0; index != count_; ++index)
+        keys[index] = key_from_integer(direction == ustore_scan_descending_k ? first + count_ - 1 - index
+                                                                             : first + index);
+    return keys;
+}
+
+#pragma endregion Ranges Against The Reference
 
 } // namespace unum::ustore::test::abi

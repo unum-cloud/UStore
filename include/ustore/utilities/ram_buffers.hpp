@@ -819,6 +819,9 @@ struct serial_strings_kit_t {
     static constexpr auto strings_unescape = sz_strings_unescape_serial;
     static constexpr auto strings_escape = sz_strings_escape_serial;
     static constexpr auto hash = sz_hash_serial;
+    static constexpr auto sha256_state_init = sz_sha256_state_init_serial;
+    static constexpr auto sha256_state_update = sz_sha256_state_update_serial;
+    static constexpr auto sha256_state_digest = sz_sha256_state_digest_serial;
 };
 
 #if STRINGZILLA_TARGET_HASWELL && STRINGZILLA_TARGET_WESTMERE
@@ -831,6 +834,9 @@ struct haswell_strings_kit_t {
     static constexpr auto strings_unescape = sz_strings_unescape_haswell;
     static constexpr auto strings_escape = sz_strings_escape_haswell;
     static constexpr auto hash = sz_hash_westmere;
+    static constexpr auto sha256_state_init = sz_sha256_state_init_serial;
+    static constexpr auto sha256_state_update = sz_sha256_state_update_serial;
+    static constexpr auto sha256_state_digest = sz_sha256_state_digest_serial;
 };
 #else
 struct haswell_strings_kit_t {
@@ -849,6 +855,9 @@ struct skylake_strings_kit_t {
     static constexpr auto strings_unescape = sz_strings_unescape_haswell;
     static constexpr auto strings_escape = sz_strings_escape_haswell;
     static constexpr auto hash = sz_hash_skylake;
+    static constexpr auto sha256_state_init = sz_sha256_state_init_serial;
+    static constexpr auto sha256_state_update = sz_sha256_state_update_serial;
+    static constexpr auto sha256_state_digest = sz_sha256_state_digest_serial;
 };
 #else
 struct skylake_strings_kit_t {
@@ -857,7 +866,7 @@ struct skylake_strings_kit_t {
 };
 #endif
 
-#if STRINGZILLA_TARGET_ICELAKE && STRINGZILLA_TARGET_SKYLAKE
+#if STRINGZILLA_TARGET_ICELAKE && STRINGZILLA_TARGET_SKYLAKE && STRINGZILLA_TARGET_GOLDMONT
 struct icelake_strings_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_icelake_k;
     static constexpr bool compiled_k = true;
@@ -867,6 +876,9 @@ struct icelake_strings_kit_t {
     static constexpr auto strings_unescape = sz_strings_unescape_icelake;
     static constexpr auto strings_escape = sz_strings_escape_icelake;
     static constexpr auto hash = sz_hash_icelake;
+    static constexpr auto sha256_state_init = sz_sha256_state_init_goldmont;
+    static constexpr auto sha256_state_update = sz_sha256_state_update_goldmont;
+    static constexpr auto sha256_state_digest = sz_sha256_state_digest_goldmont;
 };
 #else
 struct icelake_strings_kit_t {
@@ -885,6 +897,9 @@ struct neon_strings_kit_t {
     static constexpr auto strings_unescape = sz_strings_unescape_neon;
     static constexpr auto strings_escape = sz_strings_escape_neon;
     static constexpr auto hash = sz_hash_neonaes;
+    static constexpr auto sha256_state_init = sz_sha256_state_init_serial;
+    static constexpr auto sha256_state_update = sz_sha256_state_update_serial;
+    static constexpr auto sha256_state_digest = sz_sha256_state_digest_serial;
 };
 #else
 struct neon_strings_kit_t {
@@ -903,6 +918,9 @@ struct rvv_strings_kit_t {
     static constexpr auto strings_unescape = sz_strings_unescape_rvv;
     static constexpr auto strings_escape = sz_strings_escape_rvv;
     static constexpr auto hash = sz_hash_rvv;
+    static constexpr auto sha256_state_init = sz_sha256_state_init_rvv;
+    static constexpr auto sha256_state_update = sz_sha256_state_update_rvv;
+    static constexpr auto sha256_state_digest = sz_sha256_state_digest_rvv;
 };
 #else
 struct rvv_strings_kit_t {
@@ -921,6 +939,28 @@ concept strings_kit_concept = requires {
     strings_kit_type_::strings_unescape;
     strings_kit_type_::strings_escape;
     strings_kit_type_::hash;
+};
+
+/** Steps a SHA-256 state through the kernels of @p strings_kit_type_, as an archive hashes every
+ *  run it saves. */
+template <typename strings_kit_type_>
+struct strings_kit_sha256 {
+
+    void init(sz_sha256_state_t& state) const noexcept {
+        [[maybe_unused]] sz_status_t const started = strings_kit_type_::sha256_state_init(&state, nullptr);
+    }
+
+    void update(sz_sha256_state_t& state, std::span<byte_t const> bytes) const noexcept {
+        [[maybe_unused]] sz_status_t const stepped = strings_kit_type_::sha256_state_update(
+            &state, reinterpret_cast<sz_cptr_t>(bytes.data()), bytes.size(), nullptr);
+    }
+
+    [[nodiscard]] sha256_t digest(sz_sha256_state_t const& state) const noexcept {
+        sha256_t digest;
+        [[maybe_unused]] sz_status_t const finished = strings_kit_type_::sha256_state_digest(&state, digest.bytes,
+                                                                                             nullptr);
+        return digest;
+    }
 };
 
 /** The widest strings kit this build compiled in among the tiers @p capabilities_ admits, newest

@@ -8,10 +8,11 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
+#include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 #include <cstring> // `std::memcpy`
 
 #include <algorithm> // `std::ranges::fill`, `std::ranges::partition`
+#include <limits>    // `std::numeric_limits`
 #include <span>      // `std::span`
 
 #include "ustore/graph.h"    // `ustore_graph_read_edges_t`, `ustore_vertex_role_t`
@@ -352,9 +353,56 @@ inline status_t graph_write_vertices_over_blobs(blobs_verbs<home_t::host_k> cons
     return write_entries(values_verbs, arguments.database, missing.first(missing_count), arguments.durability, view);
 }
 
+/** The removal @p requested names, with every range of vertices it names listed through the
+ *  engine's own @p values_verbs into the scratch of @p view, each listed vertex in the collection
+ *  and the role of its range. */
+inline expected<ustore_graph_remove_vertices_t> vertices_of_ranges(blobs_verbs<home_t::host_k> const& values_verbs,
+                                                                   ustore_graph_remove_vertices_t const& requested,
+                                                                   view_t const& view) noexcept {
+    if (!requested.end_vertices.data) return requested;
+    ustore_length_t const* offsets = nullptr;
+    ustore_key_t const* listed = nullptr;
+    ustore_blobs_scan_t scan {};
+    scan.database = requested.database;
+    scan.count = requested.count;
+    scan.collections = requested.collections;
+    scan.start_keys = requested.vertices;
+    scan.end_keys = requested.end_vertices;
+    scan.offsets = &offsets;
+    scan.keys = &listed;
+    scan.arena = view.scratch;
+    scan.wanted = std::numeric_limits<ustore_size_t>::max();
+    if (status_t const status = values_verbs.scan(scan, view); status.failed()) return status;
+
+    std::size_t const listed_count = offsets[requested.count];
+    auto [collections, collections_status] = arena_allocate<ustore_collection_id_t>(view.scratch, listed_count);
+    if (collections_status.failed()) return collections_status;
+    auto [roles, roles_status] = arena_allocate<ustore_vertex_role_t>(view.scratch,
+                                                                      requested.roles.data ? listed_count : 0);
+    if (roles_status.failed()) return roles_status;
+    strided_iterator<ustore_collection_id_t const> const range_collections = strided(requested.collections);
+    strided_iterator<ustore_vertex_role_t const> const range_roles = strided(requested.roles);
+    for (std::size_t range = 0; range != requested.count; ++range)
+        for (std::size_t index = offsets[range]; index != offsets[range + 1]; ++index) {
+            collections[index] = range_collections[static_cast<std::ptrdiff_t>(range)];
+            if (range_roles) roles[index] = range_roles[static_cast<std::ptrdiff_t>(range)];
+        }
+
+    ustore_graph_remove_vertices_t removal = requested;
+    removal.count = listed_count;
+    removal.collections = {collections.data(), sizeof(ustore_collection_id_t)};
+    removal.vertices = {listed, sizeof(ustore_key_t)};
+    removal.end_vertices = {};
+    if (range_roles) removal.roles = {roles.data(), sizeof(ustore_vertex_role_t)};
+    return removal;
+}
+
 inline status_t graph_remove_vertices_over_blobs(blobs_verbs<home_t::host_k> const& values_verbs,
-                                                 ustore_graph_remove_vertices_t const& arguments,
+                                                 ustore_graph_remove_vertices_t const& requested,
                                                  view_t const& view) noexcept {
+    if (!requested.count) return {};
+    auto [arguments, listed_status] = vertices_of_ranges(values_verbs, requested, view);
+    if (listed_status.failed()) return listed_status;
     if (!arguments.count) return {};
 
     ustore_arena_t const scratch = view.scratch;
