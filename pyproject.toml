@@ -1,12 +1,12 @@
 # Wheels for CPython 3.12 to 3.15 and the free-threaded 3.14t and 3.15t, from the project's own CMake tree.
 [build-system]
 build-backend = "scikit_build_core.build"
-requires = ["scikit-build-core>=0.10"]
+requires = ["scikit-build-core>=0.11"]
 
 [project]
 name = "ustore"
 version = "1.0.0-rc.1"
-description = "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
+description = "GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

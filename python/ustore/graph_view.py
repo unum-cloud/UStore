@@ -3,9 +3,9 @@
 A graph collection holds every vertex and its edges, while two optional document collections hold
 the attributes of vertices, keyed by vertex, and of edges, keyed by edge identifier. Every read goes
 to the store, so a view holds nothing that could go stale, and every verb works the same over a
-`Database`, a `Transaction` and a blocking `View` of either. Every call reads into a one-off
+`Database`, a `Transaction` and a blocking `On` of either. Every call reads into a one-off
 `Arena` and copies what it needs into Python objects, which costs an arena per call, while the
-graph verbs of `ustore.lib` take arenas a loop reuses. Over a `DeferredView`, `has_node` and
+graph verbs of `ustore.lib` take arenas a loop reuses. Over a `DeferredOn`, `has_node` and
 `read_edges`, which take one call each, answer a `Deferred`, while every method built of several
 calls raises TypeError. Vertices and edges are named by `uuid.UUID`, as every key is, and any
 spelling of a key the binding accepts names them on the way in.
@@ -32,18 +32,18 @@ from ustore.lib import (
     Arena,
     Database,
     Deferred,
-    DeferredView,
+    DeferredOn,
     Modality,
     Modification,
     Neighborhoods,
     Role,
     Transaction,
-    View,
+    On,
     edge_id_default,
 )
 
-type Blocking = Database | Transaction | View
-type Receiver = Blocking | DeferredView
+type Blocking = Database | Transaction | On
+type Receiver = Blocking | DeferredOn
 type CollectionLike = UUID | str
 type Attributes = dict[str, Any]
 type Triple = tuple[UUID, UUID, UUID]
@@ -234,7 +234,7 @@ class Graph:
     @property
     def blocking(self) -> Blocking:
         """The receiver of every method built of several calls, which a deferred view cannot answer as one."""
-        if isinstance(self.view, DeferredView):
+        if isinstance(self.view, DeferredOn):
             raise TypeError(
                 "A graph over a deferred view answers a Deferred from has_node() and read_edges() alone; "
                 "call the graph verbs, such as graph_read_edges(), on the view instead"
@@ -298,7 +298,7 @@ class Graph:
 
     def has_node(self, node: KeyLike) -> bool | Deferred[bool]:
         """Whether the vertex is present, or the `Deferred` of it over a deferred view."""
-        if isinstance(self.view, DeferredView):
+        if isinstance(self.view, DeferredOn):
             return self.view.graph_contains(node, collection=self.graph_collection)
         return node in self
 

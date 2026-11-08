@@ -275,6 +275,15 @@ struct compact_t {
     answer_t finish() && noexcept { return {}; }
 };
 
+/** What a deferred @c ustore_database_flush keeps, which is nothing. */
+struct flush_t {
+    using arguments_t = ustore_database_flush_t;
+    using answer_t = status_t;
+
+    static void submit(arguments_t& arguments) noexcept { ustore_database_flush(&arguments); }
+    answer_t finish() && noexcept { return {}; }
+};
+
 #pragma endregion Deferred Verbs
 
 #pragma region Deferred Receivers
@@ -374,6 +383,15 @@ class deferred_snapshot_t {
             arguments.path = copied;
             arguments.progress = progress.callback;
             arguments.progress_state = progress.state;
+            return status_t {};
+        });
+    }
+
+    /** Makes every commit that returned before this call durable. */
+    deferred<flush_t> flush() const noexcept {
+        return deferred<flush_t>::submit([&](flush_t&, ustore_database_flush_t& arguments) noexcept {
+            arguments.database = receiver_.database;
+            arguments.executor = receiver_.executor;
             return status_t {};
         });
     }
@@ -763,7 +781,10 @@ class database_ref_t {
     database_ref_t() noexcept = default;
     explicit database_ref_t(receiver_t receiver) noexcept : receiver_(receiver) {}
 
+    /** The C handle of the database, so the reference passes as a @c ustore_database_t. */
     operator ustore_database_t() const noexcept { return receiver_.database; }
+
+    /** The database and executor this reference runs on, to build another reference on them. */
     receiver_t receiver() const noexcept { return receiver_; }
 
     /** The same head, running every call on @p executor. */
@@ -788,6 +809,7 @@ class database_ref_t {
         return description;
     }
 
+    /** Whether the engine runs transactions. */
     bool supports_transactions() noexcept { return capabilities_() & ustore_capabilities_transactions_k; }
     bool supports_snapshots() noexcept { return capabilities_() & ustore_capabilities_snapshots_k; }
 
@@ -797,6 +819,7 @@ class database_ref_t {
     /** Pins a point-in-time view of the database, which the returned snapshot frees when it goes. */
     expected<snapshot_t> snapshot() noexcept { return snapshot_t::make(receiver_); }
 
+    /** Finds the collection named @p name, or creates it when absent. */
     expected<blobs_collection_t> operator[](std::string_view name) noexcept { return find_or_create(name); }
 
     /** Whether a collection named @p name exists at the head. */
@@ -892,6 +915,18 @@ class database_ref_t {
         database_compact.progress = progress.callback;
         database_compact.progress_state = progress.state;
         ustore_database_compact(&database_compact);
+        return status_t {outcome};
+    }
+
+    /** Makes every commit that returned before this call durable, as if each had asked for
+     *  @c ustore_durability_flushed_k. */
+    status_t flush() noexcept {
+        ustore_outcome_t outcome {};
+        ustore_database_flush_t database_flush {};
+        database_flush.database = receiver_.database;
+        database_flush.executor = receiver_.executor;
+        database_flush.outcome = &outcome;
+        ustore_database_flush(&database_flush);
         return status_t {outcome};
     }
 };

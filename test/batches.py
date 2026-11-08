@@ -1,5 +1,10 @@
 """Batch scans and samples: many tasks and one `wanted` in one call, against the single form beside them, and the
-progress a scan reports."""
+progress a scan reports.
+
+File: test/batches.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import threading
 
@@ -73,6 +78,48 @@ def test_an_exported_tape_pins_its_arena(populated, blobs, arena):
         populated.scan(1, 100, arena, collection=blobs)
     populated.scan(1, 100, ustore.Arena(), collection=blobs)
     assert exported.tobytes() == b"".join(key.bytes for key in keys([1, 2, 9, 10]))
+
+
+def test_a_dlpack_export_pins_its_arena(populated, blobs, arena):
+    """A tape of keys exports DLPack in place from host pages, holding its arena until the consumer lets go."""
+    found = populated.scan_batch([1, 9], 2, arena, collection=blobs)
+    assert found.__dlpack_device__() == (1, 0)
+    exported = np.from_dlpack(found)
+    assert exported.shape == (4, 16)
+    assert exported.tobytes() == b"".join(key.bytes for key in keys([1, 2, 9, 10]))
+    with pytest.raises(ustore.ContendedError):
+        populated.scan(1, 100, arena, collection=blobs)
+    with pytest.raises(BufferError):
+        found.__dlpack__(copy=True)
+    del exported
+    populated.scan(1, 100, arena, collection=blobs)
+
+
+class DLPackOnly:
+    """Exports a NumPy array through DLPack alone, with neither the buffer protocol nor a length."""
+
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = array
+
+    def __dlpack__(self, **options):
+        return self.array.__dlpack__(**options)
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        return self.array.__dlpack_device__()
+
+
+@pytest.mark.parametrize(
+    "starts",
+    [
+        np.array([2, 10], dtype=np.int64),
+        np.array([2, 10], dtype=np.uint64),
+        np.frombuffer(b"".join(key.bytes for key in keys([2, 10])), dtype=np.uint8).reshape(2, 16).copy(),
+    ],
+    ids=["i64", "u64", "bytes"],
+)
+def test_scan_batch_takes_starts_through_dlpack(populated, blobs, arena, starts):
+    """Starts arrive through DLPack as 64-bit integers or as 16-byte keys, before any other protocol is asked."""
+    assert runs(populated.scan_batch(DLPackOnly(starts), 2, arena, collection=blobs)) == [[2, 3], [10, 11]]
 
 
 @pytest.mark.parametrize(

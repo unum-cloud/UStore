@@ -12,9 +12,10 @@
 //! Every struct releases itself when dropped, unless its consumer moved it out and left `release` null, as the
 //! specification asks of a move.
 //!
-//! An export pulls the collection's cursor into one arena per batch, which the exporters pin until the batch is
-//! released, so batches outlive each other and the stream. An import reads every batch's columns in place into the
-//! writes of the collection's modality, and an ingest appends them to one ingest that lands as one commit.
+//! An export pulls the collection's cursor into one arena per batch, which its columns share until
+//! the last is released, so batches outlive each other and the stream. An import reads every
+//! batch's columns in place into the writes of the collection's modality, and an ingest appends
+//! them to one ingest that lands as one commit.
 //!
 //! File: rust/arrow.rs
 //! Author: Ash Vardanian
@@ -22,7 +23,11 @@
 
 use std::array;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::fmt;
+use std::marker::PhantomData;
 use std::ptr;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use crate::blobs::ffi as blobs_ffi;
 use crate::db::ffi::{
@@ -32,7 +37,8 @@ use crate::db::ffi::{
     USTORE_STRINGS_U64_TAPE_K,
 };
 use crate::db::{
-    check, fail, Arena, CollectionID, Durability, Error, Key, Modality, Result, ScanDirection, Status, View, Watch,
+    check, fail, read_spelling, spelling, Arena, CollectionID, Durability, Error, Key, Modality, On, Result,
+    ScanDirection, Status, Watch,
 };
 use crate::docs::ffi as docs_ffi;
 use crate::docs::sealed::Format;
@@ -93,6 +99,26 @@ pub struct ArrowArray {
     pub private_data: *mut c_void,
 }
 
+/// An Arrow array and the device holding its buffers, as `struct ArrowDeviceArray` lays them out.
+///
+/// The buffers of an array on a device are addresses there, which only the raw pointers of
+/// [`ArrowArray`] carry, so no safe host slice ever reads them.
+#[repr(C)]
+#[derive(Debug)]
+pub struct ArrowDeviceArray {
+    /// The array.
+    pub array: ArrowArray,
+    /// The vendor's ordinal of the device, or -1 on the host.
+    pub device_id: i64,
+    /// The `ARROW_DEVICE_*` type of the device.
+    pub device_type: i32,
+    /// What to wait on before reading the buffers, or null, as an exporter here waited for its
+    /// device.
+    pub sync_event: *mut c_void,
+    /// Zeroed.
+    pub reserved: [i64; 3],
+}
+
 /// A stream of Arrow record batches of one schema, as `struct ArrowArrayStream` lays it out.
 #[repr(C)]
 #[derive(Debug)]
@@ -141,6 +167,52 @@ impl ArrowArray {
             release: None,
             private_data: ptr::null_mut(),
         }
+    }
+}
+
+impl ArrowDeviceArray {
+    /// `ARROW_DEVICE_CPU`, the type of memory the host reads in place.
+    pub const CPU: i32 = 1;
+
+    /// A released array, for an exporter to write into.
+    pub fn empty() -> Self {
+        ArrowDeviceArray {
+            array: ArrowArray::empty(),
+            device_id: 0,
+            device_type: 0,
+            sync_event: ptr::null_mut(),
+            reserved: [0; 3],
+        }
+    }
+}
+
+/// One column exported as Arrow in place, borrowing the arena it sits in until dropped.
+#[derive(Debug)]
+pub struct ArrowExport<'arena> {
+    pub(crate) schema: ArrowSchema,
+    pub(crate) array: ArrowDeviceArray,
+    pub(crate) marker: PhantomData<&'arena Arena>,
+}
+
+impl ArrowExport<'_> {
+    /// The column's type.
+    pub fn schema(&self) -> &ArrowSchema {
+        &self.schema
+    }
+
+    /// The column's buffers and the device holding them.
+    pub fn array(&self) -> &ArrowDeviceArray {
+        &self.array
+    }
+
+    /// Hands the column over past the arena's borrow, for a consumer that takes the structures by
+    /// value.
+    ///
+    /// # Safety
+    ///
+    /// The arena must outlive the release of both, which no borrow checks any more.
+    pub unsafe fn into_parts(self) -> (ArrowSchema, ArrowDeviceArray) {
+        (self.schema, self.array)
     }
 }
 
@@ -229,6 +301,37 @@ pub enum IngestOrder {
     Sorted = 0,
     /// Keys arrive in any order and may repeat, the last row of a key winning; every batch is held until the end.
     Unsorted = 1,
+}
+
+impl IngestOrder {
+    fn from_raw(raw: ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(IngestOrder::Sorted),
+            1 => Some(IngestOrder::Unsorted),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for IngestOrder {
+    /// Spells the order as "sorted" or "unsorted".
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_ingest_order_name, *self as ustore_enum_t))
+    }
+}
+
+impl FromStr for IngestOrder {
+    type Err = Error;
+
+    /// Reads "sorted" or "unsorted" back.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_ingest_order_from_name,
+            ffi::ustore_ingest_order_name,
+            IngestOrder::from_raw,
+        )
+    }
 }
 
 // region: Columns
@@ -509,6 +612,23 @@ unsafe extern "C" fn release_batch(batch: *mut ArrowArray) {
     (*batch).release = None;
 }
 
+/// What an exported column's release frees after the exporter's own: its share of the arena.
+struct HeldColumn {
+    release: Option<unsafe extern "C" fn(*mut ArrowArray)>,
+    private_data: *mut c_void,
+    arena: Arc<Mutex<Arena>>,
+}
+
+unsafe extern "C" fn release_held_column(column: *mut ArrowArray) {
+    let held = Box::from_raw((*column).private_data.cast::<HeldColumn>());
+    (*column).release = held.release;
+    (*column).private_data = held.private_data;
+    if let Some(release) = held.release {
+        release(column);
+    }
+    drop(held.arena);
+}
+
 /// The schema of a collection of `modality`: a struct of its columns, uuids tagged as `arrow.uuid`.
 fn exported_schema(modality: Modality) -> ArrowSchema {
     let columns = columns_of(modality);
@@ -560,8 +680,8 @@ impl ExportedBatch {
     /// Exports `count` keys out of `arena` as the next column.
     fn keys(&mut self, keys: ustore_keys_view_t, count: ustore_size_t, arena: &Arena) -> Result<()> {
         let mut schema = ArrowSchema::empty();
-        let mut column = ffi::ArrowDeviceArray::empty();
-        // SAFETY: a call wrote the keys into the arena, which the column pins until released.
+        let mut column = ArrowDeviceArray::empty();
+        // SAFETY: a call wrote the keys into the arena, which the column's share keeps alive.
         let status = unsafe { ffi::ustore_keys_view_to_arrow(keys, count, arena.handle, &mut schema, &mut column) };
         check(ustore_outcome_t {
             status,
@@ -575,8 +695,8 @@ impl ExportedBatch {
     /// Exports `count` strings out of `arena` as the next column, as `binary`, which the stream's schema names.
     fn strings(&mut self, strings: ustore_strings_view_t, count: ustore_size_t, arena: &Arena) -> Result<()> {
         let mut schema = ArrowSchema::empty();
-        let mut column = ffi::ArrowDeviceArray::empty();
-        // SAFETY: a call wrote the tape into the arena, which the column pins until released.
+        let mut column = ArrowDeviceArray::empty();
+        // SAFETY: a call wrote the tape into the arena, which the column's share keeps alive.
         let status = unsafe {
             ffi::ustore_strings_view_to_arrow(
                 strings,
@@ -596,8 +716,21 @@ impl ExportedBatch {
         Ok(())
     }
 
-    /// The batch of `rows` rows over the exported columns, which its release releases.
-    fn into_array(self: Box<Self>, rows: ustore_size_t) -> ArrowArray {
+    /// The batch of `rows` rows over the exported columns, which its release releases, each column
+    /// holding a share of `arena` until its own release, as a consumer may move columns out.
+    fn into_array(mut self: Box<Self>, rows: ustore_size_t, arena: Arena) -> ArrowArray {
+        // The mutex only lets the columns, released on any thread, share the arena.
+        let arena = Arc::new(Mutex::new(arena));
+        let count = self.count;
+        for column in &mut self.columns[..count] {
+            let held = Box::new(HeldColumn {
+                release: column.release,
+                private_data: column.private_data,
+                arena: arena.clone(),
+            });
+            column.private_data = Box::into_raw(held).cast();
+            column.release = Some(release_held_column);
+        }
         let owned = Box::into_raw(self);
         // SAFETY: the box was just leaked, and the batch's release takes it back.
         unsafe {
@@ -719,7 +852,7 @@ impl ExportStream {
         // SAFETY: every pointer in each `arguments` outlives its call, which is final on return.
         unsafe {
             match self.cursor {
-                ExportCursor::Vertices(cursor) => return self.pull_edges(cursor, batch, &arena),
+                ExportCursor::Vertices(cursor) => return self.pull_edges(cursor, arena, batch),
                 ExportCursor::Strings(cursor) => {
                     strings_ffi::ustore_strings_cursor_next(&mut strings_ffi::ustore_strings_cursor_next_t {
                         database: self.database,
@@ -741,7 +874,7 @@ impl ExportStream {
                     }
                     batch.strings(values, rows, &arena)?;
                     batch.keys(ustore_keys_view_t { data: keys, stride: 16 }, rows, &arena)?;
-                    return Ok(Some(batch.into_array(rows)));
+                    return Ok(Some(batch.into_array(rows, arena)));
                 }
                 ExportCursor::Docs(cursor) => docs_ffi::ustore_docs_cursor_next(&mut docs_ffi::ustore_docs_cursor_next_t {
                     database: self.database,
@@ -794,7 +927,7 @@ impl ExportStream {
         }
         batch.keys(ustore_keys_view_t { data: keys, stride: 16 }, rows, &arena)?;
         batch.strings(values, rows, &arena)?;
-        Ok(Some(batch.into_array(rows)))
+        Ok(Some(batch.into_array(rows, arena)))
     }
 
     /// Pulls the edges leaving the next pages of vertices into `arena`, skipping pages whose vertices leave none, and
@@ -802,8 +935,9 @@ impl ExportStream {
     fn pull_edges(
         &mut self,
         cursor: graph_ffi::ustore_graph_vertices_cursor_t,
+        // Before the batch, as parameters drop in reverse, so a failed pull releases columns first.
+        arena: Arena,
         mut batch: Box<ExportedBatch>,
-        arena: &Arena,
     ) -> Result<Option<ArrowArray>> {
         let vertices_arena = self
             .vertices_arena
@@ -875,9 +1009,9 @@ impl ExportStream {
                     data: triples.wrapping_add(column),
                     stride: 48,
                 };
-                batch.keys(keys, edges, arena)?;
+                batch.keys(keys, edges, &arena)?;
             }
-            return Ok(Some(batch.into_array(edges)));
+            return Ok(Some(batch.into_array(edges, arena)));
         }
     }
 
@@ -926,7 +1060,7 @@ unsafe extern "C" fn export_release(stream: *mut ArrowArrayStream) {
 ///
 /// The stream pulls on the calling thread, since nothing ties its life to an executor's.
 pub(crate) fn export<Parent>(
-    view: &View<'_, Parent>,
+    view: &On<'_, Parent>,
     collection: CollectionID,
     modality: Modality,
 ) -> Result<ArrowArrayStream> {
@@ -1095,7 +1229,7 @@ fn write_rows(target: &Target, rows: &Rows, durability: Durability) -> Result<()
 /// Writes every batch of `stream` into `collection`, holding `modality`, through the writes of `view`, the last
 /// paying `durability`, answering the rows written.
 pub(crate) fn import<Parent>(
-    view: &View<'_, Parent>,
+    view: &On<'_, Parent>,
     collection: CollectionID,
     modality: Modality,
     mut stream: ArrowArrayStream,
@@ -1204,36 +1338,14 @@ pub(crate) fn ingest(
 pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 
-    use std::ffi::c_void;
-    use std::ptr;
+    use std::ffi::c_char;
 
-    use super::{ArrowArray, ArrowSchema, IngestOrder};
+    use super::{ArrowArray, ArrowDeviceArray, ArrowSchema, IngestOrder};
     use crate::db::ffi::{
-        ustore_arena_t, ustore_collection_id_t, ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_keys_view_t,
+        ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_keys_view_t,
         ustore_outcome_t, ustore_size_t, ustore_stamp_t, ustore_status_t, ustore_strings_view_t,
     };
-
-    #[repr(C)]
-    pub struct ArrowDeviceArray {
-        pub array: ArrowArray,
-        pub device_id: i64,
-        pub device_type: i32,
-        pub sync_event: *mut c_void,
-        pub reserved: [i64; 3],
-    }
-
-    impl ArrowDeviceArray {
-        /// A released array, for an exporter to write into.
-        pub fn empty() -> Self {
-            ArrowDeviceArray {
-                array: ArrowArray::empty(),
-                device_id: 0,
-                device_type: 0,
-                sync_event: ptr::null_mut(),
-                reserved: [0; 3],
-            }
-        }
-    }
+    use crate::docs::ffi::ustore_docs_column_view_t;
 
     #[repr(C)]
     pub struct ustore_ingest_handle_t {
@@ -1299,10 +1411,20 @@ pub(crate) mod ffi {
             schema: *mut ArrowSchema,
             array: *mut ArrowDeviceArray,
         ) -> ustore_status_t;
+        pub fn ustore_docs_column_view_to_arrow(
+            column: *const ustore_docs_column_view_t,
+            count: ustore_size_t,
+            column_type: ustore_enum_t,
+            arena: ustore_arena_t,
+            schema: *mut ArrowSchema,
+            array: *mut ArrowDeviceArray,
+        ) -> ustore_status_t;
         pub fn ustore_ingest_init(arguments: *mut ustore_ingest_init_t);
         pub fn ustore_ingest_append(arguments: *mut ustore_ingest_append_t);
         pub fn ustore_ingest_finish(arguments: *mut ustore_ingest_finish_t);
         pub fn ustore_ingest_free(ingest: ustore_ingest_t);
+        pub fn ustore_ingest_order_name(order: ustore_enum_t) -> *const c_char;
+        pub fn ustore_ingest_order_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
     }
 }
 
@@ -1413,6 +1535,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<ArrowSchema>(), 72);
         assert_eq!(std::mem::size_of::<ArrowArray>(), 80);
         assert_eq!(std::mem::size_of::<ArrowArrayStream>(), 40);
-        assert_eq!(std::mem::size_of::<ffi::ArrowDeviceArray>(), 128);
+        assert_eq!(std::mem::size_of::<ArrowDeviceArray>(), 128);
     }
 }

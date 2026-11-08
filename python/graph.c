@@ -751,6 +751,16 @@ static PyObject* Neighborhoods_get_degrees(Neighborhoods* self, void* Py_UNUSED(
     return degrees;
 }
 
+static PyObject* Neighborhoods_dlpack_device(Neighborhoods* self, PyObject* Py_UNUSED(unused)) {
+    return ustore_py_dlpack_device(self->arena);
+}
+
+static PyMethodDef Neighborhoods_methods[] = {
+    {"__dlpack__", (PyCFunction)(void (*)(void))ustore_py_dlpack, ustore_py_method_flags_k, ustore_py_dlpack_doc},
+    {"__dlpack_device__", (PyCFunction)Neighborhoods_dlpack_device, METH_NOARGS, ustore_py_dlpack_device_doc},
+    {NULL, NULL, 0, NULL},
+};
+
 static PyGetSetDef Neighborhoods_getset[] = {
     {"degrees", (getter)Neighborhoods_get_degrees, NULL, doc_Neighborhoods_degrees, NULL},
     {NULL, NULL, NULL, NULL, NULL},
@@ -777,6 +787,7 @@ PyTypeObject NeighborhoodsType = {
     .tp_repr = (reprfunc)Neighborhoods_repr,
     .tp_as_sequence = &Neighborhoods_as_sequence,
     .tp_as_buffer = &Neighborhoods_as_buffer,
+    .tp_methods = Neighborhoods_methods,
     .tp_getset = Neighborhoods_getset,
 };
 

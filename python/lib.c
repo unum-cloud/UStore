@@ -10,13 +10,13 @@
 #include "lib.h"
 
 static char const doc_module[] =                                                                //
-    "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices.\n"       //
+    "GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass.\n"   //
     "\n"                                                                                        //
     "One handle per view of the data: a `Database` addresses the head, a `Transaction`\n"       //
     "groups changes across collections, and a `Snapshot` fixes a point in time. Every verb\n"   //
     "is a batch, and a single operation is a batch of one. Each runs on the calling thread,\n"  //
-    "while `on(executor)` answers a `View` blocking on an `Executor`'s threads and\n"           //
-    "`deferred(executor)` a `DeferredView` whose verbs answer a `Deferred` at once; the\n"      //
+    "while `on(executor)` answers an `On` blocking on an `Executor`'s threads and\n"            //
+    "`deferred(executor)` a `DeferredOn` whose verbs answer a `Deferred` at once; the\n"        //
     "`open_*` constructors take an `executor` keyword and block on it.\n"                       //
     "Statuses and modes are `enum.IntEnum` classes valued as the C enumerators, such as\n"      //
     "`Status`, `Durability` and `Watch`, which the `ustore` package builds on import.\n"        //
@@ -48,8 +48,8 @@ static struct {
     {"Snapshot", &SnapshotType},
     {"Executor", &ExecutorType},
     {"Arena", &ArenaType},
-    {"View", &ViewType},
-    {"DeferredView", &DeferredViewType},
+    {"On", &OnType},
+    {"DeferredOn", &DeferredOnType},
     {"Deferred", &DeferredType},
     {"Values", &ValuesType},
     {"Keys", &KeysType},

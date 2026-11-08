@@ -18,10 +18,10 @@
  *
  *  A receiver carries what every argument struct puts before its inputs: the view, the executor and
  *  the completion. A @c Database, @c Transaction and @c Snapshot run their calls on the calling
- *  thread, a @c View runs them blocking on an executor, and a @c DeferredView submits them and
- *  answers a @c Deferred at once. Constructors address no database yet, so they take an `executor`
- *  keyword and block on it, as USearch's do. Receivers never change after they are made, so one
- *  is shared across threads freely. A verb gathers its call, fills the C argument struct on its own stack and
+ *  thread, an @c On runs them blocking on an executor, and a @c DeferredOn submits them and answers
+ *  a @c Deferred at once. Constructors address no database yet, so they take an @c executor keyword
+ *  and block on it, as USearch's do. Receivers never change after they are made, so one is shared
+ *  across threads freely. A verb gathers its call, fills the C argument struct on its own stack and
  *  submits it, which copies the struct, so the call keeps only the outcome, the inputs it owns, the
  *  output slots and its arena: on the stack when it blocks, and inside its @c Deferred otherwise,
  *  which gathers the keys and the borrowed buffers in place, because a batch's inline storage points
@@ -97,7 +97,8 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include <stddef.h> // `size_t`
+#include <stdatomic.h> // the live count of an exported batch
+#include <stddef.h>    // `size_t`
 
 #include <yyjson.h> // `yyjson_val`, `yyjson_mut_doc`
 
@@ -159,8 +160,8 @@ extern PyTypeObject TransactionType;
 extern PyTypeObject SnapshotType;
 extern PyTypeObject ExecutorType;
 extern PyTypeObject ArenaType;
-extern PyTypeObject ViewType;
-extern PyTypeObject DeferredViewType;
+extern PyTypeObject OnType;
+extern PyTypeObject DeferredOnType;
 extern PyTypeObject DeferredType;
 extern PyTypeObject ValuesType;
 extern PyTypeObject KeysType;
@@ -196,6 +197,23 @@ PyObject* ustore_py_gpu_devices(PyObject* module, PyObject* arguments);
 
 /** The docstring of <tt>ustore.gpu_devices()</tt>. */
 extern char const ustore_py_gpu_devices_doc[];
+
+/**
+ *  @brief Answers @c __dlpack__ over the buffer @p self exports, which the capsule holds, pinning
+ *      its arena, until the consumer deletes it.
+ *  @return A new "dltensor" or "dltensor_versioned" capsule, or NULL with an exception set.
+ */
+PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                           PyObject* keyword_names_tuple);
+
+/** Answers @c __dlpack_device__ for outputs in @p arena, as the library reports where it lives. */
+PyObject* ustore_py_dlpack_device(PyObject* arena);
+
+/** The docstring of every @c __dlpack__. */
+extern char const ustore_py_dlpack_doc[];
+
+/** The docstring of every @c __dlpack_device__. */
+extern char const ustore_py_dlpack_device_doc[];
 
 /**
  *  @brief Builds @c CapabilitiesType, @c MeasurementType, @c ChangesType,
@@ -334,7 +352,7 @@ typedef struct Arena {
 } Arena;
 
 /** What a call addresses and how it runs, fixed per receiver: the header of every argument struct. */
-typedef struct View {
+typedef struct On {
 
     /** The object header every instance carries. */
     PyObject ob_base;
@@ -347,7 +365,7 @@ typedef struct View {
 
     /** Whether a transaction records the keys the calls touch. */
     ustore_watch_t watch;
-} View;
+} On;
 
 /** What one verb addresses and how it runs, as the receiver it was reached through names them. */
 typedef struct ustore_py_context_t {
@@ -474,6 +492,9 @@ typedef struct ustore_py_keys_t {
 
     /** Whether a buffer was borrowed and must be released. */
     int borrowed;
+
+    /** The DLPack capsule whose tensor backs @c keys when the caller exported one, or NULL. */
+    PyObject* dlpack;
 
     /** Storage for a batch that fits without the heap. */
     ustore_key_t inline_keys[ustore_py_keys_inline_k];
@@ -857,7 +878,7 @@ int ustore_py_verb_keywords_from_arguments(ustore_py_context_t const* context, P
 #pragma region Shared Helpers
 
 /**
- *  @brief Fills @p context from a @c Database, @c Transaction, @c Snapshot, @c View or @c DeferredView.
+ *  @brief Fills @p context from a @c Database, @c Transaction, @c Snapshot, @c On or @c DeferredOn.
  *  @param[in] self The receiver the verb was reached through.
  *  @param[out] context What the verb addresses and how it runs.
  *  @return 0 on success, -1 with an exception set when a handle or the executor is closed.
@@ -1187,7 +1208,7 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
 
 /**
  *  @brief Answers the @c Collection a receiver addresses by name, as `db['movies']` does.
- *  @param[in] view The @c Database, @c Transaction, @c Snapshot, @c View or @c DeferredView indexed.
+ *  @param[in] view The @c Database, @c Transaction, @c Snapshot, @c On or @c DeferredOn indexed.
  *  @param[in] name The collection's name.
  *  @return A new reference, or NULL with an exception set.
  */
@@ -1479,6 +1500,12 @@ extern char const doc_docs_remove[];
 extern char const doc_docs_scan[];
 extern char const doc_docs_sample[];
 extern char const doc_docs_measure[];
+extern char const doc_strings_write[];
+extern char const doc_strings_remove[];
+extern char const doc_strings_read[];
+extern char const doc_strings_scan[];
+extern char const doc_strings_sample[];
+extern char const doc_strings_measure[];
 extern char const doc_graph_read_edges[];
 extern char const doc_graph_degrees[];
 extern char const doc_graph_contains[];
@@ -1551,6 +1578,18 @@ PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* arguments, 
                                     PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_docs_measure(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                      PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_strings_write(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                      PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_strings_remove(PyObject* self, PyObject* const* arguments,
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_strings_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_strings_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                     PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_strings_sample(PyObject* self, PyObject* const* arguments,
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+PyObject* ustore_py_api_strings_measure(PyObject* self, PyObject* const* arguments,
+                                        Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* arguments,
                                          Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
 PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,

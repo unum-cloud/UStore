@@ -6,10 +6,10 @@
  *
  *  A database owns its directory and answers what its engine supports. A transaction or a snapshot
  *  holds a reference to the database object it answers as `database`, while C holds the database
- *  itself open until the transaction or snapshot is freed, so either may close first. A @c View or
- *  a @c DeferredView holds its origin and its executor the same way, and every @c Deferred holds
- *  its origin and its arena, while the C frees wait for the deferred calls naming a handle, so
- *  closing one never needs to count them.
+ *  itself open until the transaction or snapshot is freed, so either may close first. An @c On or a
+ *  @c DeferredOn holds its origin and its executor the same way, and every @c Deferred holds its
+ *  origin and its arena, while the C frees wait for the deferred calls naming a handle, so closing
+ *  one never needs to count them.
  */
 #include "lib.h"
 
@@ -674,6 +674,37 @@ static PyObject* Database_compact(PyObject* self, PyObject* const* arguments, Py
         .progress_state = call,
     };
     return ustore_py_call_run(&context, &compact_verb, call, &compact);
+}
+
+static char const doc_Database_flush[] =                                                    //
+    "flush() answers None.\n"                                                               //
+    "\n"                                                                                    //
+    "Makes every commit that returned before this call durable, as if each had asked for\n" //
+    "`Durability.FLUSHED`. LevelDB syncs only its current log, so a commit in a log it\n"   //
+    "already rotated stays unsynced until its compaction lands. Calls\n"                    //
+    "`ustore_database_flush`.\n"                                                            //
+    "\n"                                                                                    //
+    "Raises:\n"                                                                             //
+    "  ReadOnlyError: The database was opened read-only.";
+
+static void flush_submit(void* arguments) { ustore_database_flush((ustore_database_flush_t*)arguments); }
+
+static ustore_py_verb_t const flush_verb = {sizeof(ustore_py_call_t), flush_submit, ustore_py_call_answer_none,
+                                            header_release};
+
+static PyObject* Database_flush(PyObject* self, PyObject* Py_UNUSED(arguments)) {
+    ustore_py_context_t context;
+    if (database_context(self, "flush", &context) != 0) return NULL;
+    ustore_py_call_t stack;
+    ustore_py_call_t* const call = ustore_py_call_open(&context, &flush_verb, &stack);
+    if (!call) return NULL;
+    ustore_database_flush_t flush = {
+        .database = context.database_handle,
+        .executor = ustore_py_context_executor(&context),
+        .outcome = &call->outcome,
+        .completion = context.completion,
+    };
+    return ustore_py_call_run(&context, &flush_verb, call, &flush);
 }
 
 static char const doc_Database_describe[] =                                                  //
@@ -1562,7 +1593,7 @@ static PyObject* Transaction_get_database(Transaction* self, void* Py_UNUSED(clo
 
 #pragma region Views
 
-static char const doc_View[] =                                                                     //
+static char const doc_On[] =                                                                       //
     "What a Database, Transaction or Snapshot addresses, with the executor that runs its calls.\n" //
     "\n"                                                                                           //
     "Built through `on(executor)`, `watched()` or `unwatched()`, never by name. Its verbs and\n"   //
@@ -1570,7 +1601,7 @@ static char const doc_View[] =                                                  
     "executor, after every call submitted to it before, or on the calling thread without one.\n"   //
     "A view never changes after it is made, so threads share it freely.";
 
-static char const doc_DeferredView[] =                                                          //
+static char const doc_DeferredOn[] =                                                            //
     "What a Database, Transaction or Snapshot addresses, with the executor its calls go to.\n"  //
     "\n"                                                                                        //
     "Built through `deferred(executor)`, never by name. Its verbs submit the call and answer\n" //
@@ -1582,40 +1613,40 @@ static char const doc_DeferredView[] =                                          
     "instead. Every pull of a cursor blocks, so it opens none. A view never changes after it\n" //
     "is made, so threads share it freely.";
 
-static PyObject* View_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
-                             PyObject* Py_UNUSED(keywords)) {
+static PyObject* On_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
+                           PyObject* Py_UNUSED(keywords)) {
     PyErr_SetString(PyExc_TypeError, "A view is built through on(), deferred(), watched() or unwatched()");
     return NULL;
 }
 
-static void View_dealloc(View* self) {
+static void On_dealloc(On* self) {
     Py_XDECREF(self->origin);
     Py_XDECREF((PyObject*)self->executor);
     PyObject_Free(self);
 }
 
-static PyObject* View_repr(View* self) {
+static PyObject* On_repr(On* self) {
     return PyUnicode_FromFormat("%s(%R)", Py_TYPE(self)->tp_name + sizeof("ustore.") - 1, self->origin);
 }
 
-static char const doc_View_database[] = "The database the view's calls run against.";
+static char const doc_On_database[] = "The database the view's calls run against.";
 
-static PyObject* View_get_database(View* self, void* Py_UNUSED(closure)) {
+static PyObject* On_get_database(On* self, void* Py_UNUSED(closure)) {
     if (PyObject_TypeCheck(self->origin, &TransactionType)) return Py_NewRef(((Transaction*)self->origin)->database);
     if (PyObject_TypeCheck(self->origin, &SnapshotType)) return Py_NewRef(((Snapshot*)self->origin)->database);
     return Py_NewRef(self->origin);
 }
 
-static char const doc_View_executor[] =
+static char const doc_On_executor[] =
     "The executor the view's calls run on, where an arena for them belongs, or None for the calling thread.";
 
-static PyObject* View_get_executor(View* self, void* Py_UNUSED(closure)) {
+static PyObject* On_get_executor(On* self, void* Py_UNUSED(closure)) {
     return self->executor ? Py_NewRef((PyObject*)self->executor) : Py_NewRef(Py_None);
 }
 
 /** Answers a new receiver of @p type over @p origin, run by @p executor and recording under @p watch. */
 static PyObject* view_new(PyTypeObject* type, PyObject* origin, Executor* executor, ustore_watch_t watch) {
-    View* const view = PyObject_New(View, type);
+    On* const view = PyObject_New(On, type);
     if (!view) return NULL;
     view->origin = Py_NewRef(origin);
     view->executor = (Executor*)Py_XNewRef((PyObject*)executor);
@@ -1625,8 +1656,8 @@ static PyObject* view_new(PyTypeObject* type, PyObject* origin, Executor* execut
 
 /** What @p self derives receivers from: a view's own origin, executor and watch, or an origin with neither. */
 static void view_parts(PyObject* self, PyObject** origin, Executor** executor, ustore_watch_t* watch) {
-    if (PyObject_TypeCheck(self, &ViewType) || PyObject_TypeCheck(self, &DeferredViewType)) {
-        View const* const view = (View const*)self;
+    if (PyObject_TypeCheck(self, &OnType) || PyObject_TypeCheck(self, &DeferredOnType)) {
+        On const* const view = (On const*)self;
         *origin = view->origin;
         *executor = view->executor;
         *watch = view->watch;
@@ -1651,7 +1682,7 @@ static PyObject* view_on(PyObject* self, PyObject* executor_object, PyTypeObject
 }
 
 static char const doc_on[] =                                                                   //
-    "on(executor) answers a View whose calls block on the executor.\n"                         //
+    "on(executor) answers an On whose calls block on the executor.\n"                          //
     "\n"                                                                                       //
     "Every call runs after the ones submitted to the executor before it finishes, so a read\n" //
     "through it sees what earlier deferred writes wrote.\n"                                    //
@@ -1659,18 +1690,18 @@ static char const doc_on[] =                                                    
     "Args:\n"                                                                                  //
     "  executor (Executor): The threads that run the calls.";
 
-static PyObject* receiver_on(PyObject* self, PyObject* executor) { return view_on(self, executor, &ViewType); }
+static PyObject* receiver_on(PyObject* self, PyObject* executor) { return view_on(self, executor, &OnType); }
 
-static char const doc_deferred[] =                                                         //
-    "deferred(executor) answers a DeferredView whose calls the executor runs meanwhile.\n" //
-    "\n"                                                                                   //
-    "Every verb of it submits its call and answers a Deferred at once.\n"                  //
-    "\n"                                                                                   //
-    "Args:\n"                                                                              //
+static char const doc_deferred[] =                                                       //
+    "deferred(executor) answers a DeferredOn whose calls the executor runs meanwhile.\n" //
+    "\n"                                                                                 //
+    "Every verb of it submits its call and answers a Deferred at once.\n"                //
+    "\n"                                                                                 //
+    "Args:\n"                                                                            //
     "  executor (Executor): The threads that run the calls.";
 
 static PyObject* receiver_deferred(PyObject* self, PyObject* executor) {
-    return view_on(self, executor, &DeferredViewType);
+    return view_on(self, executor, &DeferredOnType);
 }
 
 /** Answers a view of the transaction @p self addresses, of the same completion, recording under @p watch. */
@@ -1683,7 +1714,7 @@ static PyObject* view_watching(PyObject* self, ustore_watch_t watch) {
         PyErr_SetString(PyExc_TypeError, "Only a transaction watches what it touches");
         return NULL;
     }
-    PyTypeObject* const type = PyObject_TypeCheck(self, &DeferredViewType) ? &DeferredViewType : &ViewType;
+    PyTypeObject* const type = PyObject_TypeCheck(self, &DeferredOnType) ? &DeferredOnType : &OnType;
     return view_new(type, origin, executor, watch);
 }
 
@@ -1728,6 +1759,7 @@ static PyMethodDef Database_methods[] = {
     {"deferred", (PyCFunction)(void (*)(void))receiver_deferred, METH_O, doc_deferred},
     {"clear", (PyCFunction)(void (*)(void))Database_clear, METH_O, doc_Database_clear},
     {"compact", (PyCFunction)(void (*)(void))Database_compact, ustore_py_method_flags_k, doc_Database_compact},
+    {"flush", (PyCFunction)(void (*)(void))Database_flush, METH_NOARGS, doc_Database_flush},
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"cursor", (PyCFunction)(void (*)(void))ustore_py_api_cursor, ustore_py_method_flags_k, doc_cursor},
     {"docs_cursor", (PyCFunction)(void (*)(void))ustore_py_api_docs_cursor, ustore_py_method_flags_k, doc_docs_cursor},
@@ -1775,7 +1807,19 @@ static PyMethodDef Database_methods[] = {
     {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_measure", (PyCFunction)(void (*)(void))ustore_py_api_docs_measure, ustore_py_method_flags_k,
      doc_docs_measure},
+    {"strings_read", (PyCFunction)(void (*)(void))ustore_py_api_strings_read, ustore_py_method_flags_k,
+     doc_strings_read},
+    {"strings_scan", (PyCFunction)(void (*)(void))ustore_py_api_strings_scan, ustore_py_method_flags_k,
+     doc_strings_scan},
+    {"strings_sample", (PyCFunction)(void (*)(void))ustore_py_api_strings_sample, ustore_py_method_flags_k,
+     doc_strings_sample},
+    {"strings_measure", (PyCFunction)(void (*)(void))ustore_py_api_strings_measure, ustore_py_method_flags_k,
+     doc_strings_measure},
     {"docs_remove", (PyCFunction)(void (*)(void))ustore_py_api_docs_remove, ustore_py_method_flags_k, doc_docs_remove},
+    {"strings_write", (PyCFunction)(void (*)(void))ustore_py_api_strings_write, ustore_py_method_flags_k,
+     doc_strings_write},
+    {"strings_remove", (PyCFunction)(void (*)(void))ustore_py_api_strings_remove, ustore_py_method_flags_k,
+     doc_strings_remove},
     {"pages_read", (PyCFunction)(void (*)(void))ustore_py_api_pages_read, ustore_py_method_flags_k, doc_pages_read},
     {"pages_scan", (PyCFunction)(void (*)(void))ustore_py_api_pages_scan, ustore_py_method_flags_k, doc_pages_scan},
     {"pages_sample", (PyCFunction)(void (*)(void))ustore_py_api_pages_sample, ustore_py_method_flags_k,
@@ -1886,7 +1930,19 @@ static PyMethodDef Transaction_methods[] = {
     {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_measure", (PyCFunction)(void (*)(void))ustore_py_api_docs_measure, ustore_py_method_flags_k,
      doc_docs_measure},
+    {"strings_read", (PyCFunction)(void (*)(void))ustore_py_api_strings_read, ustore_py_method_flags_k,
+     doc_strings_read},
+    {"strings_scan", (PyCFunction)(void (*)(void))ustore_py_api_strings_scan, ustore_py_method_flags_k,
+     doc_strings_scan},
+    {"strings_sample", (PyCFunction)(void (*)(void))ustore_py_api_strings_sample, ustore_py_method_flags_k,
+     doc_strings_sample},
+    {"strings_measure", (PyCFunction)(void (*)(void))ustore_py_api_strings_measure, ustore_py_method_flags_k,
+     doc_strings_measure},
     {"docs_remove", (PyCFunction)(void (*)(void))ustore_py_api_docs_remove, ustore_py_method_flags_k, doc_docs_remove},
+    {"strings_write", (PyCFunction)(void (*)(void))ustore_py_api_strings_write, ustore_py_method_flags_k,
+     doc_strings_write},
+    {"strings_remove", (PyCFunction)(void (*)(void))ustore_py_api_strings_remove, ustore_py_method_flags_k,
+     doc_strings_remove},
     {"pages_read", (PyCFunction)(void (*)(void))ustore_py_api_pages_read, ustore_py_method_flags_k, doc_pages_read},
     {"pages_scan", (PyCFunction)(void (*)(void))ustore_py_api_pages_scan, ustore_py_method_flags_k, doc_pages_scan},
     {"pages_sample", (PyCFunction)(void (*)(void))ustore_py_api_pages_sample, ustore_py_method_flags_k,
@@ -1985,6 +2041,14 @@ static PyMethodDef Snapshot_methods[] = {
     {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_measure", (PyCFunction)(void (*)(void))ustore_py_api_docs_measure, ustore_py_method_flags_k,
      doc_docs_measure},
+    {"strings_read", (PyCFunction)(void (*)(void))ustore_py_api_strings_read, ustore_py_method_flags_k,
+     doc_strings_read},
+    {"strings_scan", (PyCFunction)(void (*)(void))ustore_py_api_strings_scan, ustore_py_method_flags_k,
+     doc_strings_scan},
+    {"strings_sample", (PyCFunction)(void (*)(void))ustore_py_api_strings_sample, ustore_py_method_flags_k,
+     doc_strings_sample},
+    {"strings_measure", (PyCFunction)(void (*)(void))ustore_py_api_strings_measure, ustore_py_method_flags_k,
+     doc_strings_measure},
     {"pages_read", (PyCFunction)(void (*)(void))ustore_py_api_pages_read, ustore_py_method_flags_k, doc_pages_read},
     {"pages_scan", (PyCFunction)(void (*)(void))ustore_py_api_pages_scan, ustore_py_method_flags_k, doc_pages_scan},
     {"pages_sample", (PyCFunction)(void (*)(void))ustore_py_api_pages_sample, ustore_py_method_flags_k,
@@ -2020,13 +2084,13 @@ PyTypeObject SnapshotType = {
     .tp_getset = Snapshot_getset,
 };
 
-static PyGetSetDef View_getset[] = {
-    {"database", (getter)View_get_database, NULL, doc_View_database, NULL},
-    {"executor", (getter)View_get_executor, NULL, doc_View_executor, NULL},
+static PyGetSetDef On_getset[] = {
+    {"database", (getter)On_get_database, NULL, doc_On_database, NULL},
+    {"executor", (getter)On_get_executor, NULL, doc_On_executor, NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 
-static PyMethodDef View_methods[] = {
+static PyMethodDef On_methods[] = {
     {"on", (PyCFunction)(void (*)(void))receiver_on, METH_O, doc_on},
     {"deferred", (PyCFunction)(void (*)(void))receiver_deferred, METH_O, doc_deferred},
     {"watched", (PyCFunction)(void (*)(void))receiver_watched, METH_NOARGS, doc_watched},
@@ -2036,6 +2100,7 @@ static PyMethodDef View_methods[] = {
     {"save", (PyCFunction)(void (*)(void))Snapshot_save, ustore_py_method_flags_k, doc_Snapshot_save},
     {"clear", (PyCFunction)(void (*)(void))Database_clear, METH_O, doc_Database_clear},
     {"compact", (PyCFunction)(void (*)(void))Database_compact, ustore_py_method_flags_k, doc_Database_compact},
+    {"flush", (PyCFunction)(void (*)(void))Database_flush, METH_NOARGS, doc_Database_flush},
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"cursor", (PyCFunction)(void (*)(void))ustore_py_api_cursor, ustore_py_method_flags_k, doc_cursor},
     {"docs_cursor", (PyCFunction)(void (*)(void))ustore_py_api_docs_cursor, ustore_py_method_flags_k, doc_docs_cursor},
@@ -2068,7 +2133,19 @@ static PyMethodDef View_methods[] = {
     {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_measure", (PyCFunction)(void (*)(void))ustore_py_api_docs_measure, ustore_py_method_flags_k,
      doc_docs_measure},
+    {"strings_read", (PyCFunction)(void (*)(void))ustore_py_api_strings_read, ustore_py_method_flags_k,
+     doc_strings_read},
+    {"strings_scan", (PyCFunction)(void (*)(void))ustore_py_api_strings_scan, ustore_py_method_flags_k,
+     doc_strings_scan},
+    {"strings_sample", (PyCFunction)(void (*)(void))ustore_py_api_strings_sample, ustore_py_method_flags_k,
+     doc_strings_sample},
+    {"strings_measure", (PyCFunction)(void (*)(void))ustore_py_api_strings_measure, ustore_py_method_flags_k,
+     doc_strings_measure},
     {"docs_remove", (PyCFunction)(void (*)(void))ustore_py_api_docs_remove, ustore_py_method_flags_k, doc_docs_remove},
+    {"strings_write", (PyCFunction)(void (*)(void))ustore_py_api_strings_write, ustore_py_method_flags_k,
+     doc_strings_write},
+    {"strings_remove", (PyCFunction)(void (*)(void))ustore_py_api_strings_remove, ustore_py_method_flags_k,
+     doc_strings_remove},
     {"pages_read", (PyCFunction)(void (*)(void))ustore_py_api_pages_read, ustore_py_method_flags_k, doc_pages_read},
     {"pages_scan", (PyCFunction)(void (*)(void))ustore_py_api_pages_scan, ustore_py_method_flags_k, doc_pages_scan},
     {"pages_sample", (PyCFunction)(void (*)(void))ustore_py_api_pages_sample, ustore_py_method_flags_k,
@@ -2115,22 +2192,22 @@ static PyMethodDef View_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
-PyTypeObject ViewType = {
+PyTypeObject OnType = {
     PyVarObject_HEAD_INIT(NULL, 0) //
-        .tp_name = "ustore.View",
-    .tp_doc = doc_View,
-    .tp_basicsize = sizeof(View),
+        .tp_name = "ustore.On",
+    .tp_doc = doc_On,
+    .tp_basicsize = sizeof(On),
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_new = View_tp_new,
-    .tp_dealloc = (destructor)View_dealloc,
-    .tp_repr = (reprfunc)View_repr,
+    .tp_new = On_tp_new,
+    .tp_dealloc = (destructor)On_dealloc,
+    .tp_repr = (reprfunc)On_repr,
     .tp_as_mapping = &receiver_as_mapping,
-    .tp_methods = View_methods,
-    .tp_getset = View_getset,
+    .tp_methods = On_methods,
+    .tp_getset = On_getset,
 };
 
 /** The verbs of a blocking view, each of which submits its call here and answers a Deferred. */
-static PyMethodDef DeferredView_methods[] = {
+static PyMethodDef DeferredOn_methods[] = {
     {"on", (PyCFunction)(void (*)(void))receiver_on, METH_O, doc_on},
     {"deferred", (PyCFunction)(void (*)(void))receiver_deferred, METH_O, doc_deferred},
     {"watched", (PyCFunction)(void (*)(void))receiver_watched, METH_NOARGS, doc_watched},
@@ -2140,6 +2217,7 @@ static PyMethodDef DeferredView_methods[] = {
     {"save", (PyCFunction)(void (*)(void))Snapshot_save, ustore_py_method_flags_k, doc_Snapshot_save},
     {"clear", (PyCFunction)(void (*)(void))Database_clear, METH_O, doc_Database_clear},
     {"compact", (PyCFunction)(void (*)(void))Database_compact, ustore_py_method_flags_k, doc_Database_compact},
+    {"flush", (PyCFunction)(void (*)(void))Database_flush, METH_NOARGS, doc_Database_flush},
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"collection_find", (PyCFunction)(void (*)(void))Database_collection_find, METH_FASTCALL,
      doc_Database_collection_find},
@@ -2166,7 +2244,19 @@ static PyMethodDef DeferredView_methods[] = {
     {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_measure", (PyCFunction)(void (*)(void))ustore_py_api_docs_measure, ustore_py_method_flags_k,
      doc_docs_measure},
+    {"strings_read", (PyCFunction)(void (*)(void))ustore_py_api_strings_read, ustore_py_method_flags_k,
+     doc_strings_read},
+    {"strings_scan", (PyCFunction)(void (*)(void))ustore_py_api_strings_scan, ustore_py_method_flags_k,
+     doc_strings_scan},
+    {"strings_sample", (PyCFunction)(void (*)(void))ustore_py_api_strings_sample, ustore_py_method_flags_k,
+     doc_strings_sample},
+    {"strings_measure", (PyCFunction)(void (*)(void))ustore_py_api_strings_measure, ustore_py_method_flags_k,
+     doc_strings_measure},
     {"docs_remove", (PyCFunction)(void (*)(void))ustore_py_api_docs_remove, ustore_py_method_flags_k, doc_docs_remove},
+    {"strings_write", (PyCFunction)(void (*)(void))ustore_py_api_strings_write, ustore_py_method_flags_k,
+     doc_strings_write},
+    {"strings_remove", (PyCFunction)(void (*)(void))ustore_py_api_strings_remove, ustore_py_method_flags_k,
+     doc_strings_remove},
     {"pages_read", (PyCFunction)(void (*)(void))ustore_py_api_pages_read, ustore_py_method_flags_k, doc_pages_read},
     {"pages_scan", (PyCFunction)(void (*)(void))ustore_py_api_pages_scan, ustore_py_method_flags_k, doc_pages_scan},
     {"pages_sample", (PyCFunction)(void (*)(void))ustore_py_api_pages_sample, ustore_py_method_flags_k,
@@ -2213,18 +2303,18 @@ static PyMethodDef DeferredView_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
-PyTypeObject DeferredViewType = {
+PyTypeObject DeferredOnType = {
     PyVarObject_HEAD_INIT(NULL, 0) //
-        .tp_name = "ustore.DeferredView",
-    .tp_doc = doc_DeferredView,
-    .tp_basicsize = sizeof(View),
+        .tp_name = "ustore.DeferredOn",
+    .tp_doc = doc_DeferredOn,
+    .tp_basicsize = sizeof(On),
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_new = View_tp_new,
-    .tp_dealloc = (destructor)View_dealloc,
-    .tp_repr = (reprfunc)View_repr,
+    .tp_new = On_tp_new,
+    .tp_dealloc = (destructor)On_dealloc,
+    .tp_repr = (reprfunc)On_repr,
     .tp_as_mapping = &receiver_as_mapping,
-    .tp_methods = DeferredView_methods,
-    .tp_getset = View_getset,
+    .tp_methods = DeferredOn_methods,
+    .tp_getset = On_getset,
 };
 
 #pragma endregion Tables

@@ -1,4 +1,9 @@
-"""Collections over the C ABI: creating, naming, listing and dropping them."""
+"""Collections over the C ABI: creating, naming, listing and dropping them.
+
+File: test/catalog.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 from uuid import UUID
 
@@ -244,6 +249,15 @@ def test_compact_keeps_the_data_unless_cancelled(database):
     assert database.get(63, collection="places") == b"v" * 64 and database.get(63, collection="people") == b"w" * 64
 
 
+def test_flush_keeps_the_data_blocking_or_deferred(database):
+    database.collection_create("people", modality=Modality.BLOBS)
+    database.set(1, b"kept", collection="people")
+    database.flush()
+    with ustore.Executor.for_ram(1) as executor:
+        database.deferred(executor).flush().wait()
+    assert database.get(1, collection="people") == b"kept"
+
+
 @pytest.mark.skipif("rocksdb" not in ustore.engines_compiled(), reason="This build carries no RocksDB engine")
 def test_a_rocksdb_view_refuses_every_change(tmp_path):
     """Reads, snapshots and their saves serve, while every call that would change the database raises ReadOnlyError."""
@@ -258,6 +272,7 @@ def test_a_rocksdb_view_refuses_every_change(tmp_path):
         lambda view: view.collection_drop("people"),
         lambda view: view.clear(ustore.DropMode.PAIRS),
         lambda view: view.compact(),
+        lambda view: view.flush(),
     ]
     with ustore.Database.view_rocksdb(tmp_path) as view:
         assert view.get(1, collection="people") == b"kept" and view.collection_contains("people")

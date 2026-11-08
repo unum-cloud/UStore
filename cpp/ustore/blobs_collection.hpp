@@ -159,8 +159,13 @@ class blobs_collection_t : public blobs_read_collection_t {
     /** The twin a deferred receiver hands out, whose verbs answer deferred calls. */
     using deferred_t = deferred_blobs_collection_t;
 
+    /** Removes every value and keeps the keys. */
     status_t clear_values() noexcept { return drop_with_(ustore_drop_values_k); }
+
+    /** Removes every key and value and keeps the collection. */
     status_t clear() noexcept { return drop_with_(ustore_drop_pairs_k); }
+
+    /** Removes the collection with its name and every pair it holds. */
     status_t drop() noexcept { return drop_with_(ustore_drop_collection_k); }
 
     blobs_ref<place_batch_t> operator[](std::initializer_list<ustore_key_t> keys) noexcept { return at(keys); }

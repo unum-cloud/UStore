@@ -32,6 +32,13 @@ class _ArrowStream(Protocol):
 
     def __arrow_c_stream__(self, requested_schema: object | None = None) -> object: ...
 
+@type_check_only
+class _DLPack(Protocol):
+    """Anything exporting a DLPack tensor, such as a NumPy array, a PyTorch tensor or `Keys`."""
+
+    def __dlpack__(self, *, stream: object | None = None) -> object: ...
+    def __dlpack_device__(self) -> tuple[int, int]: ...
+
 type ArrowSource = _ArrowStream | _ArrowArray
 """An Arrow stream whose batches a call takes over, or one array, read as a stream of one batch."""
 type IngestOrder = Literal["sorted", "unsorted"]
@@ -39,7 +46,9 @@ type IngestOrder = Literal["sorted", "unsorted"]
 type Buffer = memoryview | bytes | bytearray
 type CollectionLike = UUID | str
 type KeyLike = UUID | int | str | bytes
-type KeysLike = Sequence[KeyLike] | Buffer
+type KeysLike = Sequence[KeyLike] | Buffer | _DLPack
+"""Keys as a sequence, or packed as (keys, 16) bytes or 64-bit integers in a buffer or a DLPack tensor, which may live
+on a CUDA or ROCm device when it holds the bytes."""
 type ValueLike = Buffer
 type TapeLike = _ArrowArray | tuple[Buffer, Buffer]
 """An Arrow `binary`, `large_binary`, `string` or `large_string` array, or a `(data, offsets)` pair of buffers whose
@@ -378,6 +387,20 @@ class Values:
         """The schema and array PyCapsules of the batch as Arrow `binary`, or `large_binary` once its bytes outgrow
         32-bit offsets: the presence bits, offsets and bytes the read wrote, exported in place."""
 
+    def __dlpack__(
+        self,
+        *,
+        stream: object | None = None,
+        max_version: tuple[int, int] | None = None,
+        dl_device: tuple[int, int] | None = None,
+        copy: bool | None = None,
+    ) -> object:
+        """A DLPack capsule over the memory the buffer protocol exports, pinning the arena until its consumer deletes
+        it, so `numpy.from_dlpack` reads it in place."""
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        """The DLPack device of the arena: (1, 0) for host pages, (2, ordinal) for NVIDIA, (10, ordinal) for AMD."""
+
 class Keys:
     """The keys one batch scan or sample wrote into an `Arena`, viewing it until it rewinds."""
 
@@ -387,6 +410,19 @@ class Keys:
     def __len__(self) -> int: ...
     def __getitem__(self, task: int) -> tuple[UUID, ...]: ...
     def __buffer__(self, flags: int) -> memoryview: ...
+    def __dlpack__(
+        self,
+        *,
+        stream: object | None = None,
+        max_version: tuple[int, int] | None = None,
+        dl_device: tuple[int, int] | None = None,
+        copy: bool | None = None,
+    ) -> object:
+        """A DLPack capsule over the memory the buffer protocol exports, pinning the arena until its consumer deletes
+        it, so `numpy.from_dlpack` reads it in place."""
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        """The DLPack device of the arena: (1, 0) for host pages, (2, ordinal) for NVIDIA, (10, ordinal) for AMD."""
 
 @final
 class Page:
@@ -401,6 +437,20 @@ class Page:
     def __iter__(self) -> Iterator[UUID]: ...
     def __buffer__(self, flags: int) -> memoryview:
         """The keys as an array of shape (keys, 16) bytes, pinning the arena until released."""
+
+    def __dlpack__(
+        self,
+        *,
+        stream: object | None = None,
+        max_version: tuple[int, int] | None = None,
+        dl_device: tuple[int, int] | None = None,
+        copy: bool | None = None,
+    ) -> object:
+        """A DLPack capsule over the memory the buffer protocol exports, pinning the arena until its consumer deletes
+        it, so `numpy.from_dlpack` reads it in place."""
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        """The DLPack device of the arena: (1, 0) for host pages, (2, ordinal) for NVIDIA, (10, ordinal) for AMD."""
 
 @final
 class Cursor:
@@ -468,6 +518,19 @@ class Neighborhoods:
     def __len__(self) -> int: ...
     def __getitem__(self, vertex: int) -> tuple[tuple[UUID, UUID, UUID], ...] | None: ...
     def __buffer__(self, flags: int) -> memoryview: ...
+    def __dlpack__(
+        self,
+        *,
+        stream: object | None = None,
+        max_version: tuple[int, int] | None = None,
+        dl_device: tuple[int, int] | None = None,
+        copy: bool | None = None,
+    ) -> object:
+        """A DLPack capsule over the memory the buffer protocol exports, pinning the arena until its consumer deletes
+        it, so `numpy.from_dlpack` reads it in place."""
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        """The DLPack device of the arena: (1, 0) for host pages, (2, ordinal) for NVIDIA, (10, ordinal) for AMD."""
 
 # endregion: Arenas and Result Tapes
 
@@ -758,7 +821,26 @@ class _Reads:
         collection: CollectionLike,
         offset: int = 0,
         limit: int | None = None,
-    ) -> Values: ...
+    ) -> Values:
+        """Reads a batch of binary values in one call, which no sequence of single reads
+        matches for throughput. Nothing is copied: the tape sits in the arena, and indexing
+        the answer gives a memoryview over the stored bytes, or None for an absent key.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The keys to read, as a sequence, a contiguous
+            buffer of 16-byte keys, which is read in place, or one of 64-bit integers.
+          arena (Arena): Where the tape lands, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+          offset (int, optional): Byte of every value the read starts at, where an offset
+            past the end reads empty.
+          limit (int, optional): Most bytes of every value to read from the offset, or None
+            for the rest of it.
+        Returns:
+          Values: One entry per key, in the order they were asked for.
+        Raises:
+          ContendedError: The arena serves another call or exports a buffer.
+          Error: Whatever the engine reported.
+        """
     def get(self, key: KeyLike, *, collection: CollectionLike) -> bytes | None:
         """Copies one value out of a one-off arena, which `read` with an arena of yours avoids."""
 
@@ -843,7 +925,28 @@ class _Reads:
         weights: Sequence[float] | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
-    ) -> Keys: ...
+    ) -> Keys:
+        """Lists up to `wanted` keys from `start` towards `end`. Values are not exported, so a
+        read follows the scan, or a `cursor()` walks a collection with its values instead.
+
+        Args:
+          start (KeyLike | None): The first key the scan may return, or None for the first
+            key in its direction.
+          wanted (int): Most keys the scan returns.
+          arena (Arena): Where the keys land, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+          end (KeyLike, optional): The key the scan stops before, or None for no bound.
+          direction (ScanDirection, optional): `ScanDirection.DESCENDING` walks down from
+            `start`, largest key first.
+          mode (ScanMode, optional): `ScanMode.UNORDERED` lets keys come out of order,
+            removed or repeated, to speed up the read after the scan; no engine uses it yet.
+          progress (Callable[[int, int], bool | None], optional): Called with the scans
+            finished and the scans in all; a falsy answer other than None cancels the call.
+        Returns:
+          Keys: One run of keys, in the order of the direction.
+        Raises:
+          CancelledError: The progress callable stopped the scan.
+        """
     def scan_batch(
         self,
         starts: KeysLike,
@@ -864,7 +967,17 @@ class _Reads:
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys:
         """One scan per start, reporting the scans finished to `progress`."""
-    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys: ...
+    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+        """Draws keys uniformly at random from one collection, which is how a workload picks
+        entries it has no list of.
+
+        Args:
+          wanted (int): Most keys to draw.
+          arena (Arena): Where the keys land, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+        Returns:
+          Keys: One run of keys, in no particular order.
+        """
     def sample_batch(self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
         """`count` samples of up to `wanted` keys each, all drawn from the one collection named."""
     def measure(
@@ -876,7 +989,23 @@ class _Reads:
         *,
         collection: CollectionLike,
         direction: ScanDirection = ScanDirection.ASCENDING,
-    ) -> Measurement: ...
+    ) -> Measurement:
+        """Estimates what a key range holds without walking it, so the answers are bounds
+        rather than counts.
+
+        Args:
+          start (KeyLike | None): First key of the range, or None for the first key in the
+            direction.
+          end (KeyLike | None): The key the range stops before, or None for no bound.
+          arena (Arena): Where the bounds land before they are copied out, rewound by this
+            call.
+          collection (UUID | str): The collection, by identifier or by name.
+          direction (ScanDirection, optional): `ScanDirection.DESCENDING` ranges down from
+            `start`.
+        Returns:
+          Measurement: The lower and upper bounds on the entries, the bytes of their values,
+          and the space they take on disk.
+        """
     def docs_read(
         self,
         keys: KeysLike,
@@ -886,8 +1015,33 @@ class _Reads:
         collection: CollectionLike,
         field: str | None = None,
         outputs_type: FieldType = FieldType.JSON,
-    ) -> Values: ...
-    def docs_gist(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> tuple[str, ...]: ...
+    ) -> Values:
+        """Reads whole documents, or one field of each, as JSON text or as printed strings. Whole
+        documents read as JSON pass straight through from the engine, so nothing is parsed.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The keys to read.
+          arena (Arena): Where the tape lands, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+          field (str, optional): A top-level key or a JSON Pointer to read inside every
+            document; None reads whole documents.
+          outputs_type (FieldType, optional): `FieldType.JSON` for JSON text, or
+            `FieldType.STRING` to print scalars as text.
+        Returns:
+          Values: One entry per key, None where the document or the field is absent.
+        """
+    def docs_gist(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> tuple[str, ...]:
+        """Lists every distinct path to a leaf across the requested documents, in the order they
+        were first met, which is how a table learns the columns its documents hold.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The documents to inspect.
+          arena (Arena): Where the paths land before they are copied out, rewound by this
+            call.
+          collection (UUID | str): The collection, by identifier or by name.
+        Returns:
+          tuple[str, ...]: One JSON Pointer per leaf, such as '/user/name'.
+        """
     def docs_gather(
         self,
         keys: KeysLike,
@@ -897,7 +1051,23 @@ class _Reads:
         /,
         *,
         collection: CollectionLike,
-    ) -> Columns: ...
+    ) -> Columns:
+        """Reads every field of every document into typed columns, converting each value on a
+        best-effort basis and recording what was found, converted, or could not be.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The documents, the rows of every column.
+          fields (Sequence[str]): Top-level keys or JSON Pointers, the columns of the result.
+          outputs_types (FieldType | Sequence[FieldType]): One type per field, or one for
+            every field: a fixed-width scalar from `FieldType.BOOL` to `FieldType.U8`,
+            `FieldType.UUID`, `FieldType.STRING` or `FieldType.BINARY`. A `FieldType.F16`
+            column exports as a half-precision view NumPy reads as float16, and a
+            `FieldType.UUID` column as sixteen bytes per document.
+          arena (Arena): Where the columns land, rewound by this call.
+          collection (UUID | str): The collection, by identifier or by name.
+        Returns:
+          Columns: One column per field, each holding one entry per document.
+        """
     def docs_scan(
         self,
         start: KeyLike | None,
@@ -913,7 +1083,26 @@ class _Reads:
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
-    ) -> Keys: ...
+    ) -> Keys:
+        """Lists up to `wanted` document keys from `start` towards `end`, as `scan` lists the
+        keys of blobs. Documents are not exported, so a `docs_read` follows the scan.
+
+        Args:
+          start (KeyLike | None): The first key the scan may return, or None for the first
+            key in its direction.
+          wanted (int): Most keys the scan returns.
+          arena (Arena): Where the keys land, rewound by this call.
+          collection (UUID | str): The docs collection, by identifier or by name.
+          end (KeyLike, optional): The key the scan stops before, or None for no bound.
+          direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.
+          mode (ScanMode, optional): In what order the keys come, as `scan` takes it.
+          progress (Callable[[int, int], bool | None], optional): Called with the scans
+            finished and the scans in all; a falsy answer other than None cancels the call.
+        Returns:
+          Keys: One run of keys, in the order of the direction.
+        Raises:
+          CancelledError: The progress callable stopped the scan.
+        """
     def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
         """Up to `wanted` document keys drawn at random, which a `docs_read` or a `docs_gather` follows."""
     def docs_measure(
@@ -927,6 +1116,36 @@ class _Reads:
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Measurement:
         """Bounds on what a range of document keys holds, as `measure` reads them for blobs."""
+    def strings_read(
+        self, strings: TextsLike, arena: Arena, /, *, collection: CollectionLike
+    ) -> tuple[UUID | None, ...]:
+        """the key of every string, or None for a string the strings collection does not hold."""
+    def strings_scan(
+        self,
+        prefix: str | bytes | None,
+        wanted: int,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        start: str | bytes | None = None,
+        end: str | bytes | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> tuple[str, ...]:
+        """up to `wanted` strings starting with `prefix`, in the order of their bytes."""
+    def strings_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> tuple[str, ...]:
+        """up to `wanted` strings drawn at random."""
+    def strings_measure(
+        self,
+        start: str | bytes | None,
+        end: str | bytes | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Measurement:
+        """bounds on what a range of strings holds."""
     def pages_read(
         self,
         keys: KeyLike | KeysLike,
@@ -971,10 +1190,35 @@ class _Reads:
         """Bounds on what a range of page keys holds, as `measure` reads them for blobs."""
     def graph_read_edges(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
-    ) -> Neighborhoods: ...
+    ) -> Neighborhoods:
+        """Reads every edge a batch of vertices takes part in. The edges of one vertex come sorted
+        by neighbour; with both roles the outgoing ones precede the incoming ones.
+
+        Args:
+          vertices (Sequence[KeyLike] | buffer): The vertices whose edges are read.
+          arena (Arena): Where the degrees and the edges land, rewound by this call.
+          role (Role, optional): `Role.SOURCE` for the edges a vertex leaves by, `Role.TARGET`
+            for those it is entered by, or `Role.ANY` for both, which is how an undirected
+            graph asks.
+          collection (UUID | str): The graph collection, by identifier or by name.
+        Returns:
+          Neighborhoods: One run of (source, target, edge) triples per vertex, None where it is
+          absent.
+        """
     def graph_degrees(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
-    ) -> tuple[int | None, ...]: ...
+    ) -> tuple[int | None, ...]:
+        """Counts the edges of a batch of vertices without exporting them.
+
+        Args:
+          vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.
+          arena (Arena): Where the degrees land before they are copied out, rewound by this
+            call.
+          role (Role, optional): The role of every vertex, as `graph_read_edges` takes it.
+          collection (UUID | str): The graph collection, by identifier or by name.
+        Returns:
+          tuple[int | None, ...]: The degree of every vertex, None where it is absent.
+        """
     def graph_contains(self, vertex: KeyLike, /, *, collection: CollectionLike) -> bool:
         """Whether the vertex is present, read as its degree through a one-off arena."""
     def graph_scan_vertices(
@@ -991,7 +1235,26 @@ class _Reads:
         progress: Progress | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
-    ) -> Keys: ...
+    ) -> Keys:
+        """Lists up to `wanted` vertices from `start` towards `end`, those without edges included.
+        Edges are not exported, so a `graph_read_edges` follows the scan.
+
+        Args:
+          start (KeyLike | None): The first vertex the scan may return, or None for the first
+            vertex in its direction.
+          wanted (int): Most vertices the scan returns.
+          arena (Arena): Where the vertices land, rewound by this call.
+          collection (UUID | str): The graph collection, by identifier or by name.
+          end (KeyLike, optional): The vertex the scan stops before, or None for no bound.
+          direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.
+          mode (ScanMode, optional): In what order the vertices come, as `scan` takes it.
+          progress (Callable[[int, int], bool | None], optional): Called with the scans
+            finished and the scans in all; a falsy answer other than None cancels the call.
+        Returns:
+          Keys: One run of vertices, in the order of the direction.
+        Raises:
+          CancelledError: The progress callable stopped the scan.
+        """
     def graph_sample_vertices(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
         """Up to `wanted` vertices drawn at random, those without edges included."""
     def graph_measure_vertices(
@@ -1010,10 +1273,10 @@ class _Reads:
 class _Receivers:
     """The views a database, a transaction, a snapshot or a view derives."""
 
-    def on(self, executor: Executor) -> View:
+    def on(self, executor: Executor) -> On:
         """A view whose calls block on `executor`, after every call submitted to it before."""
 
-    def deferred(self, executor: Executor) -> DeferredView:
+    def deferred(self, executor: Executor) -> DeferredOn:
         """A view whose calls `executor` runs while each verb answers a `Deferred` at once."""
 
 @type_check_only
@@ -1027,7 +1290,25 @@ class _Writes(_Reads):
         *,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> None: ...
+    ) -> None:
+        """Upserts a batch of binary values in one call. Every value is borrowed for the
+        length of the call rather than copied, so a memory-mapped buffer reaches the engine
+        untouched.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer): The keys to write.
+          values (Sequence[bytes-like] | bytes-like | tape): One value per key, a tape of
+            them, or a single bytes-like object broadcast to every key. A tape is an Arrow
+            `binary`, `large_binary`, `string` or `large_string` array, such as `Values`, or
+            a `(data, offsets)` tuple of buffers with unsigned 32-bit or 64-bit offsets, and
+            passes without a copy. None is refused, since `remove` removes keys.
+          collection (UUID | str): The collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        Raises:
+          TypeError: A value is None or exports no buffer.
+          Error: Whatever the engine reported.
+        """
     def set(
         self,
         key: KeyLike,
@@ -1035,7 +1316,18 @@ class _Writes(_Reads):
         *,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> None: ...
+    ) -> None:
+        """Upserts one binary value.
+
+        Args:
+          key (KeyLike): The key to write.
+          value (bytes-like): The bytes to store, borrowed rather than copied.
+          collection (UUID | str): The collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        Raises:
+          TypeError: The value is None or exports no buffer.
+        """
     def remove(
         self,
         keys: KeyLike | KeysLike,
@@ -1056,7 +1348,38 @@ class _Writes(_Reads):
         type: FieldType = FieldType.JSON,
         id_field: str | None = None,
         durability: Durability = Durability.BUFFERED,
-    ) -> None: ...
+    ) -> None:
+        """Writes a batch of JSON documents, or one field inside each of them. Every document is
+        borrowed for the length of the call rather than copied.
+
+        Args:
+          keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from
+            `id_field` of its document.
+          documents (Sequence[str | bytes-like | object] | str | bytes-like | dict | tape): One
+            document per key, a tape of them, or one document broadcast to every key. Text,
+            bytes and a tape, as `write` takes one, are JSON already, while a dict, a list or a
+            number inside a sequence is serialized. None is refused: `remove` removes whole
+            documents, and a merge with a JSON null removes a field. Under a fixed-width `type`,
+            a contiguous buffer of one scalar per key is a column, which reaches the store
+            without being printed as JSON and parsed back.
+          collection (UUID | str): The collection, by identifier or by name.
+          field (str, optional): A top-level key or a JSON Pointer such as '/user/name' to
+            write inside every document; None writes whole documents.
+          modification (Modification, optional): An upsert, update or insert, an RFC 6902
+            `Modification.PATCH` or an RFC 7386 `Modification.MERGE`.
+          type (FieldType, optional): How every document is spelled: `FieldType.JSON`,
+            `FieldType.STRING` for a plain string, `FieldType.NULL`, or the raw bytes of
+            `FieldType.BOOL`, `FieldType.F64`, `FieldType.F32`, `FieldType.I64` through
+            `FieldType.U8`.
+          id_field (str, optional): The field holding every key when `keys` is None.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        Raises:
+          TypeError: A document is None.
+          MalformedError: A document does not parse, or its `id_field` holds no integer.
+          NotFoundError: A field is written inside a document that does not exist.
+          AlreadyExistsError: An insert names a document that already exists.
+        """
     def docs_remove(
         self,
         keys: KeyLike | KeysLike,
@@ -1066,6 +1389,19 @@ class _Writes(_Reads):
         durability: Durability = Durability.BUFFERED,
     ) -> None:
         """Removes whole documents, or every document of a range up to its key in `ends`."""
+    def strings_write(
+        self,
+        strings: TextsLike,
+        keys: KeyLike | KeysLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> None:
+        """Upserts strings and the keys they map onto, one key per string."""
+    def strings_remove(
+        self, strings: TextsLike, *, collection: CollectionLike, durability: Durability = Durability.BUFFERED
+    ) -> None:
+        """Removes strings with their keys."""
     def pages_import(
         self,
         keys: KeyLike | KeysLike,
@@ -1159,7 +1495,19 @@ class _Writes(_Reads):
         edges: KeysLike | None = None,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> None: ...
+    ) -> None:
+        """Inserts a batch of edges, creating the vertices they connect. An edge already present
+        is kept, so writing the same batch twice changes nothing.
+
+        Args:
+          sources (Sequence[KeyLike] | buffer): The vertex every edge leaves.
+          targets (Sequence[KeyLike] | buffer): The vertex every edge enters.
+          edges (Sequence[KeyLike] | buffer, optional): The identifier of every edge, which tells
+            apart several edges between one pair; None gives every edge `edge_id_default`.
+          collection (UUID | str): The graph collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
     def graph_remove_edges(
         self,
         sources: KeysLike,
@@ -1168,10 +1516,29 @@ class _Writes(_Reads):
         edges: KeysLike | None = None,
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
-    ) -> None: ...
+    ) -> None:
+        """Removes a batch of edges and keeps the vertices they connected, even once isolated.
+
+        Args:
+          sources (Sequence[KeyLike] | buffer): The vertex every edge leaves.
+          targets (Sequence[KeyLike] | buffer): The vertex every edge enters.
+          edges (Sequence[KeyLike] | buffer, optional): The identifier of every edge; None removes
+            the edges that were given `edge_id_default`.
+          collection (UUID | str): The graph collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
     def graph_write_vertices(
         self, vertices: KeysLike, *, collection: CollectionLike, durability: Durability = Durability.BUFFERED
-    ) -> None: ...
+    ) -> None:
+        """Inserts a batch of vertices without edges, keeping those already present.
+
+        Args:
+          vertices (Sequence[KeyLike] | buffer): The vertices to insert.
+          collection (UUID | str): The graph collection, by identifier or name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
     def graph_remove_vertices(
         self,
         vertices: KeysLike,
@@ -1180,7 +1547,21 @@ class _Writes(_Reads):
         collection: CollectionLike,
         ends: KeysLike | None = None,
         durability: Durability = Durability.BUFFERED,
-    ) -> None: ...
+    ) -> None:
+        """Removes a batch of vertices together with every edge they take part in. With `ends`,
+        every vertex starts a range removed up to its end, as `remove` takes them.
+
+        Args:
+          vertices (Sequence[KeyLike] | buffer): The vertices to remove, or the first vertex of
+            every range.
+          ends (Sequence[KeyLike] | buffer, optional): The vertex every range stops before, one
+            per vertex.
+          role (Role, optional): The role every vertex plays, which only a joining graph between
+            two collections needs; `Role.ANY` otherwise.
+          collection (UUID | str): The graph collection, by identifier or by name.
+          durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
+            returning.
+        """
 
 class Database(_Writes, _Receivers):
     """An embedded database, opened through one class method per engine."""
@@ -1276,6 +1657,9 @@ class Database(_Writes, _Receivers):
         """Reclaims the space overwritten and removed data takes, one collection at a time, reporting bytes where the
         engine measures them and collections elsewhere."""
 
+    def flush(self) -> None:
+        """Makes every commit that returned before the call durable, as if each had asked for `Durability.FLUSHED`."""
+
     def describe(self) -> Description:
         """The engine, its capabilities and isolation, and the keys, memory and disk it holds."""
 
@@ -1345,10 +1729,10 @@ class Transaction(_Writes, _Receivers):
         value: BaseException | None = None,
         traceback: TracebackType | None = None,
     ) -> None: ...
-    def watched(self) -> View:
+    def watched(self) -> On:
         """A view whose calls record the keys they touch for conflicts."""
 
-    def unwatched(self) -> View:
+    def unwatched(self) -> On:
         """A view whose calls record nothing, so they never fail the commit."""
 
     def commit(self, durability: Durability = Durability.BUFFERED) -> int:
@@ -1368,17 +1752,17 @@ class Transaction(_Writes, _Receivers):
     def close(self) -> None:
         """Drops whatever is still staged and releases the handle, once its deferred calls finished."""
 
-class View(_Writes, _Receivers):
+class On(_Writes, _Receivers):
     """What a database, transaction or snapshot addresses, with the executor its calls block on."""
 
     database: Database
     executor: Executor | None
     """The executor the view's calls run on, where an arena for them belongs, or None for the calling thread."""
 
-    def watched(self) -> View:
+    def watched(self) -> On:
         """A view of the same transaction whose calls record the keys they touch for conflicts."""
 
-    def unwatched(self) -> View:
+    def unwatched(self) -> On:
         """A view of the same transaction whose calls record nothing."""
 
     def ingest_arrow(
@@ -1406,6 +1790,9 @@ class View(_Writes, _Receivers):
     def compact(self, *, progress: Progress | None = None) -> None:
         """Compacts the database on the executor, refusing a view of a transaction or a snapshot."""
 
+    def flush(self) -> None:
+        """Flushes the database on the executor, refusing a view of a transaction or a snapshot."""
+
     def describe(self) -> Description:
         """Describes the database on the executor, refusing a view of a transaction or a snapshot."""
 
@@ -1415,7 +1802,7 @@ class View(_Writes, _Receivers):
     def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
         """The IDs of every collection, at the snapshot of a snapshot and at the head otherwise."""
 
-class DeferredView:
+class DeferredOn:
     """What a database, transaction or snapshot addresses, with the executor its calls go to, each verb answering a
     `Deferred` at once. Every pull of a cursor blocks, so it opens none."""
 
@@ -1426,8 +1813,8 @@ class DeferredView:
     def __getitem__(self, name: str) -> Collection:
         """The collection `name` addresses, whose `blobs[key]` and `docs[key]` answer a `Deferred`."""
 
-    def on(self, executor: Executor) -> View:
-        """on(executor) answers a View whose calls block on the executor.
+    def on(self, executor: Executor) -> On:
+        """on(executor) answers an On whose calls block on the executor.
 
         Every call runs after the ones submitted to the executor before it finishes, so a read
         through it sees what earlier deferred writes wrote.
@@ -1436,8 +1823,8 @@ class DeferredView:
           executor (Executor): The threads that run the calls.
         """
 
-    def deferred(self, executor: Executor) -> DeferredView:
-        """deferred(executor) answers a DeferredView whose calls the executor runs meanwhile.
+    def deferred(self, executor: Executor) -> DeferredOn:
+        """deferred(executor) answers a DeferredOn whose calls the executor runs meanwhile.
 
         Every verb of it submits its call and answers a Deferred at once.
 
@@ -1445,10 +1832,10 @@ class DeferredView:
           executor (Executor): The threads that run the calls.
         """
 
-    def watched(self) -> DeferredView:
+    def watched(self) -> DeferredOn:
         """watched() answers a view of the transaction whose calls record the keys they touch for conflicts."""
 
-    def unwatched(self) -> DeferredView:
+    def unwatched(self) -> DeferredOn:
         """unwatched() answers a view of the transaction whose calls record nothing, so they never fail its commit."""
 
     def read(
@@ -1750,6 +2137,36 @@ class DeferredView:
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Deferred[Measurement]:
         """The `Deferred` of bounds on what a range of document keys holds."""
+    def strings_read(
+        self, strings: TextsLike, arena: Arena, /, *, collection: CollectionLike
+    ) -> Deferred[tuple[UUID | None, ...]]:
+        """The `Deferred` of the key of every string, or None for a string the strings collection does not hold."""
+    def strings_scan(
+        self,
+        prefix: str | bytes | None,
+        wanted: int,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        start: str | bytes | None = None,
+        end: str | bytes | None = None,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Deferred[tuple[str, ...]]:
+        """The `Deferred` of up to `wanted` strings starting with `prefix`, in the order of their bytes."""
+    def strings_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[tuple[str, ...]]:
+        """The `Deferred` of up to `wanted` strings drawn at random."""
+    def strings_measure(
+        self,
+        start: str | bytes | None,
+        end: str | bytes | None,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike,
+        direction: ScanDirection = ScanDirection.ASCENDING,
+    ) -> Deferred[Measurement]:
+        """The `Deferred` of bounds on what a range of strings holds."""
 
     def pages_read(
         self,
@@ -1983,6 +2400,17 @@ class DeferredView:
           ReadOnlyError: The database was opened read-only.
         """
 
+    def flush(self) -> Deferred[None]:
+        """flush() answers None.
+
+        Makes every commit that returned before this call durable, as if each had asked for
+        `Durability.FLUSHED`. LevelDB syncs only its current log, so a commit in a log it
+        already rotated stays unsynced until its compaction lands. Calls `ustore_database_flush`.
+
+        Raises:
+          ReadOnlyError: The database was opened read-only.
+        """
+
     def describe(self) -> Deferred[Description]:
         """describe() answers a Description.
 
@@ -2142,6 +2570,19 @@ class DeferredView:
             returning.
         """
 
+    def strings_write(
+        self,
+        strings: TextsLike,
+        keys: KeyLike | KeysLike,
+        *,
+        collection: CollectionLike,
+        durability: Durability = Durability.BUFFERED,
+    ) -> Deferred[None]:
+        """Upserts strings and the keys they map onto, one key per string."""
+    def strings_remove(
+        self, strings: TextsLike, *, collection: CollectionLike, durability: Durability = Durability.BUFFERED
+    ) -> Deferred[None]:
+        """Removes strings with their keys."""
     def pages_import(
         self,
         keys: KeyLike | KeysLike,

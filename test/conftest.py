@@ -1,4 +1,9 @@
-"""Fixtures every Python suite shares: databases in a fresh directory, and the views verbs run through."""
+"""Fixtures every Python suite shares: databases in a fresh directory, and the views verbs run through.
+
+File: test/conftest.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import random
 from collections.abc import Callable, Iterator
@@ -138,7 +143,7 @@ def arena() -> ustore.Arena:
 
 
 @pytest.fixture
-def later(view: ustore.Database | ustore.Transaction) -> Iterator[ustore.DeferredView]:
+def later(view: ustore.Database | ustore.Transaction) -> Iterator[ustore.DeferredOn]:
     """A deferred view of `view`, whose executor waits for every call it ran once the case is done."""
     with ustore.Executor.for_ram(2) as executor:
         yield view.deferred(executor)

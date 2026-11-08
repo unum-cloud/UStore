@@ -6,8 +6,8 @@
 //!
 //! A [`Database`] owns its directory, a [`Transaction`] and a [`Snapshot`] borrow it, and every
 //! result borrows the [`Arena`] it landed in, so a value read out of an arena cannot outlive it, nor
-//! survive the call that would overwrite it. A [`DeferredView`] submits the same verbs to an [`Executor`]
-//! instead, borrowing the arena the same way until the call is final.
+//! survive the call that would overwrite it. A [`DeferredOn`] submits the same verbs to an
+//! [`Executor`] instead, borrowing the arena the same way until the call is final.
 //!
 //! A [`Collection`] addresses one collection by name, as the Python binding does, and creates it with
 //! its first write. Documents parse through JsonTape and batches of values read as StringTape tapes,
@@ -144,12 +144,13 @@
 //!
 //! ```compile_fail,E0597
 //! use std::ops::ControlFlow;
-//! use ustore::{Database, Executor, RAMOptions};
+//! use ustore::{CompactConfig, Database, Executor, RAMOptions};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let executor = Executor::for_ram(&[], 2, 0)?;
 //! let mut counting = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Continue(()) };
-//! let compaction = database.head().deferred(&executor).compact(Some(&mut counting))?;
+//! let progress = Some(&mut counting as &mut ustore::ProgressCallback);
+//! let compaction = database.head().deferred(&executor).compact(CompactConfig { progress })?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
@@ -213,22 +214,31 @@ pub use stringtape;
 extern crate forkunion as _;
 extern crate stringzilla as _;
 
-pub use arrow::{ArrowArray, ArrowArrayStream, ArrowSchema, IngestOrder};
-pub use blobs::{Cursor, Entry, Measurement, Page, Scanned, Values};
+pub use arrow::{ArrowArray, ArrowArrayStream, ArrowExport, ArrowSchema, IngestOrder};
+pub use blobs::{
+    BlobsCursorConfig, BlobsSampleConfig, BlobsScanConfig, Cursor, Entry, Measurement, Page, Scanned, Values,
+};
 pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{
-    gpu_devices, key_unknown, version, Admission, Arena, Blocking, CPUClass, CaseSensitivity, ChangeKind, Changes,
-    ChangesCursor, CollectionID,
-    Collections, CommitStamp, DataDirectory, Database, Deferred, DeferredView, Deferring, Description, DropMode,
-    Durability, Engine, Error, Executor, Gds, GPUClass, GPUDevice, GPUVendor, IOOptions, Isolation, Key, KeyRange,
-    LevelDBOptions, Matching, Modality, Mood, NVMEOptions, PatternKind, PredicateCallback, PredicateCost,
-    ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions, ScanDirection, Snapshot, Status, Tape,
-    Transaction, Transport, View, Wait, Watch, UUID,
+    gpu_devices, key_unknown, version, Admission, Arena, ArenaDescription, Blocking, CPUClass, CaseSensitivity,
+    ChangeKind, Changes, ChangesCursor, ChangesCursorConfig, CollectionID, Collections, CommitStamp, CompactConfig,
+    DataDirectory, Database, Deferred, DeferredOn, Deferring, Description, DropMode, Durability, Engine, Error,
+    Executor, GPUClass, GPUDevice, GPUVendor, Gds, IOOptions, Isolation, Key, KeyRange, LevelDBOptions, Matching,
+    Modality, Mood, NVMEOptions, On, PatternKind, PredicateCallback, PredicateCost, ProgressCallback, RAMOptions,
+    ReadStamp, Residency, Result, RocksDBOptions, SaveConfig, ScanDirection, ScanMode, Snapshot, Status, Tape,
+    Transaction, Transport, Wait, Watch, UUID,
 };
 pub use docs::{
-    Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, Document, DocumentEntry, FieldAddress, FieldEntry,
-    FieldFormat, Half, Json, KeyedBy, Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
+    Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, DocsCursorConfig, DocsGatherConfig, DocsSampleConfig,
+    DocsScanConfig, Document, DocumentEntry, FieldAddress, FieldEntry, FieldFormat, FieldType, Half, Json, KeyedBy,
+    Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
 };
-pub use graph::{default_edge_id, degree_missing, Degree, Edge, GraphVerticesCursor, Neighborhoods, Role, Roles};
-pub use pages::{PageEncoding, PagesCursor};
-pub use strings::Names;
+pub use graph::{
+    default_edge_id, degree_missing, Degree, Edge, GraphSampleVerticesConfig, GraphScanVerticesConfig,
+    GraphVerticesCursor, GraphVerticesCursorConfig, Neighborhoods, Role, Roles,
+};
+pub use pages::{
+    PageEncoding, PagesCursor, PagesCursorConfig, PagesImportConfig, PagesInsertConfig, PagesReadConfig,
+    PagesSampleConfig, PagesScanConfig,
+};
+pub use strings::{Listing, Mapped, Names, StringsSampleConfig, StringsScanConfig, TextRange};

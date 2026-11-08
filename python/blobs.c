@@ -1570,6 +1570,16 @@ static char const doc_Page_values[] = "The Values of the keys when the pull aske
 
 static PyObject* Page_get_values(Page* self, void* Py_UNUSED(closure)) { return Py_NewRef(self->values); }
 
+static PyObject* Page_dlpack_device(Page* self, PyObject* Py_UNUSED(unused)) {
+    return ustore_py_dlpack_device(self->arena);
+}
+
+static PyMethodDef Page_methods[] = {
+    {"__dlpack__", (PyCFunction)(void (*)(void))ustore_py_dlpack, ustore_py_method_flags_k, ustore_py_dlpack_doc},
+    {"__dlpack_device__", (PyCFunction)Page_dlpack_device, METH_NOARGS, ustore_py_dlpack_device_doc},
+    {NULL, NULL, 0, NULL},
+};
+
 static PyGetSetDef Page_getset[] = {
     {"values", (getter)Page_get_values, NULL, doc_Page_values, NULL},
     {NULL, NULL, NULL, NULL, NULL},
@@ -1596,6 +1606,7 @@ PyTypeObject PageType = {
     .tp_repr = (reprfunc)Page_repr,
     .tp_as_sequence = &Page_as_sequence,
     .tp_as_buffer = &Page_as_buffer,
+    .tp_methods = Page_methods,
     .tp_getset = Page_getset,
 };
 

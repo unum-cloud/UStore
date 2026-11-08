@@ -86,18 +86,20 @@ use std::str::FromStr;
 
 use stringtape::CharsTape;
 
+use crate::arrow::{ffi as arrow_ffi, ArrowDeviceArray, ArrowExport, ArrowSchema};
 use crate::blobs::{Bounds, Found, Measurement, Page, Values};
 use crate::db::ffi::{
     ustore_arena_t, ustore_byte_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t,
     ustore_completion_t, ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_key_t,
     ustore_keys_view_t, ustore_length_t, ustore_octet_t, ustore_outcome_t, ustore_predicate_t,
-    ustore_progress_callback_t, ustore_scan_direction_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t,
-    ustore_transaction_t, ustore_view_t, ustore_watch_t,
+    ustore_progress_callback_t, ustore_scan_direction_t, ustore_scan_mode_t, ustore_size_t, ustore_strided_view_t,
+    ustore_strings_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
 use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
-    check, exported_slice, fail, read_spelling, spelling, Address, Arena, CollectionID, Collections, Durability, Error,
-    Key, KeyRange, Matched, Matching, Result, Rows, Status, Strings, View, UUID,
+    check, exported_slice, fail, host_arena, read_spelling, spelling, Address, Arena, CollectionID, Collections,
+    Deferring, Durability, Error, Key, KeyRange, Matched, Matching, On, Progress, ProgressCallback, Result, Rows,
+    ScanMode, Status, Strings, UUID,
 };
 
 // region: Raw Declarations
@@ -241,6 +243,29 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
+    pub struct ustore_docs_scan_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub start_keys: ustore_keys_view_t,
+        pub end_keys: ustore_keys_view_t,
+        pub direction: ustore_scan_direction_t,
+        pub filter: ustore_bytes_view_t,
+        pub predicate: ustore_predicate_t,
+        pub offsets: *mut *const ustore_length_t,
+        pub keys: *mut *const ustore_key_t,
+        pub arena: ustore_arena_t,
+        pub wanted: ustore_size_t,
+        pub mode: ustore_scan_mode_t,
+        pub progress: ustore_progress_callback_t,
+        pub progress_state: *mut c_void,
+    }
+
+    #[repr(C)]
     pub struct ustore_docs_sample_t {
         pub database: ustore_database_t,
         pub executor: ustore_executor_t,
@@ -285,9 +310,12 @@ pub(crate) mod ffi {
         pub fn ustore_docs_read(arguments: *mut ustore_docs_read_t);
         pub fn ustore_docs_gist(arguments: *mut ustore_docs_gist_t);
         pub fn ustore_docs_gather(arguments: *mut ustore_docs_gather_t);
+        pub fn ustore_docs_scan(arguments: *mut ustore_docs_scan_t);
         pub fn ustore_docs_sample(arguments: *mut ustore_docs_sample_t);
         pub fn ustore_docs_measure(arguments: *mut ustore_docs_measure_t);
         pub fn ustore_docs_modification_name(modification: ustore_enum_t) -> *const c_char;
+        pub fn ustore_docs_field_type_name(field_type: ustore_enum_t) -> *const c_char;
+        pub fn ustore_docs_field_type_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
         pub fn ustore_docs_modification_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
     }
 }
@@ -539,6 +567,94 @@ impl FromStr for Modification {
             ffi::ustore_docs_modification_from_name,
             ffi::ustore_docs_modification_name,
             Modification::from_raw,
+        )
+    }
+}
+
+/// The type a field crosses as, which every format above names one of.
+#[repr(i32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum FieldType {
+    /// JSON text.
+    #[default]
+    Json = 0,
+    /// The JSON null.
+    Null = 10,
+    /// A boolean.
+    Bool = 11,
+    /// A 128-bit UUID.
+    UUID = 12,
+    /// A 64-bit float.
+    F64 = 42,
+    /// A 32-bit float.
+    F32 = 41,
+    /// A 16-bit float.
+    F16 = 40,
+    /// A signed 64-bit integer.
+    I64 = 23,
+    /// A signed 32-bit integer.
+    I32 = 22,
+    /// A signed 16-bit integer.
+    I16 = 21,
+    /// A signed 8-bit integer.
+    I8 = 20,
+    /// An unsigned 64-bit integer.
+    U64 = 33,
+    /// An unsigned 32-bit integer.
+    U32 = 32,
+    /// An unsigned 16-bit integer.
+    U16 = 31,
+    /// An unsigned 8-bit integer.
+    U8 = 30,
+    /// The text of a value without a null terminator.
+    Binary = 50,
+    /// A value printed as text.
+    String = 51,
+}
+
+impl FieldType {
+    fn from_raw(raw: ustore_enum_t) -> Option<Self> {
+        [
+            FieldType::Json,
+            FieldType::Null,
+            FieldType::Bool,
+            FieldType::UUID,
+            FieldType::F64,
+            FieldType::F32,
+            FieldType::F16,
+            FieldType::I64,
+            FieldType::I32,
+            FieldType::I16,
+            FieldType::I8,
+            FieldType::U64,
+            FieldType::U32,
+            FieldType::U16,
+            FieldType::U8,
+            FieldType::Binary,
+            FieldType::String,
+        ]
+        .into_iter()
+        .find(|field_type| *field_type as ustore_enum_t == raw)
+    }
+}
+
+impl fmt::Display for FieldType {
+    /// Calls `ustore_docs_field_type_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_docs_field_type_name, *self as ustore_enum_t))
+    }
+}
+
+impl FromStr for FieldType {
+    type Err = Error;
+
+    /// Calls `ustore_docs_field_type_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_docs_field_type_from_name,
+            ffi::ustore_docs_field_type_name,
+            FieldType::from_raw,
         )
     }
 }
@@ -869,6 +985,70 @@ impl<Keys: AsRef<[Key]>, Offset: TapeOffset> Addresses for (Keys, CharsTape<Offs
     }
 }
 
+/// The document keys a scan keeps, what admits them and how it reports; see [`On::docs_scan`].
+pub struct DocsScanConfig<'config> {
+    /// Keys kept, at most.
+    pub wanted: usize,
+    /// Admits only the documents its filter and predicate approve; every document by default.
+    pub matching: Matching<'config>,
+    /// In what order the keys come.
+    pub mode: ScanMode,
+    /// Reports the scans finished and stops wherever it says to.
+    pub progress: Option<&'config mut ProgressCallback<'config>>,
+}
+
+impl From<usize> for DocsScanConfig<'_> {
+    fn from(wanted: usize) -> Self {
+        DocsScanConfig {
+            wanted,
+            matching: Matching::default(),
+            mode: ScanMode::Ordered,
+            progress: None,
+        }
+    }
+}
+
+/// The document keys a sample draws; see [`On::docs_sample`].
+#[derive(Clone, Copy, Debug)]
+pub struct DocsSampleConfig {
+    /// Keys drawn, at most.
+    pub wanted: usize,
+}
+
+impl From<usize> for DocsSampleConfig {
+    fn from(wanted: usize) -> Self {
+        DocsSampleConfig { wanted }
+    }
+}
+
+/// The typed columns a gather reads; see [`On::docs_gather`].
+#[derive(Clone, Copy, Debug)]
+pub struct DocsGatherConfig<Requested> {
+    /// The fields and the format each lands in, borrowed or owned.
+    pub columns: Requested,
+}
+
+impl<Requested> From<Requested> for DocsGatherConfig<Requested> {
+    fn from(columns: Requested) -> Self {
+        DocsGatherConfig { columns }
+    }
+}
+
+/// What admits the keys a cursor hands out; see [`On::docs_cursor`].
+#[derive(Debug, Default)]
+pub struct DocsCursorConfig<'config> {
+    /// Admits only the documents its filter and predicate approve; every document by default.
+    pub matching: Matching<'config>,
+}
+
+impl<'config> From<Matching<'config>> for DocsCursorConfig<'config> {
+    fn from(matching: Matching<'config>) -> Self {
+        DocsCursorConfig { matching }
+    }
+}
+
+impl Accepts<DocsScanConfig<'static>> for Deferring {}
+
 // endregion: Inputs
 
 // region: Outputs
@@ -1014,6 +1194,8 @@ impl<'arena> IntoIterator for &StringColumn<'arena> {
 pub struct Columns<'arena, Requested> {
     requested: Requested,
     rows: usize,
+    /// The arena holding the columns, borrowed for `'arena`.
+    arena: ustore_arena_t,
     /// One view per requested column, or none for a gather that reached no engine.
     views: &'arena [ffi::ustore_docs_column_view_t],
 }
@@ -1030,17 +1212,17 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
     }
 
     /// Which rows of `column` hold a value, or `None` past the last column.
-    pub fn validities(&self, column: usize) -> Option<Bitmap<'arena>> {
+    pub fn validities(&self, column: usize) -> Result<Option<Bitmap<'arena>>> {
         self.bitmap(column, |view| view.validities)
     }
 
     /// Which rows of `column` changed their meaning on conversion, or `None` past the last column.
-    pub fn conversions(&self, column: usize) -> Option<Bitmap<'arena>> {
+    pub fn conversions(&self, column: usize) -> Result<Option<Bitmap<'arena>>> {
         self.bitmap(column, |view| view.conversions)
     }
 
     /// Which rows of `column` hold a value that would not convert, or `None` past the last column.
-    pub fn collisions(&self, column: usize) -> Option<Bitmap<'arena>> {
+    pub fn collisions(&self, column: usize) -> Result<Option<Bitmap<'arena>>> {
         self.bitmap(column, |view| view.collisions)
     }
 
@@ -1052,6 +1234,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
         let Some(view) = self.views.get(column) else {
             return Ok(&[]);
         };
+        host_arena(self.arena)?;
         // SAFETY: a successful gather writes every row of a column of the requested type into the arena, which stays
         // borrowed; a C++ `bool` holds only zero or one.
         Ok(unsafe { exported_slice(view.scalars.cast::<Value>(), self.rows) })
@@ -1065,7 +1248,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
             _ => return Err(fail(Status::InvalidArgument, "the column was not gathered as strings")),
         };
         let validities = self
-            .bitmap(column, |view| view.validities)
+            .bitmap(column, |view| view.validities)?
             .unwrap_or(Bitmap { bytes: &[], count: 0 });
         let strings = match self.views.get(column) {
             // SAFETY: a successful gather exports the strings of every row of a string column as a tape in the arena,
@@ -1078,6 +1261,62 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
             strings,
             terminator,
         })
+    }
+
+    /// Every column as one Arrow array beside its schema, in request order, or none for a gather
+    /// that reached no engine.
+    ///
+    /// Scalars and [`Binary`] columns export in place, and [`Text`] ones copied without their
+    /// terminators. The columns of a device arena stay on the device, as
+    /// [`ArrowDeviceArray::device_type`] says. Each export borrows the arena, so the call that
+    /// would rewind it does not compile while one lives:
+    ///
+    /// ```compile_fail,E0499
+    /// use ustore::{Arena, Column, RAMOptions, Database, Key, Modality, Text};
+    ///
+    /// let database = Database::init_ram(&RAMOptions::default())?;
+    /// let mut arena = Arena::new()?;
+    /// let people = database.collection_create("people", Modality::Docs)?;
+    /// let columns = [Column::new::<Text>("name")];
+    /// let ada = Key::from(1u64);
+    /// let exported = database.head().docs_gather(people, &[ada], &columns, &mut arena)?.to_arrow()?;
+    /// database.head().docs_gist(people, [ada], &mut arena)?;
+    /// drop(exported);
+    /// # Ok::<(), ustore::Error>(())
+    /// ```
+    ///
+    /// Calls `ustore_docs_column_view_to_arrow`.
+    pub fn to_arrow(&self) -> Result<Vec<ArrowExport<'arena>>> {
+        let mut exported = Vec::new();
+        exported
+            .try_reserve_exact(self.views.len())
+            .map_err(|_| fail(Status::OutOfMemory, "the column exports could not be staged"))?;
+        for (column, request) in (0..self.views.len()).zip(self.requested.as_ref()) {
+            let mut schema = ArrowSchema::empty();
+            let mut array = ArrowDeviceArray::empty();
+            // SAFETY: the view is an address in the borrowed arena, which the library reads
+            // wherever it lives.
+            let status = unsafe {
+                arrow_ffi::ustore_docs_column_view_to_arrow(
+                    self.views.as_ptr().add(column),
+                    self.rows as ustore_size_t,
+                    request.format,
+                    self.arena,
+                    &mut schema,
+                    &mut array,
+                )
+            };
+            check(ustore_outcome_t {
+                status,
+                message: c"failed to export a gathered column".as_ptr(),
+            })?;
+            exported.push(ArrowExport {
+                schema,
+                array,
+                marker: PhantomData,
+            });
+        }
+        Ok(exported)
     }
 
     /// The format `column` was requested in, refusing a column the gather never read.
@@ -1093,19 +1332,23 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
         &self,
         column: usize,
         bits: fn(&ffi::ustore_docs_column_view_t) -> *const ustore_octet_t,
-    ) -> Option<Bitmap<'arena>> {
+    ) -> Result<Option<Bitmap<'arena>>> {
         if column >= self.columns() {
-            return None;
+            return Ok(None);
         }
         let bytes = match self.views.get(column) {
-            // SAFETY: a successful gather exports every bitmap of a column covering every row, in the arena.
-            Some(view) => unsafe { exported_slice(bits(view), self.rows.div_ceil(8)) },
+            Some(view) => {
+                host_arena(self.arena)?;
+                // SAFETY: a successful gather exports every bitmap of a column covering every row,
+                // in the arena.
+                unsafe { exported_slice(bits(view), self.rows.div_ceil(8)) }
+            }
             None => &[],
         };
-        Some(Bitmap {
+        Ok(Some(Bitmap {
             bytes,
             count: self.rows,
-        })
+        }))
     }
 }
 
@@ -1113,9 +1356,9 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
 
 // region: Verbs
 
-impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
-    /// Writes whole documents or values into fields inside them, where [`View::docs_remove`] removes documents and a merge
-    /// with a JSON `null` removes a field, and hands what it wrote back.
+impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
+    /// Writes whole documents or values into fields inside them, where [`On::docs_remove`] removes
+    /// documents and a merge with a JSON `null` removes a field, and hands what it wrote back.
     ///
     /// The batch is one of:
     /// - borrowed [`DocumentEntry`] values of one format, which is [`Json`] for the text the engine parses and a
@@ -1184,18 +1427,53 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Paren
     }
 }
 
-impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
+impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
+    /// Lists up to `wanted` document keys of one collection's `range` into the arena, keeping those
+    /// whose document the filter of `matching` admits and the keys its predicate admits.
+    ///
+    /// Calls `ustore_docs_scan`.
+    pub fn docs_scan<'config, 'arena>(
+        &self,
+        collection: CollectionID,
+        range: impl Into<KeyRange>,
+        config: impl Into<DocsScanConfig<'config>>,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<DocsScan<'arena, 'config>>
+    where
+        Completion: Accepts<DocsScanConfig<'config>>,
+    {
+        let range = range.into();
+        let DocsScanConfig {
+            wanted,
+            matching,
+            mode,
+            progress,
+        } = config.into();
+        let verb = DocsScan {
+            collection,
+            start: range.start_key(),
+            range,
+            arena,
+            wanted,
+            matched: Matched::new(matching),
+            mode,
+            progress: Progress::new(progress),
+            found: Found::default(),
+        };
+        Completion::answer(self, verb)
+    }
+
     /// Draws up to `wanted` document keys uniformly at random from one collection into the arena.
     pub fn docs_sample<'arena>(
         &self,
         collection: CollectionID,
-        wanted: usize,
+        config: impl Into<DocsSampleConfig>,
         arena: &'arena mut Arena,
     ) -> Completion::Answer<DocsSample<'arena>> {
         let verb = DocsSample {
             collection,
             arena,
-            wanted,
+            wanted: config.into().wanted,
             found: Found::default(),
         };
         Completion::answer(self, verb)
@@ -1282,7 +1560,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
         &self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
-        columns: Requested,
+        config: impl Into<DocsGatherConfig<Requested>>,
         arena: &'arena mut Arena,
     ) -> Completion::Answer<DocsGather<'arena, 'collections, Keys, Requested>>
     where
@@ -1292,7 +1570,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
         let verb = DocsGather {
             collections: collections.into(),
             keys,
-            columns,
+            columns: config.into().columns,
             arena,
             formats: Vec::new(),
             views: Address::default(),
@@ -1301,7 +1579,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
     }
 }
 
-/// A write of whole documents or of fields inside them; see [`View::docs_write`].
+/// A write of whole documents or of fields inside them; see [`On::docs_write`].
 #[derive(Debug)]
 pub struct DocsWrite<'collections, Documents> {
     collections: Collections<'collections>,
@@ -1316,7 +1594,7 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1351,7 +1629,7 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
     }
 }
 
-/// A removal of a batch of whole documents; see [`View::docs_remove`].
+/// A removal of a batch of whole documents; see [`On::docs_remove`].
 #[derive(Debug)]
 pub struct DocsRemove<'collections, Keys> {
     collections: Collections<'collections>,
@@ -1365,7 +1643,7 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1397,7 +1675,7 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
     }
 }
 
-/// A removal of one range of documents; see [`View::docs_remove_range`].
+/// A removal of one range of documents; see [`On::docs_remove_range`].
 #[derive(Debug)]
 pub struct DocsRemoveRange {
     collection: CollectionID,
@@ -1411,7 +1689,7 @@ impl Calling for DocsRemoveRange {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1439,7 +1717,71 @@ impl Calling for DocsRemoveRange {
     }
 }
 
-/// A random draw of document keys from one collection; see [`View::docs_sample`].
+/// A walk over the document keys of one collection; see [`On::docs_scan`].
+#[derive(Debug)]
+pub struct DocsScan<'arena, 'matching> {
+    collection: CollectionID,
+    start: Key,
+    range: KeyRange,
+    arena: &'arena mut Arena,
+    wanted: usize,
+    matched: Matched<'matching>,
+    mode: ScanMode,
+    progress: Progress<'matching>,
+    found: Found,
+}
+
+impl<'arena> Calling for DocsScan<'arena, '_> {
+    type Arguments = ffi::ustore_docs_scan_t;
+    type Output = &'arena [Key];
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &On<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let (progress, progress_state) = self.progress.lowered();
+        Ok(Some(ffi::ustore_docs_scan_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: 1,
+            collections: ustore_strided_view_t::repeated(&self.collection),
+            start_keys: ustore_strided_view_t::repeated(&self.start),
+            end_keys: self.range.end_keys(),
+            direction: self.range.direction,
+            filter: self.matched.filter(),
+            predicate: self.matched.predicate(),
+            offsets: &mut self.found.offsets.0,
+            keys: &mut self.found.keys.0,
+            arena: self.arena.handle,
+            wanted: self.wanted as ustore_size_t,
+            mode: self.mode,
+            progress,
+            progress_state,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_scan(arguments)
+    }
+
+    fn raise(&mut self) {
+        self.matched.raise();
+        self.progress.raise();
+    }
+
+    fn finish(self) -> Result<&'arena [Key]> {
+        self.arena.host()?;
+        // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`.
+        Ok(unsafe { self.found.keys() })
+    }
+}
+
+/// A random draw of document keys from one collection; see [`On::docs_sample`].
 #[derive(Debug)]
 pub struct DocsSample<'arena> {
     collection: CollectionID,
@@ -1454,7 +1796,7 @@ impl<'arena> Calling for DocsSample<'arena> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1478,12 +1820,13 @@ impl<'arena> Calling for DocsSample<'arena> {
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
+        self.arena.host()?;
         // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
 
-/// An estimate of what a range of documents holds; see [`View::docs_measure`].
+/// An estimate of what a range of documents holds; see [`On::docs_measure`].
 #[derive(Debug)]
 pub struct DocsMeasure<'arena> {
     collection: CollectionID,
@@ -1499,7 +1842,7 @@ impl Calling for DocsMeasure<'_> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1531,12 +1874,13 @@ impl Calling for DocsMeasure<'_> {
     }
 
     fn finish(self) -> Result<Measurement> {
+        self.arena.host()?;
         // SAFETY: the measurement of one range succeeded.
         Ok(unsafe { self.bounds.measurement() })
     }
 }
 
-/// A read of whole documents or of fields inside them; see [`View::docs_read`].
+/// A read of whole documents or of fields inside them; see [`On::docs_read`].
 #[derive(Debug)]
 pub struct DocsRead<'arena, 'collections, Targets> {
     collections: Collections<'collections>,
@@ -1555,7 +1899,7 @@ impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1588,12 +1932,13 @@ impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
     }
 
     fn finish(self) -> Result<Values<'arena>> {
+        self.arena.host()?;
         // SAFETY: the read succeeded over every task, and the arena stays borrowed for `'arena`.
         unsafe { Values::exported(self.count, self.presences, self.values) }
     }
 }
 
-/// A listing of the paths to the leaves of documents; see [`View::docs_gist`].
+/// A listing of the paths to the leaves of documents; see [`On::docs_gist`].
 #[derive(Debug)]
 pub struct DocsGist<'arena, 'collections, Keys> {
     collections: Collections<'collections>,
@@ -1609,7 +1954,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for DocsGist<'arena, '_, Keys> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1634,12 +1979,13 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for DocsGist<'arena, '_, Keys> {
     }
 
     fn finish(self) -> Result<Paths<'arena>> {
+        self.arena.host()?;
         // SAFETY: the gist succeeded, and the arena stays borrowed for `'arena`.
         unsafe { Paths::exported(self.written, self.fields) }
     }
 }
 
-/// A conversion of fields into typed columns; see [`View::docs_gather`].
+/// A conversion of fields into typed columns; see [`On::docs_gather`].
 #[derive(Debug)]
 pub struct DocsGather<'arena, 'collections, Keys, Requested> {
     collections: Collections<'collections>,
@@ -1659,7 +2005,7 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1700,6 +2046,7 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
         let views = unsafe { exported_slice(self.views.0, fields) };
         Ok(Columns {
             rows: self.keys.as_ref().len(),
+            arena: self.arena.handle,
             requested: self.columns,
             views,
         })
@@ -1712,6 +2059,9 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
+    use std::slice;
+
     use super::*;
     use crate::blobs::Entry;
     use crate::db::{CollectionID, Collections, Database, Executor, Modality, RAMOptions, Watch};
@@ -1757,6 +2107,25 @@ mod tests {
         let (database, docs, mut arena) = populated();
         let head = database.head();
         assert_eq!(head.docs_sample(docs, 8, &mut arena).unwrap().len(), 2);
+        let scanned = head.docs_scan(docs, key(0), 8, &mut arena).unwrap();
+        assert_eq!(scanned, &keys([1, 2]));
+        let graces = Matching {
+            filter: Some(r#"?@.name == "Grace""#),
+            ..Matching::default()
+        };
+        assert_eq!(
+            head.docs_scan(
+                docs,
+                key(0),
+                DocsScanConfig {
+                    matching: graces,
+                    ..DocsScanConfig::from(8)
+                },
+                &mut arena
+            )
+            .unwrap(),
+            &keys([2])
+        );
         let measured = head.docs_measure(docs, key(1)..key(2), &mut arena).unwrap();
         assert!(measured.min_cardinality <= 1 && measured.max_cardinality >= measured.min_cardinality);
         head.docs_remove_range(docs, key(1)..key(2), Durability::Buffered)
@@ -2062,6 +2431,49 @@ mod tests {
     }
 
     #[test]
+    fn gathered_columns_export_in_place() {
+        let (database, docs, mut arena) = populated();
+        let columns = [Column::new::<u64>("born"), Column::new::<Binary>("name")];
+        let gathered = database
+            .head()
+            .docs_gather(docs, &keys([1, 2, 42]), &columns, &mut arena)
+            .unwrap();
+        let exported = gathered.to_arrow().unwrap();
+        assert_eq!(exported.len(), 2);
+        let born = exported[0].array();
+        assert_eq!((born.device_type, born.array.length), (ArrowDeviceArray::CPU, 3));
+        // SAFETY: a scalar column on the host holds validities and values.
+        let values = unsafe { *born.array.buffers.add(1) };
+        assert_eq!(values.cast(), gathered.scalars::<u64>(0).unwrap().as_ptr());
+        let validities = unsafe { *born.array.buffers };
+        assert_eq!(
+            validities.cast(),
+            gathered.validities(0).unwrap().unwrap().as_bytes().as_ptr()
+        );
+    }
+
+    #[test]
+    fn gathered_text_exports_without_terminators() {
+        let (database, docs, mut arena) = populated();
+        let columns = [Column::new::<Text>("name")];
+        let gathered = database
+            .head()
+            .docs_gather(docs, &keys([1, 2]), &columns, &mut arena)
+            .unwrap();
+        let exported = gathered.to_arrow().unwrap();
+        let (schema, array) = (exported[0].schema(), exported[0].array());
+        // SAFETY: a string column on the host holds validities, offsets and bytes, as its schema
+        // says.
+        unsafe {
+            assert_eq!(CStr::from_ptr(schema.format), c"u");
+            let offsets = *array.array.buffers.add(1) as *const u32;
+            let bytes = *array.array.buffers.add(2) as *const u8;
+            let first = slice::from_raw_parts(bytes, *offsets.add(1) as usize);
+            assert_eq!(Some(first), gathered.strings(0).unwrap().get(0));
+        }
+    }
+
+    #[test]
     fn gathers_convert_fields_into_typed_columns() {
         let (database, docs, mut arena) = populated();
         let columns = [
@@ -2080,12 +2492,12 @@ mod tests {
 
         let born = gathered.scalars::<u64>(0).unwrap();
         assert_eq!(&born[..2], &[1815, 1906]);
-        let validities = gathered.validities(0).unwrap();
+        let validities = gathered.validities(0).unwrap().unwrap();
         assert_eq!(
             (validities.get(0), validities.get(1), validities.get(2)),
             (true, true, false)
         );
-        let conversions = gathered.conversions(0).unwrap();
+        let conversions = gathered.conversions(0).unwrap().unwrap();
         assert!(!conversions.get(0), "a positive integer is unsigned as it stands");
         assert!(conversions.get(1), "a string parsed into an integer is a conversion");
         assert_eq!(validities.len(), 3);
@@ -2105,10 +2517,10 @@ mod tests {
         assert_eq!(ranks.get(1), Some(b"Rear Admiral".as_slice()));
 
         // An object cannot become a boolean, nor a word a byte.
-        let navy = gathered.collisions(4).unwrap();
+        let navy = gathered.collisions(4).unwrap().unwrap();
         assert!(!navy.get(0) && navy.get(1));
-        assert!(!gathered.validities(4).unwrap().get(1));
-        assert!(gathered.collisions(5).unwrap().get(0));
+        assert!(!gathered.validities(4).unwrap().unwrap().get(1));
+        assert!(gathered.collisions(5).unwrap().unwrap().get(0));
         assert_eq!(gathered.scalars::<bool>(4).unwrap().len(), 3);
     }
 
@@ -2124,7 +2536,7 @@ mod tests {
         assert_eq!(gathered.scalars::<i64>(1).unwrap_err().status, Status::InvalidArgument);
         assert_eq!(gathered.strings(0).unwrap_err().status, Status::InvalidArgument);
         assert_eq!(gathered.scalars::<i64>(2).unwrap_err().status, Status::InvalidArgument);
-        assert!(gathered.validities(2).is_none());
+        assert!(gathered.validities(2).unwrap().is_none());
     }
 
     #[test]
@@ -2139,7 +2551,7 @@ mod tests {
             .unwrap();
         assert_eq!(gathered.columns(), 4);
         for column in 0..gathered.columns() {
-            assert!(gathered.validities(column).unwrap().get(0));
+            assert!(gathered.validities(column).unwrap().unwrap().get(0));
         }
     }
 
@@ -2243,7 +2655,7 @@ mod tests {
         // A half is two bytes the caller reinterprets; 1.5 is sign zero, exponent fifteen, mantissa one half.
         let weights = gathered.scalars::<Half>(0).unwrap();
         assert_eq!(weights, &[Half(0x3e00), Half(0)]);
-        assert!(gathered.validities(0).unwrap().get(0) && gathered.validities(0).unwrap().get(1));
+        assert!(gathered.validities(0).unwrap().unwrap().get(0) && gathered.validities(0).unwrap().unwrap().get(1));
 
         let identifiers = gathered.scalars::<UUID>(1).unwrap();
         assert_eq!(
@@ -2255,10 +2667,10 @@ mod tests {
             UUID::default(),
             "text that is no UUID leaves its cell zero"
         );
-        assert!(gathered.collisions(1).unwrap().get(1));
+        assert!(gathered.collisions(1).unwrap().unwrap().get(1));
 
         // A magnitude past the range of a half collides rather than rounding to infinity.
-        assert!(gathered.collisions(2).unwrap().get(0));
+        assert!(gathered.collisions(2).unwrap().unwrap().get(0));
         assert_eq!(gathered.scalars::<Half>(2).unwrap()[0], Half(0));
         assert_eq!(
             gathered.scalars::<f32>(0).unwrap_err().status,
@@ -2289,7 +2701,7 @@ mod tests {
         assert_eq!(gathered.rows(), 0);
         assert!(gathered.scalars::<i64>(0).unwrap().is_empty());
         assert!(gathered.strings(1).unwrap().is_empty());
-        assert!(gathered.validities(0).unwrap().is_empty());
+        assert!(gathered.validities(0).unwrap().unwrap().is_empty());
         assert_eq!(
             head.docs_gather(docs, &keys([1]), &[], &mut arena).unwrap().columns(),
             0
@@ -2495,7 +2907,7 @@ pub struct DocsCursor<'view> {
     marker: PhantomData<&'view ()>,
 }
 
-impl<'view, Parent> View<'view, Parent> {
+impl<'view, Parent> On<'view, Parent> {
     /// Opens a walk over the keys of one documents collection's `range`, compiling what `matching`
     /// names once, whose predicate lives as long as the cursor.
     ///
@@ -2504,14 +2916,14 @@ impl<'view, Parent> View<'view, Parent> {
         &self,
         collection: CollectionID,
         range: impl Into<KeyRange>,
-        matching: Matching<'view>,
+        config: impl Into<DocsCursorConfig<'view>>,
     ) -> Result<DocsCursor<'view>> {
         let range: KeyRange = range.into();
         let mut cursor = DocsCursor {
             handle: ptr::null_mut(),
             database: self.database(),
             executor: self.executor(),
-            matched: Box::new(Matched::new(matching)),
+            matched: Box::new(Matched::new(config.into().matching)),
             marker: PhantomData,
         };
         let mut outcome = ustore_outcome_t::default();
@@ -2581,6 +2993,7 @@ impl DocsCursor<'_> {
         unsafe { ffi::ustore_docs_cursor_next(&mut arguments) };
         self.matched.raise();
         check(outcome)?;
+        arena.host()?;
         // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
         Ok(unsafe { exported_slice(keys, written as usize) })
     }

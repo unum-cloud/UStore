@@ -73,7 +73,7 @@ use crate::arrow::{self, ArrowArrayStream, IngestOrder};
 use crate::blobs::{Entry, Values};
 use crate::db::sealed::Writable;
 use crate::db::{
-    fail, Arena, CollectionID, Database, Durability, Error, Key, Modality, Result, Status, Transaction, View, Watch,
+    fail, Arena, CollectionID, Database, Durability, Error, Key, Modality, On, Result, Status, Transaction, Watch,
 };
 use crate::docs::{DocumentEntry, Json, Modification};
 use crate::graph::{Degree, Edge, Role, Roles};
@@ -107,13 +107,13 @@ impl<'db> Transaction<'db> {
 /// copied out of it, while a batch read borrows the [`Arena`] it is given. Writes land [`Durability::Buffered`].
 #[derive(Debug)]
 pub struct Collection<'view, Parent = Database> {
-    view: View<'view, Parent>,
+    view: On<'view, Parent>,
     name: String,
     resolved: Option<(CollectionID, Modality)>,
 }
 
 impl<'view, Parent: Writable> Collection<'view, Parent> {
-    fn new(view: View<'view, Parent>, name: &str) -> Result<Self> {
+    fn new(view: On<'view, Parent>, name: &str) -> Result<Self> {
         let mut collection = Collection {
             view,
             name: name.to_owned(),

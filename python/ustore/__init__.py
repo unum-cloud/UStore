@@ -1,4 +1,4 @@
-"""GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices.
+"""GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass.
 
 File: python/ustore/__init__.py
 Author: Ash Vardanian

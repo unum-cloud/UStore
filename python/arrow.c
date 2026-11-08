@@ -238,12 +238,23 @@ typedef struct export_schema_t {
     char* metadata;
 } export_schema_t;
 
-/** One exported batch: the columns the exporters handed out, which its release releases. */
+/** What an exported column's release runs beside the exporter's own: its batch's live count. */
+typedef struct export_column_t {
+    struct export_batch_t* batch;
+    void (*release)(struct ArrowArray*);
+    void* private_data;
+} export_column_t;
+
+/** One exported batch: the columns the exporters handed out and the arena they live in, freed
+ *  with the last of the batch and its columns, which a consumer may release in any order. */
 typedef struct export_batch_t {
     struct ArrowArray columns[3];
     struct ArrowArray* children[3];
     struct ArrowSchema schemas[3];
+    export_column_t holds[3];
     void const* root_buffers[1];
+    ustore_arena_t arena;
+    atomic_size_t live;
 } export_batch_t;
 
 static void export_column_schema_release(struct ArrowSchema* schema) { schema->release = NULL; }
@@ -255,14 +266,38 @@ static void export_schema_release(struct ArrowSchema* schema) {
     schema->release = NULL;
 }
 
+static void export_batch_unshare(export_batch_t* owned) {
+    if (atomic_fetch_sub_explicit(&owned->live, 1, memory_order_acq_rel) != 1) return;
+    ustore_arena_free(owned->arena);
+    PyMem_RawFree(owned);
+}
+
+static void export_column_release(struct ArrowArray* column) {
+    export_column_t* const hold = (export_column_t*)column->private_data;
+    column->release = hold->release;
+    column->private_data = hold->private_data;
+    column->release(column);
+    export_batch_unshare(hold->batch);
+}
+
+/** Moves @p column into slot @p index of @p owned, counting it live until its release. */
+static void export_column_hold(export_batch_t* owned, size_t index, struct ArrowArray column) {
+    owned->holds[index] =
+        (export_column_t) {.batch = owned, .release = column.release, .private_data = column.private_data};
+    column.release = export_column_release;
+    column.private_data = &owned->holds[index];
+    owned->columns[index] = column;
+    atomic_fetch_add_explicit(&owned->live, 1, memory_order_relaxed);
+}
+
 static void export_batch_release(struct ArrowArray* batch) {
     export_batch_t* const owned = (export_batch_t*)batch->private_data;
     for (int64_t index = 0; index != batch->n_children; ++index) {
         if (owned->columns[index].release) owned->columns[index].release(&owned->columns[index]);
         if (owned->schemas[index].release) owned->schemas[index].release(&owned->schemas[index]);
     }
-    PyMem_RawFree(owned);
     batch->release = NULL;
+    export_batch_unshare(owned);
 }
 
 /** The names of the columns of @p modality and whether each one is ragged. */
@@ -341,7 +376,7 @@ static void export_keys(export_batch_t* owned, size_t index, ustore_keys_view_t 
     ustore_status_t const status = ustore_keys_view_to_arrow(keys, count, arena, &owned->schemas[index], &column);
     if (status != ustore_status_success_k)
         *outcome = (ustore_outcome_t) {status, "Failed to export the keys of a batch"};
-    else owned->columns[index] = column.array;
+    else export_column_hold(owned, index, column.array);
 }
 
 /** Exports @p strings as column @p index of @p owned as @c binary, which the stream's schema names. */
@@ -353,7 +388,7 @@ static void export_strings(export_batch_t* owned, size_t index, ustore_strings_v
                                                                 &owned->schemas[index], &column);
     if (status != ustore_status_success_k)
         *outcome = (ustore_outcome_t) {status, "Failed to export the values of a batch"};
-    else owned->columns[index] = column.array;
+    else export_column_hold(owned, index, column.array);
 }
 
 /** Exports the keys and values a cursor pulled into @p arena as the two columns of @p owned. */
@@ -412,9 +447,10 @@ static int export_get_next(struct ArrowArrayStream* stream, struct ArrowArray* o
     ustore_outcome_t outcome = {0};
     export_batch_t* const owned = (export_batch_t*)PyMem_RawCalloc(1, sizeof(export_batch_t));
     if (!owned) return export_failure(state, (ustore_outcome_t) {ustore_status_out_of_memory_k, "Failed to allocate"});
-    ustore_arena_t arena = NULL;
-    ustore_arena_init_t init = {.arena = &arena, .outcome = &outcome};
+    atomic_init(&owned->live, 1);
+    ustore_arena_init_t init = {.arena = &owned->arena, .outcome = &outcome};
     ustore_arena_init(&init);
+    ustore_arena_t const arena = owned->arena;
     ustore_size_t rows = 0;
     if (outcome.status == ustore_status_success_k) switch (state->modality) {
         case ustore_modality_graph_k: rows = export_edges(state, owned, arena, &outcome); break;
@@ -478,7 +514,6 @@ static int export_get_next(struct ArrowArrayStream* stream, struct ArrowArray* o
             export_keyed(owned, keys, values, rows, arena, &outcome);
         } break;
         }
-    ustore_arena_free(arena);
     char const* names[3];
     int ragged[3];
     size_t const columns = export_columns_of(state->modality, names, ragged);

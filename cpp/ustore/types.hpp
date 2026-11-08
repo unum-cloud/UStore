@@ -136,6 +136,16 @@ class arena_t {
         return made;
     }
 
+    /** Where the outputs live, as the library reports it. */
+    expected<ustore_arena_description_t> describe() const noexcept {
+        ustore_arena_description_t description {};
+        ustore_outcome_t outcome {};
+        ustore_arena_describe_t arguments {.arena = arena_, .outcome = &outcome, .description = &description};
+        ustore_arena_describe(&arguments);
+        if (status_t const status {outcome}; status.failed()) return status;
+        return description;
+    }
+
     operator ustore_arena_t() const noexcept { return arena_; }
 };
 

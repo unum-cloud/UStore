@@ -56,12 +56,13 @@ use crate::db::ffi::{
     ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t, ustore_completion_t,
     ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_key_t, ustore_keys_view_t,
     ustore_length_t, ustore_outcome_t, ustore_predicate_t, ustore_progress_callback_t, ustore_scan_direction_t,
-    ustore_size_t, ustore_strided_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
+    ustore_scan_mode_t, ustore_size_t, ustore_strided_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
 use crate::db::sealed::{Accepts, Calling, Writable};
 use crate::db::{
     check, exported_slice, fail, key_unknown, read_spelling, spelling, Address, Arena, CollectionID, Collections,
-    Durability, Error, Key, KeyRange, Matched, Matching, Result, Status, View,
+    Deferring, Durability, Error, Key, KeyRange, Matched, Matching, On, Progress, ProgressCallback, Result, ScanMode,
+    Status,
 };
 
 // region: Raw Declarations
@@ -178,6 +179,28 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
+    pub struct ustore_graph_scan_vertices_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub start_keys: ustore_keys_view_t,
+        pub end_keys: ustore_keys_view_t,
+        pub direction: ustore_scan_direction_t,
+        pub predicate: ustore_predicate_t,
+        pub offsets: *mut *const ustore_length_t,
+        pub keys: *mut *const ustore_key_t,
+        pub arena: ustore_arena_t,
+        pub wanted: ustore_size_t,
+        pub mode: ustore_scan_mode_t,
+        pub progress: ustore_progress_callback_t,
+        pub progress_state: *mut c_void,
+    }
+
+    #[repr(C)]
     pub struct ustore_graph_sample_vertices_t {
         pub database: ustore_database_t,
         pub executor: ustore_executor_t,
@@ -222,6 +245,7 @@ pub(crate) mod ffi {
         pub fn ustore_graph_remove_edges(arguments: *mut ustore_graph_remove_edges_t);
         pub fn ustore_graph_write_vertices(arguments: *mut ustore_graph_write_vertices_t);
         pub fn ustore_graph_remove_vertices(arguments: *mut ustore_graph_remove_vertices_t);
+        pub fn ustore_graph_scan_vertices(arguments: *mut ustore_graph_scan_vertices_t);
         pub fn ustore_graph_sample_vertices(arguments: *mut ustore_graph_sample_vertices_t);
         pub fn ustore_graph_measure_vertices(arguments: *mut ustore_graph_measure_vertices_t);
         pub fn ustore_vertex_role_name(vertex_role: ustore_enum_t) -> *const c_char;
@@ -355,6 +379,57 @@ impl Edge {
     }
 }
 
+/// The vertices a scan keeps, what admits them and how it reports; see [`On::graph_scan_vertices`].
+pub struct GraphScanVerticesConfig<'config> {
+    /// Vertices kept, at most.
+    pub wanted: usize,
+    /// Admits only the vertices its predicate approves; every vertex by default.
+    pub matching: Matching<'config>,
+    /// In what order the vertices come.
+    pub mode: ScanMode,
+    /// Reports the scans finished and stops wherever it says to.
+    pub progress: Option<&'config mut ProgressCallback<'config>>,
+}
+
+impl From<usize> for GraphScanVerticesConfig<'_> {
+    fn from(wanted: usize) -> Self {
+        GraphScanVerticesConfig {
+            wanted,
+            matching: Matching::default(),
+            mode: ScanMode::Ordered,
+            progress: None,
+        }
+    }
+}
+
+/// The vertices a sample draws; see [`On::graph_sample_vertices`].
+#[derive(Clone, Copy, Debug)]
+pub struct GraphSampleVerticesConfig {
+    /// Vertices drawn, at most.
+    pub wanted: usize,
+}
+
+impl From<usize> for GraphSampleVerticesConfig {
+    fn from(wanted: usize) -> Self {
+        GraphSampleVerticesConfig { wanted }
+    }
+}
+
+/// What admits the vertices a cursor hands out; see [`On::graph_vertices_cursor`].
+#[derive(Debug, Default)]
+pub struct GraphVerticesCursorConfig<'config> {
+    /// Admits only the vertices its predicate approves; every vertex by default.
+    pub matching: Matching<'config>,
+}
+
+impl<'config> From<Matching<'config>> for GraphVerticesCursorConfig<'config> {
+    fn from(matching: Matching<'config>) -> Self {
+        GraphVerticesCursorConfig { matching }
+    }
+}
+
+impl Accepts<GraphScanVerticesConfig<'static>> for Deferring {}
+
 // endregion: Vocabulary
 
 // region: Outputs
@@ -468,7 +543,7 @@ impl FusedIterator for EdgeRuns<'_> {}
 
 // region: Verbs
 
-impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
+impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
     /// Inserts edges between existing or new vertices, keeping an edge the graph already holds, and hands the edges
     /// back.
     ///
@@ -575,7 +650,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Paren
     }
 }
 
-impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
+impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
     /// The degree of every vertex in `roles`, exported into the arena without a single edge.
     ///
     /// Calls `ustore_graph_read_edges`.
@@ -624,17 +699,55 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
         Completion::answer(self, verb)
     }
 
+    /// Lists up to `wanted` vertices of one graph collection's `range` into the arena, those
+    /// without edges included, keeping those the predicate of its `matching` admits, while
+    /// [`On::graph_read_edges`] reads their edges.
+    ///
+    /// Calls `ustore_graph_scan_vertices`.
+    pub fn graph_scan_vertices<'config, 'arena>(
+        &self,
+        collection: CollectionID,
+        range: impl Into<KeyRange>,
+        config: impl Into<GraphScanVerticesConfig<'config>>,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<GraphScanVertices<'arena, 'config>>
+    where
+        Completion: Accepts<GraphScanVerticesConfig<'config>>,
+    {
+        let range = range.into();
+        let GraphScanVerticesConfig {
+            wanted,
+            matching,
+            mode,
+            progress,
+        } = config.into();
+        let verb = GraphScanVertices {
+            collection,
+            start: range.start_key(),
+            range,
+            arena,
+            wanted,
+            matched: Matched::new(matching),
+            mode,
+            progress: Progress::new(progress),
+            found: Found::default(),
+        };
+        Completion::answer(self, verb)
+    }
+
     /// Draws up to `wanted` vertices uniformly at random from one graph collection into the arena.
+    ///
+    /// Calls `ustore_graph_sample_vertices`.
     pub fn graph_sample_vertices<'arena>(
         &self,
         collection: CollectionID,
-        wanted: usize,
+        config: impl Into<GraphSampleVerticesConfig>,
         arena: &'arena mut Arena,
     ) -> Completion::Answer<GraphSampleVertices<'arena>> {
         let verb = GraphSampleVertices {
             collection,
             arena,
-            wanted,
+            wanted: config.into().wanted,
             found: Found::default(),
         };
         Completion::answer(self, verb)
@@ -642,6 +755,8 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
 
     /// Estimates the vertices and the space a range of them takes in one graph collection, through
     /// the arena its bounds land in.
+    ///
+    /// Calls `ustore_graph_measure_vertices`.
     pub fn graph_measure_vertices<'arena>(
         &self,
         collection: CollectionID,
@@ -663,7 +778,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Complet
 /// The arguments an edge upsert or removal takes over `edges`, whose keys sit one `Edge` apart, which is what
 /// `#[repr(C)]` on `Edge` promises.
 fn edges_arguments<Parent, Completion>(
-    view: &View<'_, Parent, Completion>,
+    view: &On<'_, Parent, Completion>,
     outcome: *mut ustore_outcome_t,
     completion: ustore_completion_t,
     collections: &Collections<'_>,
@@ -692,7 +807,7 @@ fn edges_arguments<Parent, Completion>(
     }))
 }
 
-/// An upsert of edges; see [`View::graph_write_edges`].
+/// An upsert of edges; see [`On::graph_write_edges`].
 #[derive(Debug)]
 pub struct GraphWriteEdges<'collections, Edges> {
     collections: Collections<'collections>,
@@ -706,7 +821,7 @@ impl<Edges: AsRef<[Edge]>> Calling for GraphWriteEdges<'_, Edges> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -723,7 +838,7 @@ impl<Edges: AsRef<[Edge]>> Calling for GraphWriteEdges<'_, Edges> {
     }
 }
 
-/// A removal of edges; see [`View::graph_remove_edges`].
+/// A removal of edges; see [`On::graph_remove_edges`].
 #[derive(Debug)]
 pub struct GraphRemoveEdges<'collections, Edges> {
     collections: Collections<'collections>,
@@ -737,7 +852,7 @@ impl<Edges: AsRef<[Edge]>> Calling for GraphRemoveEdges<'_, Edges> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -754,7 +869,7 @@ impl<Edges: AsRef<[Edge]>> Calling for GraphRemoveEdges<'_, Edges> {
     }
 }
 
-/// An upsert of bare vertices; see [`View::graph_write_vertices`].
+/// An upsert of bare vertices; see [`On::graph_write_vertices`].
 #[derive(Debug)]
 pub struct GraphWriteVertices<'collections, Keys> {
     collections: Collections<'collections>,
@@ -768,7 +883,7 @@ impl<Keys: AsRef<[Key]>> Calling for GraphWriteVertices<'_, Keys> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -796,7 +911,7 @@ impl<Keys: AsRef<[Key]>> Calling for GraphWriteVertices<'_, Keys> {
     }
 }
 
-/// A removal of vertices with their edges; see [`View::graph_remove_vertices`].
+/// A removal of vertices with their edges; see [`On::graph_remove_vertices`].
 #[derive(Debug)]
 pub struct GraphRemoveVertices<'inputs, Keys> {
     collections: Collections<'inputs>,
@@ -811,7 +926,7 @@ impl<Keys: AsRef<[Key]>> Calling for GraphRemoveVertices<'_, Keys> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -841,7 +956,7 @@ impl<Keys: AsRef<[Key]>> Calling for GraphRemoveVertices<'_, Keys> {
     }
 }
 
-/// A removal of one range of vertices with their edges; see [`View::graph_remove_vertices_range`].
+/// A removal of one range of vertices with their edges; see [`On::graph_remove_vertices_range`].
 #[derive(Debug)]
 pub struct GraphRemoveVerticesRange {
     collection: CollectionID,
@@ -856,7 +971,7 @@ impl Calling for GraphRemoveVerticesRange {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -885,7 +1000,70 @@ impl Calling for GraphRemoveVerticesRange {
     }
 }
 
-/// A random draw of vertices from one graph collection; see [`View::graph_sample_vertices`].
+/// A walk over the vertices of one graph collection; see [`On::graph_scan_vertices`].
+#[derive(Debug)]
+pub struct GraphScanVertices<'arena, 'config> {
+    collection: CollectionID,
+    start: Key,
+    range: KeyRange,
+    arena: &'arena mut Arena,
+    wanted: usize,
+    matched: Matched<'config>,
+    mode: ScanMode,
+    progress: Progress<'config>,
+    found: Found,
+}
+
+impl<'arena> Calling for GraphScanVertices<'arena, '_> {
+    type Arguments = ffi::ustore_graph_scan_vertices_t;
+    type Output = &'arena [Key];
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &On<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let (progress, progress_state) = self.progress.lowered();
+        Ok(Some(ffi::ustore_graph_scan_vertices_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: 1,
+            collections: ustore_strided_view_t::repeated(&self.collection),
+            start_keys: ustore_strided_view_t::repeated(&self.start),
+            end_keys: self.range.end_keys(),
+            direction: self.range.direction,
+            predicate: self.matched.predicate(),
+            offsets: &mut self.found.offsets.0,
+            keys: &mut self.found.keys.0,
+            arena: self.arena.handle,
+            wanted: self.wanted as ustore_size_t,
+            mode: self.mode,
+            progress,
+            progress_state,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_graph_scan_vertices(arguments)
+    }
+
+    fn raise(&mut self) {
+        self.matched.raise();
+        self.progress.raise();
+    }
+
+    fn finish(self) -> Result<&'arena [Key]> {
+        self.arena.host()?;
+        // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`.
+        Ok(unsafe { self.found.keys() })
+    }
+}
+
+/// A random draw of vertices from one graph collection; see [`On::graph_sample_vertices`].
 #[derive(Debug)]
 pub struct GraphSampleVertices<'arena> {
     collection: CollectionID,
@@ -900,7 +1078,7 @@ impl<'arena> Calling for GraphSampleVertices<'arena> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -924,12 +1102,13 @@ impl<'arena> Calling for GraphSampleVertices<'arena> {
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
+        self.arena.host()?;
         // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
 
-/// An estimate of what a range of vertices holds; see [`View::graph_measure_vertices`].
+/// An estimate of what a range of vertices holds; see [`On::graph_measure_vertices`].
 #[derive(Debug)]
 pub struct GraphMeasureVertices<'arena> {
     collection: CollectionID,
@@ -945,7 +1124,7 @@ impl Calling for GraphMeasureVertices<'_> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -977,6 +1156,7 @@ impl Calling for GraphMeasureVertices<'_> {
     }
 
     fn finish(self) -> Result<Measurement> {
+        self.arena.host()?;
         // SAFETY: the measurement of one range succeeded.
         Ok(unsafe { self.bounds.measurement() })
     }
@@ -986,7 +1166,7 @@ impl Calling for GraphMeasureVertices<'_> {
 /// when `offsets` and `tape` are not null.
 #[allow(clippy::too_many_arguments)]
 fn read_edges_arguments<Parent, Completion>(
-    view: &View<'_, Parent, Completion>,
+    view: &On<'_, Parent, Completion>,
     outcome: *mut ustore_outcome_t,
     completion: ustore_completion_t,
     collections: &Collections<'_>,
@@ -1014,7 +1194,7 @@ fn read_edges_arguments<Parent, Completion>(
     }))
 }
 
-/// A lookup of the degrees of vertices; see [`View::graph_degrees`].
+/// A lookup of the degrees of vertices; see [`On::graph_degrees`].
 #[derive(Debug)]
 pub struct GraphDegrees<'arena, 'inputs, Keys> {
     collections: Collections<'inputs>,
@@ -1030,7 +1210,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphDegrees<'arena, '_, Keys> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1053,12 +1233,13 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphDegrees<'arena, '_, Keys> {
     }
 
     fn finish(self) -> Result<&'arena [Degree]> {
+        self.arena.host()?;
         // SAFETY: the lookup succeeded over every vertex, and the arena stays borrowed for `'arena`.
         Ok(unsafe { exported_slice(self.degrees.0, self.vertices.as_ref().len()) })
     }
 }
 
-/// A lookup of the degrees and the edges of vertices; see [`View::graph_read_edges`].
+/// A lookup of the degrees and the edges of vertices; see [`On::graph_read_edges`].
 #[derive(Debug)]
 pub struct GraphReadEdges<'arena, 'inputs, Keys> {
     collections: Collections<'inputs>,
@@ -1076,7 +1257,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphReadEdges<'arena, '_, Keys> {
 
     fn arguments<Parent, Completion>(
         &mut self,
-        view: &View<'_, Parent, Completion>,
+        view: &On<'_, Parent, Completion>,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1099,6 +1280,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphReadEdges<'arena, '_, Keys> {
     }
 
     fn finish(self) -> Result<Neighborhoods<'arena>> {
+        self.arena.host()?;
         // SAFETY: the lookup succeeded over every vertex, and the arena stays borrowed for `'arena`.
         Ok(unsafe { Neighborhoods::exported(self.vertices.as_ref().len(), self.degrees, self.offsets, self.tape) })
     }
@@ -1112,7 +1294,9 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphReadEdges<'arena, '_, Keys> {
 mod tests {
     use super::*;
     use crate::blobs::Entry;
-    use crate::db::{CollectionID, Collections, Database, Executor, Modality, RAMOptions, ScanDirection, Watch};
+    use crate::db::{
+        Admission, CollectionID, Collections, Database, Executor, Modality, RAMOptions, ScanDirection, Watch,
+    };
     use crate::testing::{key, keys};
 
     /// A directed graph of one to two, one to three and two to three, in a collection of its own.
@@ -1182,6 +1366,37 @@ mod tests {
             .graph_degrees(graph, &keys([3]), Roles::Every(Role::Any), &mut arena)
             .unwrap();
         assert_eq!(degrees, &[0]);
+    }
+
+    #[test]
+    fn vertex_scans_list_bare_vertices_and_ask_the_predicate() {
+        let (database, mut arena, graph) = populated();
+        let head = database.head();
+        head.graph_write_vertices(graph, keys([4]), Durability::Buffered)
+            .unwrap();
+        assert_eq!(
+            head.graph_scan_vertices(graph, key(2), 8, &mut arena).unwrap(),
+            &keys([2, 3, 4])
+        );
+
+        let mut odd = |listed: &[Key], admissions: &mut [Admission]| {
+            for (admission, listed) in admissions.iter_mut().zip(listed) {
+                if *listed == key(1) || *listed == key(3) {
+                    *admission = Admission::Admit;
+                }
+            }
+        };
+        let config = GraphScanVerticesConfig {
+            matching: Matching {
+                predicate: Some(&mut odd),
+                ..Matching::default()
+            },
+            ..GraphScanVerticesConfig::from(8)
+        };
+        let admitted = head
+            .graph_scan_vertices(graph, KeyRange::default(), config, &mut arena)
+            .unwrap();
+        assert_eq!(admitted, &keys([1, 3]));
     }
 
     #[test]
@@ -1547,23 +1762,23 @@ pub struct GraphVerticesCursor<'view> {
     marker: PhantomData<&'view ()>,
 }
 
-impl<'view, Parent> View<'view, Parent> {
-    /// Opens a walk over the vertices of one graph collection's `range`, compiling what `matching`
-    /// names once, whose predicate lives as long as the cursor.
+impl<'view, Parent> On<'view, Parent> {
+    /// Opens a walk over the vertices of one graph collection's `range`, whose predicate lives as
+    /// long as the cursor.
     ///
     /// Calls `ustore_graph_vertices_cursor_init`.
     pub fn graph_vertices_cursor(
         &self,
         collection: CollectionID,
         range: impl Into<KeyRange>,
-        matching: Matching<'view>,
+        config: impl Into<GraphVerticesCursorConfig<'view>>,
     ) -> Result<GraphVerticesCursor<'view>> {
         let range: KeyRange = range.into();
         let mut cursor = GraphVerticesCursor {
             handle: ptr::null_mut(),
             database: self.database(),
             executor: self.executor(),
-            matched: Box::new(Matched::new(matching)),
+            matched: Box::new(Matched::new(config.into().matching)),
             marker: PhantomData,
         };
         let mut outcome = ustore_outcome_t::default();
@@ -1615,6 +1830,7 @@ impl GraphVerticesCursor<'_> {
         unsafe { ffi::ustore_graph_vertices_cursor_next(&mut arguments) };
         self.matched.raise();
         check(outcome)?;
+        arena.host()?;
         // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
         Ok(unsafe { exported_slice(keys, written as usize) })
     }

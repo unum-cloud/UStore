@@ -247,6 +247,9 @@ def test_tape_types_are_named_but_not_constructible(tape_type: type):
 def test_whole_tape_exports_a_buffer(view, blobs, arena):
     view.write([1, 2], [b"ab", b"cd"], collection=blobs)
     assert bytes(memoryview(view.read([1, 2], arena, collection=blobs))) == b"abcd"
+    found = view.read([1, 2], arena, collection=blobs)
+    assert found.__dlpack_device__() == (1, 0)
+    assert np.from_dlpack(found).tobytes() == b"abcd"
 
 
 @pytest.mark.parametrize("spelling", ["binary", "large_binary", "string", "large_string", "u32", "u64"])
@@ -373,7 +376,9 @@ def test_change_feeds_yield_writes_then_removals(engine, database, blobs, arena)
         with pytest.raises(ustore.UnsupportedError):
             database.changes_cursor(collection=blobs)
         return
-    with database.changes_cursor(collection=blobs) as feed:
+    with database.snapshot() as head:
+        since = head.read_stamp
+    with database.changes_cursor(since, collection=blobs) as feed:
         database.set(1, b"a", collection=blobs)
         database.remove(1, collection=blobs)
         changes = feed.next(8, arena, values=True)

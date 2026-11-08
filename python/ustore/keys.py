@@ -9,7 +9,7 @@ from collections.abc import Iterable, Iterator
 from operator import index
 from uuid import UUID
 
-from ustore.lib import Arena, Database, Modality, Snapshot, Transaction, View
+from ustore.lib import Arena, Database, Modality, Snapshot, Transaction, On
 
 type KeyLike = UUID | int | str | bytes
 
@@ -35,13 +35,13 @@ def is_one_key(key: object) -> bool:
 
 
 def scan_keys(
-    view: Database | Transaction | Snapshot | View,
+    view: Database | Transaction | Snapshot | On,
     collection: UUID | str,
     page: int = PAGE_KEYS,
     modality: Modality = Modality.BLOBS,
 ) -> Iterator[UUID]:
     """Yields every key of `collection`, which holds `modality`, in ascending order through the scans of that modality, each page resuming past the last key of the one before it, holding one page at a time in one arena, made where the view's calls run, for the walk's whole life."""
-    arena = Arena(view.executor if isinstance(view, View) else None)
+    arena = Arena(view.executor if isinstance(view, On) else None)
     scan = {Modality.DOCS: view.docs_scan, Modality.GRAPH: view.graph_scan_vertices}.get(modality, view.scan)
     start = KEY_MIN
     while True:

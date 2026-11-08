@@ -25,9 +25,9 @@ import numpy as np
 import pandas
 
 from ustore.keys import PAGE_KEYS, KeyLike, as_key, scan_keys
-from ustore.lib import Arena, Columns, Database, FieldType, Modality, Modification, Transaction, View
+from ustore.lib import Arena, Columns, Database, FieldType, Modality, Modification, Transaction, On
 
-type Receiver = Database | Transaction | View
+type Receiver = Database | Transaction | On
 
 # A column of these dtypes is written as raw scalars, so nothing is printed as JSON and parsed back.
 WRITE_TYPES = {
