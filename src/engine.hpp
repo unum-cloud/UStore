@@ -13,7 +13,7 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
+#include <cstddef> // `std::size_t`, `std::byte`, `std::max_align_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 
 #include <array>       // `std::array`
@@ -79,6 +79,34 @@ struct view_t {
     /** Which thread of @c executor runs the call: a pool thread's index, or the pool's size for a blocking call and a
      *  batch the driver runs itself, so no other call of that executor runs on the same index meanwhile. */
     std::size_t thread_index = 0;
+
+    /** The stamp every verb of the call reads at outside a transaction and a snapshot, which the
+     *  router pinned for a call of several verbs, or zero for each verb to pin its own. */
+    ustore_stamp_t stamp = 0;
+};
+
+/** Bytes an engine's pin of one call's stamp may take in @c call_pin_t, checked by each engine. */
+inline constexpr std::size_t call_pin_bytes_k = 128;
+
+/** The pin an engine holds while every verb of one call reads at one stamp, kept on the router's
+ *  stack for the call and given back when it ends. */
+struct call_pin_t {
+
+    /** The stamp the verbs read at, zero while nothing is pinned. */
+    ustore_stamp_t stamp = 0;
+
+    /** Gives the pin back, set by the engine that took it. */
+    void (*release)(call_pin_t&) noexcept = nullptr;
+
+    /** Where the engine keeps its pin. */
+    alignas(std::max_align_t) std::byte room[call_pin_bytes_k];
+
+    call_pin_t() noexcept = default;
+    call_pin_t(call_pin_t const&) = delete;
+    call_pin_t& operator=(call_pin_t const&) = delete;
+    ~call_pin_t() noexcept {
+        if (release) release(*this);
+    }
 };
 
 /** Where a verb runs, which is the kind of executor it takes; the storage engine is fixed at open. */
@@ -149,6 +177,9 @@ struct database_verbs_t {
                                     view_t const&) noexcept;
     status_t (*changes_cursor_next)(ustore_changes_cursor_next_t const&, view_t const&) noexcept;
     void (*changes_cursor_free)(ustore_changes_cursor_t) noexcept;
+
+    /** Pins the newest stamp into @p pin for one call's verbs; null without stamps. */
+    void (*pin_call)(ustore_database_t, call_pin_t& pin) noexcept;
 };
 
 /** The verbs of blobs collections served at one home. */
@@ -684,6 +715,10 @@ struct deferred_result_t {
 
     /** The deferred counts the call raised at submission, which the driver lowers once the outcome is final. */
     std::array<std::uint32_t*, 3> deferred_counts {};
+
+    /** The arena, cursor and transaction claims the call took, which the driver releases just
+     *  before the outcome. */
+    std::array<claim_t*, 3> claims {};
 };
 
 /** One slot of the deferred table: a copy of the caller's argument struct and the routing that runs it. */
@@ -1218,17 +1253,18 @@ inline class_verbs_t const& host_verbs() noexcept {
 template <typename value_type_>
 using floor_atomic_ref = atomic_ref_of<cpu_ladder_floor_k, value_type_>;
 
-/** Counts one more open snapshot on @p open_snapshots, through the reference of @p cpu_class_. */
+/** Counts one more open reader, a snapshot or a transaction, on @p open_readers, through the
+ *  reference of @p cpu_class_. */
 template <cpu_class_t cpu_class_>
-void count_snapshot_opened(std::size_t& open_snapshots) noexcept {
-    atomic_ref_of<cpu_class_, std::size_t> {open_snapshots}.fetch_add(1, std::memory_order_release);
+void count_reader_opened(std::size_t& open_readers) noexcept {
+    atomic_ref_of<cpu_class_, std::size_t> {open_readers}.fetch_add(1, std::memory_order_release);
 }
 
-/** Counts one snapshot closed on @p open_snapshots, answering whether it was the last one open,
- *  after which whatever the open snapshots kept alive may go. */
+/** Counts one reader closed on @p open_readers, answering whether it was the last one open,
+ *  after which whatever the open readers kept alive may go. */
 template <cpu_class_t cpu_class_>
-[[nodiscard]] bool count_snapshot_closed(std::size_t& open_snapshots) noexcept {
-    return atomic_ref_of<cpu_class_, std::size_t> {open_snapshots}.fetch_sub(1, std::memory_order_acq_rel) == 1;
+[[nodiscard]] bool count_reader_closed(std::size_t& open_readers) noexcept {
+    return atomic_ref_of<cpu_class_, std::size_t> {open_readers}.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
 
 #pragma endregion CPU Classes

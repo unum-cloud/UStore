@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstring> // `std::memcpy`
 
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -18,7 +19,7 @@
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
-#include "database.hpp"           // `database_state`, `string_task_t`, `stage_strings`, `read_string`, `scan_strings`
+#include "database.hpp"           // `database_state`, `string_task_t`, `stage_strings`, `run_end`, `scan_strings`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `validate_choices`, `validate_direction`, `samples_of`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
@@ -107,7 +108,39 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
     return serve_strings_write<cpu_class_>(arguments, texts, strided_iterator<ustore_key_t const> {}, view);
 }
 
-/** Implements @c ustore_strings_read, reading the key of every string on its own. */
+/** Reads the keys of the strings @p texts holds from @p first up to @p last, all of @p collection,
+ *  into @p outputs as @p access sees them, inside one epoch entry and one lookup of the collection:
+ *  a transaction's own string first, then the store's, watched as @p access watches. */
+template <cpu_class_t cpu_class_>
+status_t read_strings(call_access<cpu_class_> const& access, collection_id_t collection, strings_arg_t const& texts,
+                      std::size_t first, std::size_t last, strings_read_outputs_t& outputs) noexcept {
+    transaction_stamp_t const stamp = read_stamp_of(access);
+    transaction_stamp_t const watch_stamp = watch_stamp_of(access);
+    return visit_strings(access, collection, [&](auto const& store) noexcept -> status_t {
+        for (std::size_t index = first; index != last; ++index) {
+            std::string_view const text = string_of(texts[index]);
+            ustore_key_t value;
+            std::span<byte_t, sizeof(ustore_uuid_t)> const bytes = std::as_writable_bytes(std::span {value.uuid.bytes});
+            delta_view_t own_delta;
+            bool present = false;
+            if (access.strings && access.strings->uncommitted(collection, text, own_delta)) {
+                present = own_delta.kind != delta_kind_t::remove_k;
+                if (present) std::memcpy(bytes.data(), own_delta.bytes.data(), bytes.size());
+            }
+            else {
+                if (watch_stamp != invalid_transaction_stamp_k)
+                    if (status_t const watched = access.strings->watch(collection, text, watch_stamp); watched.failed())
+                        return watched;
+                present = store.find(text, bytes, stamp, access.thread_index) == lookup_result_t::written_k;
+            }
+            if (present) outputs.push_present(value);
+            else outputs.push_missing();
+        }
+        return {};
+    });
+}
+
+/** Implements @c ustore_strings_read, reading every run of strings of one collection together. */
 template <cpu_class_t cpu_class_>
 status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t const& texts, view_t const& view) noexcept {
     if (!arguments.count) return {};
@@ -120,14 +153,11 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
-    for (std::size_t index = 0; index != arguments.count; ++index) {
-        ustore_key_t value;
-        bool present = false;
-        if (status_t const read = read_string(access, collections[index], string_of(texts[index]), value.uuid, present);
-            read.failed())
+    for (std::size_t first = 0; first != arguments.count;) {
+        std::size_t const last = run_end(collections, first, arguments.count);
+        if (status_t const read = read_strings(access, collections[first], texts, first, last, outputs); read.failed())
             return read;
-        if (present) outputs.push_present(value);
-        else outputs.push_missing();
+        first = last;
     }
     outputs.finish(arguments);
     return {};

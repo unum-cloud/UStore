@@ -755,6 +755,20 @@ status_t list_cursor_keys(engine_t const& engine, ustore_database_t database, cu
 
 #pragma endregion Cursors
 
+/** Hands @p action @p view with every verb of the call reading at one stamp the engine of
+ *  @p database pins for it, or @p view itself inside a transaction or a snapshot, or for an engine
+ *  pinning no stamps. */
+template <typename action_type_>
+status_t with_call_stamp(engine_t const& engine, ustore_database_t database, view_t const& view,
+                         action_type_&& action) noexcept {
+    if (view.transaction || view.snapshot || view.stamp || !engine.database->pin_call) return action(view);
+    call_pin_t pin;
+    engine.database->pin_call(database, pin);
+    view_t pinned = view;
+    pinned.stamp = pin.stamp;
+    return action(pinned);
+}
+
 /** Finishes a call: the message, then the status with release ordering, which its waiters
  *  watch by address. */
 inline void finish(ustore_outcome_t& outcome, status_t status) noexcept {
@@ -872,12 +886,25 @@ status_t take_claims(arguments_type_ const& arguments) noexcept {
     return {};
 }
 
+/** The claims of the arena, the cursor and the transaction of @p arguments, each null when
+ *  absent. */
+template <typename arguments_type_>
+std::array<claim_t*, 3> claims_of(arguments_type_ const& arguments) noexcept {
+    ustore_arena_t const arena = arena_of(arguments);
+    ustore_transaction_t const transaction = transaction_of(arguments);
+    return {arena ? &arena->claim : nullptr, cursor_claim_of(arguments), transaction ? &transaction->claim : nullptr};
+}
+
+/** Hands every one of @p claims that is not null back to the next call. */
+inline void release(std::array<claim_t*, 3> const& claims) noexcept {
+    for (claim_t* const claim : claims)
+        if (claim) release(*claim);
+}
+
 /** Releases the claims of @p arguments once the engine returned. */
 template <typename arguments_type_>
 void release_claims(arguments_type_ const& arguments) noexcept {
-    if (ustore_arena_t const arena = arena_of(arguments)) release(arena->claim);
-    if (claim_t* const cursor = cursor_claim_of(arguments)) release(*cursor);
-    if (ustore_transaction_t const transaction = transaction_of(arguments)) release(transaction->claim);
+    release(claims_of(arguments));
 }
 
 /** Finishes @p arguments with @p status without serving them, releasing the claims the router took. */
@@ -1382,7 +1409,9 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
         if constexpr (home_k != home_t::host_k)
             if (status_t const opened = open_device_call(arguments, executor...); opened.failed()) return opened;
         if constexpr (requires { arguments.cursor->cursor; })
-            return pull(engine, arguments, *arguments.cursor, view, executor...);
+            return with_call_stamp(engine, database, view, [&](view_t const& pinned) noexcept {
+                return pull(engine, arguments, *arguments.cursor, pinned, executor...);
+            });
         else if constexpr (home_k != home_t::host_k && !requires { verb_slot<arguments_type_>::template verb<home_k>; })
             return status_t {status_code_t::unsupported_k, "Changes and the control plane run on host executors"};
         else if constexpr (requires { verb_slot<arguments_type_>::database; }) {
@@ -1417,13 +1446,15 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
                                                            executor...);
                 if (match_status.failed()) return match_status;
                 if (!match.matches_everything())
-                    return call_staged(
-                        [&](arguments_type_ const& matched, auto&... rest) noexcept {
-                            if constexpr (home_k == home_t::host_k)
-                                return scan_matched(engine.host, match, matched, rest...);
-                            else return scan_matched_on_device(engine.host, match, matched, rest...);
-                        },
-                        arguments, view, executor...);
+                    return with_call_stamp(engine, database, view, [&](view_t const& pinned) noexcept {
+                        return call_staged(
+                            [&](arguments_type_ const& matched, auto&... rest) noexcept {
+                                if constexpr (home_k == home_t::host_k)
+                                    return scan_matched(engine.host, match, matched, rest...);
+                                else return scan_matched_on_device(engine.host, match, matched, rest...);
+                            },
+                            arguments, pinned, executor...);
+                    });
             }
             return call_staged(verb, arguments, view, executor...);
         }
@@ -1489,15 +1520,15 @@ inline pool_view_t view_of(std::variant<executor_t, lent_pool_t> const& pool) no
     return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
 }
 
-/** Serves @p arguments in the scratch and on the thread @p runner names and releases their claims,
- *  leaving the outputs of a failed call null or zero, and answers the status their outcome is to
- *  finish with. */
+/** Serves @p arguments in the scratch and on the thread @p runner names, leaving the outputs of a
+ *  failed call null or zero, and answers the status their outcome is to finish with, which their
+ *  claims are released together with. */
 template <typename arguments_type_>
-status_t serve_and_release(arguments_type_& arguments, view_t const& runner) noexcept {
+status_t serve_deferred(arguments_type_& arguments, view_t const& runner) noexcept {
     status_t const status = serve(arguments, runner);
-    if constexpr (requires { clear_outputs(arguments); })
+    // A landed commit keeps its stamp beside a failed flush; the router zeroed it beforehand
+    if constexpr (requires { clear_outputs(arguments); } && !requires { arguments.commit_stamp; })
         if (status.failed()) clear_outputs(arguments);
-    release_claims(arguments);
     return status;
 }
 
@@ -1514,10 +1545,14 @@ status_t serve_open(arguments_type_& call, view_t const& runner) noexcept {
     return {};
 }
 
-/** Serves @p call with @p serve_ in the scratch and on the thread @p runner names, then finishes its outcome. */
+/** Serves @p call with @p serve_ in the scratch and on the thread @p runner names, then releases
+ *  the claims it took and finishes its outcome. */
 template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void run(call_type_* call, view_t const& runner) noexcept {
-    finish(*call->outcome, serve_(*call, runner));
+    std::array<claim_t*, 3> const claims = claims_of(*call);
+    status_t const status = serve_(*call, runner);
+    release(claims);
+    finish(*call->outcome, status);
 }
 
 /** Runs @p call on the calling thread over a scratch made for it alone, as a call without an
@@ -1533,12 +1568,13 @@ void run_alone(call_type_* call) noexcept {
 }
 
 /** Serves the copy @p erased holds on the thread @p runner names into @p result, leaving its
- *  outcome and its deferred counts to the driver, which frees the copy's table position first. */
+ *  outcome, claims and deferred counts to the driver, which first frees its table position. */
 template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void run_deferred(void* erased, deferred_result_t& result, view_t const& runner) noexcept {
     call_type_& call = *std::get_if<call_type_>(static_cast<deferred_arguments_t*>(erased));
     // Counted before the call runs, as a transaction init rewrites the handle its arguments point to
     result.deferred_counts = deferred_counts_of(call);
+    result.claims = claims_of(call);
     result.outcome = call.outcome;
     result.status = serve_(call, runner);
 }
@@ -1603,7 +1639,7 @@ template <typename arguments_type_>
 void route(arguments_type_* arguments) noexcept {
     if constexpr (requires { clear_outputs(*arguments); }) clear_outputs(*arguments);
     if (status_t const claimed = take_claims(*arguments); claimed.failed()) return finish(*arguments->outcome, claimed);
-    dispatch<arguments_type_, &serve_and_release<arguments_type_>>(arguments);
+    dispatch<arguments_type_, &serve_deferred<arguments_type_>>(arguments);
 }
 
 /**

@@ -24,9 +24,10 @@
 #include <cstring> // `std::memcpy`, `std::memset`, `std::strlen`
 
 #include <algorithm>   // `std::unique`, `std::lower_bound`
+#include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::is_invocable_r_v`
+#include <type_traits> // `std::type_identity`, `std::is_same_v`
 
 #include <yyjson.h> // `yyjson_val`
 
@@ -35,10 +36,11 @@
 #include "ustore/docs.h"     // `ustore_docs_write_t`, `ustore_docs_read_t`
 #include "ustore/ranges.hpp" // `place_batch_t`, `values_view_t`
 
+#include "ustore/docs/json_fold.hpp"        // `json_delta_t`, `apply_delta`, `modifier_text`, `document_state_t`
 #include "ustore/docs/json_patch.hpp"       // `modify`, `modification_t`
 #include "ustore/docs/json_paths.hpp"       // `extract_fields`, `json_documents_t`, `field_cell_t`, `json_text_of`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `gather_scalar`, `field_size_bytes`, `extract_keys`
-#include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`, `heap_sort`
+#include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`, `heap_sort`, `radix_sort`, `word_byte`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`
 
 #include "engine.hpp"            // `blobs_verbs<home_t::host_k>`, `view_t`
@@ -60,11 +62,6 @@ using field_path_buffer_t = char[field_path_length_limit_k];
 
 #pragma region Reading Documents
 
-/** Receives the index of a task, its field, and the binary document it addresses, and answers a status. */
-template <typename callback_type_>
-concept document_callback_concept =
-    std::is_invocable_r_v<status_t, callback_type_&, std::size_t, std::string_view, value_view_t>;
-
 /** The field of task @p index of @p fields, empty for a whole document and for every task without fields. */
 inline std::string_view field_of(strings_arg_t const& fields, std::size_t index) noexcept {
     return fields ? string_of(fields[index]) : std::string_view {};
@@ -84,34 +81,6 @@ expected<values_view_t> read_documents(documents_type_ const& documents, place_b
     auto [read, status] = documents.read(places, view);
     if (status.failed()) return status;
     return values_view_t {places.count, read.presences, read.tape};
-}
-
-/**
- *  @brief Calls @p callback on the document of every task, in order.
- *
- *  Fails a field modification of a missing document, an update or a patch of a whole document that is missing,
- *  and an insertion of a whole document that already exists.
- */
-template <typename documents_type_, document_callback_concept callback_type_>
-status_t read_each_document(documents_type_ const& documents, place_batch_t const& places, strings_arg_t const& fields,
-                            modification_t modification, view_t const& view, callback_type_&& callback) noexcept {
-
-    auto [found, status] = read_documents(documents, places, view);
-    if (status.failed()) return status;
-
-    bool const replaces_existing = modification == modification_t::update_k || modification == modification_t::patch_k;
-    for (std::size_t index = 0; index != places.size(); ++index) {
-        value_view_t const document = found[index];
-        std::string_view const field = field_of(fields, index);
-        if (!document && !field.empty() && modification != modification_t::read_k)
-            return {status_code_t::not_found_k, "Modified field belongs to a missing document"};
-        if (!document && field.empty() && replaces_existing)
-            return {status_code_t::not_found_k, "Updated or patched document is missing"};
-        if (document && field.empty() && modification == modification_t::insert_k)
-            return {status_code_t::already_exists_k, "Inserted document already exists"};
-        if (status_t const handled = callback(index, field, document); handled.failed()) return handled;
-    }
-    return {};
 }
 
 /** The documents a batch of tasks addresses, each distinct one read once, and the document of every task. */
@@ -200,42 +169,184 @@ inline expected<task_fields_t> distinct_fields(strings_arg_t const& fields, std:
 
 #pragma region Writing
 
-/** Parses, modifies and writes back the documents at @p places through @p documents. */
+/** One task of a docs write: the document it addresses, its delta, and its place in the call,
+ *  which orders the deltas of one document. */
+struct document_task_t {
+    ustore_collection_id_t collection;
+    ustore_key_t key;
+    json_delta_t delta;
+    std::size_t sequence = 0;
+};
+
+/** The deltas one docs write makes to one document, in task order. */
+struct document_deltas_t {
+    ustore_collection_id_t collection;
+    ustore_key_t key;
+    std::span<json_delta_t> deltas;
+
+    /** Whether the deltas depend on the document before them, which only a leading whole write
+     *  makes irrelevant. */
+    [[nodiscard]] bool reads_base() const noexcept {
+        return deltas.front().modification != delta_modification_t::write_k;
+    }
+
+    /** Whether the document the deltas leave is known whole, past a whole write among them. */
+    [[nodiscard]] bool writes_whole() const noexcept {
+        for (json_delta_t const& delta : deltas)
+            if (delta.modification == delta_modification_t::write_k) return true;
+        return false;
+    }
+};
+
+/**
+ *  @brief Turns every task at @p places into its delta and groups the deltas per document, each
+ *      document's in task order, so a replay of one group applies every task of the call on that
+ *      document, each seeing the ones before.
+ *
+ *  A whole upsert becomes a write of the document, which a whole JSON upsert passes through once
+ *  it parses as JSON, as extracting the keys of @p arguments has checked when it names none.
+ */
+inline expected<std::span<document_deltas_t>> group_document_deltas(ustore_docs_write_t const& arguments,
+                                                                    place_batch_t const& places,
+                                                                    strings_arg_t const& fields,
+                                                                    strings_arg_t const& values,
+                                                                    ustore_arena_t scratch) noexcept {
+    ustore_docs_modification_t const modification = arguments.modification;
+    ustore_docs_field_type_t const type = arguments.type;
+    std::size_t const count = places.size();
+    auto [tasks, tasks_status] = arena_allocate<document_task_t>(scratch, count);
+    if (tasks_status.failed()) return tasks_status;
+    for (std::size_t index = 0; index != count; ++index) {
+        std::string_view const field = field_of(fields, index);
+        value_view_t const value {values[index]};
+        json_delta_t delta {0, static_cast<delta_modification_t>(modification), field, {}};
+        if (field.empty() && delta.modification == delta_modification_t::upsert_k) {
+            delta.modification = delta_modification_t::write_k;
+            // Keys extracted from the documents already parsed every one of them
+            if (type == ustore_docs_field_type_json_k && arguments.keys.data)
+                if (status_t const parsed = json_parse(value, scratch).status(); parsed.failed()) return parsed;
+        }
+        auto [text, text_status] = modifier_text(value, type, scratch);
+        if (text_status.failed()) return text_status;
+        delta.value = text;
+        tasks[index] = document_task_t {places[index].collection, places[index].key, delta, index};
+    }
+    // The collection, the key and the batch position read as one big-endian number, a total order.
+    constexpr std::size_t uuid_bytes_k = sizeof(ustore_uuid_t);
+    auto const digit_of = [](document_task_t const& task, std::size_t digit) noexcept -> std::size_t {
+        if (digit < uuid_bytes_k) return task.collection.uuid.bytes[digit];
+        if (digit < 2 * uuid_bytes_k) return task.key.uuid.bytes[digit - uuid_bytes_k];
+        return utilities::word_byte(task.sequence, digit - 2 * uuid_bytes_k);
+    };
+    auto const precedes = [](document_task_t const& first, document_task_t const& second) noexcept {
+        if (first.collection != second.collection) return first.collection < second.collection;
+        if (first.key != second.key) return first.key < second.key;
+        return first.sequence < second.sequence;
+    };
+    utilities::radix_sort(tasks, 2 * uuid_bytes_k + sizeof(std::uint64_t), digit_of, precedes);
+
+    // The deltas of every document sit side by side in task order, which each document's span views
+    auto [deltas, deltas_status] = arena_allocate<json_delta_t>(scratch, count);
+    if (deltas_status.failed()) return deltas_status;
+    auto [documents, documents_status] = arena_allocate<document_deltas_t>(scratch, count);
+    if (documents_status.failed()) return documents_status;
+    std::size_t documents_count = 0;
+    for (std::size_t first = 0; first != count;) {
+        std::size_t end = first + 1;
+        while (end != count && tasks[end].collection == tasks[first].collection && tasks[end].key == tasks[first].key)
+            ++end;
+        for (std::size_t index = first; index != end; ++index) deltas[index] = tasks[index].delta;
+        documents[documents_count++] = document_deltas_t {tasks[first].collection, tasks[first].key,
+                                                          deltas.subspan(first, end - first)};
+        first = end;
+    }
+    return documents.first(documents_count);
+}
+
+/** Replays @p deltas over @p document in order, as @c apply_delta does one by one, but parsing the
+ *  document once before the first delta that modifies it and printing it once after the last,
+ *  failing as the first failing delta does. */
+inline status_t replay_deltas(document_state_t& document, std::span<json_delta_t const> deltas,
+                              ustore_arena_t arena) noexcept {
+    // The tree holds the document from the first modification on, until a whole write replaces it
+    json_t tree;
+    for (json_delta_t const& delta : deltas) {
+        if (delta.modification == delta_modification_t::write_k ||
+            delta.modification == delta_modification_t::remove_k) {
+            tree = {};
+            if (status_t const applied = apply_delta(document, delta, arena); applied.failed()) return applied;
+            continue;
+        }
+        auto const modification = static_cast<modification_t>(delta.modification);
+        bool const whole = delta.field.empty();
+        if (!document.exists() && !whole)
+            return {status_code_t::not_found_k, "Modified field belongs to a missing document"};
+        if (!document.exists() && (modification == modification_t::update_k || modification == modification_t::patch_k))
+            return {status_code_t::not_found_k, "Updated or patched document is missing"};
+        if (document.exists() && whole && modification == modification_t::insert_k)
+            return {status_code_t::already_exists_k, "Inserted document already exists"};
+        if (!tree.mutable_handle) {
+            value_view_t const base = document.exists() ? value_view_t(text_of_bytes(document.bytes)) : value_view_t();
+            auto [parsed, parse_status] = json_parse(base, arena);
+            if (parse_status.failed()) return parse_status;
+            tree = parsed;
+        }
+        auto [modifier, modifier_status] = any_parse(value_view_t(delta.value), ustore_docs_field_type_json_k, arena);
+        if (modifier_status.failed()) return modifier_status;
+        if (!modifier) return {status_code_t::malformed_k, "An empty value is no JSON document"};
+        auto [modifier_document, mutable_status] = json_mutable(modifier, arena);
+        if (mutable_status.failed()) return mutable_status;
+        if (status_t const modified = modify(tree, yyjson_mut_doc_get_root(modifier_document), delta.field,
+                                             modification, arena);
+            modified.failed())
+            return modified;
+        document.bytes = std::span<byte_t const>(empty_document_k, 0);
+    }
+    if (!tree.mutable_handle) return {};
+    auto [text, dump_status] = json_dump({nullptr, yyjson_mut_doc_get_root(tree.mutable_handle)}, arena);
+    if (dump_status.failed()) return dump_status;
+    document.bytes = text.empty() ? std::span<byte_t const>(empty_document_k, 0) : bytes_of_text(text);
+    return {};
+}
+
+/** Replays the deltas of every task at @p places over its document, read once through @p documents,
+ *  and writes every distinct document back once, failing as the first failing delta does and
+ *  writing nothing then. */
 template <typename documents_type_>
-status_t read_modify_write(documents_type_ const& documents, place_batch_t const& places, strings_arg_t const& fields,
-                           strings_arg_t const& values, modification_t modification, ustore_docs_field_type_t type,
-                           ustore_durability_t durability, view_t const& view) noexcept {
+status_t read_modify_write(documents_type_ const& documents, ustore_docs_write_t const& arguments,
+                           place_batch_t const& places, strings_arg_t const& fields, strings_arg_t const& values,
+                           view_t const& view) noexcept {
 
     ustore_arena_t const scratch = view.scratch;
-    growing_strings<arena_allocator<byte_t>> modified {scratch};
-
-    auto modify_one = [&](std::size_t index, std::string_view field, value_view_t binary_document) noexcept {
-        auto [document, document_status] = json_parse(binary_document, scratch);
-        if (document_status.failed()) return document_status;
-        auto [modifier, modifier_status] = any_parse(value_view_t {values[index]}, type, scratch);
-        if (modifier_status.failed()) return modifier_status;
-        if (!modifier) return status_t {status_code_t::malformed_k, "An empty value is no JSON document"};
-        auto [modifier_document, mutable_status] = json_mutable(modifier, scratch);
-        if (mutable_status.failed()) return mutable_status;
-        if (status_t const status = modify(document, yyjson_mut_doc_get_root(modifier_document), field, modification,
-                                           scratch);
-            status.failed())
-            return status;
-        auto [text, dump_status] = json_dump({nullptr, yyjson_mut_doc_get_root(document.mutable_handle)}, scratch);
-        if (dump_status.failed()) return dump_status;
-        return modified.push_back(text.bytes());
-    };
+    auto [grouped, grouped_status] = group_document_deltas(arguments, places, fields, values, scratch);
+    if (grouped_status.failed()) return grouped_status;
+    auto const grouped_strided = strided(grouped).immutable();
+    place_batch_t distinct;
+    distinct.collections_begin = grouped_strided.members(&document_deltas_t::collection).begin();
+    distinct.keys_begin = grouped_strided.members(&document_deltas_t::key).begin();
+    distinct.count = static_cast<ustore_size_t>(grouped.size());
 
     // A transaction watches the documents it rewrites, whatever the caller asked of the writes
     view_t watching = view;
     watching.watch = ustore_watch_keys_k;
-    if (status_t const status = read_each_document(documents, places, fields, modification, watching, modify_one);
-        status.failed())
-        return status;
+    auto [found, found_status] = read_documents(documents, distinct, watching);
+    if (found_status.failed()) return found_status;
+
+    growing_strings<arena_allocator<byte_t>> modified {scratch};
+    for (std::size_t index = 0; index != grouped.size(); ++index) {
+        value_view_t const current = found[index];
+        document_state_t replayed;
+        if (current)
+            replayed.bytes = current.size() ? std::span<byte_t const> {current.begin(), current.size()}
+                                            : std::span<byte_t const> {empty_document_k, 0};
+        if (status_t const applied = replay_deltas(replayed, grouped[index].deltas, scratch); applied.failed())
+            return applied;
+        if (status_t const kept = modified.push_back(value_view_t {replayed.bytes}.bytes()); kept.failed()) return kept;
+    }
 
     strings_arg_t modified_values;
     modified_values.view = modified.tape();
-    return documents.write(places, modified_values, durability, view);
+    return documents.write(distinct, modified_values, arguments.durability, view);
 }
 
 #pragma endregion Writing
@@ -297,6 +408,35 @@ inline status_t gist_paths(yyjson_val* node, field_path_buffer_t& path, sorted_p
 
 #pragma region Document Calls
 
+/** Copies the texts @p text_of answers for @p count cells into @p arena once, behind offsets as
+ *  narrow as their @p total bytes allow, each followed by a null byte the text then spans when @p
+ *  end asks for one. */
+template <typename text_of_type_>
+status_t export_texts(ustore_arena_t arena, std::size_t count, std::size_t total, string_end_t end,
+                      text_of_type_&& text_of, ustore_strings_view_t& tape) noexcept {
+    if (!count) return {};
+    auto const export_as = [&]<typename offset_type_>(std::type_identity<offset_type_>) noexcept {
+        auto [offsets, offsets_status] = arena_allocate<offset_type_>(arena, count + 1);
+        if (offsets_status.failed()) return offsets_status;
+        auto [bytes, bytes_status] = arena_allocate<byte_t>(arena, total);
+        if (bytes_status.failed()) return bytes_status;
+        std::size_t written = 0;
+        offsets[0] = 0;
+        for (std::size_t index = 0; index != count; ++index) {
+            std::string_view const text = text_of(index);
+            if (!text.empty()) std::memcpy(bytes.data() + written, text.data(), text.size());
+            written += text.size();
+            if (end == string_end_t::null_terminated_k) bytes[written++] = byte_t {0};
+            offsets[index + 1] = static_cast<offset_type_>(written);
+        }
+        if constexpr (std::is_same_v<offset_type_, std::uint32_t>) tape = u32_tape(bytes.data(), offsets.data());
+        else tape = u64_tape(bytes.data(), offsets.data());
+        return status_t {};
+    };
+    if (total <= std::numeric_limits<std::uint32_t>::max()) return export_as(std::type_identity<std::uint32_t> {});
+    return export_as(std::type_identity<std::uint64_t> {});
+}
+
 /** Implements @c ustore_docs_write over @p documents, passing whole JSON upserts through and modifying the rest as
  *  read-modify-writes. */
 template <typename documents_type_>
@@ -320,8 +460,7 @@ status_t write_documents(documents_type_ const& documents, ustore_docs_write_t c
 
     if (addresses_fields(fields, arguments.count) || arguments.type != ustore_docs_field_type_json_k ||
         arguments.modification != ustore_docs_modify_upsert_k)
-        return read_modify_write(documents, places, fields, values, static_cast<modification_t>(arguments.modification),
-                                 arguments.type, arguments.durability, view);
+        return read_modify_write(documents, arguments, places, fields, values, view);
 
     // Whole JSON documents pass through once they parse, which extracting the keys has already checked
     for (std::size_t index = 0; arguments.keys.data && index != arguments.count; ++index)
@@ -476,7 +615,10 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
         auto [scalars, scalars_status] = arena_allocate<ustore_byte_t>(arguments.arena,
                                                                        docs_count * field_size_bytes(type));
         if (scalars_status.failed()) return scalars_status;
-        growing_strings<arena_allocator<byte_t>> strings {view.scratch};
+        // A text column spans a null after every text, and a binary one does not
+        string_end_t const end = type == ustore_docs_field_type_string_k ? string_end_t::null_terminated_k
+                                                                         : string_end_t::bare_k;
+        std::size_t texts_bytes = 0;
 
         for (std::size_t document_index = 0; document_index != docs_count; ++document_index) {
             json_cell_t const value = values[field_index * docs_count + document_index];
@@ -523,10 +665,7 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
             case ustore_docs_field_type_binary_k: {
                 std::string_view text;
                 conversion = json_to_string(value, print_buffer, text);
-                // A text column spans a null after every text, and a binary one does not
-                string_end_t const end = type == ustore_docs_field_type_string_k ? string_end_t::null_terminated_k
-                                                                                 : string_end_t::bare_k;
-                if (status_t const status = strings.push_back(bytes_of(text), end); status.failed()) return status;
+                texts_bytes += text.size() + (end == string_end_t::null_terminated_k);
                 break;
             }
             default: break;
@@ -538,9 +677,18 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
                               bitmaps[2 * bitmap_stride + slot]);
         }
 
+        // The texts are sized first, so a second conversion copies each straight into the arena
         ustore_strings_view_t column_strings {};
+        auto const text_of = [&](std::size_t document_index) noexcept {
+            std::string_view text;
+            [[maybe_unused]] conversion_t const converted = json_to_string(
+                values[field_index * docs_count + document_index], print_buffer, text);
+            return text;
+        };
         if (holds_strings)
-            if (status_t const status = strings.export_into(arguments.arena, column_strings); status.failed())
+            if (status_t const status = export_texts(arguments.arena, docs_count, texts_bytes, end, text_of,
+                                                     column_strings);
+                status.failed())
                 return status;
         columns[field_index] = {
             .validities = bitmaps.data(),

@@ -10,8 +10,10 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `stderr`
 
-#include <algorithm>   // `std::ranges::find`
+#include <algorithm>   // `std::ranges::find`, `std::equal`
 #include <array>       // `std::array`
+#include <span>        // `std::span`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
 
@@ -1277,6 +1279,148 @@ std::size_t blobs_byte_range_read(config_t const& config) {
     return failures;
 }
 
+/** What a writer resizing every key of one collection in each of its commits shares with the case
+ *  reading them. */
+struct resizing_writer_t {
+    ustore_database_t database = nullptr;
+    ustore_collection_id_t collection {};
+    std::span<ustore_key_t const> keys;
+    std::uint32_t stopped = 0;
+};
+
+/** Rewrites every key of @p writer in one commit after another until stopped, the values of each
+ *  commit one letter repeated, short and long by turns. */
+void resize_values(resizing_writer_t& writer) noexcept {
+    fu::standard_atomic_ref<std::uint32_t const> const stopped {writer.stopped};
+    std::string text;
+    for (std::size_t round = 0; stopped.load(std::memory_order_acquire) == 0; ++round) {
+        text.assign(round % 2 ? 300 : 7, static_cast<char>('a' + round % 26));
+        write_text(writer.database, writer.collection, writer.keys, text);
+    }
+}
+
+/** A batched read racing a writer that resizes the same keys in every commit reads every value at
+ *  one stamp, so all of one result come from one commit. */
+std::size_t blobs_read_one_stamp_under_resizes(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    st::expected<executor_t> writing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && writing_thread.has_value() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    auto [collection, collection_status] = create_collection(database, "one_stamp.blobs", ustore_modality_blobs_k);
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
+    std::array<ustore_key_t, 64> const keys = keys_of_integers<64>(0);
+    failures += write_text(database, collection, keys, "seed");
+
+    resizing_writer_t writer {.database = database, .collection = collection, .keys = keys};
+    st::expected<fu_generation_t> const generation = writing_thread->start<&resize_values>(writer);
+    failures += expect(generation.has_value());
+    std::size_t mixed = 0;
+    for (std::size_t round = 0; generation && round != 2000; ++round) {
+        read_columns_t columns;
+        ustore_outcome_t outcome {};
+        ustore_blobs_read_t read = read_of(database, collection, keys, columns, arena, outcome);
+        ustore_blobs_read(&read);
+        failures += expect_success(outcome);
+        if (outcome.status != ustore_status_success_k) break;
+        std::string_view const first = columns.value(0);
+        for (std::size_t index = 1; index != keys.size(); ++index) mixed += columns.value(index) != first;
+    }
+    fu::standard_atomic_ref<std::uint32_t> {writer.stopped}.store(1, std::memory_order_release);
+    if (generation) writing_thread->join(*generation);
+    failures += expect_eq(mixed, 0u);
+    return failures;
+}
+
+/** What a writer moving every value between two halves of one collection's keys shares with the
+ *  case scanning them. */
+struct swapping_writer_t {
+    ustore_database_t database = nullptr;
+    ustore_collection_id_t collection {};
+    std::span<ustore_key_t const> lower;
+    std::span<ustore_key_t const> upper;
+    std::uint32_t stopped = 0;
+};
+
+/** Writes one half of the keys of @p writer and removes the other in one commit after another
+ *  until stopped, the halves swapping every commit. */
+void swap_halves(swapping_writer_t& writer) noexcept {
+    fu::standard_atomic_ref<std::uint32_t const> const stopped {writer.stopped};
+    for (std::size_t round = 0; stopped.load(std::memory_order_acquire) == 0; ++round) {
+        std::span<ustore_key_t const> const written = round % 2 ? writer.upper : writer.lower;
+        std::span<ustore_key_t const> const removed = round % 2 ? writer.lower : writer.upper;
+        ustore_outcome_t outcome {};
+        ustore_transaction_t transaction = nullptr;
+        ustore_transaction_init_t begin {.transaction = &transaction, .database = writer.database, .outcome = &outcome};
+        ustore_transaction_init(&begin);
+        if (outcome.status != ustore_status_success_k) continue;
+        write_text(writer.database, writer.collection, written, "apple", transaction);
+        ustore_blobs_remove_t remove {};
+        remove.database = writer.database;
+        remove.outcome = &outcome;
+        remove.transaction = transaction;
+        remove.count = removed.size();
+        remove.collections = {&writer.collection, 0};
+        remove.keys = {removed.data(), sizeof(ustore_key_t)};
+        ustore_blobs_remove(&remove);
+        ustore_transaction_commit_t commit {.database = writer.database,
+                                            .outcome = &outcome,
+                                            .transaction = transaction};
+        ustore_transaction_commit(&commit);
+        ustore_transaction_free(transaction);
+    }
+}
+
+/** A scan filtered by the values it lists, racing a writer that moves every value between two
+ *  halves of the keys in each commit, lists and reads at one stamp, so it keeps one half. */
+case_result_t blobs_filtered_scan_one_stamp_under_swaps(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    st::expected<executor_t> writing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && writing_thread.has_value() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
+    auto [collection, collection_status] = create_collection(database, "swaps.blobs", ustore_modality_blobs_k);
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
+    std::array<ustore_key_t, 64> const keys = keys_of_integers<64>(0);
+    std::span<ustore_key_t const> const lower {keys.data(), 32}, upper {keys.data() + 32, 32};
+    failures += write_text(database, collection, lower, "apple");
+
+    std::string_view const pattern = "apple";
+    std::array<std::uint32_t, 2> const pattern_offsets {0, static_cast<std::uint32_t>(pattern.size())};
+    swapping_writer_t writer {.database = database, .collection = collection, .lower = lower, .upper = upper};
+    st::expected<fu_generation_t> const generation = writing_thread->start<&swap_halves>(writer);
+    failures += expect(generation.has_value());
+    std::size_t torn = 0;
+    for (std::size_t round = 0; generation && round != 2000; ++round) {
+        ustore_outcome_t outcome {};
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* found = nullptr;
+        ustore_blobs_scan_t scan {};
+        scan.database = database, scan.outcome = &outcome, scan.count = 1, scan.collections = {&collection, 0};
+        scan.patterns = {.patterns = u32_tape(pattern.data(), pattern_offsets.data()),
+                         .count = 1,
+                         .kind = ustore_pattern_substrings_k,
+                         .sensitivity = ustore_cased_k};
+        scan.offsets = &offsets, scan.keys = &found, scan.arena = arena, scan.wanted = keys.size();
+        ustore_blobs_scan(&scan);
+        failures += expect_success(outcome);
+        if (outcome.status != ustore_status_success_k || !offsets) break;
+        std::span<ustore_key_t const> const kept {found, static_cast<std::size_t>(offsets[1])};
+        bool const one_half = kept.size() == lower.size() && (std::equal(kept.begin(), kept.end(), lower.begin()) ||
+                                                              std::equal(kept.begin(), kept.end(), upper.begin()));
+        torn += !one_half;
+    }
+    fu::standard_atomic_ref<std::uint32_t> {writer.stopped}.store(1, std::memory_order_release);
+    if (generation) writing_thread->join(*generation);
+    failures += expect_eq(torn, 0u);
+    return failures;
+}
+
 /** A descending cursor with an end key pages its range largest first and stops past the end key. */
 std::size_t blobs_cursor_descending_end(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
@@ -1367,6 +1511,8 @@ int main(int argc, char** argv) {
     report(totals, "blobs.range_remove", blobs_range_remove, config);
     report(totals, "blobs.range_measure", blobs_range_measure, config);
     report(totals, "blobs.byte_range_read", blobs_byte_range_read, config);
+    report(totals, "blobs.read_one_stamp_under_resizes", blobs_read_one_stamp_under_resizes, config);
+    report(totals, "blobs.filtered_scan_one_stamp_under_swaps", blobs_filtered_scan_one_stamp_under_swaps, config);
     report(totals, "blobs.cursor_descending_end", blobs_cursor_descending_end, config);
     return suite_exit_code(totals);
 }

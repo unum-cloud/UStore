@@ -23,7 +23,7 @@
 
 #include "ustore/types.h" // `ustore_executor_for_ram_t`, `ustore_arena_init_t`, `ustore_version`
 
-#include "lib.hpp" // `ustore_executor_handle_t`, `finish`, `run_as`, `wait_finished`, `enumerator_spelling`
+#include "lib.hpp" // `ustore_executor_handle_t`, `finish`, `release`, `run_as`, `wait_finished`, `enumerator_spelling`
 
 namespace unum::ustore {
 
@@ -138,11 +138,14 @@ constexpr auto version_name_k = [] {
     return text;
 }();
 
-/** Finishes the outcomes of the first @p count results of @p executor, each before lowering the deferred counts its
- *  call raised, so a free waiting on one of them returns after that outcome is final. */
+/** Finishes the outcomes of the first @p count results of @p executor, each right after releasing
+ *  the claims its call took and before lowering the deferred counts it raised. No call takes its
+ *  arena while another call of the batch still runs, its caller may reuse the arena once the
+ *  outcome is final, and a free waiting on it returns after that. */
 void publish_results(ustore_executor_handle_t& executor, std::uint32_t count) noexcept {
     for (std::uint32_t task = 0; task != count; ++task) {
         deferred_result_t const& result = executor.results[task];
+        release(result.claims);
         finish(*result.outcome, result.status);
         for (std::uint32_t* const deferred_calls : result.deferred_counts) {
             if (!deferred_calls) continue;

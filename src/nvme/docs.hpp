@@ -30,49 +30,21 @@
 #include "ustore/docs.h"     // `ustore_docs_write_t`
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 
-#include "ustore/docs/json_fold.hpp"        // `json_fold_t`, `json_delta_t`, `encode_deltas`, `modifier_text`
-#include "ustore/docs/json_values.hpp"      // `json_parse`, `extract_keys`
-#include "ustore/utilities/algorithm.hpp"   // `radix_sort`, `word_byte`
+#include "ustore/docs/json_fold.hpp"        // `json_fold_t`, `json_delta_t`, `encode_deltas`, `encoded_size`
+#include "ustore/docs/json_values.hpp"      // `extract_keys`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
+
+#include "docs_layer.hpp" // `document_deltas_t`, `group_document_deltas`
 
 #include "database.hpp" // `call_access`, `resolve_runs`, `read_value`, `write_value`, `serve_write`
 
 namespace unum::ustore::nvme {
 
-using docs::delta_modification_t;
 using docs::json_delta_t;
 using docs::json_fold_t;
 
 /** The fold every change delta of a docs collection is written for. */
 inline constexpr json_fold_t docs_fold_k {};
-
-/** One task of a docs write: the document it addresses, its delta, and its place in the call, which orders the deltas
- *  of one document. */
-struct document_task_t {
-    ustore_collection_id_t collection;
-    ustore_key_t key;
-    json_delta_t delta;
-    std::size_t sequence = 0;
-};
-
-/** The deltas one docs write makes to one document, in task order. */
-struct document_deltas_t {
-    ustore_collection_id_t collection;
-    ustore_key_t key;
-    std::span<json_delta_t> deltas;
-
-    /** Whether the deltas depend on the document before them, which only a leading whole write makes irrelevant. */
-    [[nodiscard]] bool reads_base() const noexcept {
-        return deltas.front().modification != delta_modification_t::write_k;
-    }
-
-    /** Whether the document the deltas leave is known whole, past a whole write among them. */
-    [[nodiscard]] bool writes_whole() const noexcept {
-        for (json_delta_t const& delta : deltas)
-            if (delta.modification == delta_modification_t::write_k) return true;
-        return false;
-    }
-};
 
 /**
  *  @brief Replays the deltas of @p document one by one over the document as @p access sees it, failing as the first
@@ -97,11 +69,9 @@ status_t write_document(call_access<cpu_class_> const& access, document_deltas_t
                                             : std::span<byte_t const> {empty_value_bytes_k, 0};
         whole = whole || (current && current.empty());
     }
-    for (json_delta_t& delta : document.deltas) {
-        delta.stamp = access.transaction->start_stamp();
-        if (status_t const applied = docs::apply_delta(replayed, delta, access.scratch); applied.failed())
-            return applied;
-    }
+    for (json_delta_t& delta : document.deltas) delta.stamp = access.transaction->start_stamp();
+    if (status_t const applied = replay_deltas(replayed, document.deltas, access.scratch); applied.failed())
+        return applied;
     if (whole) return write_value(access, collection, key, value_view_t {replayed.bytes});
     auto [chain, chain_status] = docs::encode_deltas(document.deltas, access.scratch);
     if (chain_status.failed()) return chain_status;
@@ -139,64 +109,21 @@ status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& f
         valid.failed())
         return valid;
 
-    auto [tasks, tasks_status] = arena_allocate<document_task_t>(scratch, count);
-    if (tasks_status.failed()) return tasks_status;
+    auto [documents, grouped_status] = group_document_deltas(arguments, places, fields, values, scratch);
+    if (grouped_status.failed()) return grouped_status;
     std::size_t bytes = 0;
-    for (std::size_t index = 0; index != count; ++index) {
-        std::string_view const field = fields ? string_of(fields[index]) : std::string_view {};
-        value_view_t const value {values[index]};
-        json_delta_t delta {0, static_cast<delta_modification_t>(arguments.modification), field, {}};
-        // A whole upsert writes the document, which a whole JSON upsert passes through once it parses
-        if (field.empty() && delta.modification == delta_modification_t::upsert_k) {
-            delta.modification = delta_modification_t::write_k;
-            if (arguments.type == ustore_docs_field_type_json_k)
-                if (status_t const parsed = docs::json_parse(value, scratch).status(); parsed.failed()) return parsed;
-        }
-        auto [text, text_status] = docs::modifier_text(value, arguments.type, scratch);
-        if (text_status.failed()) return text_status;
-        delta.value = text;
-        bytes += docs::encoded_size(delta);
-        tasks[index] = document_task_t {places[index].collection, places[index].key, delta, index};
-    }
-    // The collection, the key and the batch position read as one big-endian number, a total order.
-    constexpr std::size_t uuid_bytes_k = sizeof(ustore_uuid_t);
-    auto const digit_of = [](document_task_t const& task, std::size_t digit) noexcept -> std::size_t {
-        if (digit < uuid_bytes_k) return task.collection.uuid.bytes[digit];
-        if (digit < 2 * uuid_bytes_k) return task.key.uuid.bytes[digit - uuid_bytes_k];
-        return utilities::word_byte(task.sequence, digit - 2 * uuid_bytes_k);
-    };
-    auto const precedes = [](document_task_t const& first, document_task_t const& second) noexcept {
-        if (first.collection != second.collection) return first.collection < second.collection;
-        if (first.key != second.key) return first.key < second.key;
-        return first.sequence < second.sequence;
-    };
-    utilities::radix_sort(tasks, 2 * uuid_bytes_k + sizeof(std::uint64_t), digit_of, precedes);
-
-    // The deltas of every document sit side by side in task order, which each document's span views
-    auto [deltas, deltas_status] = arena_allocate<json_delta_t>(scratch, count);
-    if (deltas_status.failed()) return deltas_status;
-    auto [documents, documents_status] = arena_allocate<document_deltas_t>(scratch, count);
-    if (documents_status.failed()) return documents_status;
-    std::size_t documents_count = 0;
     bool reads = false;
-    for (std::size_t first = 0; first != count;) {
-        std::size_t end = first + 1;
-        while (end != count && tasks[end].collection == tasks[first].collection && tasks[end].key == tasks[first].key)
-            ++end;
-        for (std::size_t index = first; index != end; ++index) deltas[index] = tasks[index].delta;
-        document_deltas_t const document {tasks[first].collection, tasks[first].key,
-                                          deltas.subspan(first, end - first)};
+    for (document_deltas_t const& document : documents) {
         reads = reads || document.reads_base();
-        documents[documents_count++] = document;
-        first = end;
+        for (json_delta_t const& delta : document.deltas) bytes += docs::encoded_size(delta);
     }
 
     // A transaction watches the documents it checks the deltas against, whatever the caller asked of the writes
-    return serve_write(state, view, arguments.durability, documents_count, bytes,
+    return serve_write(state, view, arguments.durability, documents.size(), bytes,
                        reads ? watch_schedule_t::on_commit_k : watch_schedule_t::never_k,
                        [&](call_access<cpu_class_> const& access) noexcept -> status_t {
-                           for (std::size_t index = 0; index != documents_count; ++index)
-                               if (status_t const written = write_document(access, documents[index]); written.failed())
+                           for (document_deltas_t const& document : documents)
+                               if (status_t const written = write_document(access, document); written.failed())
                                    return written;
                            return {};
                        });

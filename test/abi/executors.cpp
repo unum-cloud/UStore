@@ -1105,6 +1105,67 @@ std::size_t executor_contended_arena(config_t const& config) {
     return failures;
 }
 
+/** A deferred scan keeps its arena claimed until its outcome is final, so while a held scan of the
+ *  same batch delays that outcome, a call on the arena keeps finishing contended. */
+std::size_t executor_claim_held_until_final(config_t const&) {
+    std::size_t failures = 0;
+    auto [executor, spawn_status] = spawn_executor(0);
+    failures += expect(spawn_status.succeeded());
+    if (failures != 0) return failures;
+    auto [arena, arena_status] = arena_t::make(executor);
+    failures += expect(arena_status.succeeded());
+    if (failures != 0) return failures;
+
+    // Both scans wait behind the first held one, so they run as one batch once it is released
+    held_scan_t first;
+    failures += submit_held(first, executor);
+    held_scan_t second;
+    auto [second_arena, second_arena_status] = arena_t::make(executor);
+    failures += expect(second_arena_status.succeeded());
+    if (failures != 0) return failures;
+    second.arena = std::move(second_arena);
+    second.executor = executor;
+    second.scan = first.scan;
+    second.scan.database = &second.database;
+    second.scan.outcome = &second.outcome;
+    second.scan.arena = second.arena;
+    second.scan.progress_state = &second;
+
+    ustore_outcome_t quick_outcome {};
+    ustore_blobs_scan_t quick = first.scan;
+    quick.outcome = &quick_outcome;
+    quick.arena = arena;
+    quick.progress = nullptr;
+    quick.progress_state = nullptr;
+    ustore_blobs_scan(&quick);
+    ustore_blobs_scan(&second.scan);
+    failures += release_held(first);
+    fu::standard_atomic_ref<hold_stage_t> const second_stage {second.stage};
+    failures += expect(spin_until([&second_stage]() noexcept {
+        return second_stage.load(std::memory_order_acquire) == hold_stage_t::entered_k;
+    }));
+
+    ustore_outcome_t outcome {};
+    ustore_blobs_scan_t blocking = quick;
+    blocking.executor = nullptr;
+    blocking.outcome = &outcome;
+    std::size_t taken_early = 0;
+    for (std::size_t round = 0; round != 200 && !taken_early; ++round) {
+        ustore_blobs_scan(&blocking);
+        taken_early += outcome.status != ustore_status_contended_k &&
+                       ustore_outcome_status(&quick_outcome) == ustore_status_deferred_k;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    failures += expect_eq(taken_early, 0u);
+
+    failures += release_held(second);
+    failures += expect(ustore_outcome_wait(&quick_outcome) == ustore_status_success_k);
+    ustore_blobs_scan(&blocking);
+    failures += expect_success(outcome);
+    ustore_executor_free(executor);
+    return failures;
+}
+
 /** A call on a transaction that an unfinished deferred call reads through finishes contended, and
  *  succeeds once it finishes. */
 case_result_t executor_contended_transaction(config_t const& config) {
@@ -1799,6 +1860,7 @@ int main(int argc, char** argv) {
     report(totals, "executor.submit_after_wait", executor_submit_after_wait, config);
     report(totals, "executor.drain", executor_drain, config);
     report(totals, "executor.contended_arena", executor_contended_arena, config);
+    report(totals, "executor.claim_held_until_final", executor_claim_held_until_final, config);
     report(totals, "executor.contended_transaction", executor_contended_transaction, config);
     report(totals, "executor.on_pool", executor_on_pool, config);
     report(totals, "executor.arena_on_device", executor_arena_on_device, config);

@@ -9,10 +9,12 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
+#include <type_traits> // `std::type_identity`, `std::is_same_v`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -24,10 +26,17 @@
 
 namespace unum::ustore::utilities {
 
+/** The bytes of a value one task of a read asks for: from an offset, at most a limit. */
+struct task_window_t {
+    std::size_t offset = 0;
+    std::size_t length = 0;
+};
+
 /** The columns of a batched read in its arena: presences and lengths sized by the batch, then the
  *  values, copied in once all are found and their length is known, so the arena holds exactly the
  *  outputs. A value appended must stay where it lies until @c finish copies it, and reads as the
- *  byte range a blobs read names for it. */
+ *  byte range a blobs read names for it. An engine that reads every window straight into one room
+ *  of the arena, end to end in task order, has @c finish adopt that room and copy nothing. */
 class read_outputs_t {
     ustore_arena_t arena_ = nullptr;
     bits_span_t presences_ {};
@@ -35,18 +44,32 @@ class read_outputs_t {
     value_view_t* found_ = nullptr;
     strided_iterator<ustore_length_t const> offsets_ {};
     strided_iterator<ustore_length_t const> limits_ {};
+    std::span<byte_t> adopted_ {};
     std::size_t index_ = 0;
     std::size_t length_ = 0;
 
     /** The bytes of @p value that task @c index_ reads: from its offset, at most its limit. */
     value_view_t ranged_(value_view_t value) const noexcept {
-        auto const task = static_cast<std::ptrdiff_t>(index_);
-        std::size_t const size = value.size();
-        std::size_t offset = offsets_ ? static_cast<std::size_t>(offsets_[task]) : 0;
-        if (offset > size) offset = size;
-        std::size_t const rest = size - offset;
-        std::size_t const length = limits_ && limits_[task] < rest ? static_cast<std::size_t>(limits_[task]) : rest;
-        return value_view_t {value.data() + offset, length};
+        task_window_t const ranged = window(index_, value.size());
+        return value_view_t {value.data() + ranged.offset, ranged.length};
+    }
+
+    /** Exports the offsets of the values lying end to end in @c adopted_, as narrow as their bytes
+     *  allow. */
+    status_t export_adopted_(ustore_strings_view_t& tape) const noexcept {
+        auto const export_as = [&]<typename offset_type_>(std::type_identity<offset_type_>) noexcept {
+            auto [offsets, status] = arena_allocate<offset_type_>(arena_, index_ + 1);
+            if (status.failed()) return status;
+            offsets[0] = 0;
+            for (std::size_t index = 0; index != index_; ++index)
+                offsets[index + 1] = static_cast<offset_type_>(offsets[index] + found_[index].size());
+            if constexpr (std::is_same_v<offset_type_, std::uint32_t>) tape = u32_tape(adopted_.data(), offsets.data());
+            else tape = u64_tape(adopted_.data(), offsets.data());
+            return status_t {};
+        };
+        if (length_ <= std::numeric_limits<std::uint32_t>::max())
+            return export_as(std::type_identity<std::uint32_t> {});
+        return export_as(std::type_identity<std::uint64_t> {});
     }
 
   public:
@@ -75,6 +98,35 @@ class read_outputs_t {
         return outputs;
     }
 
+    /** The arena the outputs land in. */
+    ustore_arena_t arena() const noexcept { return arena_; }
+
+    /** The bytes of a value of @p size that task @p task reads: from its offset, at most its
+     *  limit. */
+    task_window_t window(std::size_t task, std::size_t size) const noexcept {
+        auto const signed_task = static_cast<std::ptrdiff_t>(task);
+        std::size_t offset = offsets_ ? static_cast<std::size_t>(offsets_[signed_task]) : 0;
+        if (offset > size) offset = size;
+        std::size_t const rest = size - offset;
+        std::size_t const length = limits_ && limits_[signed_task] < rest
+                                       ? static_cast<std::size_t>(limits_[signed_task])
+                                       : rest;
+        return {offset, length};
+    }
+
+    /** Takes @p room of the arena, where the windows appended next through @c append_adopted lie
+     *  end to end, as the values @c finish exports without copying them. */
+    void adopt(std::span<byte_t> room) noexcept { adopted_ = room; }
+
+    /** Appends a found value whose window of @p length bytes lies next in the adopted room. */
+    void append_adopted(std::size_t length) noexcept {
+        if (presences_) presences_[index_] = true;
+        if (lengths_) lengths_[index_] = static_cast<ustore_length_t>(length);
+        if (found_) found_[index_] = value_view_t {adopted_.data() + length_, length};
+        length_ += length;
+        ++index_;
+    }
+
     /** Appends a found value, which stays where it lies until @c finish copies it. */
     void append(value_view_t value) noexcept {
         if (offsets_ || limits_) value = ranged_(value);
@@ -92,11 +144,14 @@ class read_outputs_t {
         ++index_;
     }
 
-    /** Copies every value into the arena at once, behind offsets as narrow as their bytes allow, and exports every
-     *  column into the outputs of @p arguments. */
+    /** Copies every value into the arena at once, unless it lies there already, behind offsets as
+     *  narrow as their bytes allow, and exports every column into the outputs of @p arguments. */
     template <typename arguments_type_>
     status_t finish(arguments_type_ const& arguments) noexcept {
-        if (arguments.values) {
+        if (arguments.values && adopted_.data()) {
+            if (status_t const status = export_adopted_(*arguments.values); status.failed()) return status;
+        }
+        else if (arguments.values) {
             auto const values = [&](std::size_t index) noexcept { return found_[index].bytes(); };
             if (status_t const status = export_strings(arena_, index_, length_, values, *arguments.values);
                 status.failed())

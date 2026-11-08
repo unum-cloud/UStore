@@ -13,6 +13,7 @@
 #include <cstring> // `std::memcpy`
 
 #include <array>       // `std::array`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
 #include <fmt/format.h>
@@ -212,6 +213,62 @@ std::size_t database_docs_modify(config_t const& config) {
     failures += expect(collection[collection_key_field_t {key_from_integer(1), "/weight"}].upsert("70").succeeded());
     failures += expect(
         json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"person":"Charles","age":26,"weight":70})"));
+    return failures;
+}
+
+/** Writes @p values into @p fields of the documents keyed @p keys in one call with
+ *  @p modification. */
+ustore_status_t write_documents_once(ustore_database_t database, ustore_collection_id_t collection,
+                                     std::span<ustore_key_t const> keys, std::span<std::string_view const> fields,
+                                     std::span<std::string_view const> values,
+                                     ustore_docs_modification_t modification) noexcept {
+    strided_strings<std::string_view> const fields_strings {{fields.data(), sizeof(std::string_view)}};
+    strided_strings<std::string_view> const values_strings {{values.data(), sizeof(std::string_view)}};
+    ustore_outcome_t outcome {};
+    ustore_docs_write_t write {};
+    write.database = database;
+    write.outcome = &outcome;
+    write.count = keys.size();
+    write.collections = {&collection, 0};
+    write.keys = {keys.data(), sizeof(ustore_key_t)};
+    if (!fields.empty()) write.fields = fields_strings.view();
+    write.values = values_strings.view();
+    write.modification = modification;
+    ustore_docs_write(&write);
+    return outcome.status;
+}
+
+/** One write naming a document twice applies its tasks in order, so field edits of both land and a
+ *  second insertion of a key the first one created finds it taken, leaving the key untouched. */
+std::size_t database_docs_repeated_document(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
+    failures += expect(collection[key_from_integer(1)].assign(R"({"a":1,"b":1})").succeeded());
+
+    std::array<ustore_key_t, 2> const repeated_keys {key_from_integer(1), key_from_integer(1)};
+    std::array<std::string_view, 2> const fields {"/a", "/b"};
+    std::array<std::string_view, 2> const numbers {"2", "3"};
+    failures += expect(write_documents_once(database, collection, repeated_keys, fields, numbers,
+                                            ustore_docs_modify_upsert_k) == ustore_status_success_k);
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"a":2,"b":3})"));
+
+    std::array<std::string_view, 2> const merges {R"({"a":4})", R"({"b":5})"};
+    failures += expect(write_documents_once(database, collection, repeated_keys, {}, merges,
+                                            ustore_docs_modify_merge_k) == ustore_status_success_k);
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"a":4,"b":5})"));
+
+    std::array<ustore_key_t, 2> const fresh_keys {key_from_integer(2), key_from_integer(2)};
+    std::array<std::string_view, 2> const documents {R"({"x":1})", R"({"x":2})"};
+    failures += expect(write_documents_once(database, collection, fresh_keys, {}, documents,
+                                            ustore_docs_modify_insert_k) == ustore_status_already_exists_k);
+    failures += expect(collection[key_from_integer(2)].insert(R"({"x":3})").succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(2)].value()), R"({"x":3})"));
     return failures;
 }
 
@@ -629,6 +686,7 @@ int main(int argc, char** argv) {
     report(totals, "database.docs_flat", database_docs_flat, config);
     report(totals, "database.docs_nested_batch", database_docs_nested_batch, config);
     report(totals, "database.docs_modify", database_docs_modify, config);
+    report(totals, "database.docs_repeated_document", database_docs_repeated_document, config);
     report(totals, "database.docs_merge_and_patch", database_docs_merge_and_patch, config);
     report(totals, "database.docs_table", database_docs_table, config);
     report(totals, "docs.range_end_bound", docs_range_end_bound, config);

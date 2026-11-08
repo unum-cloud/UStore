@@ -1177,6 +1177,55 @@ case_result_t database_free_holds(config_t const& config) {
     return failures;
 }
 
+/** A snapshot opened before its collection is dropped still reads that collection's values,
+ *  where the engine lets the drop go ahead, while the collection is gone at the head. */
+case_result_t snapshot_reads_collection_dropped_after_open(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_raw(config);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded());
+    if (failures != 0) return failures;
+
+    ustore_outcome_t outcome {};
+    ustore_database_description_t description {};
+    ustore_database_describe_t describe {.database = database, .outcome = &outcome, .description = &description};
+    ustore_database_describe(&describe);
+    failures += expect_success(outcome);
+    if ((description.capabilities & ustore_capabilities_snapshots_k) == 0) {
+        ustore_database_free(database);
+        return case_result_t::skipped("the engine keeps no snapshots", failures);
+    }
+    auto [blobs, blobs_status] = create_collection(database, "snapshot_dropped.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
+    ustore_key_t const key = key_from_integer(91);
+    failures += write_text(database, blobs, {&key, 1}, "kept");
+
+    ustore_snapshot_t snapshot = nullptr;
+    ustore_snapshot_init_t snapshot_init {.snapshot = &snapshot, .database = database, .outcome = &outcome};
+    ustore_snapshot_init(&snapshot_init);
+    failures += expect_success(outcome);
+    ustore_collection_drop_t drop {.database = database,
+                                   .outcome = &outcome,
+                                   .collection = blobs,
+                                   .mode = ustore_drop_collection_k};
+    ustore_collection_drop(&drop);
+    bool const dropped = outcome.status == ustore_status_success_k;
+    if (!dropped) failures += expect_status(outcome, status_code_t::invalid_argument_k);
+
+    read_columns_t columns;
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
+    read.view = ustore_snapshot_view(snapshot);
+    ustore_blobs_read(&read);
+    failures += expect_success(outcome);
+    failures += expect(columns.presences && (columns.presences[0] & 1) == 1 && columns.value(0) == "kept");
+    if (dropped)
+        failures += expect_status(collection_named(receiver_t {database}, "snapshot_dropped.blobs"),
+                                  status_code_t::not_found_k);
+    ustore_snapshot_free(snapshot);
+    ustore_database_free(database);
+    return failures;
+}
+
 /** A fresh database holds no collection until one is created, never listing its system collections,
  *  and refuses a name starting with an underscore, which they keep. */
 case_result_t database_fresh_collections(config_t const& config) {
@@ -2228,6 +2277,8 @@ int main(int argc, char** argv) {
     report(totals, "database.rollback", database_rollback, config);
     report(totals, "database.stamps", database_stamps, config);
     report(totals, "database.free_holds", database_free_holds, config);
+    report(totals, "snapshot.reads_collection_dropped_after_open", snapshot_reads_collection_dropped_after_open,
+           config);
     report(totals, "database.find_at_snapshot", database_find_at_snapshot, config);
     report(totals, "database.fresh_collections", database_fresh_collections, config);
     report(totals, "database.describe_compact", database_describe_compact, config);

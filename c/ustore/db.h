@@ -1288,7 +1288,7 @@ typedef struct ustore_transaction_commit_t {
     ustore_transaction_t transaction;
 
     /** Optional output for the commit's position in commit order, visible to every snapshot at or above it; zeroed
-     *  on failure. */
+     *  unless the commit landed, so a failed flush still reports it. */
     ustore_stamp_t* commit_stamp;
 
     /** How durable the writes are once the commit finishes. */
@@ -1633,7 +1633,8 @@ typedef struct ustore_ingest_finish_t {
     /** Buffered: visible on return, durable at the next flush, dropped whole by a crash before it. */
     ustore_durability_t durability;
 
-    /** Optional output for the one stamp every row landed at; zeroed on failure. */
+    /** Optional output for the one stamp every row landed at; zeroed unless the rows landed, so a
+     *  failed flush still reports it. */
     ustore_stamp_t* commit_stamp;
 
 } ustore_ingest_finish_t;

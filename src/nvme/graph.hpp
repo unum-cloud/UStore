@@ -26,6 +26,7 @@
 #include <cstring> // `std::memcpy`
 
 #include <limits> // `std::numeric_limits`
+#include <memory> // `std::construct_at`
 #include <span>   // `std::span`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
@@ -78,14 +79,6 @@ constexpr role_t mirrored_role(role_t role) noexcept {
  *  head. */
 inline watch_schedule_t graph_write_schedule(view_t const& view) noexcept {
     return view.transaction ? schedule_of(view.watch) : watch_schedule_t::on_commit_k;
-}
-
-/** Where the tasks on the collection of task @p first end: the next task naming another one. */
-inline std::size_t run_end(strided_iterator<ustore_collection_id_t const> collections, std::size_t first,
-                           std::size_t count) noexcept {
-    std::size_t end = first + 1;
-    while (end != count && collections[end] == collections[first]) ++end;
-    return end;
 }
 
 #pragma region Vertex Reads
@@ -253,6 +246,16 @@ status_t watch_vertex(call_access<cpu_class_> const& access, collection_id_t col
     return watch_keys(access, collection, std::span<stored_key_t const> {&key, 1});
 }
 
+/** Watches through the transaction of @p access, when it watches at all, that the vertex @p key of
+ *  @p collection is neither removed nor rewritten whole before the commit, unlike an added edge. */
+template <cpu_class_t cpu_class_>
+status_t watch_vertex_existence(call_access<cpu_class_> const& access, collection_id_t collection,
+                                stored_key_t key) noexcept {
+    if (!access.transaction || access.schedule == watch_schedule_t::never_k) return {};
+    return access.transaction->template watch_existence<watch_schedule_t::on_commit_k>(
+        collection, std::span<stored_key_t const> {&key, 1});
+}
+
 /** Lays the records of the edges of @p arguments out in @p scratch, two per edge but for an undirected loop, as
  *  @p operation inserts or removes them, directed from their sources. */
 template <typename arguments_type_>
@@ -314,6 +317,9 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(arguments.arena,
                                                                      arguments.edges_offsets ? count + 1 : 0);
     if (offsets_status.failed()) return offsets_status;
+    // Each present vertex's adjacency is checked once, then walked again for its edges
+    auto [adjacencies, adjacencies_status] = arena_allocate<vertex_adjacency_t>(view.scratch, count);
+    if (adjacencies_status.failed()) return adjacencies_status;
     std::size_t exported = 0;
     for (std::size_t index = 0; index != count; ++index) {
         if (!offsets.empty()) offsets[index] = static_cast<ustore_length_t>(exported);
@@ -324,6 +330,7 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
         expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertices[index], reads[index].base,
                                                                                 reads[index].pending);
         if (!adjacency) return adjacency.status();
+        std::construct_at(&adjacencies[index], *adjacency);
         std::size_t const degree = adjacency->degree(
             half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k));
         degrees[index] = static_cast<ustore_vertex_degree_t>(degree);
@@ -341,7 +348,7 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
         if (!reads[index].present) continue;
         ustore_key_t const vertex = vertices[index];
         role_t const wanted = half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k);
-        auto const adjacency = *vertex_adjacency_t::make(vertex, reads[index].base, reads[index].pending);
+        vertex_adjacency_t const& adjacency = adjacencies[index];
         for (role_t const role : {dedge_source_k, dedge_target_k}) {
             if (!(role & wanted)) continue;
             for (half_edge_cursor_t cursor = adjacency.half_edges(); cursor.valid(); cursor.next()) {
@@ -359,7 +366,7 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
 }
 
 /** Implements @c ustore_graph_write_edges, appending every edge to both of its ends, which creates the ends a graph
- *  lacked, and watching the ends it creates. */
+ *  lacked, watching the ends it creates and that the ends it extends are not removed meanwhile. */
 template <cpu_class_t cpu_class_>
 status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t const& view) noexcept {
     if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
@@ -378,19 +385,23 @@ status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t c
     if (status_t const chained = chain_by_vertex(deltas, view.scratch, chains); chained.failed()) return chained;
 
     std::size_t const bytes = deltas.size() * graph::half_edge_delta_bytes_k;
-    return serve_write(
-        state, view, arguments.durability, chains.size(), bytes, graph_write_schedule(view),
-        [&](call_access<cpu_class_> const& access) noexcept -> status_t {
-            for (vertex_chain_t const& chain : chains) {
-                collection_id_t const collection = chain.collection;
-                stored_key_t const key = stored_of(chain.vertex.uuid);
-                if (access.schedule != watch_schedule_t::never_k && !committed_vertex(access, collection, key))
-                    if (status_t const watched = watch_vertex(access, collection, key); watched.failed())
-                        return watched;
-                if (status_t const appended = append_chain(access, chain); appended.failed()) return appended;
-            }
-            return {};
-        });
+    return serve_write(state, view, arguments.durability, chains.size(), bytes, graph_write_schedule(view),
+                       [&](call_access<cpu_class_> const& access) noexcept -> status_t {
+                           for (vertex_chain_t const& chain : chains) {
+                               collection_id_t const collection = chain.collection;
+                               stored_key_t const key = stored_of(chain.vertex.uuid);
+                               // A created vertex is watched whole, an existing one for removal
+                               if (access.schedule != watch_schedule_t::never_k)
+                                   if (status_t const watched = committed_vertex(access, collection, key)
+                                                                    ? watch_vertex_existence(access, collection, key)
+                                                                    : watch_vertex(access, collection, key);
+                                       watched.failed())
+                                       return watched;
+                               if (status_t const appended = append_chain(access, chain); appended.failed())
+                                   return appended;
+                           }
+                           return {};
+                       });
 }
 
 /** Implements @c ustore_graph_remove_edges, appending the removal of every edge to both of its ends, which keeps the
@@ -445,16 +456,28 @@ status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, vi
     return serve_write(
         state, view, arguments.durability, arguments.count, 1, graph_write_schedule(view),
         [&](call_access<cpu_class_> const& access) noexcept -> status_t {
-            for (std::size_t index = 0; index != arguments.count; ++index) {
-                collection_id_t const collection = collections[index];
-                stored_key_t const key = stored_of(vertices[index].uuid);
-                if (visible_vertex(access, collection, key)) continue;
-                if (!committed_vertex(access, collection, key))
-                    if (status_t const watched = watch_vertex(access, collection, key); watched.failed())
-                        return watched;
-                if (status_t const created = access.transaction->change(collection, key, {}, graph_fold_k);
-                    created.failed())
-                    return created;
+            // Each vertex is probed once, and the ones created are watched together per collection
+            for (std::size_t first = 0; first != arguments.count;) {
+                std::size_t const last = run_end(collections, first, arguments.count);
+                collection_id_t const collection = collections[first];
+                auto [created, created_status] = arena_allocate<stored_key_t>(access.scratch, last - first);
+                if (created_status.failed()) return created_status;
+                std::size_t created_count = 0;
+                for (std::size_t index = first; index != last; ++index) {
+                    stored_key_t const key = stored_of(vertices[index].uuid);
+                    lookup_result_t const own = access.transaction->lookup_uncommitted(collection, key);
+                    if (own == lookup_result_t::written_k) continue;
+                    bool const committed = committed_vertex(access, collection, key);
+                    if (committed && own == lookup_result_t::missing_k) continue;
+                    if (!committed) created[created_count++] = key;
+                    if (status_t const changed = access.transaction->change(collection, key, {}, graph_fold_k);
+                        changed.failed())
+                        return changed;
+                }
+                if (status_t const watched = watch_keys(access, collection, created.first(created_count));
+                    watched.failed())
+                    return watched;
+                first = last;
             }
             return {};
         });

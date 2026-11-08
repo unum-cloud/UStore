@@ -8,8 +8,11 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint64_t`
+#include <cstring> // `std::memcpy`
 
-#include <span> // `std::span`
+#include <algorithm> // `std::max`, `std::min`
+#include <span>      // `std::span`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -20,7 +23,7 @@
 
 #include "database.hpp"           // `database_state`, `call_access`, `resolve_runs`, `serve_write`, `walk`
 #include "utilities/batches.hpp"  // `places_of`, `validate_write`, `samples_of`, `sample_generator_t`
-#include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `measure_outputs_t`
+#include "utilities/outputs.hpp"  // `read_outputs_t`, `task_window_t`, `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
 namespace unum::ustore::nvme {
@@ -90,10 +93,79 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
     return remove_values<cpu_class_>(arguments, view);
 }
 
-/** Reads whole values through the store of each collection, folded as its modality folds them,
- *  copying each value into the scratch once and into the arena at the end, for a caller whose
- *  resolver checked the collections; outside a transaction, every run of keys of one collection is
- *  one batched read of its store. */
+/**
+ *  @brief Reads the windows @p outputs asks of the values at @p places at the stamp of @p access,
+ *      outside a transaction, straight into the arena @p outputs exports, as one batched read of
+ *      every run of keys of one collection, a missing key reading as a missing value.
+ *
+ *  Sizes and bytes come from the one stamp the call pinned, so every window has its room in one
+ *  block of the arena, and a read of no values reads only the sizes.
+ */
+template <cpu_class_t cpu_class_>
+status_t read_values_batched(call_access<cpu_class_> const& access, ustore_blobs_read_t const& arguments,
+                             place_batch_t const& places, read_outputs_t& outputs) noexcept {
+    basic_database_of<cpu_class_>& store = *access.state.store;
+    std::size_t const count = places.size();
+    auto [keys, keys_status] = arena_allocate<stored_key_t>(access.scratch, count);
+    if (keys_status.failed()) return keys_status;
+    auto [windows, windows_status] = arena_allocate<task_window_t>(access.scratch, count);
+    if (windows_status.failed()) return windows_status;
+    auto [present, present_status] = arena_allocate<bool>(access.scratch, count);
+    if (present_status.failed()) return present_status;
+    std::size_t total = 0;
+    for (std::size_t index = 0; index != count; ++index) {
+        place_t const place = places[index];
+        keys[index] = stored_of(place.key.uuid);
+        stored_value_size_t size = 0;
+        status_t const measured = store.stored_value_size(place.collection, keys[index], size, access.stamp,
+                                                          access.thread_index);
+        if (measured.failed() && measured != status_code_t::not_found_k) return measured;
+        present[index] = measured.succeeded();
+        windows[index] = present[index] ? outputs.window(index, size) : task_window_t {};
+        total += windows[index].length;
+    }
+
+    if (arguments.values) {
+        auto [room, room_status] = arena_allocate<byte_t>(outputs.arena(), total);
+        if (room_status.failed()) return room_status;
+        auto [rooms, rooms_status] = arena_allocate<byte_t*>(access.scratch, count);
+        if (rooms_status.failed()) return rooms_status;
+        auto [results, results_status] = arena_allocate<lookup_result_t>(access.scratch, count);
+        if (results_status.failed()) return results_status;
+        for (std::size_t index = 0, at = 0; index != count; at += windows[index].length, ++index)
+            rooms[index] = room.data() + at;
+        for (std::size_t first = 0; first != count;) {
+            collection_id_t const collection = places[first].collection;
+            std::size_t last = first + 1;
+            while (last != count && places[last].collection == collection) ++last;
+            // Only the bytes of each window land, at their place in its room
+            auto sink = [&, first](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
+                task_window_t const window = windows[first + request];
+                std::uint64_t const begin = std::max<std::uint64_t>(offset, window.offset);
+                std::uint64_t const end = std::min<std::uint64_t>(offset + bytes.size(), window.offset + window.length);
+                if (begin < end)
+                    std::memcpy(rooms[first + request] + (begin - window.offset), bytes.data() + (begin - offset),
+                                static_cast<std::size_t>(end - begin));
+            };
+            if (status_t const read = store.select(collection, keys.subspan(first, last - first),
+                                                   results.subspan(first, last - first), sink, access.stamp,
+                                                   access.thread_index);
+                read.failed())
+                return read;
+            first = last;
+        }
+        outputs.adopt(room);
+    }
+    for (std::size_t index = 0; index != count; ++index)
+        if (present[index]) outputs.append_adopted(windows[index].length);
+        else outputs.append_missing();
+    return {};
+}
+
+/** Reads values through the store of each collection, folded as its modality folds them, for a
+ *  caller whose resolver checked the collections: outside a transaction as one batched read
+ *  straight into the arena, and through one key by key, each copied into the scratch and into the
+ *  arena at the end. */
 template <cpu_class_t cpu_class_>
 status_t read_values(ustore_blobs_read_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
@@ -104,24 +176,7 @@ status_t read_values(ustore_blobs_read_t const& arguments, view_t const& view) n
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
     if (!access.transaction) {
-        auto [keys, keys_status] = arena_allocate<stored_key_t>(view.scratch, places.size());
-        if (keys_status.failed()) return keys_status;
-        auto [values, values_status] = arena_allocate<value_view_t>(view.scratch, places.size());
-        if (values_status.failed()) return values_status;
-        for (std::size_t index = 0; index != places.size(); ++index) keys[index] = stored_of(places[index].key.uuid);
-        for (std::size_t first = 0; first != places.size();) {
-            collection_id_t const collection = places[first].collection;
-            std::size_t last = first + 1;
-            while (last != places.size() && places[last].collection == collection) ++last;
-            if (status_t const read = read_values_batched(access, collection, keys.subspan(first, last - first),
-                                                          values.subspan(first, last - first));
-                read.failed())
-                return read;
-            first = last;
-        }
-        for (value_view_t const& value : values)
-            if (value) outputs.append(value);
-            else outputs.append_missing();
+        if (status_t const read = read_values_batched(access, arguments, places, outputs); read.failed()) return read;
         return outputs.finish(arguments);
     }
     for (std::size_t index = 0; index != places.size(); ++index) {

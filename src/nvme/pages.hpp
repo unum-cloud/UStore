@@ -7,12 +7,12 @@
  *
  *  These calls build on the writes and the collection lookups of <tt>src/nvme/database.hpp</tt>. An edit
  *  call addressing any collection but a pages one is refused. The @c *_edits calls of
- *  <tt>src/pages_layer.hpp</tt> read the pages unwatched through the engine's own reads, check and apply
- *  the edits, and answer the edits of every page as one chain, which @c commit_page_edits lands. A
- *  chain that imports or removes the page decides it whole, so the page it leaves is written, or
- *  removed, and any other chain is appended as one @c page_fold_t change delta, watching nothing,
- *  so two commits editing one page both land. Reads take @c pages_read_over_blobs over the engine's
- *  own reads of the pages store, which fold the deltas.
+ *  <tt>src/pages_layer.hpp</tt> read the pages through the engine's own reads, check and apply the edits,
+ *  and answer the edits of every page as one chain, which @c commit_page_edits lands. A chain that
+ *  imports or removes the page decides it whole, so the page it leaves is written, or removed, and
+ *  any other chain is appended as one @c page_fold_t change delta, watching only that its page is
+ *  neither removed nor rewritten whole, so two commits editing one page both land. Reads take
+ *  @c pages_read_over_blobs over the engine's own reads of the pages store, which fold the deltas.
  */
 
 #pragma once
@@ -37,9 +37,38 @@ using ustore::pages::page_fold_t;
 /** The fold every change delta of a pages collection is written for. */
 inline constexpr page_fold_t pages_fold_k {};
 
-/** Refuses a page call of @p arguments addressing any collection but a pages one, then commits the
- *  chains @p edits answers, called as <tt>edits()</tt>, in one transaction, the caller's or one of
- *  their own flushed when the call asks. */
+/** Lands the chains of @p edited through the transaction of @p access: a chain deciding its page
+ *  whole as the page it leaves, and any other as one change delta, watching that its page is
+ *  neither removed nor rewritten whole before the commit, so no delta lands on another page. */
+template <cpu_class_t cpu_class_>
+status_t land_page_edits(call_access<cpu_class_> const& access, std::span<page_edits_t const> edited) noexcept {
+    for (page_edits_t const& page : edited) {
+        collection_id_t const collection = page.collection;
+        stored_key_t const key = stored_of(page.key.uuid);
+        delta_view_t const change {delta_kind_t::change_k, page.chain};
+        if (!pages_fold_k.closes(change)) {
+            if (status_t const watched = access.transaction->template watch_existence<watch_schedule_t::on_commit_k>(
+                    collection, std::span<stored_key_t const> {&key, 1});
+                watched.failed())
+                return watched;
+            if (status_t const changed = access.transaction->change(collection, key, page.chain, pages_fold_k);
+                changed.failed())
+                return changed;
+            continue;
+        }
+        arena_allocator<byte_t> arena {access.scratch};
+        auto [tree, tree_status] = pages_fold_k.apply({}, std::span<delta_view_t const> {&change, 1}, arena);
+        if (tree_status.failed() && tree_status != status_code_t::not_found_k) return tree_status;
+        value_view_t const value = tree_status.succeeded() ? value_view_t {tree} : value_view_t {};
+        if (status_t const written = write_value(access, collection, key, value); written.failed()) return written;
+    }
+    return {};
+}
+
+/** Refuses a page call of @p arguments addressing any collection but a pages one, then commits
+ *  the chains @p edits answers, called as <tt>edits()</tt>, in one transaction: the caller's, or one
+ *  of their own flushed when asked, which reads the pages anew on every attempt, so its watches
+ *  cover every commit landing after the read. */
 template <cpu_class_t cpu_class_, typename arguments_type_, typename edits_type_>
 status_t commit_page_edits(arguments_type_ const& arguments, view_t const& view, edits_type_&& edits) noexcept {
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
@@ -47,32 +76,25 @@ status_t commit_page_edits(arguments_type_ const& arguments, view_t const& view,
                                                ustore_modality_pages_k);
         resolved.failed())
         return resolved;
-    auto [edited, edits_status] = edits();
-    if (edits_status.failed() || edited.empty()) return edits_status;
-    std::size_t bytes = 0;
-    for (page_edits_t const& page : edited) bytes += page.chain.size();
-    return serve_write(
-        state, view, arguments.durability, edited.size(), bytes, watch_schedule_t::never_k,
-        [&](call_access<cpu_class_> const& access) noexcept -> status_t {
-            for (page_edits_t const& page : edited) {
-                collection_id_t const collection = page.collection;
-                stored_key_t const key = stored_of(page.key.uuid);
-                delta_view_t const change {delta_kind_t::change_k, page.chain};
-                if (!pages_fold_k.closes(change)) {
-                    if (status_t const changed = access.transaction->change(collection, key, page.chain, pages_fold_k);
-                        changed.failed())
-                        return changed;
-                    continue;
-                }
-                arena_allocator<byte_t> arena {access.scratch};
-                auto [tree, tree_status] = pages_fold_k.apply({}, std::span<delta_view_t const> {&change, 1}, arena);
-                if (tree_status.failed() && tree_status != status_code_t::not_found_k) return tree_status;
-                value_view_t const value = tree_status.succeeded() ? value_view_t {tree} : value_view_t {};
-                if (status_t const written = write_value(access, collection, key, value); written.failed())
-                    return written;
-            }
-            return {};
-        });
+    if (view.transaction) {
+        auto [edited, edits_status] = edits();
+        if (edits_status.failed() || edited.empty()) return edits_status;
+        return serve_write(
+            state, view, arguments.durability, edited.size(), 0, watch_schedule_t::never_k,
+            [&](call_access<cpu_class_> const& access) noexcept { return land_page_edits(access, edited); });
+    }
+    // The buffer starts at one edit header per task and doubles past it when the edits outgrow it
+    std::size_t const bytes = arguments.count * pages::edit_header_bytes_k;
+    if (status_t const committed = commit_alone(state, view.scratch, arguments.count, bytes,
+                                                watch_schedule_t::on_commit_k,
+                                                [&](call_access<cpu_class_> const& access) noexcept -> status_t {
+                                                    auto [edited, edits_status] = edits();
+                                                    if (edits_status.failed()) return edits_status;
+                                                    return land_page_edits(access, edited);
+                                                });
+        committed.failed())
+        return committed;
+    return settle(state, arguments.durability);
 }
 
 /** Implements @c ustore_pages_import, writing every imported page whole. */

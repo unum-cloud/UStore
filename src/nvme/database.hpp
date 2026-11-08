@@ -437,11 +437,11 @@ struct database_state {
     /** Held by whoever changes both system collections, so a name is checked and taken in one step. */
     std::int32_t collections_claim = 0;
 
-    /** Snapshots not yet freed, through the class's atomic reference. */
-    std::size_t open_snapshots = 0;
+    /** Snapshots and transactions not yet freed, through the class's atomic reference. */
+    std::size_t open_readers = 0;
 
-    /** Collections the collections system collection no longer lists whose runs an open snapshot may still read,
-     *  dropped once the last snapshot is freed; guarded by @c collections_claim. */
+    /** Collections unlisted from the collections system collection whose runs an open reader may
+     *  still read, dropped once the last reader is freed; guarded by @c collections_claim. */
     st::vector<ustore_collection_id_t> retired_collections;
 
     database_state() noexcept = default;
@@ -559,6 +559,10 @@ struct call_access {
 
     /** The strings the transaction writes and watches, null with no transaction. */
     strings_transaction_of<cpu_class_>* strings = nullptr;
+
+    /** The pin holding @c stamp for a call at the head, which every read of the call shares,
+     *  released when the call returns. */
+    typename basic_database_of<cpu_class_>::pin_t pin;
 };
 
 /** The schedule the watches of a call asking for @p watch take. */
@@ -572,7 +576,8 @@ std::size_t thread_index_of(database_state<cpu_class_> const& state, view_t cons
     return view.executor && view.executor == state.executor ? view.thread_index : outside_executor_k;
 }
 
-/** The access of a call reading through @p view: its transaction, its snapshot's stamp, or the head. */
+/** The access of a call reading through @p view: its transaction, its snapshot's stamp, the stamp
+ *  the router pinned for the call, or the head's newest stamp, pinned until the call returns. */
 template <cpu_class_t cpu_class_>
 call_access<cpu_class_> access_of(database_state<cpu_class_>& state, view_t const& view) noexcept {
     std::size_t const thread_index = thread_index_of(state, view);
@@ -583,7 +588,13 @@ call_access<cpu_class_> access_of(database_state<cpu_class_>& state, view_t cons
                 view.scratch,
                 state_of<snapshot_state<cpu_class_>>(view.snapshot)->pin.stamp(),
                 thread_index};
-    if (!view.transaction) return {state, nullptr, watch_schedule_t::never_k, view.scratch, head_stamp_k, thread_index};
+    if (!view.transaction) {
+        call_access<cpu_class_> access {state,        nullptr,      watch_schedule_t::never_k,
+                                        view.scratch, head_stamp_k, thread_index};
+        if (view.stamp) access.stamp = static_cast<transaction_stamp_t>(view.stamp);
+        else access.stamp = state.store->ledger().pin_reader(access.pin);
+        return access;
+    }
     transaction_state<cpu_class_>& transaction = *state_of<transaction_state<cpu_class_>>(view.transaction);
     return {state,        transaction.held.get(), schedule_of(view.watch), view.scratch,
             head_stamp_k, thread_index,           &transaction.strings};
@@ -713,73 +724,6 @@ expected<value_view_t> read_value(call_access<cpu_class_> const& access, collect
         return value_view_t {};
     }
     return status_t {status_code_t::contended_k, "A value kept changing its size while it was read"};
-}
-
-/**
- *  @brief The values of @p keys in @p collection at the stamp of @p access, outside a transaction,
- *      as one batched read of the store with as many reads in flight as its channel takes, each
- *      copied into the scratch of @p access, a missing key reading as a missing value.
- *
- *  Sizes are measured first, from the index in memory, so every value lands in a room of its own;
- *  a value whose size changed before its bytes arrived is read again alone, as @c read_value does.
- */
-template <cpu_class_t cpu_class_>
-status_t read_values_batched(call_access<cpu_class_> const& access, collection_id_t collection,
-                             std::span<stored_key_t const> keys, std::span<value_view_t> values) noexcept {
-    basic_database_of<cpu_class_>& store = *access.state.store;
-    std::size_t const count = keys.size();
-    auto [sizes, sizes_status] = arena_allocate<stored_value_size_t>(access.scratch, count);
-    if (sizes_status.failed()) return sizes_status;
-    auto [delivered, delivered_status] = arena_allocate<std::uint64_t>(access.scratch, count);
-    if (delivered_status.failed()) return delivered_status;
-    auto [results, results_status] = arena_allocate<lookup_result_t>(access.scratch, count);
-    if (results_status.failed()) return results_status;
-    auto [present, present_status] = arena_allocate<bool>(access.scratch, count);
-    if (present_status.failed()) return present_status;
-    std::uint64_t total = 0;
-    for (std::size_t index = 0; index != count; ++index) {
-        status_t const measured = store.stored_value_size(collection, keys[index], sizes[index], access.stamp,
-                                                          access.thread_index);
-        if (measured.failed() && measured != status_code_t::not_found_k) return measured;
-        present[index] = measured.succeeded();
-        if (!present[index]) sizes[index] = 0;
-        delivered[index] = 0;
-        total += sizes[index];
-    }
-    auto [room, room_status] = arena_allocate<byte_t>(access.scratch, static_cast<std::size_t>(total));
-    if (room_status.failed()) return room_status;
-    auto [rooms, rooms_status] = arena_allocate<byte_t*>(access.scratch, count);
-    if (rooms_status.failed()) return rooms_status;
-    for (std::size_t index = 0, at = 0; index != count; at += sizes[index], ++index) rooms[index] = room.data() + at;
-
-    // Bytes past a value's measured size mark it as changed meanwhile, never written past its room.
-    constexpr std::uint64_t changed_k = std::numeric_limits<std::uint64_t>::max();
-    auto sink = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
-        if (delivered[request] == changed_k || offset + bytes.size() > sizes[request]) {
-            delivered[request] = changed_k;
-            return;
-        }
-        if (!bytes.empty()) std::memcpy(rooms[request] + offset, bytes.data(), bytes.size());
-        delivered[request] += bytes.size();
-    };
-    if (status_t const read = store.select(collection, keys, std::span<lookup_result_t> {results}, sink, access.stamp,
-                                           access.thread_index);
-        read.failed())
-        return read;
-
-    for (std::size_t index = 0; index != count; ++index) {
-        bool const written = results[index] == lookup_result_t::written_k;
-        if (written && present[index] && delivered[index] == sizes[index])
-            values[index] = sizes[index] ? value_view_t {std::span<byte_t const> {rooms[index], sizes[index]}}
-                                         : value_view_t {empty_value_bytes_k, std::size_t {0}};
-        else if (!written && !present[index]) values[index] = value_view_t {};
-        else {
-            auto [value, read_status] = read_value(access, collection, keys[index]);
-            if (read_status.failed()) return read_status;
-            values[index] = value;
-        }
-    }
-    return {};
 }
 
 /** Writes @p value under @p key of @p collection, a missing value removing it: through the transaction of @p access,
@@ -980,12 +924,12 @@ status_t compact_due(database_state<cpu_class_>& state) noexcept {
     return {};
 }
 
-/** Flushes @p state when @p durability asks for it, then compacts what the write left due. */
+/** Makes landed writes durable when @p durability asks, the only failure a landed write can still
+ *  report, as the commit's own maintenance already compacts what it left due. */
 template <cpu_class_t cpu_class_>
 status_t settle(database_state<cpu_class_>& state, ustore_durability_t durability) noexcept {
-    if (durability == ustore_durability_flushed_k)
-        if (status_t const flushed = state.store->flush(); flushed.failed()) return flushed;
-    return compact_due(state);
+    if (durability != ustore_durability_flushed_k) return {};
+    return state.store->flush();
 }
 
 /**
@@ -1133,22 +1077,36 @@ expected<collections_entry_t> look_up(database_state<cpu_class_>& state, ustore_
     return read_collections_entry(state, collection, held);
 }
 
-/** Refuses a batch addressing a collection the collections system collection does not list, as @p view reads it, or
- *  one @c admit_modality refuses for @p modality, looking each run of tasks on one collection up once. */
+/** Refuses a batch addressing a reserved collection, one the database does not list at the stamp
+ *  of @p view's snapshot or at the head, or one @c admit_modality refuses for @p modality, looking
+ *  each run of tasks on one collection up once in the entries the database holds in memory. */
 template <cpu_class_t cpu_class_>
 status_t resolve_runs(database_state<cpu_class_>& state, view_t const& view,
                       strided_iterator<ustore_collection_id_t const> collections, std::size_t count,
                       ustore_modality_t modality) noexcept {
     transaction_stamp_t const stamp = view.snapshot ? state_of<snapshot_state<cpu_class_>>(view.snapshot)->pin.stamp()
                                                     : head_stamp_k;
+    std::size_t const thread_index = thread_index_of(state, view);
     for (std::size_t index = 0; index != count; ++index) {
-        if (index != 0 && collections[index] == collections[index - 1]) continue;
-        auto [entry, look_up_status] = look_up(state, view.scratch, collections[index], stamp,
-                                               thread_index_of(state, view));
-        if (look_up_status.failed()) return look_up_status;
-        if (status_t const admitted = admit_modality(entry.modality, modality); admitted.failed()) return admitted;
+        ustore_collection_id_t const& collection = collections[index];
+        if (index != 0 && collection == collections[index - 1]) continue;
+        if (reserved(collection)) return {status_code_t::not_found_k, "No such collection"};
+        std::uint16_t store_tag = 0;
+        if (status_t const listed = state.store->listed_store_tag(collection, stamp, store_tag, thread_index);
+            listed.failed())
+            return listed;
+        if (status_t const admitted = admit_modality(modality_of(store_tag), modality); admitted.failed())
+            return admitted;
     }
     return {};
+}
+
+/** Where the tasks on the collection of task @p first end: the next task naming another one. */
+inline std::size_t run_end(strided_iterator<ustore_collection_id_t const> collections, std::size_t first,
+                           std::size_t count) noexcept {
+    std::size_t end = first + 1;
+    while (end != count && collections[end] == collections[first]) ++end;
+    return end;
 }
 
 /** The resolver of this engine, which its docs and pages verbs run first. */
@@ -1639,7 +1597,7 @@ status_t list_collections(database_state<cpu_class_>& state, ustore_arena_t scra
 
 /**
  *  @brief Forgets @p collection in both system collections, then returns its runs to the volume, or leaves them to
- *      the snapshots open, which still read them.
+ *      the snapshots and transactions open, which still read them.
  *
  *  The collections system collection changes under its own claim and straight into the store,
  *  outside the registry, since no caller's transaction reads it, so its change never shows as a
@@ -1657,6 +1615,10 @@ status_t drop_collection(database_state<cpu_class_>& state, ustore_arena_t scrat
         auto [listing, read_status] = read_value(head, collections_collection_k, listed);
         if (read_status.failed()) return read_status;
         if (!listing) return {status_code_t::not_found_k, "No collection has such identifier"};
+        // Room to retire it is claimed before anything changes, so a refused drop changes nothing
+        std::size_t const retiring = state.retired_collections.size() + 1;
+        if (status_t const room = growth_status(state.retired_collections.reserve(retiring)); room.failed())
+            return {status_code_t::out_of_memory_k, "No room to retire a collection readers still hold"};
         std::string_view const record {listing};
         std::string_view const name = record.size() > sizeof(collections_record_t)
                                           ? record.substr(sizeof(collections_record_t))
@@ -1665,22 +1627,30 @@ status_t drop_collection(database_state<cpu_class_>& state, ustore_arena_t scrat
             if (status_t const unnamed = write_name(state, scratch, name, nullptr); unnamed.failed()) return unnamed;
         if (status_t const unlisted = write_value(head, collections_collection_k, listed, {}); unlisted.failed())
             return unlisted;
-        // A snapshot taken before the unlisting still reads the runs, which wait for the last snapshot to go
-        if (atomic_ref_of<cpu_class_, std::size_t> {state.open_snapshots}.load(std::memory_order_acquire) != 0 &&
-            state.retired_collections.push_back(ustore_collection_id_t {collection}) == st::status_t::success_k)
-            return {};
+        if (status_t const unlisted = state.store->unlist_collection(collection); unlisted.failed()) return unlisted;
+        // A reader counted before the unlisting still reads the runs, kept until the last one goes
+        if (atomic_ref_of<cpu_class_, std::size_t> {state.open_readers}.load(std::memory_order_acquire) != 0)
+            return growth_status(
+                state.retired_collections.push_back(st::assume_reserved, ustore_collection_id_t {collection}));
     }
     // The unlisting reaches a run in the same manifest that stops naming the collection
     return state.store->drop_collection(collection, collections_collection_k);
 }
 
-/** Drops every collection a drop left for the snapshots, which the last snapshot freed no longer reads. */
+/** Drops every collection kept for the readers, once the last reader is freed. */
 template <cpu_class_t cpu_class_>
 void drop_retired(database_state<cpu_class_>& state) noexcept {
     collections_guard<cpu_class_> const held {state};
     for (ustore_collection_id_t const& collection : state.retired_collections) [[maybe_unused]]
         status_t const dropped = state.store->drop_collection(collection);
     state.retired_collections.clear();
+}
+
+/** Counts one reader of @p state closed, and with the last one drops the collections kept for
+ *  the readers. */
+template <cpu_class_t cpu_class_>
+void close_reader(database_state<cpu_class_>& state) noexcept {
+    if (count_reader_closed<cpu_class_>(state.open_readers)) drop_retired(state);
 }
 
 #pragma endregion Clearing
@@ -1937,8 +1907,11 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     auto [outputs, outputs_status] = validate_collection_find(arguments, names);
     if (outputs_status.failed()) return outputs_status;
     // Through a snapshot the names read as they stood at its stamp, and through anything else at the head
-    call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, view.scratch};
-    call_access<cpu_class_> const named = view.snapshot ? access_of(state, view) : head;
+    call_access<cpu_class_> named {state, nullptr, watch_schedule_t::never_k, view.scratch};
+    if (view.snapshot) {
+        named.stamp = state_of<snapshot_state<cpu_class_>>(view.snapshot)->pin.stamp();
+        named.thread_index = thread_index_of(state, view);
+    }
     for (std::size_t index = 0; index != arguments.count; ++index) {
         bool present = false;
         ustore_collection_id_t found;
@@ -1969,11 +1942,19 @@ status_t transaction_init(ustore_transaction_init_t const& arguments, view_t con
         return {};
     }
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
+    // Counted before its stamp is pinned, so a drop sees it or unlisted below that stamp
+    count_reader_opened<cpu_class_>(state.open_readers);
     auto [opened, begin_status] = begin_transaction(state, state.transaction_shape);
-    if (begin_status.failed()) return begin_status;
+    if (begin_status.failed()) {
+        close_reader(state);
+        return begin_status;
+    }
     auto [made, status] = make_handle<ustore_transaction_handle_t, transaction_state<cpu_class_>>(
         nvme_variant<cpu_class_>::engine_k, state, std::move(opened));
-    if (status.failed()) return status;
+    if (status.failed()) {
+        close_reader(state);
+        return status;
+    }
     *arguments.transaction = made.release();
     return {};
 }
@@ -2255,17 +2236,24 @@ status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& argum
     return {};
 }
 
-/** Frees @p transaction, retiring it from the registry. */
+/** Frees @p transaction, retiring it from the registry, and with the last reader the runs of the
+ *  collections dropped meanwhile. */
 template <cpu_class_t cpu_class_>
 void transaction_free(ustore_transaction_t transaction) noexcept {
-    delete state_of<transaction_state<cpu_class_>>(transaction);
+    auto* const freed = state_of<transaction_state<cpu_class_>>(transaction);
+    database_state<cpu_class_>& state = freed->state;
+    delete freed;
+    close_reader(state);
 }
 
-/** Flushes and unmounts @p database ahead of freeing it, which every transaction of
- *  it must precede. */
+/** Flushes and unmounts @p database ahead of freeing it, which every transaction and snapshot of it
+ *  must precede, refusing while one is open, as its pin would outlive the ledger. */
 template <cpu_class_t cpu_class_>
 void database_free(ustore_database_t database) noexcept {
-    delete state_of<database_state<cpu_class_>>(database);
+    database_state<cpu_class_>* const state = state_of<database_state<cpu_class_>>(database);
+    if (state && atomic_ref_of<cpu_class_, std::size_t> {state->open_readers}.load(std::memory_order_acquire) != 0)
+        return;
+    delete state;
 }
 
 #pragma endregion Lifetime
@@ -2280,8 +2268,9 @@ status_t snapshot_init(ustore_snapshot_init_t const& arguments, view_t const&) n
     auto [made, status] = make_handle<ustore_snapshot_handle_t, snapshot_state<cpu_class_>>(
         nvme_variant<cpu_class_>::engine_k, state);
     if (status.failed()) return status;
+    // A drop unlisting after this count sees it, and one that unlisted before is below the stamp
+    count_reader_opened<cpu_class_>(state.open_readers);
     transaction_stamp_t const stamp = state.store->ledger().pin_reader(made.state->pin);
-    count_snapshot_opened<cpu_class_>(state.open_snapshots);
     if (arguments.read_stamp) *arguments.read_stamp = static_cast<ustore_stamp_t>(stamp);
     *arguments.snapshot = made.release();
     return {};
@@ -2448,14 +2437,26 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     return saved;
 }
 
-/** Frees the snapshot behind @p handle, letting go of the stamp it pinned, and with the last one the runs of the
- *  collections dropped meanwhile. */
+/** Frees the snapshot behind @p handle, letting go of the stamp it pinned, and with the last
+ *  reader the runs of the collections dropped meanwhile. */
 template <cpu_class_t cpu_class_>
 void snapshot_free(ustore_snapshot_t handle) noexcept {
     auto* const snapshot = state_of<snapshot_state<cpu_class_>>(handle);
     database_state<cpu_class_>& state = snapshot->state;
     delete snapshot;
-    if (count_snapshot_closed<cpu_class_>(state.open_snapshots)) drop_retired(state);
+    close_reader(state);
+}
+
+/** Pins the newest stamp of the store's ledger into the room of @p pin, for one call's verbs. */
+template <cpu_class_t cpu_class_>
+void pin_call(ustore_database_t database, call_pin_t& pin) noexcept {
+    using pin_t = typename basic_database_of<cpu_class_>::pin_t;
+    static_assert(sizeof(pin_t) <= call_pin_bytes_k && alignof(pin_t) <= alignof(std::max_align_t),
+                  "A ledger pin fits the room the router keeps for it");
+    database_state<cpu_class_>& state = *state_of<database_state<cpu_class_>>(database);
+    pin_t* const held = new (pin.room) pin_t {};
+    pin.stamp = static_cast<ustore_stamp_t>(state.store->ledger().pin_reader(*held));
+    pin.release = [](call_pin_t& pinned) noexcept { std::launder(reinterpret_cast<pin_t*>(pinned.room))->~pin_t(); };
 }
 
 #pragma endregion Snapshot Calls

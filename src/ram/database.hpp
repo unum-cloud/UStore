@@ -567,12 +567,17 @@ transaction_source<cpu_class_, isolation_> reading_as(transaction_source<cpu_cla
     return {source.state, source.transaction, watches_reads<isolation_>(watch)};
 }
 
-/** Hands @p action the source @p view names: a snapshot, a transaction, or the newest stamp, claimed for the call. */
+/** Hands @p action the source @p view names: a snapshot, a transaction, the stamp the router
+ *  claimed for the call, or the newest stamp, claimed for the call. */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename action_type_>
 auto with_source(database_state<cpu_class_, isolation_>& state, view_t const& view, action_type_&& action) noexcept {
     if (view.snapshot) {
         reader_source<cpu_class_, isolation_> source {
             state, state_of<snapshot_state<cpu_class_, isolation_>>(view.snapshot)->claim.snapshot()};
+        return action(source);
+    }
+    if (!view.transaction && view.stamp) {
+        reader_source<cpu_class_, isolation_> source {state, static_cast<generation_t>(view.stamp)};
         return action(source);
     }
     if (!view.transaction) {
@@ -2134,7 +2139,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_snapshot_in
         ram_variant<cpu_class_, isolation_>::engine_k, state);
     if (status.failed()) return status;
     state.order.take_snapshot(made.state->claim);
-    count_snapshot_opened<cpu_class_>(state.open_snapshots);
+    count_reader_opened<cpu_class_>(state.open_snapshots);
     if (arguments.read_stamp) *arguments.read_stamp = made.state->claim.snapshot();
     *arguments.snapshot = made.release();
     return {};
@@ -2603,6 +2608,19 @@ void changes_cursor_free(ustore_changes_cursor_t cursor) noexcept {
     free_unreachable(state);
 }
 
+/** Claims the newest stamp of @p database's order into the room of @p pin, for one call's verbs. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+void pin_call(ustore_database_t database, call_pin_t& pin) noexcept {
+    static_assert(sizeof(claim_t) <= call_pin_bytes_k && alignof(claim_t) <= alignof(std::max_align_t),
+                  "An order claim fits the room the router keeps for it");
+    database_state<cpu_class_, isolation_>& state = *state_of<database_state<cpu_class_, isolation_>>(database);
+    claim_t* const held = new (pin.room) claim_t {};
+    pin.stamp = static_cast<ustore_stamp_t>(state.order.take_snapshot(*held));
+    pin.release = [](call_pin_t& pinned) noexcept {
+        std::launder(reinterpret_cast<claim_t*>(pinned.room))->~claim_t();
+    };
+}
+
 #pragma endregion Change Feed Calls
 
 #pragma region Table
@@ -2631,7 +2649,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 void snapshot_free(ustore_snapshot_t handle) noexcept {
     auto* const snapshot = state_of<snapshot_state<cpu_class_, isolation_>>(handle);
     database_state<cpu_class_, isolation_>& state = snapshot->state;
-    [[maybe_unused]] bool const last = count_snapshot_closed<cpu_class_>(state.open_snapshots);
+    [[maybe_unused]] bool const last = count_reader_closed<cpu_class_>(state.open_snapshots);
     delete snapshot;
     free_unreachable(state);
 }

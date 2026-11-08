@@ -88,6 +88,7 @@ database_verbs_t const nvme_variant<cpu_class_>::database_verbs_k {
     .changes_cursor_init = &changes_cursor_init<cpu_class_>,
     .changes_cursor_next = &changes_cursor_next<cpu_class_>,
     .changes_cursor_free = &changes_cursor_free<cpu_class_>,
+    .pin_call = &pin_call<cpu_class_>,
 };
 
 template <cpu_class_t cpu_class_>

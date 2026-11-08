@@ -567,6 +567,43 @@ case_result_t database_pages_transactions(config_t const& config) {
     return failures;
 }
 
+/** A transaction that edited a page fails to commit once another commit removed that page, so the
+ *  page stays removed rather than coming back with the edit. */
+case_result_t database_pages_edit_after_removal(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!serves_pages(database)) return case_result_t::skipped("the engine serves no pages yet", failures);
+    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
+
+    auto [pages, pages_status] = create_pages_collection(database, "pages");
+    pages_client_t head {database, pages};
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(pages_status.succeeded() && arena_status.succeeded());
+    if (failures) return failures;
+    head.arena = std::move(arena);
+    element_key_t const page = element_key_of(key_from_integer(9));
+    failures += expect(head.import(page, "<doc><p>one</p></doc>").succeeded());
+
+    auto [editing, editing_status] = database.transaction();
+    auto [editing_arena, editing_arena_status] = arena_t::make();
+    failures += expect(editing_status.succeeded() && editing_arena_status.succeeded());
+    if (failures) return failures;
+    pages_client_t editing_client {database, pages, editing.transaction()};
+    editing_client.arena = std::move(editing_arena);
+    page_task_t spliced;
+    spliced.element = page, spliced.value = "lead";
+    failures += expect(editing_client.edit(modification_t::splice_k, page, {spliced}).succeeded());
+
+    failures += expect(head.edit(modification_t::remove_k, page, {{}}).succeeded());
+    failures += expect_eq(head.read(page), std::string(page_absent_k));
+    failures += expect_status(editing.commit(), status_code_t::write_conflict_k);
+    failures += expect_eq(head.read(page), std::string(page_absent_k));
+    return failures;
+}
+
 /** A failing task leaves every page of its call untouched, and a page is one value, its current
  *  shape, which a removal of the page takes away. */
 case_result_t database_pages_all_or_nothing(config_t const& config) {
@@ -850,6 +887,7 @@ int main(int argc, char** argv) {
 
     report(totals, "database.pages_random_streams", database_pages_random_streams, config);
     report(totals, "database.pages_transactions", database_pages_transactions, config);
+    report(totals, "database.pages_edit_after_removal", database_pages_edit_after_removal, config);
     report(totals, "database.pages_all_or_nothing", database_pages_all_or_nothing, config);
     report(totals, "pages.refusals", pages_refusals, config);
     report(totals, "pages.range_end_bound", pages_range_end_bound, config);

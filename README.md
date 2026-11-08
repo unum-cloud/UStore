@@ -62,11 +62,11 @@ int main() {
     if (status.failed())
         return 1;
 
-    blobs_collection_t main = db.main();
-    if (main[key_from_integer(42)].assign("Hi").failed())
+    auto [greetings, collection_status] = db.find_or_create("greetings");
+    if (collection_status.failed() || greetings[key_from_integer(42)].assign("Hi").failed())
         return 1;
 
-    auto value = main[key_from_integer(42)].value();
+    auto value = greetings[key_from_integer(42)].value();
     return value && *value == "Hi" ? 0 : 1;
 }
 ```
@@ -111,8 +111,8 @@ Scale-out stays above the database, where a data-lake layer composes several suc
 
 ## Blobs
 
-A collection maps UUID keys to binary values, and the main collection exists in every database.
-Named collections are created on first use and address the same kind of values.
+A collection maps UUID keys to binary values, and a database holds any number of them, each under its own name.
+`find_or_create` opens one by name, creating it on first use.
 
 ```cpp
 blobs_collection_t archive = *db.find_or_create("archive");
