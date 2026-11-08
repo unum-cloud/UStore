@@ -37,12 +37,13 @@ store_status_t write_one(database_state<cpu_class_, isolation_>& state,
                          value_view_t content, status_t& outcome) noexcept {
     claim_t claim;
     reader_source<cpu_class_, isolation_> source {state, state.order.take_snapshot(claim)};
-    return for_each_run(source, collections, 1, outcome,
-                        [&](auto& entries, std::size_t, std::size_t) noexcept -> store_status_t {
-                            using entry_t = entry_of<decltype(entries)>;
-                            if constexpr (!std::is_same_v<entry_t, value_pair_t>) return refused_modality(outcome);
-                            else return stage_upsert<value_pair_t>(entries, key, content);
-                        });
+    return for_each_run(
+        source, collections, 1, outcome,
+        [&]<typename entries_type_>(entries_type_& entries, std::size_t, std::size_t) noexcept -> store_status_t {
+            using entry_t = entry_of<entries_type_>;
+            if constexpr (!std::is_same_v<entry_t, value_pair_t>) return refused_modality(outcome);
+            else return stage_upsert<value_pair_t>(entries, key, content);
+        });
 }
 
 /** Implements @c ustore_blobs_write, committing a batch outside a transaction atomically. */

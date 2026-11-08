@@ -1657,6 +1657,48 @@ expected<ustore_database_t> open_saved(config_t const& config, char const* path)
     return database;
 }
 
+/** A write asking for no durability reaches the files once @c ustore_database_flush returns, so a
+ *  copy of them taken with the database still open, as a crash would leave them, reads it. */
+case_result_t database_flush_durable(config_t const& config) {
+    std::size_t failures = 0;
+    if (!config.directory()) return case_result_t::skipped(needs_directory_k, failures);
+    path_t const directory {config.directory(), "flushed"};
+    path_t const copied {config.directory(), "flushed.copy"};
+    failures += expect(recreate_directory(directory.c_str()));
+    auto [database, open_status] = open_saved(config, directory.c_str());
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "flushed", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
+    ustore_key_t const key = key_from_integer(5);
+    failures += write_text(database, blobs, {&key, 1}, "durable");
+
+    ustore_outcome_t outcome {};
+    ustore_database_flush_t flush {.database = database, .outcome = &outcome};
+    ustore_database_flush(&flush);
+    failures += expect_success(outcome);
+    std::error_code error;
+    std::filesystem::remove_all(copied.c_str(), error);
+    std::filesystem::copy(directory.c_str(), copied.c_str(), std::filesystem::copy_options::recursive, error);
+    failures += expect(!error);
+    ustore_database_free(database);
+
+    auto [copy, copy_status] = open_saved(config, copied.c_str());
+    failures += expect(copy_status.succeeded());
+    if (failures != 0) return failures;
+    auto [kept, kept_status] = collection_named(receiver_t {copy}, "flushed");
+    failures += expect(kept_status.succeeded());
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(arena_status.succeeded());
+    read_columns_t columns;
+    ustore_blobs_read_t read = read_of(copy, kept, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read(&read);
+    failures += expect_success(outcome);
+    failures += expect(columns.presences && (columns.presences[0] & 1) != 0 && columns.value(0) == "durable");
+    ustore_database_free(copy);
+    return failures;
+}
+
 /** A RAM image that exists but does not open fails the open, rather than opening an empty
  *  database over it. */
 case_result_t database_unreadable_image(config_t const& config) {
@@ -2189,6 +2231,7 @@ int main(int argc, char** argv) {
     report(totals, "database.find_at_snapshot", database_find_at_snapshot, config);
     report(totals, "database.fresh_collections", database_fresh_collections, config);
     report(totals, "database.describe_compact", database_describe_compact, config);
+    report(totals, "database.flush_durable", database_flush_durable, config);
     report(totals, "database.clear_modes", database_clear_modes, config);
     report(totals, "database.view_refusals", database_view_refusals, config);
     report(totals, "progress.cancel_scans", progress_cancel_scans, config);

@@ -25,7 +25,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 
-#include <algorithm> // `std::max`, `std::min`, `std::sort`
+#include <algorithm> // `std::max`, `std::min`
 #include <atomic>    // `std::atomic_thread_fence`, `std::memory_order_acquire`, `std::memory_order_release`
 #include <memory>    // `std::construct_at`, `std::destroy_at`
 #include <span>      // `std::span`
@@ -40,6 +40,7 @@
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`
 #include "ustore/blobs/nvme_memory_run.hpp"      // `kept_versions`, `stamped_delta`
 #include "ustore/blobs/nvme_tree.hpp"            // `lsm_tree`, `collection_config_t`, `compaction_stamps_t`
+#include "ustore/utilities/algorithm.hpp"        // `radix_sort`, `word_byte`
 #include "ustore/utilities/folds.hpp"            // `fold_concept`
 #include "ustore/utilities/nvme_channels.hpp"    // `io_channel_t`
 #include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`, `arena_allocator`, `resource_constraint`, `constrained_allocator`
@@ -131,6 +132,10 @@ class stamp_pin {
 
     /** The stamp held. */
     transaction_stamp_t stamp_ = unwritten_stamp_k;
+
+    /** The fold floor of the store a feed reads, whose address is only compared, so a dropped
+     *  store's pin can only hold a merge back; unused by the other kinds. */
+    transaction_stamp_t const* folded_ = nullptr;
 
     /** Which list of the ledger holds this pin. */
     pin_kind_t kind_ = pin_kind_t::reader_k;
@@ -367,17 +372,18 @@ class commit_ledger {
         if (stamp < folded) return {status_code_t::write_conflict_k, "A merge folded the versions after that stamp"};
         pin.stamp_ = stamp;
         pin.kind_ = pin_kind_t::feed_k;
+        pin.folded_ = &folded;
         link_(feeds_, pin);
         return {};
     }
 
-    /** @p horizon lowered to the oldest stamp a feed pins, which a merge of a collection keeps
+    /** @p horizon lowered to the oldest stamp a feed of the collection pins, which its merge keeps
      *  every version above, raising the stamp @p folded that collection's merges may have folded up
      *  to; one claim covers both, so a feed either bounds the merge or finds its fold. */
     [[nodiscard]] transaction_stamp_t fold_horizon(transaction_stamp_t horizon, transaction_stamp_t& folded) noexcept {
         guard_t const held {claim_};
         for (pin_t const* pin = feeds_.next_; pin != &feeds_; pin = pin->next_)
-            horizon = std::min(horizon, pin->stamp_);
+            if (pin->folded_ == &folded) horizon = std::min(horizon, pin->stamp_);
         if (folded < horizon) folded = horizon;
         return horizon;
     }
@@ -426,7 +432,10 @@ class commit_ledger {
                 if (into.push_back(transaction_stamp_t {pin->stamp_}) != st::status_t::success_k)
                     return {status_code_t::out_of_memory_k, "No room to list the stamps readers pin"};
         }
-        std::sort(into.begin(), into.end());
+        utilities::radix_sort(
+            std::span<transaction_stamp_t> {into}, sizeof(transaction_stamp_t),
+            [](transaction_stamp_t stamp, std::size_t digit) noexcept { return utilities::word_byte(stamp, digit); },
+            [](transaction_stamp_t first, transaction_stamp_t second) noexcept { return first < second; });
         std::size_t kept = 0;
         for (std::size_t index = 0; index != into.size(); ++index)
             if (kept == 0 || into[kept - 1] != into[index]) into[kept++] = into[index];
@@ -542,6 +551,7 @@ class commit_ledger {
         guard_t const held {claim_};
         into.ledger_ = this;
         into.stamp_ = from.stamp_;
+        into.folded_ = from.folded_;
         into.kind_ = from.kind_;
         into.previous_ = from.previous_;
         into.next_ = from.next_;
@@ -846,9 +856,11 @@ struct memory_shape_t {
  *  @tparam memory_run_type_ The memory run a commit publishes, @c blobs::memory_run or @c strings::memory_run.
  *  @tparam atomic_reference_ The reference the published view, the budget and the ledger own their words through.
  *  @tparam waiter_type_ What a core waiting on a read, a barrier or the ledger does between attempts, before it parks.
+ *  @tparam row_kit_type_ The SmashTable kit the tree's runs search with.
  */
 template <typename key_slot_type_, typename memory_run_type_, typename volume_type_,
-          template <typename> typename atomic_reference_, typename waiter_type_>
+          template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_ = st::native_row_kit_t>
 class published_runs {
   public:
 
@@ -864,7 +876,7 @@ class published_runs {
     using volume_t = volume_type_;
 
     /** The tree the flushed writes live in. */
-    using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiter_type_>;
+    using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiter_type_, row_kit_type_>;
 
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
@@ -1301,12 +1313,15 @@ class published_runs {
      *  @param[in] device_fold What composes the changes of the merge on a device, or @c no_device_fold_t where nothing
      *      does, which keeps every merge holding a change on the host.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
+     *  @param[in] fan_out The threads a merge on the host fans its slices out over, or one slice on
+     *      the calling thread.
      */
     template <utilities::fold_concept fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(io_channel_t& reading_channel, io_channel_t& writing_channel,
                                            compactor_ref_t const& compactor, fold_type_ const& fold,
                                            device_fold_type_ const& device_fold,
-                                           lsm_tree_publication_hook_t const& published) noexcept {
+                                           lsm_tree_publication_hook_t const& published,
+                                           compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
         // A pinned reader keeps the version it reads, and the durable horizon keeps the version a mount falls back to.
         st::vector<transaction_stamp_t> readers;
         if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
@@ -1320,7 +1335,7 @@ class published_runs {
         publication.oldest_readable = stamps.horizon;
         publication.chained = &published;
         return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, compactor, nullptr,
-                             fold, device_fold, publication.hook(), stamps);
+                             fold, device_fold, publication.hook(), stamps, fan_out);
     }
 
     /**

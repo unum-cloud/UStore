@@ -42,7 +42,10 @@ __device__ inline std::uint64_t chain_ticket(std::uint64_t* slot) noexcept {
                      atomicAdd(reinterpret_cast<unsigned long long*>(slot), 1ull << chain_tickets_shift_k)) >>
                  chain_tickets_shift_k;
     __syncthreads();
-    return ticket;
+    std::uint64_t const taken = ticket;
+    // A second call in the same block rewrites the slot, so no thread may still be reading it then
+    __syncthreads();
+    return taken;
 }
 
 /** The total of the blocks before ticket @p ticket of @p tickets, once each of them chained,
@@ -63,7 +66,10 @@ __device__ inline std::uint64_t chain_offset(std::uint64_t* slot, std::uint64_t 
         else atomicAdd(chain, (1ull << chain_chained_shift_k) + total);
     }
     __syncthreads();
-    return offset;
+    std::uint64_t const before = offset;
+    // A second call in the same block rewrites the slot, so no thread may still be reading it then
+    __syncthreads();
+    return before;
 }
 
 /** What one thread's value scans to across its block: the sum of the values of the threads before

@@ -109,22 +109,6 @@ inline constexpr backup_id_t invalid_backup_id_k = std::numeric_limits<backup_id
 
 #pragma endregion Identifiers
 
-#pragma region File Names
-
-/** Extension of sorted run data files. */
-inline constexpr std::string_view sorted_run_file_extension_k = "udb";
-
-/** Extension of schema documents. */
-inline constexpr std::string_view schema_file_extension_k = "sch";
-
-/** Extension of backup schema documents. */
-inline constexpr std::string_view backup_schema_file_extension_k = "bak";
-
-/** Suffix of the file holding user data next to a schema. */
-inline constexpr std::string_view user_data_file_name_k = "user.data";
-
-#pragma endregion File Names
-
 #pragma region Modes
 
 /** Whether a database holds one collection with transactions of its own, or many sharing them. */
@@ -407,7 +391,10 @@ struct stored_value_location {
 /** An inline value sits in the key slot itself, so its location names the run it was read from. */
 template <value_layout_t value_layout_>
     requires inline_value_layout_concept<value_layout_>
-struct stored_value_location<value_layout_> : public stored_value_location<value_layout_t::unknown_k> {
+struct stored_value_location<value_layout_> {
+
+    /** The caller, size, offset and kind every layout shares. */
+    stored_value_location<value_layout_t::unknown_k> extent;
 
     /** The LSM level the key slot came from. */
     u32_t lsm_level_number = unknown_run_number_k;
@@ -416,18 +403,21 @@ struct stored_value_location<value_layout_> : public stored_value_location<value
     u32_t sorted_run_number = unknown_run_number_k;
 
     /** Whether the location names a value, which a removal does not. */
-    explicit operator bool() const noexcept { return kind != delta_kind_t::remove_k; }
+    explicit operator bool() const noexcept { return extent.kind != delta_kind_t::remove_k; }
 
     /** Bytes the value occupies. */
-    stored_value_size_t size() const noexcept { return size_bytes; }
+    stored_value_size_t size() const noexcept { return extent.size_bytes; }
 
     /** Bytes a buffer needs for the value, which needs no alignment when it is inline. */
-    stored_value_size_t aligned_buffer_size() const noexcept { return size_bytes; }
+    stored_value_size_t aligned_buffer_size() const noexcept { return extent.size_bytes; }
 };
 
 /** A fixed-width value sits at one offset of one file, and every value of the collection is as wide. */
 template <>
-struct stored_value_location<value_layout_t::fixed_width_k> : public stored_value_location<value_layout_t::unknown_k> {
+struct stored_value_location<value_layout_t::fixed_width_k> {
+
+    /** The caller, size, offset and kind every layout shares. */
+    stored_value_location<value_layout_t::unknown_k> extent;
 
     /** The disk holding the file. */
     disk_id_t disk_id = disk_id_t::unknown_k;
@@ -436,30 +426,33 @@ struct stored_value_location<value_layout_t::fixed_width_k> : public stored_valu
     file_id_t file_id = file_id_t::invalid_k;
 
     /** Whether the location names a value, which a removal does not. */
-    explicit operator bool() const noexcept { return kind != delta_kind_t::remove_k; }
+    explicit operator bool() const noexcept { return extent.kind != delta_kind_t::remove_k; }
 
     /** Bytes the value occupies. */
-    stored_value_size_t size() const noexcept { return size_bytes; }
+    stored_value_size_t size() const noexcept { return extent.size_bytes; }
 
     /** Bytes a buffer needs for the value, rounded out to what unbuffered I/O accepts. */
     stored_value_size_t aligned_buffer_size() const noexcept {
-        stored_value_size_t const padded_size = stored_value_size_t(size_bytes != 0) * (buffer_padding() + size_bytes);
+        stored_value_size_t const padded_size = stored_value_size_t(extent.size_bytes != 0) *
+                                                (buffer_padding() + extent.size_bytes);
         return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
     }
 
     /** Where an unbuffered read of the value starts inside the file. */
     stored_value_size_t aligned_offset_in_file() const noexcept {
-        return round_down_to_multiple<stored_value_offset_t>(offset, buffer_alignment_k);
+        return round_down_to_multiple<stored_value_offset_t>(extent.offset, buffer_alignment_k);
     }
 
     /** Bytes between the start of the aligned read and the value itself. */
-    stored_value_size_t buffer_padding() const noexcept { return offset - aligned_offset_in_file(); }
+    stored_value_size_t buffer_padding() const noexcept { return extent.offset - aligned_offset_in_file(); }
 };
 
 /** A variable-width value sits at one offset of one file, and carries its own width. */
 template <>
-struct stored_value_location<value_layout_t::variable_width_k>
-    : public stored_value_location<value_layout_t::unknown_k> {
+struct stored_value_location<value_layout_t::variable_width_k> {
+
+    /** The caller, size, offset and kind every layout shares. */
+    stored_value_location<value_layout_t::unknown_k> extent;
 
     /** The disk holding the file. */
     disk_id_t disk_id = disk_id_t::unknown_k;
@@ -468,24 +461,25 @@ struct stored_value_location<value_layout_t::variable_width_k>
     file_id_t file_id = file_id_t::invalid_k;
 
     /** Whether the location names a value, which a removal does not. */
-    explicit operator bool() const noexcept { return kind != delta_kind_t::remove_k; }
+    explicit operator bool() const noexcept { return extent.kind != delta_kind_t::remove_k; }
 
     /** Bytes the value occupies. */
-    stored_value_size_t size() const noexcept { return size_bytes; }
+    stored_value_size_t size() const noexcept { return extent.size_bytes; }
 
     /** Bytes a buffer needs for the value, rounded out to what unbuffered I/O accepts. */
     stored_value_size_t aligned_buffer_size() const noexcept {
-        stored_value_size_t const padded_size = stored_value_size_t(size_bytes != 0) * (buffer_padding() + size_bytes);
+        stored_value_size_t const padded_size = stored_value_size_t(extent.size_bytes != 0) *
+                                                (buffer_padding() + extent.size_bytes);
         return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
     }
 
     /** Where an unbuffered read of the value starts inside the file. */
     stored_value_size_t aligned_offset_in_file() const noexcept {
-        return round_down_to_multiple<stored_value_offset_t>(offset, buffer_alignment_k);
+        return round_down_to_multiple<stored_value_offset_t>(extent.offset, buffer_alignment_k);
     }
 
     /** Bytes between the start of the aligned read and the value itself. */
-    stored_value_size_t buffer_padding() const noexcept { return offset - aligned_offset_in_file(); }
+    stored_value_size_t buffer_padding() const noexcept { return extent.offset - aligned_offset_in_file(); }
 };
 
 /**

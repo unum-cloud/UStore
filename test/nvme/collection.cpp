@@ -716,6 +716,104 @@ std::size_t widest_and_empty_values(mount_type_ const& mount) {
     return failures;
 }
 
+/** A batch naming a key several times keeps its last delta: the last write whatever its
+ *  width, an empty value before or after a wider one included, and a removal batch naming a
+ *  key twice removes it. */
+template <typename mount_type_>
+std::size_t repeated_keys_keep_the_last(mount_type_ const& mount) {
+    using types_t = collection_types<typename mount_type_::fixture_t>;
+    using variable_store_t = typename types_t::variable_store_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+
+    collection_config_t const config = test_config(0, value_max_size_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<variable_store_t> store = variable_store_t::mount(
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
+    failures += expect(store.has_value());
+    if (!store) return failures;
+
+    // The repeats of keys one to four sit on both sides of more distinct keys than an
+    // insertion sort takes.
+    constexpr std::size_t distinct_k = 100;
+    std::array<stored_key_t, 5> const leading_keys {1, 2, 2, 3, 4};
+    std::array<stored_value_size_t, 5> const leading_sizes {3, 0, 5, 0, 2};
+    std::array<stored_key_t, 4> const trailing_keys {3, 4, 1, 4};
+    std::array<stored_value_size_t, 4> const trailing_sizes {0, 4, 0, 1};
+    st::vector<stored_key_t> keys;
+    st::vector<stored_value_size_t> sizes;
+    std::size_t const count = leading_keys.size() + distinct_k + trailing_keys.size();
+    failures += expect(keys.resize(count) == st::status_t::success_k);
+    failures += expect(sizes.resize(count) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    for (std::size_t index = 0; index != count; ++index) {
+        std::size_t const trailing = index - (count - trailing_keys.size());
+        bool const leads = index < leading_keys.size(), trails = index >= count - trailing_keys.size();
+        keys[index] = leads ? leading_keys[index] : trails ? trailing_keys[trailing] : 1000 + index;
+        sizes[index] = leads ? leading_sizes[index] : trails ? trailing_sizes[trailing] : 1;
+    }
+
+    // Where the last value of each of keys one to four starts, and how wide it is.
+    std::array<std::size_t, 5> last_offsets {}, last_sizes {};
+    std::size_t total = 0;
+    for (std::size_t index = 0; index != count; ++index) {
+        if (keys[index] < last_offsets.size()) {
+            last_offsets[keys[index]] = total;
+            last_sizes[keys[index]] = sizes[index];
+        }
+        total += sizes[index];
+    }
+    st::vector<byte_t> values;
+    failures += expect(values.resize(total) == st::status_t::success_k);
+    for (std::size_t index = 0; index != values.size(); ++index) values[index] = painted(13, index);
+    failures += expect(store
+                           ->insert((*stack)->channel(), std::span<stored_key_t const> {keys},
+                                    std::span<byte_t const> {values}, std::span<stored_value_size_t const> {sizes})
+                           .succeeded());
+
+    auto holds = [&](stored_key_t stored_key, std::span<byte_t const> wanted) noexcept {
+        std::size_t missed = 0;
+        stored_value_size_t size = 0;
+        missed += expect(store->find(stored_key, size) == lookup_result_t::written_k);
+        missed += expect_eq(static_cast<std::size_t>(size), wanted.size());
+        std::array<byte_t, 8> into {};
+        missed += expect(store->select((*stack)->channel(), stored_key, std::span<byte_t> {into}, size).succeeded());
+        missed += expect_eq(std::memcmp(into.data(), wanted.data(), wanted.size()), 0);
+        return missed;
+    };
+    auto last_of = [&](stored_key_t stored_key) noexcept {
+        return std::span<byte_t const> {values}.subspan(last_offsets[stored_key], last_sizes[stored_key]);
+    };
+    for (stored_key_t stored_key = 1; stored_key != last_offsets.size(); ++stored_key)
+        failures += holds(stored_key, last_of(stored_key));
+
+    std::array<stored_key_t, 4> const removed {4, 77777, 4, 1};
+    failures += expect(store->remove((*stack)->channel(), std::span<stored_key_t const> {removed}).succeeded());
+    std::array<stored_key_t, 2> const rewritten {4, 4};
+    std::array<stored_value_size_t, 2> const rewritten_sizes {2, 3};
+    std::array<byte_t, 5> rewritten_values {};
+    for (std::size_t index = 0; index != rewritten_values.size(); ++index) rewritten_values[index] = painted(14, index);
+    failures += expect(store
+                           ->insert((*stack)->channel(), std::span<stored_key_t const> {rewritten},
+                                    std::span<byte_t const> {rewritten_values},
+                                    std::span<stored_value_size_t const> {rewritten_sizes})
+                           .succeeded());
+    for (std::size_t round = 0; round != 2; ++round) {
+        stored_value_size_t size = 0;
+        failures += expect(store->find(stored_key_t {1}, size) == lookup_result_t::removed_k);
+        failures += holds(2, last_of(2));
+        failures += holds(3, last_of(3));
+        failures += holds(4, std::span<byte_t const> {rewritten_values}.subspan(2, 3));
+        if (round == 0) failures += expect(store->flush((*stack)->channel()).succeeded());
+    }
+    return failures;
+}
+
 /** The value cache answers a version only with that version's bytes, never holds more than it was made with however
  *  many versions displace one another, and gives everything back when it dies. */
 std::size_t value_cache_holds_what_it_took() {
@@ -1408,6 +1506,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "burst_past_records", burst_past_records_lands_every_commit);
         report(totals, mount, "unaligned_exact_span", unaligned_exact_span_is_taken);
         report(totals, mount, "widest_and_empty", widest_and_empty_values);
+        report(totals, mount, "repeated_keys_keep_the_last", repeated_keys_keep_the_last);
         report(totals, mount, "holds_its_depth", batched_select_holds_its_depth);
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
         report(totals, mount, "range_removal_hides_older_runs", range_removal_hides_older_runs);

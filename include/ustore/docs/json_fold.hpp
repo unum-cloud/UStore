@@ -259,7 +259,10 @@ status_t for_each_delta(std::span<delta_view_t const> deltas, callback_type_&& c
         case delta_kind_t::write_k:
             status = callback(json_delta_t {0, delta_modification_t::write_k, {}, text_of_bytes(delta.bytes)});
             break;
-        case delta_kind_t::remove_k: status = callback(json_delta_t {0, delta_modification_t::remove_k, {}, {}}); break;
+        case delta_kind_t::remove_k:
+        case delta_kind_t::remove_range_k:
+            status = callback(json_delta_t {0, delta_modification_t::remove_k, {}, {}});
+            break;
         case delta_kind_t::change_k: status = for_each_delta(delta.bytes, callback); break;
         default: status = {status_code_t::malformed_k, "A delta has an unknown kind"}; break;
         }

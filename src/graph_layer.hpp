@@ -153,8 +153,9 @@ inline status_t pull_and_link_for_updates( //
     strided_span<updated_entry_t> unique_entries, view_t const& view) noexcept {
 
     std::size_t const unique_count = unique_entries.size();
-    auto const collections = unique_entries.immutable().members(&updated_entry_t::collection);
-    auto const keys = unique_entries.immutable().members(&updated_entry_t::key);
+    auto const collections =
+        unique_entries.immutable().members(&updated_entry_t::key).members(&collection_key_t::collection);
+    auto const keys = unique_entries.immutable().members(&updated_entry_t::key).members(&collection_key_t::key);
 
     // A transaction watches the vertices it rewrites, whatever the caller asked of the writes
     view_t watching = view;
@@ -183,8 +184,10 @@ inline status_t write_entries(blobs_verbs<home_t::host_k> const& values_verbs, u
                               view_t const& view) noexcept {
     if (entries.empty()) return {};
     strided_span<updated_entry_t const> const written = strided(entries);
-    strided_span<ustore_collection_id_t const> const collections = written.members(&updated_entry_t::collection);
-    strided_span<ustore_key_t const> const keys = written.members(&updated_entry_t::key);
+    strided_span<ustore_collection_id_t const> const collections =
+        written.members(&updated_entry_t::key).members(&collection_key_t::collection);
+    strided_span<ustore_key_t const> const keys =
+        written.members(&updated_entry_t::key).members(&collection_key_t::key);
 
     // The views of the values are gathered here, as the router gathers what an accessor writes
     auto [values, values_status] = arena_allocate<ustore_bytes_view_t>(view.scratch, entries.size());
@@ -221,10 +224,10 @@ status_t update_neighborhoods(blobs_verbs<home_t::host_k> const& values_verbs, a
     if (entries_status.failed()) return entries_status;
     std::ranges::fill(unique_entries, updated_entry_t {});
     for (std::size_t index = 0; index != edges_count; ++index) {
-        unique_entries[index].collection = edge_collections[index];
-        unique_entries[index].key = sources[index];
-        unique_entries[edges_count + index].collection = edge_collections[index];
-        unique_entries[edges_count + index].key = targets[index];
+        unique_entries[index].key.collection = edge_collections[index];
+        unique_entries[index].key.key = sources[index];
+        unique_entries[edges_count + index].key.collection = edge_collections[index];
+        unique_entries[edges_count + index].key.key = targets[index];
     }
 
     std::size_t const unique_count = sort_and_deduplicate(unique_entries.begin(), unique_entries.end());
@@ -284,8 +287,10 @@ inline status_t remove_entries(blobs_verbs<home_t::host_k> const& values_verbs, 
                                view_t const& view) noexcept {
     if (entries.empty()) return {};
     strided_span<updated_entry_t const> const removed = strided(entries);
-    strided_span<ustore_collection_id_t const> const collections = removed.members(&updated_entry_t::collection);
-    strided_span<ustore_key_t const> const keys = removed.members(&updated_entry_t::key);
+    strided_span<ustore_collection_id_t const> const collections =
+        removed.members(&updated_entry_t::key).members(&collection_key_t::collection);
+    strided_span<ustore_key_t const> const keys =
+        removed.members(&updated_entry_t::key).members(&collection_key_t::key);
 
     ustore_blobs_remove_t remove {};
     remove.database = database;
@@ -436,12 +441,12 @@ inline status_t graph_remove_vertices_over_blobs(blobs_verbs<home_t::host_k> con
     ustore_key_t const* neighbor = neighbors_per_vertex;
     for (std::size_t index = 0; index != arguments.count; ++index) {
         ustore_collection_id_t const collection = vertex_collections[index];
-        planned->collection = collection;
-        planned->key = vertices[index];
+        planned->key.collection = collection;
+        planned->key.key = vertices[index];
         ++planned;
         for (std::size_t offset = 0; offset != present_degree(index); ++offset, ++neighbor, ++planned) {
-            planned->collection = collection;
-            planned->key = *neighbor;
+            planned->key.collection = collection;
+            planned->key.key = *neighbor;
         }
     }
     unique_count = sort_and_deduplicate(unique_entries.data(), planned);

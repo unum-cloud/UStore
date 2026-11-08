@@ -49,7 +49,10 @@ using utilities::value_view_t;
 constexpr std::size_t bytes_in_degrees_header_k = 2 * sizeof(ustore_vertex_degree_t);
 
 /** A vertex value being rewritten, together with how many neighborships the update changes. */
-struct updated_entry_t : public collection_key_t {
+struct updated_entry_t {
+
+    /** The vertex, which orders and equates the entries. */
+    collection_key_t key;
 
     /** Bytes of the vertex value, degrees first. */
     ustore_byte_t* content = nullptr;
@@ -61,6 +64,14 @@ struct updated_entry_t : public collection_key_t {
     ustore_vertex_degree_t degree_delta = 0;
 
     operator value_view_t() const noexcept { return {content, length}; }
+    operator collection_key_t() const noexcept { return key; }
+
+    friend bool operator==(updated_entry_t const& left, updated_entry_t const& right) noexcept {
+        return left.key == right.key;
+    }
+    friend std::strong_ordering operator<=>(updated_entry_t const& left, updated_entry_t const& right) noexcept {
+        return left.key <=> right.key;
+    }
 };
 
 /** Reads the degree at @p index of the header of @p value, which starts wherever its blob does. */

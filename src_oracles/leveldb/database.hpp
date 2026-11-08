@@ -703,6 +703,14 @@ status_t database_compact(ustore_database_compact_t const& arguments, view_t con
     return {};
 }
 
+/** Syncs the log through an empty batch, the only sync LevelDB offers. */
+status_t database_flush(ustore_database_flush_t const& arguments, view_t const&) {
+    ::leveldb::WriteOptions synced;
+    synced.sync = true;
+    ::leveldb::WriteBatch nothing;
+    return status_of(state_of<database_t>(arguments.database)->native->Write(synced, &nothing));
+}
+
 #pragma endregion Collections
 
 #pragma region Memory

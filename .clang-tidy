@@ -1,0 +1,21 @@
+# A narrow, bug-focused check set, as the sibling libraries keep, so template-heavy headers do not bury real defects in style output.
+---
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-macro-parentheses,
+  misc-redundant-expression,
+  misc-unused-using-decls,
+  performance-*,
+  readability-duplicate-include,
+  readability-misleading-indentation,
+  readability-redundant-preprocessor,
+
+WarningsAsErrors: ""
+
+HeaderFilterRegex: "include/ustore/.*"
+
+FormatStyle: file

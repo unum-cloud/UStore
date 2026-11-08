@@ -228,7 +228,7 @@ class linux_aio_files_disk {
         for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
             queue_pair_slot_t& slot = queue_pairs_[index];
             std::int32_t expected_free = 0;
-            if (!claim_(slot.leased)
+            if (!claim_(slot.acquired)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
             std::uint32_t const base = window_of_(static_cast<queue_pair_id_t>(index));
@@ -271,7 +271,7 @@ class linux_aio_files_disk {
         ++slot->generation;
         slot->depth = 0;
         slot->free_seats = 0;
-        claim_(slot->leased).store(0, std::memory_order_release);
+        claim_(slot->acquired).store(0, std::memory_order_release);
         queue_pair.surrender();
         return {};
     }
@@ -531,15 +531,16 @@ class linux_aio_files_disk {
     struct queue_pair_slot_t {
 
         /** Zero while the slot is free, one while a queue pair holds it. */
-        std::int32_t leased = 0;
+        std::int32_t acquired = 0;
 
-        /** Raised every time the slot is leased again, so a stale token routes nowhere. */
+        /** Raised every time the slot is acquired again, so a stale token routes nowhere. */
         queue_pair_generation_t generation = 0;
 
         /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
         queue_depth_t depth = 0;
 
-        /** The kernel's context, set up at mount for the mount's whole depth and kept across leases. */
+        /** The kernel's context, set up at mount for the mount's whole depth and kept
+         *  across acquisitions. */
         aio_context_t context = 0;
 
         /** Seats no request occupies, stacked at the front of this queue pair's seat window. */
@@ -683,13 +684,13 @@ class linux_aio_files_disk {
     [[nodiscard]] queue_pair_slot_t* slot_of_(queue_pair_t const& queue_pair) noexcept {
         if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
         queue_pair_slot_t& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
-        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
+        return slot.acquired != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
     [[nodiscard]] queue_pair_slot_t const* slot_of_(queue_pair_t const& queue_pair) const noexcept {
         if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
         queue_pair_slot_t const& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
-        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
+        return slot.acquired != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
     [[nodiscard]] registered_memory_slot_t* slot_of_(registered_memory_t const& registered_memory) noexcept {
@@ -716,7 +717,9 @@ class linux_aio_files_disk {
     [[nodiscard]] registered_medium_slot_t* resolve_(medium_reference_t place) noexcept {
         if (static_cast<std::size_t>(place.medium_id) >= media_.size()) return nullptr;
         registered_medium_slot_t& slot = media_[static_cast<std::size_t>(place.medium_id)];
-        return slot.registered != 0 && slot.generation == place.generation ? &slot : nullptr;
+        return claim_(slot.registered).load(std::memory_order_acquire) != 0 && slot.generation == place.generation
+                   ? &slot
+                   : nullptr;
     }
 
     /** Marks the range and the medium of @p request as live, so neither can be taken back under it. */

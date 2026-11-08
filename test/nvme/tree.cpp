@@ -17,6 +17,7 @@
 #include <cstdlib> // `std::malloc`, `std::free`
 #include <cstring> // `std::memcmp`
 
+#include <array>   // `std::array`
 #include <memory>  // `std::addressof`, `std::align`, `std::unique_ptr`
 #include <new>     // `std::bad_alloc`, `std::align_val_t`, `std::nothrow_t`
 #include <span>    // `std::span`
@@ -30,6 +31,7 @@
 #include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`
 #include "ustore/blobs/nvme_tree.hpp"              // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
 #include "ustore/blobs/vram_nvidia_compaction.cuh" // `cuda_compactor_t`, `strings_merge_verdict`
+#include "ustore/utilities/ram_device.hpp"         // `executor_t`, `pool_view_t`
 #include "ustore/utilities/vram_device.hpp"        // `gpu_drivers_t`, `kernel_tables`, `vram_nvidia_bundle`
 
 #include "nvme/fixture.hpp" // `run_on_transport`, `expectation_t`, `painted`
@@ -381,6 +383,94 @@ template <typename level_type_>
     return level;
 }
 
+/** Runs every slice of a merge in turn on the calling thread over one pair of channels, so a case
+ *  sees what slicing changes apart from how the slices are scheduled. */
+struct sequential_fan_out_t {
+
+    /** Slices one merge is cut into. */
+    std::size_t slices_count = 1;
+
+    /** The channel every slice gathers its values on. */
+    io_channel_t* reading = nullptr;
+
+    /** The channel every slice writes its runs on. */
+    io_channel_t* writing = nullptr;
+
+    [[nodiscard]] std::size_t slices() const noexcept { return slices_count; }
+
+    status_t run(compaction_fan_out_t::slice_call_t const& slice) const noexcept {
+        for (std::size_t index = 0; index != slices_count; ++index)
+            if (status_t const ran = slice(index, *reading, *writing); ran.failed()) return ran;
+        return {};
+    }
+};
+
+/** Runs every slice of a merge on its own thread of a ForkUnion pool, each reading on that thread's
+ *  executor channel and writing on a shared one, as a blocking compact on an executor fans out. */
+template <typename channel_pool_type_>
+struct pooled_fan_out {
+
+    /** The pool whose threads run the slices, one slice per thread. */
+    pool_view_t pool;
+
+    /** The channels every slice takes its pair from. */
+    channel_pool_type_* channels = nullptr;
+
+    [[nodiscard]] std::size_t slices() const noexcept { return pool.threads_count(); }
+
+    status_t run(compaction_fan_out_t::slice_call_t const& slice) const noexcept {
+        st::vector<status_t> statuses;
+        if (statuses.resize(slices()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room for the slices' statuses"};
+        auto run_slice = [&](std::size_t task, std::size_t thread) noexcept {
+            auto [reading, reading_status] = channels->acquire(thread);
+            if (reading_status.failed()) {
+                statuses[task] = reading_status;
+                return;
+            }
+            auto [writing, writing_status] = channels->acquire();
+            if (writing_status.failed()) {
+                statuses[task] = writing_status;
+                return;
+            }
+            statuses[task] = slice(task, reading.channel(), writing.channel());
+        };
+        if (st::failed(pool.for_n_dynamic(statuses.size(), run_slice)))
+            return {status_code_t::contended_k, "The pool refused the slices"};
+        for (status_t const& status : statuses)
+            if (status.failed()) return status;
+        return {};
+    }
+};
+
+/** How many versions two levels disagree on by key, stamp and kind, read in key order across their
+ *  runs, however differently they were cut. */
+template <typename level_type_>
+[[nodiscard]] std::size_t differing_versions(level_type_ const& left, level_type_ const& right) {
+    using sorted_run_t = typename level_type_::sorted_run_t;
+    std::size_t differing = left.population_count() != right.population_count();
+    std::size_t left_run = 0, right_run = 0;
+    std::uint64_t left_position = 0, right_position = 0;
+    while (left_run != left.size() && right_run != right.size()) {
+        sorted_run_t const& left_source = left.run(left_run);
+        sorted_run_t const& right_source = right.run(right_run);
+        if (left_position == left_source.population_count()) {
+            ++left_run, left_position = 0;
+            continue;
+        }
+        if (right_position == right_source.population_count()) {
+            ++right_run, right_position = 0;
+            continue;
+        }
+        differing += left_source.key_slot(left_position).stored_key !=
+                         right_source.key_slot(right_position).stored_key ||
+                     left_source.stamp(left_position) != right_source.stamp(right_position) ||
+                     left_source.kind(left_position) != right_source.kind(right_position);
+        ++left_position, ++right_position;
+    }
+    return differing;
+}
+
 #pragma endregion Model
 
 #pragma region Flush Cases
@@ -697,7 +787,9 @@ std::size_t compaction_drops_remove_deltas_at_the_bottom(mount_type_ const& moun
     return failures;
 }
 
-/** The same two levels merged into an intermediate level keep every remove delta the bottom would drop. */
+/** The same two levels merged into an intermediate level keep every remove delta the bottom would
+ *  drop, and a merge cut into four slices, in turn or on four threads at once, keeps exactly what a
+ *  merge in one does. */
 template <typename mount_type_>
 std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     using types_t = lsm_types<typename mount_type_::fixture_t>;
@@ -711,7 +803,13 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     using sorted_run_t = typename types_t::sorted_run_t;
     std::size_t failures = 0;
     constexpr std::size_t keys_k = 240;
-    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    constexpr std::size_t threads_k = 4;
+    // Every thread of the pool reads on a channel of its own and writes on a shared one beside the
+    // case's own three
+    fixture_config_t threaded = mount.config;
+    threaded.executor_threads = threads_k;
+    threaded.shared_io_channels += threads_k;
+    expected<std::unique_ptr<fixture_t>> fixture = mount(threaded);
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
@@ -755,11 +853,13 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     if (failures != 0) return failures;
     st::vector<sorted_run_t const*> const sources = runs_of(upper);
 
+    std::array<typename merger_t::merge_buffers_t, 4> buffers;
     typename merger_t::merge_request_t request;
     request.upper = sources;
     request.upper_order = lsm_level_order_t::overlapping_k;
     request.value_max_size = value_max_size_k;
     request.placement = compaction_placement_t::host_k;
+    request.buffers = std::span<typename merger_t::merge_buffers_t> {buffers}.first(1);
 
     request.depth = lsm_level_depth_t::intermediate_k;
     expected<st::vector<run_handle_t>> kept_runs = merger_t::merge(
@@ -768,6 +868,51 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     if (!kept_runs) return failures;
     level_t const kept = level_of<level_t>(*runs, 1, *kept_runs);
     failures += expect_eq(kept.population_count(), static_cast<std::uint64_t>(keys_k));
+
+    // The same merge cut into four slices writes the very same versions and values, only cut
+    // into more runs.
+    sequential_fan_out_t sequential {4, &reading->channel(), &writing->channel()};
+    request.buffers = buffers;
+    request.fan_out = compaction_fan_out_t {sequential};
+    expected<st::vector<run_handle_t>> sliced_runs = merger_t::merge(
+        *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+    request.buffers = std::span<typename merger_t::merge_buffers_t> {buffers}.first(1);
+    request.fan_out = compaction_fan_out_t {};
+    failures += expect_status(sliced_runs, status_code_t::success_k);
+    if (!sliced_runs) return failures;
+    level_t const sliced = level_of<level_t>(*runs, 1, *sliced_runs);
+    failures += expect(sliced.size() >= 4);
+    failures += expect_eq(differing_versions(kept, sliced), std::size_t {0});
+    st::vector<byte_t> kept_values;
+    st::vector<byte_t> sliced_values;
+    failures += collect_level_values(kept, guard->channel(), kept_values);
+    failures += collect_level_values(sliced, guard->channel(), sliced_values);
+    failures += expect_eq(sliced_values.size(), kept_values.size());
+    if (sliced_values.size() == kept_values.size())
+        failures += expect_eq(std::memcmp(kept_values.data(), sliced_values.data(), kept_values.size()), 0);
+
+    // And again with every slice on its own thread of a pool, side by side.
+    st::expected<executor_t> pool = executor_t::make_unpinned(threads_k, caller_exclusivity_t::caller_inclusive_k,
+                                                              fu_capabilities_all_k);
+    failures += expect(pool.has_value());
+    if (!pool) return failures;
+    pooled_fan_out<typename fixture_t::channel_pool_t> pooled {pool->view(), &(*fixture)->channels};
+    failures += expect_eq(pooled.slices(), threads_k);
+    request.buffers = buffers;
+    request.fan_out = compaction_fan_out_t {pooled};
+    expected<st::vector<run_handle_t>> threaded_runs = merger_t::merge(
+        *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+    request.buffers = std::span<typename merger_t::merge_buffers_t> {buffers}.first(1);
+    request.fan_out = compaction_fan_out_t {};
+    failures += expect_status(threaded_runs, status_code_t::success_k);
+    if (!threaded_runs) return failures;
+    level_t const threaded_level = level_of<level_t>(*runs, 1, *threaded_runs);
+    failures += expect_eq(differing_versions(kept, threaded_level), std::size_t {0});
+    st::vector<byte_t> threaded_values;
+    failures += collect_level_values(threaded_level, guard->channel(), threaded_values);
+    failures += expect_eq(threaded_values.size(), kept_values.size());
+    if (threaded_values.size() == kept_values.size())
+        failures += expect_eq(std::memcmp(kept_values.data(), threaded_values.data(), kept_values.size()), 0);
 
     request.depth = lsm_level_depth_t::bottom_k;
     expected<st::vector<run_handle_t>> dropped_runs = merger_t::merge(
@@ -790,6 +935,8 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     }
 
     runs->discard(*volume, *kept_runs);
+    runs->discard(*volume, *sliced_runs);
+    runs->discard(*volume, *threaded_runs);
     runs->discard(*volume, *dropped_runs);
     runs->discard(*volume, upper.runs());
     failures += expect_eq(runs->size(), std::size_t {0});
@@ -960,6 +1107,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     raiser.join();
 
     failures += expect_eq(writing->channel().streams().available_buffers(), lsm_config_k.stream_buffers);
+    failures += expect_eq(reading->channel().streams().available_buffers(), lsm_config_k.stream_buffers);
     failures += expect_eq(reading->channel().requests().available_buffers(), lsm_config_k.request_buffers);
     failures += expect_eq((*fixture)->disk.outstanding(writing->channel().queue_pair()), std::size_t {0});
 
@@ -1319,11 +1467,13 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     if (failures != 0) return failures;
     st::vector<sorted_run_t const*> const sources = runs_of(upper);
 
+    std::array<typename merger_t::merge_buffers_t, 1> buffers;
     typename merger_t::merge_request_t request;
     request.upper = sources;
     request.upper_order = lsm_level_order_t::overlapping_k;
     request.depth = lsm_level_depth_t::intermediate_k;
     request.value_max_size = value_max_size_k;
+    request.buffers = buffers;
 
     request.placement = compaction_placement_t::host_k;
     expected<st::vector<run_handle_t>> host_runs = merger_t::merge(
@@ -1394,10 +1544,14 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
 #pragma region Allocation Cases
 
 /**
- *  @brief A merge reads every source index in place, so it never asks the heap for a copy of one.
+ *  @brief A merge reads every source index in place, so it never asks the heap for a copy of
+ *      one, and a merge again through the same buffers takes none of its room anew and writes
+ *      the same values.
  *
- *  The runs overlap and the survivors outnumber every source run, so neither the compactor's records
- *  nor the new run's own index at attach is the size of a source index or of all of them together.
+ *  The runs overlap and the survivors outnumber every source run, so no buffer of the merge or of
+ *  the new run is the size of a source index. The output's cells take room for every merged key
+ *  slot, the size of all indexes together, which only the first merge asks for. The second merge
+ *  finds every streaming block of its reading channel taken, so its windows fall back to the heap.
  */
 template <typename mount_type_>
 std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
@@ -1456,34 +1610,61 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     if (failures != 0) return failures;
     st::vector<sorted_run_t const*> const sources = runs_of(upper);
 
-    // The sizes a copy of one source index, or of both back to back, would be requested at.
+    // The sizes a copy of one source index would be requested at.
     allocation_watch_t& watch = allocation_watch_g;
-    watch = allocation_watch_t {};
+    allocation_watch_t indexes_watch;
     std::size_t all_indexes = 0;
     for (std::size_t run = 0; run != upper.size(); ++run) {
         std::size_t const index_bytes = upper.run(run).population_count() * sizeof(variable_slot_t);
-        watch.sizes[watch.count++] = index_bytes;
+        indexes_watch.sizes[indexes_watch.count++] = index_bytes;
         all_indexes += index_bytes;
     }
-    watch.sizes[watch.count++] = all_indexes;
 
+    std::array<typename merger_t::merge_buffers_t, 1> buffers;
     typename merger_t::merge_request_t request;
     request.upper = sources;
     request.upper_order = lsm_level_order_t::overlapping_k;
     request.depth = lsm_level_depth_t::intermediate_k;
     request.value_max_size = value_max_size_k;
     request.placement = compaction_placement_t::host_k;
+    request.buffers = buffers;
+    watch = indexes_watch;
     expected<st::vector<run_handle_t>> merged_runs = merger_t::merge(
         *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
     allocation_watch_t const seen = watch;
+    st::vector<pooled_buffer_t> taken_streams;
+    for (std::uint32_t index = 0; index != lsm_config_k.stream_buffers; ++index) {
+        auto [held, held_status] = reading->channel().streams().acquire();
+        failures += expect_status(held_status, status_code_t::success_k);
+        failures += expect(taken_streams.push_back(std::move(held)) == st::status_t::success_k);
+    }
+    watch = indexes_watch;
+    watch.sizes[watch.count++] = all_indexes;
+    expected<st::vector<run_handle_t>> merged_again = merger_t::merge(
+        *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+    allocation_watch_t const seen_again = watch;
     watch = allocation_watch_t {};
+    taken_streams.clear();
     failures += expect_status(merged_runs, status_code_t::success_k);
-    if (!merged_runs) return failures;
+    failures += expect_status(merged_again, status_code_t::success_k);
+    if (!merged_runs || !merged_again) return failures;
 
     level_t const merged = level_of<level_t>(*runs, 1, *merged_runs);
+    level_t const merged_warm = level_of<level_t>(*runs, 1, *merged_again);
     failures += expect_eq(merged.population_count(), std::uint64_t {older_keys_k + newer_keys_k / 2});
+    failures += expect_eq(merged_warm.population_count(), merged.population_count());
+    st::vector<byte_t> values;
+    st::vector<byte_t> values_again;
+    failures += collect_level_values(merged, guard->channel(), values);
+    failures += collect_level_values(merged_warm, guard->channel(), values_again);
+    failures += expect_eq(values_again.size(), values.size());
+    if (values_again.size() == values.size())
+        failures += expect_eq(std::memcmp(values.data(), values_again.data(), values.size()), 0);
     for (std::size_t index = 0; index != seen.count; ++index) failures += expect_eq(seen.hits[index], std::size_t {0});
+    for (std::size_t index = 0; index != seen_again.count; ++index)
+        failures += expect_eq(seen_again.hits[index], std::size_t {0});
     runs->discard(*volume, *merged_runs);
+    runs->discard(*volume, *merged_again);
     runs->discard(*volume, upper.runs());
     return failures;
 }

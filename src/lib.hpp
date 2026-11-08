@@ -43,7 +43,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 
-#include <algorithm>   // `std::min`
+#include <algorithm>   // `std::min`, `std::max`
 #include <array>       // `std::array`
 #include <bit>         // `std::bit_cast`
 #include <memory>      // `std::addressof`
@@ -352,7 +352,7 @@ constexpr bool one_of = (std::is_same_v<candidate_type_, listed_types_> || ...);
 template <typename arguments_type_>
 constexpr bool changes_database = requires(arguments_type_ const& arguments) { arguments.transaction; } ||
                                   one_of<arguments_type_, ustore_collection_create_t, ustore_collection_drop_t,
-                                         ustore_database_clear_t, ustore_database_compact_t>;
+                                         ustore_database_clear_t, ustore_database_compact_t, ustore_database_flush_t>;
 
 #pragma region Outputs
 
@@ -598,6 +598,44 @@ inline status_t gather_strings(ragged_input_t const& input, ustore_arena_t scrat
 
 #pragma endregion Ragged Inputs
 
+#pragma region Strings Windows
+
+/** The strings one task of a strings call names: those starting with @c prefix, from @c start,
+ *  inclusive, towards @c end, exclusive, in @c direction, where an empty start begins at the first
+ *  string in the direction and an empty end bounds nothing. */
+struct strings_window_t {
+    std::string_view prefix;
+    std::string_view start;
+    std::string_view end;
+    ustore_scan_direction_t direction = ustore_scan_ascending_k;
+
+    /** The least string of the window, or of the prefix where the window names none. */
+    [[nodiscard]] std::string_view lower() const noexcept {
+        std::string_view const bound = direction == ustore_scan_descending_k ? end : start;
+        return std::max(bound, prefix);
+    }
+
+    /** The string the window stops at, exclusive for an ascending window and inclusive for a
+     *  descending one, or empty for none. */
+    [[nodiscard]] std::string_view upper() const noexcept {
+        return direction == ustore_scan_descending_k ? start : end;
+    }
+
+    /** Whether @p text, prefixed and not below @c lower, lies past the window's upper end. */
+    [[nodiscard]] bool past(std::string_view text) const noexcept {
+        std::string_view const bound = upper();
+        if (bound.empty()) return false;
+        return direction == ustore_scan_descending_k ? bound < text : !(text < bound);
+    }
+
+    /** Whether @p text is the exclusive end a descending window starts above. */
+    [[nodiscard]] bool skips(std::string_view text) const noexcept {
+        return direction == ustore_scan_descending_k && !end.empty() && text == end;
+    }
+};
+
+#pragma endregion Strings Windows
+
 #pragma region Cursors
 
 /**
@@ -819,10 +857,6 @@ status_t take_claims(arguments_type_ const& arguments) noexcept {
         if (!arena_serves(arguments.executor, arena))
             return {status_code_t::device_k, "The arena lives where another executor computes"};
         if (!take(arena->claim)) return {status_code_t::contended_k, "The arena serves another call"};
-        if (floor_atomic_ref<std::uint32_t> {arena->exports}.load(std::memory_order_seq_cst) != 0) {
-            release(arena->claim);
-            return {status_code_t::contended_k, "Arrow still reads the arena's outputs"};
-        }
     }
     claim_t* const cursor = cursor_claim_of(arguments);
     if (cursor && !take(*cursor)) {
@@ -886,6 +920,10 @@ struct verb_slot<ustore_database_clear_t> {
 template <>
 struct verb_slot<ustore_database_compact_t> {
     static constexpr auto database = &database_verbs_t::compact;
+};
+template <>
+struct verb_slot<ustore_database_flush_t> {
+    static constexpr auto database = &database_verbs_t::flush;
 };
 template <>
 struct verb_slot<ustore_snapshot_init_t> {
@@ -1268,7 +1306,7 @@ status_t call_gathered(verb_type_ verb, arguments_type_ const& arguments, view_t
                        executors_types_&... executor) noexcept {
     if constexpr (requires { ragged_inputs(arguments); }) {
         auto const inputs = ragged_inputs(arguments);
-        std::array<strings_arg_t, std::tuple_size_v<decltype(inputs)>> strings;
+        std::array<strings_arg_t, inputs.size()> strings;
         for (std::size_t index = 0; index != inputs.size(); ++index)
             if (status_t const status = gather_strings(inputs[index], view.scratch, strings[index]); status.failed())
                 return status;

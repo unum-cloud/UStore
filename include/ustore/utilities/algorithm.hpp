@@ -2,22 +2,30 @@
  *  @file include/ustore/utilities/algorithm.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
- *  @brief Searches over sorted batches, 128-bit sorted merges and intersections, reservoir sampling of keys over the
- *      iterators of ordered engines, and inserts and erases in buffers of trivially copyable elements.
+ *  @brief Searches over sorted batches, 128-bit sorted merges and intersections, reservoir
+ *      sampling over engine iterators, inserts and erases in trivially copyable buffers, sorts
+ *      that allocate nothing and a loser tree naming the least head among sorted runs.
  */
 
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memmove`
 
 #include <algorithm>   // `std::ranges::lower_bound`, `std::min`
+#include <array>       // `std::array`
 #include <chrono>      // `std::chrono::steady_clock`
 #include <concepts>    // `std::same_as`, `std::convertible_to`
 #include <random>      // `std::minstd_rand`, `std::uniform_int_distribution`
 #include <ranges>      // `std::ranges::random_access_range`
 #include <span>        // `std::span`
 #include <type_traits> // `std::is_trivially_copyable_v`
+#include <utility>     // `std::move`, `std::swap`
+
+#include <smashtable/basic_vector.hpp> // `st::vector`
+#include <smashtable/row_layout.hpp>   // `st::key128_t`
+#include <smashtable/shared.hpp>       // `st::status_t`, `st::default_allocator`, `st::assume_uninitialized`
 
 #include "ustore/utilities/types.hpp" // `status_t`, `ustore_key_t`
 
@@ -226,6 +234,237 @@ status_t merge_sorted_128(std::span<ustore_key_t const> first, std::span<ustore_
     }
     return {};
 }
+
+/** The byte @p index of @p word, counting from the most significant, as a big-endian
+ *  layout stores it. */
+constexpr std::size_t word_byte(std::uint64_t word, std::size_t index) noexcept {
+    return static_cast<std::size_t>((word >> ((sizeof(std::uint64_t) - 1 - index) * 8)) & 0xFF);
+}
+
+/** The 64-bit word @p word of a stored key, counting from the most significant. */
+inline std::uint64_t stored_key_word(std::uint64_t stored_key, std::size_t) noexcept { return stored_key; }
+
+/** The 64-bit word @p word of a 16-byte key, the high one first, as its ordering compares them. */
+inline std::uint64_t stored_key_word(st::key128_t stored_key, std::size_t word) noexcept {
+    return word == 0 ? stored_key.high : stored_key.low;
+}
+
+/** The byte @p digit of a stored key, counting from the most significant, so bytes order as
+ *  the keys do. */
+template <typename stored_key_type_>
+std::size_t stored_key_byte(stored_key_type_ const& stored_key, std::size_t digit) noexcept {
+    return word_byte(stored_key_word(stored_key, digit / sizeof(std::uint64_t)), digit % sizeof(std::uint64_t));
+}
+
+/** Orders @p values from the byte @p digit on, up to @p digits, most significant first. */
+template <typename value_type_, typename digit_type_, typename order_type_>
+void radix_sort_(std::span<value_type_> values, std::size_t digit, std::size_t digits, digit_type_ const& digit_of,
+                 order_type_ const& precedes) noexcept {
+    // Below this many values, moving them beats clearing and walking a 256-bucket table.
+    constexpr std::size_t insertion_limit_k = 64;
+    if (values.size() < insertion_limit_k) {
+        for (std::size_t index = 1; index < values.size(); ++index) {
+            value_type_ moved = std::move(values[index]);
+            std::size_t position = index;
+            for (; position != 0 && precedes(moved, values[position - 1]); --position)
+                values[position] = std::move(values[position - 1]);
+            values[position] = std::move(moved);
+        }
+        return;
+    }
+    // One repeated value, as a batch rewriting a key yields, is already in order.
+    std::size_t differing = 1;
+    while (differing != values.size() && !precedes(values[0], values[differing]) &&
+           !precedes(values[differing], values[0]))
+        ++differing;
+    if (differing == values.size()) return;
+    for (; digit != digits; ++digit) {
+        std::array<std::size_t, 256> ends {};
+        for (value_type_ const& value : values) ++ends[digit_of(value, digit)];
+        if (ends[digit_of(values[0], digit)] == values.size()) continue;
+        std::array<std::size_t, 256> next;
+        for (std::size_t bucket = 0, start = 0; bucket != 256; ++bucket) {
+            next[bucket] = start;
+            start += ends[bucket];
+            ends[bucket] = start;
+        }
+        // Each swap drops one value into its bucket for good, so the cycles finish in one sweep.
+        for (std::size_t bucket = 0; bucket != 256; ++bucket)
+            while (next[bucket] != ends[bucket]) {
+                std::size_t const home = digit_of(values[next[bucket]], digit);
+                if (home == bucket) ++next[bucket];
+                else std::swap(values[next[bucket]], values[next[home]++]);
+            }
+        for (std::size_t bucket = 0, begin = 0; bucket != 256; begin = ends[bucket++])
+            if (ends[bucket] - begin > 1)
+                radix_sort_(values.subspan(begin, ends[bucket] - begin), digit + 1, digits, digit_of, precedes);
+        return;
+    }
+}
+
+/** Sorts @p values in place by @p digits bytes, most significant first, that @p digit_of reads as
+ *  <tt>digit_of(value, digit)</tt>, allocating nothing: an insertion sort under @p precedes below 64
+ *  values, otherwise an MSD radix skipping the bytes every value shares. @p precedes must order as
+ *  the bytes do; values it calls equal land in no particular order among themselves. */
+template <typename value_type_, typename digit_type_, typename order_type_>
+void radix_sort(std::span<value_type_> values, std::size_t digits, digit_type_ const& digit_of,
+                order_type_ const& precedes) noexcept {
+    radix_sort_(values, 0, digits, digit_of, precedes);
+}
+
+/** Sorts @p keyed by their @c stored_key in place, allocating nothing; entries of one key land in
+ *  no particular order among themselves. */
+template <typename keyed_type_>
+void sort_by_stored_key(std::span<keyed_type_> keyed) noexcept {
+    using stored_key_t = typename keyed_type_::stored_key_t;
+    auto const digit_of = [](keyed_type_ const& entry, std::size_t digit) noexcept {
+        return stored_key_byte(entry.stored_key, digit);
+    };
+    auto const precedes = [](keyed_type_ const& first, keyed_type_ const& second) noexcept {
+        return first.stored_key < second.stored_key;
+    };
+    radix_sort(keyed, sizeof(stored_key_t), digit_of, precedes);
+}
+
+/** Sifts the last of @p heap up into the heap the values before it form, whose top
+ *  no value precedes. */
+template <typename value_type_, typename order_type_>
+void heap_sift_up(std::span<value_type_> heap, order_type_ const& precedes) noexcept {
+    for (std::size_t child = heap.size() - 1; child != 0;) {
+        std::size_t const parent = (child - 1) / 2;
+        if (!precedes(heap[parent], heap[child])) return;
+        std::swap(heap[parent], heap[child]);
+        child = parent;
+    }
+}
+
+/** Sifts the value at @p root of @p heap down below every value it precedes. */
+template <typename value_type_, typename order_type_>
+void heap_sift_down(std::span<value_type_> heap, std::size_t root, order_type_ const& precedes) noexcept {
+    for (std::size_t child = 2 * root + 1; child < heap.size(); root = child, child = 2 * root + 1) {
+        if (child + 1 < heap.size() && precedes(heap[child], heap[child + 1])) ++child;
+        if (!precedes(heap[root], heap[child])) return;
+        std::swap(heap[root], heap[child]);
+    }
+}
+
+/** Sorts @p values ascending under @p precedes in place through a heap, allocating nothing; values
+ *  it calls equal land in no particular order among themselves. */
+template <typename value_type_, typename order_type_>
+void heap_sort(std::span<value_type_> values, order_type_ const& precedes) noexcept {
+    for (std::size_t parent = values.size() / 2; parent-- != 0;) heap_sift_down(values, parent, precedes);
+    for (std::size_t size = values.size(); size > 1;) {
+        std::swap(values[0], values[--size]);
+        heap_sift_down(values.first(size), 0, precedes);
+    }
+}
+
+/**
+ *  @brief Sorts @p values ascending under @p precedes, keeping equal values in their order:
+ *      insertion-sorted runs of 16, then merge passes between @p values and @p scratch, ending in
+ *      @p values, allocating nothing.
+ *  @param[in,out] scratch At least as many values as @p values, each assignable, whose contents
+ *      are left moved-from.
+ */
+template <typename value_type_, typename order_type_>
+void merge_sort(std::span<value_type_> values, std::span<value_type_> scratch, order_type_ const& precedes) noexcept {
+    // Longer runs spend more comparisons shifting than a merge level would.
+    constexpr std::size_t run_k = 16;
+    std::size_t const count = values.size();
+    value_type_* source = values.data();
+    value_type_* target = scratch.data();
+    for (std::size_t first = 0; first < count; first += run_k) {
+        value_type_* const begin = source + first;
+        value_type_* const end = source + std::min(first + run_k, count);
+        for (value_type_* next = begin + 1; next < end; ++next) {
+            value_type_ moved = std::move(*next);
+            value_type_* hole = next;
+            for (; hole != begin && precedes(moved, hole[-1]); --hole) *hole = std::move(hole[-1]);
+            *hole = std::move(moved);
+        }
+    }
+    for (std::size_t width = run_k; width < count; width *= 2) {
+        for (std::size_t first = 0; first < count; first += 2 * width) {
+            value_type_* left = source + first;
+            value_type_* const middle = source + std::min(first + width, count);
+            value_type_* right = middle;
+            value_type_* const end = source + std::min(first + 2 * width, count);
+            value_type_* written = target + first;
+            // The right value goes first only when it strictly precedes, which keeps
+            // the merge stable.
+            while (left != middle && right != end)
+                if (precedes(*right, *left)) *written++ = std::move(*right++);
+                else *written++ = std::move(*left++);
+            while (left != middle) *written++ = std::move(*left++);
+            while (right != end) *written++ = std::move(*right++);
+        }
+        std::swap(source, target);
+    }
+    if (source != values.data())
+        for (std::size_t index = 0; index != count; ++index) values[index] = std::move(source[index]);
+}
+
+/**
+ *  @brief Names the least head among the sorted runs one pass merges: a tournament whose inner
+ *      nodes keep the run that lost the match played there, so moving the least run's head on
+ *      replays only the path above its leaf.
+ *
+ *  Run @c i plays from leaf @c runs + i of a tree laid out as a heap, whose @c runs - 1 inner nodes
+ *  give two children to every node for any count of runs. The caller's order tells whether one
+ *  run's head precedes another's, an exhausted run's preceding none. Naming the least head is the
+ *  one step a merge kit takes over with a vector minimum across the heads.
+ */
+template <typename allocator_type_ = st::default_allocator<std::uint32_t>>
+class loser_tree {
+  public:
+    using allocator_t = allocator_type_;
+
+    loser_tree() noexcept = default;
+
+    /** Allocates the inner nodes through @p allocator. */
+    explicit loser_tree(allocator_t const& allocator) noexcept : losers_(allocator) {}
+
+    /** Plays every match among the heads of @p runs runs, which @p precedes orders as
+     *  <tt>precedes(first, second)</tt>. */
+    template <typename order_type_>
+    st::status_t reset(std::uint32_t runs, order_type_ const& precedes) noexcept {
+        losers_.clear();
+        if (st::status_t const grown = losers_.resize(st::assume_uninitialized, runs); grown != st::status_t::success_k)
+            return grown;
+        least_ = runs != 0 ? play_(1, precedes) : 0;
+        return st::status_t::success_k;
+    }
+
+    /** The run whose head precedes every other's. */
+    [[nodiscard]] std::uint32_t least() const noexcept { return least_; }
+
+    /** Replays the matches above the least run's leaf, once its head moved on. */
+    template <typename order_type_>
+    void replay(order_type_ const& precedes) noexcept {
+        std::uint32_t winner = least_;
+        for (std::size_t node = (losers_.size() + winner) / 2; node != 0; node /= 2)
+            if (precedes(losers_[node], winner)) std::swap(losers_[node], winner);
+        least_ = winner;
+    }
+
+  private:
+    /** Plays every match below @p node, keeping each loser, and answers the winner. */
+    template <typename order_type_>
+    std::uint32_t play_(std::size_t node, order_type_ const& precedes) noexcept {
+        if (node >= losers_.size()) return static_cast<std::uint32_t>(node - losers_.size());
+        std::uint32_t const left = play_(2 * node, precedes);
+        std::uint32_t const right = play_(2 * node + 1, precedes);
+        bool const right_wins = precedes(right, left);
+        losers_[node] = right_wins ? left : right;
+        return right_wins ? right : left;
+    }
+
+    /** The run that lost the match at every inner node, from node one on. */
+    st::vector<std::uint32_t, allocator_t> losers_;
+
+    /** The run whose head precedes every other's. */
+    std::uint32_t least_ = 0;
+};
 
 #pragma endregion Sorted Keys
 

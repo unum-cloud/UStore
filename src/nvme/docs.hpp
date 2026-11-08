@@ -23,15 +23,16 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint64_t`
 
-#include <algorithm> // `std::sort`
-#include <span>      // `std::span`
+#include <span> // `std::span`
 
 #include "ustore/docs.h"     // `ustore_docs_write_t`
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 
 #include "ustore/docs/json_fold.hpp"        // `json_fold_t`, `json_delta_t`, `encode_deltas`, `modifier_text`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `extract_keys`
+#include "ustore/utilities/algorithm.hpp"   // `radix_sort`, `word_byte`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
 #include "database.hpp" // `call_access`, `resolve_runs`, `read_value`, `write_value`, `serve_write`
@@ -157,11 +158,19 @@ status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& f
         bytes += docs::encoded_size(delta);
         tasks[index] = document_task_t {places[index].collection, places[index].key, delta, index};
     }
-    std::sort(tasks.begin(), tasks.end(), [](document_task_t const& first, document_task_t const& second) noexcept {
+    // The collection, the key and the batch position read as one big-endian number, a total order.
+    constexpr std::size_t uuid_bytes_k = sizeof(ustore_uuid_t);
+    auto const digit_of = [](document_task_t const& task, std::size_t digit) noexcept -> std::size_t {
+        if (digit < uuid_bytes_k) return task.collection.uuid.bytes[digit];
+        if (digit < 2 * uuid_bytes_k) return task.key.uuid.bytes[digit - uuid_bytes_k];
+        return utilities::word_byte(task.sequence, digit - 2 * uuid_bytes_k);
+    };
+    auto const precedes = [](document_task_t const& first, document_task_t const& second) noexcept {
         if (first.collection != second.collection) return first.collection < second.collection;
         if (first.key != second.key) return first.key < second.key;
         return first.sequence < second.sequence;
-    });
+    };
+    utilities::radix_sort(tasks, 2 * uuid_bytes_k + sizeof(std::uint64_t), digit_of, precedes);
 
     // The deltas of every document sit side by side in task order, which each document's span views
     auto [deltas, deltas_status] = arena_allocate<json_delta_t>(scratch, count);

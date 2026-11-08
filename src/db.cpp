@@ -191,6 +191,7 @@ status_t finish_ingest(ustore_ingest_finish_t const& arguments) noexcept {
 void ustore_database_describe(ustore_database_describe_t* arguments) { route(arguments); }
 void ustore_database_clear(ustore_database_clear_t* arguments) { route(arguments); }
 void ustore_database_compact(ustore_database_compact_t* arguments) { route(arguments); }
+void ustore_database_flush(ustore_database_flush_t* arguments) { route(arguments); }
 void ustore_snapshot_init(ustore_snapshot_init_t* arguments) { route(arguments); }
 void ustore_snapshot_save(ustore_snapshot_save_t* arguments) { route(arguments); }
 void ustore_collection_list(ustore_collection_list_t* arguments) { route(arguments); }

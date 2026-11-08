@@ -9,7 +9,7 @@
  *  needs Linux 6.12 or newer, the floor the other transports keep too.
  *
  *  A ring belongs to one queue pair rather than to the disk, and the queue pair to one thread at a time,
- *  which the lease of the queue pair keeps, so no ring is shared between threads entering it at once. A
+ *  which the acquired queue pair keeps, so no ring is shared between threads entering it at once. A
  *  queue pair moves between threads with nothing outstanding, and its ring moves with it, since rings are
  *  set up without @c SINGLE_ISSUER: a ring bound to one task would be rebuilt at every move. Every ring is
  *  created with @c IORING_SETUP_R_DISABLED at mount - where mapping and the sparse tables can still fail
@@ -33,11 +33,10 @@
 #include "ustore/types.h" // `USTORE_OS_LINUX_`
 
 #if USTORE_OS_LINUX_
-#include <linux/io_uring.h> // `io_uring_sqe`, `io_uring_cqe`, `IORING_SETUP_R_DISABLED`
-#include <sys/mman.h>       // `mmap`, `munmap`, `MAP_SHARED`
-#include <sys/syscall.h>    // `__NR_io_uring_setup`, `__NR_io_uring_enter`
-#include <sys/uio.h>        // `iovec`
-#include <unistd.h>         // `syscall`, `close`, `gettid`
+#include <sys/mman.h>    // `mmap`, `munmap`, `MAP_SHARED`
+#include <sys/syscall.h> // `SYS_gettid`
+#include <sys/uio.h>     // `iovec`
+#include <unistd.h>      // `syscall`, `close`
 #endif
 
 #include <array>   // `std::array`
@@ -108,20 +107,109 @@ enum class range_pinning_t : std::uint8_t {
 
 #pragma region Kernel
 
-/*  Older distribution headers carry the syscall and miss the newer constants, so the few this
- *  transport needs are spelled out rather than made a build-time requirement. */
-#if !defined(IORING_SETUP_NO_SQARRAY)
-#define IORING_SETUP_NO_SQARRAY (1U << 16)
-#endif
-#if !defined(IORING_RSRC_REGISTER_SPARSE)
-#define IORING_RSRC_REGISTER_SPARSE (1U << 0)
-#endif
-#if !defined(IORING_ASYNC_CANCEL_ANY)
-#define IORING_ASYNC_CANCEL_ANY (1U << 2)
-#endif
-#if !defined(IORING_SQ_CQ_OVERFLOW)
-#define IORING_SQ_CQ_OVERFLOW (1U << 1)
-#endif
+/** @c IORING_SETUP_*: the io_uring setup flags every ring of this transport takes, with
+ *  @c R_DISABLED from Linux 5.10, @c COOP_TASKRUN and @c TASKRUN_FLAG from Linux 5.19, and
+ *  @c NO_SQARRAY from Linux 6.6. */
+enum linux_uring_setup_t : std::uint32_t {
+    linux_uring_setup_r_disabled_k = 1u << 6,
+    linux_uring_setup_coop_taskrun_k = 1u << 8,
+    linux_uring_setup_taskrun_flag_k = 1u << 9,
+    linux_uring_setup_no_sqarray_k = 1u << 16,
+};
+
+/** @c IOSQE_*: per-entry flags. */
+enum linux_uring_entry_flag_t : std::uint8_t {
+    linux_uring_entry_io_link_k = 1u << 2,
+};
+
+/** @c io_uring_sqe, the 64-byte submission entry, with the members this transport writes. */
+struct linux_uring_sqe_t {
+    std::uint8_t opcode;
+    std::uint8_t entry_flags;
+    std::uint16_t ioprio;
+    std::int32_t fd;
+    std::uint64_t off;
+    std::uint64_t addr;
+    std::uint32_t len;
+    union {
+        std::uint32_t fsync_flags;
+        std::uint32_t cancel_flags;
+    };
+    std::uint64_t user_data;
+    std::uint16_t buf_index;
+    std::uint16_t personality;
+    std::int32_t file_index;
+    std::uint64_t addr3;
+    std::uint64_t padding;
+};
+static_assert(sizeof(linux_uring_sqe_t) == 64, "the kernel reads 64-byte submission entries");
+
+/** @c io_uring_cqe, the 16-byte completion entry. */
+struct linux_uring_cqe_t {
+    std::uint64_t user_data;
+    std::int32_t res;
+    std::uint32_t completion_flags;
+};
+static_assert(sizeof(linux_uring_cqe_t) == 16, "the kernel writes 16-byte completion entries");
+
+/** @c io_sqring_offsets, where the submission ring's words sit in its mapping. */
+struct linux_uring_submission_offsets_t {
+    std::uint32_t head_offset;
+    std::uint32_t tail_offset;
+    std::uint32_t ring_mask_offset;
+    std::uint32_t ring_entries_offset;
+    std::uint32_t flags_offset;
+    std::uint32_t dropped_offset;
+    std::uint32_t array_offset;
+    std::uint32_t reserved;
+    std::uint64_t reserved2;
+};
+static_assert(sizeof(linux_uring_submission_offsets_t) == 40, "the kernel fills 40 bytes of submission offsets");
+
+/** @c io_cqring_offsets, where the completion ring's words sit in its mapping. */
+struct linux_uring_completion_offsets_t {
+    std::uint32_t head_offset;
+    std::uint32_t tail_offset;
+    std::uint32_t ring_mask_offset;
+    std::uint32_t ring_entries_offset;
+    std::uint32_t overflow_offset;
+    std::uint32_t cqes_offset;
+    std::uint32_t flags_offset;
+    std::uint32_t reserved;
+    std::uint64_t reserved2;
+};
+static_assert(sizeof(linux_uring_completion_offsets_t) == 40, "the kernel fills 40 bytes of completion offsets");
+
+/** @c io_uring_params, what @c io_uring_setup takes and fills. */
+struct linux_uring_params_t {
+    std::uint32_t sq_entries, cq_entries, setup_flags, sq_thread_cpu, sq_thread_idle, features, wq_fd;
+    std::uint32_t resv[3];
+    linux_uring_submission_offsets_t sq_off;
+    linux_uring_completion_offsets_t cq_off;
+};
+static_assert(sizeof(linux_uring_params_t) == 120, "the kernel takes 120 bytes of ring parameters");
+
+/** @c io_uring_rsrc_register, a sparse table of buffers or files. */
+struct linux_uring_rsrc_register_t {
+    std::uint32_t nr, flags;
+    std::uint64_t resv2, data, tags;
+};
+static_assert(sizeof(linux_uring_rsrc_register_t) == 32, "the kernel takes 32-byte table registrations");
+
+/** @c io_uring_rsrc_update, a run of files written into a table. */
+struct linux_uring_rsrc_update_t {
+    std::uint32_t offset, resv;
+    std::uint64_t data;
+};
+static_assert(sizeof(linux_uring_rsrc_update_t) == 16, "the kernel takes 16-byte table updates");
+
+/** @c io_uring_rsrc_update2, a run of buffers or files written into a table. */
+struct linux_uring_rsrc_update2_t {
+    std::uint32_t offset, resv;
+    std::uint64_t data, tags;
+    std::uint32_t nr, resv2;
+};
+static_assert(sizeof(linux_uring_rsrc_update2_t) == 32, "the kernel takes 32-byte table updates");
 
 #pragma endregion Kernel
 
@@ -130,10 +218,10 @@ enum class range_pinning_t : std::uint8_t {
 /**
  *  @brief The ring Linux offers, over one or more @c O_DIRECT files registered as media.
  *
- *  This is not a @c basic_disk over a blocking device: the queue is the kernel's, so the disk drives
- *  it directly and only the bookkeeping is its own. @c submit writes submission entries and enters
- *  once, @c poll enters with @c min_complete of zero to run the deferred completion work and copies
- *  whatever landed, and neither ever waits.
+ *  This is not a @c basic_disk over a blocking device: the queue is the kernel's, so the disk
+ *  drives it directly and only the bookkeeping is its own. @c submit writes submission entries and
+ *  enters once, @c poll reads whatever landed from the shared ring and enters, with @c min_complete
+ *  of zero, only when the kernel flags completion work waiting on the task, and neither ever waits.
  *
  *  A defect the ring can see before the kernel does - a stale registered memory, an extent past its
  *  range, a length past one transfer, an alignment the filesystem refuses - never fails the batch.
@@ -179,12 +267,13 @@ class linux_uring_files_disk {
 
     /**
      *  @brief Sets one tiny ring up and takes it down again, which is the only honest availability test.
+     *  @param[in] flags The setup flags tried, which a test widens to one the kernel refuses.
      *  @return Whether the kernel offers the flags this transport needs, or why it does not.
      */
-    [[nodiscard]] static linux_uring_probe_t probe() noexcept {
-        io_uring_params parameters {};
-        parameters.flags = ring_setup_flags_k;
-        long const opened = ::syscall(__NR_io_uring_setup, probe_entries_k, &parameters);
+    [[nodiscard]] static linux_uring_probe_t probe(std::uint32_t flags = ring_setup_flags_k) noexcept {
+        linux_uring_params_t parameters {};
+        parameters.setup_flags = flags;
+        long const opened = setup_(probe_entries_k, parameters);
         if (opened >= 0) {
             ::close(static_cast<int>(opened));
             return linux_uring_probe_t::available_k;
@@ -286,11 +375,11 @@ class linux_uring_files_disk {
         for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
             queue_pair_slot_t& slot = queue_pairs_[index];
             std::int32_t expected_free = 0;
-            if (!claim_(slot.leased)
+            if (!claim_(slot.acquired)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
             if (status_t const bound = bind_ring_(rings_[index], identity); bound.failed()) {
-                claim_(slot.leased).store(0, std::memory_order_release);
+                claim_(slot.acquired).store(0, std::memory_order_release);
                 return bound;
             }
             slot.depth = depth;
@@ -335,7 +424,7 @@ class linux_uring_files_disk {
         ++slot->generation;
         slot->depth = 0;
         slot->bound_thread = 0;
-        claim_(slot->leased).store(0, std::memory_order_release);
+        claim_(slot->acquired).store(0, std::memory_order_release);
         queue_pair.surrender();
         return {};
     }
@@ -424,7 +513,7 @@ class linux_uring_files_disk {
             direct_alignment_t const alignment = buffering_ == file_buffering_t::unbuffered_k
                                                      ? direct
                                                      : direct_alignment_t {1, 1};
-            slot.file = file;
+            atomic_reference_<native_file_t> {slot.file}.store(file, std::memory_order_release);
             slot.capacity = native_file_capacity(file);
             slot.memory_alignment = alignment.memory;
             slot.offset_alignment = alignment.offset;
@@ -444,9 +533,12 @@ class linux_uring_files_disk {
         if (!slot) return {status_code_t::invalid_argument_k, "The medium is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
             return {status_code_t::invalid_argument_k, "The medium is still named by requests in flight"};
-        close_native_file(slot->file);
+        // Rings stop installing the file before it closes, so none hands the kernel a closed
+        // one for long
+        native_file_t const file = atomic_reference_<native_file_t> {slot->file}.exchange(invalid_native_file_k,
+                                                                                          std::memory_order_acq_rel);
+        close_native_file(file);
         ++slot->generation;
-        slot->file = invalid_native_file_k;
         slot->capacity = 0;
         claim_(slot->registered).store(0, std::memory_order_release);
         epoch_(media_epoch_).add(1, std::memory_order_release);
@@ -484,7 +576,7 @@ class linux_uring_files_disk {
         std::size_t const room = credit < seats ? credit : seats;
         std::size_t const taking = requests.size() < room ? requests.size() : room;
 
-        io_uring_sqe* linked = nullptr;
+        linux_uring_sqe_t* linked = nullptr;
         std::size_t queued = 0;
         bool chain_broken = false;
         for (std::size_t index = 0; index != taking; ++index) {
@@ -514,7 +606,7 @@ class linux_uring_files_disk {
                 chain_broken = chains_next_(request) && deallocated.failed();
                 continue;
             }
-            io_uring_sqe& entry = ring.submission_entries[(published + queued) & ring.submission_mask];
+            linux_uring_sqe_t& entry = ring.submission_entries[(published + queued) & ring.submission_mask];
             build_(entry, request, ring.pinning);
             borrow_(request);
             track_(*slot, base, request);
@@ -529,8 +621,7 @@ class linux_uring_files_disk {
                                                                       std::memory_order_release);
             std::size_t accepted = 0;
             while (accepted != queued) {
-                long const entered = ::syscall(__NR_io_uring_enter, ring.file, static_cast<unsigned>(queued - accepted),
-                                               0u, 0u, nullptr, 0);
+                long const entered = enter_(ring, static_cast<unsigned>(queued - accepted), 0u);
                 if (entered > 0) {
                     accepted += static_cast<std::size_t>(entered);
                     continue;
@@ -550,8 +641,9 @@ class linux_uring_files_disk {
      *  @param[out] into Room for completions, which bounds how many one call moves.
      *  @return How many completions were moved, which is zero when nothing has landed.
      *
-     *  @note The entry carries @c min_complete of zero, so the call flushes the task work the kernel queued
-     *      for the ring and returns without waiting for anything.
+     *  @note The call enters the ring only when the kernel raised @c IORING_SQ_TASKRUN, and then
+     *      with @c min_complete of zero, so it flushes that task work and returns without
+     *      waiting for anything.
      */
     expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
@@ -561,7 +653,7 @@ class linux_uring_files_disk {
         ring_t& ring = rings_[static_cast<std::size_t>(queue_pair.id())];
 
         std::size_t moved = 0;
-        if (slot->flights_count != 0) enter_for_completions_(ring);
+        if (slot->flights_count != 0 && runs_task_work_(ring)) enter_for_completions_(ring);
         moved += poll_completions_(*slot, base, ring, into);
         if (overflowed_(ring) && moved != into.size()) {
             enter_for_completions_(ring);
@@ -586,13 +678,15 @@ class linux_uring_files_disk {
         unsigned const published = *ring.submission_tail;
         if (published - consumed >= ring.submission_entries_count) return;
 
-        io_uring_sqe& entry = ring.submission_entries[published & ring.submission_mask];
+        std::uint8_t const async_cancel = 14;     // IORING_OP_ASYNC_CANCEL
+        std::uint32_t const cancel_any = 1u << 2; // IORING_ASYNC_CANCEL_ANY, from Linux 5.19
+        linux_uring_sqe_t& entry = ring.submission_entries[published & ring.submission_mask];
         std::memset(&entry, 0, sizeof(entry));
-        entry.opcode = IORING_OP_ASYNC_CANCEL;
-        entry.cancel_flags = IORING_ASYNC_CANCEL_ANY;
+        entry.opcode = async_cancel;
+        entry.cancel_flags = cancel_any;
         entry.user_data = cancel_marker_k;
         atomic_reference_<unsigned> {*ring.submission_tail}.store(published + 1, std::memory_order_release);
-        [[maybe_unused]] long const entered = ::syscall(__NR_io_uring_enter, ring.file, 1u, 0u, 0u, nullptr, 0);
+        [[maybe_unused]] long const entered = enter_(ring, 1u, 0u);
     }
 
     /**
@@ -631,7 +725,7 @@ class linux_uring_files_disk {
         std::size_t shared_bytes = 0;
 
         /** The submission entries, mapped apart from the rings that index them. */
-        io_uring_sqe* submission_entries = nullptr;
+        linux_uring_sqe_t* submission_entries = nullptr;
 
         /** Bytes the submission entry mapping spans. */
         std::size_t submission_entries_bytes = 0;
@@ -661,7 +755,7 @@ class linux_uring_files_disk {
         unsigned completion_mask = 0;
 
         /** The completion entries themselves. */
-        io_uring_cqe* completion_entries = nullptr;
+        linux_uring_cqe_t* completion_entries = nullptr;
 
         /** The thread this ring is bound to, zero while it is still disabled. */
         thread_identity_t bound_thread = 0;
@@ -680,9 +774,9 @@ class linux_uring_files_disk {
     struct queue_pair_slot_t {
 
         /** Zero while the slot is free, one while a queue pair holds it. */
-        std::int32_t leased = 0;
+        std::int32_t acquired = 0;
 
-        /** Raised every time the slot is leased again, so a stale token routes nowhere. */
+        /** Raised every time the slot is acquired again, so a stale token routes nowhere. */
         queue_pair_generation_t generation = 0;
 
         /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
@@ -794,8 +888,10 @@ class linux_uring_files_disk {
      *  No @c SINGLE_ISSUER, and so no @c DEFER_TASKRUN: a queue pair moves to whichever thread takes the write path
      *  or a shared channel, and a ring bound to one task would be rebuilt at every move, its pins and its regions
      *  freed by the kernel's deferred exit work, until the locked-memory cap refuses the next ring.
+     *  The kernel raises a flag when completions wait on task work, so polling enters only then.
      */
-    static constexpr unsigned ring_setup_flags_k = IORING_SETUP_NO_SQARRAY | IORING_SETUP_R_DISABLED;
+    static constexpr unsigned ring_setup_flags_k = linux_uring_setup_no_sqarray_k | linux_uring_setup_r_disabled_k |
+                                                   linux_uring_setup_coop_taskrun_k | linux_uring_setup_taskrun_flag_k;
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
@@ -807,7 +903,9 @@ class linux_uring_files_disk {
 
     /** The kernel's name for the calling thread, since a ring binds to a task and a @c pthread_t is reused. */
     [[nodiscard]] static thread_identity_t bound_thread_identity_() noexcept {
-        return static_cast<std::uint64_t>(::gettid());
+        // glibc wraps `gettid` only from 2.30, while the system call is in every kernel this
+        // transport runs on
+        return static_cast<std::uint64_t>(::syscall(SYS_gettid));
     }
 
     static atomic_reference_<std::int32_t> claim_(std::int32_t& word) noexcept {
@@ -826,60 +924,89 @@ class linux_uring_files_disk {
 
 #pragma region Rings
 
+    /** Sets a ring of @p entries up as @p parameters ask, answering its descriptor or
+     *  a negative failure. */
+    static long setup_(unsigned entries, linux_uring_params_t& parameters) noexcept {
+        long const setup_syscall = 425 + linux_syscall_offset_k; // __NR_io_uring_setup
+        return ::syscall(setup_syscall, entries, &parameters);
+    }
+
+    /** Submits @p to_submit entries of @p ring and waits for @p min_complete completions as
+     *  @p flags say. */
+    static long enter_(ring_t const& ring, unsigned to_submit, unsigned min_complete,
+                       std::uint32_t flags = 0u) noexcept {
+        long const enter_syscall = 426 + linux_syscall_offset_k; // __NR_io_uring_enter
+        return ::syscall(enter_syscall, ring.file, to_submit, min_complete, flags, nullptr, 0);
+    }
+
+    /** Issues the registration @p opcode on @p ring with @p count of @p arguments. */
+    static long register_(ring_t const& ring, std::uint32_t opcode, void const* arguments, unsigned count) noexcept {
+        long const register_syscall = 427 + linux_syscall_offset_k; // __NR_io_uring_register
+        return ::syscall(register_syscall, ring.file, opcode, arguments, count);
+    }
+
     /** Sets one ring up disabled, maps it, and gives it the sparse buffer and file tables. */
     status_t create_ring_(ring_t& ring) noexcept {
-        io_uring_params parameters {};
-        parameters.flags = ring_setup_flags_k | IORING_SETUP_CQSIZE;
+        std::uint32_t const cqsize = 1u << 3;                 // IORING_SETUP_CQSIZE
+        std::uint32_t const single_mmap = 1u << 0;            // IORING_FEAT_SINGLE_MMAP
+        std::uint64_t const submission_ring = 0;              // IORING_OFF_SQ_RING
+        std::uint64_t const submission_entries = 0x10000000u; // IORING_OFF_SQES
+        std::uint32_t const register_sparse = 1u << 0;        // IORING_RSRC_REGISTER_SPARSE, from Linux 5.19
+        std::uint32_t const buffers2 = 15;                    // IORING_REGISTER_BUFFERS2, from Linux 5.13
+        std::uint32_t const files2 = 13;                      // IORING_REGISTER_FILES2, from Linux 5.13
+        linux_uring_params_t parameters {};
+        parameters.setup_flags = ring_setup_flags_k | cqsize;
         std::uint64_t const wanted = static_cast<std::uint64_t>(depth_limit_) * completion_slack_k;
         parameters.cq_entries = static_cast<unsigned>(wanted < 65536u ? wanted : 65536u);
-        long const opened = ::syscall(__NR_io_uring_setup, depth_limit_, &parameters);
+        long const opened = setup_(depth_limit_, parameters);
         if (opened < 0) return native_file_failure(errno, "The kernel refused an io_uring ring");
         ring.file = static_cast<int>(opened);
-        if ((parameters.features & IORING_FEAT_SINGLE_MMAP) == 0) {
+        if ((parameters.features & single_mmap) == 0) {
             teardown_ring_(ring);
             return {status_code_t::unsupported_k, "This kernel maps the two rings apart"};
         }
 
-        std::size_t const submission_bytes = parameters.sq_off.array + parameters.sq_entries * sizeof(unsigned);
-        std::size_t const completion_bytes = parameters.cq_off.cqes + parameters.cq_entries * sizeof(io_uring_cqe);
+        std::size_t const submission_bytes = parameters.sq_off.array_offset + parameters.sq_entries * sizeof(unsigned);
+        std::size_t const completion_bytes = parameters.cq_off.cqes_offset +
+                                             parameters.cq_entries * sizeof(linux_uring_cqe_t);
         ring.shared_bytes = submission_bytes > completion_bytes ? submission_bytes : completion_bytes;
         ring.shared = ::mmap(nullptr, ring.shared_bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring.file,
-                             IORING_OFF_SQ_RING);
+                             submission_ring);
         if (ring.shared == MAP_FAILED) {
             ring.shared = nullptr;
             teardown_ring_(ring);
             return {status_code_t::out_of_memory_k, "The ring would not map"};
         }
-        ring.submission_entries_bytes = parameters.sq_entries * sizeof(io_uring_sqe);
+        ring.submission_entries_bytes = parameters.sq_entries * sizeof(linux_uring_sqe_t);
         void* const entries = ::mmap(nullptr, ring.submission_entries_bytes, PROT_READ | PROT_WRITE,
-                                     MAP_SHARED | MAP_POPULATE, ring.file, IORING_OFF_SQES);
+                                     MAP_SHARED | MAP_POPULATE, ring.file, submission_entries);
         if (entries == MAP_FAILED) {
             teardown_ring_(ring);
             return {status_code_t::out_of_memory_k, "The submission entries would not map"};
         }
-        ring.submission_entries = static_cast<io_uring_sqe*>(entries);
+        ring.submission_entries = static_cast<linux_uring_sqe_t*>(entries);
 
         byte_t* const shared = static_cast<byte_t*>(ring.shared);
-        ring.submission_head = reinterpret_cast<unsigned*>(shared + parameters.sq_off.head);
-        ring.submission_tail = reinterpret_cast<unsigned*>(shared + parameters.sq_off.tail);
-        ring.submission_flags = reinterpret_cast<unsigned*>(shared + parameters.sq_off.flags);
-        ring.submission_mask = *reinterpret_cast<unsigned*>(shared + parameters.sq_off.ring_mask);
+        ring.submission_head = reinterpret_cast<unsigned*>(shared + parameters.sq_off.head_offset);
+        ring.submission_tail = reinterpret_cast<unsigned*>(shared + parameters.sq_off.tail_offset);
+        ring.submission_flags = reinterpret_cast<unsigned*>(shared + parameters.sq_off.flags_offset);
+        ring.submission_mask = *reinterpret_cast<unsigned*>(shared + parameters.sq_off.ring_mask_offset);
         ring.submission_entries_count = parameters.sq_entries;
-        ring.completion_head = reinterpret_cast<unsigned*>(shared + parameters.cq_off.head);
-        ring.completion_tail = reinterpret_cast<unsigned*>(shared + parameters.cq_off.tail);
-        ring.completion_mask = *reinterpret_cast<unsigned*>(shared + parameters.cq_off.ring_mask);
-        ring.completion_entries = reinterpret_cast<io_uring_cqe*>(shared + parameters.cq_off.cqes);
+        ring.completion_head = reinterpret_cast<unsigned*>(shared + parameters.cq_off.head_offset);
+        ring.completion_tail = reinterpret_cast<unsigned*>(shared + parameters.cq_off.tail_offset);
+        ring.completion_mask = *reinterpret_cast<unsigned*>(shared + parameters.cq_off.ring_mask_offset);
+        ring.completion_entries = reinterpret_cast<linux_uring_cqe_t*>(shared + parameters.cq_off.cqes_offset);
 
-        io_uring_rsrc_register table {};
-        table.flags = IORING_RSRC_REGISTER_SPARSE;
+        linux_uring_rsrc_register_t table {};
+        table.flags = register_sparse;
         table.nr = registered_memories_limit_;
-        if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_BUFFERS2, &table, sizeof(table)) < 0) {
+        if (register_(ring, buffers2, &table, sizeof(table)) < 0) {
             status_t const refused = native_file_failure(errno, "The ring would not take a buffer table");
             teardown_ring_(ring);
             return refused;
         }
         table.nr = media_limit_;
-        if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_FILES2, &table, sizeof(table)) < 0) {
+        if (register_(ring, files2, &table, sizeof(table)) < 0) {
             status_t const refused = native_file_failure(errno, "The ring would not take a file table");
             teardown_ring_(ring);
             return refused;
@@ -891,10 +1018,8 @@ class linux_uring_files_disk {
 
     /** Unmaps and closes one ring, giving its pins back at once, and leaves the slot ready for a fresh one. */
     static void teardown_ring_(ring_t& ring) noexcept {
-        if (ring.file >= 0) {
-            [[maybe_unused]] long const unpinned = ::syscall(__NR_io_uring_register, ring.file,
-                                                             IORING_UNREGISTER_BUFFERS, nullptr, 0);
-        }
+        std::uint32_t const unregister_buffers = 1; // IORING_UNREGISTER_BUFFERS
+        if (ring.file >= 0) register_(ring, unregister_buffers, nullptr, 0);
         if (ring.submission_entries) ::munmap(ring.submission_entries, ring.submission_entries_bytes);
         if (ring.shared) ::munmap(ring.shared, ring.shared_bytes);
         if (ring.file >= 0) ::close(ring.file);
@@ -913,8 +1038,9 @@ class linux_uring_files_disk {
         if (ring.bound_thread == identity) return {};
         if (ring.file < 0)
             if (status_t const created = create_ring_(ring); created.failed()) return created;
+        std::uint32_t const enable_rings = 12; // IORING_REGISTER_ENABLE_RINGS, from Linux 5.10
         if (ring.bound_thread == 0)
-            if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_ENABLE_RINGS, nullptr, 0) < 0)
+            if (register_(ring, enable_rings, nullptr, 0) < 0)
                 return native_file_failure(errno, "The ring would not be enabled");
         ring.bound_thread = identity;
         return {};
@@ -922,6 +1048,7 @@ class linux_uring_files_disk {
 
     /** Writes the disk's registered ranges and media into @p ring's tables when it is behind. */
     status_t carry_tables_(ring_t& ring, std::size_t seat) noexcept {
+        std::uint32_t const files_update = 6; // IORING_REGISTER_FILES_UPDATE
         epoch_t const registered_memories = epoch_(registered_memories_epoch_).load(std::memory_order_acquire);
         if (ring.carried_registered_memories != registered_memories) {
             auto [pinned, pin_ranges_status] = pin_ranges_(ring, seat, registered_memories);
@@ -933,15 +1060,19 @@ class linux_uring_files_disk {
         std::int32_t const media = epoch_(media_epoch_).load(std::memory_order_acquire);
         if (ring.carried_media != media) {
             int* const files = &registered_media_[seat * media_limit_];
-            for (std::size_t index = 0; index != media_limit_; ++index) {
-                registered_medium_slot_t& slot = media_[index];
-                bool const live = claim_(slot.registered).load(std::memory_order_acquire) != 0;
-                files[index] = live ? slot.file : -1;
-            }
-            io_uring_rsrc_update update {};
+            linux_uring_rsrc_update_t update {};
             update.data = reinterpret_cast<std::uint64_t>(files);
-            if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_FILES_UPDATE, &update, media_limit_) < 0)
-                return native_file_failure(errno, "The ring would not take its registered media");
+            for (;;) {
+                for (std::size_t index = 0; index != media_limit_; ++index) {
+                    registered_medium_slot_t& slot = media_[index];
+                    bool const live = claim_(slot.registered).load(std::memory_order_acquire) != 0;
+                    files[index] = live ? atomic_reference_<native_file_t> {slot.file}.load(std::memory_order_acquire)
+                                        : invalid_native_file_k;
+                }
+                if (register_(ring, files_update, &update, media_limit_) >= 0) break;
+                // A medium closed after the table read it, and the next read finds it cleared
+                if (errno != EBADF) return native_file_failure(errno, "The ring would not take its registered media");
+            }
             ring.carried_media = media;
         }
         return {};
@@ -964,11 +1095,11 @@ class linux_uring_files_disk {
             vectors[index].iov_base = live ? slot.base : nullptr;
             vectors[index].iov_len = live ? static_cast<std::size_t>(slot.length) : 0;
         }
-        io_uring_rsrc_update2 update {};
+        linux_uring_rsrc_update2_t update {};
         update.nr = registered_memories_limit_;
         update.data = reinterpret_cast<std::uint64_t>(vectors);
-        long const took = ::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_BUFFERS_UPDATE, &update,
-                                    sizeof(update));
+        std::uint32_t const buffers_update = 16; // IORING_REGISTER_BUFFERS_UPDATE, from Linux 5.13
+        long const took = register_(ring, buffers_update, &update, sizeof(update));
         if (took == static_cast<long>(registered_memories_limit_)) return range_pinning_t::pinned_k;
         if (took < 0 && errno != ENOMEM)
             return native_file_failure(errno, "The ring would not take its registered ranges");
@@ -978,14 +1109,22 @@ class linux_uring_files_disk {
 
     /** Runs the completion work the kernel queued for @p ring, without waiting. */
     static void enter_for_completions_(ring_t& ring) noexcept {
-        [[maybe_unused]] long const entered = ::syscall(__NR_io_uring_enter, ring.file, 0u, 0u, IORING_ENTER_GETEVENTS,
-                                                        nullptr, 0);
+        std::uint32_t const getevents = 1u << 0; // IORING_ENTER_GETEVENTS
+        [[maybe_unused]] long const entered = enter_(ring, 0u, 0u, getevents);
+    }
+
+    /** Whether the kernel queued completion work that only an entry into the ring runs. */
+    [[nodiscard]] static bool runs_task_work_(ring_t const& ring) noexcept {
+        unsigned const task_run = 1u << 2; // IORING_SQ_TASKRUN, from Linux 5.19
+        unsigned const flags = atomic_reference_<unsigned> {*ring.submission_flags}.load(std::memory_order_acquire);
+        return (flags & task_run) != 0;
     }
 
     /** Whether the kernel is holding completions back because the queue had no room for them. */
     [[nodiscard]] static bool overflowed_(ring_t const& ring) noexcept {
+        unsigned const completion_overflow = 1u << 1; // IORING_SQ_CQ_OVERFLOW
         unsigned const flags = atomic_reference_<unsigned> {*ring.submission_flags}.load(std::memory_order_acquire);
-        return (flags & IORING_SQ_CQ_OVERFLOW) != 0;
+        return (flags & completion_overflow) != 0;
     }
 
     /** Closes every ring and every open medium, which both the destructor and a move assignment need. */
@@ -1009,13 +1148,13 @@ class linux_uring_files_disk {
     [[nodiscard]] queue_pair_slot_t* slot_of_(queue_pair_t const& queue_pair) noexcept {
         if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
         queue_pair_slot_t& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
-        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
+        return slot.acquired != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
     [[nodiscard]] queue_pair_slot_t const* slot_of_(queue_pair_t const& queue_pair) const noexcept {
         if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
         queue_pair_slot_t const& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
-        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
+        return slot.acquired != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
     [[nodiscard]] registered_memory_slot_t* slot_of_(registered_memory_t const& registered_memory) noexcept {
@@ -1042,7 +1181,9 @@ class linux_uring_files_disk {
     [[nodiscard]] registered_medium_slot_t* resolve_(medium_reference_t place) noexcept {
         if (static_cast<std::size_t>(place.medium_id) >= media_.size()) return nullptr;
         registered_medium_slot_t& slot = media_[static_cast<std::size_t>(place.medium_id)];
-        return slot.registered != 0 && slot.generation == place.generation ? &slot : nullptr;
+        return claim_(slot.registered).load(std::memory_order_acquire) != 0 && slot.generation == place.generation
+                   ? &slot
+                   : nullptr;
     }
 
     /** Marks the range and the medium of @p request as live, so neither can be taken back under it. */
@@ -1155,15 +1296,22 @@ class linux_uring_files_disk {
     }
 
     /** Writes @p request into @p entry, addressing the medium by table index and the buffer as @p pinning allows. */
-    void build_(io_uring_sqe& entry, request_t const& request, range_pinning_t pinning) noexcept {
+    void build_(linux_uring_sqe_t& entry, request_t const& request, range_pinning_t pinning) noexcept {
+        std::uint8_t const fixed_file = 1u << 0; // IOSQE_FIXED_FILE
+        std::uint8_t const flush = 3;            // IORING_OP_FSYNC
+        std::uint32_t const datasync = 1u << 0;  // IORING_FSYNC_DATASYNC
+        std::uint8_t const read_pinned = 4;      // IORING_OP_READ_FIXED
+        std::uint8_t const write_pinned = 5;     // IORING_OP_WRITE_FIXED
+        std::uint8_t const read_unpinned = 22;   // IORING_OP_READ, from Linux 5.6
+        std::uint8_t const write_unpinned = 23;  // IORING_OP_WRITE, from Linux 5.6
         std::memset(&entry, 0, sizeof(entry));
-        entry.flags = IOSQE_FIXED_FILE;
-        if (request.chaining == request_chaining_t::chained_k) entry.flags |= IOSQE_IO_LINK;
+        entry.entry_flags = fixed_file;
+        if (request.chaining == request_chaining_t::chained_k) entry.entry_flags |= linux_uring_entry_io_link_k;
         entry.fd = static_cast<std::int32_t>(request.medium.medium_id);
         entry.user_data = request.token.bits;
         if (request.kind == request_kind_t::flush_k) {
-            entry.opcode = IORING_OP_FSYNC;
-            entry.fsync_flags = IORING_FSYNC_DATASYNC;
+            entry.opcode = flush;
+            entry.fsync_flags = datasync;
             return;
         }
         registered_memory_slot_t const* const memory = resolve_(request.buffer);
@@ -1172,19 +1320,19 @@ class linux_uring_files_disk {
         entry.len = static_cast<std::uint32_t>(request.extent.length);
         switch (pinning) {
         case range_pinning_t::pinned_k:
-            entry.opcode = request.kind == request_kind_t::read_k ? IORING_OP_READ_FIXED : IORING_OP_WRITE_FIXED;
+            entry.opcode = request.kind == request_kind_t::read_k ? read_pinned : write_pinned;
             entry.buf_index = static_cast<std::uint16_t>(request.buffer.memory_id);
             return;
         case range_pinning_t::unpinned_k:
-            entry.opcode = request.kind == request_kind_t::read_k ? IORING_OP_READ : IORING_OP_WRITE;
+            entry.opcode = request.kind == request_kind_t::read_k ? read_unpinned : write_unpinned;
             return;
         }
     }
 
     /** Drops the link from @p linked, since the request that would have followed it never arrived. */
-    static void unlink_(io_uring_sqe*& linked) noexcept {
+    static void unlink_(linux_uring_sqe_t*& linked) noexcept {
         if (!linked) return;
-        linked->flags = static_cast<std::uint8_t>(linked->flags & ~IOSQE_IO_LINK);
+        linked->entry_flags = static_cast<std::uint8_t>(linked->entry_flags & ~linux_uring_entry_io_link_k);
         linked = nullptr;
     }
 
@@ -1230,7 +1378,7 @@ class linux_uring_files_disk {
         unsigned const posted = atomic_reference_<unsigned> {*ring.completion_tail}.load(std::memory_order_acquire);
         std::size_t moved = 0;
         while (head != posted && moved != into.size()) {
-            io_uring_cqe const& entry = ring.completion_entries[head & ring.completion_mask];
+            linux_uring_cqe_t const& entry = ring.completion_entries[head & ring.completion_mask];
             ++head;
             expected<flight_t> const flight = retire_(slot, base, request_token_t {entry.user_data});
             if (!flight) continue;
@@ -1310,7 +1458,9 @@ class linux_uring_files_disk {
   public:
 
     /** Answers that this platform has no ring to offer. */
-    [[nodiscard]] static linux_uring_probe_t probe() noexcept { return linux_uring_probe_t::refused_k; }
+    [[nodiscard]] static linux_uring_probe_t probe(std::uint32_t = 0) noexcept {
+        return linux_uring_probe_t::refused_k;
+    }
 
     /** Refuses the mount, since this platform has no ring to mount on. */
     static expected<linux_uring_files_disk> make(linux_uring_disk_config_t const&) noexcept {

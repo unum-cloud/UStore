@@ -12,17 +12,18 @@
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
-#include <cstddef> // `std::size_t`
+#include <cstddef> // `std::size_t`, `std::byte`, `std::to_integer`
 #include <cstdint> // `std::uint32_t`, `std::uintptr_t`
 #include <cstring> // `std::memcmp`
 
 #include <dlfcn.h> // `dlopen`, `dlsym`
 
 #include <array>       // `std::array`
-#include <span>        // `std::span`, `std::as_writable_bytes`
+#include <span>        // `std::span`, `std::as_bytes`, `std::as_writable_bytes`
 #include <string>      // `std::string`, `std::to_string`
 #include <string_view> // `std::string_view`
 #include <variant>     // `std::variant`, `std::visit`
+#include <source_location> // `std::source_location`
 #include <vector>      // `std::vector`
 
 #include <fmt/format.h>
@@ -288,12 +289,24 @@ struct fixture_t {
 /** Counts a failure unless the @p count elements at device @p device equal those at host @p host, and live on the
  *  device of @p mover. */
 template <typename element_type_>
-std::size_t expect_column(mover_t& mover, element_type_ const* host, element_type_ const* device, std::size_t count) {
+std::size_t expect_column(mover_t& mover, element_type_ const* host, element_type_ const* device, std::size_t count,
+                          std::source_location const where = std::source_location::current()) {
     if (!count || (!host && !device)) return 0;
+    if (!host != !device) fmt::println(stderr, "  called at line {}: one side has no column", where.line());
     if (expect(host && device)) return 1;
     std::vector<element_type_> const fetched = mover.fetch(device, count);
-    return expect(mover.holds(device)) + expect(mover.status().succeeded()) +
-           expect(std::memcmp(fetched.data(), host, count * sizeof(element_type_)) == 0);
+    std::span<std::byte const> const fetched_bytes = std::as_bytes(std::span<element_type_ const> {fetched});
+    std::span<std::byte const> const host_bytes = std::as_bytes(std::span<element_type_ const> {host, count});
+    bool const same = std::memcmp(fetched.data(), host, count * sizeof(element_type_)) == 0;
+    if (!same)
+        for (std::size_t index = 0; index != host_bytes.size(); ++index)
+            if (fetched_bytes[index] != host_bytes[index]) {
+                fmt::println(stderr, "  called at line {}: byte {} of {} is {:#x} on the device, {:#x} on the host",
+                             where.line(), index, host_bytes.size(), std::to_integer<unsigned>(fetched_bytes[index]),
+                             std::to_integer<unsigned>(host_bytes[index]));
+                break;
+            }
+    return expect(mover.holds(device)) + expect(mover.status().succeeded()) + expect(same);
 }
 
 /** Counts a failure unless the device tape of @p count strings equals the host one. */
@@ -811,6 +824,11 @@ void admit_even_keys(ustore_key_t const* keys, ustore_admission_t* admissions, u
         admissions[index] = keys[index].uuid.bytes[15] % 2 == 0 ? ustore_admit_k : ustore_reject_k;
 }
 
+/** Whether the library embeds kernels for the vendor of @p listed. */
+bool embeds_kernels(ustore_gpu_device_t const& listed) {
+    return listed.vendor == ustore_gpu_vendor_nvidia_k ? !vram_nvidia_bundle().empty() : !vram_amd_bundle().empty();
+}
+
 case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, config_t config) {
     mover_t mover;
     if (expect(mover.open(listed).succeeded())) return 1;
@@ -819,11 +837,11 @@ case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, con
     fixture_t fixture {config, "matching"};
     if (fixture.failures) return fixture.failures;
     std::size_t failures = 0;
-    // Every device matches values through the library's kernels, but the stand-in HIP driver, which
+    // Every device matches values through the library's kernels, but the stand-in HIP driver
     // loads no bundle
-    device_service_t const matches_values = listed.vendor == ustore_gpu_vendor_nvidia_k || !fake_hip_counters()
-                                                ? device_service_t::served_k
-                                                : device_service_t::unsupported_k;
+    bool const loads_bundle = embeds_kernels(listed) &&
+                              (listed.vendor == ustore_gpu_vendor_nvidia_k || !fake_hip_counters());
+    device_service_t const matches_values = loads_bundle ? device_service_t::served_k : device_service_t::unsupported_k;
     ustore_predicate_t const even_cheap {.callback = &admit_even_keys, .cost = ustore_predicate_cheap_k};
     ustore_predicate_t const even_expensive {.callback = &admit_even_keys, .cost = ustore_predicate_expensive_k};
 
@@ -1045,9 +1063,7 @@ int main(int argc, char** argv) {
         report(totals, (prefix + "matching").c_str(), vram_matching, ordinal, listed, config);
         // A build embedding no kernels for the vendor, like the one the HIP stand-in runs under,
         // lists no tape case
-        bool const embeds = listed.vendor == ustore_gpu_vendor_nvidia_k ? !vram_nvidia_bundle().empty()
-                                                                        : !vram_amd_bundle().empty();
-        if (embeds) report(totals, (prefix + "tapes").c_str(), vram_tapes, listed);
+        if (embeds_kernels(listed)) report(totals, (prefix + "tapes").c_str(), vram_tapes, listed);
     }
     return suite_exit_code(totals);
 }

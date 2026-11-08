@@ -3,14 +3,11 @@
  *  @author Ash Vardanian
  *  @date October 29, 2026
  *  @brief Implements <tt>c/ustore/arrow.h</tt>: Arrow columns read into views and views exported as Arrow columns that
- *      pin their arena.
+ *      read their arena's outputs until its next call or free.
  *
- *  An export counts itself into the arena's @c exports and then reads its claim, while a call takes
- *  the claim and then reads @c exports, both sequentially consistent, so at least one of two racing
- *  sides backs off and no call rewinds what Arrow still reads. <tt>verification/arena_exports.cpp</tt>
- *  checks it. An export that carves behind the outputs, dense keys or offsets of another width,
- *  takes the claim as a call does, so neither a call nor another carving export touches the arena's
- *  blocks meanwhile, and counts itself in before letting the claim go.
+ *  An export that carves behind the outputs, dense keys or offsets of another width, takes
+ *  the claim as a call does, so neither a call nor another carving export touches the
+ *  arena's blocks meanwhile.
  */
 
 #include <cstddef> // `std::size_t`
@@ -92,32 +89,10 @@ consteval std::array<char, metadata_capacity_k> encode_metadata(std::initializer
 inline constexpr std::array<char, metadata_capacity_k> uuid_metadata_k = encode_metadata(
     {{"ARROW:extension:name", "arrow.uuid"}, {"ARROW:extension:metadata", ""}});
 
-/** What an exported column owns: the arena it pins and the buffers it points at. */
+/** What an exported column owns: the buffers it points at. */
 struct exported_column_t {
-    ustore_arena_t arena = nullptr;
     std::array<void const*, 3> buffers {};
 };
-
-/** Gives back one export of @p arena, freeing it when it was the last export of an arena already freed. */
-void unpin_arena(ustore_arena_t arena) noexcept {
-    if (floor_atomic_ref<std::uint32_t> {arena->exports}.fetch_sub(1, std::memory_order_acq_rel) ==
-        (arena_freed_bit_k | 1))
-        arena_free(arena);
-}
-
-/** Counts one export into @p arena. */
-void count_export(ustore_arena_t arena) noexcept {
-    floor_atomic_ref<std::uint32_t> {arena->exports}.fetch_add(1, std::memory_order_seq_cst);
-}
-
-/** Counts one export into @p arena, unless a call fills it. */
-ustore_status_t pin_arena(ustore_arena_t arena) noexcept {
-    count_export(arena);
-    if (floor_atomic_ref<claim_t> {arena->claim}.load(std::memory_order_seq_cst) == claim_t::free_k)
-        return ustore_status_success_k;
-    unpin_arena(arena);
-    return ustore_status_contended_k;
-}
 
 /** The device runs of @p arena, with the Arrow device type and ordinal they live on, null
  *  for host pages. */
@@ -325,22 +300,17 @@ ustore_status_t densify_on_device(ustore_arena_t arena, strided_rows_t& rows) no
 void release_exported_schema(ArrowSchema* schema) noexcept { schema->release = nullptr; }
 
 void release_exported_column(ArrowArray* array) noexcept {
-    auto* const column = static_cast<exported_column_t*>(array->private_data);
-    unpin_arena(column->arena);
-    delete column;
+    delete static_cast<exported_column_t*>(array->private_data);
     array->release = nullptr;
 }
 
-/** Exports @p rows rows of @p buffers out of @p arena, which the caller pinned, laid out as @p format says, into
- *  @p schema and @p array, or unpins it on failure. */
+/** Exports @p rows rows of @p buffers out of @p arena, laid out as @p format says, into @p schema
+ *  and @p array. */
 ustore_status_t export_column(ustore_arena_t arena, std::size_t rows, std::array<void const*, 3> buffers,
                               std::int64_t buffers_count, char const* format, char const* metadata, ArrowSchema* schema,
                               ArrowDeviceArray* array) noexcept {
-    auto* const column = new (std::nothrow) exported_column_t {arena, buffers};
-    if (!column) {
-        unpin_arena(arena);
-        return ustore_status_out_of_memory_k;
-    }
+    auto* const column = new (std::nothrow) exported_column_t {buffers};
+    if (!column) return ustore_status_out_of_memory_k;
     *schema = {.format = format,
                .name = "",
                .metadata = metadata,
@@ -558,18 +528,12 @@ ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys, ustore_size_t
                                      rows, nullptr};
         ustore_status_t const status = device_arena_of(arena).blocks ? densify_on_device(arena, strided_keys)
                                                                      : densify_on_host(arena, strided_keys);
-        if (status == ustore_status_success_k) count_export(arena);
         release(arena->claim);
         if (status != ustore_status_success_k) return status;
         data = strided_keys.dense;
     }
-    else {
-        if (ustore_status_t const pinned = pin_arena(arena); pinned != ustore_status_success_k) return pinned;
-        if (!arena_holds(arena, keys.data, static_cast<std::size_t>(count) * sizeof(ustore_key_t))) {
-            unpin_arena(arena);
-            return ustore_status_invalid_argument_k;
-        }
-    }
+    else if (!arena_holds(arena, keys.data, static_cast<std::size_t>(count) * sizeof(ustore_key_t)))
+        return ustore_status_invalid_argument_k;
     return export_column(arena, count, {nullptr, data, nullptr}, 2, "w:16", uuid_metadata_k.data(), schema, array);
 }
 
@@ -588,11 +552,7 @@ ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, usto
     char const* const format = layout == ustore_strings_u64_tape_k ? "Z" : "z";
     std::size_t const rows = static_cast<std::size_t>(count);
     if (!count || layout == strings.layout) {
-        if (ustore_status_t const pinned = pin_arena(arena); pinned != ustore_status_success_k) return pinned;
-        if (count && !arena_holds_tape(arena, strings, rows)) {
-            unpin_arena(arena);
-            return ustore_status_invalid_argument_k;
-        }
+        if (count && !arena_holds_tape(arena, strings, rows)) return ustore_status_invalid_argument_k;
         void const* const exported_offsets = count ? offsets : no_rows_k;
         void const* const exported_data = data ? static_cast<void const*>(data) : no_rows_k;
         return export_column(arena, count, {nullptr, exported_offsets, exported_data}, 3, format, nullptr, schema,
@@ -605,7 +565,6 @@ ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, usto
     ustore_status_t const status = device_arena_of(arena).blocks
                                        ? convert_on_device(arena, strings, rows, converted, data)
                                        : convert_on_host(arena, strings, rows, converted, data);
-    if (status == ustore_status_success_k) count_export(arena);
     release(arena->claim);
     if (status != ustore_status_success_k) return status;
     void const* const exported_data = data ? static_cast<void const*>(data) : no_rows_k;
@@ -664,7 +623,6 @@ ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const
                     },
                     buffers);
             });
-    if (status == ustore_status_success_k) count_export(arena);
     release(arena->claim);
     if (status != ustore_status_success_k) return status;
 

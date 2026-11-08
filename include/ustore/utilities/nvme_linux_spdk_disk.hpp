@@ -53,7 +53,7 @@
 #include <utility>     // `std::exchange`
 
 #if USTORE_WITH_SPDK
-#include <spdk/env.h>      // `spdk_env_init`, `spdk_mem_register`, `spdk_vtophys`
+#include <spdk/env.h>      // `spdk_env_init`, `spdk_mem_register`, `spdk_vtophys`, `spdk_dma_zmalloc`, `spdk_dma_free`
 #include <spdk/env_dpdk.h> // `spdk_env_dpdk_external_init`
 #include <spdk/nvme.h>     // `spdk_nvme_connect`, `spdk_nvme_ns_cmd_read`, `spdk_nvme_qpair`
 #endif
@@ -601,6 +601,38 @@ linux_spdk_environment<atomic_reference_, waiter_type_>::acquire(linux_spdk_envi
 
 #pragma endregion Environment
 
+#pragma region DMA Memory
+
+/** Allocates DMA-able memory from the SPDK environment, which PCIe controllers write into
+ *  directly, as the arena of a disk that translates addresses must be; a build without SPDK
+ *  answers @c nullptr. */
+template <typename value_type_ = byte_t>
+struct linux_spdk_dma_allocator {
+    using value_type = value_type_;
+    using propagate_on_container_move_assignment = std::true_type;
+    using is_always_equal = std::true_type;
+
+    constexpr linux_spdk_dma_allocator() noexcept = default;
+
+    /** The rebinding conversion @c std::allocator_traits performs. */
+    template <typename other_type_>
+    constexpr linux_spdk_dma_allocator(linux_spdk_dma_allocator<other_type_> const&) noexcept {}
+
+#if USTORE_WITH_SPDK
+    value_type_* allocate(std::size_t count) noexcept {
+        return static_cast<value_type_*>(spdk_dma_zmalloc(count * sizeof(value_type_), portable_alignment_k, nullptr));
+    }
+    void deallocate(value_type_* pointer, std::size_t) noexcept { spdk_dma_free(pointer); }
+#else
+    value_type_* allocate(std::size_t) noexcept { return nullptr; }
+    void deallocate(value_type_*, std::size_t) noexcept {}
+#endif
+
+    bool operator==(linux_spdk_dma_allocator const&) const noexcept { return true; }
+};
+
+#pragma endregion DMA Memory
+
 #if USTORE_WITH_SPDK
 
 #pragma region Attachments
@@ -840,6 +872,10 @@ class linux_spdk_disk {
         return disk;
     }
 
+    /** Whether the arena this disk registers must come from @c linux_spdk_dma_allocator: a PCIe
+     *  controller DMAs to translated addresses, while a socket transport copies from any memory. */
+    [[nodiscard]] bool needs_dma_memory() const noexcept { return reach_ == reach_t::translated_k; }
+
     /** What this disk accepts, which the namespace's sector size and the controller's limits fix. */
     [[nodiscard]] ring_capabilities_t capabilities() const noexcept {
         ring_capabilities_t reported;
@@ -880,7 +916,7 @@ class linux_spdk_disk {
         for (std::size_t seat = 0; seat != queue_pairs_.size(); ++seat) {
             queue_pair_slot_t& slot = queue_pairs_[seat];
             std::int32_t expected_free = 0;
-            if (!claim_(slot.leased)
+            if (!claim_(slot.acquired)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
             spdk_nvme_io_qpair_opts options {};
@@ -889,7 +925,7 @@ class linux_spdk_disk {
             options.io_queue_requests = depth_limit_ * 2;
             slot.queue = spdk_nvme_ctrlr_alloc_io_qpair(controller_, &options, sizeof(options));
             if (!slot.queue) {
-                claim_(slot.leased).store(0, std::memory_order_release);
+                claim_(slot.acquired).store(0, std::memory_order_release);
                 return status_t {status_code_t::capacity_exhausted_k, "The controller would not give a queue pair"};
             }
             slot.depth = depth;
@@ -934,7 +970,7 @@ class linux_spdk_disk {
         slot->queue = nullptr;
         ++slot->generation;
         slot->depth = 0;
-        claim_(slot->leased).store(0, std::memory_order_release);
+        claim_(slot->acquired).store(0, std::memory_order_release);
         queue_pair.surrender();
         return {};
     }
@@ -1248,9 +1284,9 @@ class linux_spdk_disk {
     struct queue_pair_slot_t {
 
         /** Zero while the slot is free, one while a queue pair holds it. */
-        std::int32_t leased = 0;
+        std::int32_t acquired = 0;
 
-        /** Raised every time the slot is leased again, so a stale token routes nowhere. */
+        /** Raised every time the slot is acquired again, so a stale token routes nowhere. */
         queue_pair_generation_t generation = 0;
 
         /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
@@ -1522,13 +1558,13 @@ class linux_spdk_disk {
     [[nodiscard]] queue_pair_slot_t* slot_of_(queue_pair_t const& queue_pair) noexcept {
         if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
         queue_pair_slot_t& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
-        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
+        return slot.acquired != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
     [[nodiscard]] queue_pair_slot_t const* slot_of_(queue_pair_t const& queue_pair) const noexcept {
         if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
         queue_pair_slot_t const& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
-        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
+        return slot.acquired != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
     [[nodiscard]] registered_memory_slot_t* slot_of_(registered_memory_t const& registered_memory) noexcept {
@@ -1946,6 +1982,10 @@ class linux_spdk_disk {
                                           linux_spdk_disk_config_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
     }
+
+    /** Whether the arena must come from DMA memory, which a disk that never
+     *  connected never asks. */
+    [[nodiscard]] bool needs_dma_memory() const noexcept { return false; }
 
     /** What this disk would accept, which is nothing at all. */
     [[nodiscard]] ring_capabilities_t capabilities() const noexcept { return {}; }

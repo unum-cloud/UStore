@@ -30,6 +30,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
+#include <algorithm>   // `std::min`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::shared_ptr`, `std::make_shared`
 #include <new>         // placement `new`
@@ -260,6 +261,12 @@ class any_files_disk {
         return linux_uring ? linux_uring->pinning() : range_pinning_t::unpinned_k;
     }
 
+    /** Whether the arena must come from DMA memory, which only SPDK over a PCIe controller asks. */
+    [[nodiscard]] bool needs_dma_memory() const noexcept {
+        linux_spdk_disk_t const* const linux_spdk = std::get_if<linux_spdk_disk_t>(&held_);
+        return linux_spdk && linux_spdk->needs_dma_memory();
+    }
+
 #pragma region Queue Pairs
 
     /** Takes a queue pair on @p depth requests of the held ring for the calling thread. */
@@ -389,7 +396,9 @@ inline expected<io_transport_t> probed_transport(io_transport_t wanted, linux_ur
     bool const takes_linux_uring = wanted == io_transport_t::automatic_k || wanted == io_transport_t::linux_uring_k;
     if (takes_linux_uring && linux_uring == linux_uring_probe_t::available_k) return io_transport_t::linux_uring_k;
     if (wanted == io_transport_t::linux_uring_k)
-        return status_t {status_code_t::unsupported_k, "The kernel creates no io_uring ring"};
+        return status_t {status_code_t::unsupported_k, linux_uring == linux_uring_probe_t::too_old_k
+                                                           ? "The io_uring transport needs Linux 6.12 or newer"
+                                                           : "The kernel refuses io_uring rings"};
     if (!takes_linux_uring && wanted != io_transport_t::linux_aio_k) return wanted;
     return linux_aio == linux_aio_probe_t::available_k ? io_transport_t::linux_aio_k : io_transport_t::blocking_k;
 }
@@ -457,16 +466,24 @@ class basic_storage_mount {
         auto [addresses, addresses_status] = addresses_of(config);
         if (addresses_status.failed()) return addresses_status;
 
+        // A block is one request, so none outgrows what the disk moves in one transfer, as
+        // SPDK's controllers bound
+        io_channel_config_t channels = config.channels;
+        if (std::uint64_t const transfer = disk_.capabilities().max_transfer_bytes; transfer != 0) {
+            channels.request_buffer_bytes = std::min(channels.request_buffer_bytes, transfer);
+            channels.stream_buffer_bytes = std::min(channels.stream_buffer_bytes, transfer);
+        }
+
         memory_arena_config_t arena;
-        arena.bytes = config.channels.arena_bytes() * (threads + config.shared_io_channels);
+        arena.bytes = channels.arena_bytes() * (threads + config.shared_io_channels);
         auto [pinned, make_arena_status] = arena_t::make(disk_, constraint, arena);
         if (make_arena_status.failed()) return make_arena_status;
         arena_ = std::move(pinned);
 
-        auto [leased, make_channel_pool_status] = channel_pool_t::make(disk_, arena_.registration(), threads,
-                                                                       config.shared_io_channels, config.channels);
+        auto [acquired, make_channel_pool_status] = channel_pool_t::make(disk_, arena_.registration(), threads,
+                                                                         config.shared_io_channels, channels);
         if (make_channel_pool_status.failed()) return make_channel_pool_status;
-        channels_ = std::move(leased);
+        channels_ = std::move(acquired);
 
         raise_open_files_limit();
         volume_config_t volume;

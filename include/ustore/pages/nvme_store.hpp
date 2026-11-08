@@ -28,10 +28,12 @@ namespace unum::ustore::pages {
  *  @tparam waiter_type_ What a core waiting on a read or the ledger does between attempts, before it parks.
  *  @tparam device_fold_type_ What composes the changes of a merge on a device,
  *      or @c blobs::no_device_fold_t where nothing does.
+ *  @tparam row_kit_type_ The SmashTable kit the memory runs' trees search with.
  */
 template <typename stored_key_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, typename device_fold_type_>
-using nvme_store = blobs::nvme_store<blobs::key_slot<stored_key_type_, blobs::value_layout_t::variable_width_k>,
-                                     volume_type_, atomic_reference_, waiter_type_, page_fold_t, device_fold_type_>;
+          typename waiter_type_, typename device_fold_type_, typename row_kit_type_>
+using nvme_store =
+    blobs::nvme_store<blobs::key_slot<stored_key_type_, blobs::value_layout_t::variable_width_k>, volume_type_,
+                      atomic_reference_, waiter_type_, page_fold_t, device_fold_type_, row_kit_type_>;
 
 } // namespace unum::ustore::pages

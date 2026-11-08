@@ -885,16 +885,6 @@ store_status_t read_strings(view_type_ const& view, strings_arg_t const& texts, 
     return store_status_t::success_k;
 }
 
-/** The strings one task of a strings call names: those starting with @c prefix, from @c start,
- *  inclusive, towards @c end, exclusive, in @c direction, where an empty start begins at the first
- *  string in the direction and an empty end bounds nothing. */
-struct strings_window_t {
-    std::string_view prefix;
-    std::string_view start;
-    std::string_view end;
-    ustore_scan_direction_t direction = ustore_scan_ascending_k;
-};
-
 /** Hands @p visit every string of @p window through @p view, smallest first, as <tt>visit(text)</tt>
  *  answering whether the walk goes on. */
 template <typename view_type_, typename visit_type_>
@@ -1188,8 +1178,9 @@ template <typename entry_type_, typename source_type_, typename stage_type_>
 store_status_t stage_runs_of(source_type_& source, strided_iterator<ustore_collection_id_t const> collections,
                              std::size_t count, status_t& outcome, stage_type_&& stage) noexcept {
     return for_each_run(source, collections, count, outcome,
-                        [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                            if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
+                        [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                                    std::size_t end) noexcept -> store_status_t {
+                            if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
                                 return refused_modality(outcome);
                             else {
                                 auto part = source.part(entries);
@@ -1447,8 +1438,9 @@ store_status_t stage_values_emptied(transaction_source<cpu_class_, isolation_>& 
                                     ustore_collection_id_t collection, status_t& outcome) noexcept {
     strided_iterator<ustore_collection_id_t const> const collections {&collection, sizeof(collection)};
     return for_each_run(
-        source, collections, 1, outcome, [&](auto& entries, std::size_t, std::size_t) noexcept -> store_status_t {
-            using entry_t = entry_of<decltype(entries)>;
+        source, collections, 1, outcome,
+        [&]<typename entries_type_>(entries_type_& entries, std::size_t, std::size_t) noexcept -> store_status_t {
+            using entry_t = entry_of<entries_type_>;
             if constexpr (std::is_same_v<entry_t, half_edge_t>) return store_status_t::success_k;
             else if constexpr (std::is_same_v<entry_t, string_pair_t>)
                 return refused(outcome, "A strings collection's values are keys, which can't be emptied");
@@ -1885,9 +1877,9 @@ status_t read_values(database_state<cpu_class_, isolation_>& state, arguments_ty
     store_status_t const read = with_source(state, view, [&](auto& source) noexcept {
         store_status_t const runs = for_each_run(
             source, places.collections_begin, places.size(), outcome,
-            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
-                    return refused_modality(outcome);
+            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                        std::size_t end) noexcept -> store_status_t {
+                if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>) return refused_modality(outcome);
                 else {
                     auto store = source.view(entries);
                     if (!store) return store.status();
@@ -1920,16 +1912,17 @@ status_t read_into_scratch(source_type_& source, place_batch_t const& places, vi
     if (outputs_status.failed()) return outputs_status;
     source_type_ reading = reading_as(source, view.watch);
     status_t outcome;
-    store_status_t const runs = for_each_run(
-        reading, places.collections_begin, places.size(), outcome,
-        [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-            if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>) return refused_modality(outcome);
-            else {
-                auto store = reading.view(entries);
-                if (!store) return store.status();
-                return read_keys<entry_type_>(*store, places, first, end, outputs);
-            }
-        });
+    store_status_t const runs = for_each_run(reading, places.collections_begin, places.size(), outcome,
+                                             [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                                                         std::size_t end) noexcept -> store_status_t {
+                                                 if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
+                                                     return refused_modality(outcome);
+                                                 else {
+                                                     auto store = reading.view(entries);
+                                                     if (!store) return store.status();
+                                                     return read_keys<entry_type_>(*store, places, first, end, outputs);
+                                                 }
+                                             });
     if (outcome.failed()) return outcome;
     if (st::failed(runs)) {
         failure = runs;
@@ -1952,8 +1945,9 @@ status_t scan_keys(database_state<cpu_class_, isolation_>& state, arguments_type
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
         return for_each_run(source, scans.collections, scans.size(), outcome,
-                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                                if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
+                            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                                        std::size_t end) noexcept -> store_status_t {
+                                if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
                                     return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);
@@ -1989,8 +1983,9 @@ status_t sample_keys(database_state<cpu_class_, isolation_>& state, arguments_ty
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
         return for_each_run(source, samples.collections, samples.size(), outcome,
-                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                                if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
+                            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                                        std::size_t end) noexcept -> store_status_t {
+                                if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
                                     return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);
@@ -2023,8 +2018,9 @@ status_t measure_keys(database_state<cpu_class_, isolation_>& state, arguments_t
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
         return for_each_run(source, measures.collections, measures.size(), outcome,
-                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                                if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
+                            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                                        std::size_t end) noexcept -> store_status_t {
+                                if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
                                     return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);
@@ -2116,6 +2112,12 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_co
         return translate(vacuumed);
     claim.retire();
     free_unreachable(state);
+    return persist(state);
+}
+
+/** Implements @c ustore_database_flush, rewriting the image as a flushed commit does. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_flush_t const&, view_t const&) noexcept {
     return persist(state);
 }
 
@@ -2548,8 +2550,8 @@ status_t changes_cursor_next(ustore_changes_cursor_next_t const& arguments, view
     std::size_t const wanted = static_cast<std::size_t>(arguments.wanted);
     st::vector<found_change_t, arena_allocator<found_change_t>> found {{view.scratch}};
     status_t const collected = std::visit(
-        [&](auto const& entries) noexcept -> status_t {
-            if constexpr (std::is_same_v<entry_of<decltype(entries)>, string_pair_t>) return {};
+        [&]<typename entries_type_>(entries_type_ const& entries) noexcept -> status_t {
+            if constexpr (std::is_same_v<entry_of<entries_type_>, string_pair_t>) return {};
             else return find_changes(*feed, entries, read_stamp, wanted, found);
         },
         feed->store->entries);

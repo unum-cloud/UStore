@@ -544,7 +544,29 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
 void ustore_arena_free(ustore_arena_t arena) {
     if (!arena) return;
     wait_deferred_calls(arena->deferred_calls);
-    // A live export frees the arena on its last release instead
-    if (floor_atomic_ref<std::uint32_t> {arena->exports}.fetch_add(arena_freed_bit_k, std::memory_order_acq_rel) == 0)
-        destroy_arena(arena);
+    destroy_arena(arena);
+}
+
+void ustore_arena_describe(ustore_arena_describe_t* arguments) {
+    ustore_outcome_t& outcome = *arguments->outcome;
+    ustore_arena_t const arena = arguments->arena;
+    if (!arena || !arguments->description)
+        return finish(outcome, {status_code_t::invalid_argument_k, "The call needs an arena and a description output"});
+    ustore_arena_description_t& description = *arguments->description;
+    description = {ustore_residency_ram_k, -1};
+    gpu_vendor_t vendor = gpu_vendor_t::nvidia_k;
+    std::int32_t vendor_ordinal = -1;
+    if (cuda_blocks_t const* const cuda = std::get_if<cuda_blocks_t>(&arena->memory)) vendor_ordinal = cuda->device;
+    if (hip_blocks_t const* const hip = std::get_if<hip_blocks_t>(&arena->memory)) {
+        vendor = gpu_vendor_t::amd_k;
+        vendor_ordinal = hip->device;
+    }
+    if (vendor_ordinal < 0) return finish(outcome, {});
+    description.residency = ustore_residency_vram_k;
+    std::span<gpu_device_t const> const devices = gpu_devices();
+    for (std::size_t position = 0; position != devices.size(); ++position)
+        if (devices[position].vendor == vendor &&
+            devices[position].vendor_ordinal == static_cast<std::uint32_t>(vendor_ordinal))
+            description.device = static_cast<std::int32_t>(position);
+    finish(outcome, {});
 }

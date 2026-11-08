@@ -195,7 +195,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
     if (writing_status.failed()) return writing_status;
     auto [merging, merging_status] = mount.channels().acquire();
     if (merging_status.failed()) return merging_status;
-    volume_t& volume = mount.router().volume(volume_id_t {});
+    volume_t& volume = mount.volume();
     auto [database, open_status] = database_t::open(volume, writing.channel(), merging.channel(),
                                                     database_config(workload), resources);
     if (open_status.failed()) return open_status;
@@ -318,6 +318,8 @@ status_t run_workload(settings_t const& settings, workload_t const& workload) no
     std::string const directory = fmt::format("{}/{}", settings.directory, workload.name);
     std::error_code error;
     std::filesystem::remove_all(directory, error);
+    std::filesystem::create_directories(directory, error);
+    std::string const manifest = fmt::format("{}/bench.ustore.json", directory);
 
     resources_config_t config;
     config.threads = workload.threads;
@@ -325,14 +327,14 @@ status_t run_workload(settings_t const& settings, workload_t const& workload) no
     config.io_transport = static_cast<io_transport_t>(settings.transport.selected);
     data_directory_config_t data;
     data.max_size = settings.volume_size.value;
-    if (sz::failed(config.directory.assign(string_view_t {directory})) ||
+    if (sz::failed(config.manifest.assign(string_view_t {manifest})) ||
         sz::failed(data.path.assign(string_view_t {directory})) ||
         st::failed(config.data_directories.push_back(std::move(data))))
         return {status_code_t::out_of_memory_k, "No memory for the directories"};
 
     status_t ran;
     {
-        expected<resources_ptr_t> opened = open_resources<atomic_reference, waiter_t>(config, uuid_t {});
+        expected<resources_ptr_t> opened = open_resources<atomic_reference, waiter_t>(config);
         if (!opened) return opened.status();
         resources_ptr_t const resources = std::move(*opened);
         fmt::println("- {}: {} transport, {} threads, {} keys", workload.name,

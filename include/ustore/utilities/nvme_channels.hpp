@@ -38,10 +38,12 @@
 #include <array>   // `std::array`
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`
+#include <variant> // `std::variant`, `std::visit`
 
 #include <smashtable/basic_fixed_pool.hpp> // `st::basic_fixed_pool`
 #include <smashtable/basic_vector.hpp>     // `st::vector`
 
+#include "ustore/utilities/nvme_linux_spdk_disk.hpp" // `linux_spdk_dma_allocator`
 #include "ustore/utilities/nvme_ring.hpp"   // `ring_concept`, `read_request`, `write_request`, `deallocate_request`
 #include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`, `resource_constraint`
 #include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`
@@ -113,11 +115,13 @@ class registered_memory_arena {
         if (!constraint.acquire(bytes)) return status_t {status_code_t::out_of_memory_k, "The budget refused an arena"};
         arena.constraint_ = &constraint;
         arena.charged_ = bytes;
-        if (arena.storage_.resize(bytes) != st::status_t::success_k)
+        if constexpr (requires { disk.needs_dma_memory(); })
+            if (disk.needs_dma_memory()) arena.storage_.template emplace<dma_storage_t>();
+        if (std::visit([&](auto& storage) noexcept { return storage.resize(bytes); }, arena.storage_) !=
+            st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "An arena of that size does not fit"};
 
-        auto [pinned, register_memory_status] = disk.register_memory(std::span<byte_t> {arena.storage_},
-                                                                     memory_space_t::host_k);
+        auto [pinned, register_memory_status] = disk.register_memory(arena.bytes(), memory_space_t::host_k);
         if (register_memory_status.failed()) return register_memory_status;
         arena.registered_memory_ = std::move(pinned);
         return arena;
@@ -132,10 +136,14 @@ class registered_memory_arena {
     }
 
     /** The whole range, which only the pools carved out of it address. */
-    [[nodiscard]] std::span<byte_t> bytes() noexcept { return std::span<byte_t> {storage_}; }
+    [[nodiscard]] std::span<byte_t> bytes() noexcept {
+        return std::visit([](auto& storage) noexcept { return std::span<byte_t> {storage}; }, storage_);
+    }
 
     /** Bytes the arena holds. */
-    [[nodiscard]] std::uint64_t size() const noexcept { return storage_.size(); }
+    [[nodiscard]] std::uint64_t size() const noexcept {
+        return std::visit([](auto const& storage) noexcept { return std::uint64_t {storage.size()}; }, storage_);
+    }
 
     /** Whether the arena is still pinned. */
     [[nodiscard]] bool registered() const noexcept { return registered_memory_.held(); }
@@ -151,7 +159,14 @@ class registered_memory_arena {
   private:
 
     /** The bytes, aligned so a mount demanding the portable alignment can address offset zero. */
-    using storage_t = st::vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
+    using heap_storage_t = st::vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
+
+    /** The bytes of a disk whose controller DMAs to translated addresses, from
+     *  the SPDK environment. */
+    using dma_storage_t = st::vector<byte_t, linux_spdk_dma_allocator<byte_t>>;
+
+    /** Heap bytes, or DMA bytes for a disk that needs them, chosen when the arena is made. */
+    using storage_t = std::variant<heap_storage_t, dma_storage_t>;
 
     /** Returns the charge to the budget, which both the destructor and a move assignment need. */
     void refund_() noexcept {
@@ -420,31 +435,31 @@ class basic_io_channel_pool;
 class io_channel_t {
   public:
 
-    /** This channel's queue pair held by one pipeline, which gives it back when the lease dies. */
-    class lease_t {
+    /** This channel's queue pair held by one pipeline, which gives it back when it dies. */
+    class acquired_channel_t {
       public:
 
-        lease_t() noexcept = default;
-        lease_t(lease_t const&) = delete;
-        lease_t& operator=(lease_t const&) = delete;
-        lease_t(lease_t&& other) noexcept : channel_(std::exchange(other.channel_, nullptr)) {}
-        lease_t& operator=(lease_t&& other) noexcept {
+        acquired_channel_t() noexcept = default;
+        acquired_channel_t(acquired_channel_t const&) = delete;
+        acquired_channel_t& operator=(acquired_channel_t const&) = delete;
+        acquired_channel_t(acquired_channel_t&& other) noexcept : channel_(std::exchange(other.channel_, nullptr)) {}
+        acquired_channel_t& operator=(acquired_channel_t&& other) noexcept {
             if (this != &other) release_(), channel_ = std::exchange(other.channel_, nullptr);
             return *this;
         }
-        ~lease_t() noexcept { release_(); }
+        ~acquired_channel_t() noexcept { release_(); }
 
-        /** The channel whose queue pair this lease holds. */
+        /** The channel whose queue pair this one holds. */
         [[nodiscard]] io_channel_t& channel() const noexcept { return *channel_; }
 
       private:
 
         friend class io_channel_t;
 
-        explicit lease_t(io_channel_t& channel) noexcept : channel_(&channel) {}
+        explicit acquired_channel_t(io_channel_t& channel) noexcept : channel_(&channel) {}
 
         void release_() noexcept {
-            if (channel_ != nullptr) channel_->leased_ = false;
+            if (channel_ != nullptr) channel_->acquired_ = false;
             channel_ = nullptr;
         }
 
@@ -478,10 +493,10 @@ class io_channel_t {
     [[nodiscard]] request_token_t token(request_tag_t tag) const noexcept { return queue_pair_.token(tag); }
 
     /** Leases the queue pair to one pipeline, or answers @c contended_k while another holds it. */
-    expected<lease_t> lease() noexcept {
-        if (leased_) return status_t {status_code_t::contended_k, "Another pipeline holds this channel's queue pair"};
-        leased_ = true;
-        return lease_t {*this};
+    expected<acquired_channel_t> acquire() noexcept {
+        if (acquired_) return status_t {status_code_t::contended_k, "Another pipeline holds this channel's queue pair"};
+        acquired_ = true;
+        return acquired_channel_t {*this};
     }
 
   private:
@@ -505,8 +520,8 @@ class io_channel_t {
     /** The tag the next request of this channel carries, wrapping harmlessly past the depth. */
     request_tag_t next_tag_ = 0;
 
-    /** Whether a lease holds the queue pair, which only the lease clears. */
-    bool leased_ = false;
+    /** Whether an acquired channel holds the queue pair, which only it clears. */
+    bool acquired_ = false;
 };
 
 /**
@@ -644,9 +659,9 @@ class basic_io_channel_pool {
 
         for (std::size_t index = 0; index != wanted; ++index) {
             io_channel_t& channel = pool.channels_[index];
-            auto [leased, acquire_queue_pair_status] = disk.acquire_queue_pair(config.depth);
+            auto [acquired, acquire_queue_pair_status] = disk.acquire_queue_pair(config.depth);
             if (acquire_queue_pair_status.failed()) return acquire_queue_pair_status;
-            channel.queue_pair_ = std::move(leased);
+            channel.queue_pair_ = std::move(acquired);
             if (channel.completions_.resize(config.depth) != st::status_t::success_k)
                 return status_t {status_code_t::out_of_memory_k, "A channel could not size its polling room"};
 
@@ -789,9 +804,12 @@ class basic_read_pipeline {
     basic_read_pipeline(basic_read_pipeline const&) = delete;
     basic_read_pipeline& operator=(basic_read_pipeline const&) = delete;
 
-    /** A pipeline holding the queue pair of @p lease alone for its life, against @p disk. */
-    basic_read_pipeline(disk_type_& disk, io_channel_t::lease_t&& lease, medium_reference_t medium) noexcept
-        : disk_(disk), lease_(std::move(lease)), channel_(lease_.channel()), medium_(medium) {}
+    /** A pipeline holding the queue pair of @p acquired_channel alone for its life,
+     *  against @p disk. */
+    basic_read_pipeline(disk_type_& disk, io_channel_t::acquired_channel_t&& acquired_channel,
+                        medium_reference_t medium) noexcept
+        : disk_(disk), acquired_channel_(std::move(acquired_channel)), channel_(acquired_channel_.channel()),
+          medium_(medium) {}
 
     /**
      *  @brief Whether another offer would find a block, credit and room in the window, without taking any.
@@ -800,8 +818,12 @@ class basic_read_pipeline {
      *  so a caller tagging offers consecutively may index a table of the depth by tag modulo depth.
      */
     [[nodiscard]] bool can_enqueue() const noexcept {
-        return channel_.requests().available_buffers() != 0 && entries_.size() < channel_.queue_pair().depth();
+        return channel_.requests().available_buffers() != 0 && can_enqueue_into();
     }
+
+    /** Whether another offer into registered memory the caller holds would find credit and room
+     *  in the window. */
+    [[nodiscard]] bool can_enqueue_into() const noexcept { return entries_.size() < channel_.queue_pair().depth(); }
 
     /** Queues a read of @p extent of the pipeline's medium under @p tag, as the
      *  three-argument form does. */
@@ -813,19 +835,22 @@ class basic_read_pipeline {
         if (!can_enqueue()) return {status_code_t::capacity_exhausted_k, "This channel has no block or credit left"};
         auto [block, acquire_status] = channel_.requests().acquire();
         if (acquire_status.failed()) return acquire_status;
-        entry_t entry;
-        entry.block = std::move(block);
-        entry.tag = tag;
-        entry.requested_bytes = extent.length;
-        request_t const request = read_request(medium, extent, entry.block.reference(), channel_.token(next_slot_));
-        if (staged_.push_back(request_t {request}) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A pipeline could not stage another request"};
-        if (entries_.push_back(std::move(entry)) != st::status_t::success_k) {
-            staged_.pop_back();
-            return {status_code_t::out_of_memory_k, "A pipeline could not track another request"};
-        }
-        ++next_slot_;
-        return {};
+        memory_reference_t const into = block.reference();
+        std::span<byte_t> const landing = block.bytes();
+        return offer_(medium, extent, into, landing, std::move(block), tag);
+    }
+
+    /**
+     *  @brief Queues a read of @p extent of @p medium under @p tag straight into @p landing,
+     *      registered memory whose place @p into names, which the caller holds until the read
+     *      completes, so the read takes no block.
+     *
+     *  The sink sees the bytes where they landed, and nothing is recycled once it returns.
+     */
+    status_t enqueue_read(medium_reference_t medium, extent_t extent, memory_reference_t into,
+                          std::span<byte_t> landing, request_tag_t tag) noexcept {
+        if (!can_enqueue_into()) return {status_code_t::capacity_exhausted_k, "This channel has no credit left"};
+        return offer_(medium, extent, into, landing, pooled_buffer_t {}, tag);
     }
 
     /** Submits what is staged, keeping whatever the ring would not take for the next call. */
@@ -864,7 +889,7 @@ class basic_read_pipeline {
             block.state = completion.state;
             block.status = completion.status;
             block.requested_bytes = entry->requested_bytes;
-            block.bytes = std::span<byte_t const> {entry->block.bytes().data(),
+            block.bytes = std::span<byte_t const> {entry->landing.data(),
                                                    static_cast<std::size_t>(completion.transferred_bytes)};
             sink(block);
             entry->block.release();
@@ -905,8 +930,12 @@ class basic_read_pipeline {
     /** One offered request and the block it fills, retired when its completion is polled. */
     struct entry_t {
 
-        /** The block the device writes into, recycled after the sink has seen it. */
+        /** The block the device writes into, recycled after the sink has seen it, or none for a
+         *  read into the caller's memory. */
         pooled_buffer_t block;
+
+        /** The bytes the device writes into: the block's, or the caller's. */
+        std::span<byte_t> landing;
 
         /** The caller's tag, which the sink matches its own bookkeeping on. */
         request_tag_t tag = 0;
@@ -917,6 +946,26 @@ class basic_read_pipeline {
         /** Whether this entry still awaits its completion. */
         bool live = true;
     };
+
+    /** Stages a read of @p extent of @p medium into @p landing, whose place @p into names, keeping
+     *  @p block until its completion. */
+    status_t offer_(medium_reference_t medium, extent_t extent, memory_reference_t into, std::span<byte_t> landing,
+                    pooled_buffer_t&& block, request_tag_t tag) noexcept {
+        entry_t entry;
+        entry.block = std::move(block);
+        entry.landing = landing;
+        entry.tag = tag;
+        entry.requested_bytes = extent.length;
+        request_t const request = read_request(medium, extent, into, channel_.token(next_slot_));
+        if (staged_.push_back(request_t {request}) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A pipeline could not stage another request"};
+        if (entries_.push_back(std::move(entry)) != st::status_t::success_k) {
+            staged_.pop_back();
+            return {status_code_t::out_of_memory_k, "A pipeline could not track another request"};
+        }
+        ++next_slot_;
+        return {};
+    }
 
     /** The entry a completion belongs to, found by the ring tag it was minted with. */
     [[nodiscard]] entry_t* entry_of_(request_tag_t slot) noexcept {
@@ -946,7 +995,7 @@ class basic_read_pipeline {
     disk_type_& disk_;
 
     /** The queue pair this pipeline holds alone. */
-    io_channel_t::lease_t lease_;
+    io_channel_t::acquired_channel_t acquired_channel_;
 
     /** The channel this pipeline submits and polls on. */
     io_channel_t& channel_;
@@ -987,9 +1036,12 @@ class basic_write_pipeline {
     basic_write_pipeline(basic_write_pipeline const&) = delete;
     basic_write_pipeline& operator=(basic_write_pipeline const&) = delete;
 
-    /** A pipeline holding the queue pair of @p lease alone for its life, against @p disk. */
-    basic_write_pipeline(disk_type_& disk, io_channel_t::lease_t&& lease, medium_reference_t medium) noexcept
-        : disk_(disk), lease_(std::move(lease)), channel_(lease_.channel()), medium_(medium) {}
+    /** A pipeline holding the queue pair of @p acquired_channel alone for its life,
+     *  against @p disk. */
+    basic_write_pipeline(disk_type_& disk, io_channel_t::acquired_channel_t&& acquired_channel,
+                         medium_reference_t medium) noexcept
+        : disk_(disk), acquired_channel_(std::move(acquired_channel)), channel_(acquired_channel_.channel()),
+          medium_(medium) {}
 
     /** Takes a block to fill, or answers @c capacity_exhausted_k until a poll_completions frees one. */
     expected<pooled_buffer_t> acquire_buffer() noexcept { return channel_.requests().acquire(); }
@@ -1168,7 +1220,7 @@ class basic_write_pipeline {
     disk_type_& disk_;
 
     /** The queue pair this pipeline holds alone. */
-    io_channel_t::lease_t lease_;
+    io_channel_t::acquired_channel_t acquired_channel_;
 
     /** The channel this pipeline submits and polls on. */
     io_channel_t& channel_;

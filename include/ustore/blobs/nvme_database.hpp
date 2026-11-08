@@ -29,7 +29,7 @@
 #include <cstdint> // `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm>   // `std::copy`, `std::sort`, `std::lower_bound`
+#include <algorithm>   // `std::copy`, `std::lower_bound`
 #include <array>       // `std::array`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
@@ -53,6 +53,7 @@
 #include "ustore/utilities/nvme_channels.hpp"   // `io_channel_t`, `basic_io_channel_pool`
 #include "ustore/utilities/nvme_mounts.hpp"     // `resources_shared_ptr`
 #include "ustore/utilities/nvme_ring.hpp"       // `portable_alignment_k`
+#include "ustore/utilities/algorithm.hpp"       // `radix_sort`
 #include "ustore/utilities/nvme_volume.hpp"     // `medium_extent_t`, `volume_config_t`
 #include "ustore/utilities/ram_buffers.hpp"     // `constrained_allocator`
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_t`, `bytes_span_t`, `save_fields`, `load_fields`
@@ -135,13 +136,14 @@ class database_snapshot {
  *  @brief A group of writes and reads over several collections that succeed or fail together.
  *  @tparam stored_key_type_ The key every collection of the store is addressed by.
  *  @tparam store_type_ The store the writes land in, which must satisfy @c transaction_store_concept.
+ *  @tparam row_kit_type_ The SmashTable kit the writes' and watches' hash tables search with.
  *
  *  The core carries the writes, the watches, the stamps and the two-phase lifecycle; what is here
  *  resolves a collection's name to its ID and widths once per run of calls, and reads through the
  *  store at the right stamp.
  */
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
+          typename waiter_type_, typename row_kit_type_>
 class database_transaction {
   public:
 
@@ -154,7 +156,7 @@ class database_transaction {
     using store_t = store_type_;
 
     /** The registry that orders this transaction against every other of the same store. */
-    using registry_t = transaction_registry<stored_key_t, store_t, atomic_reference_, waiter_type_>;
+    using registry_t = transaction_registry<stored_key_t, store_t, atomic_reference_, waiter_type_, row_kit_type_>;
 
     /** The writes, the watches, the stamps and the lifecycle this transaction shares with
      *  every other kind. */
@@ -585,6 +587,8 @@ struct unverified_runs_t {};
  *      transactions they share.
  *  @tparam stored_key_type_ The key every collection of this database is addressed by.
  *  @tparam volume_type_ The volume every run of every collection lives on.
+ *  @tparam row_kit_type_ The SmashTable kit the stores' memory runs, the transactions' hash tables
+ *      and the collection indexes search with, which every store keyed by this database shares.
  *  @tparam store_tags_type_ Where among @p store_types_ the store a tag names sits, through a
  *      static @c index_of answering the count of @p store_types_ for a tag naming none.
  *  @tparam store_types_ The stores a collection may live in, of which a create and a mount take the
@@ -595,7 +599,7 @@ struct unverified_runs_t {};
  *  registry and every live transaction name it.
  */
 template <typename stored_key_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, typename store_tags_type_, nvme_store_concept... store_types_>
+          typename waiter_type_, typename row_kit_type_, typename store_tags_type_, nvme_store_concept... store_types_>
 class basic_database {
   public:
 
@@ -608,7 +612,7 @@ class basic_database {
     using volume_t = volume_type_;
 
     /** The transport those volumes move bytes through. */
-    using disk_t = std::remove_reference_t<decltype(std::declval<volume_t&>().disk())>;
+    using disk_t = typename volume_t::disk_t;
 
     /** The queue pairs every call that moves bytes borrows one of. */
     using channel_pool_t = basic_io_channel_pool<disk_t, atomic_reference_>;
@@ -620,10 +624,12 @@ class basic_database {
     using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeric_id_t>;
 
     /** The transactions of this database, the order they commit in and the conflicts that stop them. */
-    using registry_t = transaction_registry<stored_key_t, basic_database, atomic_reference_, waiter_type_>;
+    using registry_t =
+        transaction_registry<stored_key_t, basic_database, atomic_reference_, waiter_type_, row_kit_type_>;
 
     /** One transaction over the collections of this database. */
-    using transaction_t = database_transaction<stored_key_t, basic_database, atomic_reference_, waiter_type_>;
+    using transaction_t =
+        database_transaction<stored_key_t, basic_database, atomic_reference_, waiter_type_, row_kit_type_>;
 
     /** A live transaction, owned by whoever asked for it and retired when it dies. */
     using transaction_unique_ptr_t = std::unique_ptr<transaction_t>;
@@ -1114,7 +1120,7 @@ class basic_database {
                             using scanner_t =
                                 nvme_store_cursor<typename store_type_::key_slot_t, volume_t, atomic_reference_,
                                                   waiter_type_, typename store_type_::fold_t,
-                                                  typename store_type_::device_fold_t>;
+                                                  typename store_type_::device_fold_t, row_kit_type_>;
                             auto [scanner, over_status] = scanner_t::over(collection, from, stamp, thread_index,
                                                                           direction);
                             if (over_status.failed()) return over_status;
@@ -1195,7 +1201,7 @@ class basic_database {
 
     /**
      *  @brief Pins @p pin at @p stamp for a feed of the changes committed to @p id after it, so no
-     *      merge of any collection folds a version above it until the pin is released.
+     *      merge of that collection folds a version above it until the pin is released.
      *
      *  @par Statuses:
      *  - @c write_conflict_k A merge of @p id may have folded a version above @p stamp already.
@@ -1381,8 +1387,9 @@ class basic_database {
         return false;
     }
 
-    /** Merges one overfull level of every collection that has one, which needs two channels at once. */
-    status_t compact() noexcept {
+    /** Merges one overfull level of every collection that has one, which needs two channels at
+     *  once, fanning each merge on the host out over @p fan_out. */
+    status_t compact(compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
         expected<claimed_channel_t> reading = claim_channel_();
         if (!reading) return reading.status();
         auto [writing, acquire_status] = channels_->acquire();
@@ -1397,7 +1404,7 @@ class basic_database {
         for (std::size_t index = 0; index != collections_.size(); ++index) {
             auto [merged, compact_status] = std::visit(
                 [&](auto& held) noexcept {
-                    return held.compact(reading->channel(), writing.channel(), compactor_, published);
+                    return held.compact(reading->channel(), writing.channel(), compactor_, published, fan_out);
                 },
                 collections_[index]->held);
             if (compact_status.failed() && first.succeeded()) first = compact_status;
@@ -1496,9 +1503,10 @@ class basic_database {
      *      first when the collection's memory runs are past their bounds.
      *  @return @c write_conflict_k for a collection gone since the transaction wrote it.
      */
-    status_t seal_collection(collection_id_t collection_id,
-                             transaction_deltas<stored_key_t, atomic_reference_, waiter_type_> const& written,
-                             sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
+    status_t seal_collection(
+        collection_id_t collection_id,
+        transaction_deltas<stored_key_t, atomic_reference_, waiter_type_, row_kit_type_> const& written,
+        sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed) noexcept {
         st::vector<keyed_delta<stored_key_t>, constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_>>
             deltas {
                 constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_> {resources_->memory_constraint}};
@@ -1518,7 +1526,7 @@ class basic_database {
      *  @return @c write_conflict_k for a collection gone since the transaction wrote it.
      */
     status_t prepare_collection(collection_id_t collection_id,
-                                sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
+                                sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed) noexcept {
         reader_t const inside = ledger_.epochs().enter();
         collection_entry_t* const found = entry_with_id_(collection_id);
         if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
@@ -1532,7 +1540,8 @@ class basic_database {
 
     /** Publishes @p sealed under @p stamp in the view @c prepare_collection laid out, before the stamp itself is,
      *  on the thread holding the leader word, which a drop waits for. */
-    void publish_collection(collection_id_t collection_id, sealed_commit<stored_key_t, atomic_reference_>& sealed,
+    void publish_collection(collection_id_t collection_id,
+                            sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed,
                             transaction_stamp_t stamp) noexcept {
         reader_t const inside = ledger_.epochs().enter();
         collection_entry_t* const found = entry_with_id_(collection_id);
@@ -1700,8 +1709,11 @@ class basic_database {
             return status_t {status_code_t::out_of_memory_k, "No room to index the target's runs"};
         for (manifest_file_t const& file : held.files) [[maybe_unused]]
             st::status_t const indexed = held_by_run.push_back(st::assume_reserved, &file);
-        std::sort(
-            held_by_run.begin(), held_by_run.end(),
+        utilities::radix_sort(
+            std::span<manifest_file_t const*> {held_by_run}, uuid_t::size_bytes_k,
+            [](manifest_file_t const* file, std::size_t digit) noexcept -> std::size_t {
+                return file->run.bytes[digit];
+            },
             [](manifest_file_t const* left, manifest_file_t const* right) noexcept { return left->run < right->run; });
 
         manifest_t manifest;
@@ -1771,11 +1783,13 @@ class basic_database {
     using entries_t = st::basic_growing_pool<collection_entry_t, std::uint32_t, catalog_allocator_t>;
 
     /** The entries of the published collections by ID, their UUID bytes taken as the key. */
-    using ids_index_t = st::basic_hash_index<st::key128_t, std::uint32_t, st::default_hash_t, catalog_allocator_t>;
+    using ids_index_t =
+        st::basic_hash_index<st::key128_t, std::uint32_t, st::default_hash_t, catalog_allocator_t, row_kit_type_>;
 
     /** The entries of the published collections by a hash of their name, which a lookup confirms
      *  against the name. */
-    using names_index_t = st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t, catalog_allocator_t>;
+    using names_index_t =
+        st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t, catalog_allocator_t, row_kit_type_>;
 
     /**
      *  @brief One published list of collections, naming every entry the database held when it was laid out.
@@ -1974,7 +1988,7 @@ class basic_database {
         collection_id_t id = collection_invalid_id_k;
 
         /** Its deltas and the run they become. */
-        sealed_commit<stored_key_t, atomic_reference_> sealed;
+        sealed_commit<stored_key_t, atomic_reference_, row_kit_type_> sealed;
     };
 
     static status_t prepare_head_(void* context) noexcept {
@@ -2019,7 +2033,8 @@ class basic_database {
     /** Seals with @p sealer into @p sealed out of @p collection_id's collection, then makes room while its memory
      *  runs are past twice their bounds, inside the ledger's epochs only while sealing. */
     template <typename sealer_type_>
-    status_t seal_into_(collection_id_t collection_id, sealed_commit<stored_key_t, atomic_reference_>& sealed,
+    status_t seal_into_(collection_id_t collection_id,
+                        sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed,
                         sealer_type_&& sealer) noexcept {
         {
             reader_t const inside = ledger_.epochs().enter();
@@ -2362,15 +2377,15 @@ class basic_database {
     status_t move_extent_(io_channel_t& reading, io_channel_t* writing, medium_extent_t const& from,
                           medium_extent_t const* into, digester_type_ const& digester, sha256_t& digest) noexcept {
         disk_t& disk = volume_->disk();
-        auto [reader_lease, reader_lease_status] = reading.lease();
-        if (reader_lease_status.failed()) return reader_lease_status;
-        basic_read_pipeline<disk_t> reader {disk, std::move(reader_lease), from.medium};
+        auto [reader_channel, reader_channel_status] = reading.acquire();
+        if (reader_channel_status.failed()) return reader_channel_status;
+        basic_read_pipeline<disk_t> reader {disk, std::move(reader_channel), from.medium};
         std::optional<basic_write_pipeline<disk_t, waiter_type_>> writer;
         std::uint64_t block_bytes = reading.requests().buffer_bytes();
         if (writing) {
-            auto [writer_lease, writer_lease_status] = writing->lease();
-            if (writer_lease_status.failed()) return writer_lease_status;
-            writer.emplace(disk, std::move(writer_lease), into->medium);
+            auto [writer_channel, writer_channel_status] = writing->acquire();
+            if (writer_channel_status.failed()) return writer_channel_status;
+            writer.emplace(disk, std::move(writer_channel), into->medium);
             if (writing->requests().buffer_bytes() < block_bytes) block_bytes = writing->requests().buffer_bytes();
         }
         block_bytes = round_down_to_multiple<std::uint64_t>(block_bytes, portable_alignment_k);

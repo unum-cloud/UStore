@@ -1,34 +1,29 @@
 cff-version: 1.2.0
-title: "UStore: GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
+title: "UStore: GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass"
 message: "If you use this software, please cite it as below."
 type: software
 license: Apache-2.0
-version: 1.0.0-rc.1
-doi: 10.5281/zenodo.7537042
 repository-code: https://github.com/unum-cloud/UStore
 url: https://www.unum.cloud/ustore
+doi: 10.5281/zenodo.7537042
 abstract: >-
-  UStore is a GPU-accelerated embedded transactional database built for high-throughput NVMe
-  devices, taking a hyper-converged design where storage and compute share one node rather than
-  being disaggregated across a network. Point lookups stay on the CPU, reaching the drive through
-  kernel bypass with io_uring passthrough and SPDK and searching tree nodes sized to the medium
-  with SIMD kits chosen once when a database opens, while GPUs take over LSM compaction and other
-  bulk operations, loading sorted runs straight into device memory through GPUDirect Storage.
-  Blobs, documents, and graphs live in multi-modal collections addressed by 128-bit UUID keys,
-  with transactions spanning collections, all exposed through one engine-agnostic C ABI and thin
-  Python and Rust bindings that forward each call without copying results into language
-  containers. A reference in-memory backend on SmashTable ships alongside support for third-party
-  key-value stores such as RocksDB and LevelDB behind the same interface.
+  UStore is an embedded transactional database engine that keeps blobs, documents, graphs, strings
+  and markup pages in collections addressed by 128-bit UUID keys, with transactions spanning
+  collections behind one engine-agnostic C ABI. Its NVMe engine reaches drives through kernel
+  bypass with io_uring and SPDK, lays immutable sorted runs into 1 GB slots of raw drives or into
+  files under JSON manifests, searches them with SIMD S+ trees, and merges them on GPUs that read
+  through GPUDirect Storage. It links into the process that uses it on machines pairing NVMe
+  drives with GPUs, beside an in-memory reference engine and RocksDB and LevelDB engines that serve
+  the same calls.
 keywords:
   - database
-  - transactional
-  - key-value
+  - transactions
+  - key-value store
   - multi-modal
   - nvme
-  - io-uring
-  - spdk
+  - kernel bypass
   - gpu
-  - simd
+  - log-structured merge tree
 
 authors:
   - family-names: Vardanian
@@ -40,49 +35,42 @@ references:
   - type: article
     title: "Networks Processing Performance Report"
     url: https://www.unum.cloud/blog/graphs
-    date-published: 2020-11-12
     authors:
       - family-names: Vardanian
         given-names: Ash
   - type: article
     title: "Why Build a Custom DBMS?"
     url: https://www.unum.cloud/blog/why-build-dbms
-    date-published: 2021-01-02
     authors:
       - family-names: Vardanian
         given-names: Ash
   - type: article
     title: "Text Indexing in ElasticSearch, MongoDB and UDisk"
     url: https://www.unum.cloud/blog/texts
-    date-published: 2021-01-03
     authors:
       - family-names: Vardanian
         given-names: Ash
   - type: article
     title: "UDisk Crushing Benchmarks: YCSB, pt. 2"
     url: https://www.unum.cloud/blog/ycsb-udisk
-    date-published: 2021-11-25
     authors:
       - family-names: Vardanian
         given-names: Ash
   - type: article
     title: "Unbranding and Extending the Yahoo Cloud Serving Benchmark"
     url: https://www.unum.cloud/blog/ucsb
-    date-published: 2022-03-22
     authors:
       - family-names: Vardanian
         given-names: Ash
   - type: article
     title: "Beating RocksDB by up to 7x in almost every workload"
     url: https://www.unum.cloud/blog/ucsb-10tb
-    date-published: 2022-09-13
     authors:
       - family-names: Vardanian
         given-names: Ash
   - type: article
     title: "Making the Edge Efficient with Gcore and Intel"
     url: https://www.unum.cloud/blog/intel-gcore-unum
-    date-published: 2023-06-08
     authors:
       - family-names: Vardanian
         given-names: Ash

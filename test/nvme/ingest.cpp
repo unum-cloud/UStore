@@ -56,7 +56,7 @@ struct database_types {
     using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
     using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t, strings_kit_t>;
     template <typename... store_types_>
-    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t,
+    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, st::native_row_kit_t,
                                              layout_store_tags<store_types_...>, store_types_...>;
     using database_t = basic_database_of<strings_store_t, blobs_store_of<value_layout_t::inline_12_bytes_k>,
                                          blobs_store_of<value_layout_t::inline_44_bytes_k>,

@@ -68,7 +68,7 @@ struct database_types {
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
                                       last_write_fold_t, no_device_fold_t>;
     template <typename... store_types_>
-    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t,
+    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, st::native_row_kit_t,
                                              layout_store_tags<store_types_...>, store_types_...>;
     using database_t = basic_database_of<
         blobs_store_of<value_layout_t::inline_12_bytes_k>, blobs_store_of<value_layout_t::inline_44_bytes_k>,

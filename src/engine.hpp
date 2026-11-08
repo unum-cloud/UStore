@@ -20,13 +20,14 @@
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::bad_alloc`, `std::nothrow`
 #include <thread>      // `std::thread::id`
-#include <type_traits> // `std::is_same_v`
+#include <type_traits> // `std::is_same_v`, `std::conditional_t`
 #include <utility>     // `std::forward`
 #include <variant>     // `std::variant`, `std::monostate`
 
 #include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref` & kin - the classes' atomic references
 #include <forkunion/capabilities.hpp>  // `fu::capabilities_t`, `fu::x86_pause_t` & waiter kin, `fu::cpu_capabilities`
 #include <smashtable/basic_vector.hpp> // `st::vector`
+#include <smashtable/row_search.hpp>   // `st::row_kit_t`, `st::serial_row_kit_t` & kin, `st::native_row_kit_t`
 #include <stringzilla/capabilities.h>  // `sz_capability_t`, `sz_cap_serial_k`
 
 #include "ustore/blobs.h"   // `ustore_blobs_read_t`, `ustore_blobs_write_t` and the other binary calls
@@ -126,6 +127,7 @@ struct database_verbs_t {
     status_t (*describe)(ustore_database_describe_t const&, view_t const&) noexcept;
     status_t (*clear)(ustore_database_clear_t const&, view_t const&) noexcept;
     status_t (*compact)(ustore_database_compact_t const&, view_t const&) noexcept;
+    status_t (*flush)(ustore_database_flush_t const&, view_t const&) noexcept;
     status_t (*snapshot_init)(ustore_snapshot_init_t const&, view_t const&) noexcept;
     status_t (*snapshot_save)(ustore_snapshot_save_t const&, view_t const&) noexcept;
     status_t (*collection_list)(ustore_collection_list_t const&, view_t const&) noexcept;
@@ -653,11 +655,11 @@ constexpr std::size_t parked_check_micros_k = 1000;
 /** Every argument struct that names an executor, the inits, opens and views of the engines included, so a deferred
  *  submission keeps its call by value. */
 using deferred_arguments_t = std::variant<
-    ustore_database_describe_t, ustore_database_clear_t, ustore_database_compact_t, ustore_snapshot_init_t,
-    ustore_snapshot_save_t, ustore_collection_list_t, ustore_collection_create_t, ustore_collection_find_t,
-    ustore_collection_drop_t, ustore_transaction_init_t, ustore_transaction_stage_t, ustore_transaction_commit_t,
-    ustore_transaction_rollback_t, ustore_blobs_write_t, ustore_blobs_remove_t, ustore_blobs_read_t,
-    ustore_blobs_scan_t, ustore_blobs_sample_t, ustore_blobs_measure_t, ustore_strings_sample_t,
+    ustore_database_describe_t, ustore_database_clear_t, ustore_database_compact_t, ustore_database_flush_t,
+    ustore_snapshot_init_t, ustore_snapshot_save_t, ustore_collection_list_t, ustore_collection_create_t,
+    ustore_collection_find_t, ustore_collection_drop_t, ustore_transaction_init_t, ustore_transaction_stage_t,
+    ustore_transaction_commit_t, ustore_transaction_rollback_t, ustore_blobs_write_t, ustore_blobs_remove_t,
+    ustore_blobs_read_t, ustore_blobs_scan_t, ustore_blobs_sample_t, ustore_blobs_measure_t, ustore_strings_sample_t,
     ustore_strings_measure_t, ustore_docs_measure_t, ustore_graph_sample_vertices_t, ustore_graph_measure_vertices_t,
     ustore_pages_sample_t, ustore_pages_measure_t, ustore_docs_write_t, ustore_docs_read_t, ustore_docs_gist_t,
     ustore_docs_gather_t, ustore_docs_remove_t, ustore_docs_scan_t, ustore_docs_sample_t, ustore_graph_read_edges_t,
@@ -1016,6 +1018,43 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu_class) noe
 /** The StringZilla kernels the stores and calls of @p cpu_class_ run their string work through. */
 template <cpu_class_t cpu_class_>
 using strings_kit_of = typename utilities::strings_ladder<stringzilla_capabilities_of(cpu_class_)>::strings_kit_t;
+
+/** The SmashTable row kit one CPU class searches its trees and hash tables with; the Arm classes
+ *  stay on NEON, as none of them requires SVE. */
+constexpr st::row_kit_t row_kit_kind_of(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+    case cpu_class_t::intel_haswell_k:
+    case cpu_class_t::intel_sierra_k: return st::row_kit_t::haswell_k;
+    case cpu_class_t::intel_skylake_k: return st::row_kit_t::skylake_k;
+    case cpu_class_t::intel_icelake_k: return st::row_kit_t::icelake_k;
+    case cpu_class_t::aws_g2_k:
+    case cpu_class_t::apple_m2_k:
+    case cpu_class_t::aws_g5_k: return st::row_kit_t::neon_k;
+    case cpu_class_t::alibaba_c930_k: return st::row_kit_t::rvv_k;
+    case cpu_class_t::monoversioned_k: return st::native_row_kit_t::kit_k;
+    default: return st::row_kit_t::serial_k;
+    }
+}
+
+/** The first of @p row_kit_types_ that @p kit_ names and this build compiled,
+ *  else @p floor_type_. */
+template <st::row_kit_t kit_, typename floor_type_, typename... row_kit_types_>
+struct compiled_row_kit {
+    using type = floor_type_;
+};
+
+template <st::row_kit_t kit_, typename floor_type_, typename head_type_, typename... tail_types_>
+struct compiled_row_kit<kit_, floor_type_, head_type_, tail_types_...> {
+    using type = std::conditional_t<head_type_::compiled_k && head_type_::kit_k == kit_, head_type_,
+                                    typename compiled_row_kit<kit_, floor_type_, tail_types_...>::type>;
+};
+
+/** The SmashTable kit the trees and hash tables of @p cpu_class_ search with, the serial one where
+ *  this build lacks the class's own. */
+template <cpu_class_t cpu_class_>
+using row_kit_of = typename compiled_row_kit<row_kit_kind_of(cpu_class_), st::serial_row_kit_t, st::icelake_row_kit_t,
+                                             st::skylake_row_kit_t, st::haswell_row_kit_t, st::neon_row_kit_t,
+                                             st::rvv_row_kit_t, st::native_row_kit_t>::type;
 
 /** Whether one compiled class is distinct from the class it degrades to: another strings kit,
  *  waiter or atomic reference, the one fact justifying its variant. */

@@ -17,7 +17,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::max`, `std::min`, `std::sort`
+#include <algorithm> // `std::max`, `std::min`
 #include <memory>    // `std::allocator_traits`
 #include <span>      // `std::span`
 #include <utility>   // `std::move`
@@ -29,6 +29,7 @@
 
 #include "ustore/blobs/nvme_compaction.hpp" // `compaction_stamps_t`, `keeps_older_version`
 #include "ustore/blobs/nvme_key_slot.hpp"   // `transaction_stamp_t`, `stored_value_offset_t`, `storage_limits_t`
+#include "ustore/utilities/algorithm.hpp"   // `sort_by_stored_key`, `loser_tree`
 #include "ustore/utilities/folds.hpp"       // `delta_kind_t`, `delta_view_t`, `fold_concept`, `fold_delta_pair`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 #include "ustore/utilities/types.hpp"       // `byte_t`, `expected`, `status_t`
@@ -41,6 +42,7 @@ using utilities::delta_view_t;
 /** One delta a transaction hands over for sealing: the key it is filed under, its kind and its bytes. */
 template <typename stored_key_type_>
 struct keyed_delta {
+    using stored_key_t = stored_key_type_;
 
     /** The key the delta is filed under. */
     stored_key_type_ stored_key {};
@@ -69,7 +71,8 @@ struct stamped_delta {
  *  Sealing runs on the committing thread before the commit is ordered, so the sort and the copy never sit on a path
  *  another commit waits on.
  */
-template <typename stored_key_type_, typename allocator_type_ = st::default_allocator<byte_t>>
+template <typename stored_key_type_, typename allocator_type_ = st::default_allocator<byte_t>,
+          typename row_kit_type_ = st::native_row_kit_t>
 class sealed_deltas {
   public:
     using stored_key_t = stored_key_type_;
@@ -109,9 +112,7 @@ class sealed_deltas {
                                         allocator_t allocator = {}) noexcept {
         if (deltas.empty() && ranges.empty())
             return status_t {status_code_t::invalid_argument_k, "A seal takes at least one delta or range"};
-        std::sort(deltas.begin(), deltas.end(), [](keyed_delta_t const& first, keyed_delta_t const& second) noexcept {
-            return first.stored_key < second.stored_key;
-        });
+        utilities::sort_by_stored_key(deltas);
         std::uint64_t total_bytes = 0;
         std::uint8_t least_kind = deltas.empty() ? 0 : static_cast<std::uint8_t>(deltas[0].delta.kind);
         std::uint8_t greatest_kind = least_kind;
@@ -198,8 +199,8 @@ class sealed_deltas {
   private:
     using key_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_key_t>;
     using stored_keys_t =
-        st::immutable_splus_tree<stored_key_t, st::keys_per_row<stored_key_t>(st::default_row_bytes_k),
-                                 st::native_row_kit_t, key_allocator_t>;
+        st::immutable_splus_tree<stored_key_t, st::keys_per_row<stored_key_t>(st::default_row_bytes_k), row_kit_type_,
+                                 key_allocator_t>;
     using offsets_t =
         st::vector<stored_value_offset_t,
                    typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_value_offset_t>>;
@@ -269,12 +270,13 @@ class sealed_deltas {
  *  Versions of one key sit newest first, which a merge of several runs relies on; a run sealed from one commit holds
  *  one version per key. The stamps column is based at the oldest stamp, so a run of one commit spends no bits on it.
  */
-template <typename stored_key_type_, typename allocator_type_ = st::default_allocator<byte_t>>
+template <typename stored_key_type_, typename allocator_type_ = st::default_allocator<byte_t>,
+          typename row_kit_type_ = st::native_row_kit_t>
 class memory_run {
   public:
     using stored_key_t = stored_key_type_;
     using allocator_t = allocator_type_;
-    using sealed_deltas_t = sealed_deltas<stored_key_t, allocator_t>;
+    using sealed_deltas_t = sealed_deltas<stored_key_t, allocator_t, row_kit_type_>;
     using range_tombstones_t = typename sealed_deltas_t::range_tombstones_t;
     using stamps_t =
         st::immutable_packed_array<std::uint64_t,
@@ -457,17 +459,35 @@ status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps
         count += run->size();
         tombstones += run->range_tombstones().size();
     }
-    if (versions.reserve(count) != st::status_t::success_k)
+    using positions_allocator_t =
+        typename std::allocator_traits<typename versions_type_::allocator_type>::template rebind_alloc<std::size_t>;
+    using tournament_allocator_t =
+        typename std::allocator_traits<typename versions_type_::allocator_type>::template rebind_alloc<std::uint32_t>;
+    st::vector<std::size_t, positions_allocator_t> positions {positions_allocator_t {versions.get_allocator()}};
+    utilities::loser_tree<tournament_allocator_t> tournament {tournament_allocator_t {versions.get_allocator()}};
+    // Every run sits in key order with a key's versions newest first, so a tournament of the runs'
+    // heads merges them, an exhausted run's head preceding none.
+    auto const precedes = [&](std::uint32_t first, std::uint32_t second) noexcept {
+        run_type_ const& first_run = *runs[first];
+        run_type_ const& second_run = *runs[second];
+        if (positions[first] == first_run.size()) return false;
+        if (positions[second] == second_run.size()) return true;
+        if (first_run.stored_key(positions[first]) < second_run.stored_key(positions[second])) return true;
+        if (second_run.stored_key(positions[second]) < first_run.stored_key(positions[first])) return false;
+        return second_run.stamp(positions[second]) < first_run.stamp(positions[first]);
+    };
+    if (versions.reserve(count) != st::status_t::success_k ||
+        positions.resize(runs.size()) != st::status_t::success_k ||
+        tournament.reset(static_cast<std::uint32_t>(runs.size()), precedes) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "A merge could not hold its versions"};
-    for (run_type_ const* run : runs)
-        for (std::size_t position = 0; position != run->size(); ++position) [[maybe_unused]]
-            st::status_t const placed = versions.push_back(
-                st::assume_reserved, version_t {run->stored_key(position), run->stamp(position), run->delta(position)});
-    std::sort(versions.begin(), versions.end(), [](version_t const& first, version_t const& second) noexcept {
-        if (first.stored_key < second.stored_key) return true;
-        if (second.stored_key < first.stored_key) return false;
-        return first.stamp > second.stamp;
-    });
+    for (std::size_t taken = 0; taken != count; ++taken) {
+        std::uint32_t const head = tournament.least();
+        run_type_ const& run = *runs[head];
+        std::size_t const position = positions[head]++;
+        [[maybe_unused]] st::status_t const placed = versions.push_back(
+            st::assume_reserved, version_t {run.stored_key(position), run.stamp(position), run.delta(position)});
+        tournament.replay(precedes);
+    }
     auto const hidden = [&](version_t const& version) noexcept {
         return tombstones != 0 && hidden_by_range(runs, version.stored_key, version.stamp, survival);
     };

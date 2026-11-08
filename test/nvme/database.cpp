@@ -69,7 +69,7 @@ struct database_types {
     using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
     using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t, strings_kit_t>;
     template <typename... store_types_>
-    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t,
+    using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, st::native_row_kit_t,
                                              layout_store_tags<store_types_...>, store_types_...>;
     using database_t = basic_database_of<strings_store_t, blobs_store_of<value_layout_t::inline_12_bytes_k>,
                                          blobs_store_of<value_layout_t::inline_44_bytes_k>,
@@ -1140,8 +1140,8 @@ struct archive_types {
     using volume_t = any_volume<typename fixture_type_::disk_t, waiter_t, volume_allocator_t>;
     using store_t = nvme_store<key_slot<stored_key_t, value_layout_t::variable_width_k>, volume_t, atomic_reference,
                                waiter_t, last_write_fold_t, no_device_fold_t>;
-    using database_t =
-        basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, layout_store_tags<store_t>, store_t>;
+    using database_t = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, st::native_row_kit_t,
+                                      layout_store_tags<store_t>, store_t>;
 };
 
 /** Steps the serial SHA-256 kernels, counting every block it hashes into @c blocks. */
@@ -1982,7 +1982,10 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
         memory_shape_t const shape = store.memory_shape(any_collection_id_t {named[committer]});
         std::uint64_t tiers = 0;
         for (std::uint64_t covered = 1; covered < shape.commits; covered *= fan_in) ++tiers;
-        failures += expect(shape.runs <= (fan_in - 1) * (tiers + 1));
+        std::uint64_t const bound = (fan_in - 1) * (tiers + 1);
+        if (shape.runs > bound)
+            fmt::println(stderr, "  {} runs past {} after {} commits", shape.runs, bound, shape.commits);
+        failures += expect(shape.runs <= bound);
     }
 
     // Once everything returned, every key holds its last round, wherever the flushes left it.
@@ -2210,9 +2213,9 @@ std::size_t feed_reads_across_flushes_and_merges(mount_type_ const& mount) {
     return failures;
 }
 
-/** A feed keeps every version above its stamp out of a flush's reach until it is freed; afterwards
- *  a flush folds the versions again, and a feed below the stamp it folded at is refused while one
- *  at the head opens. */
+/** A feed keeps every version above its stamp out of a flush's reach until it is freed, while a
+ *  second collection folds beside it; afterwards a flush folds the versions again, and a feed below
+ *  the stamp it folded at is refused while one at the head opens. */
 template <typename mount_type_>
 std::size_t freed_feed_lets_merges_fold(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
@@ -2228,34 +2231,40 @@ std::size_t freed_feed_lets_merges_fold(mount_type_ const& mount) {
     expected<collection_id_t> const folded = create_named(store, "folded", test_config(8, 0));
     failures += expect(folded.has_value());
     if (!folded) return failures;
+    expected<collection_id_t> const beside = create_named(store, "beside", test_config(8, 0));
+    failures += expect(beside.has_value());
+    if (!beside) return failures;
     any_collection_id_t const id {*folded};
-    auto const rewrite = [&](std::uint64_t first) {
+    auto const rewrite = [&](any_collection_id_t const& written_id, std::uint64_t first) {
         std::size_t written = 0;
         for (std::uint64_t round = first; round != first + rewrites_k; ++round) {
             std::array<byte_t, 8> const counter = counted(round);
-            written += expect(store.insert(id, key_k, stored_value_view_t {counter}).succeeded());
+            written += expect(store.insert(written_id, key_k, stored_value_view_t {counter}).succeeded());
         }
         return written;
     };
 
-    failures += rewrite(0);
+    failures += rewrite(id, 0);
     transaction_stamp_t const since = store.ledger().published();
     typename database_t::pin_t pin;
     failures += expect(store.pin_feed(id, pin, since).succeeded());
-    failures += rewrite(rewrites_k);
+    failures += rewrite(id, rewrites_k);
     failures += expect(store.flush().succeeded());
     std::uint64_t const pinned_population = store.population_count();
     // The version the head read at the feed's stamp, and every rewrite above it.
     failures += expect_eq(pinned_population, rewrites_k + 1);
+    failures += rewrite(any_collection_id_t {*beside}, 0);
+    failures += expect(store.flush().succeeded());
+    failures += expect_eq(store.population_count(), pinned_population + 1);
     st::vector<fed_change_t> fed;
     stored_change<stored_key_t> handed {since, std::numeric_limits<stored_key_t>::max()};
     failures += pull_changes(store, id, handed, 2, fed);
     failures += expect_eq(fed.size(), std::size_t {rewrites_k});
 
     pin.release();
-    failures += rewrite(2 * rewrites_k);
+    failures += rewrite(id, 2 * rewrites_k);
     failures += expect(store.flush().succeeded());
-    failures += expect_eq(store.population_count(), pinned_population + 1);
+    failures += expect_eq(store.population_count(), pinned_population + 2);
     failures += expect_status(store.pin_feed(id, pin, since), status_code_t::write_conflict_k);
     failures += expect(!pin.held());
     failures += expect(store.pin_feed(id, pin, store.ledger().published()).succeeded());

@@ -1,11 +1,12 @@
 /**
- *  @file test/strings_collection.cpp
+ *  @file test/strings/collection.cpp
  *  @author Ash Vardanian
  *  @date September 17, 2026
  *  @brief Unit tests of @c strings_collection_t, the C++ handle over the strings modality.
  *
- *  Every case runs against a fresh collection of the strings modality. Walks run with a read-ahead smaller
- *  than the collection too, so the paging a stream does is exercised beside its single-page config.
+ *  Every case runs against a fresh collection of the strings modality. Walks run with a
+ *  read-ahead smaller than the collection too, so the paging a stream does is exercised beside
+ *  its single-page config.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -73,7 +74,8 @@ struct fixture_t {
     [[nodiscard]] bool ready() const noexcept { return database && strings != ustore_collection_id_t {}; }
 };
 
-/** Counts one failure when the collection lacks @p text or maps it onto another key than @p wanted. */
+/** Counts one failure when the collection lacks @p text or maps it onto another key
+ *  than @p wanted. */
 [[nodiscard]] std::size_t expect_value(strings_collection_t& strings, std::string_view text,
                                        ustore_key_t wanted) noexcept {
     auto maybe_present = strings.present(text);
@@ -84,8 +86,8 @@ struct fixture_t {
     return expect_eq(*maybe_value, wanted);
 }
 
-/** Counts one failure when the collection still holds @p text, or a read of it answers another key than the nil
- *  UUID. */
+/** Counts one failure when the collection still holds @p text, or a read of it answers another key
+ *  than the nil UUID. */
 [[nodiscard]] std::size_t expect_missing(strings_collection_t& strings, std::string_view text) noexcept {
     auto maybe_present = strings.present(text);
     if (!maybe_present) return expect(maybe_present.has_value());
@@ -172,8 +174,9 @@ std::size_t strings_collection_paged_walk(config_t const& config) {
     failures += expect_eq(first_page[0], sz::string_view_t {"page:a"});
     failures += expect_eq(first_page[1], sz::string_view_t {"page:b"});
 
-    // The page the walk resumes from is inclusive, so the string it starts at comes back once more, and since that
-    // string lives in the arena of the first page, the second page lands in another arena
+    // The page the walk resumes from is inclusive, so the string it starts at comes back once
+    // more, and since that string lives in the arena of the first page, the second page lands
+    // in another arena
     auto maybe_second = fixture.strings.prefixed_page("page:", 8, second_arena, std::string_view {first_page[1]});
     if (!maybe_second) return failures + expect(maybe_second.has_value());
     sz::strings_view_t const second_page = *maybe_second;
@@ -182,18 +185,20 @@ std::size_t strings_collection_paged_walk(config_t const& config) {
     failures += expect_eq(second_page[0], sz::string_view_t {"page:b"});
     failures += expect_eq(second_page[1], sz::string_view_t {"page:c"});
 
-    // A stream pulls from a cursor, which resumes past the last string it handed out, whatever its read-ahead
+    // A stream pulls from a cursor, which resumes past the last string it handed out,
+    // whatever its read-ahead
     std::array<std::string_view, 3> const ordered {"page:a", "page:b", "page:c"};
     failures += expect_walk(fixture.strings, "page:", ordered, small_read_ahead_k);
     failures += expect_walk(fixture.strings, "page:", ordered, 3);
     return failures;
 }
 
-/** What a case expects a strings collection to hold: every string it wrote and did not remove, with its last key. */
+/** What a case expects a strings collection to hold: every string it wrote and did not remove, with
+ *  its last key. */
 using strings_model_t = std::map<std::string, ustore_key_t>;
 
-/** Counts the failures of reading every string of @p texts out of @p strings as @p model holds it, and of walking the
- *  strings @p model holds under @p prefix. */
+/** Counts the failures of reading every string of @p texts out of @p strings as @p model holds it,
+ *  and of walking the strings @p model holds under @p prefix. */
 [[nodiscard]] std::size_t expect_model(strings_collection_t& strings, std::span<std::string const> texts,
                                        strings_model_t const& model, std::string_view prefix) noexcept {
     std::size_t failures = 0;
@@ -208,8 +213,9 @@ using strings_model_t = std::map<std::string, ustore_key_t>;
     return expect_walk(strings, prefix, prefixed);
 }
 
-/** Strings sharing a head, short ones and one of 64 KiB read the same while their commits merge in memory, once
- *  flushes and compactions move them to disk with rewrites and removals in between, and once the database reopens. */
+/** Strings sharing a head, short ones and one of 64 KiB read the same while their commits merge in
+ *  memory, once flushes and compactions move them to disk with rewrites and removals in between,
+ *  and once the database reopens. */
 std::size_t strings_collection_survives_maintenance(config_t const& config) {
     std::size_t failures = 0;
     std::vector<std::string> texts;
@@ -234,8 +240,8 @@ std::size_t strings_collection_survives_maintenance(config_t const& config) {
         }
         failures += expect_model(fixture.strings, texts, model, shared_k);
 
-        // Every round rewrites some strings, removes others, and flushes and compacts, so versions of one string
-        // and its removal land on different levels before a compaction merges them
+        // Every round rewrites some strings, removes others, and flushes and compacts, so versions
+        // of one string and its removal land on different levels before a compaction merges them
         for (std::size_t round = 0; round != 9 && failures == 0; ++round) {
             for (std::size_t index = round; index < texts.size(); index += 3) {
                 ustore_key_t const value = key_from_integer((round + 1) * texts.size() + index + 1);

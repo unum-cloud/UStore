@@ -1061,6 +1061,53 @@ USTORE_EXPORT void ustore_arena_init(ustore_arena_init_t* arguments);
  */
 USTORE_EXPORT void ustore_arena_free(ustore_arena_t arena);
 
+/** Where an arena's outputs live, as @c ustore_arena_describe reports it. */
+typedef enum ustore_residency_t {
+
+    /** No residency, which only a zeroed description reads as. */
+    ustore_residency_unknown_k = 0,
+
+    /** Host pages, which the calling thread reads in place. */
+    ustore_residency_ram_k = 1,
+
+    /** One device's memory, which only that device's code reads. */
+    ustore_residency_vram_k = 2,
+
+} ustore_residency_t;
+
+/** Where an arena's outputs live. */
+typedef struct ustore_arena_description_t {
+
+    /** RAM for host pages, VRAM for one device's memory. */
+    ustore_residency_t residency;
+
+    /** The UStore ordinal of the device as @c ustore_gpu_devices lists it, or -1 for host pages. */
+    int32_t device;
+} ustore_arena_description_t;
+
+/** The arguments of @c ustore_arena_describe. */
+typedef struct ustore_arena_describe_t {
+
+    /** The arena to describe. */
+    ustore_arena_t arena;
+
+    /** Output for the outcome, final on return. */
+    ustore_outcome_t* outcome;
+
+    /** Output for where the arena's outputs live. */
+    ustore_arena_description_t* description;
+} ustore_arena_describe_t;
+
+/**
+ *  @brief Reports where an arena's outputs live, as the executor that made it decided, so a caller
+ *      reads them as host memory or hands them to device code without remembering that executor.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k A @c NULL arena or description.
+ */
+USTORE_EXPORT void ustore_arena_describe(ustore_arena_describe_t* arguments);
+
 /**
  *  @brief Reports the version of the library the program runs against, which may differ from the macros it
  *      compiled against.

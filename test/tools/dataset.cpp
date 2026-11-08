@@ -1,9 +1,9 @@
 /**
- *  @file test/tools.cpp
+ *  @file test/tools/dataset.cpp
  *  @author Ash Vardanian
  *  @date April 16, 2023
- *  @brief Tests importing and exporting documents and graph edges through NDJSON and CSV files, collections of every
- *      modality through Arrow streams and files, and the CLI on top.
+ *  @brief Tests importing and exporting documents and graph edges through NDJSON and CSV files,
+ *      collections of every modality through Arrow streams and files, and the CLI on top.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -244,8 +244,8 @@ class test_database_t {
         ustore_database_clear(&clear);
     }
 
-    /** Creates an anonymous collection holding @p modality, answering its ID, or the nil UUID after reporting why it
-     *  could not. */
+    /** Creates an anonymous collection holding @p modality, answering its ID, or the nil UUID after
+     *  reporting why it could not. */
     [[nodiscard]] ustore_collection_id_t create(ustore_modality_t modality, ustore_outcome_t& outcome) noexcept {
         ustore_collection_id_t created {};
         ustore_collection_create_t create {};
@@ -284,13 +284,15 @@ struct json_document_t {
     ~json_document_t() noexcept { yyjson_doc_free(handle); }
 };
 
-/** Finds @p field in @p object, as a JSON pointer when it starts with a slash and as a key otherwise. */
+/** Finds @p field in @p object, as a JSON pointer when it starts with a slash and as
+ *  a key otherwise. */
 [[nodiscard]] yyjson_val* lookup(yyjson_val* object, std::string_view field) noexcept {
     return field.starts_with('/') ? yyjson_ptr_getn(object, field.data(), field.size())
                                   : yyjson_obj_getn(object, field.data(), field.size());
 }
 
-/** Serializes @p value minified into @p output, so equal values of equal key order compare equal as text. */
+/** Serializes @p value minified into @p output, so equal values of equal key order compare
+ *  equal as text. */
 [[nodiscard]] bool canonical(yyjson_val* value, sz::string_t& output) noexcept {
     output.clear();
     if (!value) return true;
@@ -308,7 +310,8 @@ struct json_document_t {
     return serialized;
 }
 
-/** Parses all of @p text as the decimal integer an exported key spells into @p key, answering whether it parsed. */
+/** Parses all of @p text as the decimal integer an exported key spells into @p key, answering
+ *  whether it parsed. */
 [[nodiscard]] bool parse_key(std::string_view text, std::uint64_t& key) noexcept {
     std::from_chars_result const parsed = std::from_chars(text.data(), text.data() + text.size(), key);
     return !text.empty() && parsed.ec == std::errc {} && parsed.ptr == text.data() + text.size();
@@ -344,7 +347,8 @@ struct json_document_t {
 
 #pragma region Checks
 
-/** One exported edge, compared after sorting, with the integers its keys spell, as the fixture's keys all do. */
+/** One exported edge, compared after sorting, with the integers its keys spell, as the fixture's
+ *  keys all do. */
 struct edge_row_t {
     std::uint64_t source;
     std::uint64_t target;
@@ -436,7 +440,8 @@ struct edge_row_t {
     return failures;
 }
 
-/** Checks that the documents exported to @p output match the fixture rows of @p input, one per key. */
+/** Checks that the documents exported to @p output match the fixture rows of @p input,
+ *  one per key. */
 [[nodiscard]] std::size_t check_documents(char const* output, char const* input, field_selection_t selection) noexcept {
     std::size_t failures = 0;
     sz::string_t content;
@@ -483,7 +488,8 @@ struct edge_row_t {
 
 #pragma region Round Trips
 
-/** Imports edges from @p input, exports them to @p output, and checks the export holds exactly the fixture edges. */
+/** Imports edges from @p input, exports them to @p output, and checks the export holds exactly
+ *  the fixture edges. */
 [[nodiscard]] std::size_t graph_round_trip(config_t const& config, char const* input, char const* output) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
@@ -525,7 +531,8 @@ struct edge_row_t {
     return failures;
 }
 
-/** Imports documents from @p input, exports them to @p output, and checks the rows or fields @p selection keeps. */
+/** Imports documents from @p input, exports them to @p output, and checks the rows or fields
+ *  @p selection keeps. */
 [[nodiscard]] std::size_t documents_round_trip(config_t const& config, char const* input, char const* output,
                                                field_selection_t selection) noexcept {
     test_database_t database;
@@ -576,7 +583,8 @@ struct edge_row_t {
 
 #pragma region Invalid Tasks
 
-/** Graph import rejects a task without a path, source, target or database, and accepts one without edges. */
+/** Graph import rejects a task without a path, source, target or database, and accepts
+ *  one without edges. */
 [[nodiscard]] std::size_t graph_import_rejects_invalid_tasks(config_t const& config, char const* input) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
@@ -626,7 +634,8 @@ struct edge_row_t {
     return failures;
 }
 
-/** Graph export rejects a task without a path, source, target or database, or with a pointer field. */
+/** Graph export rejects a task without a path, source, target or database, or with
+ *  a pointer field. */
 [[nodiscard]] std::size_t graph_export_rejects_invalid_tasks(config_t const& config, char const* output) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
@@ -680,7 +689,8 @@ struct edge_row_t {
     return failures;
 }
 
-/** Document import rejects a task without a path, fields, an accessor, database or an identifier among the fields. */
+/** Document import rejects a task without a path, fields, an accessor, database or an identifier
+ *  among the fields. */
 [[nodiscard]] std::size_t docs_import_rejects_invalid_tasks(config_t const& config, char const* input) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
@@ -735,7 +745,8 @@ struct edge_row_t {
     return failures;
 }
 
-/** Document export rejects a task without a path, fields, an accessor or database, or with an unknown format. */
+/** Document export rejects a task without a path, fields, an accessor or database, or with
+ *  an unknown format. */
 [[nodiscard]] std::size_t docs_export_rejects_invalid_tasks(config_t const& config, char const* output) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
@@ -793,17 +804,20 @@ struct edge_row_t {
 
 #pragma region CLI
 
-/** Runs @p command with @p arguments through the system's shell and answers zero exactly when it exited with zero. */
+/** Runs @p command with @p arguments through the system's shell and answers zero exactly when it
+ *  exited with zero. */
 template <typename... arguments_type_>
     requires(std::same_as<arguments_type_, char const*> && ...)
 [[nodiscard]] int run_command(char const* command, arguments_type_... arguments) noexcept {
-    // A word with a space would split under both `sh` and `cmd.exe`, and the fixture paths carry none
+    // A word with a space would split under both `sh` and `cmd.exe`, and the fixture
+    // paths carry none
     sz::string_t line;
     bool const built = append(line, command) && ((append(line, " ") && append(line, arguments)) && ...);
     return built ? std::system(line.c_str()) : -1;
 }
 
-/** Creates, imports into, exports and drops a named collection, and refuses an import naming no collection. */
+/** Creates, imports into, exports and drops a named collection, and refuses an import
+ *  naming no collection. */
 [[nodiscard]] std::size_t cli_round_trip(fixture_paths_t const& paths, config_t const& config,
                                          char const* executable) noexcept {
     std::size_t failures = 0;
@@ -861,14 +875,16 @@ constexpr ipc_key_value_t page_metadata_k[] {{"ustore.page_encoding", "xml"}};
 /** The cells of one row, each the bytes of its column. */
 using arrow_row_t = std::vector<std::string>;
 
-/** A table to write as an Arrow stream: its schema, whose metadata views constants, and its rows. */
+/** A table to write as an Arrow stream: its schema, whose metadata views constants,
+ *  and its rows. */
 struct arrow_table_t {
     std::vector<ipc_field_t> fields;
     std::vector<ipc_key_value_t> metadata;
     std::vector<arrow_row_t> rows;
 };
 
-/** The 16 bytes of the UUID spelling @p integer, as <tt>uuid.UUID(int=n).bytes</tt> and @c key_from_integer do. */
+/** The 16 bytes of the UUID spelling @p integer, as <tt>uuid.UUID(int=n).bytes</tt> and
+ *  @c key_from_integer do. */
 [[nodiscard]] std::string uuid_cell(std::uint64_t integer) {
     std::string cell(16, '\0');
     for (std::size_t index = 0; index != 8; ++index) cell[15 - index] = char((integer >> (8 * index)) & 0xFF);
@@ -885,8 +901,8 @@ struct arrow_table_t {
     return {.name = name, .type = ipc_type_t::binary_k};
 }
 
-/** The table a round trip of @p modality writes, its keys shuffled; blobs carry no @c ustore.modality, so their
- *  modality comes from the columns. */
+/** The table a round trip of @p modality writes, its keys shuffled; blobs carry no
+ *  @c ustore.modality, so their modality comes from the columns. */
 [[nodiscard]] arrow_table_t modality_table(ustore_modality_t modality) {
     arrow_table_t table;
     if (modality != ustore_modality_blobs_k)
@@ -920,7 +936,8 @@ struct arrow_table_t {
     return table;
 }
 
-/** Writes @p table as an Arrow stream of one batch to @p path through the codec, answering whether it landed. */
+/** Writes @p table as an Arrow stream of one batch to @p path through the codec, answering
+ *  whether it landed. */
 [[nodiscard]] bool write_arrow_stream(char const* path, arrow_table_t const& table) {
     ipc_schema_t const schema {table.fields, table.metadata};
     std::size_t const columns = table.fields.size();
@@ -977,8 +994,9 @@ struct arrow_read_t {
     std::vector<std::size_t> body_offsets;
 };
 
-/** Reads the Arrow stream, or the file when it starts with the magic, in @p bytes with the codec, counting a failure
- *  for anything it refuses, and, for a stream, for any byte past its end-of-stream marker. */
+/** Reads the Arrow stream, or the file when it starts with the magic, in @p bytes with the codec,
+ *  counting a failure for anything it refuses, and, for a stream, for any byte past its
+ *  end-of-stream marker. */
 [[nodiscard]] std::size_t read_arrow(std::span<std::byte const> bytes, arrow_read_t& read) {
     std::size_t failures = 0;
     bool const is_file = bytes.size() >= 8 && std::memcmp(bytes.data(), ipc_file_magic_k.data(), 8) == 0;
@@ -1063,8 +1081,9 @@ struct arrow_read_t {
     return failures;
 }
 
-/** Imports a stream of @p modality through the CLI, by path or, for blobs, through standard input with the modality
- *  read off its columns, exports it to <tt>.arrows</tt>, and checks every row and the schema's modality come back. */
+/** Imports a stream of @p modality through the CLI, by path or, for blobs, through standard input
+ *  with the modality read off its columns, exports it to <tt>.arrows</tt>, and checks every row and the
+ *  schema's modality come back. */
 [[nodiscard]] std::size_t arrow_round_trip(fixture_paths_t const& paths, config_t const& config, char const* executable,
                                            ustore_modality_t modality) {
     std::size_t failures = 0;
@@ -1094,8 +1113,8 @@ struct arrow_read_t {
     return failures;
 }
 
-/** An export to <tt>--output -</tt> writes only Arrow bytes to standard output, a stream ending at its marker, and its
- *  status line to standard error. */
+/** An export to <tt>--output -</tt> writes only Arrow bytes to standard output, a stream ending at its
+ *  marker, and its status line to standard error. */
 [[nodiscard]] std::size_t arrow_stdout_only_arrow(fixture_paths_t const& paths, config_t const& config,
                                                   char const* executable) {
     std::size_t failures = 0;
@@ -1177,8 +1196,8 @@ struct arrow_read_t {
     return failures;
 }
 
-/** A bulk import either lands every row, or, on an engine that ingests no stream, fails cleanly with nothing written to
- *  standard output and drops the collection it created. */
+/** A bulk import either lands every row, or, on an engine that ingests no stream, fails cleanly
+ *  with nothing written to standard output and drops the collection it created. */
 [[nodiscard]] std::size_t arrow_bulk_lands_or_refuses(fixture_paths_t const& paths, config_t const& config,
                                                       char const* executable) {
     std::size_t failures = 0;
@@ -1216,8 +1235,8 @@ struct arrow_read_t {
     return failures;
 }
 
-/** The name and modality of every named collection the CLI lists in @p directory on @p engine, sorted, as a snapshot
- *  export skips the unnamed ones. */
+/** The name and modality of every named collection the CLI lists in @p directory on @p engine,
+ *  sorted, as a snapshot export skips the unnamed ones. */
 [[nodiscard]] std::size_t list_collections(char const* executable, char const* engine, char const* directory,
                                            char const* listing, std::vector<std::string>& collections) {
     std::size_t failures = expect_eq(
@@ -1235,8 +1254,9 @@ struct arrow_read_t {
     return failures;
 }
 
-/** A snapshot export of every modality, imported on NVMe when the build has it and on the suite's engine otherwise,
- *  holds the same collections with the same rows, and a second export into the same directory is refused. */
+/** A snapshot export of every modality, imported on NVMe when the build has it and on the suite's
+ *  engine otherwise, holds the same collections with the same rows, and a second export into the
+ *  same directory is refused. */
 [[nodiscard]] std::size_t snapshot_export_import(fixture_paths_t const& paths, config_t const& config,
                                                  char const* executable) {
     std::size_t failures = 0;
@@ -1267,7 +1287,8 @@ struct arrow_read_t {
     failures += expect(run_command(executable, "--engine", engine, "--directory", paths.directory, "snapshot", "export",
                                    snapshot.c_str(), "2>", listing.c_str()) != 0);
 
-    // The NVMe engine opens only where the build has it, which a listing of an empty directory probes
+    // The NVMe engine opens only where the build has it, which a listing of an
+    // empty directory probes
     bool const has_nvme = run_command(executable, "--engine", "nvme", "--directory", target.c_str(), "collection",
                                       "list", ">", listing.c_str(), "2>&1") == 0;
     char const* const target_engine = has_nvme ? "nvme" : engine;

@@ -66,3 +66,7 @@ tmp/
 # Datasets arrive through `data/<name>` symlinks
 data/*
 !data/.gitkeep
+
+# Mojo
+.pixi/
+pixi.lock

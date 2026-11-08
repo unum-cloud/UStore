@@ -33,7 +33,7 @@
 #include <span>      // `std::span`
 #include <utility>   // `std::move`, `std::swap`
 
-#include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
+#include <smashtable/basic_hash_table.hpp> // `st::basic_hash_table`, `st::mapping`, `st::assume_reserved`
 #include <smashtable/basic_vector.hpp>     // `st::vector`
 #include <smashtable/shared.hpp>           // `st::walk_control_t`
 
@@ -63,7 +63,8 @@ using utilities::resources_shared_ptr;
  *      collection it wrote.
  *  @note Owned by one transaction and touched by its thread alone, so nothing here is atomic.
  */
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_ = st::native_row_kit_t>
 class transaction_deltas {
   public:
 #pragma region Types
@@ -123,8 +124,9 @@ class transaction_deltas {
 
     /** The deltas of one collection. */
     struct collection_deltas_t {
-        using stored_values_t = st::hash_map<stored_key_t, stored_value_place_t, stored_key_hash_t, st::equal_to_t,
-                                             constrained_allocator<std::byte, atomic_reference_>>;
+        using stored_values_t =
+            st::basic_hash_table<st::mapping<stored_key_t, stored_value_place_t>, stored_key_hash_t, st::equal_to_t,
+                                 constrained_allocator<std::byte, atomic_reference_>, row_kit_type_>;
 
         /** The value widths the collection admits, which every write is checked against. */
         value_widths_t widths;
@@ -139,8 +141,9 @@ class transaction_deltas {
         ranges_t ranges;
     };
 
-    using collections_t = st::hash_map<collection_id_t, collection_deltas_t, collection_id_hash_t, st::equal_to_t,
-                                       constrained_allocator<std::byte, atomic_reference_>>;
+    using collections_t =
+        st::basic_hash_table<st::mapping<collection_id_t, collection_deltas_t>, collection_id_hash_t, st::equal_to_t,
+                             constrained_allocator<std::byte, atomic_reference_>, row_kit_type_>;
 
 #pragma endregion Types
 
@@ -292,8 +295,9 @@ class transaction_deltas {
 #pragma endregion Private Members
 };
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::transaction_deltas(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::transaction_deltas(
     std::size_t capacity_bytes, std::size_t elements_max_count,
     resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
     : collections_by_id({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}),
@@ -304,17 +308,20 @@ inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::tr
     if (st::failed(insertions_buffer.resize(capacity_bytes))) capacity_bytes_ = 0;
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::transaction_deltas(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::transaction_deltas(
     transaction_deltas&& other) noexcept
     : collections_by_id(std::move(other.collections_by_id)), insertions_buffer(std::move(other.insertions_buffer)),
       next_inserted_offset(other.next_inserted_offset), resources_(std::move(other.resources_)),
       capacity_bytes_(other.capacity_bytes_), elements_max_count_(other.elements_max_count_),
       elements_count_(other.elements_count_) {}
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>&
-transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::operator=(transaction_deltas&& other) noexcept {
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>&
+transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::operator=(
+    transaction_deltas&& other) noexcept {
     std::swap(collections_by_id, other.collections_by_id);
     std::swap(insertions_buffer, other.insertions_buffer);
     std::swap(next_inserted_offset, other.next_inserted_offset);
@@ -325,16 +332,18 @@ transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::operator=
     return *this;
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline std::size_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::count(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline std::size_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::count(
     collection_id_t id) const noexcept {
     auto iterator = collections_by_id.find(id);
     return iterator == collections_by_id.end() ? 0 : iterator.value().stored_values.size();
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
 template <typename callback_type_>
-inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::for_each_collection(
+inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::for_each_collection(
     callback_type_&& callback) const noexcept {
     [[maybe_unused]] st::status_t const walked = collections_by_id.for_each([&](auto const& entry) noexcept {
         callback(
@@ -342,8 +351,9 @@ inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
     });
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline lookup_result_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::lookup(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline lookup_result_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::lookup(
     collection_id_t id, stored_key_t stored_key) const noexcept {
 
     auto result = lookup_result_t::missing_k;
@@ -363,8 +373,9 @@ inline lookup_result_t transaction_deltas<stored_key_type_, atomic_reference_, w
     return result;
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::stored_value_size(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::stored_value_size(
     collection_id_t id, stored_key_t stored_key, stored_value_size_t& size) const noexcept {
 
     auto status = status_t {status_code_t::not_found_k, "Object not exists"};
@@ -379,8 +390,9 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return status;
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::select(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::select(
     collection_id_t id, stored_key_t stored_key, stored_value_span_t stored_value,
     stored_value_size_t& size) const noexcept {
 
@@ -413,16 +425,17 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return status;
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
 template <typename stored_value_location_type_>
-inline lookup_result_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::find(
+inline lookup_result_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::find(
     collection_id_t id, stored_key_t stored_key, stored_value_location_type_& location) const noexcept {
 
-    location.size_bytes = 0;
-    location.offset = 0;
-    location.kind = delta_kind_t::remove_k;
-    location.recipient_id = reinterpret_cast<std::uint64_t>(this);
-    location.recipient_state_id = 0;
+    location.extent.size_bytes = 0;
+    location.extent.offset = 0;
+    location.extent.kind = delta_kind_t::remove_k;
+    location.extent.recipient_id = reinterpret_cast<std::uint64_t>(this);
+    location.extent.recipient_state_id = 0;
 
     auto result = lookup_result_t::missing_k;
     auto iterator = collections_by_id.find(id);
@@ -430,19 +443,20 @@ inline lookup_result_t transaction_deltas<stored_key_type_, atomic_reference_, w
 
     iterator.value().stored_values.probe_to_find(stored_key, [&](auto const& entry) noexcept {
         auto const& stored_value_place = entry.value();
-        location.offset = stored_value_place.offset;
-        location.size_bytes = stored_value_place.size;
-        location.kind = stored_value_place.kind;
+        location.extent.offset = stored_value_place.offset;
+        location.extent.size_bytes = stored_value_place.size;
+        location.extent.kind = stored_value_place.kind;
         constexpr lookup_result_t results[2] = {lookup_result_t::written_k, lookup_result_t::removed_k};
-        result = results[location.kind == delta_kind_t::remove_k];
+        result = results[location.extent.kind == delta_kind_t::remove_k];
     });
 
     return result;
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
 template <typename stored_value_location_type_>
-inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::select(
+inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::select(
     stored_value_location_type_ const& location, stored_value_span_t stored_value,
     notifier<atomic_reference_, waiter_type_> notifier) const noexcept {
 
@@ -454,24 +468,25 @@ inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
         notifier.fail({status_code_t::invalid_argument_k, "A buffer shorter than the stored value"});
         return;
     }
-    if (location.recipient_id != reinterpret_cast<std::uint64_t>(this)) {
+    if (location.extent.recipient_id != reinterpret_cast<std::uint64_t>(this)) {
         notifier.fail({status_code_t::invalid_argument_k, "A stored value location of other deltas"});
         return;
     }
-    if (location.recipient_state_id != 0) {
+    if (location.extent.recipient_state_id != 0) {
         notifier.fail({status_code_t::invalid_argument_k, "A stored value location of another buffer state"});
         return;
     }
 
-    if (location.size_bytes > 0) {
-        auto inserted = as_bytes_view(insertions_buffer).subspan(location.offset, location.size_bytes);
+    if (location.extent.size_bytes > 0) {
+        auto inserted = as_bytes_view(insertions_buffer).subspan(location.extent.offset, location.extent.size_bytes);
         std::memcpy(stored_value.data() + location.buffer_padding(), inserted.data(), inserted.size());
     }
     notifier.did_one();
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::reach_collection_(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::reach_collection_(
     collection_id_t id, value_widths_t widths, collection_deltas_t*& collection) noexcept {
 
     auto iterator = collections_by_id.find(id);
@@ -495,8 +510,9 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return status_t {};
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::write(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::write(
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, stored_value_view_t stored_value,
     transaction_stamp_t watch_stamp) noexcept {
 
@@ -508,7 +524,8 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     if (status.failed()) return status;
 
     if (!can_fit(1, stored_value.size())) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
+        return status_t {status_code_t::capacity_exhausted_k,
+                         "The transaction holds transaction_max_deltas or transaction_max_bytes"};
 
     // The room for the key is taken before a byte of the value lands, so a refusal writes nothing.
     if (collection->stored_values.reserve_more(1) == collection_deltas_t::stored_values_t::reserve_result_t::failed_k)
@@ -543,8 +560,9 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return status_t {};
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::remove(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::remove(
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, transaction_stamp_t watch_stamp) noexcept {
 
     collection_deltas_t* collection = nullptr;
@@ -552,7 +570,8 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     if (status.failed()) return status;
 
     if (!can_fit(1, 0)) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
+        return status_t {status_code_t::capacity_exhausted_k,
+                         "The transaction holds transaction_max_deltas or transaction_max_bytes"};
 
     if (collection->stored_values.reserve_more(1) == collection_deltas_t::stored_values_t::reserve_result_t::failed_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another key"};
@@ -576,8 +595,9 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return status_t {};
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::remove_range(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::remove_range(
     collection_id_t id, value_widths_t widths, stored_key_t start, stored_key_t end) noexcept {
 
     if (!(start < end)) return status_t {status_code_t::invalid_argument_k, "A range ends at or before its start"};
@@ -586,7 +606,8 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     if (status.failed()) return status;
 
     if (!can_fit(1, 0)) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
+        return status_t {status_code_t::capacity_exhausted_k,
+                         "The transaction holds transaction_max_deltas or transaction_max_bytes"};
     if (collection->ranges.reserve(collection->ranges.size() + 1) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another range"};
 
@@ -610,17 +631,21 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return status_t {};
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline std::span<typename transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::range_t const>
-transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::ranges(collection_id_t id) const noexcept {
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline std::span<
+    typename transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::range_t const>
+transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::ranges(
+    collection_id_t id) const noexcept {
     auto iterator = collections_by_id.find(id);
     if (iterator == collections_by_id.end()) return {};
     return std::span<range_t const> {iterator.value().ranges};
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
 template <utilities::fold_concept fold_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::change(
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::change(
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, stored_value_view_t change,
     fold_type_ const& fold) noexcept {
 
@@ -655,7 +680,8 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     }
 
     if (!can_fit(held ? 0 : 1, folded.bytes.size())) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
+        return status_t {status_code_t::capacity_exhausted_k,
+                         "The transaction holds transaction_max_deltas or transaction_max_bytes"};
     stored_value_offset_t inserted_offset = 0;
     if (!folded.bytes.empty()) {
         inserted_offset = static_cast<stored_value_offset_t>(next_inserted_offset);
@@ -684,8 +710,9 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return status_t {};
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline bool transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::delta(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline bool transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::delta(
     collection_id_t id, stored_key_t stored_key, delta_view_t& held) const noexcept {
     auto iterator = collections_by_id.find(id);
     if (iterator == collections_by_id.end()) return false;
@@ -699,8 +726,9 @@ inline bool transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
     return found;
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::rescope_watches(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::rescope_watches(
     transaction_stamp_t watch_stamp) noexcept {
     [[maybe_unused]] st::status_t const walked = collections_by_id.for_each([&](auto& collection) noexcept {
         [[maybe_unused]] st::status_t const rescoped = collection.value_ref().stored_values.for_each(
@@ -711,9 +739,10 @@ inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
     });
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
 template <typename callback_type_>
-inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::for_each_write(
+inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::for_each_write(
     callback_type_&& callback) const noexcept {
     [[maybe_unused]] st::status_t const walked = collections_by_id.for_each([&](auto const& collection) noexcept {
         [[maybe_unused]] st::status_t const listed = collection.value().stored_values.for_each(
@@ -721,9 +750,10 @@ inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
     });
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
 template <typename callback_type_>
-inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::for_each_delta(
+inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::for_each_delta(
     collection_id_t id, callback_type_&& callback) const noexcept {
     auto iterator = collections_by_id.find(id);
     if (iterator == collections_by_id.end()) return;
@@ -736,9 +766,10 @@ inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
         });
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
 template <typename stored_value_location_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::find(
+inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::find(
     collection_id_t id, std::span<stored_key_t const> stored_keys, std::span<stored_value_location_type_> locations,
     missing_locations_t missing_locations) const {
 
@@ -758,17 +789,18 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return status_t {};
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
 template <typename stored_value_location_type_>
-inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::select(
+inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::select(
     std::span<stored_value_location_type_ const> locations, bytes_span_t buffer,
     notifier<atomic_reference_, waiter_type_> notifier) const {
 
     for (std::size_t index = 0, offset = 0; (index < locations.size()) & !notifier.has_failed(); ++index) {
         auto const& location = locations[index];
-        auto is_recipient = location.recipient_id == reinterpret_cast<std::uint64_t>(this);
+        auto is_recipient = location.extent.recipient_id == reinterpret_cast<std::uint64_t>(this);
         if (is_recipient) {
-            if (location.size_bytes > 0) {
+            if (location.extent.size_bytes > 0) {
                 auto stored_value = buffer.subspan(offset, location.aligned_buffer_size());
                 select<stored_value_location_type_>(location, stored_value, notifier);
             }
@@ -778,8 +810,10 @@ inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
     }
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::check_stored_value(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline status_t
+transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::check_stored_value(
     value_widths_t const& widths, stored_key_t stored_key, stored_value_size_t stored_value_size) const noexcept {
 
     bool valid_key = stored_key != limit<stored_key_t>::max();
@@ -789,8 +823,9 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     return valid ? status_t {} : status_t {status_code_t::malformed_k, "Invalid stored value"};
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline bool transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::can_fit(
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline bool transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::can_fit(
     std::size_t stored_values_count, std::size_t stored_values_sum_size) const noexcept {
 
     auto used_memory = next_inserted_offset;
@@ -801,8 +836,9 @@ inline bool transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
     return has_element_place & has_enough_space;
 }
 
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_>::clear() noexcept {
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_>
+inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::clear() noexcept {
     collections_by_id.clear();
     next_inserted_offset = 0;
     elements_count_ = 0;
@@ -861,7 +897,8 @@ constexpr watch_purpose_t operator&(watch_purpose_t first, watch_purpose_t secon
  *
  *  Watching the same key twice keeps the earlier stamp and widens the purpose.
  */
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_ = st::native_row_kit_t>
 class read_set {
   public:
     using stored_key_t = stored_key_type_;
@@ -876,8 +913,8 @@ class read_set {
         watch_purpose_t purpose;
     };
 
-    using stored_keys_t = st::hash_map<stored_key_t, watch_t, stored_key_hash_t, st::equal_to_t,
-                                       constrained_allocator<std::byte, atomic_reference_>>;
+    using stored_keys_t = st::basic_hash_table<st::mapping<stored_key_t, watch_t>, stored_key_hash_t, st::equal_to_t,
+                                               constrained_allocator<std::byte, atomic_reference_>, row_kit_type_>;
 
     /** A set charging @p resources for the keys it holds. */
     explicit read_set(resources_shared_ptr<atomic_reference_, waiter_type_> const& resources) noexcept
@@ -932,13 +969,15 @@ class read_set {
 };
 
 /** The keys one transaction watches, kept apart per collection so two collections never collide. */
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_ = st::native_row_kit_t>
 class grouped_read_set {
   public:
     using stored_key_t = stored_key_type_;
-    using read_set_t = read_set<stored_key_t, atomic_reference_, waiter_type_>;
-    using groups_t = st::hash_map<collection_id_t, read_set_t, collection_id_hash_t, st::equal_to_t,
-                                  constrained_allocator<std::byte, atomic_reference_>>;
+    using read_set_t = read_set<stored_key_t, atomic_reference_, waiter_type_, row_kit_type_>;
+    using groups_t =
+        st::basic_hash_table<st::mapping<collection_id_t, read_set_t>, collection_id_hash_t, st::equal_to_t,
+                             constrained_allocator<std::byte, atomic_reference_>, row_kit_type_>;
 
     /** A set charging @p resources for the keys of every collection it watches. */
     explicit grouped_read_set(resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
@@ -1028,11 +1067,12 @@ struct transaction_share_t {
 };
 
 /** Everything one transaction carries between its start and its commit. */
-template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
+          typename row_kit_type_ = st::native_row_kit_t>
 struct transaction_state {
     using stored_key_t = stored_key_type_;
-    using transaction_deltas_t = transaction_deltas<stored_key_t, atomic_reference_, waiter_type_>;
-    using read_set_t = grouped_read_set<stored_key_t, atomic_reference_, waiter_type_>;
+    using transaction_deltas_t = transaction_deltas<stored_key_t, atomic_reference_, waiter_type_, row_kit_type_>;
+    using read_set_t = grouped_read_set<stored_key_t, atomic_reference_, waiter_type_, row_kit_type_>;
 
     /** One range of keys a transaction walked, which any commit landing inside it
      *  since @c watch_stamp conflicts with, the keys it never found included. */
@@ -1053,7 +1093,7 @@ struct transaction_state {
         collection_id_t id = collection_invalid_id_k;
 
         /** Its deltas and the run they become. */
-        sealed_commit<stored_key_t, atomic_reference_> commit;
+        sealed_commit<stored_key_t, atomic_reference_, row_kit_type_> commit;
     };
 
     /** Every written collection's sealed deltas, between a stage or a commit and its landing. */
@@ -1160,11 +1200,11 @@ concept nvme_store_concept = requires(
  *  collection, whichever ID names it.
  */
 template <typename store_type_, typename stored_key_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
+          typename waiter_type_, typename row_kit_type_ = st::native_row_kit_t>
 concept transaction_store_concept = requires(
     store_type_& store, collection_id_t collection_id, stored_key_type_ stored_key,
-    transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_> const& deltas,
-    sealed_commit<stored_key_type_, atomic_reference_>& sealed, transaction_stamp_t stamp) {
+    transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_> const& deltas,
+    sealed_commit<stored_key_type_, atomic_reference_, row_kit_type_>& sealed, transaction_stamp_t stamp) {
     { store.ledger() } -> std::same_as<commit_ledger<atomic_reference_, waiter_type_>&>;
     { store.written_since(collection_id, stored_key, stamp) } -> std::same_as<bool>;
     { store.range_written_since(collection_id, stored_key, stored_key, stamp) } -> std::same_as<bool>;
@@ -1195,14 +1235,14 @@ class transaction_core;
  *  carry the key.
  */
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
+          typename waiter_type_, typename row_kit_type_ = st::native_row_kit_t>
 class transaction_registry {
   public:
 #pragma region Types
 
     using stored_key_t = stored_key_type_;
     using store_t = store_type_;
-    using transaction_state_t = transaction_state<stored_key_t, atomic_reference_, waiter_type_>;
+    using transaction_state_t = transaction_state<stored_key_t, atomic_reference_, waiter_type_, row_kit_type_>;
     using transaction_deltas_t = typename transaction_state_t::transaction_deltas_t;
     using collection_info_t = typename transaction_deltas_t::collection_info_t;
 
@@ -1295,10 +1335,10 @@ class transaction_registry {
 #pragma region Interface Methods
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
+          typename waiter_type_, typename row_kit_type_>
 template <typename transaction_type_>
 inline expected<std::unique_ptr<transaction_type_>>
-transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::create_transaction(
+transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_, row_kit_type_>::create_transaction(
     transaction_config_t const& config) noexcept {
 
     transaction_deltas_t deltas(config.max_bytes, config.max_deltas, resources_);
@@ -1313,9 +1353,10 @@ transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_ty
 #pragma region Commit Stages
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::stage_(
-    transaction_state_t& data, transaction_stamp_t start_stamp, transaction_stamp_t& stage_stamp) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                     row_kit_type_>::stage_(transaction_state_t& data, transaction_stamp_t start_stamp,
+                                                            transaction_stamp_t& stage_stamp) noexcept {
 
     // Sealed before the leader word is taken, so the sort, the copy and any flush hold up
     // no other committer.
@@ -1336,9 +1377,9 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline transaction_stamp_t transaction_registry<stored_key_type_, store_type_, atomic_reference_,
-                                                waiter_type_>::commit_staged_(transaction_state_t& data) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline transaction_stamp_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                                row_kit_type_>::commit_staged_(transaction_state_t& data) noexcept {
 
     // The stage prepared every collection's view, so from the stamp on nothing can fail.
     commit_t committing {this, &data, invalid_transaction_stamp_k};
@@ -1352,9 +1393,9 @@ inline transaction_stamp_t transaction_registry<stored_key_type_, store_type_, a
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
+          typename waiter_type_, typename row_kit_type_>
 inline expected<transaction_stamp_t>
-transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::commit_(
+transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_, row_kit_type_>::commit_(
     transaction_state_t& data, transaction_stamp_t start_stamp) noexcept {
 
     if (status_t const sealed = seal_(data); sealed.failed()) return sealed;
@@ -1376,9 +1417,9 @@ transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_ty
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::discard_(
-    transaction_state_t& data) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                 row_kit_type_>::discard_(transaction_state_t& data) noexcept {
     forget_(data, data.sealed.size());
     for (transaction_share_t* share = data.shares; share != nullptr; share = share->next) share->forget(share->context);
     store_->ledger().stop_leading();
@@ -1388,9 +1429,9 @@ inline void transaction_registry<stored_key_type_, store_type_, atomic_reference
 /** Seals every written collection's deltas on the committing thread, one sealed
  *  entry per collection. */
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::seal_(
-    transaction_state_t& data) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                     row_kit_type_>::seal_(transaction_state_t& data) noexcept {
     data.sealed.clear();
     if (data.sealed.reserve(data.deltas.collections_by_id.size()) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "No room to seal a commit"};
@@ -1410,9 +1451,10 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
 /** Checks the watches against the views published so far and lays out every written collection's
  *  view, on the thread holding the leader word; a refusal forgets every view it laid out. */
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::prepare_(
-    transaction_state_t& data, transaction_stamp_t start_stamp) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                     row_kit_type_>::prepare_(transaction_state_t& data,
+                                                              transaction_stamp_t start_stamp) noexcept {
 
     // Every watch is scoped from the start or later, so nothing published since the start leaves
     // nothing to check.
@@ -1437,18 +1479,18 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::forget_(
-    transaction_state_t& data, std::size_t prepared) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                 row_kit_type_>::forget_(transaction_state_t& data, std::size_t prepared) noexcept {
     for (std::size_t index = 0; index != prepared; ++index) store_->forget_collection(data.sealed[index].id);
 }
 
 /** Flushes every collection @p data sealed, answering whether any of them gave
  *  memory-run records back. */
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::flushed_records_(
-    transaction_state_t& data) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                 row_kit_type_>::flushed_records_(transaction_state_t& data) noexcept {
     bool freed = false;
     for (typename transaction_state_t::sealed_collection_t const& sealed : data.sealed)
         freed |= store_->flushed_records(sealed.id);
@@ -1458,25 +1500,25 @@ inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference
 /** Merges, flushes and compacts whatever the landed commit left due in the collections it wrote; a
  *  failure there leaves the commit landed, and the next commit making room meets it again. */
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::maintain_(
-    transaction_state_t& data) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                 row_kit_type_>::maintain_(transaction_state_t& data) noexcept {
     for (auto const& sealed : data.sealed) [[maybe_unused]]
         status_t const maintained = store_->maintain(sealed.id);
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::prepare_commit_(
-    void* context) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                     row_kit_type_>::prepare_commit_(void* context) noexcept {
     commit_t const& committing = *static_cast<commit_t const*>(context);
     return committing.owner->prepare_(*committing.data, committing.start_stamp);
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::publish_commit_(
-    void* context, transaction_stamp_t stamp) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                 row_kit_type_>::publish_commit_(void* context, transaction_stamp_t stamp) noexcept {
     commit_t const& committing = *static_cast<commit_t const*>(context);
     for (auto& sealed : committing.data->sealed)
         committing.owner->store_->publish_collection(sealed.id, sealed.commit, stamp);
@@ -1489,9 +1531,11 @@ inline void transaction_registry<stored_key_type_, store_type_, atomic_reference
 #pragma region Conflict Check
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::watch_now_(
-    transaction_stamp_t start_stamp, collection_id_t group_id, std::span<stored_key_t const> stored_keys) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                     row_kit_type_>::watch_now_(transaction_stamp_t start_stamp,
+                                                                collection_id_t group_id,
+                                                                std::span<stored_key_t const> stored_keys) noexcept {
 
     bool written = false;
     for (std::size_t index = 0; index != stored_keys.size() && !written; ++index)
@@ -1501,9 +1545,9 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_>
-inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_>::conflicting_(
-    transaction_state_t const& data) noexcept {
+          typename waiter_type_, typename row_kit_type_>
+inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                                 row_kit_type_>::conflicting_(transaction_state_t const& data) noexcept {
 
     // First-committer-wins over the watched writes, then every key read or tracked.
     bool conflict = false;
@@ -1564,7 +1608,7 @@ class transaction_core {
     using store_t = typename registry_t::store_t;
 
     /** The uncommitted writes and the watched keys this transaction carries. */
-    using state_t = transaction_state<stored_key_t, atomic_reference_, waiter_type_>;
+    using state_t = typename registry_t::transaction_state_t;
 
     /** The uncommitted deltas alone, filed under the collection they belong to. */
     using transaction_deltas_t = typename state_t::transaction_deltas_t;

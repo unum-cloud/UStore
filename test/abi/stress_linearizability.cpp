@@ -1,8 +1,9 @@
 /**
- *  @file test/stress_linearizability.cpp
+ *  @file test/abi/stress_linearizability.cpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
- *  @brief Stress test that concurrent write transactions replay, in commit order, to the state the database holds.
+ *  @brief Stress test that concurrent write transactions replay, in commit order, to the state
+ *      the database holds.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -94,7 +95,8 @@ using payload_t = std::size_t;
 /** One write a thread staged, stamped with the outcome of the transaction holding it. */
 struct operation_t {
 
-    /** Integer of the key the write targets, which also indexes the replay; the key is its @c key_of. */
+    /** Integer of the key the write targets, which also indexes the replay; the key is
+     *  its @c key_of. */
     std::uint64_t key = 0;
 
     /** Value an insert writes. */
@@ -115,7 +117,8 @@ struct operation_t {
     }
 };
 
-/** One configuration: a mix at a thread count, each thread committing a number of transactions per round. */
+/** One configuration: a mix at a thread count, each thread committing a number of
+ *  transactions per round. */
 struct workload_t {
 
     /** Shares of inserts and removes. */
@@ -155,7 +158,8 @@ struct linearizability_run_t {
     /** Configuration every opening of the database reads. */
     config_t const* config = nullptr;
 
-    /** Database reopened for every thread and transaction count, which bounds the remove deltas clears leave behind. */
+    /** Database reopened for every thread and transaction count, which bounds the remove deltas
+     *  clears leave behind. */
     database_t database;
 
     /** Collection of the open database every transaction writes and every verification reads. */
@@ -188,7 +192,8 @@ struct linearizability_run_t {
     return 0;
 }
 
-/** Makes the arena of @p run, sizes its buffers for its largest configuration and seeds one generator per thread. */
+/** Makes the arena of @p run, sizes its buffers for its largest configuration and seeds one
+ *  generator per thread. */
 [[nodiscard]] std::size_t prepare_run(linearizability_run_t& run, linearizability_options_t const& options,
                                       random_t random) {
     std::size_t parts = 0;
@@ -209,7 +214,8 @@ struct linearizability_run_t {
     return failures;
 }
 
-/** Reopens the database of @p run and begins one transaction per slot, freeing the previous ones first. */
+/** Reopens the database of @p run and begins one transaction per slot, freeing the
+ *  previous ones first. */
 [[nodiscard]] std::size_t reopen_run(linearizability_run_t& run) {
     for (writer_slot_t& slot : run.slots) slot.transaction = transaction_t {};
     if (run.database) run.database.close();
@@ -229,7 +235,8 @@ struct linearizability_run_t {
 
 #pragma region Round
 
-/** Stages and commits one transaction of random writes, stamping each logged write with the commit's outcome. */
+/** Stages and commits one transaction of random writes, stamping each logged write with
+ *  the commit's outcome. */
 std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collection, std::span<operation_t> batch,
                               operations_mix_t mix, std::uniform_int_distribution<std::uint64_t>& key_distribution) {
     std::size_t failures = expect(slot.transaction.reset().succeeded());
@@ -239,9 +246,15 @@ std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collec
                                                                              : operation_code_t::remove_k;
         operation.key = key_distribution(slot.random_generator);
         operation.value = slot.random_generator();
-        failures += operation.code == operation_code_t::insert_k
-                        ? expect(inside[key_from_integer(operation.key)].assign(operation.value_view()).succeeded())
-                        : expect(inside[key_from_integer(operation.key)].remove().succeeded());
+        // A stage refused for a busy channel changed nothing, and another thread gives
+        // the channel back
+        status_t staged;
+        do {
+            staged = operation.code == operation_code_t::insert_k
+                         ? inside[key_from_integer(operation.key)].assign(operation.value_view())
+                         : inside[key_from_integer(operation.key)].remove();
+        } while (staged == status_code_t::capacity_exhausted_k);
+        failures += expect(staged.succeeded());
     }
 
     auto maybe_stamp = slot.transaction.commit();
@@ -264,7 +277,8 @@ void write_round(writer_slot_t& slot, ustore_collection_id_t collection, std::sp
                                            key_distribution);
 }
 
-/** Keeps, per key, the committed write with the highest stamp, and the later-logged one among equal stamps. */
+/** Keeps, per key, the committed write with the highest stamp, and the later-logged one
+ *  among equal stamps. */
 void replay_round(std::span<operation_t const> operations, std::span<operation_t const*> latest) {
     std::fill(latest.begin(), latest.end(), nullptr);
     for (operation_t const& operation : operations) {
@@ -291,7 +305,8 @@ std::size_t expect_payload(value_view_t retrieved, operation_t const& operation)
     return failures;
 }
 
-/** Checks the database against the replay: every inserted key holds its payload, and no other key is present. */
+/** Checks the database against the replay: every inserted key holds its payload, and no other
+ *  key is present. */
 std::size_t verify_round(linearizability_run_t& run, std::span<operation_t const*> latest) {
     std::size_t present_count = 0;
     for (operation_t const* const winner : latest)
@@ -309,7 +324,8 @@ std::size_t verify_round(linearizability_run_t& run, std::span<operation_t const
     return failures;
 }
 
-/** Runs one round: threads commit their transactions, then the main thread replays their logs, checks and clears. */
+/** Runs one round: threads commit their transactions, then the main thread replays their logs,
+ *  checks and clears. */
 std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload_t const& workload) {
     std::size_t const per_thread = workload.operations_per_thread();
     std::span<operation_t> const operations {run.operations.data(), workload.threads_count * per_thread};
@@ -332,10 +348,12 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
 #pragma region Configurations
 
 /**
- *  @brief Checks that the state after each round of concurrent random writes matches their replay in commit order.
+ *  @brief Checks that the state after each round of concurrent random writes matches their replay
+ *      in commit order.
  *
- *  Every round ends at a checkpoint where all threads stop, the main thread replays the committed writes in
- *  stamp order, compares the replay against the database, and clears it for the next round.
+ *  Every round ends at a checkpoint where all threads stop, the main thread replays the
+ *  committed writes in stamp order, compares the replay against the database, and clears it for
+ *  the next round.
  *
  *  @param[in,out] run Database, logs and thread slots the run allocated once.
  *  @param[in,out] executor Pool of exactly the workload's thread count.
@@ -354,7 +372,8 @@ std::size_t linear_writes(linearizability_run_t& run, executor_t& executor, work
     return failures;
 }
 
-/** Runs every mix of inserts and removes at @p threads threads committing @p transactions per round. */
+/** Runs every mix of inserts and removes at @p threads threads committing
+ *  @p transactions per round. */
 std::size_t linear_writes_mixes(linearizability_run_t& run, executor_t& executor,
                                 linearizability_options_t const& options, std::size_t threads, std::size_t transactions,
                                 std::chrono::nanoseconds slice) {
@@ -368,7 +387,8 @@ std::size_t linear_writes_mixes(linearizability_run_t& run, executor_t& executor
     return failures;
 }
 
-/** Runs and reports every transaction count on one pool of @p threads threads, each on a freshly opened database. */
+/** Runs and reports every transaction count on one pool of @p threads threads, each on a
+ *  freshly opened database. */
 void linear_writes_on_threads(suite_totals_t& totals, linearizability_run_t& run,
                               linearizability_options_t const& options, std::size_t threads,
                               std::chrono::nanoseconds slice) {

@@ -38,9 +38,10 @@
 #include <smashtable/basic_vector.hpp>           // `st::vector`
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
 #include <smashtable/immutable_splus_tree.hpp>   // `st::immutable_splus_tree_view`
-#include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`
+#include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`, `st::assume_uninitialized`
 
 #include "ustore/blobs/nvme_key_slot.hpp"      // `stored_key_concept`
+#include "ustore/utilities/algorithm.hpp"      // `loser_tree`
 #include "ustore/utilities/blocking_files.hpp" // `path_max_bytes_k`
 #include "ustore/utilities/folds.hpp"          // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
 #include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
@@ -50,6 +51,7 @@
 namespace unum::ustore::blobs {
 
 using utilities::delta_view_t;
+using utilities::loser_tree;
 
 #pragma region Vocabulary
 
@@ -490,7 +492,7 @@ struct sorted_run_index_view {
     /** The run's cells in sorted order, or null for a run of keys alone, read through @c keys. */
     key_slot_type_ const* cells = nullptr;
 
-    /** Key slots the run holds. */
+    /** Key slots the view holds, from @c first on. */
     std::uint64_t key_slots_count = 0;
 
     /** The stamp of every key slot in sorted order, or null for a run whose every stamp reads as zero. */
@@ -511,6 +513,10 @@ struct sorted_run_index_view {
 
     /** The run's range tombstones, or null for none, which only the host compactor reads. */
     blobs::range_tombstones<typename key_slot_type_::stored_key_t> const* range_tombstones = nullptr;
+
+    /** The run's position the view starts at, which only a slice of a host merge moves off zero;
+     *  every column above is still indexed by the run's own positions. */
+    std::uint64_t first = 0;
 };
 
 /** One version a merge of strings carries: its source run and its sorted position there. */
@@ -638,58 +644,6 @@ template <typename element_type_, typename allocator_type_>
 using rebound_vector =
     st::vector<element_type_, typename std::allocator_traits<allocator_type_>::template rebind_alloc<element_type_>>;
 
-/** What one compaction writes, kept between compactions so their buffers are reused. */
-template <typename key_slot_type_, typename allocator_type_ = st::default_allocator<key_slot_type_>>
-struct compaction_output {
-
-    /** The cells of the new sorted runs one after another, each run's in sorted order. */
-    rebound_vector<key_slot_type_, allocator_type_> cells;
-
-    /** The new sorted runs in ascending order of stored keys. */
-    rebound_vector<compacted_sorted_run_t, allocator_type_> sorted_runs;
-
-    /** The value copy ranges of every sorted run in turn, empty for stored values held inline. */
-    rebound_vector<value_copy_range_t, allocator_type_> value_copy_ranges;
-
-    /** One offset per key slot into the stored values across the sorted runs and one past the last, for a
-     *  variable-width layout alone, which every new run rebases from its first key slot. */
-    rebound_vector<std::uint64_t, allocator_type_> value_offsets;
-
-    /** One stamp per key slot in sorted order across the sorted runs, each at or above the merge's floor. */
-    rebound_vector<std::uint64_t, allocator_type_> stamps;
-
-    /** One @c delta_kind_t per key slot in sorted order across the sorted runs. */
-    rebound_vector<std::uint8_t, allocator_type_> kinds;
-
-    /** The values a fold wrote, back to back in survivor order, which copy ranges naming the index past every source
-     *  run read. */
-    rebound_vector<byte_t, allocator_type_> folded;
-
-    /** One offset per key slot into @c tails across the sorted runs and one past the last, none for whole keys. */
-    rebound_vector<std::uint64_t, allocator_type_> tail_offsets;
-
-    /** The tails of the key slots back to back in sorted order across the sorted runs. */
-    rebound_vector<byte_t, allocator_type_> tails;
-
-    compaction_output() noexcept = default;
-
-    /** Allocates every buffer through @p allocator. */
-    explicit compaction_output(allocator_type_ const& allocator) noexcept
-        : cells(typename std::allocator_traits<allocator_type_>::template rebind_alloc<key_slot_type_>(allocator)),
-          sorted_runs(typename std::allocator_traits<allocator_type_>::template rebind_alloc<compacted_sorted_run_t>(
-              allocator)),
-          value_copy_ranges(
-              typename std::allocator_traits<allocator_type_>::template rebind_alloc<value_copy_range_t>(allocator)),
-          value_offsets(
-              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
-          stamps(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
-          kinds(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint8_t>(allocator)),
-          folded(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)),
-          tail_offsets(
-              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
-          tails(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)) {}
-};
-
 /** A key slot with the index of the sorted run it came from, its stamp and its kind, the unit every merge moves. */
 template <typename key_slot_type_>
 struct located_key_slot {
@@ -764,6 +718,95 @@ constexpr bool same_key(located_tailed_key_slot<key_slot_type_> const& first,
                         located_tailed_key_slot<key_slot_type_> const& second) noexcept {
     return first.located.key_slot.stored_key == second.located.key_slot.stored_key && first.tail == second.tail;
 }
+
+/** The record a merge of @p key_slot_type_ moves: a located key slot, beside its tail for
+ *  a tailed shape. */
+template <typename key_slot_type_>
+using compaction_record = std::conditional_t<tailed_key_slot_concept<key_slot_type_>,
+                                             located_tailed_key_slot<key_slot_type_>, located_key_slot<key_slot_type_>>;
+
+/** What one compaction writes, kept between compactions so their buffers are reused, and the host
+ *  compactor's working buffers beside it. */
+template <typename key_slot_type_, typename allocator_type_ = st::default_allocator<key_slot_type_>>
+struct compaction_output {
+
+    /** The cells of the new sorted runs one after another, each run's in sorted order. */
+    rebound_vector<key_slot_type_, allocator_type_> cells;
+
+    /** The new sorted runs in ascending order of stored keys. */
+    rebound_vector<compacted_sorted_run_t, allocator_type_> sorted_runs;
+
+    /** The value copy ranges of every sorted run in turn, empty for stored values held inline. */
+    rebound_vector<value_copy_range_t, allocator_type_> value_copy_ranges;
+
+    /** One offset per key slot into the stored values across the sorted runs and one past the last,
+     *  for a variable-width layout alone, which every new run rebases from its first key slot. */
+    rebound_vector<std::uint64_t, allocator_type_> value_offsets;
+
+    /** One stamp per key slot in sorted order across the sorted runs, each at or above
+     *  the merge's floor. */
+    rebound_vector<std::uint64_t, allocator_type_> stamps;
+
+    /** One @c delta_kind_t per key slot in sorted order across the sorted runs. */
+    rebound_vector<std::uint8_t, allocator_type_> kinds;
+
+    /** The values a fold wrote, back to back in survivor order, which copy ranges naming the index
+     *  past every source run read. */
+    rebound_vector<byte_t, allocator_type_> folded;
+
+    /** One offset per key slot into @c tails across the sorted runs and one past the last, none
+     *  for whole keys. */
+    rebound_vector<std::uint64_t, allocator_type_> tail_offsets;
+
+    /** The tails of the key slots back to back in sorted order across the sorted runs. */
+    rebound_vector<byte_t, allocator_type_> tails;
+
+    /** The next record of every source run, which the host compactor's merge moves
+     *  along its run. */
+    rebound_vector<compaction_record<key_slot_type_>, allocator_type_> merge_heads;
+
+    /** The tournament naming which of @c merge_heads comes next in merged order. */
+    loser_tree<typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint32_t>> merge_tournament;
+
+    /** The versions of the one key the host compactor settles, in merged order. */
+    rebound_vector<compaction_record<key_slot_type_>, allocator_type_> key_versions;
+
+    /** Whether each of @c key_versions survives. */
+    rebound_vector<std::uint8_t, allocator_type_> key_versions_kept;
+
+    /** Whether a range tombstone hides each of @c key_versions. */
+    rebound_vector<std::uint8_t, allocator_type_> key_versions_hidden;
+
+    compaction_output() noexcept = default;
+
+    /** Allocates every buffer through @p allocator. */
+    explicit compaction_output(allocator_type_ const& allocator) noexcept
+        : cells(typename std::allocator_traits<allocator_type_>::template rebind_alloc<key_slot_type_>(allocator)),
+          sorted_runs(typename std::allocator_traits<allocator_type_>::template rebind_alloc<compacted_sorted_run_t>(
+              allocator)),
+          value_copy_ranges(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<value_copy_range_t>(allocator)),
+          value_offsets(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
+          stamps(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
+          kinds(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint8_t>(allocator)),
+          folded(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)),
+          tail_offsets(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
+          tails(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)),
+          merge_heads(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<compaction_record<key_slot_type_>>(
+                  allocator)),
+          merge_tournament(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint32_t>(allocator)),
+          key_versions(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<compaction_record<key_slot_type_>>(
+                  allocator)),
+          key_versions_kept(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint8_t>(allocator)),
+          key_versions_hidden(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint8_t>(allocator)) {}
+};
 
 #pragma endregion Vocabulary
 
@@ -1035,6 +1078,77 @@ st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t val
 }
 
 /**
+ *  @brief Appends to @p ranges where the value of @p survivor comes from, as a range of its own
+ *      that @c coalesce_value_copies later joins with its neighbours, and nothing for a survivor
+ *      holding no value bytes.
+ *  @param[in] upper The upper LSM level's views, whose value offsets locate the values of
+ *      a variable width.
+ *  @param[in] lower The lower LSM level's views.
+ *  @param[in] value_stride Bytes every value of a fixed-width layout takes, which locates its
+ *      values by position.
+ *  @param[in,out] folded_begin Where the next folded value starts in the folded bytes, which
+ *      hold the folded values in survivor order, so a survivor naming the run past every source
+ *      moves it on.
+ */
+template <typename key_slot_type_, typename ranges_type_>
+st::status_t append_value_copy(located_key_slot<key_slot_type_> const& survivor,
+                               std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                               std::span<sorted_run_index_view<key_slot_type_> const> lower, std::uint64_t value_stride,
+                               std::uint64_t& folded_begin, ranges_type_& ranges) noexcept {
+    if (survivor.size == 0) return st::status_t::success_k;
+    std::uint64_t source_begin = folded_begin;
+    if (survivor.sorted_run == upper.size() + lower.size()) folded_begin += survivor.size;
+    else {
+        sorted_run_index_view<key_slot_type_> const& view = survivor.sorted_run < upper.size()
+                                                                ? upper[survivor.sorted_run]
+                                                                : lower[survivor.sorted_run - upper.size()];
+        source_begin = !view.value_offsets.empty() ? view.value_offsets[survivor.position]
+                                                   : survivor.position * value_stride;
+    }
+    if (source_begin > std::numeric_limits<std::uint32_t>::max()) return st::status_t::capacity_exhausted_k;
+    return ranges.push_back(
+        value_copy_range_t {survivor.sorted_run, static_cast<std::uint32_t>(source_begin), survivor.size, 0});
+}
+
+/**
+ *  @brief Coalesces @p ranges, one per survivor value as @c append_value_copy appended them, into
+ *      the copy ranges of each of @p sorted_runs in place, joining the values of neighbouring
+ *      survivors that sit back to back in one source, and counts each run's ranges into it.
+ *
+ *  A run's values take exactly its @c stored_values_bytes, so the ranges it starts with follow from
+ *  those of the runs before it.
+ */
+template <typename sorted_runs_type_, typename ranges_type_>
+st::status_t coalesce_value_copies(sorted_runs_type_& sorted_runs, ranges_type_& ranges) noexcept {
+    std::size_t taken = 0;
+    std::size_t placed = 0;
+    for (std::size_t run = 0; run != sorted_runs.size(); ++run) {
+        std::size_t const first_range = placed;
+        std::uint64_t target = 0;
+        while (target < sorted_runs[run].stored_values_bytes && taken != ranges.size()) {
+            value_copy_range_t const piece = ranges[taken++];
+            if (placed != first_range) {
+                value_copy_range_t& last = ranges[placed - 1];
+                std::uint64_t const extended = std::uint64_t {last.bytes} + piece.bytes;
+                if (last.source_run == piece.source_run &&
+                    last.source_begin + std::uint64_t {last.bytes} == piece.source_begin &&
+                    extended <= std::numeric_limits<std::uint32_t>::max()) {
+                    last.bytes = static_cast<std::uint32_t>(extended);
+                    target += piece.bytes;
+                    continue;
+                }
+            }
+            if (target > std::numeric_limits<std::uint32_t>::max()) return st::status_t::capacity_exhausted_k;
+            ranges[placed++] = value_copy_range_t {piece.source_run, piece.source_begin, piece.bytes,
+                                                   static_cast<std::uint32_t>(target)};
+            target += piece.bytes;
+        }
+        sorted_runs[run].value_copy_ranges_count = placed - first_range;
+    }
+    return ranges.resize(st::assume_uninitialized, placed);
+}
+
+/**
  *  @brief Coalesces where the values of @p survivors come from into the copy ranges of each of @p sorted_runs, and
  *      counts each run's ranges into it.
  *  @param[in] survivors The survivors in sorted order across the new runs; one naming the run past every source has
@@ -1050,51 +1164,16 @@ st::status_t plan_value_copies(record_type_ const* survivors,
                                std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                std::span<sorted_run_index_view<key_slot_type_> const> lower, std::uint64_t value_stride,
                                sorted_runs_type_& sorted_runs, ranges_type_& ranges) noexcept {
-    using st::status_t;
     ranges.clear();
-    std::uint64_t const sources_count = upper.size() + lower.size();
+    std::uint64_t survivors_count = 0;
+    for (std::size_t run = 0; run != sorted_runs.size(); ++run) survivors_count += sorted_runs[run].key_slots_count;
     std::uint64_t folded_begin = 0;
-    std::uint64_t first = 0;
-    for (std::size_t run = 0; run != sorted_runs.size(); ++run) {
-        std::size_t const first_range = ranges.size();
-        std::uint64_t const end = first + sorted_runs[run].key_slots_count;
-        std::uint64_t target = 0;
-        for (std::uint64_t index = first; index != end; ++index) {
-            located_key_slot<key_slot_type_> const& record = located_of(survivors[index]);
-            if (record.size == 0) continue;
-            std::uint64_t source_begin = folded_begin;
-            if (record.sorted_run == sources_count) folded_begin += record.size;
-            else {
-                sorted_run_index_view<key_slot_type_> const& view = record.sorted_run < upper.size()
-                                                                        ? upper[record.sorted_run]
-                                                                        : lower[record.sorted_run - upper.size()];
-                source_begin = !view.value_offsets.empty() ? view.value_offsets[record.position]
-                                                           : record.position * value_stride;
-            }
-            if (ranges.size() != first_range) {
-                value_copy_range_t& last = ranges[ranges.size() - 1];
-                std::uint64_t const extended = std::uint64_t {last.bytes} + record.size;
-                if (last.source_run == record.sorted_run &&
-                    last.source_begin + std::uint64_t {last.bytes} == source_begin &&
-                    extended <= std::numeric_limits<std::uint32_t>::max()) {
-                    last.bytes = static_cast<std::uint32_t>(extended);
-                    target += record.size;
-                    continue;
-                }
-            }
-            if (source_begin > std::numeric_limits<std::uint32_t>::max() ||
-                target > std::numeric_limits<std::uint32_t>::max())
-                return status_t::capacity_exhausted_k;
-            status_t const pushed = ranges.push_back(
-                value_copy_range_t {record.sorted_run, static_cast<std::uint32_t>(source_begin), record.size,
-                                    static_cast<std::uint32_t>(target)});
-            if (pushed != status_t::success_k) return pushed;
-            target += record.size;
-        }
-        sorted_runs[run].value_copy_ranges_count = ranges.size() - first_range;
-        first = end;
-    }
-    return status_t::success_k;
+    for (std::uint64_t index = 0; index != survivors_count; ++index)
+        if (st::status_t const appended = append_value_copy(located_of(survivors[index]), upper, lower, value_stride,
+                                                            folded_begin, ranges);
+            appended != st::status_t::success_k)
+            return appended;
+    return coalesce_value_copies(sorted_runs, ranges);
 }
 
 /**
@@ -1204,7 +1283,8 @@ constexpr bool views_locate_values(std::span<sorted_run_index_view<key_slot_type
     else {
         if (bounds.value_stride != 0) return false;
         for (sorted_run_index_view<key_slot_type_> const& view : views)
-            if (view.key_slots_count != 0 && view.value_offsets.size() != view.key_slots_count + 1) return false;
+            if (view.key_slots_count != 0 && view.value_offsets.size() < view.first + view.key_slots_count + 1)
+                return false;
         return true;
     }
 }
@@ -1266,19 +1346,6 @@ std::size_t union_sorted_keys(first_reader_type_&& read_first, std::size_t first
 #pragma endregion Rules
 
 #pragma region Host
-
-/** Merges sorted ranges @c [begin,middle) and @c [middle,end) of @p source into the same range of @p target. */
-template <typename record_type_, typename order_type_>
-constexpr void merge_ranges(record_type_ const* source, std::uint64_t begin, std::uint64_t middle, std::uint64_t end,
-                            record_type_* target, order_type_ const& order) noexcept {
-    std::uint64_t left = begin;
-    std::uint64_t right = middle;
-    std::uint64_t output = begin;
-    while ((left != middle) & (right != end))
-        target[output++] = order(source[right], source[left]) ? source[right++] : source[left++];
-    while (left != middle) target[output++] = source[left++];
-    while (right != end) target[output++] = source[right++];
-}
 
 /** The compactor's status for a fold that refused a chain, which only running out of memory is not a refusal. */
 inline st::status_t fold_refusal(utilities::status_t const& refused) noexcept {
@@ -1391,10 +1458,11 @@ struct host_compactor_t {
                          value_reader_type_&& read_value,
                          compaction_output<key_slot_type_, allocator_type_>& output) const noexcept {
         using st::status_t;
-        using st::vector;
+        using record_t = compaction_record<key_slot_type_>;
+        using view_t = sorted_run_index_view<key_slot_type_>;
         constexpr bool tailed_k = tailed_key_slot_concept<key_slot_type_>;
-        using record_t =
-            std::conditional_t<tailed_k, located_tailed_key_slot<key_slot_type_>, located_key_slot<key_slot_type_>>;
+        constexpr bool locates_k = locates_stored_values_concept<key_slot_type_>;
+        constexpr st::assume_uninitialized_t uninitialized {};
 
         if (!admits_sorted_runs(bounds)) return status_t::invalid_argument_k;
         std::uint64_t const sorted_runs_count = upper.size() + lower.size();
@@ -1402,106 +1470,68 @@ struct host_compactor_t {
         if (!views_locate_values(upper, bounds) || !views_locate_values(lower, bounds))
             return status_t::invalid_argument_k;
 
-        std::uint64_t upper_key_slots = 0;
-        for (std::size_t index = 0; index != upper.size(); ++index) upper_key_slots += upper[index].key_slots_count;
-        std::uint64_t merged_count = upper_key_slots;
-        for (std::size_t index = 0; index != lower.size(); ++index) merged_count += lower[index].key_slots_count;
+        std::uint64_t merged_count = 0;
+        for (view_t const& view : upper) merged_count += view.key_slots_count;
+        for (view_t const& view : lower) merged_count += view.key_slots_count;
 
-        vector<record_t> records;
-        vector<record_t> scratch;
-        status_t status = records.resize(merged_count);
-        if (status != status_t::success_k) return status;
-        status = scratch.resize(merged_count);
-        if (status != status_t::success_k) return status;
+        // Survivors land once each, in merged order, so every column takes room for all records
+        // and shrinks after
+        output.cells.clear();
+        output.stamps.clear();
+        output.kinds.clear();
+        output.value_offsets.clear();
+        output.value_copy_ranges.clear();
+        output.folded.clear();
+        output.tail_offsets.clear();
+        output.tails.clear();
+        output.merge_heads.clear();
+        if (output.cells.resize(uninitialized, merged_count) != status_t::success_k ||
+            output.stamps.resize(uninitialized, merged_count) != status_t::success_k ||
+            output.kinds.resize(uninitialized, merged_count) != status_t::success_k ||
+            output.value_copy_ranges.reserve(locates_k ? merged_count : 0) != status_t::success_k ||
+            output.value_offsets.resize(uninitialized, locates_k ? merged_count + 1 : 0) != status_t::success_k ||
+            output.tail_offsets.resize(uninitialized, tailed_k ? merged_count + 1 : 0) != status_t::success_k ||
+            output.merge_heads.resize(uninitialized, sorted_runs_count) != status_t::success_k)
+            return status_t::out_of_memory_heap_k;
+        if constexpr (locates_k) output.value_offsets[0] = 0;
+        if constexpr (tailed_k) output.tail_offsets[0] = 0;
 
-        // Every sorted run's cells are already in sorted order, in one run per sorted run
-        vector<std::uint64_t> run_starts;
-        status = run_starts.resize(upper.size() + 1);
-        if (status != status_t::success_k) return status;
-        std::uint64_t run_offset = 0;
-        for (std::uint64_t sorted_run = 0; sorted_run != sorted_runs_count; ++sorted_run) {
-            sorted_run_index_view<key_slot_type_> const& view = sorted_run < upper.size()
-                                                                    ? upper[sorted_run]
-                                                                    : lower[sorted_run - upper.size()];
-            if (sorted_run <= upper.size()) run_starts[sorted_run] = run_offset;
+        // Every run's head is its next record, and a run whose head stands at its view's
+        // end is exhausted
+        auto const view_of = [&](std::uint32_t run) noexcept -> view_t const& {
+            return run < upper.size() ? upper[run] : lower[run - upper.size()];
+        };
+        auto const load_head = [&](std::uint32_t run, std::uint64_t position) noexcept {
+            view_t const& view = view_of(run);
+            record_t& head = output.merge_heads[run];
+            located_key_slot<key_slot_type_>& located = located_of(head);
+            located.position = static_cast<std::uint32_t>(position);
+            if (position == view.first + view.key_slots_count) return;
             stored_value_offset_t const* const offsets = !view.value_offsets.empty() ? view.value_offsets.data()
                                                                                      : nullptr;
-            for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
-                located_of(records[run_offset + sorted]) = located_key_slot<key_slot_type_> {
-                    key_slot_of(view, sorted),
-                    static_cast<std::uint32_t>(sorted_run),
-                    delta_kind_t::write_k,
-                    0,
-                    static_cast<std::uint32_t>(sorted),
-                    stored_value_bytes(offsets, bounds.value_stride, sorted)};
-            if (view.stamps != nullptr)
-                for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
-                    located_of(records[run_offset + sorted]).stamp = (*view.stamps)[static_cast<std::size_t>(sorted)];
-            if (view.kinds != nullptr)
-                for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
-                    located_of(records[run_offset + sorted]).kind = static_cast<delta_kind_t>(
-                        (*view.kinds)[static_cast<std::size_t>(sorted)]);
-            if constexpr (tailed_k)
-                for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
-                    records[run_offset + sorted].tail = view.tails.at(sorted);
-            run_offset += view.key_slots_count;
-        }
-        run_starts[upper.size()] = upper_key_slots;
-
-        // Overlapping runs merge pairwise, so the newest key slot of every stored key leads its run
-        survivor_first_t const order {static_cast<std::uint32_t>(upper.size())};
-        bool const overlapping = (kind == compaction_kind_t::overlapping_into_intermediate_k) |
-                                 (kind == compaction_kind_t::overlapping_into_bottom_k);
-        if (overlapping) {
-            record_t* source = records.data();
-            record_t* target = scratch.data();
-            std::uint64_t runs = upper.size();
-            while (runs > 1) {
-                std::uint64_t merged_runs = 0;
-                for (std::uint64_t run = 0; run < runs; run += 2) {
-                    std::uint64_t const middle = run_starts[run + 1 < runs ? run + 1 : runs];
-                    std::uint64_t const end = run_starts[run + 2 < runs ? run + 2 : runs];
-                    merge_ranges(source, run_starts[run], middle, end, target, order);
-                    run_starts[merged_runs++] = run_starts[run];
-                }
-                run_starts[merged_runs] = upper_key_slots;
-                runs = merged_runs;
-                std::swap(source, target);
-            }
-            if (source != records.data())
-                for (std::uint64_t index = 0; index != upper_key_slots; ++index) records[index] = scratch[index];
-        }
-
-        // One merge path joins the upper and lower runs, and the survivors move back
-        merge_ranges(records.data(), 0, upper_key_slots, merged_count, scratch.data(), order);
-
-        // A version a range tombstone hides turns into a removal, so the versions below drop
-        // and a change folds onto nothing, and then drops itself, as the tombstone stays with
-        // the new runs.
-        vector<std::uint8_t> hidden;
-        if (carries_range_tombstones(upper, lower)) {
-            status = hidden.resize(merged_count);
-            if (status != status_t::success_k) return status;
-            for (std::uint64_t index = 0; index != merged_count; ++index) {
-                located_key_slot<key_slot_type_>& record = located_of(scratch[index]);
-                hidden[index] = hidden_by_range(upper, lower, record, stamps) ? 1 : 0;
-                if (hidden[index]) record.kind = delta_kind_t::remove_k;
-            }
-        }
-
-        // Survival settles before any fold, so a fold sees every version dropped behind its change
-        vector<std::uint8_t> kept;
-        status = kept.resize(merged_count);
-        if (status != status_t::success_k) return status;
-        for (std::uint64_t index = 0; index != merged_count; ++index)
-            kept[index] = survives(index != 0 ? scratch.data() + index - 1 : nullptr, scratch[index], kind, stamps);
-
-        // A folded survivor's value, which replaces its own once every survivor is placed
-        struct folded_t {
-            std::uint64_t survivor = 0;
-            std::span<byte_t const> bytes;
+            located = located_key_slot<key_slot_type_> {
+                key_slot_of(view, position),
+                run,
+                view.kinds != nullptr ? static_cast<delta_kind_t>((*view.kinds)[static_cast<std::size_t>(position)])
+                                      : delta_kind_t::write_k,
+                view.stamps != nullptr ? (*view.stamps)[static_cast<std::size_t>(position)] : 0,
+                static_cast<std::uint32_t>(position),
+                stored_value_bytes(offsets, bounds.value_stride, position)};
+            if constexpr (tailed_k) head.tail = view.tails.at(position);
         };
-        vector<folded_t> folds;
+        survivor_first_t const order {static_cast<std::uint32_t>(upper.size())};
+        auto const exhausted = [&](std::uint32_t run) noexcept {
+            view_t const& view = view_of(run);
+            return located_of(output.merge_heads[run]).position == view.first + view.key_slots_count;
+        };
+        auto const precedes = [&](std::uint32_t first, std::uint32_t second) noexcept {
+            if (exhausted(first)) return false;
+            return exhausted(second) || order(output.merge_heads[first], output.merge_heads[second]);
+        };
+        for (std::uint32_t run = 0; run != sorted_runs_count; ++run) load_head(run, view_of(run).first);
+        status_t status = output.merge_tournament.reset(static_cast<std::uint32_t>(sorted_runs_count), precedes);
+        if (status != status_t::success_k) return status;
+
         utilities::local_arena_t arena;
         utilities::arena_allocator<byte_t> arena_bytes = arena.allocator();
         auto const value_of = [&](record_t const& record, std::span<byte_t const>& bytes) noexcept {
@@ -1509,59 +1539,106 @@ struct host_compactor_t {
             if (located_of(record).kind == delta_kind_t::remove_k) return status_t::success_k;
             return read_value(located_of(record), arena_bytes, bytes);
         };
+
+        // Settles the versions of one key: a version a range tombstone hides turns into a removal,
+        // so the versions below drop and a change folds onto nothing, and then drops itself, as the
+        // tombstone stays with the new runs. Survival settles before any fold, so a fold sees every
+        // version dropped behind its change.
+        bool const tombstoned = carries_range_tombstones(upper, lower);
         std::uint64_t survivors = 0;
-        for (std::uint64_t index = 0; index != merged_count; ++index) {
-            if (!kept[index] || (!hidden.empty() && hidden[index])) continue;
-            record_t& survivor = records[survivors++];
-            survivor = scratch[index];
-            if (located_of(survivor).kind != delta_kind_t::change_k) continue;
-            folded_versions_t const versions = folded_versions(kind, stamps, scratch.data(), kept.data(), merged_count,
-                                                               index);
-            if (versions.end == index + 1 && !versions.applies) continue;
-            delta_view_t folded;
-            status = fold_versions(fold, scratch.data(), index, versions, value_of, arena_bytes, folded);
-            if (status != status_t::success_k) return status;
-            located_of(survivor).kind = folded.kind;
-            if (folds.push_back(folded_t {survivors - 1, folded.bytes}) != status_t::success_k)
+        std::uint64_t folded_begin = 0;
+        auto const settle = [&]() noexcept -> status_t {
+            std::size_t const count = output.key_versions.size();
+            output.key_versions_kept.clear();
+            output.key_versions_hidden.clear();
+            if (output.key_versions_kept.resize(uninitialized, count) != status_t::success_k ||
+                output.key_versions_hidden.resize(uninitialized, count) != status_t::success_k)
                 return status_t::out_of_memory_heap_k;
-        }
+            record_t* const versions = output.key_versions.data();
+            std::uint8_t* const kept = output.key_versions_kept.data();
+            std::uint8_t* const hidden = output.key_versions_hidden.data();
+            for (std::size_t index = 0; index != count; ++index) {
+                located_key_slot<key_slot_type_>& version = located_of(versions[index]);
+                hidden[index] = tombstoned && hidden_by_range(upper, lower, version, stamps) ? 1 : 0;
+                if (hidden[index]) version.kind = delta_kind_t::remove_k;
+            }
+            for (std::size_t index = 0; index != count; ++index)
+                kept[index] = survives(index != 0 ? versions + index - 1 : nullptr, versions[index], kind, stamps);
 
-        // A folded value replaces its survivor's own: inline in the key slot, or in the compaction's folded bytes
-        output.folded.clear();
-        for (folded_t const& folded : folds) {
-            status = place_folded_value(folded.bytes, bounds.value_stride,
-                                        static_cast<std::uint32_t>(sorted_runs_count),
-                                        located_of(records[folded.survivor]), output.folded);
-            if (status != status_t::success_k) return status;
-        }
+            for (std::size_t index = 0; index != count; ++index) {
+                if (!kept[index] || hidden[index]) continue;
+                record_t survivor = versions[index];
+                located_key_slot<key_slot_type_>& placed = located_of(survivor);
+                // A folded value replaces the survivor's own: inline in the key slot, or in
+                // the folded bytes
+                if (placed.kind == delta_kind_t::change_k) {
+                    folded_versions_t const folding = folded_versions(kind, stamps, versions, kept, count, index);
+                    if (folding.end != index + 1 || folding.applies) {
+                        delta_view_t folded;
+                        status_t const read = fold_versions(fold, versions, index, folding, value_of, arena_bytes,
+                                                            folded);
+                        if (read != status_t::success_k) return read;
+                        placed.kind = folded.kind;
+                        status_t const laid = place_folded_value(folded.bytes, bounds.value_stride,
+                                                                 static_cast<std::uint32_t>(sorted_runs_count), placed,
+                                                                 output.folded);
+                        if (laid != status_t::success_k) return laid;
+                    }
+                }
+                place_key_slot(placed, stamps.floor, output.cells[survivors], output.stamps[survivors],
+                               output.kinds[survivors]);
+                if constexpr (locates_k)
+                    output.value_offsets[survivors + 1] = output.value_offsets[survivors] + placed.size;
+                if (status_t const appended = append_value_copy(placed, upper, lower, bounds.value_stride, folded_begin,
+                                                                output.value_copy_ranges);
+                    appended != status_t::success_k)
+                    return appended;
+                if constexpr (tailed_k) {
+                    std::size_t const written = output.tails.size();
+                    if (output.tails.resize(uninitialized, written + survivor.tail.size()) != status_t::success_k)
+                        return status_t::out_of_memory_heap_k;
+                    if (!survivor.tail.empty())
+                        std::memcpy(output.tails.data() + written, survivor.tail.data(), survivor.tail.size());
+                    output.tail_offsets[survivors + 1] = written + survivor.tail.size();
+                }
+                ++survivors;
+            }
+            output.key_versions.clear();
+            return status_t::success_k;
+        };
 
-        vector<std::uint64_t> prefix;
-        if constexpr (locates_stored_values_concept<key_slot_type_>) {
-            status = prefix.resize(survivors + 1);
-            if (status != status_t::success_k) return status;
-            prefix[0] = 0;
-            for (std::uint64_t index = 0; index != survivors; ++index)
-                prefix[index + 1] = prefix[index] + located_of(records[index]).size;
+        // One pass takes every record in merged order, the newest version of every key first
+        output.key_versions.clear();
+        for (std::uint64_t taken = 0; taken != merged_count; ++taken) {
+            std::uint32_t const run = output.merge_tournament.least();
+            record_t const& head = output.merge_heads[run];
+            if (!output.key_versions.empty() && !same_key(output.key_versions[0], head))
+                if (status_t const settled = settle(); settled != status_t::success_k) return settled;
+            if (output.key_versions.push_back(record_t {head}) != status_t::success_k)
+                return status_t::out_of_memory_heap_k;
+            load_head(run, std::uint64_t {located_of(head).position} + 1);
+            output.merge_tournament.replay(precedes);
         }
+        if (!output.key_versions.empty())
+            if (status_t const settled = settle(); settled != status_t::success_k) return settled;
+
+        if (output.cells.resize(uninitialized, survivors) != status_t::success_k ||
+            output.stamps.resize(uninitialized, survivors) != status_t::success_k ||
+            output.kinds.resize(uninitialized, survivors) != status_t::success_k ||
+            output.value_offsets.resize(uninitialized, locates_k ? survivors + 1 : 0) != status_t::success_k ||
+            output.tail_offsets.resize(uninitialized, tailed_k ? survivors + 1 : 0) != status_t::success_k)
+            return status_t::out_of_memory_heap_k;
+
         // Tails take room in a run file beside the values, so the plan bounds both together.
-        vector<std::uint64_t> planned;
-        if constexpr (tailed_k) {
-            status = planned.resize(survivors + 1);
-            if (status != status_t::success_k) return status;
-            planned[0] = 0;
-            for (std::uint64_t index = 0; index != survivors; ++index)
-                planned[index + 1] = planned[index] + (prefix.size() != 0 ? prefix[index + 1] - prefix[index] : 0) +
-                                     records[index].tail.size();
-        }
-        vector<std::uint64_t> const& bounded = tailed_k ? planned : prefix;
-        auto const read_prefix = [&bounded](std::uint64_t index, std::uint64_t& bytes) noexcept {
-            bytes = bounded.size() != 0 ? bounded[index] : 0;
+        auto const read_prefix = [&](std::uint64_t index, std::uint64_t& bytes) noexcept {
+            bytes = 0;
+            if constexpr (locates_k) bytes += output.value_offsets[index];
+            if constexpr (tailed_k) bytes += output.tail_offsets[index];
             return status_t::success_k;
         };
         // Runs split between heads alone, so the key slots of one head stay in one run however their tails differ.
-        auto const shares_key = [&records](std::uint64_t index, bool& shared) noexcept {
-            shared = located_of(records[index - 1]).key_slot.stored_key ==
-                     located_of(records[index]).key_slot.stored_key;
+        auto const shares_key = [&output](std::uint64_t index, bool& shared) noexcept {
+            shared = output.cells[index - 1].stored_key == output.cells[index].stored_key;
             return status_t::success_k;
         };
         status = plan_sorted_runs<key_slot_type_>(survivors, bounds, read_prefix, shares_key, output.sorted_runs);
@@ -1570,52 +1647,17 @@ struct host_compactor_t {
             std::uint64_t planned_first = 0;
             for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
                 std::uint64_t const end = planned_first + output.sorted_runs[index].key_slots_count;
-                output.sorted_runs[index].stored_values_bytes = prefix.size() != 0 ? prefix[end] - prefix[planned_first]
-                                                                                   : 0;
+                std::uint64_t values_bytes = 0;
+                if constexpr (locates_k) values_bytes = output.value_offsets[end] - output.value_offsets[planned_first];
+                output.sorted_runs[index].stored_values_bytes = values_bytes;
                 planned_first = end;
             }
         }
+        status = coalesce_value_copies(output.sorted_runs, output.value_copy_ranges);
+        if (status != status_t::success_k) return status;
 
-        status = output.cells.resize(survivors);
-        if (status != status_t::success_k) return status;
-        status = output.stamps.resize(survivors);
-        if (status != status_t::success_k) return status;
-        status = output.kinds.resize(survivors);
-        if (status != status_t::success_k) return status;
-        for (std::uint64_t survivor = 0; survivor != survivors; ++survivor)
-            place_key_slot(located_of(records[survivor]), stamps.floor, output.cells[survivor], output.stamps[survivor],
-                           output.kinds[survivor]);
-
-        status = plan_value_copies<key_slot_type_>(records.data(), upper, lower, bounds.value_stride,
-                                                   output.sorted_runs, output.value_copy_ranges);
-        if (status != status_t::success_k) return status;
-        output.value_offsets.clear();
-        if constexpr (locates_stored_values_concept<key_slot_type_>)
-            if (is_variable_width(key_slot_type_::value_layout_k)) {
-                status = output.value_offsets.resize(prefix.size());
-                if (status != status_t::success_k) return status;
-                for (std::size_t index = 0; index != prefix.size(); ++index)
-                    output.value_offsets[index] = prefix[index];
-            }
-
-        output.tail_offsets.clear();
-        output.tails.clear();
-        if constexpr (tailed_k) {
-            std::uint64_t tails_bytes = 0;
-            for (std::uint64_t index = 0; index != survivors; ++index) tails_bytes += records[index].tail.size();
-            status = output.tail_offsets.resize(survivors + 1);
-            if (status != status_t::success_k) return status;
-            status = output.tails.resize(tails_bytes);
-            if (status != status_t::success_k) return status;
-            std::uint64_t written = 0;
-            for (std::uint64_t index = 0; index != survivors; ++index) {
-                std::string_view const tail = records[index].tail;
-                output.tail_offsets[index] = written;
-                if (!tail.empty()) std::memcpy(output.tails.data() + written, tail.data(), tail.size());
-                written += tail.size();
-            }
-            output.tail_offsets[survivors] = written;
-        }
+        // The running sizes are the new runs' value offsets, which a variable width alone keeps
+        if constexpr (locates_k && !is_variable_width(key_slot_type_::value_layout_k)) output.value_offsets.clear();
         return status_t::success_k;
     }
 };
@@ -1767,7 +1809,8 @@ class ring_sections_reader {
     /** Bytes one request moves at most, so a section of any size stays within one transfer of the ring. */
     static constexpr std::uint64_t request_bytes_k = std::uint64_t {64} << 20;
 
-    /** Takes @p disk in, reading volume @c i from the medium @p media[i] names, and leases a queue pair of it. */
+    /** Takes @p disk in, reading volume @c i from the medium @p media[i] names, and acquires a
+     *  queue pair of it. */
     static expected<ring_sections_reader> make(disk_type_&& disk,
                                                std::span<utilities::medium_options_t const> media) noexcept {
         ring_sections_reader reader;
@@ -1779,22 +1822,22 @@ class ring_sections_reader {
             if (!registered) return registered.status();
             reader.media_[volume] = std::move(*registered);
         }
-        expected<utilities::queue_pair_t> leased = reader.disk_.acquire_queue_pair(depth_k);
-        if (!leased) return leased.status();
-        reader.queue_pair_ = std::move(*leased);
+        expected<utilities::queue_pair_t> acquired = reader.disk_.acquire_queue_pair(depth_k);
+        if (!acquired) return acquired.status();
+        reader.queue_pair_ = std::move(*acquired);
         return reader;
     }
 
-    /** Takes @p disk in, reading each run from its own file in @p volume, and leases a pair. */
+    /** Takes @p disk in, reading each run from its own file in @p volume, and acquires a pair. */
     template <typename named_volume_type_>
         requires std::same_as<named_volume_type_, volume_type_>
     static expected<ring_sections_reader> make(disk_type_&& disk, named_volume_type_ const& volume) noexcept {
         ring_sections_reader reader;
         reader.disk_ = std::move(disk);
         reader.volume_ = &volume;
-        expected<utilities::queue_pair_t> leased = reader.disk_.acquire_queue_pair(depth_k);
-        if (!leased) return leased.status();
-        reader.queue_pair_ = std::move(*leased);
+        expected<utilities::queue_pair_t> acquired = reader.disk_.acquire_queue_pair(depth_k);
+        if (!acquired) return acquired.status();
+        reader.queue_pair_ = std::move(*acquired);
         return reader;
     }
 

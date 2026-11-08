@@ -602,8 +602,10 @@ inline expected<kinds_column_t> pack_kinds(std::span<std::uint8_t const> kinds) 
  *  that ever reads it.
  *
  *  @tparam waiter_type_ What the core does while it waits for an index read or a barrier.
+ *  @tparam row_kit_type_ The SmashTable kit the run's trees search with.
  */
-template <typename key_slot_type_, typename volume_type_, typename waiter_type_>
+template <typename key_slot_type_, typename volume_type_, typename waiter_type_,
+          typename row_kit_type_ = st::native_row_kit_t>
 class lsm_sorted_run {
   public:
 
@@ -624,7 +626,7 @@ class lsm_sorted_run {
                            blobs::range_tombstones<stored_key_t>>;
 
     /** The transport the volume moves bytes through. */
-    using disk_t = std::remove_reference_t<decltype(std::declval<volume_type_&>().disk())>;
+    using disk_t = typename volume_type_::disk_t;
 
     /** Where the sections of this run sit inside its extent. */
     using sorted_run_layout_t = sorted_run_layout<key_slot_t>;
@@ -655,11 +657,17 @@ class lsm_sorted_run {
      *  strings instantiates. */
     using strings_layout_t = strings_run_layout<key_slot_t>;
 
+    /** The SmashTable kit every search of the run's trees runs, which the saved bytes
+     *  never depend on. */
+    using row_kit_t = row_kit_type_;
+
     /** The heads of a run of strings, or of one of its layers, searched in place. */
-    using heads_view_t = st::immutable_splus_tree_view<st::key128_t>;
+    using heads_view_t =
+        st::immutable_splus_tree_view<st::key128_t, st::keys_per_row<st::key128_t>(st::default_row_bytes_k), row_kit_t>;
 
     /** The saved S+ tree every lookup descends: of the keys, or of a run of strings' heads. */
-    using keys_view_t = st::immutable_splus_tree_view<stored_key_t>;
+    using keys_view_t =
+        st::immutable_splus_tree_view<stored_key_t, st::keys_per_row<stored_key_t>(st::default_row_bytes_k), row_kit_t>;
 
 #pragma endregion Types
 
@@ -875,9 +883,9 @@ class lsm_sorted_run {
             return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
         medium_extent_t const& extent = reservation.extent;
         sorted_run_header_t const& header = reservation.header;
-        auto [writer_lease, writer_lease_status] = channel.lease();
-        if (writer_lease_status.failed()) return writer_lease_status;
-        write_pipeline_t writer {volume.disk(), std::move(writer_lease), extent.medium};
+        auto [writer_channel, writer_channel_status] = channel.acquire();
+        if (writer_channel_status.failed()) return writer_channel_status;
+        write_pipeline_t writer {volume.disk(), std::move(writer_channel), extent.medium};
 
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
         auto [head, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
@@ -948,6 +956,48 @@ class lsm_sorted_run {
         }
         if (status_t const trailer = run.read_trailer_(channel); trailer.failed()) return trailer;
         if (status_t const ranges = run.read_range_tombstones_(channel); ranges.failed()) return ranges;
+        return run;
+    }
+
+    /**
+     *  @brief The run a merge just wrote at @p extent, built from what the merge still holds rather
+     *      than read back from the volume, which leaves it as @c open would.
+     *  @param[in,out] volume The volume the run reads through afterwards, borrowed
+     *      and outliving it.
+     *  @param[in] extent Where the merge wrote the run.
+     *  @param[in] header The header the merge wrote.
+     *  @param[in] cells The cells in sorted order, which a run keeping its cells copies.
+     *  @param[in] tree_words The saved tree of the keys, as @c save_keys laid it.
+     *  @param[in] value_offsets The value offsets the merge wrote, none but for a variable width.
+     *  @param[in] stamps The stamps column the merge packed for the trailer.
+     *  @param[in] kinds The kinds column the merge packed for the trailer.
+     *  @param[in] tombstones The range tombstones the merge wrote at the run's end.
+     */
+    static expected<lsm_sorted_run> adopt(volume_type_& volume, medium_extent_t const& extent,
+                                          sorted_run_header_t const& header,
+                                          [[maybe_unused]] std::span<key_slot_t const> cells,
+                                          st::vector<std::uint64_t> tree_words,
+                                          st::vector<stored_value_offset_t> value_offsets, stamps_column_t stamps,
+                                          kinds_column_t kinds, range_tombstones_t tombstones) noexcept
+        requires(!tailed_k)
+    {
+        lsm_sorted_run run;
+        run.volume_ = &volume;
+        run.extent_ = extent;
+        run.header_ = header;
+        if constexpr (keeps_cells_k)
+            if (run.cells_.assign(cells) != st::status_t::success_k)
+                return status_t {status_code_t::out_of_memory_k, "A run could not hold its index"};
+        run.tree_words_ = std::move(tree_words);
+        st::expected<keys_view_t> const tree = keys_view_t::make(
+            std::as_bytes(std::span<std::uint64_t const> {run.tree_words_}));
+        if (!tree || tree->size() != header.key_slots_count)
+            return status_t {status_code_t::internal_k, "A merged run's tree disagrees with it"};
+        run.tree_ = *tree;
+        run.value_offsets_ = std::move(value_offsets);
+        run.stamps_ = std::move(stamps);
+        run.kinds_ = std::move(kinds);
+        run.range_tombstones_ = std::move(tombstones);
         return run;
     }
 
@@ -1193,6 +1243,12 @@ class lsm_sorted_run {
 
     /** The saved S+ tree every lookup descends: of the keys, or of a run of strings' heads. */
     [[nodiscard]] keys_view_t const& keys() const noexcept { return tree_; }
+
+    /** The saved tree of the keys, or of a run of strings' heads, which a merge views in place with
+     *  its own kit. */
+    [[nodiscard]] std::span<std::byte const> keys_bytes() const noexcept {
+        return std::as_bytes(std::span<std::uint64_t const> {tree_words_});
+    }
 
     /** Where @p stored_key sits in sorted order, or @c population_count when the run holds no such key. */
     [[nodiscard]] std::uint64_t position_of(stored_key_t stored_key) const noexcept
@@ -1477,9 +1533,9 @@ class lsm_sorted_run {
         if (pending.resize(depth) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A run could not track its reads in flight"};
 
-        auto [reader_lease, reader_lease_status] = channel.lease();
-        if (reader_lease_status.failed()) return reader_lease_status;
-        read_pipeline_t reader {volume_->disk(), std::move(reader_lease), extent_.medium};
+        auto [reader_channel, reader_channel_status] = channel.acquire();
+        if (reader_channel_status.failed()) return reader_channel_status;
+        read_pipeline_t reader {volume_->disk(), std::move(reader_channel), extent_.medium};
         status_t first;
         auto adapter = [&](completed_buffer_t const& completed) noexcept {
             pending_read_t const& piece = pending[completed.tag % depth];
@@ -1704,7 +1760,9 @@ class lsm_sorted_run {
     /** Saves the S+ tree of @p keys, which ascend, into @p words. */
     template <typename key_type_>
     static status_t save_tree_(std::span<key_type_ const> keys, st::vector<std::uint64_t>& words) noexcept {
-        st::expected<st::immutable_splus_tree<key_type_>> tree = st::immutable_splus_tree<key_type_>::make(keys);
+        using tree_t =
+            st::immutable_splus_tree<key_type_, st::keys_per_row<key_type_>(st::default_row_bytes_k), row_kit_t>;
+        st::expected<tree_t> tree = tree_t::make(keys);
         if (!tree) return {status_code_t::out_of_memory_k, "A run could not build the tree of its keys"};
         std::size_t const saved = tree->saved_bytes();
         if (words.resize(divide_round_up(saved, sizeof(std::uint64_t))) != st::status_t::success_k)
@@ -1935,9 +1993,9 @@ class lsm_sorted_run {
         extent_t const piece = extent_.slice(0, head_bytes);
         if (piece.length != head_bytes) return {status_code_t::malformed_k, "The run is shorter than its header"};
 
-        auto [reader_lease, reader_lease_status] = channel.lease();
-        if (reader_lease_status.failed()) return reader_lease_status;
-        read_pipeline_t reader {volume_->disk(), std::move(reader_lease), extent_.medium};
+        auto [reader_channel, reader_channel_status] = channel.acquire();
+        if (reader_channel_status.failed()) return reader_channel_status;
+        read_pipeline_t reader {volume_->disk(), std::move(reader_channel), extent_.medium};
         if (status_t const offered = reader.enqueue_read(piece, 0); offered.failed()) return offered;
         if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
 
@@ -2052,9 +2110,9 @@ class lsm_sorted_run {
         std::uint64_t const section = into.size();
         std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
         if (block == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
-        auto [reader_lease, reader_lease_status] = channel.lease();
-        if (reader_lease_status.failed()) return reader_lease_status;
-        read_pipeline_t reader {volume_->disk(), std::move(reader_lease), extent_.medium};
+        auto [reader_channel, reader_channel_status] = channel.acquire();
+        if (reader_channel_status.failed()) return reader_channel_status;
+        read_pipeline_t reader {volume_->disk(), std::move(reader_channel), extent_.medium};
         status_t moved;
         auto sink = [&](completed_buffer_t const& completed) noexcept {
             if (status_t const whole = require_completed_in_full(completed); whole.failed()) {

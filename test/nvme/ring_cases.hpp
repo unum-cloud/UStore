@@ -94,10 +94,10 @@ std::size_t ring_reads_back_what_it_wrote(disk_type_& disk, medium_reference_t m
     failures += expect_eq(buffer.size(), 2 * blocks_k * block_bytes_k);
     if (buffer.size() != 2 * blocks_k * block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -158,10 +158,10 @@ std::size_t ring_reaches_depth_beyond_its_credit(disk_type_& disk, medium_refere
     failures += expect_eq(buffer.size(), queue_pair_depth_k * block_bytes_k);
     if (buffer.size() != queue_pair_depth_k * block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -209,10 +209,10 @@ std::size_t ring_refuses_when_full(disk_type_& disk, medium_reference_t medium) 
     failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
     if (buffer.size() != block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -256,10 +256,10 @@ std::size_t ring_reports_a_partial_transfer(disk_type_& disk, medium_reference_t
     failures += expect_eq(buffer.size(), bytes);
     if (buffer.size() != bytes) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -307,10 +307,10 @@ std::size_t ring_refuses_a_torn_read(disk_type_& disk, medium_reference_t medium
     failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
     if (buffer.size() != block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -349,10 +349,10 @@ std::size_t ring_drains_a_cancelled_queue_pair(disk_type_& disk, medium_referenc
     failures += expect_eq(buffer.size(), queue_pair_depth_k * block_bytes_k);
     if (buffer.size() != queue_pair_depth_k * block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -414,17 +414,17 @@ case_result_t ring_separates_two_queue_pairs(disk_type_& disk, medium_reference_
     failures += expect_eq(buffer.size(), 2 * queue_pair_depth_k * block_bytes_k);
     if (buffer.size() != 2 * queue_pair_depth_k * block_bytes_k) return failures;
 
-    expected<queue_pair_t> first_leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    expected<queue_pair_t> second_leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(first_leased.has_value());
-    failures += expect(second_leased.has_value());
-    if (!first_leased || !second_leased) {
-        if (first_leased) failures += expect(disk.release_queue_pair(*first_leased).succeeded());
-        if (second_leased) failures += expect(disk.release_queue_pair(*second_leased).succeeded());
+    expected<queue_pair_t> first_acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    expected<queue_pair_t> second_acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(first_acquired.has_value());
+    failures += expect(second_acquired.has_value());
+    if (!first_acquired || !second_acquired) {
+        if (first_acquired) failures += expect(disk.release_queue_pair(*first_acquired).succeeded());
+        if (second_acquired) failures += expect(disk.release_queue_pair(*second_acquired).succeeded());
         return failures;
     }
-    queue_pair_t first = std::move(*first_leased);
-    queue_pair_t second = std::move(*second_leased);
+    queue_pair_t first = std::move(*first_acquired);
+    queue_pair_t second = std::move(*second_acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -484,10 +484,10 @@ std::size_t ring_refuses_a_foreign_token(disk_type_& disk, medium_reference_t me
     failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
     if (buffer.size() != block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -519,10 +519,10 @@ std::size_t ring_holds_a_registered_memory_in_flight(disk_type_& disk, medium_re
     failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
     if (buffer.size() != block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -556,10 +556,10 @@ std::size_t ring_cuts_a_chain(disk_type_& disk, medium_reference_t medium) {
     failures += expect_eq(buffer.size(), 3 * block_bytes_k);
     if (buffer.size() != 3 * block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -600,10 +600,10 @@ std::size_t ring_flushes_what_it_reaped(disk_type_& disk, medium_reference_t med
     failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
     if (buffer.size() != block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -647,10 +647,10 @@ std::size_t ring_fails_a_misaligned_request(disk_type_& disk, medium_reference_t
     failures += expect_eq(buffer.size(), 2 * block_bytes_k);
     if (buffer.size() != 2 * block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -705,10 +705,10 @@ std::size_t ring_exhausts_its_slots(disk_type_& disk, [[maybe_unused]] medium_re
 
     st::vector<queue_pair_t> queue_pairs;
     for (std::uint16_t index = 0; index != limits.queue_pairs_limit; ++index) {
-        expected<queue_pair_t> leased = disk.acquire_queue_pair(1);
-        failures += expect(leased.has_value());
-        if (!leased) break;
-        failures += expect(queue_pairs.push_back(std::move(*leased)) == st::status_t::success_k);
+        expected<queue_pair_t> acquired = disk.acquire_queue_pair(1);
+        failures += expect(acquired.has_value());
+        if (!acquired) break;
+        failures += expect(queue_pairs.push_back(std::move(*acquired)) == st::status_t::success_k);
     }
     expected<queue_pair_t> const beyond = disk.acquire_queue_pair(1);
     failures += expect(!beyond.has_value());
@@ -746,10 +746,10 @@ std::size_t ring_refuses_an_undrained_release(disk_type_& disk, medium_reference
     failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
     if (buffer.size() != block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -786,13 +786,13 @@ std::size_t ring_holds_a_medium_in_flight(disk_type_& disk, medium_options_t con
     if (!registered) return failures;
     registered_medium_t registered_medium = std::move(*registered);
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) {
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) {
         failures += expect(disk.unregister_medium(registered_medium).succeeded());
         return failures;
     }
-    queue_pair_t queue_pair = std::move(*leased);
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -841,10 +841,10 @@ template <typename disk_type_>
 std::size_t ring_refuses_an_oversized_wait(disk_type_& disk, [[maybe_unused]] medium_reference_t medium) {
     std::size_t failures = 0;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     std::array<completion_t, 2> room {};
     expected<std::size_t> const wanted = poll_completions_at_least<waiter_t>(disk, queue_pair,
@@ -865,10 +865,10 @@ std::size_t ring_moves_a_queue_pair_between_threads(disk_type_& disk, medium_ref
     failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
     if (buffer.size() != block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -911,10 +911,10 @@ std::size_t ring_keeps_what_it_flushed(disk_type_& disk, medium_options_t const&
     failures += expect_eq(buffer.size(), 2 * block_bytes_k);
     if (buffer.size() != 2 * block_bytes_k) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
@@ -979,13 +979,13 @@ std::size_t ring_deallocates_a_file_extent(disk_type_& disk, medium_options_t co
     failures += expect(registered.has_value());
     if (!registered) return failures;
     registered_medium_t registered_medium = std::move(*registered);
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) {
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) {
         failures += expect(disk.unregister_medium(registered_medium).succeeded());
         return failures;
     }
-    queue_pair_t queue_pair = std::move(*leased);
+    queue_pair_t queue_pair = std::move(*acquired);
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());
     if (!pinned) {

@@ -267,6 +267,8 @@ typedef enum ustore_engine_t {
 
 } ustore_engine_t;
 
+#pragma region Database
+
 /** A directory the data files may occupy, with the bytes they may take there. */
 typedef struct ustore_data_directory_t {
 
@@ -503,7 +505,7 @@ typedef struct ustore_database_open_nvme_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** The manifest, @c <database>.ustore.json, whose directory must exist and holds the database's
+    /** The manifest, <tt>\<database\>.ustore.json</tt>, whose directory must exist and holds the database's
      *  first data directory, or the raw address of its first slot, as in @c /dev/nvme0n1@64GiB. */
     ustore_bytes_view_t directory;
 
@@ -725,6 +727,51 @@ typedef struct ustore_database_compact_t {
  */
 USTORE_EXPORT void ustore_database_compact(ustore_database_compact_t* arguments);
 
+/** The arguments of @c ustore_database_flush. */
+typedef struct ustore_database_flush_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+} ustore_database_flush_t;
+
+/**
+ *  @brief Makes every commit that returned before this call durable, as if each had asked for
+ *      @c ustore_durability_flushed_k.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  LevelDB syncs only its current log, so a commit in a log it already rotated stays unsynced
+ *  until its compaction lands.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k The executor's deferred table is full.
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_read_only_k The database was opened read-only.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ */
+USTORE_EXPORT void ustore_database_flush(ustore_database_flush_t* arguments);
+
+/**
+ *  @brief Waits until every deferred call naming the database finishes, then closes it and frees
+ *      its memory once no transaction, snapshot or cursor of it holds it open, while the data
+ *      persists on disk.
+ *  @param[in,out] database The database to be closed; @c NULL is safe.
+ */
+USTORE_EXPORT void ustore_database_free(ustore_database_t database);
+
+#pragma endregion Database
+
+#pragma region Snapshots
+
 /** The arguments of @c ustore_snapshot_init. */
 typedef struct ustore_snapshot_init_t {
 
@@ -777,7 +824,7 @@ typedef struct ustore_snapshot_save_t {
     ustore_completion_t completion;
 
     /** Directory that receives the saved database, or on NVMe its manifest,
-     *  @c <database>.ustore.json, or the raw address of its first slot. */
+     *  <tt>\<database\>.ustore.json</tt>, or the raw address of its first slot. */
     ustore_bytes_view_t path;
 
     /** Optional callback reporting the bytes saved. */
@@ -817,6 +864,16 @@ USTORE_EXPORT void ustore_snapshot_save(ustore_snapshot_save_t* arguments);
  *  @return The view, or @c NULL, the head, for a @c NULL snapshot.
  */
 USTORE_EXPORT ustore_view_t ustore_snapshot_view(ustore_snapshot_t snapshot);
+
+/**
+ *  @brief Waits until every deferred call naming the snapshot finishes, then releases it,
+ *      unpinning the versions only it kept, and frees its memory with every view of it once no
+ *      cursor reads through it.
+ *  @param[in,out] snapshot The snapshot to be freed; @c NULL is safe.
+ */
+USTORE_EXPORT void ustore_snapshot_free(ustore_snapshot_t snapshot);
+
+#pragma endregion Snapshots
 
 /** What a collection holds, recorded beside its name so a view of another kind is refused. Zero names no modality. */
 typedef enum ustore_modality_t {
@@ -887,6 +944,8 @@ USTORE_EXPORT char const* ustore_modality_name(ustore_modality_t modality);
 
 /** Reads a modality back from its canonical spelling; zero, naming no modality, when unrecognized. */
 USTORE_EXPORT ustore_modality_t ustore_modality_from_name(ustore_bytes_view_t name);
+
+#pragma region Collections
 
 /**
  *  @brief The arguments of @c ustore_collection_list, which exports every collection with its name and modality.
@@ -1109,6 +1168,10 @@ typedef struct ustore_collection_drop_t {
  */
 USTORE_EXPORT void ustore_collection_drop(ustore_collection_drop_t* arguments);
 
+#pragma endregion Collections
+
+#pragma region Transactions
+
 /** The arguments of @c ustore_transaction_init. */
 typedef struct ustore_transaction_init_t {
 
@@ -1301,12 +1364,9 @@ USTORE_EXPORT void ustore_transaction_rollback(ustore_transaction_rollback_t* ar
  */
 USTORE_EXPORT void ustore_transaction_free(ustore_transaction_t transaction);
 
-/**
- *  @brief Waits until every deferred call naming the snapshot finishes, then releases it, unpinning the versions
- *      only it kept, and frees its memory with every view of it once no cursor reads through it.
- *  @param[in,out] snapshot The snapshot to be freed; @c NULL is safe.
- */
-USTORE_EXPORT void ustore_snapshot_free(ustore_snapshot_t snapshot);
+#pragma endregion Transactions
+
+#pragma region Changes
 
 /** What one committed change did to its key. */
 typedef enum ustore_change_kind_t {
@@ -1451,12 +1511,9 @@ USTORE_EXPORT void ustore_changes_cursor_next(ustore_changes_cursor_next_t* argu
  */
 USTORE_EXPORT void ustore_changes_cursor_free(ustore_changes_cursor_t cursor);
 
-/**
- *  @brief Waits until every deferred call naming the database finishes, then closes it and frees its memory once
- *      no transaction, snapshot or cursor of it holds it open, while the data persists on disk.
- *  @param[in,out] database The database to be closed; @c NULL is safe.
- */
-USTORE_EXPORT void ustore_database_free(ustore_database_t database);
+#pragma endregion Changes
+
+#pragma region Ingests
 
 /** In what order an ingest's rows arrive, which decides whether its appends land as they come or wait to be sorted. */
 typedef enum ustore_ingest_order_t {
@@ -1594,6 +1651,8 @@ USTORE_EXPORT void ustore_ingest_finish(ustore_ingest_finish_t* arguments);
 
 /** Frees an ingest, dropping every row of an unfinished one; @c NULL is safe. */
 USTORE_EXPORT void ustore_ingest_free(ustore_ingest_t ingest);
+
+#pragma endregion Ingests
 
 #ifdef __cplusplus
 }

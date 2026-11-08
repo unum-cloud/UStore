@@ -39,7 +39,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm> // `std::max`, `std::min`, `std::stable_sort`, `std::sort`, `std::push_heap`, `std::sort_heap`
+#include <algorithm> // `std::max`, `std::min`
 #include <array>     // `std::array`
 #include <atomic>    // `std::memory_order_acquire`
 #include <bit>       // `std::bit_floor`
@@ -55,8 +55,10 @@
 
 #include "ustore/blobs/nvme_memory_run.hpp"     // `keyed_delta`, `memory_run`, `sealed_deltas`
 #include "ustore/blobs/nvme_key_slot.hpp"       // `limit`, `stored_value_size_t`, `value_layout_t`
+#include "ustore/blobs/nvme_value_cache.hpp"    // `value_cache`
 #include "ustore/blobs/nvme_published_runs.hpp" // `published_runs`, `commit_ledger`, `stamp_pin`
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree`, `lsm_tree_position_t`, `collection_config_t`
+#include "ustore/utilities/algorithm.hpp"       // `sort_by_stored_key`, `heap_sort`, `heap_sift_up`
 #include "ustore/utilities/folds.hpp"           // `fold_concept`
 #include "ustore/utilities/nvme_channels.hpp"   // `io_channel_t`
 #include "ustore/utilities/nvme_ring.hpp"       // `portable_alignment_k`
@@ -70,235 +72,6 @@ using utilities::constrained_buffer;
 using utilities::outside_executor_k;
 using utilities::resource_constraint;
 
-#pragma region Value Cache
-
-#pragma region Cache
-
-/**
- *  @brief Values of versions point reads already paid I/O for, keyed by the key and the stamp of the version, so a
- *      flush or a compaction moving a version leaves its entry right and nothing is ever cleared.
- *
- *  A fixed array of slots, a slot per hash of the version, each owning its words from its first fill until the cache
- *  dies and refilled in place. A fill moves the slot's sequence to odd, writes the version, and moves the sequence on
- *  to the next even value; a probe copies the version out between two loads of the sequence and keeps the copy only
- *  when both read the same even value. Neither ever waits, a probe writes nothing, and a displaced version is simply
- *  overwritten, so nothing is freed until the cache is. Every word moves atomically, so a probe racing a fill copies a
- *  torn version it then drops rather than racing on memory. The words are charged to the budget the cache was made
- *  with, which is borrowed and must outlive the cache.
- *
- *  @tparam atomic_reference_ The reference every word of a slot and the budget are owned through.
- */
-template <typename stored_key_type_, template <typename> typename atomic_reference_>
-class value_cache {
-  public:
-
-#pragma region Types
-
-    /** The key the cache addresses its values by. */
-    using stored_key_t = stored_key_type_;
-
-#pragma endregion Types
-
-#pragma region Construction
-
-    value_cache() noexcept = default;
-    value_cache(value_cache const&) = delete;
-    value_cache& operator=(value_cache const&) = delete;
-    value_cache(value_cache&& other) noexcept = default;
-
-    value_cache& operator=(value_cache&& other) noexcept {
-        if (this == &other) return *this;
-        std::swap(slots_, other.slots_);
-        std::swap(slot_words_, other.slot_words_);
-        return *this;
-    }
-
-    /** Frees the words of every slot filled so far, which only a cache no reader reaches may. */
-    ~value_cache() noexcept {
-        words_allocator_t allocator {slots_.get_allocator()};
-        for (std::uint64_t* words : slots_)
-            if (words) allocator.deallocate(words, slot_words_);
-    }
-
-    /**
-     *  @brief A cache holding what @p capacity_bytes of @p constraint afford of values @p value_size wide.
-     *  @param[in] capacity_bytes Bytes the cache may take, where zero leaves it holding nothing.
-     *  @param[in] value_size Bytes one value takes, which is its widest for a variable-width layout.
-     *  @param[in,out] constraint The budget the cached bytes are charged to, which must outlive the cache.
-     */
-    [[nodiscard]] static value_cache of(std::size_t capacity_bytes, stored_value_size_t value_size,
-                                        resource_constraint<atomic_reference_>& constraint) noexcept {
-        value_cache cache;
-        cache.slots_ = slots_t {constrained_allocator<std::uint64_t*, atomic_reference_> {constraint}};
-        if (capacity_bytes == 0 || value_size == 0) return cache;
-        std::size_t const slot_words = value_word_k + words_of_(value_size);
-        std::size_t const affordable = capacity_bytes / (slot_words * sizeof(std::uint64_t) + sizeof(std::uint64_t*));
-        if (affordable == 0) return cache;
-        // A slot is found by masking the hash, so the budget is rounded down to a power of two of slots.
-        if (cache.slots_.resize(std::bit_floor(affordable)) != st::status_t::success_k) return cache;
-        for (std::uint64_t*& slot : cache.slots_) slot = nullptr;
-        cache.slot_words_ = slot_words;
-        return cache;
-    }
-
-#pragma endregion Construction
-
-#pragma region Lookups
-
-    /** The entries the cache holds at once, zero when it caches nothing. */
-    [[nodiscard]] std::size_t capacity() const noexcept { return slots_.size(); }
-
-    /**
-     *  @brief Copies the value cached for the version of @p stored_key stamped @p stamp into @p into, when it fits.
-     *  @param[in] stored_key The key whose cached value is wanted.
-     *  @param[in] stamp The stamp of the version wanted.
-     *  @param[out] into Room for the value's bytes.
-     *  @param[out] size Bytes copied, untouched unless the copy is kept.
-     *  @return Whether the slot held that version from the first load of its sequence to the last, so the copy is kept.
-     */
-    [[nodiscard]] bool copy(stored_key_t const& stored_key, transaction_stamp_t stamp, std::span<byte_t> into,
-                            stored_value_size_t& size) const noexcept {
-        if (slots_.empty()) return false;
-        std::uint64_t const* const words =
-            atomic_reference_<std::uint64_t* const> {slots_[slot_of_(stored_key, stamp)]}.load(
-                std::memory_order_acquire);
-        if (!words) return false;
-        std::uint64_t const sequence = load_(words[sequence_word_k], std::memory_order_acquire);
-        // Zero is a slot no fill finished yet, and an odd sequence one a fill is writing.
-        if (sequence == 0 || sequence % 2 != 0 || load_(words[stamp_word_k]) != stamp) return false;
-        stored_key_t cached {};
-        load_bytes_(words + key_word_k, std::as_writable_bytes(std::span<stored_key_t, 1> {&cached, 1}));
-        std::uint64_t const cached_size = load_(words[size_word_k]);
-        if (!(cached == stored_key) || cached_size > into.size()) return false;
-        load_bytes_(words + value_word_k, into.first(static_cast<std::size_t>(cached_size)));
-        // Orders every load above before the sequence is read again, as a fill's release fence orders its stores.
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (load_(words[sequence_word_k]) != sequence) return false;
-        size = static_cast<stored_value_size_t>(cached_size);
-        return true;
-    }
-
-    /** Caches @p stored_value as the version of @p stored_key stamped @p stamp in the slot that version hashes to,
-     *  overwriting whatever it held; a fill finding another fill in the slot, or the budget refusing the slot's first
-     *  words, caches nothing. */
-    void add(stored_key_t const& stored_key, transaction_stamp_t stamp, std::span<byte_t const> stored_value) noexcept {
-        if (slots_.empty() || words_of_(stored_value.size()) > slot_words_ - value_word_k) return;
-        std::uint64_t* const words = words_of_slot_(slots_[slot_of_(stored_key, stamp)]);
-        if (!words) return;
-        atomic_reference_<std::uint64_t> const sequence {words[sequence_word_k]};
-        std::uint64_t stable = sequence.load(std::memory_order_relaxed);
-        if (stable % 2 != 0 ||
-            !sequence.compare_exchange_strong(stable, stable + 1, std::memory_order_relaxed, std::memory_order_relaxed))
-            return;
-        // Orders the odd sequence before every store below, which a probe's acquire fence pairs with.
-        std::atomic_thread_fence(std::memory_order_release);
-        store_(words[stamp_word_k], stamp);
-        store_(words[size_word_k], stored_value.size());
-        store_bytes_(words + key_word_k, std::as_bytes(std::span<stored_key_t const, 1> {&stored_key, 1}));
-        store_bytes_(words + value_word_k, stored_value);
-        sequence.store(stable + 2, std::memory_order_release);
-    }
-
-#pragma endregion Lookups
-
-  private:
-
-#pragma region Private Types
-
-    /** One pointer per slot to the words it owns, null until its first fill, charged to the budget. */
-    using slots_t = st::vector<std::uint64_t*, constrained_allocator<std::uint64_t*, atomic_reference_>>;
-
-    /** Allocates the words of a slot from the same budget. */
-    using words_allocator_t = constrained_allocator<std::uint64_t, atomic_reference_>;
-
-#pragma endregion Private Types
-
-#pragma region Private Methods
-
-    /** Words @p bytes take, rounded up. */
-    [[nodiscard]] static constexpr std::size_t words_of_(std::size_t bytes) noexcept {
-        return (bytes + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t);
-    }
-
-    [[nodiscard]] std::size_t slot_of_(stored_key_t const& stored_key, transaction_stamp_t stamp) const noexcept {
-        return (stored_key_hash_t {}(stored_key) ^ st::hash<transaction_stamp_t> {}(stamp)) & (slots_.size() - 1);
-    }
-
-    /** The words @p slot owns, allocated with a zero header by the first fill and kept until the cache dies, or null
-     *  when the budget refuses them; two first fills racing keep the words of whichever publishes first. */
-    [[nodiscard]] std::uint64_t* words_of_slot_(std::uint64_t*& slot) noexcept {
-        atomic_reference_<std::uint64_t*> const published {slot};
-        if (std::uint64_t* const words = published.load(std::memory_order_acquire)) return words;
-        words_allocator_t allocator {slots_.get_allocator()};
-        std::uint64_t* const allocated = allocator.allocate(slot_words_);
-        if (!allocated) return nullptr;
-        std::memset(allocated, 0, value_word_k * sizeof(std::uint64_t));
-        std::uint64_t* first = nullptr;
-        if (published.compare_exchange_strong(first, allocated, std::memory_order_acq_rel, std::memory_order_acquire))
-            return allocated;
-        allocator.deallocate(allocated, slot_words_);
-        return first;
-    }
-
-    [[nodiscard]] static std::uint64_t load_(std::uint64_t const& word,
-                                             std::memory_order order = std::memory_order_relaxed) noexcept {
-        return atomic_reference_<std::uint64_t const> {word}.load(order);
-    }
-
-    static void store_(std::uint64_t& word, std::uint64_t value) noexcept {
-        atomic_reference_<std::uint64_t> {word}.store(value, std::memory_order_relaxed);
-    }
-
-    /** Stores @p bytes into the words from @p words on, one atomic word at a time, the last padded with zeros. */
-    static void store_bytes_(std::uint64_t* words, std::span<byte_t const> bytes) noexcept {
-        for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(std::uint64_t)) {
-            std::uint64_t word = 0;
-            std::memcpy(&word, bytes.data() + offset, std::min(sizeof(word), bytes.size() - offset));
-            store_(words[offset / sizeof(word)], word);
-        }
-    }
-
-    /** Fills @p bytes from the words from @p words on, one atomic word at a time. */
-    static void load_bytes_(std::uint64_t const* words, std::span<byte_t> bytes) noexcept {
-        for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(std::uint64_t)) {
-            std::uint64_t const word = load_(words[offset / sizeof(word)]);
-            std::memcpy(bytes.data() + offset, &word, std::min(sizeof(word), bytes.size() - offset));
-        }
-    }
-
-#pragma endregion Private Methods
-
-#pragma region Private Members
-
-    /** The word of a slot holding its sequence: zero before its first fill, odd while a fill writes it. */
-    static constexpr std::size_t sequence_word_k = 0;
-
-    /** The word of a slot holding the stamp of the version it caches. */
-    static constexpr std::size_t stamp_word_k = 1;
-
-    /** The word of a slot holding how many bytes the value takes. */
-    static constexpr std::size_t size_word_k = 2;
-
-    /** The first word of a slot holding the key. */
-    static constexpr std::size_t key_word_k = 3;
-
-    /** The first word of a slot holding the value, after the key. */
-    static constexpr std::size_t value_word_k = key_word_k + (sizeof(stored_key_t) + sizeof(std::uint64_t) - 1) /
-                                                                 sizeof(std::uint64_t);
-
-    /** The slots, each naming the words it owns or null. */
-    slots_t slots_;
-
-    /** Words every slot owns: the header, the key and the widest value. */
-    std::size_t slot_words_ = 0;
-
-#pragma endregion Private Members
-};
-
-#pragma endregion Cache
-
-#pragma endregion Value Cache
-
 #pragma region Store
 
 #pragma region Vocabulary
@@ -306,12 +79,13 @@ class value_cache {
 /** One commit's deltas for one collection, sealed off every shared path by its committer, and the run the leader
  *  stamps them into, both charged to a budget whose word @p atomic_reference_ owns; both outlive the request carrying
  *  them only until the commit lands or is refused. */
-template <typename stored_key_type_, template <typename> typename atomic_reference_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_,
+          typename row_kit_type_ = st::native_row_kit_t>
 struct sealed_commit {
 
     /** The deltas, sorted and copied, which the leader moves into a run of the store's pool once it
      *  draws the stamp. */
-    sealed_deltas<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>> deltas;
+    sealed_deltas<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>, row_kit_type_> deltas;
 
     /** Whether the commit carries no delta and no range tombstone for this store, adding no run. */
     [[nodiscard]] bool empty() const noexcept { return deltas.size() == 0 && deltas.range_tombstones().empty(); }
@@ -382,7 +156,8 @@ constexpr bool change_precedes(stored_change<stored_key_type_> const& first,
 }
 
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_>
+          typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+          typename row_kit_type_ = st::native_row_kit_t>
 class nvme_store_cursor;
 
 #pragma endregion Vocabulary
@@ -412,9 +187,11 @@ class nvme_store_cursor;
  *  @tparam fold_type_ What a change delta does, which reads and merges fold with.
  *  @tparam device_fold_type_ What composes the changes of a merge on a device, or @c no_device_fold_t where nothing
  *      does, which keeps every merge holding a change on the host.
+ *  @tparam row_kit_type_ The SmashTable kit the memory runs' trees search with.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_>
+          typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+          typename row_kit_type_ = st::native_row_kit_t>
 class nvme_store {
   public:
 
@@ -431,6 +208,9 @@ class nvme_store {
 
     /** What composes the changes of a merge on a device, or @c no_device_fold_t where nothing does. */
     using device_fold_t = device_fold_type_;
+
+    /** The SmashTable kit the memory runs' trees search with. */
+    using row_kit_t = row_kit_type_;
 
     /** The key the runs order their key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
@@ -454,16 +234,17 @@ class nvme_store {
     using keyed_delta_t = keyed_delta<stored_key_t>;
 
     /** One commit's deltas, sorted and copied, before they are stamped. */
-    using sealed_deltas_t = sealed_deltas<stored_key_t, constrained_allocator<byte_t, atomic_reference_>>;
+    using sealed_deltas_t = sealed_deltas<stored_key_t, constrained_allocator<byte_t, atomic_reference_>, row_kit_t>;
 
     /** The keys one range removal hides. */
     using range_t = range_tombstone<stored_key_t>;
 
     /** One commit's deltas, stamped, which nothing changes once a view names them. */
-    using memory_run_t = memory_run<stored_key_t, constrained_allocator<byte_t, atomic_reference_>>;
+    using memory_run_t = memory_run<stored_key_t, constrained_allocator<byte_t, atomic_reference_>, row_kit_t>;
 
     /** The tree, memory runs and view this store publishes, and every merge, flush and compaction of them. */
-    using published_runs_t = published_runs<key_slot_t, memory_run_t, volume_t, atomic_reference_, waiter_type_>;
+    using published_runs_t =
+        published_runs<key_slot_t, memory_run_t, volume_t, atomic_reference_, waiter_type_, row_kit_t>;
 
     /** The tree the flushed writes of this collection live in. */
     using tree_t = typename published_runs_t::tree_t;
@@ -481,7 +262,7 @@ class nvme_store {
     using view_t = typename published_runs_t::view_t;
 
     /** One commit's deltas for this store between their sealing and their landing. */
-    using sealed_commit_t = sealed_commit<stored_key_t, atomic_reference_>;
+    using sealed_commit_t = sealed_commit<stored_key_t, atomic_reference_, row_kit_t>;
 
     /** One version a merge or a flush carries over from a memory run. */
     using stamped_delta_t = stamped_delta<stored_key_t>;
@@ -942,13 +723,12 @@ class nvme_store {
             if (selected.size() < bound) {
                 [[maybe_unused]] st::status_t const placed = selected.push_back(st::assume_reserved,
                                                                                 located_change_t {located});
-                std::push_heap(selected.begin(), selected.end(), earlier);
+                utilities::heap_sift_up(std::span<located_change_t> {selected}, earlier);
                 return;
             }
             if (!earlier(located, selected.front())) return;
-            std::pop_heap(selected.begin(), selected.end(), earlier);
-            selected.back() = located;
-            std::push_heap(selected.begin(), selected.end(), earlier);
+            selected.front() = located;
+            utilities::heap_sift_down(std::span<located_change_t> {selected}, 0, earlier);
         };
         auto gather_ranges = [&]<typename tombstones_type_>(tombstones_type_ const& held) noexcept {
             for (std::size_t index = 0; index != held.size(); ++index) {
@@ -983,11 +763,11 @@ class nvme_store {
             }
 
         // A commit's meeting ranges, like clipped merge pieces, walk as one, so keys return once.
-        std::sort(ranges.begin(), ranges.end(),
-                  [](stamped_range_t const& first, stamped_range_t const& second) noexcept {
-                      if (first.stamp != second.stamp) return first.stamp < second.stamp;
-                      return first.range.start < second.range.start;
-                  });
+        utilities::heap_sort(std::span<stamped_range_t> {ranges},
+                             [](stamped_range_t const& first, stamped_range_t const& second) noexcept {
+                                 if (first.stamp != second.stamp) return first.stamp < second.stamp;
+                                 return first.range.start < second.range.start;
+                             });
         std::size_t joined = 0;
         for (std::size_t index = 0; index != ranges.size(); ++index) {
             stamped_range_t& last = ranges[joined == 0 ? 0 : joined - 1];
@@ -1018,7 +798,7 @@ class nvme_store {
             }
         }
 
-        std::sort_heap(selected.begin(), selected.end(), earlier);
+        utilities::heap_sort(std::span<located_change_t> {selected}, earlier);
         for (located_change_t const& located : selected) {
             auto read_value = [&](std::span<byte_t> into) noexcept {
                 return read_change_(channel, levels, located, into);
@@ -1386,11 +1166,14 @@ class nvme_store {
      *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device
      *      compactor.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
+     *  @param[in] fan_out The threads a merge on the host fans its slices out over, or one slice on
+     *      the calling thread.
      */
     expected<compaction_outcome_t> compact(
         io_channel_t& reading_channel, io_channel_t& writing_channel, compactor_ref_t const& compactor,
-        lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        return runs_.compact(reading_channel, writing_channel, compactor, fold_, device_fold_, published);
+        lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
+        compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
+        return runs_.compact(reading_channel, writing_channel, compactor, fold_, device_fold_, published, fan_out);
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a collection holding no memory run
@@ -1404,7 +1187,8 @@ class nvme_store {
 
   private:
 
-    friend class nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_, fold_t, device_fold_t>;
+    friend class nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_, fold_t, device_fold_t,
+                                   row_kit_t>;
 
 #pragma region Private Types
 
@@ -1526,7 +1310,8 @@ class nvme_store {
     using stamped_ranges_t = st::vector<stamped_range_t, constrained_allocator<stamped_range_t, atomic_reference_>>;
 
     /** The walk a feed pull expands a range tombstone with. */
-    using cursor_t = nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_, fold_t, device_fold_t>;
+    using cursor_t =
+        nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_, fold_t, device_fold_t, row_kit_t>;
 
     /** What the tree answered for every deferred key. */
     using deferred_answers_t = st::vector<lookup_result_t, constrained_allocator<lookup_result_t, atomic_reference_>>;
@@ -1880,16 +1665,25 @@ class nvme_store {
         return deltas;
     }
 
-    /** Keeps the last delta of every key of @p deltas, in their order, which a batch naming a key twice takes. */
+    /**
+     *  @brief Keeps the last delta of every key of @p deltas, which a batch naming a
+     *      key twice takes.
+     *
+     *  A batch is all writes, whose values sit back to back in arrival order, or all removals,
+     *  which carry no bytes and are alike. So a key's latest write is the one whose bytes start
+     *  last, or the longer one at a shared start, which only an empty value before it can take.
+     */
     [[nodiscard]] static std::span<keyed_delta_t> last_of_each_key_(deltas_t& deltas) noexcept {
-        std::stable_sort(deltas.begin(), deltas.end(), [](keyed_delta_t const& first, keyed_delta_t const& second) {
-            return first.stored_key < second.stored_key;
-        });
+        utilities::sort_by_stored_key(std::span<keyed_delta_t> {deltas});
         std::size_t kept = 0;
-        for (std::size_t index = 0; index != deltas.size(); ++index) {
-            bool const repeated = index + 1 != deltas.size() &&
-                                  deltas[index + 1].stored_key == deltas[index].stored_key;
-            if (!repeated) deltas[kept++] = deltas[index];
+        for (keyed_delta_t const& delta : deltas) {
+            if (kept == 0 || deltas[kept - 1].stored_key != delta.stored_key) {
+                deltas[kept++] = delta;
+                continue;
+            }
+            std::span<byte_t const> const held = deltas[kept - 1].delta.bytes, offered = delta.delta.bytes;
+            if (held.data() < offered.data() || (held.data() == offered.data() && held.size() < offered.size()))
+                deltas[kept - 1] = delta;
         }
         return std::span<keyed_delta_t> {deltas.data(), kept};
     }
@@ -2082,424 +1876,6 @@ class nvme_store {
 
 #pragma endregion Store
 
-#pragma region Store Cursor
-
-#pragma region Cursor
-
-/**
- *  @brief Every key of one store in ascending order, each with what it is and how wide it is, read a page at a time.
- *
- *  Each page is read inside the ledger's epochs from whichever view is published, and the epochs are left between
- *  pages, so a commit, merge, flush or compaction replacing a view waits for at most one page of a scan. Every page
- *  reads at the one stamp the scan is pinned at, whose versions every merge keeps, and starts at the key past the
- *  page before it, which that page found without handing it out, so no key is visited twice or skipped. A head scan
- *  pins the published stamp it starts at for as long as it lives.
- */
-template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_>
-class nvme_store_cursor {
-  public:
-
-#pragma region Types
-
-    /** The key slot every run of the walked store holds. */
-    using key_slot_t = key_slot_type_;
-
-    /** The volume every run of the walked store lives on. */
-    using volume_t = volume_type_;
-
-    /** The key the runs order their key slots by. */
-    using stored_key_t = typename key_slot_t::stored_key_t;
-
-    /** The store this cursor walks. */
-    using nvme_store_t =
-        nvme_store<key_slot_t, volume_t, atomic_reference_, waiter_type_, fold_type_, device_fold_type_>;
-
-    /** The view of that store the walk reads. */
-    using view_t = typename nvme_store_t::view_t;
-
-    /** One memory run of that view. */
-    using memory_run_t = typename nvme_store_t::memory_run_t;
-
-    /** One key of a page. */
-    using entry_t = scan_entry<stored_key_t>;
-
-    /** Keys one page holds. */
-    static constexpr std::size_t page_keys_k = scan_page_keys<stored_key_t>();
-
-#pragma endregion Types
-
-#pragma region Construction
-
-    nvme_store_cursor() noexcept = default;
-    nvme_store_cursor(nvme_store_cursor const&) = delete;
-    nvme_store_cursor& operator=(nvme_store_cursor const&) = delete;
-    nvme_store_cursor(nvme_store_cursor&&) noexcept = default;
-    nvme_store_cursor& operator=(nvme_store_cursor&&) noexcept = default;
-
-    /** A walk over @p source positioned on its first key not below @p from, or not above it in
-     *  @p direction descending, where @p source must outlive the cursor, seeing what a reader
-     *  pinned at @p stamp sees, announced on executor thread @p thread_index's epoch slot while it
-     *  reads a page, the first of which it reads before returning. */
-    static expected<nvme_store_cursor> over(nvme_store_t const& source, stored_key_t from = limit<stored_key_t>::min(),
-                                            transaction_stamp_t stamp = head_stamp_k,
-                                            std::size_t thread_index = outside_executor_k,
-                                            scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
-        nvme_store_cursor cursor;
-        cursor.source_ = &source;
-        cursor.thread_index_ = thread_index;
-        cursor.direction_ = direction;
-        cursor.stamp_ = stamp == head_stamp_k ? source.runs_.ledger().pin_reader(cursor.pin_) : stamp;
-        if (status_t const filled = cursor.fill_(from); filled.failed()) return filled;
-        return cursor;
-    }
-
-#pragma endregion Construction
-
-#pragma region Walk
-
-    /** Whether every key has been visited. */
-    [[nodiscard]] bool reached_end() const noexcept { return at_ == page().size() && filled_ <= page_keys_k; }
-
-    /** The key the scan sits on, meaningless once the walk has ended. */
-    [[nodiscard]] stored_key_t stored_key() const noexcept { return page_[at_].stored_key; }
-
-    /** Whether the key the scan sits on carries a value or a removal, @c missing_k once the walk has ended. */
-    [[nodiscard]] lookup_result_t state() const noexcept {
-        return reached_end() ? lookup_result_t::missing_k : page_[at_].state;
-    }
-
-    /** Bytes the value of that key takes, which is zero for a removal and for an empty value. */
-    [[nodiscard]] stored_value_size_t size() const noexcept { return reached_end() ? 0 : page_[at_].size; }
-
-    /** The keys of the page the scan sits on, every one of which comes before the keys of the next page. */
-    [[nodiscard]] std::span<entry_t const> page() const noexcept {
-        return std::span<entry_t const> {page_.data(), std::min(filled_, page_keys_k)};
-    }
-
-    /** Whether a page follows the one the scan sits on, and in @p from the key it starts at. */
-    [[nodiscard]] bool follows(stored_key_t& from) const noexcept {
-        if (filled_ <= page_keys_k) return false;
-        from = page_[page_keys_k].stored_key;
-        return true;
-    }
-
-    /** Moves to the next key, reading the next page once this one is spent. */
-    status_t advance() noexcept {
-        if (at_ != page().size()) ++at_;
-        stored_key_t from {};
-        if (at_ != page().size() || !follows(from)) return {};
-        return fill_(from);
-    }
-
-#pragma endregion Walk
-
-  private:
-
-#pragma region Private Types
-
-    /** One reader inside the scanned collection's epochs, announced while a page is read. */
-    using reader_t = typename nvme_store_t::published_runs_t::reader_t;
-
-    /** Where one run of one level the scan walks has got to. */
-    struct run_cursor_t {
-
-        /** The level the run belongs to, zero being the one flushes land on. */
-        std::uint32_t level_number = 0;
-
-        /** The run inside that level, older first where the runs overlap. */
-        std::uint32_t run_index = 0;
-
-        /** The next sorted position inside that run. */
-        std::uint64_t position = 0;
-
-        /** Key slots the run holds, past which the cursor is spent. */
-        std::uint64_t population = 0;
-
-        /** One past the last position a descending walk has yet to visit, zero once spent. */
-        std::uint64_t end = 0;
-    };
-
-#pragma endregion Private Types
-
-#pragma region Private Methods
-
-    /** Reads the keys from @p from on into the page inside the ledger's epochs, from the view published now, with one
-     *  key past the page beside it, which the next page starts at. */
-    status_t fill_(stored_key_t from) noexcept {
-        reader_t const inside = source_->runs_.enter(thread_index_);
-        // Every version at or below the pinned stamp stays in whichever view a merge publishes later.
-        view_ = source_->runs_.view();
-        at_ = 0;
-        filled_ = 0;
-        status_t const positioned = position_(from);
-        bool const descending = direction_ == scan_direction_t::descending_k;
-        while (positioned.succeeded() && filled_ != page_.size() &&
-               (descending ? next_down_(page_[filled_]) : next_(page_[filled_])))
-            ++filled_;
-        view_ = nullptr;
-        return positioned;
-    }
-
-    /** Places a cursor on the first key not below @p from in every memory run and every run of every level. */
-    status_t position_(stored_key_t from) noexcept {
-        std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
-        if (memory_positions_.resize(memory_runs.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A scan could not hold a cursor per memory run"};
-        if (memory_ends_.resize(memory_runs.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A scan could not hold a cursor per memory run"};
-        for (std::size_t index = 0; index != memory_runs.size(); ++index) {
-            memory_run_t const& run = *memory_runs[index];
-            memory_positions_[index] = run.lower_bound(from);
-            // A descending walk starts past every version of the start key itself.
-            std::size_t end = memory_positions_[index];
-            while (end != run.size() && run.stored_key(end) == from) ++end;
-            memory_ends_[index] = end;
-        }
-
-        typename nvme_store_t::level_set_t const& levels = *view_->levels;
-        std::size_t runs = 0;
-        for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
-        cursors_.clear();
-        if (cursors_.reserve(runs) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A scan could not hold a cursor per run"};
-        for (std::size_t number = 0; number != levels.size(); ++number) {
-            auto const& level = levels.level(number);
-            for (std::size_t index = 0; index != level.size(); ++index) {
-                run_cursor_t cursor;
-                cursor.level_number = static_cast<std::uint32_t>(number);
-                cursor.run_index = static_cast<std::uint32_t>(index);
-                cursor.population = level.run(index).population_count();
-                cursor.position = level.run(index).lower_bound(from);
-                cursor.end = cursor.position;
-                while (cursor.end != cursor.population && level.run(index).key_slot(cursor.end).stored_key == from)
-                    ++cursor.end;
-                [[maybe_unused]] st::status_t const placed = cursors_.push_back(std::move(cursor));
-            }
-        }
-        return {};
-    }
-
-    /** Moves the cursors past the next key, taking its newest version at or below the scan's stamp into @p entry and
-     *  skipping the versions behind it and any key whose every version is newer; answers whether a key was left. */
-    bool next_(entry_t& entry) noexcept {
-        std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
-        for (;;) {
-            stored_key_t smallest = limit<stored_key_t>::max();
-            bool any = false;
-            for (std::size_t index = 0; index != memory_runs.size(); ++index) {
-                if (memory_positions_[index] == memory_runs[index]->size()) continue;
-                stored_key_t const head = memory_runs[index]->stored_key(memory_positions_[index]);
-                if (any && !(head < smallest)) continue;
-                smallest = head;
-                any = true;
-            }
-            for (std::size_t index = 0; index != cursors_.size(); ++index) {
-                if (cursors_[index].position == cursors_[index].population) continue;
-                stored_key_t const head = key_slot_at_(cursors_[index]).stored_key;
-                if (any && !(head < smallest)) continue;
-                smallest = head;
-                any = true;
-            }
-            if (!any) return false;
-
-            entry.stored_key = smallest;
-            bool const taken = take_newest_memory_run_(entry) || take_youngest_run_(entry);
-
-            // Every run holds the versions of a key side by side, so each cursor passes all of them at once.
-            for (std::size_t index = 0; index != memory_runs.size(); ++index)
-                while (memory_positions_[index] != memory_runs[index]->size() &&
-                       memory_runs[index]->stored_key(memory_positions_[index]) == smallest)
-                    ++memory_positions_[index];
-            for (std::size_t index = 0; index != cursors_.size(); ++index)
-                while (cursors_[index].position != cursors_[index].population &&
-                       key_slot_at_(cursors_[index]).stored_key == smallest)
-                    ++cursors_[index].position;
-            if (taken) return true;
-        }
-    }
-
-    /**
-     *  @brief Moves the cursors below the next key downwards, taking its newest version at or
-     *      below the scan's stamp into @p entry, as @c next_ does upwards; answers whether a
-     *      key was left.
-     *
-     *  Each run's versions of one key sit newest first, so a cursor steps down to the first version
-     *  of the key it ends at, from where the takes read forward as they do for an ascending walk,
-     *  and then ends there.
-     */
-    bool next_down_(entry_t& entry) noexcept {
-        std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
-        for (;;) {
-            stored_key_t largest = limit<stored_key_t>::min();
-            bool any = false;
-            for (std::size_t index = 0; index != memory_runs.size(); ++index) {
-                if (memory_ends_[index] == 0) continue;
-                stored_key_t const tail = memory_runs[index]->stored_key(memory_ends_[index] - 1);
-                if (any && !(largest < tail)) continue;
-                largest = tail;
-                any = true;
-            }
-            for (std::size_t index = 0; index != cursors_.size(); ++index) {
-                if (cursors_[index].end == 0) continue;
-                stored_key_t const tail = key_slot_below_(cursors_[index]).stored_key;
-                if (any && !(largest < tail)) continue;
-                largest = tail;
-                any = true;
-            }
-            if (!any) return false;
-
-            // A cursor not on the key sits past it, where the takes find no version of it.
-            for (std::size_t index = 0; index != memory_runs.size(); ++index) {
-                memory_run_t const& run = *memory_runs[index];
-                std::size_t start = memory_ends_[index];
-                while (start != 0 && run.stored_key(start - 1) == largest) --start;
-                memory_positions_[index] = start;
-            }
-            for (run_cursor_t& cursor : cursors_) {
-                auto const& run = view_->levels->level(cursor.level_number).run(cursor.run_index);
-                std::uint64_t start = cursor.end;
-                while (start != 0 && run.key_slot(start - 1).stored_key == largest) --start;
-                cursor.position = start;
-            }
-            entry.stored_key = largest;
-            bool const taken = take_newest_memory_run_(entry) || take_youngest_run_(entry);
-            for (std::size_t index = 0; index != memory_runs.size(); ++index)
-                memory_ends_[index] = memory_positions_[index];
-            for (run_cursor_t& cursor : cursors_) cursor.end = cursor.position;
-            if (taken) return true;
-        }
-    }
-
-    /** The key slot right below where @p cursor ends, which must not be spent. */
-    [[nodiscard]] key_slot_t key_slot_below_(run_cursor_t const& cursor) const noexcept {
-        return view_->levels->level(cursor.level_number).run(cursor.run_index).key_slot(cursor.end - 1);
-    }
-
-    /** The key slot @p cursor sits on, which must not be spent. */
-    [[nodiscard]] key_slot_t key_slot_at_(run_cursor_t const& cursor) const noexcept {
-        return view_->levels->level(cursor.level_number).run(cursor.run_index).key_slot(cursor.position);
-    }
-
-    /** Takes the newest memory run carrying a version of @p entry's key at or below the scan's stamp as its answer,
-     *  which outranks every level; answers whether any does. */
-    bool take_newest_memory_run_(entry_t& entry) noexcept {
-        std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
-        for (std::size_t index = 0; index != memory_runs.size(); ++index) {
-            memory_run_t const& run = *memory_runs[index];
-            std::size_t position = memory_positions_[index];
-            // A merged run holds a key's versions newest first, and the first at or below the stamp answers.
-            while (position != run.size() && run.stored_key(position) == entry.stored_key &&
-                   run.stamp(position) > stamp_)
-                ++position;
-            if (position == run.size() || !(run.stored_key(position) == entry.stored_key)) continue;
-            delta_view_t const delta = run.delta(position);
-            bool const hidden = nvme_store_t::hidden_in_memory_(reading_(), entry.stored_key, run.stamp(position));
-            take_(hidden ? delta_kind_t::remove_range_k : delta.kind, delta.bytes.size(), entry);
-            return true;
-        }
-        return false;
-    }
-
-    /** Takes the newest version of @p entry's key at or below the scan's stamp, which does @p kind and carries @p size
-     *  bytes, as its answer, folding the versions below a change. */
-    void take_(delta_kind_t kind, std::size_t size, entry_t& entry) noexcept {
-        entry.size = 0;
-        if (kind == delta_kind_t::change_k)
-            entry.state = source_->find_folded_(reading_(), entry.stored_key, entry.size);
-        else if (utilities::removes(kind)) entry.state = lookup_result_t::removed_k;
-        else {
-            entry.state = lookup_result_t::written_k;
-            entry.size = static_cast<stored_value_size_t>(size);
-        }
-    }
-
-    /**
-     *  @brief Takes the shallowest and, inside a level, the youngest run carrying a version of @p entry's key at or
-     *      below the scan's stamp as its answer, the newest such version inside it.
-     *  @return Whether any run carries one.
-     */
-    bool take_youngest_run_(entry_t& entry) noexcept {
-        std::size_t chosen = cursors_.size();
-        std::uint64_t chosen_position = 0;
-        for (std::size_t index = 0; index != cursors_.size(); ++index) {
-            run_cursor_t const& cursor = cursors_[index];
-            if (chosen != cursors_.size() && !outranks_(cursor, cursors_[chosen])) continue;
-            auto const& run = view_->levels->level(cursor.level_number).run(cursor.run_index);
-            std::uint64_t position = cursor.position;
-            while (position != cursor.population && run.key_slot(position).stored_key == entry.stored_key &&
-                   run.stamp(position) > stamp_)
-                ++position;
-            if (position == cursor.population || !(run.key_slot(position).stored_key == entry.stored_key)) continue;
-            chosen = index;
-            chosen_position = position;
-        }
-        if (chosen == cursors_.size()) return false;
-        run_cursor_t const& cursor = cursors_[chosen];
-        auto const& run = view_->levels->level(cursor.level_number).run(cursor.run_index);
-        lsm_tree_position_t const at {cursor.level_number, lsm_level_position_t {cursor.run_index, chosen_position}};
-        bool const hidden = nvme_store_t::hidden_in_levels_(reading_(), entry.stored_key, at);
-        take_(hidden ? delta_kind_t::remove_range_k : run.kind(chosen_position),
-              run.value_window(chosen_position).bytes, entry);
-        return true;
-    }
-
-    /** The view the page being read walks, at the scan's stamp. */
-    [[nodiscard]] typename nvme_store_t::reading_t reading_() const noexcept {
-        return typename nvme_store_t::reading_t {view_, stamp_};
-    }
-
-    /** Whether @p first carries a newer version of a key than @p second does. */
-    [[nodiscard]] static bool outranks_(run_cursor_t const& first, run_cursor_t const& second) noexcept {
-        if (first.level_number != second.level_number) return first.level_number < second.level_number;
-        return first.run_index > second.run_index;
-    }
-
-#pragma endregion Private Methods
-
-#pragma region Private Members
-
-    /** The store walked, which outlives the cursor. */
-    nvme_store_t const* source_ = nullptr;
-
-    /** The published stamp a head scan reads at, which keeps its versions in every merge while the scan lives. */
-    typename nvme_store_t::pin_t pin_;
-
-    /** The stamp the scan reads at, which sees the newest version of every key at or below it. */
-    transaction_stamp_t stamp_ = head_stamp_k;
-
-    /** The executor thread the scan announces on while it reads a page. */
-    std::size_t thread_index_ = outside_executor_k;
-
-    /** The view the page being read walks, null between pages, when no reader keeps it alive. */
-    view_t const* view_ = nullptr;
-
-    /** The next sorted position inside every memory run of the view, newest run first. */
-    st::vector<std::size_t> memory_positions_;
-
-    /** Per memory run, newest first, one past the last position a descending walk is yet to see. */
-    st::vector<std::size_t> memory_ends_;
-
-    /** The order the walk hands its keys out in. */
-    scan_direction_t direction_ = scan_direction_t::ascending_k;
-
-    /** One cursor per run of every level the view names. */
-    st::vector<run_cursor_t> cursors_;
-
-    /** The keys of the page, then the key the next page starts at. */
-    std::array<entry_t, page_keys_k + 1> page_ {};
-
-    /** Entries the page read, a page and one more while another page follows. */
-    std::size_t filled_ = 0;
-
-    /** The entry of the page the scan sits on. */
-    std::size_t at_ = 0;
-
-#pragma endregion Private Members
-};
-
-#pragma endregion Cursor
-
-#pragma endregion Store Cursor
-
 } // namespace unum::ustore::blobs
+
+#include "ustore/blobs/nvme_store_cursor.hpp" // `nvme_store_cursor`

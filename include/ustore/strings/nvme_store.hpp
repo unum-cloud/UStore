@@ -817,11 +817,15 @@ class nvme_store {
      *  @param[in] compactor The compactor the database picked at open, which the tree passes over for runs carrying
      *      tails, as no device compaction is compiled for them.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
+     *  @param[in] fan_out The threads a merge fans its slices out over, which a merge of strings
+     *      runs as one.
      */
     expected<compaction_outcome_t> compact(
         io_channel_t& reading_channel, io_channel_t& writing_channel, blobs::compactor_ref_t const& compactor,
-        lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        return runs_.compact(reading_channel, writing_channel, compactor, fold_, blobs::no_device_fold_t {}, published);
+        lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
+        blobs::compaction_fan_out_t const& fan_out = blobs::compaction_fan_out_t {}) noexcept {
+        return runs_.compact(reading_channel, writing_channel, compactor, fold_, blobs::no_device_fold_t {}, published,
+                             fan_out);
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a store holding no memory run takes. */

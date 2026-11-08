@@ -125,9 +125,6 @@ struct ustore_arena_handle_t {
     /** Deferred calls naming the arena that are not final, through the floor class's reference. */
     std::uint32_t deferred_calls = 0;
 
-    /** Arrow arrays reading the arena's outputs, with @c arena_freed_bit_k set once @c ustore_arena_free ran. */
-    std::uint32_t exports = 0;
-
     /** Host pages for the calls of a host executor, or one device's memory for those of a VRAM executor. */
     std::variant<host_blocks_t, cuda_blocks_t, hip_blocks_t> memory;
 };
@@ -152,9 +149,6 @@ using cuda_blocks_t = ustore_arena_handle_t::cuda_blocks_t;
 
 /** The memory of an arena on one AMD device. */
 using hip_blocks_t = ustore_arena_handle_t::hip_blocks_t;
-
-/** The bit of @c ustore_arena_handle_t::exports that @c ustore_arena_free sets, so the last export frees the arena. */
-inline constexpr std::uint32_t arena_freed_bit_k = std::uint32_t {1} << 31;
 
 /** Where every allocation in an arena starts, as Apache Arrow aligns its buffers, so typed outputs read in place. */
 constexpr std::size_t arena_alignment_k = 64;

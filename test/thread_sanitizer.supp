@@ -2,3 +2,8 @@
 # RocksDB builds uninstrumented, so its write-thread queues, group commits and arenas synchronize through atomics the
 # sanitizer never sees, while the `memcpy`, `new` and `pthread_cond_*` calls they order are still intercepted.
 race:rocksdb::
+# NVIDIA's closed cuFile library builds uninstrumented, so its own threads' synchronization stays out of sight.
+race:libcufile
+race:numa_node_to_cpus
+mutex:std::condition_variable::wait
+called_from_lib:libcufile.so

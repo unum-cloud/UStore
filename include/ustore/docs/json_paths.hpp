@@ -218,8 +218,9 @@ inline expected<field_paths_t> compile_field_paths(std::span<std::string_view co
     auto [path_of_field, map_status] = arena_allocate<std::size_t>(scratch, fields.size());
     if (map_status.failed()) return map_status;
     std::size_t paths_count = 0;
-    st::hash_map<std::string_view, std::size_t, st::default_hash_t, st::equal_to_t, arena_allocator<std::byte>>
-        known_paths {{}, {}, arena_allocator<std::byte> {scratch}};
+    using known_paths_t =
+        st::hash_map<std::string_view, std::size_t, st::default_hash_t, st::equal_to_t, arena_allocator<std::byte>>;
+    known_paths_t known_paths {{}, {}, arena_allocator<std::byte> {scratch}};
     st::vector<char, arena_allocator<char>> path {{scratch}};
     for (std::size_t field_index = 0; field_index != fields.size(); ++field_index) {
         auto [valid, path_status] = json_path_of(fields[field_index], path);
@@ -235,7 +236,7 @@ inline expected<field_paths_t> compile_field_paths(std::span<std::string_view co
         if (kept_status.failed()) return kept_status;
         std::memcpy(kept.data(), spelled.data(), spelled.size());
         std::string_view const stable {kept.begin(), kept.end()};
-        if (known_paths.reserve_more(1) == decltype(known_paths)::reserve_result_t::failed_k)
+        if (known_paths.reserve_more(1) == known_paths_t::reserve_result_t::failed_k)
             return status_t {status_code_t::out_of_memory_k, "No room to compile another path"};
         known_paths.emplace(stable, std::size_t {paths_count}, st::assume_reserved);
         path_of_field[field_index] = paths_count;

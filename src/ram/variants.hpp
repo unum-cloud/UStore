@@ -31,6 +31,7 @@ database_verbs_t const ram_variant<cpu_class_, isolation_>::database_verbs_k {
     .describe = &serve_database<cpu_class_, isolation_, ustore_database_describe_t>,
     .clear = &serve_database<cpu_class_, isolation_, ustore_database_clear_t>,
     .compact = &serve_database<cpu_class_, isolation_, ustore_database_compact_t>,
+    .flush = &serve_database<cpu_class_, isolation_, ustore_database_flush_t>,
     .snapshot_init = &serve_database<cpu_class_, isolation_, ustore_snapshot_init_t>,
     .snapshot_save = &serve_database<cpu_class_, isolation_, ustore_snapshot_save_t>,
     .collection_list = &serve_database<cpu_class_, isolation_, ustore_collection_list_t>,

@@ -1124,6 +1124,11 @@ status_t database_compact(ustore_database_compact_t const& arguments, view_t con
     return {};
 }
 
+/** Syncs the write-ahead log, which every commit since the last memtable flush sits in. */
+status_t database_flush(ustore_database_flush_t const& arguments, view_t const&) {
+    return status_of(state_of<database_t>(arguments.database)->native->FlushWAL(true));
+}
+
 #pragma endregion Collections
 
 #pragma region Transactions

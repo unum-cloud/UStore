@@ -23,7 +23,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 #include <cstring> // `std::memcpy`, `std::memset`, `std::strlen`
 
-#include <algorithm>   // `std::sort`, `std::unique`, `std::lower_bound`
+#include <algorithm>   // `std::unique`, `std::lower_bound`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_invocable_r_v`
@@ -38,7 +38,7 @@
 #include "ustore/docs/json_patch.hpp"       // `modify`, `modification_t`
 #include "ustore/docs/json_paths.hpp"       // `extract_fields`, `json_documents_t`, `field_cell_t`, `json_text_of`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `gather_scalar`, `field_size_bytes`, `extract_keys`
-#include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
+#include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`, `heap_sort`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`
 
 #include "engine.hpp"            // `blobs_verbs<home_t::host_k>`, `view_t`
@@ -185,7 +185,8 @@ inline expected<task_fields_t> distinct_fields(strings_arg_t const& fields, std:
     auto [fields_of_tasks, mapping_status] = arena_allocate<std::size_t>(scratch, count);
     if (mapping_status.failed()) return mapping_status;
     for (std::size_t index = 0; index != count; ++index) distinct[index] = field_of(fields, index);
-    std::sort(distinct.begin(), distinct.end());
+    utilities::heap_sort(distinct,
+                         [](std::string_view first, std::string_view second) noexcept { return first < second; });
     std::size_t const distinct_count = static_cast<std::size_t>(std::unique(distinct.begin(), distinct.end()) -
                                                                 distinct.begin());
     std::span<std::string_view> const sorted = distinct.first(distinct_count);

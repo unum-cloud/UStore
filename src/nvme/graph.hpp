@@ -22,11 +22,11 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::sort`
-#include <limits>    // `std::numeric_limits`
-#include <span>      // `std::span`
+#include <limits> // `std::numeric_limits`
+#include <span>   // `std::span`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -34,6 +34,7 @@
 #include "ustore/ranges.hpp" // `strided`, `strided_iterator`
 
 #include "ustore/graph/adjacency_fold.hpp"  // `adjacency_fold_t`, `vertex_adjacency_t`, `deltas_of_edge`
+#include "ustore/utilities/algorithm.hpp"   // `radix_sort`, `word_byte`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growth_status`
 
 #include "database.hpp" // `call_access`, `access_of`, `resolve_runs`, `watch_keys`, `serve_write`
@@ -206,11 +207,20 @@ struct vertex_chain_t {
  *  chain of @p chains, all in @p scratch. */
 template <typename chains_type_>
 status_t chain_by_vertex(std::span<vertex_delta_t> deltas, ustore_arena_t scratch, chains_type_& chains) noexcept {
-    std::sort(deltas.begin(), deltas.end(), [](vertex_delta_t const& first, vertex_delta_t const& second) noexcept {
+    // The collection, the vertex and the batch position read as one big-endian number,
+    // a total order.
+    constexpr std::size_t uuid_bytes_k = sizeof(ustore_uuid_t);
+    auto const digit_of = [](vertex_delta_t const& delta, std::size_t digit) noexcept -> std::size_t {
+        if (digit < uuid_bytes_k) return delta.collection.uuid.bytes[digit];
+        if (digit < 2 * uuid_bytes_k) return delta.vertex.uuid.bytes[digit - uuid_bytes_k];
+        return utilities::word_byte(delta.sequence, digit - 2 * uuid_bytes_k);
+    };
+    auto const precedes = [](vertex_delta_t const& first, vertex_delta_t const& second) noexcept {
         if (first.collection != second.collection) return first.collection < second.collection;
         if (first.vertex != second.vertex) return first.vertex < second.vertex;
         return first.sequence < second.sequence;
-    });
+    };
+    utilities::radix_sort(deltas, 2 * uuid_bytes_k + sizeof(std::uint64_t), digit_of, precedes);
     arena_allocator<byte_t> arena {scratch};
     for (std::size_t first = 0; first != deltas.size();) {
         std::size_t end = first + 1;

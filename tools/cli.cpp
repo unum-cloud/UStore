@@ -920,6 +920,7 @@ using recovery_disk_t = blocking_files_disk<fu::standard_atomic_ref, fu::standar
 
 /** What a run opened offline reads through: the disk the run's file or device is registered on. */
 struct recovery_volume_t {
+    using disk_t = recovery_disk_t;
     recovery_disk_t* disk_ = nullptr;
     [[nodiscard]] recovery_disk_t& disk() const noexcept { return *disk_; }
 };

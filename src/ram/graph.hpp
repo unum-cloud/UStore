@@ -47,8 +47,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_read_
     status_t outcome;
     store_status_t const exported = with_source(state, view, [&](auto& source) noexcept {
         return for_each_run(source, collections, arguments.count, outcome,
-                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                                using entry_t = entry_of<decltype(entries)>;
+                            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                                        std::size_t end) noexcept -> store_status_t {
+                                using entry_t = entry_of<entries_type_>;
                                 if constexpr (!std::is_same_v<entry_t, half_edge_t>) return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);

@@ -115,7 +115,8 @@ class page_state {
     status_t apply(delta_view_t const& delta) noexcept {
         switch (delta.kind) {
         case delta_kind_t::write_k: return load(delta.bytes);
-        case delta_kind_t::remove_k: exists = false; return {};
+        case delta_kind_t::remove_k:
+        case delta_kind_t::remove_range_k: exists = false; return {};
         case delta_kind_t::change_k:
             return for_each_edit(delta.bytes, [&](edit_t const& edit) noexcept -> status_t { return apply(edit); });
         }
@@ -183,7 +184,7 @@ struct page_fold_t {
                 if (!view) return view.status();
                 status = growth_status(edits.push_back(import_edit({}, view->root_key(), delta.bytes)));
             }
-            else if (delta.kind == delta_kind_t::remove_k)
+            else if (utilities::removes(delta.kind))
                 status = growth_status(edits.push_back(remove_edit({}, nil_key_k)));
             else
                 status = for_each_edit(delta.bytes, [&](edit_t const& edit) noexcept -> status_t {

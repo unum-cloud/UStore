@@ -59,10 +59,10 @@ std::size_t on_queue_pair(linux_aio_files_disk_t& disk, std::size_t bytes, queue
     failures += expect_eq(buffer.size(), bytes);
     if (buffer.size() != bytes) return failures;
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(depth);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(depth);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
     failures += expect(pinned.has_value());

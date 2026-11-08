@@ -34,11 +34,11 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
+#include <cstddef> // `std::size_t`, `std::to_integer`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::int32_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm> // `std::sort`, `std::min`, `std::max`
+#include <algorithm> // `std::min`, `std::max`
 #include <limits>    // `std::numeric_limits`
 #include <memory>    // `std::allocator_traits`
 #include <new>       // placement `new`
@@ -46,7 +46,7 @@
 
 #include <smashtable/shared.hpp> // `st::status_t`
 
-#include "ustore/utilities/algorithm.hpp" // `compare_128`, `intersect_sorted_128`, `sorted_128_cursor_concept`
+#include "ustore/utilities/algorithm.hpp" // `compare_128`, `sorted_128_cursor_concept`, `radix_sort`, `word_byte`
 #include "ustore/utilities/folds.hpp"     // `delta_kind_t`, `delta_view_t`, `fold_concept`
 #include "ustore/utilities/types.hpp"     // `byte_t`, `expected`, `round_up_to_multiple`, `smallest_key_k`
 
@@ -561,6 +561,27 @@ inline bool sequenced_less(sequenced_record_t const& first, sequenced_record_t c
     return first.sequence < second.sequence;
 }
 
+/** The bytes @c sequenced_less orders by, read as one big-endian number: whether a record keeps the
+ *  vertex, a kept record's neighbor, edge and role, then the sequence. */
+inline std::size_t sequenced_digit(sequenced_record_t const& entry, std::size_t digit) noexcept {
+    constexpr std::size_t id_bytes_k = delta_edge_offset_k - delta_neighbor_offset_k;
+    bool const keeps = operation_of(entry.record) != half_edge_operation_t::remove_vertex_k;
+    if (digit == 0) return keeps;
+    if (digit <= 2 * id_bytes_k + 1) {
+        if (!keeps) return 0;
+        std::size_t const offset = digit <= id_bytes_k       ? delta_neighbor_offset_k + digit - 1
+                                   : digit <= 2 * id_bytes_k ? delta_edge_offset_k + digit - 1 - id_bytes_k
+                                                             : delta_role_offset_k;
+        return std::to_integer<std::size_t>(entry.record[offset]);
+    }
+    std::size_t const sequence_digit = digit - (2 * id_bytes_k + 2);
+    return utilities::word_byte(entry.sequence, sizeof(std::uint64_t) - sizeof(std::uint32_t) + sequence_digit);
+}
+
+/** How many bytes @c sequenced_digit reads. */
+inline constexpr std::size_t sequenced_digits_k = 2 * (delta_edge_offset_k - delta_neighbor_offset_k) + 2 +
+                                                  sizeof(std::uint32_t);
+
 /**
  *  @brief The fold of graph adjacency, fitting the fold concept of <tt>ustore/utilities/folds.hpp</tt>.
  *
@@ -648,7 +669,8 @@ struct adjacency_fold_t {
             for (std::size_t index = 0; index != chain.size(); ++index, ++count)
                 new (entries + count) sequenced_record_t {chain.record(index), static_cast<std::uint32_t>(count)};
         }
-        std::sort(entries, entries + total, sequenced_less);
+        utilities::radix_sort(std::span<sequenced_record_t> {entries, total}, sequenced_digits_k, sequenced_digit,
+                              sequenced_less);
 
         // The newest removal of the vertex sorts last among the leading ones and cuts everything older
         std::size_t index = 0;

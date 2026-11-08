@@ -146,8 +146,9 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
     for (std::uint32_t const value : shape.per_thread)
         if (offsets[value + 1] != offsets[value]) shape.per_thread[kept++] = value;
     shape.per_thread = shape.per_thread.first(kept);
-    std::uint64_t const frame_words = sz_subdocuments_frame_words_simt_(on_device);
-    std::uint64_t const key_bytes = round_up_to_multiple<std::uint64_t>(sz_subdocuments_key_bytes_(on_device),
+    // The device tables are still being uploaded, so the host only ever reads its own
+    std::uint64_t const frame_words = sz_subdocuments_frame_words_simt_(engine_slot.data());
+    std::uint64_t const key_bytes = round_up_to_multiple<std::uint64_t>(sz_subdocuments_key_bytes_(engine_slot.data()),
                                                                         arena_alignment_k);
     std::size_t const walkers_count = std::max(
         {shape.per_thread.size(), shape.per_group.size(), shape.per_chunk.size()});

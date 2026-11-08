@@ -2,15 +2,16 @@
  *  @file tools/arrow_ipc.hpp
  *  @author Ash Vardanian
  *  @date October 29, 2026
- *  @brief A codec of Apache Arrow IPC streams and files with no Arrow library and no @c flatc, over hand-numbered
- *      FlatBuffers tables for byte strings, fixed-width values, numbers, lists and structs, with C Data adapters.
+ *  @brief A codec of Apache Arrow IPC streams and files with no Arrow library and no @c flatc, over
+ *      hand-numbered FlatBuffers tables for byte strings, fixed-width values, numbers, lists and
+ *      structs, with C Data adapters.
  *
- *  The codec neither allocates nor does I/O, since every buffer is the caller's. Readers
- *  name how many bytes the next step needs, so a pipe reads exactly that much, and writers
- *  answer @c ipc_status_t::too_small_k with the bytes they need, so an empty output
- *  measures. Bodies are never copied: a writer answers them as gathers for @c writev, and a
- *  reader answers spans into the body it was lent. Every scalar crosses the wire
- *  little-endian, through @c ipc_load_little and @c ipc_store_little, whatever the host.
+ *  The codec neither allocates nor does I/O, since every buffer is the caller's. Readers name how
+ *  many bytes the next step needs, so a pipe reads exactly that much, and writers answer
+ *  @c ipc_status_t::too_small_k with the bytes they need, so an empty output measures. Bodies are
+ *  never copied: a writer answers them as gathers for @c writev, and a reader answers spans into
+ *  the body it was lent. Every scalar crosses the wire little-endian, through @c ipc_load_little
+ *  and @c ipc_store_little, whatever the host.
  *
  *  The slots follow <tt>Schema.fbs</tt>, <tt>Message.fbs</tt> and <tt>File.fbs</tt> of Apache Arrow's <tt>format/</tt>
  *  directory. The names carry no type of the project they ship in, so another project copies the
@@ -25,54 +26,52 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
+/* The C linkage matches other copies of the block, so whichever lands first defines one type. */
 #pragma region C Data Interface
 
-// The C linkage matches other copies of the block, so whichever lands first defines one type
 extern "C" {
 
-// clang-format off
 #ifndef ARROW_C_DATA_INTERFACE
-#  define ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
 
-#  define ARROW_FLAG_DICTIONARY_ORDERED 1
-#  define ARROW_FLAG_NULLABLE 2
-#  define ARROW_FLAG_MAP_KEYS_SORTED 4
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE           2
+#define ARROW_FLAG_MAP_KEYS_SORTED    4
 
 struct ArrowSchema {
-  // Array type description
-  const char* format;
-  const char* name;
-  const char* metadata;
-  int64_t flags;
-  int64_t n_children;
-  struct ArrowSchema** children;
-  struct ArrowSchema* dictionary;
+    // Array type description
+    const char* format;
+    const char* name;
+    const char* metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema** children;
+    struct ArrowSchema* dictionary;
 
-  // Release callback
-  void (*release)(struct ArrowSchema*);
-  // Opaque producer-specific data
-  void* private_data;
+    // Release callback
+    void (*release)(struct ArrowSchema*);
+    // Opaque producer-specific data
+    void* private_data;
 };
 
 struct ArrowArray {
-  // Array data description
-  int64_t length;
-  int64_t null_count;
-  int64_t offset;
-  int64_t n_buffers;
-  int64_t n_children;
-  const void** buffers;
-  struct ArrowArray** children;
-  struct ArrowArray* dictionary;
+    // Array data description
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void** buffers;
+    struct ArrowArray** children;
+    struct ArrowArray* dictionary;
 
-  // Release callback
-  void (*release)(struct ArrowArray*);
-  // Opaque producer-specific data
-  void* private_data;
+    // Release callback
+    void (*release)(struct ArrowArray*);
+    // Opaque producer-specific data
+    void* private_data;
 };
 
-#endif  // ARROW_C_DATA_INTERFACE
-// clang-format on
+#endif // ARROW_C_DATA_INTERFACE
 
 } // extern "C"
 
@@ -80,16 +79,21 @@ struct ArrowArray {
 
 namespace unum::ustore::tools {
 
+using bytes_span_t = std::span<std::byte>;
+using bytes_view_t = std::span<std::byte const>;
+
 #pragma region Vocabulary
 
-/** Where buffers start unless the caller asks otherwise, as Arrow recommends, so SIMD kernels read them in place. */
+/** Where buffers start unless the caller asks otherwise, as Arrow recommends, so SIMD kernels read
+ *  them in place. */
 inline constexpr std::uint32_t ipc_alignment_default_k = 64;
 
-/** Where buffers start for readers of the file through @c O_DIRECT and cuFile, a page, also the largest alignment. */
+/** Where buffers start for readers of the file through @c O_DIRECT and cuFile, a page, also the
+ *  largest alignment. */
 inline constexpr std::uint32_t ipc_alignment_direct_k = 4096;
 
-/** The most fields a schema carries, nested ones counted, which sizes @c ipc_arrow_storage_t; each level of nesting
- *  costs a field, which also bounds how deep the codec recurses. */
+/** The most fields a schema carries, nested ones counted, which sizes @c ipc_arrow_storage_t; each
+ *  level of nesting costs a field, which also bounds how deep the codec recurses. */
 inline constexpr std::size_t ipc_fields_max_k = 16;
 
 /** The most buffers a batch carries: validity, offsets and data of every field. */
@@ -116,15 +120,17 @@ enum class ipc_status_t : std::uint8_t {
     /** The input contradicts itself or the format. */
     malformed_k,
 
-    /** Valid Arrow the codec does not handle: big-endian, dictionaries, compression, views, unions, maps or nulls. */
+    /** Valid Arrow the codec does not handle: big-endian, dictionaries, compression, views, unions,
+     *  maps or nulls. */
     unsupported_k,
 
-    /** An output the caller lent is too short; the call names the bytes or entries it needs where it can. */
+    /** An output the caller lent is too short; the call names the bytes or entries it needs where
+     *  it can. */
     too_small_k,
 };
 
-/** The value types the codec reads and writes, numbered apart from Arrow's union so more widths and nested types append
- *  without renumbering. */
+/** The value types the codec reads and writes, numbered apart from Arrow's union so more widths and
+ *  nested types append without renumbering. */
 enum class ipc_type_t : std::uint8_t {
 
     /** Byte strings with 32-bit offsets, @c z in the C Data interface. */
@@ -142,7 +148,8 @@ enum class ipc_type_t : std::uint8_t {
     /** Values of @c ipc_field_t::width bytes each, <tt>w:N</tt>. */
     fixed_size_binary_k,
 
-    /** Integers of @c ipc_field_t::width bits, 8 to 64, signed or not, @c c @c C @c s @c S @c i @c I @c l @c L. */
+    /** Integers of @c ipc_field_t::width bits, 8 to 64, signed or not, @c c @c C @c s @c S @c i
+     *  @c I @c l @c L. */
     int_k,
 
     /** Floats of @c ipc_field_t::width bits, 16, 32 or 64, @c e @c f @c g. */
@@ -167,7 +174,8 @@ enum class ipc_signedness_t : std::uint8_t {
     signed_k,
 };
 
-/** Whether a field may hold nulls. Batches with nulls are refused either way; the bit only round-trips. */
+/** Whether a field may hold nulls. Batches with nulls are refused either way; the bit only
+ *  round-trips. */
 enum class ipc_nullability_t : std::uint8_t {
     non_nullable_k,
     nullable_k,
@@ -190,8 +198,9 @@ struct ipc_field_t {
     std::string_view name;
     ipc_type_t type = ipc_type_t::binary_k;
 
-    /** Bytes per value of @c ipc_type_t::fixed_size_binary_k, values per list of @c ipc_type_t::fixed_size_list_k, and
-     *  bits per value of @c ipc_type_t::int_k and @c ipc_type_t::floating_point_k; zero for every other type. */
+    /** Bytes per value of @c ipc_type_t::fixed_size_binary_k, values per list of
+     *  @c ipc_type_t::fixed_size_list_k, and bits per value of @c ipc_type_t::int_k and
+     *  @c ipc_type_t::floating_point_k; zero for every other type. */
     std::int32_t width = 0;
 
     /** Whether an @c ipc_type_t::int_k field is signed. */
@@ -218,22 +227,22 @@ struct ipc_node_t {
 };
 
 /**
- *  @brief One record batch: a node per field and its buffers, viewing bytes the caller keeps alive, both in the
- *      depth-first order of the fields, so each nested field follows its parent.
+ *  @brief One record batch: a node per field and its buffers, viewing bytes the caller keeps alive,
+ *      both in the depth-first order of the fields, so each nested field follows its parent.
  *
- *  Every field starts with a validity buffer, empty since nulls are refused. Byte strings then take offsets and data,
- *  fixed-width values, integers and floats take data, lists take offsets, and fixed-size lists and structs take nothing
- *  more, their values living in their children.
+ *  Every field starts with a validity buffer, empty since nulls are refused. Byte strings then take
+ *  offsets and data, fixed-width values, integers and floats take data, lists take offsets, and
+ *  fixed-size lists and structs take nothing more, their values living in their children.
  */
 struct ipc_batch_t {
     std::int64_t length = 0;
     std::span<ipc_node_t const> nodes;
-    std::span<std::span<std::byte const> const> buffers;
+    std::span<bytes_view_t const> buffers;
 };
 
 /** One @c writev entry of a body: bytes to write, then that many zeros to align what follows. */
 struct ipc_gather_t {
-    std::span<std::byte const> bytes;
+    bytes_view_t bytes;
     std::uint32_t padding = 0;
 };
 
@@ -253,7 +262,8 @@ struct ipc_block_t {
 /** How a writer lays messages out. */
 struct ipc_options_t {
 
-    /** Where every body and buffer starts in the file, a power of two between 8 and @c ipc_alignment_direct_k. */
+    /** Where every body and buffer starts in the file, a power of two between 8 and
+     *  @c ipc_alignment_direct_k. */
     std::uint32_t alignment = ipc_alignment_default_k;
 };
 
@@ -267,7 +277,8 @@ constexpr std::uint64_t ipc_round_up(std::uint64_t value, std::uint64_t alignmen
     return remainder ? value + (alignment - remainder) : value;
 }
 
-/** Reads a little-endian @p scalar_type_ from @p bytes, whatever the host's order and the address's alignment. */
+/** Reads a little-endian @p scalar_type_ from @p bytes, whatever the host's order and the address's
+ *  alignment. */
 template <typename scalar_type_>
 constexpr scalar_type_ ipc_load_little(std::byte const* bytes) noexcept {
     std::uint64_t value = 0;
@@ -276,7 +287,8 @@ constexpr scalar_type_ ipc_load_little(std::byte const* bytes) noexcept {
     return static_cast<scalar_type_>(value);
 }
 
-/** Writes @p value to @p bytes little-endian, whatever the host's order and the address's alignment. */
+/** Writes @p value to @p bytes little-endian, whatever the host's order and the address's
+ *  alignment. */
 template <typename scalar_type_>
 constexpr void ipc_store_little(std::byte* bytes, scalar_type_ value) noexcept {
     std::uint64_t const bits = static_cast<std::uint64_t>(value);
@@ -350,8 +362,8 @@ enum ipc_int_slot_t : std::uint16_t {
     ipc_int_is_signed_k = 1,
 };
 
-/** Slots of the @c FloatingPoint table in <tt>Schema.fbs</tt>, whose @c Precision counts 0, 1 and 2 for 16, 32 and 64
- *  bits. */
+/** Slots of the @c FloatingPoint table in <tt>Schema.fbs</tt>, whose @c Precision counts 0, 1 and 2 for
+ *  16, 32 and 64 bits. */
 enum ipc_floating_point_slot_t : std::uint16_t {
     ipc_floating_point_precision_k = 0,
 };
@@ -403,46 +415,48 @@ struct ipc_flatbuffer_vector_t {
 };
 
 /**
- *  @brief A table inside a FlatBuffer, whose vtable and extent were checked against the buffer when it opened, so every
- *      slot reads in bounds.
+ *  @brief A table inside a FlatBuffer, whose vtable and extent were checked against the buffer when
+ *      it opened, so every slot reads in bounds.
  *
- *  Every read takes the caller's status and does nothing once it failed, so a reader checks once after a run of reads
- *  and answers the first failure. A reference past the end of the buffer records @c ipc_status_t::truncated_k, and one
- *  that contradicts the format @c ipc_status_t::malformed_k. A table that never opened reads as absent, with every slot
- *  at its default.
+ *  Every read takes the caller's status and does nothing once it failed, so a reader checks once
+ *  after a run of reads and answers the first failure. A reference past the end of the buffer
+ *  records @c ipc_status_t::truncated_k, and one that contradicts the format
+ *  @c ipc_status_t::malformed_k. A table that never opened reads as absent, every slot defaulted.
  */
 class ipc_flatbuffer_table_t {
-    std::span<std::byte const> buffer_;
+    bytes_view_t flatbuffer_;
     std::size_t table_ = 0;
     std::size_t vtable_ = 0;
     std::size_t vtable_bytes_ = 0;
     std::size_t table_bytes_ = 0;
 
-    /** Answers in @p target where the @c uoffset at @p position points, with @p target_bytes there in bounds. */
+    /** Answers in @p target where the @c uoffset at @p position points, with @p target_bytes there
+     *  in bounds. */
     ipc_status_t follow(std::size_t position, std::size_t target_bytes, std::size_t& target) const noexcept {
-        if (position > buffer_.size() || buffer_.size() - position < 4) return ipc_status_t::truncated_k;
-        std::uint32_t const offset = ipc_load_little<std::uint32_t>(buffer_.data() + position);
+        if (position > flatbuffer_.size() || flatbuffer_.size() - position < 4) return ipc_status_t::truncated_k;
+        std::uint32_t const offset = ipc_load_little<std::uint32_t>(flatbuffer_.data() + position);
         if (offset == 0) return ipc_status_t::malformed_k;
-        if (offset > buffer_.size() - position || buffer_.size() - position - offset < target_bytes)
+        if (offset > flatbuffer_.size() - position || flatbuffer_.size() - position - offset < target_bytes)
             return ipc_status_t::truncated_k;
         target = position + offset;
         return ipc_status_t::success_k;
     }
 
-    /** Opens the table the @c uoffset at @p position points to, leaving the table absent on a failure. */
-    ipc_status_t open(std::span<std::byte const> buffer, std::size_t position) noexcept {
-        buffer_ = buffer;
+    /** Opens the table the @c uoffset at @p position points to, leaving the table absent on a
+     *  failure. */
+    ipc_status_t open(bytes_view_t flatbuffer, std::size_t position) noexcept {
+        flatbuffer_ = flatbuffer;
         std::size_t table = 0;
         if (ipc_status_t const status = follow(position, 4, table); status != ipc_status_t::success_k) return status;
         std::int64_t const vtable = static_cast<std::int64_t>(table) -
-                                    ipc_load_little<std::int32_t>(buffer.data() + table);
+                                    ipc_load_little<std::int32_t>(flatbuffer.data() + table);
         if (vtable < 0) return ipc_status_t::malformed_k;
-        if (static_cast<std::uint64_t>(vtable) + 4 > buffer.size()) return ipc_status_t::truncated_k;
+        if (static_cast<std::uint64_t>(vtable) + 4 > flatbuffer.size()) return ipc_status_t::truncated_k;
         std::size_t const start = static_cast<std::size_t>(vtable);
-        std::size_t const vtable_bytes = ipc_load_little<std::uint16_t>(buffer.data() + start);
-        std::size_t const table_bytes = ipc_load_little<std::uint16_t>(buffer.data() + start + 2);
+        std::size_t const vtable_bytes = ipc_load_little<std::uint16_t>(flatbuffer.data() + start);
+        std::size_t const table_bytes = ipc_load_little<std::uint16_t>(flatbuffer.data() + start + 2);
         if (vtable_bytes < 4 || vtable_bytes % 2 || table_bytes < 4) return ipc_status_t::malformed_k;
-        if (vtable_bytes > buffer.size() - start || table_bytes > buffer.size() - table)
+        if (vtable_bytes > flatbuffer.size() - start || table_bytes > flatbuffer.size() - table)
             return ipc_status_t::truncated_k;
         table_ = table, vtable_ = start, vtable_bytes_ = vtable_bytes, table_bytes_ = table_bytes;
         return ipc_status_t::success_k;
@@ -451,13 +465,14 @@ class ipc_flatbuffer_table_t {
   public:
     ipc_flatbuffer_table_t() noexcept = default;
 
-    /** Opens the table that the @c uoffset at @p position of @p buffer points to, unless @p status already failed. */
-    ipc_flatbuffer_table_t(std::span<std::byte const> buffer, std::size_t position, ipc_status_t& status) noexcept {
-        if (status == ipc_status_t::success_k) status = open(buffer, position);
+    /** Opens the table that the @c uoffset at @p position of @p flatbuffer points to, unless
+     *  @p status already failed. */
+    ipc_flatbuffer_table_t(bytes_view_t flatbuffer, std::size_t position, ipc_status_t& status) noexcept {
+        if (status == ipc_status_t::success_k) status = open(flatbuffer, position);
     }
 
     /** The buffer the table lives in, which nested tables and vectors resolve against. */
-    [[nodiscard]] std::span<std::byte const> buffer() const noexcept { return buffer_; }
+    [[nodiscard]] bytes_view_t flatbuffer() const noexcept { return flatbuffer_; }
 
     /** Whether the table opened. */
     [[nodiscard]] bool present() const noexcept { return table_ != 0; }
@@ -466,7 +481,7 @@ class ipc_flatbuffer_table_t {
     std::size_t field(std::uint16_t slot, std::size_t bytes, ipc_status_t& status) const noexcept {
         std::size_t const entry = 4 + 2 * std::size_t(slot);
         if (status != ipc_status_t::success_k || entry + 2 > vtable_bytes_) return 0;
-        std::size_t const offset = ipc_load_little<std::uint16_t>(buffer_.data() + vtable_ + entry);
+        std::size_t const offset = ipc_load_little<std::uint16_t>(flatbuffer_.data() + vtable_ + entry);
         if (offset == 0) return 0;
         if (offset < 4 || offset + bytes > table_bytes_) {
             status = ipc_status_t::malformed_k;
@@ -479,13 +494,13 @@ class ipc_flatbuffer_table_t {
     template <typename scalar_type_>
     scalar_type_ scalar(std::uint16_t slot, scalar_type_ fallback, ipc_status_t& status) const noexcept {
         std::size_t const position = field(slot, sizeof(scalar_type_), status);
-        return position ? ipc_load_little<scalar_type_>(buffer_.data() + position) : fallback;
+        return position ? ipc_load_little<scalar_type_>(flatbuffer_.data() + position) : fallback;
     }
 
     /** The table of @p slot, absent when the slot is. */
     ipc_flatbuffer_table_t table(std::uint16_t slot, ipc_status_t& status) const noexcept {
         std::size_t const position = field(slot, 4, status);
-        return position ? ipc_flatbuffer_table_t(buffer_, position, status) : ipc_flatbuffer_table_t {};
+        return position ? ipc_flatbuffer_table_t(flatbuffer_, position, status) : ipc_flatbuffer_table_t {};
     }
 
     /** Where the vector of @p slot holds its elements of @p element_bytes each. */
@@ -495,9 +510,9 @@ class ipc_flatbuffer_table_t {
         if (!position) return {};
         status = follow(position, 4, start);
         if (status != ipc_status_t::success_k) return {};
-        std::uint32_t const count = ipc_load_little<std::uint32_t>(buffer_.data() + start);
+        std::uint32_t const count = ipc_load_little<std::uint32_t>(flatbuffer_.data() + start);
         start += 4;
-        if (count > (buffer_.size() - start) / element_bytes) {
+        if (count > (flatbuffer_.size() - start) / element_bytes) {
             status = ipc_status_t::truncated_k;
             return {};
         }
@@ -507,11 +522,11 @@ class ipc_flatbuffer_table_t {
     /** The string of @p slot, empty when absent. */
     std::string_view string(std::uint16_t slot, ipc_status_t& status) const noexcept {
         ipc_flatbuffer_vector_t const bytes = vector(slot, 1, status);
-        return {reinterpret_cast<char const*>(buffer_.data()) + bytes.first, bytes.count};
+        return {reinterpret_cast<char const*>(flatbuffer_.data()) + bytes.first, bytes.count};
     }
 };
 
-/** One field of a table being built: its slot in the vtable and its width in bytes, 1, 2, 4 or 8. */
+/** One field of a table being built: its slot in the vtable and its byte width, 1, 2, 4 or 8. */
 struct ipc_flatbuffer_slot_t {
     std::uint16_t slot;
     std::uint16_t bytes;
@@ -521,20 +536,21 @@ struct ipc_flatbuffer_slot_t {
  *  @brief Lays a FlatBuffer out front to back, each vtable before its table and each child after
  *      its parent, so every @c uoffset points forward as the format requires.
  *
- *  Writes past the end of the output are dropped while the size still grows, so one pass both writes and measures.
- *  Everything claimed is zeroed first, padding included.
+ *  Writes past the end of the output are dropped while the size still grows, so one pass both
+ *  writes and measures. Everything claimed is zeroed first, padding included.
  */
 class ipc_flatbuffer_builder_t {
-    std::span<std::byte> output_;
+    bytes_span_t output_;
     std::size_t size_ = 0;
 
   public:
-    explicit ipc_flatbuffer_builder_t(std::span<std::byte> output) noexcept : output_(output) {}
+    explicit ipc_flatbuffer_builder_t(bytes_span_t output) noexcept : output_(output) {}
 
     /** Bytes laid out so far, whether or not they fit the output. */
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
 
-    /** Claims and zeroes @p bytes at the next position that leaves @p remainder modulo @p alignment. */
+    /** Claims and zeroes @p bytes at the next position that leaves @p remainder modulo
+     *  @p alignment. */
     std::size_t claim(std::size_t bytes, std::size_t alignment, std::size_t remainder = 0) noexcept {
         std::size_t const start = size_ + ((remainder - size_) & (alignment - 1));
         std::size_t const end = start + bytes;
@@ -553,8 +569,8 @@ class ipc_flatbuffer_builder_t {
     /** Points the @c uoffset at @p slot to @p target, which lies after it. */
     void link(std::size_t slot, std::size_t target) noexcept { store(slot, static_cast<std::uint32_t>(target - slot)); }
 
-    /** Lays out a vtable and its table holding @p fields, widest first, and answers in @p positions where each lands,
-     *  and as the result where the table starts. */
+    /** Lays out a vtable and its table holding @p fields, widest first, and answers in @p positions
+     *  where each lands, and as the result where the table starts. */
     std::size_t table(std::span<ipc_flatbuffer_slot_t const> fields, std::span<std::size_t> positions) noexcept {
         std::size_t slots = 0, table_bytes = 4;
         for (ipc_flatbuffer_slot_t const& field : fields) {
@@ -564,7 +580,7 @@ class ipc_flatbuffer_builder_t {
         bool const has_longs = !fields.empty() && fields.front().bytes == 8;
         std::size_t const vtable_bytes = 4 + 2 * slots;
         std::size_t const vtable = claim(vtable_bytes, 2);
-        // A table at 4 modulo 8 puts its longs, which follow the 4-byte `soffset`, on 8-byte boundaries
+        // A table at 4 modulo 8 puts its longs, past the 4-byte `soffset`, on 8-byte boundaries
         std::size_t const table = claim(table_bytes, has_longs ? 8 : 4, has_longs ? 4 : 0);
         store(vtable, static_cast<std::uint16_t>(vtable_bytes));
         store(vtable + 2, static_cast<std::uint16_t>(table_bytes));
@@ -587,8 +603,8 @@ class ipc_flatbuffer_builder_t {
         return start;
     }
 
-    /** Lays out a vector of @p count zeroed elements of @p element_bytes, those holding longs 8-aligned, and answers
-     *  where its count starts, 4 bytes before the first element. */
+    /** Lays out a vector of @p count zeroed elements of @p element_bytes, those holding longs
+     *  8-aligned, and answers where its count starts, 4 bytes before the first element. */
     std::size_t vector(std::size_t count, std::size_t element_bytes) noexcept {
         bool const has_longs = element_bytes % 8 == 0;
         std::size_t const start = claim(4 + count * element_bytes, has_longs ? 8 : 4, has_longs ? 4 : 0);
@@ -630,7 +646,8 @@ constexpr std::size_t ipc_value_bytes(ipc_field_t const& field) noexcept {
     return field.type == ipc_type_t::fixed_size_binary_k ? width : width / 8;
 }
 
-/** Buffers a field of @p type takes in a batch, its validity bitmap included, its children's not. */
+/** Buffers a field of @p type takes in a batch, its validity bitmap included, its children's
+ *  not. */
 constexpr std::size_t ipc_buffers_of(ipc_type_t type) noexcept {
     if (ipc_type_is_variable(type)) return 3;
     return ipc_type_is_fixed(type) || ipc_type_is_list(type) ? 2 : 1;
@@ -683,7 +700,8 @@ constexpr ipc_status_t ipc_check_schema(ipc_schema_t const& schema) noexcept {
     return ipc_status_t::success_k;
 }
 
-/** Checks a writer's alignment and the absolute @p position its message starts at, which must keep 8-byte order. */
+/** Checks a writer's alignment and the absolute @p position its message starts at, which must keep
+ *  8-byte order. */
 constexpr ipc_status_t ipc_check_layout(ipc_options_t options, std::uint64_t position) noexcept {
     std::uint32_t const alignment = options.alignment;
     if (alignment < 8 || alignment > ipc_alignment_direct_k || (alignment & (alignment - 1)))
@@ -704,7 +722,7 @@ inline ipc_status_t ipc_read_key_values(ipc_flatbuffer_table_t const& table, std
     if (status != ipc_status_t::success_k) return status;
     if (vector.count > pool.size() - used) return ipc_status_t::too_small_k;
     for (std::size_t index = 0; index != vector.count; ++index) {
-        ipc_flatbuffer_table_t const pair(table.buffer(), vector.first + 4 * index, status);
+        ipc_flatbuffer_table_t const pair(table.flatbuffer(), vector.first + 4 * index, status);
         pool[used + index] = {pair.string(ipc_key_value_key_k, status), pair.string(ipc_key_value_value_k, status)};
     }
     pairs = pool.subspan(used, vector.count);
@@ -712,7 +730,8 @@ inline ipc_status_t ipc_read_key_values(ipc_flatbuffer_table_t const& table, std
     return status;
 }
 
-/** Maps the @c type union of a @c Field table onto @p field, refusing what the codec does not handle. */
+/** Maps the @c type union of a @c Field table onto @p field, refusing what the codec does not
+ *  handle. */
 inline ipc_status_t ipc_read_type(ipc_flatbuffer_table_t const& table, ipc_field_t& field) noexcept {
     ipc_status_t status = ipc_status_t::success_k;
     std::uint8_t const type_type = table.scalar<std::uint8_t>(ipc_field_type_type_k, 0, status);
@@ -755,7 +774,8 @@ inline ipc_status_t ipc_read_type(ipc_flatbuffer_table_t const& table, ipc_field
     return status;
 }
 
-/** Where a schema being read puts its fields and its pairs of metadata, and how many of each it took. */
+/** Where a schema being read puts its fields and its pairs of metadata, and how many of each it
+ *  took. */
 struct ipc_schema_pools_t {
     std::span<ipc_field_t> fields;
     std::span<ipc_key_value_t> pairs;
@@ -766,8 +786,8 @@ struct ipc_schema_pools_t {
 inline ipc_status_t ipc_read_field(ipc_flatbuffer_table_t const& table, ipc_schema_pools_t& pools,
                                    ipc_field_t& field) noexcept;
 
-/** Reads the vector of @c Field tables in @p slot into the next fields of @p pools, all siblings side by side, then
- *  each one's children after them, and answers the siblings in @p fields. */
+/** Reads the vector of @c Field tables in @p slot into the next fields of @p pools, all siblings
+ *  side by side, then each one's children after them, and answers the siblings in @p fields. */
 inline ipc_status_t ipc_read_fields(ipc_flatbuffer_table_t const& parent, std::uint16_t slot, ipc_schema_pools_t& pools,
                                     std::span<ipc_field_t const>& fields) noexcept {
     ipc_status_t status = ipc_status_t::success_k;
@@ -779,7 +799,7 @@ inline ipc_status_t ipc_read_fields(ipc_flatbuffer_table_t const& parent, std::u
     std::span<ipc_field_t> const siblings = pools.fields.subspan(pools.fields_used, vector.count);
     pools.fields_used += vector.count;
     for (std::size_t index = 0; index != vector.count; ++index) {
-        ipc_flatbuffer_table_t const field(parent.buffer(), vector.first + 4 * index, status);
+        ipc_flatbuffer_table_t const field(parent.flatbuffer(), vector.first + 4 * index, status);
         if (status == ipc_status_t::success_k) status = ipc_read_field(field, pools, siblings[index]);
         if (status != ipc_status_t::success_k) return status;
     }
@@ -787,7 +807,8 @@ inline ipc_status_t ipc_read_fields(ipc_flatbuffer_table_t const& parent, std::u
     return ipc_status_t::success_k;
 }
 
-/** Reads one @c Field table into @p field, its metadata and children into the next entries of @p pools. */
+/** Reads one @c Field table into @p field, its metadata and children into the next entries of
+ *  @p pools. */
 inline ipc_status_t ipc_read_field(ipc_flatbuffer_table_t const& table, ipc_schema_pools_t& pools,
                                    ipc_field_t& field) noexcept {
     ipc_status_t status = ipc_status_t::success_k;
@@ -824,7 +845,8 @@ constexpr bool ipc_reads_version(std::int16_t version) noexcept {
     return version == ipc_metadata_version_4_k || version == ipc_metadata_version_5_k;
 }
 
-/** One message's metadata: its kind, its body's length and its header table, viewing the metadata it was read from. */
+/** One message's metadata: its kind, its body's length and its header table, viewing the metadata
+ *  it was read from. */
 struct ipc_message_t {
     ipc_message_kind_t kind = ipc_message_kind_t::schema_k;
     std::int64_t body_bytes = 0;
@@ -833,14 +855,13 @@ struct ipc_message_t {
 
 /**
  *  @brief Reads the prefix of a message from the first bytes of @p bytes: the <tt>0xFFFFFFFF</tt>
- *      continuation marker and an @c int32 length, or the bare length that writers before
- *      format 0.15 emit.
+ *      continuation marker and an @c int32 length, or the bare length writers before 0.15 emit.
  *
- *  @p prefix_bytes always names the bytes the prefix needs, 4 and then 8 once a marker shows, so a pipe reader that
- *  gets @c ipc_status_t::truncated_k reads up to that many and calls again. @p metadata_bytes is zero at the end of the
- *  stream.
+ *  @p prefix_bytes always names the bytes the prefix needs, 4 and then 8 once a marker shows, so a
+ *  pipe reader that gets @c ipc_status_t::truncated_k reads up to that many and calls again.
+ *  @p metadata_bytes is zero at the end of the stream.
  */
-inline ipc_status_t ipc_read_prefix(std::span<std::byte const> bytes, std::uint32_t& metadata_bytes,
+inline ipc_status_t ipc_read_prefix(bytes_view_t bytes, std::uint32_t& metadata_bytes,
                                     std::size_t& prefix_bytes) noexcept {
     metadata_bytes = 0, prefix_bytes = 4;
     if (bytes.size() < 4) return ipc_status_t::truncated_k;
@@ -858,9 +879,9 @@ inline ipc_status_t ipc_read_prefix(std::span<std::byte const> bytes, std::uint3
     return ipc_status_t::success_k;
 }
 
-/** Reads the @c Message in the @p metadata the prefix framed, which outlives @p message. The end of the stream is the
- *  zero length @c ipc_read_prefix answers, so empty metadata reads as truncated. */
-inline ipc_status_t ipc_read_message(std::span<std::byte const> metadata, ipc_message_t& message) noexcept {
+/** Reads the @c Message in the @p metadata the prefix framed, which outlives @p message. The end of
+ *  the stream is the zero length @c ipc_read_prefix answers, so empty metadata is truncated. */
+inline ipc_status_t ipc_read_message(bytes_view_t metadata, ipc_message_t& message) noexcept {
     ipc_status_t status = ipc_status_t::success_k;
     ipc_flatbuffer_table_t const root(metadata, 0, status);
     std::int16_t const version = root.scalar<std::int16_t>(ipc_message_version_k, 0, status);
@@ -881,8 +902,8 @@ inline ipc_status_t ipc_read_message(std::span<std::byte const> metadata, ipc_me
     return message.header.present() ? ipc_status_t::success_k : ipc_status_t::malformed_k;
 }
 
-/** Reads the schema a message carries: its fields into @p fields, the columns first and every nested field after, each
- *  field's children side by side, and every pair of metadata into @p metadata. */
+/** Reads the schema a message carries: its fields into @p fields, the columns first and every
+ *  nested field after, each field's children side by side, and its pairs into @p metadata. */
 inline ipc_status_t ipc_read_schema(ipc_message_t const& message, std::span<ipc_field_t> fields,
                                     std::span<ipc_key_value_t> metadata, ipc_schema_t& schema) noexcept {
     if (message.kind != ipc_message_kind_t::schema_k) return ipc_status_t::malformed_k;
@@ -890,14 +911,15 @@ inline ipc_status_t ipc_read_schema(ipc_message_t const& message, std::span<ipc_
 }
 
 /**
- *  @brief Reads the record batch a message carries, its nodes into @p nodes and views of its buffers into @p buffers,
- *      each checked to lie inside @p body.
+ *  @brief Reads the record batch a message carries, its nodes into @p nodes and views of its
+ *      buffers into @p buffers, each checked to lie inside @p body.
  *
- *  Compression is refused before the body is needed. The values themselves are left to @c ipc_validate_batch.
+ *  Compression is refused before the body is needed. The values themselves are left to
+ *  @c ipc_validate_batch.
  */
-inline ipc_status_t ipc_read_batch(ipc_message_t const& message, std::span<std::byte const> body,
-                                   ipc_schema_t const& schema, std::span<ipc_node_t> nodes,
-                                   std::span<std::span<std::byte const>> buffers, ipc_batch_t& batch) noexcept {
+inline ipc_status_t ipc_read_batch(ipc_message_t const& message, bytes_view_t body, ipc_schema_t const& schema,
+                                   std::span<ipc_node_t> nodes, std::span<bytes_view_t> buffers,
+                                   ipc_batch_t& batch) noexcept {
     if (message.kind != ipc_message_kind_t::record_batch_k) return ipc_status_t::malformed_k;
     ipc_flatbuffer_table_t const& header = message.header;
     ipc_status_t status = ipc_status_t::success_k;
@@ -917,7 +939,7 @@ inline ipc_status_t ipc_read_batch(ipc_message_t const& message, std::span<std::
     if (node_vector.count > nodes.size() || buffer_vector.count > buffers.size()) return ipc_status_t::too_small_k;
     body = body.first(static_cast<std::size_t>(message.body_bytes));
 
-    std::byte const* const metadata = header.buffer().data();
+    std::byte const* const metadata = header.flatbuffer().data();
     for (std::size_t index = 0; index != node_vector.count; ++index) {
         std::byte const* const node = metadata + node_vector.first + ipc_flatbuffer_pair_bytes_k * index;
         nodes[index] = {ipc_load_little<std::int64_t>(node), ipc_load_little<std::int64_t>(node + 8)};
@@ -935,31 +957,31 @@ inline ipc_status_t ipc_read_batch(ipc_message_t const& message, std::span<std::
     return ipc_status_t::success_k;
 }
 
-/** Checks that the @p offsets of @p length strings or lists climb from a non-negative start and end at most at
- *  @p limit, the bytes of their data or the rows of their child. */
+/** Checks that the @p offsets of @p length strings or lists climb from a non-negative start and end
+ *  at most at @p limit, the bytes of their data or the rows of their child. */
 template <typename offset_type_>
-constexpr ipc_status_t ipc_validate_offsets(std::span<std::byte const> offsets, std::uint64_t limit,
-                                            std::uint64_t length) noexcept {
+constexpr ipc_status_t ipc_validate_offsets(bytes_view_t offsets, std::uint64_t limit, std::uint64_t length) noexcept {
     if (length == 0 && offsets.empty()) return ipc_status_t::success_k;
     if (offsets.size() / sizeof(offset_type_) <= length) return ipc_status_t::malformed_k;
     offset_type_ previous = ipc_load_little<offset_type_>(offsets.data());
     if (previous < 0) return ipc_status_t::malformed_k;
     for (std::uint64_t index = 1; index <= length; ++index) {
-        offset_type_ const current = ipc_load_little<offset_type_>(offsets.data() + index * sizeof(offset_type_));
-        if (current < previous) return ipc_status_t::malformed_k;
-        previous = current;
+        offset_type_ const offset = ipc_load_little<offset_type_>(offsets.data() + index * sizeof(offset_type_));
+        if (offset < previous) return ipc_status_t::malformed_k;
+        previous = offset;
     }
     return static_cast<std::uint64_t>(previous) <= limit ? ipc_status_t::success_k : ipc_status_t::malformed_k;
 }
 
-/** How far a walk over the nodes and buffers of a batch, in the depth-first order of its fields, has come. */
+/** How far a walk over the nodes and buffers of a batch, in the depth-first order of its fields,
+ *  has come. */
 struct ipc_batch_cursor_t {
     std::size_t node = 0;
     std::size_t buffer = 0;
 };
 
-/** Checks the values of @p field, whose node must hold at least @p needed rows, and of its children, moving @p cursor
- *  past all of them. */
+/** Checks the values of @p field, whose node must hold at least @p needed rows, and of its
+ *  children, moving @p cursor past all of them. */
 constexpr ipc_status_t ipc_validate_field(ipc_field_t const& field, ipc_batch_t const& batch, std::uint64_t needed,
                                           ipc_batch_cursor_t& cursor) noexcept {
     ipc_node_t const& node = batch.nodes[cursor.node++];
@@ -997,9 +1019,9 @@ constexpr ipc_status_t ipc_validate_field(ipc_field_t const& field, ipc_batch_t 
     return status;
 }
 
-/** Checks the values of a batch against its schema: a node per field without nulls, every column as long as the batch
- *  and every child long enough for its parent, offsets that climb and end inside their data or child, and fixed-width
- *  data long enough. UTF-8 is not checked, as for bytes. */
+/** Checks the values of a batch against its schema: a node per field without nulls, every column as
+ *  long as the batch and every child long enough for its parent, offsets that climb and end inside
+ *  their data or child, and fixed-width data long enough. UTF-8 is not checked, as for bytes. */
 constexpr ipc_status_t ipc_validate_batch(ipc_schema_t const& schema, ipc_batch_t const& batch) noexcept {
     if (ipc_status_t const status = ipc_check_schema(schema); status != ipc_status_t::success_k) return status;
     if (batch.length < 0 || batch.nodes.size() != ipc_fields_of(schema.fields) ||
@@ -1015,13 +1037,13 @@ constexpr ipc_status_t ipc_validate_batch(ipc_schema_t const& schema, ipc_batch_
 }
 
 /**
- *  @brief Reads the footer at the end of a whole @p file: its schema into the entries lent, and the Blocks of its
- *      record batches into @p blocks, so a mapped file imports them in parallel.
+ *  @brief Reads the footer at the end of a whole @p file: its schema into the entries lent, and the
+ *      Blocks of its record batches into @p blocks, so a mapped file imports them in parallel.
  *
- *  @p blocks_count names how many Blocks the footer holds, also when @p blocks is too short for them. A file that
- *  starts with the magic but does not end with it reads as truncated.
+ *  @p blocks_count names how many Blocks the footer holds, also when @p blocks is too short for
+ *  them. A file that starts with the magic but does not end with it reads as truncated.
  */
-inline ipc_status_t ipc_read_footer(std::span<std::byte const> file, std::span<ipc_field_t> fields,
+inline ipc_status_t ipc_read_footer(bytes_view_t file, std::span<ipc_field_t> fields,
                                     std::span<ipc_key_value_t> metadata, ipc_schema_t& schema,
                                     std::span<ipc_block_t> blocks, std::size_t& blocks_count) noexcept {
     blocks_count = 0;
@@ -1140,7 +1162,8 @@ inline std::size_t ipc_build_type(ipc_flatbuffer_builder_t& builder, ipc_field_t
 
 inline std::size_t ipc_build_field(ipc_flatbuffer_builder_t& builder, ipc_field_t const& field) noexcept;
 
-/** Lays out a vector of @c Field tables, each followed by its own children, and answers where it starts. */
+/** Lays out a vector of @c Field tables, each followed by its own children, and answers where it
+ *  starts. */
 inline std::size_t ipc_build_fields(ipc_flatbuffer_builder_t& builder, std::span<ipc_field_t const> fields) noexcept {
     std::size_t const vector = builder.vector(fields.size(), 4);
     for (std::size_t index = 0; index != fields.size(); ++index)
@@ -1148,8 +1171,8 @@ inline std::size_t ipc_build_fields(ipc_flatbuffer_builder_t& builder, std::span
     return vector;
 }
 
-/** Lays out a @c Field table, whose @c children vector is written even when empty as Arrow's own readers insist, and
- *  answers where it starts. */
+/** Lays out a @c Field table, whose @c children vector is written even when empty as Arrow's own
+ *  readers insist, and answers where it starts. */
 inline std::size_t ipc_build_field(ipc_flatbuffer_builder_t& builder, ipc_field_t const& field) noexcept {
     ipc_flatbuffer_slot_t const slots[] {{ipc_field_name_k, 4},     {ipc_field_type_k, 4},
                                          {ipc_field_children_k, 4}, {ipc_field_custom_metadata_k, 4},
@@ -1177,7 +1200,8 @@ inline std::size_t ipc_build_schema(ipc_flatbuffer_builder_t& builder, ipc_schem
     return table;
 }
 
-/** Lays out the root @c uoffset and a V5 @c Message table, and answers the @c header slot for the caller to link. */
+/** Lays out the root @c uoffset and a V5 @c Message table, and answers the @c header slot for the
+ *  caller to link. */
 inline std::size_t ipc_build_message(ipc_flatbuffer_builder_t& builder, ipc_message_header_t header_type,
                                      std::uint64_t body_bytes) noexcept {
     ipc_flatbuffer_slot_t const slots[] {{ipc_message_body_length_k, 8},
@@ -1193,9 +1217,9 @@ inline std::size_t ipc_build_message(ipc_flatbuffer_builder_t& builder, ipc_mess
     return positions[1];
 }
 
-/** Frames metadata the builder laid after the prefix in @p output: pads it so the message ends on the alignment at its
- *  absolute file @p position, then writes the marker and the length. */
-inline ipc_status_t ipc_frame_message(std::span<std::byte> output, std::uint64_t position, ipc_options_t options,
+/** Frames metadata the builder laid after the prefix in @p output: pads it so the message ends on
+ *  the alignment at its absolute file @p position, then writes the marker and the length. */
+inline ipc_status_t ipc_frame_message(bytes_span_t output, std::uint64_t position, ipc_options_t options,
                                       ipc_flatbuffer_builder_t& builder, std::size_t& written) noexcept {
     std::uint64_t const end = ipc_round_up(position + 8 + builder.size(), options.alignment);
     written = static_cast<std::size_t>(end - position);
@@ -1207,18 +1231,19 @@ inline ipc_status_t ipc_frame_message(std::span<std::byte> output, std::uint64_t
 }
 
 /** The output past the 8 bytes of a message's prefix, where its metadata goes. */
-inline std::span<std::byte> ipc_past_prefix(std::span<std::byte> output) noexcept {
-    return output.size() > 8 ? output.subspan(8) : std::span<std::byte> {};
+inline bytes_span_t ipc_past_prefix(bytes_span_t output) noexcept {
+    return output.size() > 8 ? output.subspan(8) : bytes_span_t {};
 }
 
 /**
- *  @brief Writes a schema message for absolute file @p position into @p output, answering its bytes in @p written.
+ *  @brief Writes a schema message for absolute file @p position into @p output, answering its bytes
+ *      in @p written.
  *
- *  A short @p output answers @c ipc_status_t::too_small_k with the bytes needed in @p written, so an empty one
- *  measures.
+ *  A short @p output answers @c ipc_status_t::too_small_k with the bytes needed in @p written, so
+ *  an empty one measures.
  */
 inline ipc_status_t ipc_write_schema(ipc_schema_t const& schema, ipc_options_t options, std::uint64_t position,
-                                     std::span<std::byte> output, std::size_t& written) noexcept {
+                                     bytes_span_t output, std::size_t& written) noexcept {
     written = 0;
     if (ipc_status_t const status = ipc_check_schema(schema); status != ipc_status_t::success_k) return status;
     if (ipc_status_t const status = ipc_check_layout(options, position); status != ipc_status_t::success_k)
@@ -1230,18 +1255,17 @@ inline ipc_status_t ipc_write_schema(ipc_schema_t const& schema, ipc_options_t o
 }
 
 /**
- *  @brief Writes the metadata of a record batch message for absolute file @p position into @p metadata, and its body as
- *      one gather per buffer into @p body, without copying a byte of it.
+ *  @brief Writes the metadata of a record batch message for absolute file @p position into
+ *      @p metadata, and its body as one gather per buffer into @p body, copying none of it.
  *
- *  The metadata ends on the alignment, so the body starts aligned at its absolute file
- *  position, and every buffer is padded to the alignment after it. A short @p metadata
- *  or @p body answers @c ipc_status_t::too_small_k with @p metadata_written still naming
- *  the metadata bytes needed, while the body needs one gather per buffer.
+ *  The metadata ends on the alignment, so the body starts aligned at its absolute file position,
+ *  and every buffer is padded to the alignment after it. A short @p metadata or @p body answers
+ *  @c ipc_status_t::too_small_k with @p metadata_written still naming the metadata bytes needed,
+ *  while the body needs one gather per buffer.
  */
 inline ipc_status_t ipc_write_batch(ipc_schema_t const& schema, ipc_batch_t const& batch, ipc_options_t options,
-                                    std::uint64_t position, std::span<std::byte> metadata,
-                                    std::size_t& metadata_written, std::span<ipc_gather_t> body,
-                                    std::uint64_t& body_bytes) noexcept {
+                                    std::uint64_t position, bytes_span_t metadata, std::size_t& metadata_written,
+                                    std::span<ipc_gather_t> body, std::uint64_t& body_bytes) noexcept {
     metadata_written = 0, body_bytes = 0;
     if (ipc_status_t const status = ipc_check_schema(schema); status != ipc_status_t::success_k) return status;
     if (ipc_status_t const status = ipc_check_layout(options, position); status != ipc_status_t::success_k)
@@ -1251,7 +1275,7 @@ inline ipc_status_t ipc_write_batch(ipc_schema_t const& schema, ipc_batch_t cons
         return ipc_status_t::malformed_k;
 
     std::uint64_t body_end = 0;
-    for (std::span<std::byte const> const buffer : batch.buffers)
+    for (bytes_view_t const buffer : batch.buffers)
         body_end = ipc_round_up(body_end + buffer.size(), options.alignment);
 
     ipc_flatbuffer_builder_t builder(ipc_past_prefix(metadata));
@@ -1275,7 +1299,7 @@ inline ipc_status_t ipc_write_batch(ipc_schema_t const& schema, ipc_batch_t cons
     bool const gathers_fit = body.size() >= batch.buffers.size();
     std::uint64_t offset = 0;
     for (std::size_t index = 0; index != batch.buffers.size(); ++index) {
-        std::span<std::byte const> const buffer = batch.buffers[index];
+        bytes_view_t const buffer = batch.buffers[index];
         std::uint64_t const next = ipc_round_up(offset + buffer.size(), options.alignment);
         builder.store(buffers + 4 + ipc_flatbuffer_pair_bytes_k * index, static_cast<std::int64_t>(offset));
         builder.store(buffers + 12 + ipc_flatbuffer_pair_bytes_k * index, static_cast<std::int64_t>(buffer.size()));
@@ -1288,7 +1312,7 @@ inline ipc_status_t ipc_write_batch(ipc_schema_t const& schema, ipc_batch_t cons
 }
 
 /** Writes the 8 bytes that end a stream, the marker and a zero length. */
-inline ipc_status_t ipc_write_end_of_stream(std::span<std::byte> output, std::size_t& written) noexcept {
+inline ipc_status_t ipc_write_end_of_stream(bytes_span_t output, std::size_t& written) noexcept {
     written = 8;
     if (output.size() < written) return ipc_status_t::too_small_k;
     ipc_store_little(output.data(), std::uint32_t(0xFFFFFFFFu));
@@ -1297,14 +1321,14 @@ inline ipc_status_t ipc_write_end_of_stream(std::span<std::byte> output, std::si
 }
 
 /**
- *  @brief Writes what ends a file after its end-of-stream marker: the @c Footer with the schema and the @p blocks of
- *      every batch, its @c int32 length, and the magic.
+ *  @brief Writes what ends a file after its end-of-stream marker: the @c Footer with the schema and
+ *      the @p blocks of every batch, its @c int32 length, and the magic.
  *
  *  A file is @c ipc_file_magic_k, the stream, then this, so writing it never seeks and a pipe takes
  *  it. A short @p output answers @c ipc_status_t::too_small_k with the bytes needed in @p written.
  */
 inline ipc_status_t ipc_write_footer(ipc_schema_t const& schema, std::span<ipc_block_t const> blocks,
-                                     std::span<std::byte> output, std::size_t& written) noexcept {
+                                     bytes_span_t output, std::size_t& written) noexcept {
     written = 0;
     if (ipc_status_t const status = ipc_check_schema(schema); status != ipc_status_t::success_k) return status;
     ipc_flatbuffer_builder_t builder(output);
@@ -1340,12 +1364,13 @@ inline ipc_status_t ipc_write_footer(ipc_schema_t const& schema, std::span<ipc_b
 #pragma region C Data Adapters
 
 /**
- *  @brief The memory an exported @c ArrowSchema or @c ArrowArray tree lives in, which the caller lends and keeps alive
- *      until the tree is released, so exporting allocates nothing.
+ *  @brief The memory an exported @c ArrowSchema or @c ArrowArray tree lives in, which the caller
+ *      lends and keeps alive until the tree is released, so exporting allocates nothing.
  *
- *  Every field takes one entry of each array, nested ones included, as @c ipc_fields_max_k counts them: the columns
- *  first, then each field's children side by side, depth-first. Schemas also need @c text for their names, formats and
- *  metadata, which the caller lends; batches need none. Release marks the tree released and frees nothing.
+ *  Every field takes one entry of each array, nested ones included, as @c ipc_fields_max_k counts
+ *  them: the columns first, then each field's children side by side, depth-first. Schemas also need
+ *  @c text for their names, formats and metadata, which the caller lends; batches need none.
+ *  Release marks the tree released and frees nothing.
  */
 struct ipc_arrow_storage_t {
     ArrowSchema schema_children[ipc_fields_max_k];
@@ -1359,7 +1384,8 @@ struct ipc_arrow_storage_t {
     std::span<char> text;
 };
 
-/** The offsets of an empty array of either width, since the C Data interface wants one offset even then. */
+/** The offsets of an empty array of either width, since the C Data interface wants one offset even
+ *  then. */
 inline constexpr std::int64_t ipc_zero_offsets_k[1] {};
 
 /** Releases an exported schema tree in caller-lent storage: its children, then itself. */
@@ -1376,8 +1402,8 @@ inline void ipc_release_array(ArrowArray* array) noexcept {
     array->release = nullptr;
 }
 
-/** The C Data format of @p field when it takes no parameter, or the prefix before its width, <tt>w:</tt> or
- *  <tt>+w:</tt>. */
+/** The C Data format of @p field when it takes no parameter, or the prefix before its width, <tt>w:</tt>
+ *  or <tt>+w:</tt>. */
 constexpr std::string_view ipc_arrow_format_of(ipc_field_t const& field) noexcept {
     bool const is_signed = field.signedness == ipc_signedness_t::signed_k;
     switch (field.type) {
@@ -1414,8 +1440,8 @@ constexpr std::size_t ipc_decimal_digits(std::uint32_t value) noexcept {
     return digits;
 }
 
-/** Characters metadata takes in the C Data encoding: an @c int32 count, then a length and the bytes of each key and
- *  value, or none when there is no pair. */
+/** Characters metadata takes in the C Data encoding: an @c int32 count, then a length and the bytes
+ *  of each key and value, or none when there is no pair. */
 constexpr std::size_t ipc_arrow_metadata_bytes(std::span<ipc_key_value_t const> pairs) noexcept {
     if (pairs.empty()) return 0;
     std::size_t bytes = 4;
@@ -1449,8 +1475,8 @@ inline char const* ipc_append_string(char*& cursor, std::string_view text) noexc
     return start;
 }
 
-/** Appends @p pairs in the C Data encoding, whose integers are native-endian, and answers where they start, or null
- *  when there is no pair. */
+/** Appends @p pairs in the C Data encoding, whose integers are native-endian, and answers where
+ *  they start, or null when there is no pair. */
 inline char const* ipc_append_metadata(char*& cursor, std::span<ipc_key_value_t const> pairs) noexcept {
     if (pairs.empty()) return nullptr;
     char const* const start = cursor;
@@ -1467,16 +1493,17 @@ inline char const* ipc_append_metadata(char*& cursor, std::span<ipc_key_value_t 
     return start;
 }
 
-/** Exports @p fields into @p storage from entry @p first on, their children into the entries @p next hands out. */
+/** Exports @p fields into @p storage from entry @p first on, their children into the entries
+ *  @p next hands out. */
 inline void ipc_export_schemas(std::span<ipc_field_t const> fields, std::size_t first, std::size_t& next,
                                ipc_arrow_storage_t& storage, char*& cursor) noexcept {
     for (std::size_t index = 0; index != fields.size(); ++index) {
         ipc_field_t const& field = fields[index];
-        ArrowSchema& child = storage.schema_children[first + index];
-        child = {};
-        storage.schema_pointers[first + index] = &child;
+        ArrowSchema& out = storage.schema_children[first + index];
+        out = {};
+        storage.schema_pointers[first + index] = &out;
         std::string_view const format = ipc_arrow_format_of(field);
-        child.format = cursor;
+        out.format = cursor;
         ipc_append_text(cursor, format.data(), format.size());
         if (ipc_arrow_format_has_width(field)) {
             std::uint32_t value = static_cast<std::uint32_t>(field.width);
@@ -1486,15 +1513,15 @@ inline void ipc_export_schemas(std::span<ipc_field_t const> fields, std::size_t 
             cursor += digits;
         }
         *cursor++ = 0;
-        child.name = ipc_append_string(cursor, field.name);
-        child.metadata = ipc_append_metadata(cursor, field.metadata);
-        child.flags = field.nullability == ipc_nullability_t::nullable_k ? ARROW_FLAG_NULLABLE : 0;
-        child.release = &ipc_release_schema;
+        out.name = ipc_append_string(cursor, field.name);
+        out.metadata = ipc_append_metadata(cursor, field.metadata);
+        out.flags = field.nullability == ipc_nullability_t::nullable_k ? ARROW_FLAG_NULLABLE : 0;
+        out.release = &ipc_release_schema;
         if (field.children.empty()) continue;
         std::size_t const children = next;
         next += field.children.size();
-        child.n_children = static_cast<std::int64_t>(field.children.size());
-        child.children = storage.schema_pointers + children;
+        out.n_children = static_cast<std::int64_t>(field.children.size());
+        out.children = storage.schema_pointers + children;
         ipc_export_schemas(field.children, children, next, storage, cursor);
     }
 }
@@ -1518,37 +1545,37 @@ inline ipc_status_t ipc_schema_to_arrow(ipc_schema_t const& schema, ipc_arrow_st
     return ipc_status_t::success_k;
 }
 
-/** Exports the arrays of @p fields from the nodes and buffers at @p cursor into @p storage from entry @p first on,
- *  their children into the entries @p next hands out. */
+/** Exports the arrays of @p fields from the nodes and buffers at @p cursor into @p storage from
+ *  entry @p first on, their children into the entries @p next hands out. */
 inline ipc_status_t ipc_export_arrays(std::span<ipc_field_t const> fields, ipc_batch_t const& batch,
                                       ipc_batch_cursor_t& cursor, std::size_t first, std::size_t& next,
                                       ipc_arrow_storage_t& storage) noexcept {
     for (std::size_t index = 0; index != fields.size(); ++index) {
         ipc_field_t const& field = fields[index];
-        ArrowArray& child = storage.array_children[first + index];
+        ArrowArray& out = storage.array_children[first + index];
         void const** const pointers = storage.child_buffers[first + index];
         ipc_node_t const& node = batch.nodes[cursor.node++];
         if (node.null_count != 0) return ipc_status_t::unsupported_k;
         std::size_t const buffer = cursor.buffer + 1;
         cursor.buffer += ipc_buffers_of(field.type);
-        child = {};
-        storage.array_pointers[first + index] = &child;
-        child.length = node.length;
-        child.n_buffers = static_cast<std::int64_t>(ipc_buffers_of(field.type));
+        out = {};
+        storage.array_pointers[first + index] = &out;
+        out.length = node.length;
+        out.n_buffers = static_cast<std::int64_t>(ipc_buffers_of(field.type));
         pointers[0] = nullptr;
         if (ipc_type_is_variable(field.type) || ipc_type_is_list(field.type)) {
-            std::span<std::byte const> const offsets = batch.buffers[buffer];
+            bytes_view_t const offsets = batch.buffers[buffer];
             pointers[1] = offsets.empty() ? static_cast<void const*>(ipc_zero_offsets_k) : offsets.data();
         }
         else if (ipc_type_is_fixed(field.type)) pointers[1] = batch.buffers[buffer].data();
         if (ipc_type_is_variable(field.type)) pointers[2] = batch.buffers[buffer + 1].data();
-        child.buffers = pointers;
-        child.release = &ipc_release_array;
+        out.buffers = pointers;
+        out.release = &ipc_release_array;
         if (field.children.empty()) continue;
         std::size_t const children = next;
         next += field.children.size();
-        child.n_children = static_cast<std::int64_t>(field.children.size());
-        child.children = storage.array_pointers + children;
+        out.n_children = static_cast<std::int64_t>(field.children.size());
+        out.children = storage.array_pointers + children;
         if (ipc_status_t const status = ipc_export_arrays(field.children, batch, cursor, children, next, storage);
             status != ipc_status_t::success_k)
             return status;
@@ -1556,7 +1583,8 @@ inline ipc_status_t ipc_export_arrays(std::span<ipc_field_t const> fields, ipc_b
     return ipc_status_t::success_k;
 }
 
-/** Exports @p batch as a C Data struct array in @p storage, its buffers viewing the body the batch views. */
+/** Exports @p batch as a C Data struct array in @p storage, its buffers viewing the body the batch
+ *  views. */
 inline ipc_status_t ipc_batch_to_arrow(ipc_schema_t const& schema, ipc_batch_t const& batch,
                                        ipc_arrow_storage_t& storage, ArrowArray& arrow) noexcept {
     if (ipc_status_t const status = ipc_check_schema(schema); status != ipc_status_t::success_k) return status;
@@ -1658,8 +1686,8 @@ constexpr ipc_status_t ipc_read_arrow_format(std::string_view format, ipc_field_
     }
 }
 
-/** Imports @p count C Data @p children into the next fields of @p pools, siblings side by side and each one's children
- *  after them, as a reader of IPC lays them out, and answers the siblings in @p fields. */
+/** Imports @p count C Data @p children into the next fields of @p pools, siblings side by side and
+ *  each one's children after them, as an IPC reader does, and answers the siblings in @p fields. */
 inline ipc_status_t ipc_import_schemas(ArrowSchema* const* children, std::int64_t count, ipc_schema_pools_t& pools,
                                        std::span<ipc_field_t const>& fields) noexcept {
     if (count < 0 || (count && !children)) return ipc_status_t::malformed_k;
@@ -1687,7 +1715,8 @@ inline ipc_status_t ipc_import_schemas(ArrowSchema* const* children, std::int64_
     return ipc_status_t::success_k;
 }
 
-/** Imports a C Data struct schema, viewing its strings, which the producer keeps alive until it is released. */
+/** Imports a C Data struct schema, viewing its strings, which the producer keeps alive until it is
+ *  released. */
 inline ipc_status_t ipc_schema_from_arrow(ArrowSchema const& arrow, std::span<ipc_field_t> fields,
                                           std::span<ipc_key_value_t> metadata, ipc_schema_t& schema) noexcept {
     if (!arrow.release || !arrow.format) return ipc_status_t::malformed_k;
@@ -1699,7 +1728,8 @@ inline ipc_status_t ipc_schema_from_arrow(ArrowSchema const& arrow, std::span<ip
     return status == ipc_status_t::success_k ? ipc_check_schema(schema) : status;
 }
 
-/** Whether a C Data array holds no null: a zero count, or an unknown one with no validity bitmap. */
+/** Whether a C Data array holds no null: a zero count, or an unknown one with no validity
+ *  bitmap. */
 constexpr bool ipc_arrow_has_no_nulls(ArrowArray const& array) noexcept {
     return array.null_count == 0 || (array.null_count == -1 && (array.n_buffers == 0 || !array.buffers[0]));
 }
@@ -1716,12 +1746,12 @@ inline std::int64_t ipc_arrow_offset(std::byte const* offsets, std::size_t offse
     return narrow;
 }
 
-/** Imports the C Data @p arrays of @p fields, rows @p skip to @p skip + @p length of each before its own offset, into
- *  the nodes and buffers at @p cursor, depth-first, and their children after each of them. */
+/** Imports the C Data @p arrays of @p fields, rows @p skip to @p skip + @p length of each before
+ *  its own offset, into the nodes and buffers at @p cursor, depth-first, and their children after
+ *  each of them. */
 inline ipc_status_t ipc_import_arrays(std::span<ipc_field_t const> fields, ArrowArray* const* arrays,
                                       std::uint64_t skip, std::uint64_t length, std::span<ipc_node_t> nodes,
-                                      std::span<std::span<std::byte const>> buffers,
-                                      ipc_batch_cursor_t& cursor) noexcept {
+                                      std::span<bytes_view_t> buffers, ipc_batch_cursor_t& cursor) noexcept {
     for (std::size_t index = 0; index != fields.size(); ++index) {
         ipc_field_t const& field = fields[index];
         ArrowArray const* const array = arrays ? arrays[index] : nullptr;
@@ -1744,7 +1774,8 @@ inline ipc_status_t ipc_import_arrays(std::span<ipc_field_t const> fields, Arrow
             if (end < 0) return ipc_status_t::malformed_k;
             buffers[cursor.buffer++] = {offsets ? offsets + start * offset_bytes : offsets,
                                         offsets ? static_cast<std::size_t>((length + 1) * offset_bytes) : 0};
-            // A list's offsets index its child from the child's own start, so the child goes whole up to the end
+            // A list's offsets index its child from the child's own start, so the child goes whole
+            // up to the end
             child_skip = 0, child_length = static_cast<std::uint64_t>(end);
             if (ipc_type_is_variable(field.type)) {
                 std::byte const* const data = static_cast<std::byte const*>(array->buffers[2]);
@@ -1772,15 +1803,15 @@ inline ipc_status_t ipc_import_arrays(std::span<ipc_field_t const> fields, Arrow
 }
 
 /**
- *  @brief Imports a C Data struct array of @p schema as a batch whose buffers view the producer's, which it keeps alive
- *      until the array is released, so writing it copies nothing.
+ *  @brief Imports a C Data struct array of @p schema as a batch whose buffers view the producer's,
+ *      which it keeps alive until the array is released, so writing it copies nothing.
  *
- *  Offsets keep the producer's start, which IPC allows, so byte strings span from their data's first byte to the last
- *  offset, and a list's child from its first row to the list's last offset. Native-endian buffers are taken as
- *  little-endian, as on every host the codec targets.
+ *  Offsets keep the producer's start, which IPC allows, so byte strings span from their data's
+ *  first byte to the last offset, and a list's child from its first row to the list's last offset.
+ *  Native-endian buffers are taken as little-endian, as on every host the codec targets.
  */
 inline ipc_status_t ipc_batch_from_arrow(ipc_schema_t const& schema, ArrowArray const& arrow,
-                                         std::span<ipc_node_t> nodes, std::span<std::span<std::byte const>> buffers,
+                                         std::span<ipc_node_t> nodes, std::span<bytes_view_t> buffers,
                                          ipc_batch_t& batch) noexcept {
     if (ipc_status_t const status = ipc_check_schema(schema); status != ipc_status_t::success_k) return status;
     if (!arrow.release || arrow.length < 0 || arrow.offset < 0) return ipc_status_t::malformed_k;

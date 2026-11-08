@@ -241,7 +241,7 @@ std::size_t channels_refuse_beyond_their_spares(mount_type_ const& mount) {
 #pragma region Pipeline Cases
 
 /** A pipeline holds its channel's queue pair alone: a second pipeline on it is refused with
- *  @c contended_k while the first lives, and one leases it again once the first is gone. */
+ *  @c contended_k while the first lives, and one acquires it again once the first is gone. */
 template <typename mount_type_>
 std::size_t second_pipeline_is_refused(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
@@ -259,18 +259,18 @@ std::size_t second_pipeline_is_refused(mount_type_ const& mount) {
     medium_reference_t const medium = (*fixture)->media[0].reference();
 
     {
-        expected<io_channel_t::lease_t> first = guard->channel().lease();
+        expected<io_channel_t::acquired_channel_t> first = guard->channel().acquire();
         failures += expect(first.has_value());
         if (!first) return failures;
         write_pipeline_t writer {(*fixture)->disk, std::move(*first), medium};
-        expected<io_channel_t::lease_t> second = guard->channel().lease();
+        expected<io_channel_t::acquired_channel_t> second = guard->channel().acquire();
         failures += expect_status(second, status_code_t::contended_k);
     }
-    expected<io_channel_t::lease_t> again = guard->channel().lease();
+    expected<io_channel_t::acquired_channel_t> again = guard->channel().acquire();
     failures += expect(again.has_value());
     if (!again) return failures;
     read_pipeline_t reader {(*fixture)->disk, std::move(*again), medium};
-    expected<io_channel_t::lease_t> beside = guard->channel().lease();
+    expected<io_channel_t::acquired_channel_t> beside = guard->channel().acquire();
     failures += expect_status(beside, status_code_t::contended_k);
     return failures;
 }
@@ -295,10 +295,10 @@ std::size_t pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
     medium_reference_t const medium = (*fixture)->media[0].reference();
 
     {
-        expected<io_channel_t::lease_t> lease = guard->channel().lease();
-        failures += expect(lease.has_value());
-        if (!lease) return failures;
-        write_pipeline_t writer {(*fixture)->disk, std::move(*lease), medium};
+        expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
+        failures += expect(acquired_channel.has_value());
+        if (!acquired_channel) return failures;
+        write_pipeline_t writer {(*fixture)->disk, std::move(*acquired_channel), medium};
         for (std::uint64_t index = 0; index != blocks_k; ++index) {
             expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
             failures += expect(block.has_value());
@@ -311,10 +311,10 @@ std::size_t pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
         failures += expect(writer.make_durable().succeeded());
     }
 
-    expected<io_channel_t::lease_t> lease = guard->channel().lease();
-    failures += expect(lease.has_value());
-    if (!lease) return failures;
-    read_pipeline_t reader {(*fixture)->disk, std::move(*lease), medium};
+    expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
+    failures += expect(acquired_channel.has_value());
+    if (!acquired_channel) return failures;
+    read_pipeline_t reader {(*fixture)->disk, std::move(*acquired_channel), medium};
     std::size_t seen = 0;
     std::size_t mismatches = 0;
     std::uint64_t offered = 0;
@@ -372,10 +372,10 @@ std::size_t pipeline_holds_its_depth(mount_type_ const& mount) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
 
-    expected<io_channel_t::lease_t> lease = guard->channel().lease();
-    failures += expect(lease.has_value());
-    if (!lease) return failures;
-    read_pipeline_t reader {(*fixture)->disk, std::move(*lease), (*fixture)->media[0].reference()};
+    expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
+    failures += expect(acquired_channel.has_value());
+    if (!acquired_channel) return failures;
+    read_pipeline_t reader {(*fixture)->disk, std::move(*acquired_channel), (*fixture)->media[0].reference()};
     std::uint64_t offered = 0;
     std::size_t polled_total = 0;
     std::size_t deepest = 0;
@@ -421,10 +421,10 @@ case_result_t pipeline_refuses_a_short_write(mount_type_ const& mount) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
 
-    expected<io_channel_t::lease_t> lease = guard->channel().lease();
-    failures += expect(lease.has_value());
-    if (!lease) return failures;
-    write_pipeline_t writer {(*fixture)->disk, std::move(*lease), (*fixture)->media[0].reference()};
+    expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
+    failures += expect(acquired_channel.has_value());
+    if (!acquired_channel) return failures;
+    write_pipeline_t writer {(*fixture)->disk, std::move(*acquired_channel), (*fixture)->media[0].reference()};
     expected<pooled_buffer_t> block = writer.acquire_buffer();
     failures += expect(block.has_value());
     if (!block) return failures;
@@ -452,10 +452,10 @@ std::size_t pipeline_reports_a_partial_read(mount_type_ const& mount) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
 
-    expected<io_channel_t::lease_t> lease = guard->channel().lease();
-    failures += expect(lease.has_value());
-    if (!lease) return failures;
-    read_pipeline_t reader {(*fixture)->disk, std::move(*lease), (*fixture)->media[0].reference()};
+    expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
+    failures += expect(acquired_channel.has_value());
+    if (!acquired_channel) return failures;
+    read_pipeline_t reader {(*fixture)->disk, std::move(*acquired_channel), (*fixture)->media[0].reference()};
     constexpr std::uint64_t reachable_k = block_bytes_k;
     failures += expect(
         reader.enqueue_read(extent_t {channels_config_k.volume_bytes - reachable_k, 2 * block_bytes_k}, 0).succeeded());

@@ -104,6 +104,19 @@ namespace fu = ashvardanian::forkunion;
 namespace st = ashvardanian::smashtable;
 namespace sz = ashvardanian::stringzilla;
 
+/** The base Linux adds to syscall numbers on MIPS and Alpha, so mirrored numbers add it too. */
+#if defined(_MIPS_SIM) && _MIPS_SIM == _ABIO32
+inline constexpr long linux_syscall_offset_k = 4000;
+#elif defined(_MIPS_SIM) && _MIPS_SIM == _ABI64
+inline constexpr long linux_syscall_offset_k = 5000;
+#elif defined(_MIPS_SIM) && _MIPS_SIM == _ABIN32
+inline constexpr long linux_syscall_offset_k = 6000;
+#elif defined(__alpha__)
+inline constexpr long linux_syscall_offset_k = 110;
+#else
+inline constexpr long linux_syscall_offset_k = 0;
+#endif
+
 namespace utilities {
 
 using f64_t = double;

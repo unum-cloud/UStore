@@ -4,10 +4,11 @@
  *  @date October 29, 2026
  *  @brief The binary interface between Apache Arrow and the views every call takes and answers.
  *
- *  Converters read one Arrow column into a @c ustore_keys_view_t or a @c ustore_strings_view_t in place, and exporters
- *  hand the keys, tapes and bitmaps a call wrote into an arena out as Arrow columns that pin that arena. Loops over
- *  whole collections, record batches and schemas belong to their callers: a cursor and the exporters move a collection
- *  out, and the converters and the writes, or an ingest of @c ustore/db.h, move one in.
+ *  Converters read one Arrow column into a @c ustore_keys_view_t or a @c ustore_strings_view_t in
+ *  place, and exporters hand the keys, tapes and bitmaps a call wrote into an arena out as Arrow
+ *  columns that read it in place. Loops over whole collections, record batches and schemas belong
+ *  to their callers: a cursor and the exporters move a collection out, and the converters and the
+ *  writes, or an ingest of @c ustore/db.h, move one in.
  *
  *  Keys are @c fixed_size_binary(16), tagged as the @c arrow.uuid extension or not, whose bytes are
  *  those of @c ustore_key_t, and byte strings are @c binary or @c large_binary, or @c utf8 and
@@ -245,12 +246,12 @@ USTORE_EXPORT ustore_status_t ustore_strings_view_from_arrow(struct ArrowSchema 
  *  @brief Exports @p count keys a call wrote into @p arena as one Arrow @c fixed_size_binary(16)
  *      column tagged as @c arrow.uuid, in place.
  *
- *  The array pins @p arena until its @c release: meanwhile a call naming the arena is
- *  refused with @c ustore_status_contended_k, and @c ustore_arena_free leaves the arena to
- *  the last release. Arenas on host pages export as @c ARROW_DEVICE_CPU, and those of a VRAM
- *  executor as @c ARROW_DEVICE_CUDA or @c ARROW_DEVICE_ROCM with the vendor's ordinal of
- *  their device and no @c sync_event, as the call that filled one waited for its device. The
- *  schema's @c name is empty, for the caller to point at its own.
+ *  The array reads @p arena's outputs until the arena's next call or free, like every other output
+ *  view, and its @c release frees only the array's own nodes. Arenas on host pages export as
+ *  @c ARROW_DEVICE_CPU, and those of a VRAM executor as @c ARROW_DEVICE_CUDA or
+ *  @c ARROW_DEVICE_ROCM with the vendor's ordinal of their device and no @c sync_event, as the
+ *  call that filled one waited for its device. The schema's @c name is empty, for the caller to
+ *  point at its own.
  *
  *  Keys of another stride, like the triples of edges, are copied dense into @p arena first, under
  *  the claim a call takes, so no other call or carving export runs on @p arena meanwhile; a device
@@ -258,7 +259,8 @@ USTORE_EXPORT ustore_status_t ustore_strings_view_from_arrow(struct ArrowSchema 
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k An output is missing, or dense keys lie outside @p arena.
- *  - @c ustore_status_contended_k A call fills @p arena, or another export carves it.
+ *  - @c ustore_status_contended_k Keys of another stride met a call filling @p arena, or another
+ *    export carving it, while being copied dense.
  *  - @c ustore_status_device_k No executor spawns on the arena's device, or it has no kernels.
  *  - @c ustore_status_out_of_memory_k An allocation failed.
  */
@@ -271,12 +273,15 @@ USTORE_EXPORT ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys,
  *      when the tape already has it.
  *
  *  A @c ustore_strings_u32_tape_k layout exports as @c binary and a @c ustore_strings_u64_tape_k
- *  one as @c large_binary, pinning @p arena as @c ustore_keys_view_to_arrow does. A tape of the
- *  other width has its offsets converted into @p arena first, under the claim, narrowed ones
- *  counted from the tape's first byte; a device arena's offsets cross to the host and back through
- *  an executor the export spawns on that device.
- *  @return The statuses of @c ustore_keys_view_to_arrow, with an accessor or an unknown @p layout refused as an invalid
- *      argument, and @c ustore_status_capacity_exhausted_k for strings spanning more bytes than 32-bit offsets reach.
+ *  one as @c large_binary, living until @p arena's next call or free as
+ *  @c ustore_keys_view_to_arrow does. A tape of the other width has its offsets converted into
+ *  @p arena first, under the claim, narrowed ones counted from the tape's first byte; a device
+ *  arena's offsets cross to the host and back through an executor the export spawns on that device.
+ *  Strings spanning more bytes than 32-bit offsets reach answer
+ *  @c ustore_status_capacity_exhausted_k.
+ *
+ *  @return The statuses of @c ustore_keys_view_to_arrow, contended only while converting a tape
+ *      of the other width, with an accessor or an unknown @p layout an invalid argument.
  */
 USTORE_EXPORT ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, ustore_size_t count,
                                                            ustore_strings_layout_t layout, ustore_arena_t arena,
@@ -288,12 +293,13 @@ USTORE_EXPORT ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t
  *      Arrow lays the column out alike.
  *
  *  Scalars export as the Arrow type of their width, UUIDs as @c fixed_size_binary(16) tagged as
- *  @c arrow.uuid, and binary strings as @c binary or @c large_binary by the width of their offsets,
- *  all in place. Booleans are packed into bits, and strings copied without the null byte ending
- *  every row into @c utf8 or @c large_utf8, behind the call's outputs in @p arena under the claim a
- *  call takes, on the arena's device for a device arena, through an executor the export spawns
- *  there, which also reads a @p column the gather left on the device. The array pins @p arena as
- *  @c ustore_keys_view_to_arrow does, and leaves its null count unknown.
+ *  @c arrow.uuid, and binary strings as @c binary or @c large_binary by the width of their
+ *  offsets, all in place. Booleans are packed into bits, and strings copied without the null byte
+ *  ending every row into @c utf8 or @c large_utf8, behind the call's outputs in @p arena under
+ *  the claim a call takes, on the arena's device for a device arena, through an executor the
+ *  export spawns there, which also reads a @p column the gather left on the device. The array
+ *  lives until @p arena's next call or free as @c ustore_keys_view_to_arrow does, and leaves its
+ *  null count unknown.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k An output or the @p column is missing, @p type is no

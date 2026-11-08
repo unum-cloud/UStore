@@ -43,15 +43,16 @@
 
 namespace unum::ustore::oracles::rocksdb {
 
-/** The widest StringZilla kernels this build compiled, as the engine serves every
- *  CPU class alike. */
-using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+/** The StringZilla kernels of the floor class, the only ones every CPU running this build can
+ *  execute, as the engine serves every CPU class alike. */
+using strings_kit_t = strings_kit_of<cpu_ladder_floor_k>;
 
 /** The database verbs of this engine. */
 database_verbs_t const database_verbs_k {
     .describe = &guarded<&database_describe>,
     .clear = &guarded<&database_clear>,
     .compact = &guarded<&database_compact>,
+    .flush = &guarded<&database_flush>,
     .snapshot_init = &guarded<&snapshot_init>,
     .snapshot_save = &guarded<&snapshot_save>,
     .collection_list = &guarded<&collection_list>,

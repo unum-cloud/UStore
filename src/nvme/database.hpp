@@ -85,25 +85,25 @@ template <cpu_class_t cpu_class_, value_layout_t value_layout_>
 using blobs_store_of =
     blobs::nvme_store<key_slot<stored_key_t, value_layout_>, typename storage_mount_of<cpu_class_>::volume_t,
                       atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, last_write_fold_t,
-                      blobs::no_device_fold_t>;
+                      blobs::no_device_fold_t, row_kit_of<cpu_class_>>;
 
 /** The store of a graph collection. */
 template <cpu_class_t cpu_class_>
-using graph_store_of =
-    graph::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                      atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, graph_device_fold_t>;
+using graph_store_of = graph::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
+                                         atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
+                                         graph_device_fold_t, row_kit_of<cpu_class_>>;
 
 /** The store of a docs collection. */
 template <cpu_class_t cpu_class_>
 using docs_store_of = docs::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
                                        atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
-                                       blobs::no_device_fold_t>;
+                                       blobs::no_device_fold_t, row_kit_of<cpu_class_>>;
 
 /** The store of a pages collection. */
 template <cpu_class_t cpu_class_>
 using pages_store_of = pages::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
                                          atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
-                                         blobs::no_device_fold_t>;
+                                         blobs::no_device_fold_t, row_kit_of<cpu_class_>>;
 
 /** The store of a strings collection, keyed by whole strings. */
 template <cpu_class_t cpu_class_>
@@ -152,8 +152,8 @@ struct store_tags_t {
 template <cpu_class_t cpu_class_>
 using basic_database_of =
     basic_database<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                   atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, store_tags_t,
-                   strings_store_of<cpu_class_>, graph_store_of<cpu_class_>, docs_store_of<cpu_class_>,
+                   atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, row_kit_of<cpu_class_>,
+                   store_tags_t, strings_store_of<cpu_class_>, graph_store_of<cpu_class_>, docs_store_of<cpu_class_>,
                    pages_store_of<cpu_class_>, blobs_store_of<cpu_class_, value_layout_t::inline_12_bytes_k>,
                    blobs_store_of<cpu_class_, value_layout_t::inline_44_bytes_k>,
                    blobs_store_of<cpu_class_, value_layout_t::fixed_width_k>,
@@ -1319,40 +1319,6 @@ status_t walk_strings_down(call_access<cpu_class_> const& access, collection_id_
     }
 }
 
-/** The strings one task of a strings call names: those starting with @c prefix, from @c start,
- *  inclusive, towards @c end, exclusive, in @c direction, where an empty start begins at the first
- *  string in the direction and an empty end bounds nothing. */
-struct strings_window_t {
-    std::string_view prefix;
-    std::string_view start;
-    std::string_view end;
-    ustore_scan_direction_t direction = ustore_scan_ascending_k;
-
-    /** The least string of the window, or of the prefix where the window names none. */
-    [[nodiscard]] std::string_view lower() const noexcept {
-        std::string_view const bound = direction == ustore_scan_descending_k ? end : start;
-        return std::max(bound, prefix);
-    }
-
-    /** The string the window stops at, exclusive for an ascending window and inclusive for a
-     *  descending one, or empty for none. */
-    [[nodiscard]] std::string_view upper() const noexcept {
-        return direction == ustore_scan_descending_k ? start : end;
-    }
-
-    /** Whether @p text, prefixed and not below @c lower, lies past the window's upper end. */
-    [[nodiscard]] bool past(std::string_view text) const noexcept {
-        std::string_view const bound = upper();
-        if (bound.empty()) return false;
-        return direction == ustore_scan_descending_k ? bound < text : !(text < bound);
-    }
-
-    /** Whether @p text is the exclusive end a descending window starts above. */
-    [[nodiscard]] bool skips(std::string_view text) const noexcept {
-        return direction == ustore_scan_descending_k && !end.empty() && text == end;
-    }
-};
-
 /**
  *  @brief Hands @p visitor every present string of @p window in @p collection, smallest first, or
  *      largest first in @p order descending, as @p access sees them: a transaction's own writes
@@ -1761,19 +1727,98 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const& 
     return compact_due(state);
 }
 
-/** Implements @c ustore_database_compact: flushing every collection, then merging every level over its bounds,
- *  reporting one unit per pass, as a pass merges every collection at once. */
+/**
+ *  @brief Fans the slices of one merge out over the threads of the executor a blocking compact runs
+ *      on, one slice per thread.
+ *
+ *  A blocking call runs once every earlier ticket finished and before the driver dispatches the
+ *  next batch, so this dispatch is the pool's only one. Each slice reads on the channel of the
+ *  thread running it, which nothing else takes meanwhile, and writes on a shared channel, of which
+ *  the open keeps one more per thread. A pool that refuses the dispatch leaves every slice to the
+ *  calling thread, in turn.
+ */
 template <cpu_class_t cpu_class_>
-status_t database_compact(ustore_database_compact_t const& arguments, view_t const&) noexcept {
+class compaction_fan_out {
+  public:
+    using channel_pool_t = typename storage_mount_of<cpu_class_>::channel_pool_t;
+
+    compaction_fan_out(pool_view_t pool, channel_pool_t& channels, view_t const& caller) noexcept
+        : pool_(pool), channels_(channels), scratch_(caller.scratch), caller_thread_(caller.thread_index) {}
+
+    /** One slice per thread of the pool. */
+    [[nodiscard]] std::size_t slices() const noexcept { return pool_.threads_count(); }
+
+    /** Runs @p slice once per index on the pool's threads, answering the first failure. */
+    status_t run(compaction_fan_out_t::slice_call_t const& slice) noexcept {
+        st::vector<status_t, arena_allocator<status_t>> statuses {{scratch_}};
+        if (statuses.resize(slices()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A merge could not track its slices"};
+        auto run_slice = [&](std::size_t task, std::size_t thread) noexcept {
+            auto [reading, reading_status] = channels_.acquire(thread);
+            if (reading_status.failed()) {
+                statuses[task] = reading_status;
+                return;
+            }
+            auto [writing, writing_status] = channels_.acquire();
+            if (writing_status.failed()) {
+                statuses[task] = writing_status;
+                return;
+            }
+            statuses[task] = slice(task, reading.channel(), writing.channel());
+        };
+        if (st::failed(pool_.for_n_dynamic(statuses.size(), run_slice)))
+            for (std::size_t task = 0; task != statuses.size(); ++task) run_slice(task, caller_thread_);
+        for (status_t const& status : statuses)
+            if (status.failed()) return status;
+        return {};
+    }
+
+  private:
+    /** The executor's pool, idle while the blocking call runs. */
+    pool_view_t pool_;
+
+    /** The mount's channels, one per executor thread and the shared ones. */
+    channel_pool_t& channels_;
+
+    /** The calling thread's scratch, which holds every slice's status. */
+    ustore_arena_t scratch_;
+
+    /** The calling thread's index among the executor's, whose channel it reads on when it runs
+     *  the slices itself. */
+    std::size_t caller_thread_ = 0;
+};
+
+/** Implements @c ustore_database_compact: flushing every collection, then merging every level
+ *  over its bounds, reporting one unit per pass, as a pass merges every collection at once. A
+ *  blocking call on the executor that opened the database fans every merge on the host out over
+ *  that executor's threads. */
+template <cpu_class_t cpu_class_>
+status_t database_compact(ustore_database_compact_t const& arguments, view_t const& view) noexcept {
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const flushed = state.store->flush(); flushed.failed()) return flushed;
+    std::optional<compaction_fan_out<cpu_class_>> threads;
+    compaction_fan_out_t fan_out;
+    auto fan_out_on = [&]<typename mount_type_>(mount_type_& mount) noexcept {
+        if constexpr (std::is_same_v<mount_type_, storage_mount_of<cpu_class_>>)
+            fan_out = compaction_fan_out_t {threads.emplace(view_of(view.executor->pool), mount.channels(), view)};
+        return status_t {};
+    };
+    if (arguments.completion == ustore_completion_blocking_k && view.executor && view.executor == state.executor)
+        if (status_t const visited = state.resources->storage.visit(fan_out_on); visited.failed()) return visited;
     progress_t progress {arguments.progress, arguments.progress_state, compaction_passes_k};
     for (std::size_t pass = 0; pass != compaction_passes_k; ++pass) {
         if (state.store->needs_compaction())
-            if (status_t const compacted = state.store->compact(); compacted.failed()) return compacted;
+            if (status_t const compacted = state.store->compact(fan_out); compacted.failed()) return compacted;
         if (!progress.advance(1)) return progress_cancelled_k;
     }
     return {};
+}
+
+/** Implements @c ustore_database_flush, writing every collection's memory runs and publishing the
+ *  manifest naming them. */
+template <cpu_class_t cpu_class_>
+status_t database_flush(ustore_database_flush_t const& arguments, view_t const&) noexcept {
+    return database_state_of<cpu_class_>(arguments).store->flush();
 }
 
 #pragma endregion Database Calls
@@ -2061,6 +2106,8 @@ inline status_t read_options(ustore_database_open_nvme_t const& arguments, resou
                       take_unless_zero(collections.value_size, arguments.collection_value_size) &&
                       take_unless_zero(collections.value_max_size, arguments.collection_value_max_size);
     if (!fits) return {status_code_t::invalid_argument_k, "An option of the engine exceeds its range"};
+    // A merge fanned out over the executor writes every slice on a shared channel of its own
+    resources.shared_io_channels += placement.threads;
     auto ignore_issue = [](issue_kind_t, std::string_view) noexcept {};
     if (!validate(resources, transactions, ignore_issue) || !validate(resources, collections, ignore_issue))
         return {status_code_t::invalid_argument_k, "The configuration of the engine is invalid"};
@@ -2115,11 +2162,11 @@ expected<compactor_ref_t> compactor_of(database_state<cpu_class_>& state, resour
                                        ustore_executor_handle_t const* compactions) noexcept {
     if (!compactions) return compactor_ref_t {};
     typename device_compaction<cpu_class_>::volume_t const* volume = nullptr;
-    [[maybe_unused]] status_t const visited = state.resources->storage.visit([&](auto& mount) noexcept -> status_t {
-        if constexpr (std::is_same_v<std::remove_reference_t<decltype(mount)>, storage_mount_of<cpu_class_>>)
-            volume = &mount.volume();
-        return {};
-    });
+    [[maybe_unused]] status_t const visited = state.resources->storage.visit(
+        [&]<typename mount_type_>(mount_type_& mount) noexcept -> status_t {
+            if constexpr (std::is_same_v<mount_type_, storage_mount_of<cpu_class_>>) volume = &mount.volume();
+            return {};
+        });
     if (!volume) return status_t {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     device_compaction<cpu_class_>& compaction = state.compaction.emplace();
     if (status_t const opened = compaction.open(*compactions, resources, *volume); opened.failed()) return opened;
@@ -2132,9 +2179,8 @@ expected<compactor_ref_t> compactor_of(database_state<cpu_class_>& state, resour
 template <cpu_class_t cpu_class_>
 status_t mount_store(database_state<cpu_class_>& state, database_config_t const& transactions,
                      compactor_ref_t compactor) noexcept {
-    return state.resources->storage.visit([&](auto& mount) noexcept -> status_t {
-        using mount_t = std::remove_reference_t<decltype(mount)>;
-        if constexpr (std::is_same_v<mount_t, storage_mount_of<cpu_class_>>)
+    return state.resources->storage.visit([&]<typename mount_type_>(mount_type_& mount) noexcept -> status_t {
+        if constexpr (std::is_same_v<mount_type_, storage_mount_of<cpu_class_>>)
             return state.store->mount(mount.volume(), mount.channels(), transactions, compactor,
                                       strings_kit_sha256<strings_kit_of<cpu_class_>> {});
         else return {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};

@@ -472,7 +472,7 @@ class basic_single_collection_database {
     using key_slot_t = typename collection_t::key_slot_t;
 
     /** The transport the volume moves bytes through. */
-    using disk_t = std::remove_reference_t<decltype(std::declval<volume_t&>().disk())>;
+    using disk_t = typename volume_t::disk_t;
 
     /** An ordered walk over that collection, memory runs merged in front of every run. */
     using scanner_t = nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_,

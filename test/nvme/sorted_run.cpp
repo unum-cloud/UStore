@@ -415,9 +415,9 @@ status_t read_raw(disk_type_& disk, io_channel_t& channel, medium_extent_t const
     if (into.resize(static_cast<std::size_t>(length)) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "No room for the raw bytes"};
     std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
-    auto [reader_lease, reader_lease_status] = channel.lease();
-    if (reader_lease_status.failed()) return reader_lease_status;
-    basic_read_pipeline<disk_type_> reader {disk, std::move(reader_lease), blob.medium};
+    auto [reader_channel, reader_channel_status] = channel.acquire();
+    if (reader_channel_status.failed()) return reader_channel_status;
+    basic_read_pipeline<disk_type_> reader {disk, std::move(reader_channel), blob.medium};
     status_t moved;
     auto sink = [&](completed_buffer_t const& completed) noexcept {
         if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
@@ -644,9 +644,9 @@ status_t paint_stub_header(disk_type_& disk, io_channel_t& channel, medium_refer
     header.value_layout = value_layout_t::variable_width_k;
     header.content_id = uuid_generator();
 
-    auto [writer_lease, writer_lease_status] = channel.lease();
-    if (writer_lease_status.failed()) return writer_lease_status;
-    basic_write_pipeline<disk_type_, waiter_t> writer {disk, std::move(writer_lease), medium};
+    auto [writer_channel, writer_channel_status] = channel.acquire();
+    if (writer_channel_status.failed()) return writer_channel_status;
+    basic_write_pipeline<disk_type_, waiter_t> writer {disk, std::move(writer_channel), medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     std::memset(block.bytes().data(), 0, static_cast<std::size_t>(run_config_k.page_bytes));
@@ -1190,10 +1190,10 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
 
     // The test's own pipeline gives the queue pair back before the run's batched read takes it.
     {
-        expected<io_channel_t::lease_t> lease = guard->channel().lease();
-        failures += expect(lease.has_value());
-        if (!lease) return failures;
-        read_pipeline_t reader {(*fixture)->disk, std::move(*lease), run->extent().medium};
+        expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
+        failures += expect(acquired_channel.has_value());
+        if (!acquired_channel) return failures;
+        read_pipeline_t reader {(*fixture)->disk, std::move(*acquired_channel), run->extent().medium};
         std::size_t offered = 0;
         std::size_t polled_total = 0;
         std::size_t mismatches = 0;

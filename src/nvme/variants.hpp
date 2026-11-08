@@ -67,6 +67,7 @@ database_verbs_t const nvme_variant<cpu_class_>::database_verbs_k {
     .describe = &database_describe<cpu_class_>,
     .clear = &database_clear<cpu_class_>,
     .compact = &database_compact<cpu_class_>,
+    .flush = &database_flush<cpu_class_>,
     .snapshot_init = &snapshot_init<cpu_class_>,
     .snapshot_save = &snapshot_save<cpu_class_>,
     .collection_list = &collection_list<cpu_class_>,

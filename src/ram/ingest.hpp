@@ -15,10 +15,11 @@
 
 #include <cstddef> // `std::size_t`
 
-#include <algorithm>   // `std::is_sorted`, `std::stable_sort`
+#include <algorithm>   // `std::is_sorted`
 #include <array>       // `std::array`
 #include <iterator>    // `std::make_move_iterator`
 #include <new>         // `std::nothrow`
+#include <span>        // `std::span`
 #include <type_traits> // `std::is_same_v`
 #include <utility>     // `std::move`
 #include <variant>     // `std::variant`, `std::get_if`
@@ -31,6 +32,7 @@
 #include "ustore/graph/half_edges.hpp"      // `half_edge_t`, `half_edge_direction_t`
 #include "ustore/pages/ram_store.hpp"       // `page_pair_t`
 #include "ustore/strings/ram_store.hpp"     // `string_pair_t`, `string_key_from`
+#include "ustore/utilities/algorithm.hpp"   // `merge_sort`
 #include "ustore/utilities/ram_buffers.hpp" // `growth_status`
 
 #include "database.hpp"          // `database_state`, `transaction_source`, `for_each_run`, `persist`
@@ -150,18 +152,19 @@ status_t bucket_entries(store_type_ const& store, ingested_entries<typename stor
     return {};
 }
 
-/** Sorts the entries of one partition, unless they already ascend, and drops every entry a later one of the same
- *  key repeats, answering where the kept entries end. */
+/** Sorts the entries of one partition through @p scratch, unless they already ascend, and drops
+ *  every entry a later one of the same key repeats, answering where the kept entries end. */
 template <typename store_type_>
 std::size_t settle_partition(ingested_entries<typename store_type_::value_t>& bucketed, std::size_t first,
-                             std::size_t end) noexcept {
+                             std::size_t end, std::span<typename store_type_::value_t> scratch) noexcept {
     using entry_t = typename store_type_::value_t;
     entry_t* const begin = bucketed.data();
     auto const ordered = [](entry_t const& left, entry_t const& right) noexcept {
         return precedes<store_type_>(left, right);
     };
     // A stable sort keeps a repeated key's rows in their order, so the last of each run is the last row
-    if (!std::is_sorted(begin + first, begin + end, ordered)) std::stable_sort(begin + first, begin + end, ordered);
+    if (!std::is_sorted(begin + first, begin + end, ordered))
+        utilities::merge_sort(std::span<entry_t> {bucketed}.subspan(first, end - first), scratch, ordered);
     std::size_t kept = first;
     for (std::size_t index = first; index != end; ++index) {
         if (index + 1 != end && !ordered(begin[index], begin[index + 1])) continue;
@@ -183,17 +186,26 @@ status_t stage_ingest(store_type_& store, part_type_& part, ustore_ingest_order_
     if (status_t const bucketed_status = bucket_entries(store, entries, bucketed, offsets); bucketed_status.failed())
         return bucketed_status;
     bool const sorts = order == ustore_ingest_unsorted_k || std::is_same_v<entry_t, half_edge_t>;
+    // The entries moved out keep their room, which the sorts merge through without allocating.
+    if (sorts)
+        if (status_t const resized = growth_status(entries.resize(bucketed.size())); resized.failed()) return resized;
+    status_t staged_status;
     for (std::size_t partition = 0; partition != store_type_::partitions_k; ++partition) {
         std::size_t const first = offsets[partition];
-        std::size_t const end = sorts ? settle_partition<store_type_>(bucketed, first, offsets[partition + 1])
+        std::size_t const end = sorts ? settle_partition<store_type_>(bucketed, first, offsets[partition + 1],
+                                                                      std::span<entry_t> {entries})
                                       : offsets[partition + 1];
         if (first == end) continue;
         entry_t* const begin = bucketed.data();
         store_status_t const staged = part.upsert_partition(partition, std::make_move_iterator(begin + first),
                                                             std::make_move_iterator(begin + end), st::assume_sorted);
-        if (st::failed(staged)) return translate(staged);
+        if (st::failed(staged)) {
+            staged_status = translate(staged);
+            break;
+        }
     }
-    return {};
+    entries.clear();
+    return staged_status;
 }
 
 /** An ingest under way: its database, collection and order, and every entry appended so far. */

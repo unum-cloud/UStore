@@ -14,7 +14,7 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
-#include <algorithm>       // `std::upper_bound`
+#include <algorithm>       // `std::sort`, `std::upper_bound`
 #include <array>           // `std::array`
 #include <map>             // `std::map`
 #include <memory>          // `std::addressof`
@@ -33,6 +33,7 @@
 
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`, `epoch_domain`
 #include "ustore/blobs/nvme_memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_deltas`
+#include "ustore/utilities/algorithm.hpp"        // `sort_by_stored_key`
 
 namespace unum::ustore::test {
 
@@ -158,6 +159,33 @@ static std::size_t removal_and_empty_value_differ() {
     failures += check(!view->find(10, 4, found) && !view->find(30, 5, found));
     failures += check(view->written_since(20, 4) && !view->written_since(20, 5) && !view->written_since(30, 0));
     failures += check(view->range_written_since(11, 20, 4) && !view->range_written_since(11, 19, 4));
+    return failures;
+}
+
+/** Sorting orders deltas by key, by insertion below 64 entries and by radix from there, through
+ *  bytes every key shares and runs of one repeated key, as a library sort over the same 16-byte
+ *  keys orders them. */
+static std::size_t sort_orders_by_key() {
+    using wide_delta_t = keyed_delta<st::key128_t>;
+    std::size_t failures = 0;
+    std::mt19937_64 generator(42);
+    for (std::size_t const count : {std::size_t {20}, std::size_t {1000}}) {
+        std::vector<wide_delta_t> deltas(count);
+        for (std::size_t index = 0; index != count; ++index) {
+            std::uint64_t const high = (generator() % 4) << 40;
+            std::uint64_t const low = (generator() % 3) << 16;
+            deltas[index] = wide_delta_t {{high, low}, {delta_kind_t::remove_k, {}}};
+        }
+        std::vector<wide_delta_t> reference = deltas;
+        std::sort(reference.begin(), reference.end(), [](wide_delta_t const& first, wide_delta_t const& second) {
+            return first.stored_key < second.stored_key;
+        });
+        utilities::sort_by_stored_key(std::span<wide_delta_t> {deltas});
+        std::size_t mismatched = 0;
+        for (std::size_t index = 0; index != count; ++index)
+            mismatched += deltas[index].stored_key != reference[index].stored_key;
+        failures += check(mismatched == 0);
+    }
     return failures;
 }
 
@@ -470,6 +498,7 @@ int main() {
     counted("memory_run.refusals", refusals);
     counted("memory_run.removal_and_empty_value_differ", removal_and_empty_value_differ);
     counted("memory_run.range_tombstones_hide_older_runs", range_tombstones_hide_older_runs);
+    counted("memory_run.sort_orders_by_key", sort_orders_by_key);
     counted("collection_view.random_streams_match_model", random_streams_match_model);
     counted("collection_view.readers_against_one_publisher", readers_against_one_publisher);
     fmt::println("total {} passed, {} failed", total - failed, failed);

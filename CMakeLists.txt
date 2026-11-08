@@ -9,7 +9,7 @@ project(
     LANGUAGES C CXX
     VERSION ${ustore_version_number_}
     HOMEPAGE_URL "https://github.com/unum-cloud/UStore"
-    DESCRIPTION "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
+    DESCRIPTION "GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass"
 )
 
 # Git does not run hooks shipped inside a clone, so configuring the build points `core.hooksPath` at `.githooks`.
@@ -514,7 +514,7 @@ if (${USTORE_BUILD_TEST})
         "strings"
     )
     list(TRANSFORM ustore_abi_names_ PREPEND "abi/" OUTPUT_VARIABLE ustore_abi_paths_)
-    set(ustore_test_paths_ ${ustore_abi_paths_} "compilation" "strings_collection")
+    set(ustore_test_paths_ ${ustore_abi_paths_} "compilation" "strings/collection")
     # Every suite reaching the one GPU the machine shares, which CTest runs one at a time
     set(ustore_gpu_tests_)
 
@@ -716,8 +716,14 @@ if (${USTORE_BUILD_TEST})
         endforeach ()
     endforeach ()
 
+    # The kernel ABI suite compares the Linux mirrors to the kernel's own headers, which only Linux has
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(ustore_utilities_test_names_ "ram_buffers" "algorithm" "kernel_abi")
+    else ()
+        set(ustore_utilities_test_names_ "ram_buffers" "algorithm")
+    endif ()
+
     # The templates of `include/ustore/` build against the header target alone, with no engine linked
-    set(ustore_utilities_test_names_ "ram_buffers" "algorithm")
     foreach (test_name_ IN ITEMS ${ustore_utilities_test_names_})
         add_executable(ustore_test_utilities_${test_name_} test/utilities/${test_name_}.cpp)
         target_include_directories(ustore_test_utilities_${test_name_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
@@ -803,7 +809,8 @@ if (${USTORE_BUILD_TEST})
     endforeach ()
 
     foreach (stress_name_ IN ITEMS ${ustore_stress_names_})
-        add_executable(ustore_stress_${stress_name_} test/stress_${stress_name_}.cpp)
+        add_executable(ustore_stress_${stress_name_} test/abi/stress_${stress_name_}.cpp)
+        target_include_directories(ustore_stress_${stress_name_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(ustore_stress_${stress_name_} PRIVATE ustore::static fmt::fmt ustore_warnings)
         foreach (engine_name_ IN ITEMS ${ustore_engine_names_})
             add_test(NAME ustore_stress_${stress_name_}_${engine_name_}
@@ -821,7 +828,8 @@ if (${USTORE_BUILD_TEST})
             ustore_test_tools_arrow_ipc PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
         )
         add_test(NAME ustore_test_tools_arrow_ipc COMMAND ustore_test_tools_arrow_ipc)
-        add_executable(ustore_test_tools test/tools.cpp tools/dataset.cpp tools/dataset_arrow.cpp)
+        add_executable(ustore_test_tools test/tools/dataset.cpp tools/dataset.cpp tools/dataset_arrow.cpp)
+        target_include_directories(ustore_test_tools PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(ustore_test_tools PRIVATE ustore::static fmt::fmt ustore_warnings)
         add_dependencies(ustore_test_tools ustore_cli)
         foreach (engine_name_ IN ITEMS ${ustore_engine_names_})
@@ -893,6 +901,9 @@ if (${USTORE_BUILD_BENCH})
         # The PubChem ingest opens the engine through the C ABI alone, so one source measures every layout shipped
         add_executable(ustore_bench_nvme_pubchem bench/nvme_pubchem.cpp)
         target_link_libraries(ustore_bench_nvme_pubchem PRIVATE ustore::static fmt::fmt ustore_warnings)
+
+        add_executable(ustore_bench_compaction bench/compaction.cpp)
+        target_link_libraries(ustore_bench_compaction PRIVATE ustore::static fmt::fmt ustore_warnings)
 
         add_executable(ustore_bench_nvme_single_collection_database bench/nvme_single_collection_database.cpp)
         target_link_libraries(

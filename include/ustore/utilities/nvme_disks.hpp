@@ -43,9 +43,8 @@
 #if USTORE_OS_LINUX_
 #include <linux/falloc.h> // `FALLOC_FL_PUNCH_HOLE`, `FALLOC_FL_KEEP_SIZE`
 #include <linux/fs.h>     // `BLKGETSIZE64`, `BLKDISCARD`
-#include <linux/stat.h>   // `struct statx`, `STATX_DIOALIGN`
 #include <sys/ioctl.h>    // `ioctl`
-#include <sys/syscall.h>  // `__NR_statx`
+#include <sys/syscall.h>  // `SYS_statx`
 #endif
 
 #include <bit>      // `std::has_single_bit`
@@ -1134,14 +1133,55 @@ inline status_t deallocate_native_file(native_file_t file, extent_t extent) noex
     return {};
 }
 
+#pragma region Kernel
+
+/** @c statx_timestamp. */
+struct linux_statx_timestamp_t {
+    std::int64_t tv_sec;
+    std::uint32_t tv_nsec;
+    std::int32_t reserved;
+};
+
+/** @c statx, with the unbuffered-read alignments Linux 6.1 added. */
+struct linux_statx_t {
+    std::uint32_t mask;
+    std::uint32_t blksize;
+    std::uint64_t attributes;
+    std::uint32_t nlink;
+    std::uint32_t uid;
+    std::uint32_t gid;
+    std::uint16_t mode;
+    std::uint16_t spare0;
+    std::uint64_t ino;
+    std::uint64_t size;
+    std::uint64_t blocks;
+    std::uint64_t attributes_mask;
+    linux_statx_timestamp_t atime;
+    linux_statx_timestamp_t btime;
+    linux_statx_timestamp_t ctime;
+    linux_statx_timestamp_t mtime;
+    std::uint32_t rdev_major;
+    std::uint32_t rdev_minor;
+    std::uint32_t dev_major;
+    std::uint32_t dev_minor;
+    std::uint64_t mnt_id;
+    std::uint32_t dio_mem_align;
+    std::uint32_t dio_offset_align;
+    std::uint64_t spare3[12];
+};
+static_assert(sizeof(linux_statx_t) == 256, "the kernel writes a 256-byte statx");
+
+#pragma endregion Kernel
+
 /** Asks @p file's filesystem what unbuffered access demands, falling back to
- *  the portable numbers. */
+ *  the portable numbers. The @c STATX_DIOALIGN mask bit is from Linux 6.1. */
 [[nodiscard]] inline direct_alignment_t direct_alignment_of(native_file_t file) noexcept {
-    struct statx description {};
-    if (::syscall(__NR_statx, file, "", AT_EMPTY_PATH, STATX_DIOALIGN, &description) != 0) return {};
-    if ((description.stx_mask & STATX_DIOALIGN) == 0) return {};
-    if (description.stx_dio_mem_align == 0 || description.stx_dio_offset_align == 0) return {};
-    return direct_alignment_t {description.stx_dio_mem_align, description.stx_dio_offset_align};
+    std::uint32_t const dioalign = 0x2000; // STATX_DIOALIGN
+    linux_statx_t description {};
+    if (::syscall(SYS_statx, file, "", AT_EMPTY_PATH, dioalign, &description) != 0) return {};
+    if ((description.mask & dioalign) == 0) return {};
+    if (description.dio_mem_align == 0 || description.dio_offset_align == 0) return {};
+    return direct_alignment_t {description.dio_mem_align, description.dio_offset_align};
 }
 
 #elif USTORE_OS_APPLE_

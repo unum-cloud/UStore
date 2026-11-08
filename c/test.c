@@ -107,6 +107,14 @@ int main(void) {
     failures += expect_success(&outcome, __LINE__);
     if (failures) return 1;
 
+    // An arena made for the calling thread lives on host pages
+    ustore_arena_description_t arena_description = {0};
+    ustore_arena_describe_t arena_describe = {.arena = arena, .outcome = &outcome, .description = &arena_description};
+    ustore_arena_describe(&arena_describe);
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(arena_description.residency == ustore_residency_ram_k, __LINE__);
+    failures += expect(arena_description.device == -1, __LINE__);
+
     // No collection exists until one is created, and every call names the collections it addresses
     ustore_collection_id_t blobs = {{{0}}};
     ustore_collection_create_t create_blobs = {.database = database,
@@ -246,7 +254,8 @@ int main(void) {
     failures += expect(pulled == 0 && found_keys == NULL, __LINE__);
     ustore_blobs_cursor_free(keys_cursor);
 
-    // A tape a read wrote exports as an Arrow column pinning its arena, which refuses the next call until released
+    // A tape a read wrote exports as an Arrow column reading its arena in place until the
+    // arena's next call
     ustore_arena_t exported = NULL;
     ustore_arena_init_t exported_init = {.arena = &exported, .outcome = &outcome};
     ustore_arena_init(&exported_init);
@@ -258,17 +267,15 @@ int main(void) {
     failures += expect(ustore_strings_view_to_arrow(values, 3, ustore_strings_u32_tape_k, exported, &schema, &column) ==
                            ustore_status_success_k,
                        __LINE__);
-    ustore_blobs_read(&read);
-    failures += expect(outcome.status == ustore_status_contended_k, __LINE__);
     ustore_strings_view_t converted = {0};
     ustore_size_t converted_count = 0;
     failures += expect(ustore_strings_view_from_arrow(&schema, &column.array, &converted, &converted_count) ==
                                ustore_status_success_k &&
                            converted_count == 3 && tape_holds(&converted, 2, "blue"),
                        __LINE__);
-    ustore_arena_free(exported);
     if (column.array.release) column.array.release(&column.array);
     if (schema.release) schema.release(&schema);
+    ustore_arena_free(exported);
     read.arena = arena;
 
     // A strings cursor copies its prefix and walks the strings it starts, with the keys they map onto

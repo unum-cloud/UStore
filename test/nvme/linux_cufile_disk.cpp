@@ -150,10 +150,10 @@ case_result_t cufile_moves_device_memory(linux_cufile_files_disk_t& disk, medium
     std::span<byte_t> const read = whole(host).subspan(device_bytes_k);
     paint(written, 41);
 
-    expected<queue_pair_t> leased = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(leased.has_value());
-    if (!leased) return failures;
-    queue_pair_t queue_pair = std::move(*leased);
+    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
+    failures += expect(acquired.has_value());
+    if (!acquired) return failures;
+    queue_pair_t queue_pair = std::move(*acquired);
     expected<registered_memory_t> host_registered = disk.register_memory(whole(host), memory_space_t::host_k);
     expected<registered_memory_t> device_registered = disk.register_memory(device.bytes(), memory_space_t::gpu_k);
     failures += expect(host_registered.has_value() && device_registered.has_value());

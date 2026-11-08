@@ -1,5 +1,5 @@
 /**
- *  @file test/stress_atomicity.cpp
+ *  @file test/abi/stress_atomicity.cpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
  *  @brief Stress test that concurrent batched transactions land whole or not at all.
@@ -139,8 +139,8 @@ struct batches_t {
     return 0;
 }
 
-/** Makes the arena of @p run, fills its keys, seeds one generator per thread, and begins their transactions when the
- *  engine has them. */
+/** Makes the arena of @p run, fills its keys, seeds one generator per thread, and begins their
+ *  transactions when the engine has them. */
 [[nodiscard]] std::size_t prepare_run(atomicity_run_t& run, atomicity_options_t const& options, random_t random) {
     auto [arena, arena_status] = arena_t::make();
     run.arena = std::move(arena);
@@ -160,7 +160,8 @@ struct batches_t {
 
 #pragma region Round
 
-/** Commits one batch, retrying staging and conflicts until it lands, and fails only when no transaction begins. */
+/** Commits one batch, retrying staging and conflicts until it lands, and fails only when
+ *  no transaction begins. */
 std::size_t commit_batch(transaction_t& transaction, ustore_collection_id_t target, keys_view_t keys,
                          value_view_t value, batch_operation_t operation) {
     while (true) {
@@ -196,7 +197,8 @@ std::size_t verify_batch(blobs_collection_t& collection, arena_t& arena, keys_vi
     return failures;
 }
 
-/** Runs one round: every thread writes every batch, then the main thread checks what they left and clears it. */
+/** Runs one round: every thread writes every batch, then the main thread checks what they left
+ *  and clears it. */
 std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t const& batches) {
     std::span<writer_slot_t> const slots {run.slots.data(), batches.threads_count};
     auto writer = [&](std::size_t thread) noexcept { write_round(slots[thread], run.collection, batches, thread); };
@@ -213,7 +215,8 @@ std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t cons
 #pragma region Configurations
 
 /**
- *  @brief Checks that batches written, or periodically erased, by competing threads hold one value in all their keys.
+ *  @brief Checks that batches written, or periodically erased, by competing threads hold one value
+ *      in all their keys.
  *
  *  Each thread picks its own value per batch, so once all threads finish a round every batch must
  *  hold one value in all of its keys, whichever thread won it. Every round ends by clearing the
@@ -250,7 +253,8 @@ std::size_t inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& 
     return failures;
 }
 
-/** Runs every thread count against every batch size, erasing batches when @p deletes asks for it. */
+/** Runs every thread count against every batch size, erasing batches when @p deletes
+ *  asks for it. */
 std::size_t database_inserts(atomicity_run_t& run, atomicity_options_t const& options, round_deletes_t deletes) {
     if (!run.database.supports_transactions()) return 0;
     std::size_t const configurations_count = 2 * options.threads.size * options.batch_sizes.size;

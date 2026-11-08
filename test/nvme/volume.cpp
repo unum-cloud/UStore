@@ -17,9 +17,10 @@
 #include <cstdio>  // `std::fopen`, `std::fwrite`, `std::fseek`, `std::fclose`
 #include <cstring> // `std::memcpy`
 
-#include <array>      // `std::array`
-#include <filesystem> // `std::filesystem::resize_file`, `std::filesystem::exists`
-#include <span>       // `std::span`
+#include <array>       // `std::array`
+#include <filesystem>  // `std::filesystem::resize_file`, `std::filesystem::exists`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -517,13 +518,23 @@ std::size_t addresses_read_their_forms() {
     return failures;
 }
 
-/** io_uring named outright never falls back, while the automatic choice does. */
+/** io_uring named outright never falls back, while the automatic choice does, and a kernel refusing
+ *  a setup flag surfaces as unsupported with the Linux version the transport needs. */
 std::size_t probed_transport_refuses_a_missing_ring() {
     std::size_t failures = 0;
     for (linux_uring_probe_t const missing : {linux_uring_probe_t::refused_k, linux_uring_probe_t::too_old_k})
         failures += expect_status(
             probed_transport(io_transport_t::linux_uring_k, missing, linux_aio_probe_t::available_k),
             status_code_t::unsupported_k);
+    // A sandbox refusing every ring answers refused_k for any flag, so only a machine with rings
+    // can tell a refused one
+    if (linux_uring_files_disk_t::probe() == linux_uring_probe_t::available_k) {
+        linux_uring_probe_t const refused_flag = linux_uring_files_disk_t::probe(std::uint32_t {1} << 31);
+        failures += expect(refused_flag == linux_uring_probe_t::too_old_k);
+        auto [old, old_status] = probed_transport(io_transport_t::linux_uring_k, refused_flag,
+                                                  linux_aio_probe_t::available_k);
+        failures += expect(std::string_view {old_status.message}.find("Linux 6.12") != std::string_view::npos);
+    }
     auto [automatic, automatic_status] = probed_transport(io_transport_t::automatic_k, linux_uring_probe_t::too_old_k,
                                                           linux_aio_probe_t::available_k);
     failures += expect(automatic_status.succeeded());

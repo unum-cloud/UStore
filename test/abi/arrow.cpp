@@ -531,9 +531,9 @@ std::size_t arrow_docs_columns_export(config_t const& config) {
     return failures;
 }
 
-/** A cursor's keys and values export in place, read back through the converters, pin the arena against the next
- *  call until released, and outlive the arena's free. */
-std::size_t arrow_exports_pin_the_arena(config_t const& config) {
+/** A cursor's keys and values export in place and read back through the converters until the
+ *  arena's next call. */
+std::size_t arrow_exports_read_in_place(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
@@ -638,13 +638,9 @@ std::size_t arrow_exports_pin_the_arena(config_t const& config) {
     wide_array.array.release(&wide_array.array);
     wide_schema.release(&wide_schema);
 
-    // While exported, the arena refuses the next pull, which clears its outputs
     ustore_key_t const* const pulled_keys = keys;
     ustore_size_t const pulled = written;
     std::string const first_value = cell_of(values, 0);
-    ustore_blobs_cursor_next(&next);
-    failures += expect_status(status_t {outcome}, status_code_t::contended_k);
-
     ustore_keys_view_t read_keys {};
     ustore_strings_view_t read_values {};
     ustore_size_t key_count = 0, value_count = 0;
@@ -654,8 +650,6 @@ std::size_t arrow_exports_pin_the_arena(config_t const& config) {
                           ustore_status_success_k);
     failures += expect(read_keys.data == pulled_keys && key_count == pulled && value_count == pulled);
 
-    // Freed while exported, the arena lives until the last release
-    ustore_arena_free(arena);
     failures += expect(cell_of(read_values, 0) == first_value);
     failures += expect(cell_of(read_keys.data[39]) == cell_of(key_from_integer(40)));
     key_array.array.release(&key_array.array);
@@ -663,6 +657,7 @@ std::size_t arrow_exports_pin_the_arena(config_t const& config) {
     value_array.array.release(&value_array.array);
     key_schema.release(&key_schema);
     value_schema.release(&value_schema);
+    ustore_arena_free(arena);
     ustore_blobs_cursor_free(cursor);
     return failures;
 }
@@ -944,7 +939,7 @@ int main(int argc, char** argv) {
     config_t const config {options.engine, directory};
 
     report(totals, "arrow.converters", arrow_converters, config);
-    report(totals, "arrow.exports_pin_the_arena", arrow_exports_pin_the_arena, config);
+    report(totals, "arrow.exports_read_in_place", arrow_exports_read_in_place, config);
     report(totals, "arrow.docs_columns_export", arrow_docs_columns_export, config);
     report(totals, "arrow.ingest_per_engine", arrow_ingest_per_engine, config);
     report(totals, "arrow.ingest_equals_writes", arrow_ingest_equals_writes, config);
