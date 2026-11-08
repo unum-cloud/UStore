@@ -13,6 +13,13 @@
 # Bypass knowingly, which you almost never should, with: git commit --no-verify
 
 set -u
+
+# CITATION.cff cites the concept DOI, which spans every release, so it never carries a version.
+if git show :CITATION.cff 2> /dev/null | grep -q '^version:'; then
+    echo "pre-commit: CITATION.cff carries no version; the concept DOI spans every release." >&2
+    exit 1
+fi
+
 export LC_ALL=C # Byte-wise regexes, immune to the committer's locale
 unset FORCE_COLOR CLICOLOR_FORCE # Plain tool output, since the checks parse it by its colons
 

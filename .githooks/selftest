@@ -3266,6 +3266,14 @@ assert_accepts "third-party API names keep their abbreviations" include/$project
 inline char *probe(yyjson_val *value) { return yyjson_val_write(value, 0, nullptr); }
 FIXTURE
 
+stage_fixture_verbatim CITATION.cff <<'FIXTURE'
+cff-version: 1.2.0
+version: 1.0.0
+FIXTURE
+run_precommit
+fired_count=1 # The citation check exits before the staged-file rules, so no summary line counts it
+expect_rejection "versioned citation" "CITATION.cff carries no version"
+
 # endregion UStore Fixtures
 
 # region Commit Message Fixtures
@@ -3281,7 +3289,6 @@ stage_release_fixture() { # stage_release_fixture <version> [<relative-path> <se
         printf '%s\n' "$version" > VERSION
         printf '[package]\nname = "ustore"\nversion = "%s"\n' "$version" > Cargo.toml
         printf '[project]\nname = "ustore"\nversion = "%s"\n' "$version" > pyproject.toml
-        printf 'cff-version: 1.2.0\nversion: %s\n' "$version" > CITATION.cff
         printf '#define USTORE_VERSION_MAJOR %s\n#define USTORE_VERSION_MINOR %s\n#define USTORE_VERSION_PATCH %s\n' \
             "$major" "$minor" "$patch" > c/ustore/types.h
         [ $# -lt 3 ] || { sed "$3" "$2" > "$2.edited" && mv "$2.edited" "$2"; }

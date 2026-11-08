@@ -41,9 +41,9 @@ Pin a commit, not a version, when building on them.
   - `nvme_sorted_run.hpp`: one immutable sorted run on a volume.
   - `nvme_compaction.hpp`: the rules of a merge, the host compactor and the sections readers a device compactor reads through.
   - `vram_nvidia_compaction.hpp` and `vram_nvidia_compaction.cuh`: the host face of the device compactor, and its kernels, which compile into the library's bundles.
-  - `nvme_tree.hpp`: configurations and schemas, LSM levels, the merge of one level into the next, and the level set readers see.
+  - `nvme_tree.hpp`: configurations and schemas, the merge of one level into the next, and the level set readers see; `nvme_lsm_level.hpp`: the LSM levels.
   - `nvme_published_runs.hpp`: `commit_ledger`, `stamp_pin` and `pinned_snapshot`, the stamps and the sequencer every NVMe store commits through, `maintenance_claim`, the claim a database's maintenance runs under, and `published_runs`, the tree, memory runs and published view every NVMe store owns, with the commits, merges, flushes, compactions and truncations that move its runs.
-  - `nvme_store.hpp`: `nvme_store`, the store of one collection, memory runs and a value cache in front of a tree, with its snapshots and `nvme_store_cursor`.
+  - `nvme_store.hpp`: `nvme_store`, the store of one collection, memory runs in front of a tree, with its snapshots; `nvme_value_cache.hpp`: its value cache; `nvme_store_cursor.hpp`: `nvme_store_cursor`.
   - `nvme_transactions.hpp`: `transaction_deltas` and the read sets one transaction carries, `transaction_registry`, which orders and conflict-checks the transactions of one store, and `transaction_core`, the lifecycle, stamps and watches every transaction is made of.
   - `nvme_database.hpp`: databases of named collections, with their snapshots and optimistic transactions over the shared registry and core.
   - `nvme_single_collection_database.hpp`: single-collection databases, with their snapshots and transactions over the same registry and core.

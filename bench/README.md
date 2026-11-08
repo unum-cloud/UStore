@@ -1,4 +1,4 @@
-# Benchmarks
+# UStore Benchmarks
 
 UStore's speed claims rest on one hyper-converged machine, so this suite measures on one: its NVMe drives, its CPU cores and its GPUs, on Hopper and Blackwell boxes alike.
 Comparisons against other databases live in a separate harness.
@@ -14,6 +14,7 @@ Every binary echoes its flags, then prints its progress and one line per row to 
 | `louvain.cpp`                         | Louvain communities over a graph collection and over memory         |
 | `docs_paths.cpp`                      | Document fields located by yyjson against StringZilla subdocuments  |
 | `nvme_single_collection_database.cpp` | Inserts, finds, selects, scans and removals, per value layout       |
+| `compaction.cpp`                      | One full compaction of the same level-0 runs, per engine and device |
 
 The Twitter benchmark samples keys, parsed objects, one field, a four-column table and two-hop traversals.
 It also stores every tweet's body as a plain value, then reads those one key at a time and walks them in pages.
@@ -124,6 +125,53 @@ Every enabled workload opens one database over a fresh volume under `--directory
 build_release/build/bin/ustore_bench_nvme_single_collection_database \
     --workloads bench/nvme_single_collection_database.json --directory /mnt/nvme/ustore-scdb
 ```
+
+### Compaction
+
+`compaction.cpp` times one full compaction of the same overlapping level-0 runs in RocksDB and in NVMe, the latter merging on host threads or on a GPU, and builds as `ustore_bench_compaction` when `USTORE_WITH_NVME` is on.
+It writes random 16-byte keys with 100-byte values while no merge runs: RocksDB through `disable_auto_compactions=true` in the options file its next open loads, and NVMe by stopping half a memory run short of the level-0 run count that starts a merge.
+The timed `ustore_database_compact` then flushes what memory holds and merges every run into one sorted level, after every file of the database is synced and dropped from the page cache.
+Each row reports the CPU time of all threads and the bytes the process read and wrote during the call, and 100,000 sampled keys are read back afterwards.
+
+| Flag            | Default    | Meaning                                                      |
+| :-------------- | :--------- | :----------------------------------------------------------- |
+| `--engine`      | `nvme`     | `nvme` or `rocksdb`                                          |
+| `--compactor`   | `cpu`      | Where NVMe merges: `cpu`, or `gpu` through a CUDA executor   |
+| `--directory`   | Required   | An empty directory the database fills                        |
+| `--runs`        | `16`       | Level-0 runs the merge takes, and NVMe's level enlarge factor |
+| `--run-records` | `400000`   | Records of every level-0 run                                 |
+| `--value-size`  | `100`      | Bytes of every value                                         |
+| `--write-limit` | `8GiB`     | Bytes the process may write before it stops                  |
+
+```sh
+build/bin/ustore_bench_compaction --engine rocksdb --directory /mnt/nvme/compaction-rocksdb
+build/bin/ustore_bench_compaction --engine nvme --compactor gpu --directory /mnt/nvme/compaction-gpu
+```
+
+On an Intel Core i9-13950HX with an RTX 4060 Laptop GPU and one PCIe 4 SSD under ext4, cuFile in compatibility mode, 6.2M records of 116 bytes, 719 MB:
+
+| Engine  | Compactor | Level-0 runs | Seconds |  GB/s | CPU seconds | Read bytes | Written bytes |
+| :------ | :-------- | -----------: | ------: | ----: | ----------: | ---------: | ------------: |
+| RocksDB | CPU       |           14 |    5.36 | 0.134 |        2.26 |     0.76 G |        0.80 G |
+| NVMe    | CPU       |           16 |    3.93 | 0.183 |        3.94 |     0.74 G |        0.74 G |
+| NVMe    | GPU       |           16 |    2.12 | 0.339 |        4.28 |     0.74 G |        0.74 G |
+
+Each source run streams its values through a window of its own, so NVMe reads every byte it copies once, as RocksDB does.
+The GPU ranks the keys and the host copies the values, which makes the device row 1.9 times faster than the host row and 2.5 times faster than RocksDB.
+
+On the same machine's Crucial T710 at PCIe 4.0 x4, every run pinned to four P-cores with one thread each, as medians of three or more runs:
+
+| Engine  | Compactor | Transport                         | Seconds |  GB/s | CPU seconds | Drive read commands |
+| :------ | :-------- | :-------------------------------- | ------: | ----: | ----------: | ------------------: |
+| RocksDB | CPU       | ext4, 1 subcompaction             |   2.705 | 0.266 |        1.80 |               13.8K |
+| RocksDB | CPU       | ext4, 4 subcompactions            |   0.903 | 0.796 |        2.06 |               13.8K |
+| NVMe    | CPU       | io_uring on the raw device        |   1.110 | 0.648 |        1.14 |              106.5K |
+| NVMe    | CPU       | SPDK under vfio-pci               |   1.316 | 0.547 |        1.32 |              113.0K |
+| NVMe    | GPU       | cuFile compatibility, raw device  |   0.915 | 0.786 |        1.82 |              106.6K |
+
+RocksDB splits its manual compaction across four threads, while NVMe merges on one, so four subcompactions tie the GPU row and beat both CPU rows.
+SPDK runs slower than io_uring here, because the merge is bound by its one thread, and SPDK caps every command at the controller's 512 KiB where the kernel splits larger blocks itself.
+Read commands count the whole run, load included, from the drive's own counters; NVMe issues about 8 times more than RocksDB for the same bytes.
 
 ### Louvain
 

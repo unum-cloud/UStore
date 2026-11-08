@@ -1,4 +1,4 @@
-# Contribution Guide
+# Contributing to UStore
 
 Thank you for coming here!
 This guide is for everyone who changes UStore, people and coding agents alike, and every rule in it holds for every file in the tree.
@@ -34,7 +34,7 @@ The `release` and `relwithdebinfo` presets build with whatever toolchain the env
 `trace` is `dev` plus `-ftime-trace`, writing a `.json` beside every object to show where compile time goes.
 `check` turns warnings into errors through `USTORE_WERROR`, and suites, benchmarks and tools are off unless a preset or `-D` asks for them.
 Only `release` and the Windows presets add RocksDB and LevelDB; every other preset builds the RAM engine and whatever `-D USTORE_WITH_*` adds.
-`msvc2026_x64` and `msvc2022_arm64` build `release` with Visual Studio, while `android_arm64`, `wasm32_emscripten` and `wasm64_emscripten` compile the libraries over the RAM engine and run nothing.
+`msvc2026_x64` and `msvc2026_arm64` build `release` with Visual Studio, while `android_arm64`, `wasm32_emscripten` and `wasm64_emscripten` compile the libraries over the RAM engine and run nothing.
 `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` and `CMAKE_CUDA_COMPILER_LAUNCHER` come from the environment, so exporting `ccache` there caches objects in every tree.
 
 `USTORE_MARCH` sets the floor of UStore's own units, an ISA level like `x86-64-v3`, `native` or a CPU name like `graniterapids`, and hands the same value and build kind to ForkUnion, StringZilla and SmashTable.
@@ -216,7 +216,7 @@ The install splits into components: `sdk` holds the shared library, `c/ustore/`,
 `cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, stripped, as the preview SDK `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows.
 A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration carries it.
 
-## Python Builds
+## Python
 
 `pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `USTORE_BUILD_PYTHON=ON`, leaving suites, benchmarks and tools at their default off, then installs the `ustore_python` target into the wheel.
 `python/CMakeLists.txt` defines that target as the C11 extension `ustore.lib` from `python/lib.c` and one source per C header beside it, linked against `ustore::static` and installed into the `python/ustore/` package, and the build tree lives in `build_python/`.
@@ -233,7 +233,7 @@ pytest prints both in its header as `- Seed:` and `- Filter:`, so a failing run 
 
 An engine is left out through `CMAKE_ARGS` or `--config-settings=cmake.define.USTORE_WITH_<ENGINE>=OFF`, while NVMe stays out until its sources build; the build reads no environment variable of its own.
 
-## Rust Builds
+## Rust
 
 `Cargo.toml` and `build.rs` at the root build the crate from `rust/lib.rs`, and `build.rs` compiles no C or C++ itself.
 The crate's own usage is described in [`rust/README.md`](rust/README.md).

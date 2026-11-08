@@ -13,7 +13,6 @@ git diff --quiet HEAD || { echo "mint-release: commit or stash your changes firs
 IFS=. read -r major minor patch <<< "$core"
 export version core major minor patch
 echo "$version" > VERSION
-perl -pi -e 's/^version: .+$/version: $ENV{version}/' CITATION.cff
 perl -pi -e 's/^(version = ")[^"]+/$1$ENV{version}/' pyproject.toml Cargo.toml
 perl -pi -e 's/^(#define USTORE_VERSION_MAJOR )[0-9]+$/$1$ENV{major}/; s/^(#define USTORE_VERSION_MINOR )[0-9]+$/$1$ENV{minor}/; s/^(#define USTORE_VERSION_PATCH )[0-9]+$/$1$ENV{patch}/' c/ustore/types.h
 git commit -am "Release: v$version"

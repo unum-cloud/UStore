@@ -83,12 +83,12 @@ A graph collection lives in the graph store of `include/ustore/graph/nvme_store.
 A docs collection lives in the docs store of `include/ustore/docs/nvme_store.hpp`, whose field writes, patches and merges append `json_fold_t` change deltas through `src/nvme/docs.hpp`.
 A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold_t` change deltas that the `*_edits` calls of `src/pages_layer.hpp` encode and `src/nvme/pages.hpp` commits.
 Reads of documents and pages take the read paths of `src/docs_layer.hpp` and `src/pages_layer.hpp` over the engine's own reads of those stores, which fold the change deltas.
-`USTORE_WITH_NVME` is off by default, and the Python package turns it on; what follows is a v1 target:
+`USTORE_WITH_NVME` is off by default, and the Python package turns it on; what follows is a v1 target, with SPDK mounts, GPU compaction and GPUDirect Storage reads supported today:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.
 - __SIMD point lookups__ — sorted run indexes, micro-sets and ring buffers become SmashTable components with compile-time SIMD kits, one artifact carrying all of them and a database choosing one when it opens.
 - __GPU bulk operations__ — compaction merges sorted runs on the CPU or on a CUDA GPU, runs on both Hopper and Blackwell, and produces the same output as CPU compaction.
-- __GPUDirect Storage__ — sorted runs move between NVMe drives and GPU memory without staging in host memory.
+- __GPUDirect Storage__ — compaction reads sorted runs from NVMe drives into GPU memory without staging in host memory.
 - __Isolation__ — NVMe's transactions reach SmashTable's levels once they run on SmashTable, after an analysis shows no loss of consistency or efficiency.
 
 See [`nvme/README.md`](nvme/README.md) for its layers.
@@ -142,16 +142,16 @@ A page shorter than `wanted`, or one ending at the largest key, sets the cursor'
 
 ## Dependencies
 
-| Dependency        | Used by                   | Role                                                              |
-| :---------------- | :------------------------ | :---------------------------------------------------------------- |
-| SmashTable        | `ram` engine, NVMe        | Ordered and hash collections, transactions, snapshots, `expected` |
-| StringZilla       | Every engine              | Strings                                                           |
-| ForkUnion         | `ram_device.hpp`          | Threads, topology and domain-placed memory                        |
-| yyjson            | Every engine              | JSON documents and configuration                                  |
-| RocksDB           | RocksDB engine            | Persistent LSM trees with two-phase transactions                  |
-| LevelDB           | LevelDB engine            | Persistent LSM tree with snapshots                                |
-| fmt               | RocksDB, LevelDB, NVMe    | Formatting responses, logs and file names                         |
-| CUDA toolkit      | NVMe, optional            | Compiling the GPU compaction kernels into the NVIDIA bundle       |
-| GPUDirect Storage | NVMe, optional, v1 target | Reads and writes between NVMe drives and GPU memory               |
-| liburing          | RocksDB engine, on Linux  | Batched SST reads through io_uring, falling back to `pread`       |
-| SPDK              | NVMe, optional            | User-space NVMe access                                            |
+| Dependency        | Used by                  | Role                                                              |
+| :---------------- | :----------------------- | :---------------------------------------------------------------- |
+| SmashTable        | `ram` engine, NVMe       | Ordered and hash collections, transactions, snapshots, `expected` |
+| StringZilla       | Every engine             | Strings                                                           |
+| ForkUnion         | `ram_device.hpp`         | Threads, topology and domain-placed memory                        |
+| yyjson            | Every engine             | JSON documents and configuration                                  |
+| RocksDB           | RocksDB engine           | Persistent LSM trees with two-phase transactions                  |
+| LevelDB           | LevelDB engine           | Persistent LSM tree with snapshots                                |
+| fmt               | RocksDB, LevelDB, NVMe   | Formatting responses, logs and file names                         |
+| CUDA toolkit      | NVMe, optional           | Compiling the GPU compaction kernels into the NVIDIA bundle       |
+| GPUDirect Storage | NVMe, optional           | Reads sorted runs from NVMe drives into GPU memory                |
+| liburing          | RocksDB engine, on Linux | Batched SST reads through io_uring, falling back to `pread`       |
+| SPDK              | NVMe, optional           | User-space NVMe access                                            |

@@ -39,8 +39,9 @@ jobs:
           path: build_release/_deps
           key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
 
-      - name: Configure
-        run: cmake --preset release
+      # The NVMe engine calls io_uring directly, so no liburing is installed; its io_uring and SPDK suites skip on hosted runners
+      - name: Configure with the NVMe Engine
+        run: cmake --preset release -D USTORE_WITH_NVME=ON
       # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
       - name: Build the C Tests with MSVC
         if: runner.os == 'Windows'
@@ -85,8 +86,9 @@ jobs:
           path: build_release/_deps
           key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
 
-      - name: Configure
-        run: cmake --preset release
+      # The NVMe engine calls io_uring directly, so no liburing is installed; its io_uring and SPDK suites skip on hosted runners
+      - name: Configure with the NVMe Engine
+        run: cmake --preset release -D USTORE_WITH_NVME=ON
       # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
       - name: Build the C Tests with MSVC
         if: runner.os == 'Windows'
@@ -220,23 +222,23 @@ jobs:
       - name: Restore Fetched Dependencies
         uses: actions/cache@v6
         with:
-          path: build_msvc2022_arm64/_deps
-          key: deps-${{ runner.os }}-${{ runner.arch }}-msvc2022_arm64-${{ hashFiles('cmake/*.cmake') }}
+          path: build_msvc2026_arm64/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-msvc2026_arm64-${{ hashFiles('cmake/*.cmake') }}
 
       - name: Configure
-        run: cmake --preset msvc2022_arm64
+        run: cmake --preset msvc2026_arm64
       # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
       - name: Build the C Tests with MSVC
         if: runner.os == 'Windows'
-        run: cmake --build --preset msvc2022_arm64 --target ustore_test_c ustore_test_c_shared
+        run: cmake --build --preset msvc2026_arm64 --target ustore_test_c ustore_test_c_shared
       # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
       - name: Run the C Tests against the Static and Shared Libraries
         if: runner.os == 'Windows'
-        run: ctest --preset msvc2022_arm64 --tests-regex '^ustore_test_c(_shared)?$'
+        run: ctest --preset msvc2026_arm64 --tests-regex '^ustore_test_c(_shared)?$'
       - name: Build
-        run: cmake --build --preset msvc2022_arm64
+        run: cmake --build --preset msvc2026_arm64
       - name: Test
-        run: ctest --preset msvc2022_arm64
+        run: ctest --preset msvc2026_arm64
 
   test_ubuntu_asan:
     name: Test ASan and UBSan on Ubuntu x86-64
@@ -386,6 +388,28 @@ jobs:
           export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME}"
           cmake --preset android_arm64
           cmake --build --preset android_arm64
+
+  # glibc 2.28 and Linux 4.18 headers, which carry no io_uring, so the NVMe engine builds from its own kernel mirrors;
+  # the test runs on the runner's new kernel, where the mirrors meet the real ABI.
+  test_old_kernel_headers:
+    name: Build C Library on Old Kernel Headers
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --recursive
+      - name: Build C Library
+        run: |
+          cmake -B build_old_headers -D CMAKE_BUILD_TYPE=Release -D USTORE_WITH_NVME=ON -D USTORE_BUILD_TEST=ON \
+            -D USTORE_BUILD_BENCH=OFF -D USTORE_BUILD_TOOLS=OFF
+          cmake --build build_old_headers --parallel 4 --target ustore_test_c ustore_test_nvme_volume
+      - name: Test C Library
+        run: ctest --test-dir build_old_headers --tests-regex '^ustore_test_(c|nvme_volume)$' --output-on-failure
 
   # The minimal and the extended module over the RAM engine; nothing runs them.
   build_wasm:

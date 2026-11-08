@@ -1,7 +1,7 @@
 <h1 align="center">UStore</h1>
 <h3 align="center">
-GPU-Accelerated Embedded Transactional Database<br/>
-for High-Throughput NVMe Devices
+GPU-Accelerated Multi-Modal Transactional Database Engine<br/>
+Built around Kernel Bypass
 </h3>
 <br/>
 
@@ -23,42 +23,21 @@ Blobs • Documents • Graphs
 C • C++ • Python • Rust
 </p>
 
-UStore is a GPU-accelerated embedded DBMS for high-throughput NVMe devices, GPUDirect Storage and similar direct paths between drives, memory and accelerators.
-It links into the process that uses it, and there is no server to deploy.
-It is open about where its speed comes from: kernel bypass through io_uring and SPDK, SIMD for fast point lookups, and GPUs for LSM compactions and other bulk operations.
-Those paths belong to NVMe, the hyper-converged engine that v1 targets, while the reference `ram` engine and the RocksDB and LevelDB engines run behind the same C ABI today, as [Roadmap to v1](#roadmap-to-v1) details.
+---
+
+![UStore banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/UStore-v1.png?raw=true)
+
+UStore is an embedded transactional database engine that keeps blobs, documents, graphs, strings and markup pages in collections addressed by 128-bit UUID keys, with transactions spanning collections behind one C ABI.
+Its NVMe engine reaches drives through kernel bypass with io_uring and SPDK, lays immutable sorted runs into 1 GB slots of raw drives or into files under JSON manifests, searches them with SIMD S+ trees, and merges them on GPUs that read through GPUDirect Storage.
+It links into the process that uses it, with no server to deploy, and the in-memory `ram` reference engine and the RocksDB and LevelDB engines serve the same calls.
 
 - __Transactions across collections__ — blobs, documents and graphs stage into one transaction and commit together.
-- __One C ABI over every engine__ — the same calls run on the in-memory `ram` reference engine and on the RocksDB and LevelDB key-value stores, and will run on NVMe once its sources build.
+- __One C ABI over every engine__ — the same calls run on the NVMe engine, the in-memory `ram` reference engine and the RocksDB and LevelDB key-value stores.
 - __Isolation chosen at open__ — the `ram` engine runs at `strict_serializable` or `snapshot`, picked by the `isolation` field of `ustore_database_init_ram_t`.
 - __Documents without a query language__ — fields are addressed by JSON Pointer and modified by JSON Patch and JSON MergePatch.
 - __Graphs as a modality__ — directed multigraphs with identified edges, stored in the same database as the documents they relate.
 - __Batches with strides__ — every call takes arrays of keys, values and collections, laid out as structures of arrays or arrays of structures.
 - __Sampling as a primitive__ — `ustore_blobs_sample` draws random keys from a collection, next to read, write and scan.
-
-## Architecture
-
-| Layer      | What it is                                                             | Where                      |
-| :--------- | :--------------------------------------------------------------------- | :------------------------- |
-| Bindings   | C, C++, Python and Rust, each forwarding rather than reimplementing    | `cpp/`, `python/`, `rust/` |
-| C ABI      | One argument struct per call, 128-bit UUID keys                        | `c/ustore/*.h`             |
-| Modalities | Documents and graphs, written once over any engine                     | `src/*.cpp`                |
-| Engines    | `ram` and `nvme` are ours, `rocksdb` and `leveldb` are checked against | `src/`, `src_oracles/`     |
-| Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                          |
-
-- __The C ABI__ in `c/ustore/*.h` is the only interface: every call takes one argument struct, and every binding forwards to it.
-- __The modalities__ in `src/docs_layer.hpp` and `src/graph_layer.hpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
-- __The `ram` engine__ is the reference: ordered multi-version stores in memory on SmashTable containers, persisted as one binary image when it opens with a directory.
-- __NVMe__ is the engine the hardware paths serve: each collection is an `lsm_tree` of `lsm_level`s of `lsm_sorted_run`s, point lookups search SmashTable's SIMD row kits, compactions merge sorted runs on the CPU or a GPU, GPUDirect Storage moves runs between drives and GPU memory, and a transport chosen at mount reaches the drive through io_uring, SPDK or blocking positioned I/O.
-- __RocksDB and LevelDB__ keep their own storage formats, so an application moves between them and the other engines without changing a call.
-
-## Why Hyper-Converged
-
-Disaggregated storage puts a network between every query and its data, and a server full of PCIe 5.0 NVMe drives reads faster than the links in front of it carry.
-Compaction then turns into a remote copy, and a GPU that could merge sorted runs waits on bytes crossing the network twice.
-UStore argues for the opposite design: storage, compute and accelerators in one box, each device reached through the most direct path its platform offers.
-Kernel bypass removes the system calls and page-cache copies between the drive and the engine, GPUDirect Storage moves data between drives and GPU memory without staging it in host memory, and SIMD kits keep point lookups on the CPU, where a single lookup is too small to ship anywhere.
-Scale-out stays above the database, where a data-lake layer composes several such boxes through two-phase commits and each box keeps its own drives and accelerators.
 
 ## Quickstart
 
@@ -98,12 +77,37 @@ A persistent engine opens through its own constructor, which takes the directory
 auto [db, status] = database_t::open_rocksdb({.directory = bytes_of("/var/lib/ustore/")});
 ```
 
-`open_ram` persists the in-memory engine in a directory as one image, and `view_rocksdb` serves a RocksDB directory read-only, refusing every change with `status_code_t::read_only_k`.
-Every fallible C++ call returns a `status_t`, an `expected`, or a `deferred` call whose `wait` answers one, and every C call reports failure through its `ustore_outcome_t` argument, a status beside a static message.
-A deferred C call returns once submitted, and its outcome is polled through `ustore_outcome_status` and waited on through `ustore_outcome_wait`.
-Calls run on the calling thread until a receiver names an executor, which by default spawns a thread for 7/8 of the cores local to the memory domains it serves, and keeps its scratch and its arenas on those domains.
-Scans, cursor pulls, snapshot saves and compactions report their advance to an optional progress callback, which is the only way to cancel a call.
+> `open_ram` persists the in-memory engine in a directory as one image, and `view_rocksdb` serves a RocksDB directory read-only, refusing every change with `status_code_t::read_only_k`.
+> Every fallible C++ call returns a `status_t`, an `expected`, or a `deferred` call whose `wait` answers one, and every C call reports failure through its `ustore_outcome_t` argument, a status beside a static message.
+> A deferred C call returns once submitted, and its outcome is polled through `ustore_outcome_status` and waited on through `ustore_outcome_wait`.
+> Calls run on the calling thread until a receiver names an executor, which by default spawns a thread for 7/8 of the cores local to the memory domains it serves, and keeps its scratch and its arenas on those domains.
+> Scans, cursor pulls, snapshot saves and compactions report their advance to an optional progress callback, which is the only way to cancel a call.
+
 The C ABI and its argument structs are described in [`c/README.md`](https://github.com/unum-cloud/UStore/blob/main/c/README.md), and the C++ wrappers in [`cpp/README.md`](https://github.com/unum-cloud/UStore/blob/main/cpp/README.md).
+
+## Architecture
+
+| Layer      | What it is                                                             | Where                      |
+| :--------- | :--------------------------------------------------------------------- | :------------------------- |
+| Bindings   | C, C++, Python and Rust, each forwarding rather than reimplementing    | `cpp/`, `python/`, `rust/` |
+| C ABI      | One argument struct per call, 128-bit UUID keys                        | `c/ustore/*.h`             |
+| Modalities | Documents and graphs, written once over any engine                     | `src/*.cpp`                |
+| Engines    | `ram` and `nvme` are ours, `rocksdb` and `leveldb` are checked against | `src/`, `src_oracles/`     |
+| Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                          |
+
+- __The C ABI__ in `c/ustore/*.h` is the only interface: every call takes one argument struct, and every binding forwards to it.
+- __The modalities__ in `src/docs_layer.hpp` and `src/graph_layer.hpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
+- __The `ram` engine__ is the reference: ordered multi-version stores in memory on SmashTable containers, persisted as one binary image when it opens with a directory.
+- __NVMe__ is the engine the hardware paths serve: each collection is an `lsm_tree` of `lsm_level`s of `lsm_sorted_run`s, point lookups search SmashTable's SIMD row kits, compactions merge sorted runs on the CPU or a GPU, GPUDirect Storage reads runs from drives into GPU memory for compaction, and a transport chosen at mount reaches the drive through io_uring, SPDK or blocking positioned I/O.
+- __RocksDB and LevelDB__ keep their own storage formats, so an application moves between them and the other engines without changing a call.
+
+## Why Hyper-Converged
+
+Disaggregated storage puts a network between every query and its data, and a server full of PCIe 5.0 NVMe drives reads faster than the links in front of it carry.
+Compaction then turns into a remote copy, and a GPU that could merge sorted runs waits on bytes crossing the network twice.
+UStore argues for the opposite design: storage, compute and accelerators in one box, each device reached through the most direct path its platform offers.
+Kernel bypass removes the system calls and page-cache copies between the drive and the engine, GPUDirect Storage reads data from drives into GPU memory without staging it in host memory, and SIMD kits keep point lookups on the CPU, where a single lookup is too small to ship anywhere.
+Scale-out stays above the database, where a data-lake layer composes several such boxes through two-phase commits and each box keeps its own drives and accelerators.
 
 ## Blobs
 
@@ -191,14 +195,14 @@ if (auto [commit_stamp, commit_status] = transaction.commit(); commit_status.fai
 
 A commit applies every staged write or none of them.
 
-### Consistency and Isolation
+### Consistency & Isolation
 
 A transaction watches the keys it reads and writes, and a commit fails when another transaction committed a colliding write in between.
 `ustore_watch_none_k` turns that collision detection off for one call, trading the guarantee for cheaper commits, and changes nothing on a `ram` database at `strict_serializable`, which validates every read.
 
 A snapshot is an opaque handle pinning a consistent view of the whole database for reads, and `db.snapshot()` returns an `expected<snapshot_t>` that reads through it and frees it when it goes.
 `snapshot.save(path)` writes exactly what the snapshot sees out as a new database of the same engine.
-Spin models in [`verification/`](verification/) check the ring's completion credit, the one-issuer rule that moves a queue pair between threads, and the write, flush, record and sync order behind durability; model-checking the commit protocol under GenMC is a v1 target.
+Spin models in [`verification/`](https://github.com/unum-cloud/UStore/tree/main/verification) check the ring's completion credit, the one-issuer rule that moves a queue pair between threads, and the write, flush, record and sync order behind durability; model-checking the commit protocol under GenMC is a v1 target.
 
 ### Durability
 
@@ -240,8 +244,8 @@ An engine reports itself through `ustore_database_describe`: its name, what it s
 The C++ `database_t` exposes the capability bits as `supports_transactions`, `supports_snapshots` and `supports_collections`.
 `ustore_database_clear` empties every collection at once, and `ustore_database_compact` reclaims the space overwritten and removed data still takes.
 NVMe builds behind `USTORE_WITH_NVME`, which is off by default and on in the presets that test it.
-It runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_CUDA_ARCH`; [`src/nvme/README.md`](src/nvme/README.md) describes its layers.
-A database on NVMe is a `<database>.ustore.json` manifest and one `.ustore` file per sorted run, on filesystems or in 1 GB slots of raw drives, as [`docs/format.md`](docs/format.md) describes.
+It runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_CUDA_ARCH`; [`src/nvme/README.md`](https://github.com/unum-cloud/UStore/blob/main/src/nvme/README.md) describes its layers.
+A database on NVMe is a `<database>.ustore.json` manifest and one `.ustore` file per sorted run, on filesystems or in 1 GB slots of raw drives, as [`docs/format.md`](https://github.com/unum-cloud/UStore/blob/main/docs/format.md) describes.
 
 ## Compatibility
 
@@ -256,11 +260,11 @@ The C headers are C11, checked by `c/test.c` under every platform's compiler aga
 | Windows x86-64 |       ✅        |   ✅    |   ✅    | untested |   ✅   |  ✅  |
 
 Every column but NVMe is exercised by CI on all four platforms: `.github/workflows/prerelease.yml` builds and tests the C ABI and each engine, the Python extension and the Rust crate.
-The NVMe column records the suites in [`test/`](test/) on two Linux x86-64 machines rather than CI, which does not build NVMe yet; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP but is not yet mounted by the engine.
+The NVMe column records the suites in [`test/`](https://github.com/unum-cloud/UStore/tree/main/test) on two Linux x86-64 machines rather than CI, which does not build NVMe yet; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP and is mounted by the engine.
 GPU compaction targets NVIDIA Hopper and Blackwell alike, and its output must match CPU compaction on the same runs.
-The engines and the layout of `src/` are described in [`src/README.md`](src/README.md).
+The engines and the layout of `src/` are described in [`src/README.md`](https://github.com/unum-cloud/UStore/blob/main/src/README.md).
 
-### Why Not the RocksDB Interface
+### Why Not RocksDB
 
 LevelDB and RocksDB expose C++ interfaces built on standard library strings and containers.
 A caller cannot bring its own strings, arena or allocator, and an allocation failure surfaces as an exception, which a database under memory pressure hits routinely.
@@ -270,7 +274,7 @@ UStore puts a C ABI in front of the same engines instead.
 Each call takes one argument struct, so optional arguments keep their defaults and the argument order stops mattering.
 Outputs are allocated from an arena the caller owns and reuses across calls.
 
-## Keys and Values
+## Keys & Values
 
 Keys are 128-bit UUIDs in `c/ustore/db.h`, compared bytewise, and `key_from_integer` spells a non-negative integer as its big-endian bytes, so keys made from integers order as the integers.
 Collections are named by UUIDv7 identifiers the catalog mints once and never reuses, and the main collection by the nil UUID.
@@ -278,19 +282,17 @@ Fixed-width keys compare as machine words, while variable-length keys force char
 Map strings onto keys once, at the edge of the application, and address documents, graphs and blobs by the resulting identifiers.
 
 Value lengths are `ustore_length_t`, a 64-bit unsigned integer, and a batch of values is one `ustore_strings_view_t`: an Apache Arrow tape of 32-bit offsets as in `binary`, of 64-bit offsets as in `large_binary`, or an accessor callback over any other layout.
-A call writes its tapes with 32-bit offsets while the bytes fit in 4 GiB and 64-bit beyond, so neither one value nor one batch stops at 4 GiB.
+A call writes its tapes with 32-bit offsets while the bytes fit in 4 GB and 64-bit beyond, so neither one value nor one batch stops at 4 GB.
 
 ## Roadmap to v1
-
-v1 is planned for mid-November 2026.
 
 - __Keys__ — today 128-bit UUID keys and UUIDv7 collection identifiers on every engine, NVMe included; v1 adds time-ordered UUIDv7 keys for local inserts.
 - __The `ram` engine__ — today `strict_serializable` or `snapshot` at open, with binary image persistence; v1 targets the conformance suite passing at both levels, every level proven by anomaly tests.
 - __RocksDB, LevelDB__ — today built against their current headers; v1 targets the same conformance suite, each reporting the isolation it delivers.
 - __NVMe__ — today on the current C ABI over blocking and io_uring transports with GPU compaction wired in, each database a manifest and its run files, on filesystems or raw slots; v1 targets the graph as two collections of one database, backup and export by syncing the run files, and CI on every platform.
-- __Kernel bypass__ — today io_uring on files and block devices, with registered buffers where the memlock cap allows and plain pointers otherwise, and an SPDK transport passing the shared ring cases over NVMe/TCP; v1 targets SPDK mounted by the engine and NVMe passthrough.
+- __Kernel bypass__ — today io_uring on files and block devices, with registered buffers where the memlock cap allows and plain pointers otherwise, and an SPDK transport passing the shared ring cases over NVMe/TCP; v1 targets NVMe passthrough.
 - __SIMD point lookups__ — today the sorted-run index is searched on SmashTable's kits; v1 targets one kit chosen per artifact at open.
-- __GPU__ — today LSM compaction in three kernels per merge, launched through the driver with no CUDA runtime, reached from the engine when built with CUDA, with the host and device merges checked to agree byte for byte on every transport; v1 targets GPUDirect Storage between drives and GPU memory.
+- __GPU__ — today LSM compaction in three kernels per merge, launched through the driver with no CUDA runtime, reached from the engine when built with CUDA, with the host and device merges checked to agree byte for byte on every transport; GPUDirect Storage reads runs from drives into GPU memory for compaction.
 - __Bindings__ — today a raw CPython core in C11 with Pandas and NetworkX adapters, and a Rust crate over the same C ABI; v1 adds an executor for the NVMe engine to both.
 - __Platforms__ — today CI builds and tests the C ABI, `ram`, RocksDB, LevelDB, the Python extension and the Rust crate on Linux x86-64, Linux AArch64, macOS arm64 and Windows x86-64; v1 adds NVMe to that matrix once it builds.
 
@@ -315,4 +317,23 @@ ustore/
 └── examples/         one script per modality
 ```
 
-Conventions, hooks and the commit format are described in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Conventions, hooks and the commit format are described in [`CONTRIBUTING.md`](https://github.com/unum-cloud/UStore/blob/main/CONTRIBUTING.md).
+
+## Citation
+
+If UStore helps your research or product, please cite it:
+
+```bibtex
+@software{Vardanian_UStore,
+  author = {Vardanian, Ash},
+  title = {{UStore: GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass}},
+  doi = {10.5281/zenodo.7537042},
+  url = {https://github.com/unum-cloud/UStore},
+  license = {Apache-2.0}
+}
+```
+
+## License
+
+Licensed under the Apache License, Version 2.0.
+See `LICENSE` for details.

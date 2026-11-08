@@ -212,6 +212,19 @@
       }
     },
     {
+      "name": "msvc2026_arm64",
+      "inherits": ["release", "windows"],
+      "displayName": "Windows ARM64 - Visual Studio 2026",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "ARM64",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_C_FLAGS": "/DWIN32 /D_WINDOWS /pathmap:${sourceDir}=.",
+        "CMAKE_CXX_FLAGS": "/DWIN32 /D_WINDOWS /EHsc /pathmap:${sourceDir}=."
+      }
+    },
+    {
       "name": "android_arm64",
       "inherits": "base",
       "displayName": "Android ARM64 - compile only",
@@ -412,6 +425,7 @@
     },
     { "name": "msvc2026_x64", "configurePreset": "msvc2026_x64", "configuration": "Release" },
     { "name": "msvc2022_arm64", "configurePreset": "msvc2022_arm64", "configuration": "Release" },
+    { "name": "msvc2026_arm64", "configurePreset": "msvc2026_arm64", "configuration": "Release" },
     { "name": "android_arm64", "configurePreset": "android_arm64", "jobs": 0 },
     { "name": "wasm32_emscripten", "configurePreset": "wasm32_emscripten", "jobs": 0 },
     { "name": "wasm64_emscripten", "configurePreset": "wasm64_emscripten", "jobs": 0 },
@@ -470,7 +484,8 @@
       "configurePreset": "cuda"
     },
     { "name": "msvc2026_x64", "inherits": "base", "configurePreset": "msvc2026_x64", "configuration": "Release" },
-    { "name": "msvc2022_arm64", "inherits": "base", "configurePreset": "msvc2022_arm64", "configuration": "Release" }
+    { "name": "msvc2022_arm64", "inherits": "base", "configurePreset": "msvc2022_arm64", "configuration": "Release" },
+    { "name": "msvc2026_arm64", "inherits": "base", "configurePreset": "msvc2026_arm64", "configuration": "Release" }
   ],
   "workflowPresets": [
     {

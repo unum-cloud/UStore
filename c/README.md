@@ -323,7 +323,7 @@ Every output is optional: `.lengths` exports the length of every value without i
 `offsets` and `limits` read the bytes of every value from its offset, at most its limit of them, and report that slice's length, where an offset past the end reads empty.
 The outputs stay valid until the next call given `arena`; to keep them past it, pass that call another arena.
 A `NULL` arena is refused with `ustore_status_invalid_argument_k`, an arena serves one call at a time, and a call that fails, is cancelled or has nothing to report leaves its outputs `NULL`.
-`ustore_arena_free` waits until every deferred call naming the arena is final.
+`ustore_arena_free` waits until every deferred call naming the arena is final, and `ustore_arena_describe` reports whether an arena's outputs live on host pages or on which device.
 
 ## Scans
 

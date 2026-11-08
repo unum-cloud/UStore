@@ -72,7 +72,7 @@ Its collections borrow the transaction, so they are no longer used by the time `
 ## Receivers & Deferred Calls
 
 A call addresses the head of the database, a transaction, or a snapshot, and never two of them.
-`View` is that view: a read passes the `ustore_view_t` it holds, and a write passes its transaction and whether that watches the write.
+`On` is that view: a read passes the `ustore_view_t` it holds, and a write passes its transaction and whether that watches the write.
 A view is `Copy` and borrows the database, transaction or snapshot it came from, which is its `Parent` type, so a view of a snapshot has no verb that writes, and only a view of a transaction stages and commits.
 
 The receiver also decides where a verb runs and how it completes, while the verb and its arguments stay the same:
@@ -108,7 +108,7 @@ The two are distinct types, so neither is compared with the other by accident.
 `Transaction::rollback` withdraws a stage while keeping the reads and writes, so the transaction can stage again.
 A snapshot is a handle the database hands out, pinning the state it was taken at until it is dropped, and every view at it borrows it; `Snapshot::save` writes it out as a database of its own.
 
-`View::deferred` makes a `DeferredView`, whose verbs return once their call is submitted and answer a `Deferred`.
+`On::deferred` makes a `DeferredOn`, whose verbs return once their call is submitted and answer a `Deferred`.
 Every verb keeps its name and its arguments, the transaction verbs `stage`, `commit`, `rollback` and `reset`, `save`, `clear`, `compact` and `collection_drop` included, while the inputs it takes must be owned, since the library reads them after the verb returns.
 A deferred view takes keys or edges in an array or a `Vec`, keys beside a `BytesTape` of values or a `CharsTape` of JSON, paths in a `CharsTape`, columns in a `Vec<Column<'static>>`, names and save paths as a `String`, and `'static` collections, roles, fields, names and progress handlers, and a borrow of any of them does not compile.
 It borrows the arena as a blocking view does, so the result of a deferred read borrows it too.
@@ -127,7 +127,7 @@ assert_eq!(values.get(0), Some(b"Ada".as_slice()));
 // submit four scans, each into an arena of its own, then await each
 let mut arenas = (0..4).map(|_| Arena::new_in(&executor)).collect::<Result<Vec<_>, _>>()?;
 let scans = arenas.iter_mut().zip(starts)
-    .map(|(arena, start)| deferred.scan(people, start, 1000, Matching::default(), arena)).collect::<Result<Vec<_>, _>>()?;
+    .map(|(arena, start)| deferred.scan(people, start, 1000, arena)).collect::<Result<Vec<_>, _>>()?;
 for scan in scans { consume(scan.await?); }
 
 transaction.deferred(&executor).write(people, (keys, names), Durability::Buffered)?.await?;
@@ -194,7 +194,7 @@ Zero threads take 7/8 of the cores those domains carry, leaving the rest to the 
 `Executor::on_pool` borrows the threads of a ForkUnion `fu_pool_t`, so several libraries in one process share them, and is `unsafe`, since the pool must outlive the executor.
 `Executor::for_nvme` spawns the threads of the NVMe engine, one I/O ring apiece, and its `IOOptions` tell every database opened on it how to move bytes: the transport, the channels and their buffers.
 `Executor::for_vram` drives one CUDA device through one stream, its own or one the caller lends, failing with `Status::Unsupported` in a library built without CUDA, and is `unsafe`, since a lent stream must outlive the executor; `NVMEOptions::compactions` places an NVMe database's merges on it.
-`View::on` names the executor and keeps the view blocking, so its verbs answer exactly as they do on the calling thread.
+`On::on` names the executor and keeps the view blocking, so its verbs answer exactly as they do on the calling thread.
 `Executor::drain` waits for every call submitted before the drain began and leaves the threads in `Mood::Parked` or `Mood::Spinning` whenever they next go idle, and dropping the executor drains it.
 
 Opening a database blocks, and `RAMOptions`, `RocksDBOptions`, `LevelDBOptions` and `NVMEOptions` name the executor the open runs on, where `None` opens on the calling thread.
@@ -205,8 +205,10 @@ The NVMe engine reads the `IOOptions` of its executor once, at the open, so the 
 Every output whose length scales with the call, such as values, presence bits, offsets, keys, degrees, edges, bounds, names and columns, lands in an `Arena`, and the verb answers a view over it without copying.
 `Arena::new_in(&executor)` places one where that executor computes, decided once, and `Arena::new()` makes host pages for the calling thread; both call `ustore_arena_init`, and dropping one calls `ustore_arena_free`.
 A call rewinds its arena and the arena keeps its high-water mark, so a steady loop allocates once.
+`Arena::describe` reports where the outputs live, and a view over device memory is refused with `Status::Device` rather than read on the host.
 A read through `&mut arena` hands back a result that borrows it, so a value read out of an arena can neither outlive it nor survive the call that would overwrite it.
-Every verb takes its arena last, after its inputs and the knobs that shape the work, such as the count a scan wants.
+Every verb takes its arena last, after its inputs and the config that shapes the work, such as the `BlobsScanConfig` of a scan.
+A config converts from its most common knob, so `scan(people, ada, 100, &mut arena)` wants 100 keys, and `BlobsScanConfig { matching, ..BlobsScanConfig::from(100) }` reaches every other knob.
 Writes export nothing and take no arena, and fixed-size reports, such as stamps, a `Measurement`, a `Description` or a resolved collection, come back as plain values.
 
 The library rewinds an arena on every call through it, so results from one call stop being readable the moment the next one runs.
@@ -218,7 +220,7 @@ let others = database.head().read(people, &[grace], &mut arena)?; // refused whi
 println!("{:?}", values.get(0));
 
 let (mut found, mut fetched) = (Arena::new()?, Arena::new()?);     // two live results, two arenas
-for &key in database.head().scan(people, ada, 100, Matching::default(), &mut found)?.keys {
+for &key in database.head().scan(people, ada, 100, &mut found)?.keys {
     consume(database.head().read(people, &[key], &mut fetched)?);  // rewinds fetched, never found
 }
 ```
@@ -276,7 +278,7 @@ println!("{} keys in {} bytes on disk", description.keys, description.disk_bytes
 
 people.clear(DropMode::Values)?;  // keeps every key, emptying its value
 people.compact(None)?;            // reclaims what overwritten and removed data still takes
-people.snapshot()?.save("/var/lib/people-copy", None)?;
+people.snapshot()?.save("/var/lib/people-copy")?;
 ```
 
 `open_ram` loads the image its directory holds, if any, and rewrites it whole on a flushed commit and on close.
@@ -292,7 +294,7 @@ RocksDB and LevelDB create the path, while the RAM engine writes its image into 
 
 ## Progress & Cancellation
 
-`compact` and `save` take an optional progress handler, an `FnMut(finished, total) -> ControlFlow<()>`, called with the units finished so far and the units the call finishes if it runs to the end.
+The configs of `compact`, `save` and the scans carry an optional progress handler, an `FnMut(finished, total) -> ControlFlow<()>`, called with the units finished so far and the units the call finishes if it runs to the end.
 Answering `ControlFlow::Break(())` cancels the call, which fails with `Status::Cancelled` and publishes nothing.
 
 ```rust
@@ -304,7 +306,8 @@ let mut before_the_deadline = move |_finished: usize, _total: usize| match Insta
     true => ControlFlow::Continue(()),
     false => ControlFlow::Break(()),
 };
-match snapshot.save("/var/lib/people-copy", Some(&mut before_the_deadline)) {
+let config = SaveConfig { path: "/var/lib/people-copy", progress: Some(&mut before_the_deadline) };
+match snapshot.save(config) {
     Err(failure) if failure.status == ustore::Status::Cancelled => println!("the copy was removed"),
     other => other?,
 }
@@ -381,7 +384,7 @@ A read hands back a `Values`, which addresses the tape in the arena rather than 
 `Values::tape` hands the whole batch out as a `Tape` over that tape: one more offset than values, and the bytes between them, 32-bit while the bytes fit in 4 GiB, as Arrow lays out `binary`, and 64-bit beyond, as it lays out `large_binary`.
 A missing value is empty there, and `Values::presences` is the bitmap of the keys found, as Arrow reads a validity buffer.
 
-A write carries values and nothing else, so an empty slice writes an empty value, and `View::remove` removes keys with their values in a batch of its own.
+A write carries values and nothing else, so an empty slice writes an empty value, and `On::remove` removes keys with their values in a batch of its own.
 A removal therefore never hides inside a batch of writes.
 
 ```rust
@@ -389,15 +392,15 @@ let entries = [Entry::new(ada, b"rewritten"), Entry::new(kent, b"")];
 database.head().write(people, &entries, Durability::Buffered)?;
 database.head().remove(people, &[grace], Durability::Buffered)?;
 
-let first = database.head().scan(people, Key::from(0u64), 100, Matching::default(), &mut arena)?.keys;
+let first = database.head().scan(people, Key::from(0u64), 100, &mut arena)?.keys;
 let measured = database.head().measure(people, ada..kent, &mut arena)?;
 let largest = KeyRange { direction: ScanDirection::Descending, ..KeyRange::default() };
-let last = database.head().scan(people, largest, 10, Matching::default(), &mut arena)?.keys;
+let last = database.head().scan(people, largest, 10, &mut arena)?.keys;
 let headers = database.head().read_slices(people, &[ada, kent], ..64, &mut arena)?;
 database.head().remove_range(people, ada..kent, Durability::Buffered)?;
 ```
 
-`View::remove` removes whole documents the same way, while a field goes with a merge that carries a JSON `null` for it.
+`On::remove` removes whole documents the same way, while a field goes with a merge that carries a JSON `null` for it.
 `scan` lists up to the count it wants from a start key, `sample` draws keys at random, and `measure` bounds the keys and the bytes a range of keys holds.
 Scans, cursors and measures take a `KeyRange`: a start key, inclusive, an end key, exclusive, and a `ScanDirection`, where a key alone walks up from it and `start..end` walks up between them.
 `read_slices` reads one byte range of every value, and `remove_range`, `docs_remove_range` and `graph_remove_vertices_range` remove every key of a range in one atomic call.
@@ -480,7 +483,7 @@ let names = database.head().docs_read(people, &[FieldAddress::new(ada, "name")],
 A write carries one format for the whole batch, named by the type of its entries: a scalar from `f64` down to `u8` or `bool`, `Text` for a JSON string, or `Json` for any JSON value.
 The same formats write a whole document, which is then one number, one boolean or one string rather than an object.
 `KeyedBy` writes documents that carry their keys under a field of their own: a non-negative integer, spelled as `Key::from` spells it, or a UUID in canonical text.
-Mixing two formats in one batch does not compile, and every entry carries a value: `View::remove` removes whole documents, and a merge carrying a JSON `null` removes a field.
+Mixing two formats in one batch does not compile, and every entry carries a value: `On::remove` removes whole documents, and a merge carrying a JSON `null` removes a field.
 `Modification` chooses between an upsert, an update, an insert, an RFC 6902 patch and an RFC 7386 merge.
 Reads hand back the same `Values` a binary read does, of keys for whole documents or of `FieldAddress` values for fields, exported in the format named before the arena, `Json` or printed `Text`, with a missing document or field reported as `None`.
 
@@ -508,7 +511,7 @@ let paths = database.head().docs_gist(people, [ada, grace], &mut arena)?;
 let columns = [Column::new::<u64>("born"), Column::new::<Text>("name")];
 let gathered = database.head().docs_gather(people, &[ada, grace], &columns, &mut other_arena)?;
 let born: &[u64] = gathered.scalars::<u64>(0)?;
-let valid = gathered.validities(0).unwrap().get(1);
+let valid = gathered.validities(0)?.unwrap().get(1);
 let name = gathered.strings(1)?.get(0);
 ```
 
@@ -577,9 +580,9 @@ Every call through a `Collection`, and `Executor::drain`, block as well.
 
 The crate binds none of these:
 
-- The verbs of the strings modality of `strings.h` and of the pages of `pages.h`, beyond the pages cursor, sample and measure and what Arrow reaches: `export_arrow`, `import_arrow` and `ingest_arrow` move collections of either modality whole, through their cursors, `ustore_strings_write` and `ustore_pages_import`.
-- The progress of a scan and of a cursor pull, since the crate scans one range at a time and each reports a single unit once its work is done.
-- Unordered scans and the lengths a read writes beside its values.
+- The strings cursor, which `export_arrow` drives, and the range removals of `ustore_pages_remove`.
+- The progress of a cursor pull, which reports a single unit once its page is out.
+- The lengths a read writes beside its values, which the tape's offsets already carry.
 
 ## Design
 
@@ -590,9 +593,9 @@ The crate is a thin layer over the C ABI in `c/ustore/`, and every rule below fo
   The constructors keep C's lifecycle names: `init_ram` starts empty, `open_<engine>` serves a directory in place, and `view_rocksdb` serves one read-only.
 - __Blocking verbs return `Result` directly.__
   `database.head().read(people, &[ada, grace], &mut arena)?` takes no executor, completion or call value, and nothing about asynchrony reaches a caller who never asks for it.
-- __`View<'view, Parent, Completion>` makes the receiver a type, not a flag.__
+- __`On<'view, Parent, Completion>` makes the receiver a type, not a flag.__
   What every C argument struct puts before its inputs, the view, the executor and the completion, is chosen by the receiver a verb is called on: `database.head()`, `transaction.view(watch)` or `snapshot.view()`, then `.on(&executor)` or `.deferred(&executor)`, where `transaction.on(&executor)` and `transaction.deferred(&executor)` watch the keys.
-  Each verb is written once, generic over the completion, so a `DeferredView` offers the same verbs with the same arguments and answers a `Deferred` instead of the result.
+  Each verb is written once, generic over the completion, so a `DeferredOn` offers the same verbs with the same arguments and answers a `Deferred` instead of the result.
   Opening a database has no view yet, so its options name the executor, and the open blocks.
 - __A call the view cannot serve does not compile.__
   The parent, a `Database`, a `Transaction` or a `Snapshot`, decides the verbs beyond the reads: only a transaction stages, commits, rolls back and resets, only the head clears, compacts and drops collections, only a snapshot saves, and nothing writes through a snapshot.
@@ -603,7 +606,7 @@ The crate is a thin layer over the C ABI in `c/ustore/`, and every rule below fo
   No handle keeps an arena of its own.
 - __Shorthand makes one-off arenas.__
   A `Collection` call with no arena to pass, such as `get` or `contains`, makes an arena for that call, copies its result out, and frees it: slower than reuse, and stateless.
-- __A `DeferredView` refuses borrowed inputs at compile time.__
+- __A `DeferredOn` refuses borrowed inputs at compile time.__
   The library reads a deferred call's inputs after the verb returns, so the `Accepts` bound admits only owned ones, and passing `&[Key]` fails with "a deferred view needs owned inputs".
   The arena stays a borrow, which is safe because `ustore_arena_free` waits for the calls writing into it.
 - __Deferred calls use the language's own idioms.__

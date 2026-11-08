@@ -4,7 +4,42 @@ INPUT                  = ../c/ustore ../cpp/ustore
 RECURSIVE              = YES
 FILE_PATTERNS          = *.h *.hpp
 EXTENSION_MAPPING      = cuh=C++
-EXCLUDE_SYMBOLS        = *_
+EXCLUDE_SYMBOLS        = *_ \
+                         Arrow* \
+                         unum::ustore::reset_t \
+                         unum::ustore::stage_t \
+                         unum::ustore::commit_t \
+                         unum::ustore::rollback_t \
+                         unum::ustore::save_t \
+                         unum::ustore::create_t \
+                         unum::ustore::drop_t \
+                         unum::ustore::list_t \
+                         unum::ustore::describe_t \
+                         unum::ustore::clear_t \
+                         unum::ustore::compact_t \
+                         unum::ustore::flush_t \
+                         unum::ustore::blobs_read_t \
+                         unum::ustore::blobs_write_t \
+                         unum::ustore::blobs_remove_t \
+                         unum::ustore::strings_read_t \
+                         unum::ustore::strings_write_t \
+                         unum::ustore::strings_remove_t \
+                         unum::ustore::strings_scan_t \
+                         unum::ustore::graph_read \
+                         unum::ustore::graph_write_edges_t \
+                         unum::ustore::graph_remove_edges_t \
+                         unum::ustore::graph_write_vertices_t \
+                         unum::ustore::graph_remove_vertices_t \
+                         unum::ustore::docs_read_t \
+                         unum::ustore::docs_write_t \
+                         unum::ustore::docs_remove_t \
+                         unum::ustore::docs_gist_t \
+                         unum::ustore::docs_gather_t \
+                         unum::ustore::places_arg_extractor* \
+                         unum::ustore::values_arg_extractor* \
+                         unum::ustore::location_store* \
+                         unum::ustore::batch_element \
+                         unum::ustore::batch_element<*
 ENABLE_PREPROCESSING   = YES
 MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = YES
@@ -18,6 +53,8 @@ EXTRACT_STATIC         = YES
 GENERATE_HTML          = NO
 GENERATE_LATEX         = NO
 GENERATE_XML           = YES
+XML_PROGRAMLISTING     = NO
+INPUT_FILTER           = "sed -E 's/^( [*]  )@(author|date) .*/\1/'"
 HAVE_DOT               = NO
 QUIET                  = YES
 WARN_IF_UNDOCUMENTED   = NO

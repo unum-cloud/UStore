@@ -37,8 +37,8 @@ The types are templates of `include/ustore/`, which `variants.hpp` instantiates 
 - `blobs/nvme_key_slot.hpp` — identifiers, value layouts, stored keys and values, key slots and the sorted run index.
 - `blobs/nvme_sorted_run.hpp` — `lsm_sorted_run`.
 - `blobs/nvme_compaction.hpp`, `vram_nvidia_compaction.hpp` and `vram_nvidia_compaction.cuh` — the host compactor, the host face of the device one, and its kernels.
-- `blobs/nvme_tree.hpp` — configurations and schemas, `lsm_level`, its merger and `lsm_tree`.
-- `blobs/nvme_store.hpp` — the value cache, `nvme_store`, its snapshot and `nvme_store_cursor`.
+- `blobs/nvme_tree.hpp` — configurations and schemas, the merger and `lsm_tree`; `blobs/nvme_lsm_level.hpp` holds `lsm_level`.
+- `blobs/nvme_store.hpp` — `nvme_store` and its snapshot; `blobs/nvme_value_cache.hpp` holds the value cache and `blobs/nvme_store_cursor.hpp` holds `nvme_store_cursor`.
 - `blobs/nvme_transactions.hpp` — `transaction_deltas`, the read sets, `transaction_registry` and `transaction_core`, which both databases compose.
 - `blobs/nvme_database.hpp` and `nvme_single_collection_database.hpp` — both databases, their snapshots and transactions over the shared registry and core.
 - `graph/adjacency_fold.hpp`, `vram_nvidia_adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below, and the host face of its device fold.

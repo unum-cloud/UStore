@@ -1,4 +1,4 @@
-# Python SDK
+# UStore for Python
 
 The bindings are pure CPython in C11, sitting directly on the C ABI in `c/ustore/`, with no pybind11, NanoBind or SWIG.
 The native core is one extension, `ustore.lib`, and the `ustore` package re-exports it.
@@ -75,7 +75,7 @@ A document or a vertex is a value like any other, so documents, graphs and binar
 ## Receivers & Deferred Calls
 
 A receiver carries what every argument struct of the C ABI puts before its inputs: the view, the executor and the completion.
-A `Database`, `Transaction` or `Snapshot` runs its calls on the calling thread, `on(executor)` answers a `ustore.View` whose calls block on that executor, and `deferred(executor)` answers a `ustore.DeferredView` whose calls submit there and answer a `ustore.Deferred`.
+A `Database`, `Transaction` or `Snapshot` runs its calls on the calling thread, `on(executor)` answers a `ustore.On` whose calls block on that executor, and `deferred(executor)` answers a `ustore.DeferredOn` whose calls submit there and answer a `ustore.Deferred`.
 The receiver's type alone chooses the completion, so all three offer the same verbs with the same arguments, and receivers never change after they are made, so threads share them freely.
 Constructors address no database yet, so no receiver offers them: `open_ram`, `open_rocksdb`, `view_rocksdb` and `open_leveldb` take an `executor=` keyword and block on it, as they block on the calling thread without one.
 In a coroutine, `await` a deferred call; anywhere else, `wait()` blocks the thread with its state detached:
@@ -195,6 +195,9 @@ To keep a result past the next call, or to read one while making the next, pass 
 An arena serves one call at a time, so each deferred call needs its own.
 A NumPy array or `memoryview` over an output pins its arena as a `memoryview` pins a `bytearray`, so the next call naming that arena raises `ContendedError` until the export is released.
 A stale result raises `UninitializedError` when indexed, exported or asked for its `lengths`, `counts` or `degrees`.
+`Values`, `Keys`, `Page` and `Neighborhoods` export DLPack too, so `numpy.from_dlpack(keys)` and `torch.from_dlpack(keys)` read the arena in place, and `__dlpack_device__` reports where the library placed it.
+Python reads every answer on the host, so a verb handed an arena in device memory raises `DeviceError` before it runs.
+A batch of keys is taken from `__dlpack__` before the buffer protocol: packed 16-byte keys pass as they are from host, CUDA, ROCm or managed memory, and 64-bit integers convert where the host reads them.
 
 ```python
 arena = ustore.Arena()
@@ -394,7 +397,7 @@ The suites live in `test/` as `<topic>.py` beside the C++ ones, and benchmarks i
 
 ## What This Binding Does Not Expose
 
-- The strings and pages verbs, strings cursors among them, which Python and Rust gain together.
+- The strings cursor, which `export_arrow` drives.
 - Deferred constructors: an open takes `executor=` and blocks on it, so a database exists once it answers.
 - Deferred cursors: every pull blocks, so a deferred view opens none.
 - `ustore_status_name` and the other `_name` and `_from_name` functions: the module builds every enum through them at import, so `Status["WRITE_CONFLICT"]` parses a name and no string ever reaches a verb.
