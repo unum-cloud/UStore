@@ -111,6 +111,13 @@ class test_store_t {
         return stamps_[stored_key] > from;
     }
 
+    /** Whether a commit since @p from wrote @p stored_key, as every write here replaces
+     *  a balance whole. */
+    bool replaced_since(collection_id_t collection_id, stored_key_t stored_key,
+                        transaction_stamp_t from) const noexcept {
+        return written_since(collection_id, stored_key, from);
+    }
+
     /** Whether a commit since @p from wrote any account from @p lower to @p upper inclusive. */
     bool range_written_since(collection_id_t, stored_key_t lower, stored_key_t upper,
                              transaction_stamp_t from) const noexcept {
@@ -142,8 +149,12 @@ class test_store_t {
         return {};
     }
 
+    /** Claims nothing, since balances live in place and need no memory-run record. */
+    status_t claim_memory_record(collection_id_t, memory_run_claim_t&) noexcept { return {}; }
+
     /** Takes the sealed changes for the commit that follows, or refuses them. */
-    status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference>&) noexcept {
+    status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference>&,
+                                memory_run_claim_t&&) noexcept {
         if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
         return {};
     }
@@ -168,9 +179,6 @@ class test_store_t {
 
     /** Maintains nothing, since balances live in place. */
     status_t maintain(collection_id_t) noexcept { return {}; }
-
-    /** Frees no memory-run record, since this store holds none. */
-    bool flushed_records(collection_id_t) noexcept { return false; }
 
     /** The balance @p stored_key holds right now, which a later commit may already have moved. */
     std::uint64_t balance(stored_key_t stored_key) const noexcept {

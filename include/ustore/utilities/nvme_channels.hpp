@@ -36,6 +36,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
 #include <array>   // `std::array`
+#include <limits>  // `std::numeric_limits`
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`
 #include <variant> // `std::variant`, `std::visit`
@@ -421,9 +422,13 @@ struct io_channel_config_t {
 
 #pragma region Channel
 
-template <typename disk_type_, template <typename> typename atomic_reference_>
+template <typename disk_type_, template <typename> typename atomic_reference_, typename waiter_type_>
     requires ring_concept<disk_type_>
 class basic_io_channel_pool;
+
+template <typename disk_type_>
+    requires ring_concept<disk_type_>
+class basic_read_pipeline;
 
 /**
  *  @brief One queue pair and everything the thread holding it needs, owned by the pool that opened it.
@@ -501,9 +506,28 @@ class io_channel_t {
 
   private:
 
-    template <typename disk_type_, template <typename> typename atomic_reference_>
+    template <typename disk_type_, template <typename> typename atomic_reference_, typename waiter_type_>
         requires ring_concept<disk_type_>
     friend class basic_io_channel_pool;
+
+    template <typename disk_type_>
+        requires ring_concept<disk_type_>
+    friend class basic_read_pipeline;
+
+    /** One read a pipeline offered and has not yet retired, at the ring position of its slot. */
+    struct read_entry_t {
+
+        /** The bytes the device writes into, a block's or the caller's, null once retired. */
+        byte_t* landing = nullptr;
+
+        /** Bytes the request asked for, against which a partial transfer is measured. */
+        std::uint32_t requested_bytes = 0;
+
+        /** The caller's tag, which the sink matches its own bookkeeping on. */
+        request_tag_t tag = 0;
+    };
+
+    static_assert(sizeof(read_entry_t) == 16, "A read entry fills a quarter of a cache line");
 
     /** The queue pair, taken at mount and given back at unmount. */
     queue_pair_t queue_pair_;
@@ -516,6 +540,15 @@ class io_channel_t {
 
     /** Room for one poll, sized to the queue pair's depth. */
     st::vector<completion_t> completions_;
+
+    /** The reads of the pipeline holding the queue pair, a ring of its depth indexed by slot. */
+    st::vector<read_entry_t> read_entries_;
+
+    /** The block each of those reads fills, none for a read into the caller's memory. */
+    st::vector<pooled_buffer_t> read_blocks_;
+
+    /** The requests of those reads, the newest of which the ring may not have taken yet. */
+    st::vector<request_t> read_requests_;
 
     /** The tag the next request of this channel carries, wrapping harmlessly past the depth. */
     request_tag_t next_tag_ = 0;
@@ -544,7 +577,7 @@ class basic_io_channel_guard {
 
     basic_io_channel_guard(basic_io_channel_guard&& other) noexcept
         : disk_(std::exchange(other.disk_, nullptr)), channel_(std::exchange(other.channel_, nullptr)),
-          claim_(std::exchange(other.claim_, nullptr)) {}
+          claim_(std::exchange(other.claim_, nullptr)), released_(std::exchange(other.released_, nullptr)) {}
 
     basic_io_channel_guard& operator=(basic_io_channel_guard&& other) noexcept {
         if (this == &other) return *this;
@@ -552,18 +585,20 @@ class basic_io_channel_guard {
         disk_ = std::exchange(other.disk_, nullptr);
         channel_ = std::exchange(other.channel_, nullptr);
         claim_ = std::exchange(other.claim_, nullptr);
+        released_ = std::exchange(other.released_, nullptr);
         return *this;
     }
 
     ~basic_io_channel_guard() noexcept { surrender_(); }
 
     /** Builds the guard a pool hands back; callers never call this. */
-    [[nodiscard]] static basic_io_channel_guard held(disk_type_& disk, io_channel_t& channel,
-                                                     std::int32_t* claim) noexcept {
+    [[nodiscard]] static basic_io_channel_guard held(disk_type_& disk, io_channel_t& channel, std::int32_t* claim,
+                                                     std::uint32_t* released) noexcept {
         basic_io_channel_guard guard;
         guard.disk_ = &disk;
         guard.channel_ = &channel;
         guard.claim_ = claim;
+        guard.released_ = released;
         return guard;
     }
 
@@ -589,9 +624,11 @@ class basic_io_channel_guard {
         if (channel_ && disk_) [[maybe_unused]]
             status_t const drained = disk_->drain(channel_->queue_pair());
         if (claim_) atomic_reference_<std::int32_t> {*claim_}.store(0, std::memory_order_release);
+        if (released_) atomic_reference_<std::uint32_t> {*released_}.fetch_add(1, std::memory_order_release);
         disk_ = nullptr;
         channel_ = nullptr;
         claim_ = nullptr;
+        released_ = nullptr;
     }
 
     /** The disk the channel belongs to, null once moved from. */
@@ -602,6 +639,10 @@ class basic_io_channel_guard {
 
     /** The word a shared channel is claimed through, null for a channel owned by one executor thread. */
     std::int32_t* claim_ = nullptr;
+
+    /** The pool's count of shared releases, which a thread finding every shared channel
+     *  out waits on. */
+    std::uint32_t* released_ = nullptr;
 };
 
 #pragma endregion Channel
@@ -611,13 +652,14 @@ class basic_io_channel_guard {
 /**
  *  @brief Every queue pair one disk hands out, opened at mount and lent one operation at a time.
  *
- *  Executor threads take their own channel by thread index, so the common path claims nothing. Threads
- *  outside the pool claim one of the shared channels and are refused with @c capacity_exhausted_k when
- *  every shared is out, which is the same back-off the job gate already asks for.
+ *  Executor threads take their own channel by thread index, so the common path claims nothing.
+ *  Threads outside the pool claim one of the shared channels and wait for a release while every
+ *  shared is out.
  *
  *  @tparam atomic_reference_ The reference the shared claim words are owned through.
+ *  @tparam waiter_type_ What a thread finding every shared channel out does until one is released.
  */
-template <typename disk_type_, template <typename> typename atomic_reference_>
+template <typename disk_type_, template <typename> typename atomic_reference_, typename waiter_type_>
     requires ring_concept<disk_type_>
 class basic_io_channel_pool {
   public:
@@ -664,6 +706,10 @@ class basic_io_channel_pool {
             channel.queue_pair_ = std::move(acquired);
             if (channel.completions_.resize(config.depth) != st::status_t::success_k)
                 return status_t {status_code_t::out_of_memory_k, "A channel could not size its polling room"};
+            if (channel.read_entries_.resize(config.depth) != st::status_t::success_k ||
+                channel.read_blocks_.resize(config.depth) != st::status_t::success_k ||
+                channel.read_requests_.resize(config.depth) != st::status_t::success_k)
+                return status_t {status_code_t::out_of_memory_k, "A channel could not size its read ring"};
 
             std::uint64_t const base = per_channel * index;
             buffer_pool_config_t requests;
@@ -704,25 +750,29 @@ class basic_io_channel_pool {
         if (thread_index >= executor_channels_) return acquire();
         io_channel_t& channel = channels_[thread_index];
         if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) return adopted;
-        return guard_t::held(*disk_, channel, nullptr);
+        return guard_t::held(*disk_, channel, nullptr, nullptr);
     }
 
-    /** The first free shared channel, for a thread outside the executor, or @c capacity_exhausted_k when every
-     *  shared is out. */
+    /** The first free shared channel, for a thread outside the executor, waiting for a release
+     *  while every one is out. */
     expected<guard_t> acquire() noexcept {
-        for (std::size_t index = 0; index != shared_claims_.size(); ++index) {
-            std::int32_t expected_free = 0;
-            atomic_reference_<std::int32_t> claim {shared_claims_[index]};
-            if (!claim.compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
-                continue;
-            io_channel_t& channel = channels_[executor_channels_ + index];
-            if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) {
-                claim.store(0, std::memory_order_release);
-                return adopted;
+        for (;;) {
+            std::uint32_t const released = atomic_reference_<std::uint32_t> {released_}.load(std::memory_order_acquire);
+            for (std::size_t index = 0; index != shared_claims_.size(); ++index) {
+                std::int32_t expected_free = 0;
+                atomic_reference_<std::int32_t> claim {shared_claims_[index]};
+                if (!claim.compare_exchange_strong(expected_free, 1, std::memory_order_acquire,
+                                                   std::memory_order_relaxed))
+                    continue;
+                io_channel_t& channel = channels_[executor_channels_ + index];
+                if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) {
+                    claim.store(0, std::memory_order_release);
+                    return adopted;
+                }
+                return guard_t::held(*disk_, channel, &shared_claims_[index], &released_);
             }
-            return guard_t::held(*disk_, channel, &shared_claims_[index]);
+            waiter_type_ {}(&released_, released, std::size_t {0});
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every shared channel of this mount is out"};
     }
 
     /** Channels the mount opened, which is the executor's threads plus the shared_channels. */
@@ -744,6 +794,10 @@ class basic_io_channel_pool {
 
     /** Channels reserved for executor threads, which is where the shared channels start. */
     std::size_t executor_channels_ = 0;
+
+    /** Shared channels released so far, a word that only moves forward, which a thread finding
+     *  every one out waits on. */
+    std::uint32_t released_ = 0;
 };
 
 #pragma endregion Pool
@@ -790,11 +844,13 @@ inline status_t require_completed_in_full(completed_buffer_t const& completed) n
 #pragma region Reading
 
 /**
- *  @brief Keeps a channel's ring as full as its blocks allow, polling to make room rather than waiting.
+ *  @brief Keeps a channel's ring as full as its blocks allow, polling to make room and sleeping
+ *      only when nothing else can move.
  *
- *  A caller offers transfers, flushes them to the ring and polls; the sink sees each block while
- *  the channel still owns it, copies what it needs out, and the block is recycled the moment the
- *  sink returns. A tag is the caller's own, so a sink can index whatever plan it built.
+ *  A caller offers transfers, flushes them to the ring and polls or waits; the sink sees each
+ *  block while the channel still owns it, copies what it needs out, and the block is recycled the
+ *  moment the sink returns. A tag is the caller's own, so a sink can index whatever plan it built.
+ *  The offers live in the channel's read ring at their slot's position, so nothing is allocated.
  */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
@@ -811,6 +867,18 @@ class basic_read_pipeline {
         : disk_(disk), acquired_channel_(std::move(acquired_channel)), channel_(acquired_channel_.channel()),
           medium_(medium) {}
 
+    /** Waits out whatever is still in flight and hands every block back, so the next pipeline
+     *  finds the read ring empty and no completion of this one arrives under its slots. */
+    ~basic_read_pipeline() noexcept {
+        if (outstanding_ != 0) [[maybe_unused]]
+            status_t const drained = disk_.drain(channel_.queue_pair());
+        for (; oldest_slot_ != next_slot_; ++oldest_slot_) {
+            std::size_t const position = position_(oldest_slot_);
+            channel_.read_blocks_[position].release();
+            channel_.read_entries_[position].landing = nullptr;
+        }
+    }
+
     /**
      *  @brief Whether another offer would find a block, credit and room in the window, without taking any.
      *
@@ -823,7 +891,9 @@ class basic_read_pipeline {
 
     /** Whether another offer into registered memory the caller holds would find credit and room
      *  in the window. */
-    [[nodiscard]] bool can_enqueue_into() const noexcept { return entries_.size() < channel_.queue_pair().depth(); }
+    [[nodiscard]] bool can_enqueue_into() const noexcept {
+        return static_cast<std::size_t>(next_slot_ - oldest_slot_) < channel_.read_entries_.size();
+    }
 
     /** Queues a read of @p extent of the pipeline's medium under @p tag, as the
      *  three-argument form does. */
@@ -855,23 +925,31 @@ class basic_read_pipeline {
 
     /** Submits what is staged, keeping whatever the ring would not take for the next call. */
     status_t submit() noexcept {
-        while (!staged_.empty()) {
-            auto [taken, submit_status] = disk_.submit(channel_.queue_pair(), std::span<request_t const> {staged_});
+        std::size_t const positions = channel_.read_requests_.size();
+        while (staged_slot_ != next_slot_) {
+            std::size_t const first = position_(staged_slot_);
+            std::size_t const staged = static_cast<std::size_t>(next_slot_ - staged_slot_);
+            std::size_t const contiguous = staged < positions - first ? staged : positions - first;
+            std::span<request_t const> const batch {channel_.read_requests_.data() + first, contiguous};
+            auto [taken, submit_status] = disk_.submit(channel_.queue_pair(), batch);
             if (submit_status.failed()) return submit_status;
             if (taken == 0) return {};
             outstanding_ += taken;
-            drop_front_(staged_, taken);
+            staged_slot_ += static_cast<request_tag_t>(taken);
         }
         return {};
     }
 
     /** Requests offered and not yet polled, staged ones included. */
-    [[nodiscard]] std::size_t outstanding() const noexcept { return outstanding_ + staged_.size(); }
+    [[nodiscard]] std::size_t outstanding() const noexcept {
+        return outstanding_ + static_cast<std::size_t>(next_slot_ - staged_slot_);
+    }
 
     /**
-     *  @brief Harvests every completion that has landed, calling @p sink once per block.
+     *  @brief Harvests every completion that has landed, calling @p sink once per block, and
+     *      returns at once when none has.
      *  @param[in] sink Called with a @c completed_buffer_t while the channel still owns the block.
-     *  @return How many blocks the sink saw, which is zero when nothing has landed yet.
+     *  @return How many completions arrived, which is zero when nothing has landed yet.
      */
     template <typename sink_type_>
     expected<std::size_t> poll_completions(sink_type_&& sink) noexcept {
@@ -879,38 +957,35 @@ class basic_read_pipeline {
         auto [completed, poll_completions_status] = disk_.poll_completions(channel_.queue_pair(),
                                                                            channel_.completion_buffer());
         if (poll_completions_status.failed()) return poll_completions_status;
-        std::span<completion_t const> const landed = channel_.completion_buffer().first(completed);
-        for (completion_t const& completion : landed) {
-            if (!completion.retires()) continue;
-            entry_t* const entry = entry_of_(completion.token.tag());
-            if (!entry) continue;
-            completed_buffer_t block;
-            block.tag = entry->tag;
-            block.state = completion.state;
-            block.status = completion.status;
-            block.requested_bytes = entry->requested_bytes;
-            block.bytes = std::span<byte_t const> {entry->landing.data(),
-                                                   static_cast<std::size_t>(completion.transferred_bytes)};
-            sink(block);
-            entry->block.release();
-            entry->live = false;
-            --outstanding_;
-        }
-        compact_();
-        return landed.size();
+        return retire_(completed, sink);
     }
 
-    /** Harvests until at least one block is seen, which is how an exhausted pool makes room. */
+    /**
+     *  @brief Harvests at least one completion, sleeping in the kernel where the disk can park the
+     *      thread, and polling once where it cannot, as on SPDK and the blocking floor.
+     *  @param[in] sink Called with a @c completed_buffer_t while the channel still owns the block.
+     *  @return How many completions arrived, which is zero only when nothing is in flight.
+     */
+    template <typename sink_type_>
+    expected<std::size_t> wait_completions(sink_type_&& sink) noexcept {
+        if (outstanding_ == 0) return std::size_t {0};
+        auto [completed, wait_completions_status] = wait_on_disk_();
+        if (wait_completions_status.failed()) return wait_completions_status;
+        return retire_(completed, sink);
+    }
+
+    /** Harvests until at least one block retires, which is how an exhausted pool makes room. */
     template <typename sink_type_>
     status_t poll_one_completion(sink_type_&& sink) noexcept {
         if (outstanding_ == 0) return {status_code_t::invalid_argument_k, "This channel has nothing in flight"};
         std::size_t const before = outstanding_;
-        for (std::size_t spins = 0; outstanding_ == before && spins != poll_spin_limit_k; ++spins) {
-            auto [seen, poll_completions_status] = poll_completions(sink);
-            if (poll_completions_status.failed()) return poll_completions_status;
+        while (outstanding_ == before) {
+            if (disk_.outstanding(channel_.queue_pair()) == 0)
+                return {status_code_t::io_k, "The ring answered for every request, one of which never retired here"};
+            auto [seen, wait_completions_status] = wait_completions(sink);
+            if (wait_completions_status.failed()) return wait_completions_status;
         }
-        return outstanding_ == before ? status_t {status_code_t::io_k, "A channel's completions never arrived"}
-                                      : status_t {};
+        return {};
     }
 
     /** Harvests everything outstanding, which a caller does before it drops the pipeline. */
@@ -927,68 +1002,65 @@ class basic_read_pipeline {
 
   private:
 
-    /** One offered request and the block it fills, retired when its completion is polled. */
-    struct entry_t {
+    using read_entry_t = io_channel_t::read_entry_t;
 
-        /** The block the device writes into, recycled after the sink has seen it, or none for a
-         *  read into the caller's memory. */
-        pooled_buffer_t block;
-
-        /** The bytes the device writes into: the block's, or the caller's. */
-        std::span<byte_t> landing;
-
-        /** The caller's tag, which the sink matches its own bookkeeping on. */
-        request_tag_t tag = 0;
-
-        /** Bytes the request asked for, against which a partial transfer is measured. */
-        std::uint64_t requested_bytes = 0;
-
-        /** Whether this entry still awaits its completion. */
-        bool live = true;
-    };
+    /** The read ring position of @p slot. */
+    [[nodiscard]] std::size_t position_(request_tag_t slot) const noexcept {
+        return static_cast<std::size_t>(slot) % channel_.read_entries_.size();
+    }
 
     /** Stages a read of @p extent of @p medium into @p landing, whose place @p into names, keeping
      *  @p block until its completion. */
     status_t offer_(medium_reference_t medium, extent_t extent, memory_reference_t into, std::span<byte_t> landing,
                     pooled_buffer_t&& block, request_tag_t tag) noexcept {
-        entry_t entry;
-        entry.block = std::move(block);
-        entry.landing = landing;
-        entry.tag = tag;
-        entry.requested_bytes = extent.length;
-        request_t const request = read_request(medium, extent, into, channel_.token(next_slot_));
-        if (staged_.push_back(request_t {request}) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A pipeline could not stage another request"};
-        if (entries_.push_back(std::move(entry)) != st::status_t::success_k) {
-            staged_.pop_back();
-            return {status_code_t::out_of_memory_k, "A pipeline could not track another request"};
-        }
+        if (extent.length > std::numeric_limits<std::uint32_t>::max())
+            return {status_code_t::invalid_argument_k, "A read asks for more bytes than one request carries"};
+        std::size_t const position = position_(next_slot_);
+        channel_.read_requests_[position] = read_request(medium, extent, into, channel_.token(next_slot_));
+        channel_.read_blocks_[position] = std::move(block);
+        channel_.read_entries_[position] = read_entry_t {landing.data(), static_cast<std::uint32_t>(extent.length),
+                                                         tag};
         ++next_slot_;
         return {};
     }
 
-    /** The entry a completion belongs to, found by the ring tag it was minted with. */
-    [[nodiscard]] entry_t* entry_of_(request_tag_t slot) noexcept {
-        request_tag_t const base = next_slot_ - static_cast<request_tag_t>(entries_.size());
-        std::uint32_t const index = slot - base;
-        if (index >= entries_.size()) return nullptr;
-        entry_t& entry = entries_[index];
-        return entry.live ? &entry : nullptr;
+    /** Waits for at least one completion where the disk offers a sleeping wait, or polls once. */
+    expected<std::size_t> wait_on_disk_() noexcept {
+        if constexpr (requires(disk_type_& disk, queue_pair_t const& queue_pair, std::span<completion_t> into) {
+                          disk.wait_completions(queue_pair, into);
+                      })
+            return disk_.wait_completions(channel_.queue_pair(), channel_.completion_buffer());
+        else return disk_.poll_completions(channel_.queue_pair(), channel_.completion_buffer());
     }
 
-    /** Drops the retired prefix of the entry table, so a long run does not grow it without bound. */
-    void compact_() noexcept {
-        std::size_t retired = 0;
-        while (retired != entries_.size() && !entries_[retired].live) ++retired;
-        if (retired != 0) drop_front_(entries_, retired);
-    }
-
-    /** Removes the first @p count elements of @p elements, shifting the rest down. */
-    template <typename element_type_>
-    static void drop_front_(st::vector<element_type_>& elements, std::size_t count) noexcept {
-        for (std::size_t index = count; index != elements.size(); ++index)
-            elements[index - count] = std::move(elements[index]);
-        for (std::size_t index = 0; index != count; ++index) elements.pop_back();
+    /** Hands the first @p completed completions of the channel's buffer to @p sink, recycling
+     *  their blocks, and moves the window past the retired prefix. */
+    template <typename sink_type_>
+    std::size_t retire_(std::size_t completed, sink_type_& sink) noexcept {
+        std::span<completion_t const> const landed = channel_.completion_buffer().first(completed);
+        for (completion_t const& completion : landed) {
+            if (!completion.retires()) continue;
+            request_tag_t const slot = completion.token.tag();
+            request_tag_t const submitted = staged_slot_ - oldest_slot_;
+            if (static_cast<request_tag_t>(slot - oldest_slot_) >= submitted) continue;
+            std::size_t const position = position_(slot);
+            read_entry_t& entry = channel_.read_entries_[position];
+            if (entry.landing == nullptr) continue;
+            completed_buffer_t block;
+            block.tag = entry.tag;
+            block.state = completion.state;
+            block.status = completion.status;
+            block.requested_bytes = entry.requested_bytes;
+            block.bytes = std::span<byte_t const> {entry.landing,
+                                                   static_cast<std::size_t>(completion.transferred_bytes)};
+            sink(block);
+            channel_.read_blocks_[position].release();
+            entry.landing = nullptr;
+            --outstanding_;
+        }
+        while (oldest_slot_ != staged_slot_ && channel_.read_entries_[position_(oldest_slot_)].landing == nullptr)
+            ++oldest_slot_;
+        return landed.size();
     }
 
     /** The disk this pipeline submits against. */
@@ -997,20 +1069,20 @@ class basic_read_pipeline {
     /** The queue pair this pipeline holds alone. */
     io_channel_t::acquired_channel_t acquired_channel_;
 
-    /** The channel this pipeline submits and polls on. */
+    /** The channel this pipeline submits and polls on, whose read ring holds the offers. */
     io_channel_t& channel_;
 
     /** The medium every offer reads from. */
     medium_reference_t medium_;
 
-    /** One entry per offered request, in the order they were offered. */
-    st::vector<entry_t> entries_;
-
-    /** Requests built but not yet taken by the ring. */
-    st::vector<request_t> staged_;
-
     /** Requests the ring has taken and not yet handed back. */
     std::size_t outstanding_ = 0;
+
+    /** The oldest offer not yet retired, where the window starts. */
+    request_tag_t oldest_slot_ = 0;
+
+    /** The oldest offer the ring has not yet taken, where the staged requests start. */
+    request_tag_t staged_slot_ = 0;
 
     /** The ring tag the next offer takes, which rises for the life of the pipeline. */
     request_tag_t next_slot_ = 0;

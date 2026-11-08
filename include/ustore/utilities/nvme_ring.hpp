@@ -894,8 +894,8 @@ struct ring_capabilities_t {
  *
  *  Nothing here blocks. @c submit takes a prefix of the batch and answers how much it took, which is
  *  zero on a full ring; @c poll answers how many completions it moved, which is zero when none are
- *  ready. A bounded wait is a spin over @c poll, because SPDK has no interrupt at all and an
- *  io_uring ring with @c DEFER_TASKRUN only processes completions when its owning thread enters.
+ *  ready. A disk whose kernel can park the caller also offers @c wait_completions, which sleeps
+ *  until one lands; SPDK has no interrupt at all, so @ref wait_completions polls it instead.
  */
 template <typename disk_type_>
 concept ring_concept = requires(disk_type_& disk, disk_type_ const& constant, queue_pair_t& queue_pair,
@@ -945,6 +945,29 @@ expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t c
         completed += moved;
     }
     return completed;
+}
+
+/**
+ *  @brief Moves at least one completion of @p queue_pair into @p into, sleeping in the kernel where
+ *      the disk offers @c wait_completions and polling through @p waiter_type_ where it does not.
+ *  @param[in,out] disk The ring the queue pair polls from.
+ *  @param[in] queue_pair The queue pair whose completions are wanted, held by the calling thread.
+ *  @param[out] into Room for the completions, which bounds how many one call moves.
+ *  @return The completions moved, which is zero only once the queue pair has nothing outstanding.
+ *  @tparam waiter_type_ What the polling core does after a poll that moved nothing.
+ */
+template <typename waiter_type_, typename disk_type_>
+    requires ring_concept<disk_type_>
+expected<std::size_t> wait_completions(disk_type_& disk, queue_pair_t const& queue_pair,
+                                       std::span<completion_t> into) noexcept {
+    if constexpr (requires { disk.wait_completions(queue_pair, into); }) return disk.wait_completions(queue_pair, into);
+    else
+        for (std::size_t spins = 0;; ++spins) {
+            auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, into);
+            if (poll_completions_status.failed()) return poll_completions_status;
+            if (moved != 0 || disk.outstanding(queue_pair) == 0) return moved;
+            waiter_type_ {}(&spins, spins, std::size_t {0});
+        }
 }
 
 #pragma endregion Contract

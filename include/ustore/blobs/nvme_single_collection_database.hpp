@@ -731,17 +731,6 @@ class basic_single_collection_database {
     /** Pins the newest published stamp, at which every read through the snapshot answers, and flushes nothing. */
     expected<snapshot_t> pin_stamp() noexcept { return snapshot_t::of(*this); }
 
-    /** Flushes the memory runs under the claim, answering whether that gave memory-run records
-     *  back, which a commit refused a record waits on before it resubmits. */
-    [[nodiscard]] bool flushed_records(collection_id_t = single_collection_id_k) noexcept {
-        std::size_t const held = collection_.memory_shape().runs;
-        {
-            claim_guard_t const claimed {*this};
-            if (adopt_channels_().failed() || flush_and_compact_().failed()) return false;
-        }
-        return collection_.memory_shape().runs < held;
-    }
-
 #pragma endregion Maintenance
 
 #pragma region Transactions
@@ -822,6 +811,12 @@ class basic_single_collection_database {
         return collection_.written_since(stored_key, from);
     }
 
+    /** Whether a commit newer than @p from removed @p stored_key or wrote it whole. */
+    [[nodiscard]] bool replaced_since(collection_id_t, stored_key_t stored_key,
+                                      transaction_stamp_t from) const noexcept {
+        return collection_.replaced_since(stored_key, from);
+    }
+
     /** Whether a commit newer than @p from wrote any key from @p lower to @p upper inclusive. */
     [[nodiscard]] bool range_written_since(collection_id_t, stored_key_t lower, stored_key_t upper,
                                            transaction_stamp_t from) const noexcept {
@@ -845,10 +840,39 @@ class basic_single_collection_database {
         return make_room_(sealed);
     }
 
-    /** Lays out the view @p sealed is published in, on the thread holding the ledger's leader word. */
-    status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
-        if (sealed.empty()) return {};
-        return collection_.prepare(sealed);
+    /**
+     *  @brief Claims a memory-run record for a commit sealed for the collection, before the commit
+     *      takes the leader word: a free one, else the flush of the memory runs while nobody holds
+     *      the claim, else one vacated while this waits.
+     *  @note Called outside the ledger's epochs, which every flush waits out.
+     */
+    status_t claim_memory_record(collection_id_t, memory_run_claim_t& claimed) noexcept {
+        atomic_reference_<std::uint32_t const> const vacated {collection_.vacated()};
+        for (;;) {
+            std::uint32_t const observed = vacated.load(std::memory_order_acquire);
+            status_t const taken = collection_.try_claim(claimed);
+            if (taken != status_code_t::capacity_exhausted_k) return taken;
+            // A flush frees every published run's record; with none published, every record is out
+            // with a commit.
+            if (collection_.memory_shape().runs != 0) {
+                claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+                if (held.holding()) {
+                    if (status_t const adopted = adopt_channels_(); adopted.failed()) return adopted;
+                    if (status_t const flushed = flush_and_compact_(); flushed.failed()) return flushed;
+                    continue;
+                }
+            }
+            if (vacated.load(std::memory_order_acquire) == observed)
+                waiter_type_ {}(&collection_.vacated(), observed, std::size_t {0});
+        }
+    }
+
+    /** Lays out the view @p sealed is published in, out of the room @p claimed holds, on the
+     *  thread holding the ledger's leader word. */
+    status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference_>& sealed,
+                                memory_run_claim_t&& claimed) noexcept {
+        collection_.prepare(sealed, std::move(claimed));
+        return {};
     }
 
     /** Publishes @p sealed under @p stamp, before the stamp itself is, on the thread holding the leader word. */
@@ -947,12 +971,12 @@ class basic_single_collection_database {
         if (!sealed) return sealed.status();
         if (sealed->empty()) return {};
         if (status_t const room = make_room_(*sealed); room.failed()) return room;
-        for (;;) {
-            status_t const committed = collection_.commit(*sealed);
-            if (committed.succeeded()) break;
-            // A commit refused a memory-run record retries only once a flush gave records back.
-            if (committed != status_code_t::capacity_exhausted_k || !flushed_records()) return committed;
-        }
+        // Claimed before the leader word, waiting on a flush when every record is out, so the
+        // commit cannot be refused.
+        memory_run_claim_t claimed;
+        if (status_t const taken = claim_memory_record(single_collection_id_k, claimed); taken.failed()) return taken;
+        if (status_t const committed = collection_.commit(*sealed, std::move(claimed)); committed.failed())
+            return committed;
         // The commit has landed, so a failure to maintain is met again by the next commit making room.
         [[maybe_unused]] status_t const maintained = maintain(single_collection_id_k);
         return {};
@@ -1060,8 +1084,9 @@ class basic_single_collection_database {
         return collection_.restore(writing_channel_, std::span<lsm_tree_run_record_t const> {runs});
     }
 
-    /** Publishes @p written of @p bytes as the owner's data, and gives back the data it replaces
-     *  once the manifest naming the new one is durable; a refusal keeps the old data. */
+    /** Publishes @p written of @p bytes as the owner's data; whichever extent the durable
+     *  manifest stops naming, the replaced one or a refused new one, goes back after the next
+     *  publication that succeeds. */
     status_t replace_user_data_(uuid_t const& run, medium_extent_t const& written, std::uint64_t bytes) noexcept {
         uuid_t const replaced_run = std::exchange(user_data_run_, run);
         medium_extent_t const replaced = std::exchange(user_data_, written);
@@ -1070,10 +1095,10 @@ class basic_single_collection_database {
             user_data_run_ = replaced_run;
             user_data_ = replaced;
             user_data_bytes_ = replaced_bytes;
-            if (bytes != 0) volume_.deallocate(written);
+            if (bytes != 0) volume_.deallocate_after_publication(written);
             return published;
         }
-        if (replaced_bytes != 0) volume_.deallocate(replaced);
+        if (replaced_bytes != 0) volume_.deallocate_after_publication(replaced);
         return {};
     }
 

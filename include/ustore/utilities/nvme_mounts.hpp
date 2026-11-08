@@ -327,6 +327,14 @@ class any_files_disk {
         return std::visit([&](auto& disk) noexcept { return disk.poll_completions(queue_pair, into); }, held_);
     }
 
+    /** Moves at least one of @p queue pair's completions into @p into, sleeping in the kernel where
+     *  the held transport can and polling where it cannot. */
+    expected<std::size_t> wait_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
+        return std::visit(
+            [&](auto& disk) noexcept { return utilities::wait_completions<waiter_type_>(disk, queue_pair, into); },
+            held_);
+    }
+
     /** Stops @p queue pair's requests that have not started. */
     void cancel(queue_pair_t const& queue_pair) noexcept {
         std::visit([&](auto& disk) noexcept { disk.cancel(queue_pair); }, held_);
@@ -430,7 +438,7 @@ class basic_storage_mount {
     using volume_t = any_volume<disk_type_, waiter_type_, allocator_t>;
 
     /** Every queue pair this mount hands out, one per executor thread plus the shared channels. */
-    using channel_pool_t = basic_io_channel_pool<disk_type_, atomic_reference_>;
+    using channel_pool_t = basic_io_channel_pool<disk_type_, atomic_reference_, waiter_type_>;
 
     /** The one pinned range every I/O buffer is carved out of, charged to the host budget. */
     using arena_t = registered_memory_arena<atomic_reference_>;

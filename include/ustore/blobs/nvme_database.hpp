@@ -229,6 +229,20 @@ class database_transaction {
         return core_.template watch_more<watch_schedule_>(collection_id, stored_keys);
     }
 
+    /**
+     *  @brief Watches @p stored_keys of @p id for being removed or wholly written, letting
+     *      change deltas through.
+     *  @param[in] id The collection the keys belong to, named by its ID or by its name.
+     *  @param[in] stored_keys The keys an edit folds onto, which must still stand when it commits.
+     */
+    template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
+    status_t watch_existence(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys) noexcept {
+        collection_id_t const collection_id = resolve_(id).id;
+        if (collection_id == collection_invalid_id_k)
+            return {status_code_t::not_found_k, "The store names no such collection"};
+        return core_.template watch_existence<watch_schedule_>(collection_id, stored_keys);
+    }
+
     /** Watches every key of @p id from @p lower to @p upper inclusive, the absent ones too, which a scan this
      *  transaction ran over them does so a commit inserting into the range conflicts. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
@@ -582,6 +596,13 @@ inline constexpr std::size_t collection_name_max_bytes_k = 64;
 /** What a mount takes for a digester to check no run against the SHA-256 its manifest names. */
 struct unverified_runs_t {};
 
+/** What a published ingest answers: its stamp, or @c invalid_transaction_stamp_k when it never
+ *  landed, beside the status of publishing it or, once landed, of the flush it asked for. */
+struct ingest_outcome_t {
+    transaction_stamp_t stamp = invalid_transaction_stamp_k;
+    status_t status;
+};
+
 /**
  *  @brief Named collections of one database, the manifest that names them and the
  *      transactions they share.
@@ -615,7 +636,7 @@ class basic_database {
     using disk_t = typename volume_t::disk_t;
 
     /** The queue pairs every call that moves bytes borrows one of. */
-    using channel_pool_t = basic_io_channel_pool<disk_t, atomic_reference_>;
+    using channel_pool_t = basic_io_channel_pool<disk_t, atomic_reference_, waiter_type_>;
 
     /** One borrowed queue pair, drained and given back when it dies. */
     using channel_guard_t = typename channel_pool_t::guard_t;
@@ -672,6 +693,14 @@ class basic_database {
 
         /** The collection itself, pinned here so a snapshot may name it. */
         any_collection_t held;
+
+        /** The first stamp a reader sees this collection at: the one its create drew, or none
+         *  for one a mount adopted, which every stamp sees. */
+        transaction_stamp_t listed_stamp = unwritten_stamp_k;
+
+        /** The first stamp a reader stops seeing it at: the stamp its unlisting drew, or none
+         *  while it stays listed. */
+        transaction_stamp_t unlisted_stamp = invalid_transaction_stamp_k;
     };
 
 #pragma endregion Types
@@ -817,6 +846,35 @@ class basic_database {
         return {};
     }
 
+    /** The store tag of @p collection_id as a reader pinned at @p stamp sees it, the head
+     *  included, inside the epochs of @p thread_index, answering @c not_found_k for a collection
+     *  not listed at that stamp. */
+    status_t listed_store_tag(collection_id_t collection_id, transaction_stamp_t stamp, std::uint16_t& store_tag,
+                              std::size_t thread_index = outside_executor_k) noexcept {
+        reader_t const inside = ledger_.epochs().enter(thread_index);
+        collection_entry_t const* const found = entry_with_id_(collection_id);
+        if (!found) return {status_code_t::not_found_k, "The database lists no such collection at that stamp"};
+        transaction_stamp_t const at = stamp == head_stamp_k ? ledger_.published() : stamp;
+        transaction_stamp_t const listed = atomic_reference_<transaction_stamp_t const> {found->listed_stamp}.load(
+            std::memory_order_acquire);
+        transaction_stamp_t const unlisted = atomic_reference_<transaction_stamp_t const> {found->unlisted_stamp}.load(
+            std::memory_order_acquire);
+        if (at < listed || unlisted <= at)
+            return {status_code_t::not_found_k, "The database lists no such collection at that stamp"};
+        store_tag = found->store_tag;
+        return {};
+    }
+
+    /** Unlists @p collection_id from the stamp a commit draws for it on, keeping it for the
+     *  readers pinned below, answering @c not_found_k for a collection the database names not. */
+    status_t unlist_collection(collection_id_t collection_id) noexcept {
+        claim_guard_t const claim {*this};
+        collection_entry_t* const found = entry_with_id_(collection_id);
+        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+        stamp_next_commit_(found->unlisted_stamp);
+        return {};
+    }
+
     /**
      *  @brief The ID @p id answers to and the bounds it was created with, read in one lookup.
      *  @param[in] id The collection to resolve, named by its ID or by its name.
@@ -899,6 +957,8 @@ class basic_database {
         else if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
             created = status_t {status_code_t::out_of_memory_k, "No room for another collection"};
         else {
+            // Hidden from every pinned stamp until the commit below draws its listing stamp.
+            entry->listed_stamp = invalid_transaction_stamp_k;
             if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed())
                 created = flushed;
             else if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) created = saved;
@@ -906,6 +966,7 @@ class basic_database {
             if (created.failed()) collections_.erase(collections_.size() - 1);
         }
         if (created.failed()) release_entry_(*entry);
+        else stamp_next_commit_(entry->listed_stamp);
         return created;
     }
 
@@ -1346,22 +1407,24 @@ class basic_database {
      *  @param[in] durability Flushed for an ingest durable on return, flushing every collection and
      *      publishing the manifest, or buffered for one the next manifest names and a crash before
      *      it drops whole.
-     *  @return The stamp, or the status that stopped it with every run dropped, either way with the claim given back.
+     *  @return The stamp beside the status of the flush @p durability asked for, or no stamp
+     *      beside the status that stopped it with every run dropped, with the claim given back.
      */
-    expected<transaction_stamp_t> publish_ingest(ingest_t& ingest, ustore_durability_t durability) noexcept {
+    ingest_outcome_t publish_ingest(ingest_t& ingest, ustore_durability_t durability) noexcept {
         // The channel goes back before the claim, as every claimed call gives them back
-        expected<transaction_stamp_t> const landed = [&]() noexcept -> expected<transaction_stamp_t> {
+        ingest_outcome_t const landed = [&]() noexcept -> ingest_outcome_t {
             auto [guard, acquire_status] = channels_->acquire();
-            if (acquire_status.failed()) return acquire_status;
+            if (acquire_status.failed()) return ingest_outcome_t {invalid_transaction_stamp_k, acquire_status};
             io_channel_t& channel = guard.channel();
             expected<transaction_stamp_t> const published = with_ingest_<expected<transaction_stamp_t>>(
                 ingest,
                 [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
                     return held.publish_ingest(channel, ingested);
                 });
-            if (!published || durability != ustore_durability_flushed_k) return published;
-            if (status_t const durable = flush_holding_(channel); durable.failed()) return durable;
-            return published;
+            // The stamp is final once published, so a failed flush is retried as a flush
+            if (!published) return ingest_outcome_t {invalid_transaction_stamp_k, published.status()};
+            if (durability != ustore_durability_flushed_k) return ingest_outcome_t {*published, {}};
+            return ingest_outcome_t {*published, flush_holding_(channel)};
         }();
         ingest.claim_ = claim_guard_t {};
         return landed;
@@ -1482,6 +1545,21 @@ class basic_database {
             found->held);
     }
 
+    /** Whether a commit newer than @p from removed @p stored_key of @p collection_id or wrote it
+     *  whole, read from the published view; a collection gone since counts as replaced. */
+    [[nodiscard]] bool replaced_since(collection_id_t collection_id, stored_key_t stored_key,
+                                      transaction_stamp_t from) noexcept {
+        reader_t const inside = ledger_.epochs().enter();
+        collection_entry_t const* const found = entry_with_id_(collection_id);
+        if (!found) return true;
+        return std::visit(
+            [&]<typename store_type_>(store_type_ const& collection) noexcept {
+                if constexpr (keyed_by_database<store_type_>()) return collection.replaced_since(stored_key, from);
+                else return true;
+            },
+            found->held);
+    }
+
     /** Whether a commit newer than @p from wrote any key of @p collection_id from @p lower to @p upper inclusive,
      *  read from the published view; a collection gone since counts as written. */
     [[nodiscard]] bool range_written_since(collection_id_t collection_id, stored_key_t lower, stored_key_t upper,
@@ -1522,17 +1600,22 @@ class basic_database {
     }
 
     /**
-     *  @brief Lays out the view @p sealed's run is published in, on the thread holding the leader word.
+     *  @brief Lays out the view @p sealed's run is published in, out of the room @p claimed holds,
+     *      on the thread holding the leader word.
      *  @return @c write_conflict_k for a collection gone since the transaction wrote it.
      */
     status_t prepare_collection(collection_id_t collection_id,
-                                sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed) noexcept {
+                                sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed,
+                                memory_run_claim_t&& claimed) noexcept {
         reader_t const inside = ledger_.epochs().enter();
         collection_entry_t* const found = entry_with_id_(collection_id);
         if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
         return std::visit(
             [&]<typename store_type_>(store_type_& collection) noexcept -> status_t {
-                if constexpr (keyed_by_database<store_type_>()) return collection.prepare(sealed);
+                if constexpr (keyed_by_database<store_type_>()) {
+                    collection.prepare(sealed, std::move(claimed));
+                    return {};
+                }
                 else return keyed_otherwise_();
             },
             found->held);
@@ -1583,19 +1666,60 @@ class basic_database {
      *  included. */
     [[nodiscard]] channel_pool_t& channels() noexcept { return *channels_; }
 
-    /** Flushes @p collection_id's memory runs under the claim, answering whether that gave
-     *  memory-run records back, which a commit refused a record waits on before it resubmits. */
-    [[nodiscard]] bool flushed_records(collection_id_t collection_id) noexcept {
-        std::size_t const held = memory_shape(any_collection_id_t {collection_id}).runs;
-        {
-            claim_guard_t const claimed {*this};
-            collection_entry_t* const found = entry_with_id_(collection_id);
-            if (!found) return false;
-            if (std::visit([&](auto& collection) noexcept { return flush_and_compact_(collection); }, found->held)
-                    .failed())
-                return false;
+    /**
+     *  @brief Claims a memory-run record of @p collection_id's store for a commit sealed for it,
+     *      before the commit takes the leader word: a free one, else the flush of the collection's
+     *      memory runs while nobody holds the claim, else one vacated while this waits.
+     *  @return @c write_conflict_k for a collection gone since it was written, or why a flush or
+     *      the view failed.
+     *  @note Called outside the ledger's epochs, which every flush waits out.
+     */
+    status_t claim_memory_record(collection_id_t collection_id, memory_run_claim_t& claimed) noexcept {
+        for (;;) {
+            std::uint32_t const* vacated = nullptr;
+            std::uint32_t observed = 0;
+            bool flushable = false;
+            {
+                reader_t const inside = ledger_.epochs().enter();
+                collection_entry_t* const found = entry_with_id_(collection_id);
+                if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+                status_t const taken = std::visit(
+                    [&](auto& collection) noexcept -> status_t {
+                        vacated = &collection.vacated();
+                        observed = atomic_reference_<std::uint32_t const> {*vacated}.load(std::memory_order_acquire);
+                        status_t const status = collection.try_claim(claimed);
+                        flushable = collection.memory_shape().runs != 0;
+                        return status;
+                    },
+                    found->held);
+                if (taken.succeeded()) {
+                    claimed.owner = this;
+                    claimed.give_back = &give_back_memory_record_;
+                    claimed.collection = collection_id;
+                    return {};
+                }
+                if (taken != status_code_t::capacity_exhausted_k) return taken;
+            }
+            // A flush frees every published run's record; with none published, every record is out
+            // with a commit.
+            if (flushable) {
+                claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+                if (held.holding()) {
+                    collection_entry_t* const claimed_entry = entry_with_id_(collection_id);
+                    if (!claimed_entry)
+                        return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+                    if (status_t const flushed = std::visit(
+                            [&](auto& collection) noexcept { return flush_and_compact_(collection); },
+                            claimed_entry->held);
+                        flushed.failed())
+                        return flushed;
+                    continue;
+                }
+            }
+            // Entries never move, so the word stays readable if a drop destroys the store.
+            if (atomic_reference_<std::uint32_t const> {*vacated}.load(std::memory_order_acquire) == observed)
+                waiter_type_ {}(vacated, observed, std::size_t {0});
         }
-        return memory_shape(any_collection_id_t {collection_id}).runs < held;
     }
 
 #pragma endregion Write Path
@@ -1753,10 +1877,16 @@ class basic_database {
         if (failure.succeeded())
             failure = manifest.print(constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint},
                                      json);
-        if (failure.succeeded()) failure = into.publish_manifest(channel, std::span<char const> {json});
         if (failure.failed()) {
             for (medium_extent_t const& extent : placed) into.deallocate(extent);
             return failure;
+        }
+        if (status_t const published = into.publish_manifest(channel, std::span<char const> {json});
+            published.failed()) {
+            // A publication failing past its rename leaves a manifest on disk naming these, so none
+            // goes back yet.
+            for (medium_extent_t const& extent : placed) into.deallocate_after_publication(extent);
+            return published;
         }
 
         // The target gives back every run the previous manifest named and this one does not.
@@ -1969,7 +2099,25 @@ class basic_database {
     /** A free record of @c entries_, or null when the pool may not grow. */
     [[nodiscard]] collection_entry_t* take_entry_() noexcept {
         std::uint32_t const index = entries_.take();
-        return index == entries_t::absent_k ? nullptr : &entries_[index];
+        if (index == entries_t::absent_k) return nullptr;
+        collection_entry_t& entry = entries_[index];
+        entry.listed_stamp = unwritten_stamp_k;
+        entry.unlisted_stamp = invalid_transaction_stamp_k;
+        return &entry;
+    }
+
+    /** Lands a commit of nothing, whose stamp the leader stores into @p word before it publishes
+     *  the stamp, so a reader pinned at that stamp or later reads @p word set. */
+    void stamp_next_commit_(transaction_stamp_t& word) noexcept {
+        commit_request_t request;
+        request.context = &word;
+        request.prepare = [](void*) noexcept -> status_t { return {}; };
+        request.publish = [](void* context, transaction_stamp_t stamp) noexcept {
+            atomic_reference_<transaction_stamp_t> {*static_cast<transaction_stamp_t*>(context)}.store(
+                stamp, std::memory_order_release);
+        };
+        // A commit preparing nothing is never refused.
+        [[maybe_unused]] expected<transaction_stamp_t> const landed = ledger_.submit(request);
     }
 
     /** Destroys the collection @p entry holds and returns its record to @c entries_. */
@@ -1989,11 +2137,24 @@ class basic_database {
 
         /** Its deltas and the run they become. */
         sealed_commit<stored_key_t, atomic_reference_, row_kit_type_> sealed;
+
+        /** The memory-run record the run lands in, claimed before the leader word. */
+        memory_run_claim_t record;
     };
 
     static status_t prepare_head_(void* context) noexcept {
         head_commit_t& head = *static_cast<head_commit_t*>(context);
-        return head.store->prepare_collection(head.id, head.sealed);
+        return head.store->prepare_collection(head.id, head.sealed, std::move(head.record));
+    }
+
+    /** Gives @p claimed back to the store of its collection, or frees its view alone once a drop
+     *  took the store. */
+    static void give_back_memory_record_(memory_run_claim_t& claimed) noexcept {
+        basic_database& owner = *static_cast<basic_database*>(claimed.owner);
+        reader_t const inside = owner.ledger_.epochs().enter();
+        if (collection_entry_t* const found = owner.entry_with_id_(claimed.collection))
+            std::visit([&](auto& collection) noexcept { collection.give_back(claimed); }, found->held);
+        else claimed.destroy_view(claimed.view);
     }
 
     static void publish_head_(void* context, transaction_stamp_t stamp) noexcept {
@@ -2014,17 +2175,14 @@ class basic_database {
         }
         if (status_t const sealed = seal_into_(head.id, head.sealed, sealer); sealed.failed()) return sealed;
         if (head.sealed.empty()) return {};
+        // Claimed before the leader word, waiting on a flush when every record is out, so the
+        // commit cannot be refused.
+        if (status_t const claimed = claim_memory_record(head.id, head.record); claimed.failed()) return claimed;
         commit_request_t request;
         request.context = &head;
         request.prepare = &prepare_head_;
         request.publish = &publish_head_;
-        for (;;) {
-            status_t const committed = ledger_.submit(request).status();
-            if (committed.succeeded()) break;
-            // A commit refused a memory-run record resubmits only once a flush gave records back,
-            // so it never spins.
-            if (committed != status_code_t::capacity_exhausted_k || !flushed_records(head.id)) return committed;
-        }
+        if (status_t const committed = ledger_.submit(request).status(); committed.failed()) return committed;
         // The commit has landed, so a failure to maintain is met again by the next commit making room.
         [[maybe_unused]] status_t const maintained = maintain(head.id);
         return {};
@@ -2256,9 +2414,9 @@ class basic_database {
         return {};
     }
 
-    /** Publishes @p written of @p bytes as the caller's own data, and gives the data it replaces
-     *  back once the manifest naming the new one is durable; a refused publication keeps the old
-     *  data and drops the new. */
+    /** Publishes @p written of @p bytes as the caller's own data; whichever extent the durable
+     *  manifest stops naming, the replaced one or a refused new one, goes back after the next
+     *  publication that succeeds. */
     status_t replace_user_data_(io_channel_t& channel, uuid_t const& run, medium_extent_t const& written,
                                 std::uint64_t bytes) noexcept {
         uuid_t const replaced_run = std::exchange(user_data_run_, run);
@@ -2268,10 +2426,10 @@ class basic_database {
             user_data_run_ = replaced_run;
             user_data_ = replaced;
             user_data_bytes_ = replaced_bytes;
-            if (bytes != 0) volume_->deallocate(written);
+            if (bytes != 0) volume_->deallocate_after_publication(written);
             return published;
         }
-        if (replaced_bytes != 0) volume_->deallocate(replaced);
+        if (replaced_bytes != 0) volume_->deallocate_after_publication(replaced);
         return {};
     }
 

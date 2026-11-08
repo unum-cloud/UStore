@@ -150,6 +150,20 @@ class lsm_record_pool {
         return records_.handle_of(index);
     }
 
+    /** Takes a free record without filling it and answers its handle, or @c capacity_exhausted_k
+     *  when every record is taken, which a claimer meets by waiting for @c vacated to move. */
+    expected<handle_t> try_claim() noexcept {
+        lock_();
+        index_t const index = records_.take();
+        unlock_();
+        if (index == absent_k) return status_t {status_code_t::capacity_exhausted_k, "Every record of a pool is taken"};
+        return records_.handle_of(index);
+    }
+
+    /** The count of records vacated so far, a word that only moves forward, which a claimer
+     *  finding every record taken waits on; read it through the atomic reference. */
+    [[nodiscard]] std::uint32_t const& vacated() const noexcept { return vacated_; }
+
     /** Records taken. */
     [[nodiscard]] std::size_t size() const noexcept { return records_.size(); }
 
@@ -181,6 +195,7 @@ class lsm_record_pool {
         *held = record_t {};
         lock_();
         records_.vacate(record.index);
+        atomic_reference_<std::uint32_t> {vacated_}.fetch_add(1, std::memory_order_release);
         unlock_();
     }
 
@@ -233,6 +248,9 @@ class lsm_record_pool {
 
     /** Zero while no thread takes or vacates a record. */
     std::int32_t claim_ = 0;
+
+    /** Records vacated so far, which a claimer finding every record taken waits on. */
+    std::uint32_t vacated_ = 0;
 
 #pragma endregion Private Members
 };

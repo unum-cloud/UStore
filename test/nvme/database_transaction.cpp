@@ -1013,6 +1013,64 @@ std::size_t range_watches_catch_phantoms(mount_type_ const& mount) {
     return failures;
 }
 
+/** A transaction watching a key for existence commits over a change delta folded onto the key
+ *  since its start, and conflicts with a removal or a whole write of it, which a key watch would
+ *  conflict with alike. */
+template <typename mount_type_>
+std::size_t existence_watches_pass_changes(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using stack_t = typename types_t::stack_t;
+    using transaction_unique_ptr_t = typename types_t::transaction_unique_ptr_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    auto& store = *(*stack)->store;
+    collections_t named;
+    failures += create_collections(store, named);
+    failures += insert_keys(store, named, shape_t::fixed_k, first_half);
+    failures += expect(store.flush().succeeded());
+    any_collection_id_t const id = named[shape_t::fixed_k];
+    expected<transaction_unique_ptr_t> watcher = store.create_transaction();
+    expected<transaction_unique_ptr_t> changer = store.create_transaction();
+    failures += expect(watcher.has_value() && changer.has_value());
+    if (failures != 0) return failures;
+    value_buffer_t buffer {};
+    stored_key_t const edited = 7;
+
+    auto watch_and_commit = [&](auto&& meddle) {
+        std::size_t missed = 0;
+        missed += expect((*watcher)->watch_existence(id, std::span<stored_key_t const> {&edited, 1}).succeeded());
+        missed += meddle();
+        missed += expect((*watcher)->insert(id, 1, value_of(shape_t::fixed_k, 1, buffer)).succeeded());
+        status_t const committed = (*watcher)->commit();
+        if (committed.failed()) (*watcher)->rollback();
+        return std::pair {missed, committed};
+    };
+
+    // A change delta committed since the watch leaves the key standing.
+    auto [changed_missed, changed_status] = watch_and_commit([&] {
+        std::size_t missed = 0;
+        missed += expect(
+            (*changer)->change(id, edited, value_of(shape_t::fixed_k, 2, buffer), last_write_fold_t {}).succeeded());
+        missed += expect((*changer)->commit().succeeded());
+        return missed;
+    });
+    failures += changed_missed;
+    failures += expect(changed_status.succeeded());
+
+    // A whole write and a removal since the watch each refuse it.
+    auto [written_missed, written_status] = watch_and_commit(
+        [&] { return expect(store.insert(id, edited, value_of(shape_t::fixed_k, 3, buffer)).succeeded()); });
+    failures += written_missed;
+    failures += expect_status(written_status, status_code_t::write_conflict_k);
+    auto [removed_missed,
+          removed_status] = watch_and_commit([&] { return expect(store.remove(id, edited).succeeded()); });
+    failures += removed_missed;
+    failures += expect_status(removed_status, status_code_t::write_conflict_k);
+    return failures;
+}
+
 #pragma endregion Cases
 
 } // namespace unum::ustore::test
@@ -1049,6 +1107,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "disjoint_bands_never_conflict", disjoint_bands_never_conflict);
         report(totals, mount, "reads_at_start", reads_at_start);
         report(totals, mount, "range_watches_catch_phantoms", range_watches_catch_phantoms);
+        report(totals, mount, "existence_watches_pass_changes", existence_watches_pass_changes);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, transaction_config_k, 1, "database_transaction", cases);

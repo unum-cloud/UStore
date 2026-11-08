@@ -845,17 +845,27 @@ class nvme_store {
                                      sealed.deltas.values_bytes() + sealed.deltas.range_tombstones().bytes());
     }
 
+    /** Claims a memory-run record and the room of the view naming its run, or answers
+     *  @c capacity_exhausted_k while every record is taken, which the claimer meets by flushing
+     *  or by waiting on @c vacated. */
+    status_t try_claim(memory_run_claim_t& claimed) noexcept { return runs_.try_claim(claimed); }
+
+    /** Takes back what @p claimed holds, which this store claimed and nobody prepared. */
+    void give_back(memory_run_claim_t& claimed) noexcept { runs_.give_back(claimed); }
+
+    /** The count of memory-run records vacated so far, which a claimer finding every one
+     *  taken waits on. */
+    [[nodiscard]] std::uint32_t const& vacated() const noexcept { return runs_.vacated(); }
+
     /**
-     *  @brief Lays out the view naming @p sealed's run ahead of the current ones, so @c publish cannot fail.
-     *  @note Called by the thread holding the ledger's leader word, which then publishes or forgets it before it lets
-     *      the word go.
+     *  @brief Lays out the view naming @p sealed's run ahead of the current ones, out of the room
+     *      @p claimed holds, so @c publish cannot fail.
+     *  @note Called by the thread holding the ledger's leader word, which then publishes or forgets
+     *      it before it lets the word go.
      */
-    status_t prepare(sealed_commit_t& sealed) noexcept {
-        if (sealed.empty()) {
-            runs_.forget_prepared();
-            return {};
-        }
-        return runs_.prepare();
+    void prepare(sealed_commit_t& sealed, memory_run_claim_t&& claimed) noexcept {
+        if (sealed.empty()) runs_.forget_prepared();
+        else runs_.prepare(std::move(claimed));
     }
 
     /** Stamps @p sealed's run with @p stamp, publishes the view @c prepare laid out, and takes the run over, which the
@@ -871,11 +881,12 @@ class nvme_store {
     /** Drops the view @c prepare laid out, which the leader does for a commit it then refuses. */
     void forget_prepared() noexcept { runs_.forget_prepared(); }
 
-    /** Lands @p sealed as a commit of its own through the ledger's sequencer, and returns once it is published; a
-     *  commit sealing no run draws no stamp. */
-    status_t commit(sealed_commit_t& sealed) noexcept {
+    /** Lands @p sealed as a commit of its own through the ledger's sequencer, in the
+     *  record @p claimed holds, and returns once it is published; a commit sealing no run
+     *  draws no stamp. */
+    status_t commit(sealed_commit_t& sealed, memory_run_claim_t&& claimed) noexcept {
         if (sealed.empty()) return {};
-        alone_t alone {this, &sealed};
+        alone_t alone {this, &sealed, &claimed};
         commit_request_t request;
         request.context = &alone;
         request.prepare = &prepare_alone_;
@@ -915,6 +926,45 @@ class nvme_store {
                 if (stored_key < run.lower_stored_key() || run.upper_stored_key() < stored_key) continue;
                 std::uint64_t const position = run.position_of(stored_key);
                 if (position != run.population_count()) return run.stamp(position) > from;
+            }
+        }
+        return false;
+    }
+
+    /**
+     *  @brief Whether a commit newer than @p from removed @p stored_key or wrote it whole, which
+     *      an existence watch asks: change deltas since leave the key standing, so the versions
+     *      past them decide.
+     *
+     *  Versions are walked newest first, memory runs before levels, until one is a removal or a
+     *  write, which answers yes, or one is stamped at or below @p from, which answers no.
+     */
+    [[nodiscard]] bool replaced_since(stored_key_t stored_key, transaction_stamp_t from) const noexcept {
+        reader_t const inside = runs_.enter();
+        view_t const& view = *runs_.view();
+        for (memory_run_t const* run : view.memory_runs.runs()) {
+            if (run->newest_stamp() <= from) return false;
+            if (run->range_tombstones().overlaps_since(stored_key, stored_key, from)) return true;
+            for (std::size_t position = run->lower_bound(stored_key);
+                 position != run->size() && run->stored_key(position) == stored_key; ++position) {
+                if (run->stamp(position) <= from) return false;
+                if (run->delta(position).kind != delta_kind_t::change_k) return true;
+            }
+        }
+        level_set_t const& taken = *view.levels;
+        if (levels_removed_since_(taken, stored_key, stored_key, from)) return true;
+        for (std::size_t number = 0; number != taken.size(); ++number) {
+            auto const& level = taken.level(number);
+            for (std::size_t index = level.size(); index-- != 0;) {
+                auto const& run = level.run(index);
+                if (run.newest_stamp() <= from) continue;
+                if (stored_key < run.lower_stored_key() || run.upper_stored_key() < stored_key) continue;
+                for (std::uint64_t position = run.lower_bound(stored_key);
+                     position != run.population_count() && run.key_slot(position).stored_key == stored_key;
+                     ++position) {
+                    if (run.stamp(position) <= from) return false;
+                    if (run.kind(position) != delta_kind_t::change_k) return true;
+                }
             }
         }
         return false;
@@ -1206,6 +1256,9 @@ class nvme_store {
 
         /** What its committer sealed. */
         sealed_commit_t* sealed = nullptr;
+
+        /** The record its committer claimed for the run. */
+        memory_run_claim_t* claimed = nullptr;
     };
 
     /** A column one flush writes, charging the store's budget. */
@@ -1698,20 +1751,29 @@ class nvme_store {
             if (status_t const merged = merge_memory_runs(); merged.failed()) return merged;
         if (!sealed->empty() && memory_pressure(*sealed) != memory_pressure_t::fits_k)
             if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
+        if (sealed->empty()) return {};
+        memory_run_claim_t claimed;
         for (;;) {
-            status_t const committed = commit(*sealed);
-            if (committed != status_code_t::capacity_exhausted_k) return committed;
-            // A commit refused a memory-run record resubmits only once a flush gave records back,
-            // so it never spins.
-            std::size_t const held = runs_.memory_shape().runs;
-            if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
-            if (runs_.memory_shape().runs >= held) return committed;
+            atomic_reference_<std::uint32_t const> const vacated {runs_.vacated()};
+            std::uint32_t const observed = vacated.load(std::memory_order_acquire);
+            status_t const taken = try_claim(claimed);
+            if (taken.succeeded()) break;
+            if (taken != status_code_t::capacity_exhausted_k) return taken;
+            // A flush frees every published run's record; with none published, every record is out
+            // with a commit.
+            if (runs_.memory_shape().runs != 0) {
+                if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
+            }
+            else if (vacated.load(std::memory_order_acquire) == observed)
+                waiter_type_ {}(&runs_.vacated(), observed, std::size_t {0});
         }
+        return commit(*sealed, std::move(claimed));
     }
 
     static status_t prepare_alone_(void* context) noexcept {
         alone_t const& alone = *static_cast<alone_t const*>(context);
-        return alone.owner->prepare(*alone.sealed);
+        alone.owner->prepare(*alone.sealed, std::move(*alone.claimed));
+        return {};
     }
 
     static void publish_alone_(void* context, transaction_stamp_t stamp) noexcept {

@@ -1562,7 +1562,11 @@ class lsm_sorted_run {
                 std::uint64_t const room = window.extent.length - at;
                 std::uint64_t const length = block_bytes < room ? block_bytes : room;
                 pending[tag % depth] = piece_of_(window, request, at, length);
-                if (reader.enqueue_read(extent_t {window.extent.offset + at, length}, tag).failed()) break;
+                extent_t const piece {window.extent.offset + at, length};
+                if (status_t const queued = reader.enqueue_read(piece, tag); queued.failed()) {
+                    if (reader.outstanding() == 0) return queued;
+                    break;
+                }
                 ++tag;
                 if (at + length == window.extent.length) {
                     ++request;
@@ -1571,8 +1575,8 @@ class lsm_sorted_run {
                 else ++chunk;
             }
             if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
-            auto [polled, poll_completions_status] = reader.poll_completions(adapter);
-            if (poll_completions_status.failed()) return poll_completions_status;
+            auto [polled, wait_completions_status] = reader.wait_completions(adapter);
+            if (wait_completions_status.failed()) return wait_completions_status;
         }
         return first;
     }
@@ -2085,9 +2089,9 @@ class lsm_sorted_run {
                                                                  std::span<request_t const> {batch});
             if (submit_status.failed()) return submit_status;
             if (taken != 1) return {status_code_t::io_k, "The ring would not take an index read"};
-            auto [completed, poll_completions_status] = poll_completions_at_least<waiter_type_>(
-                volume_->disk(), channel.queue_pair(), channel.completion_buffer(), 1);
-            if (poll_completions_status.failed()) return poll_completions_status;
+            auto [completed, wait_completions_status] = utilities::wait_completions<waiter_type_>(
+                volume_->disk(), channel.queue_pair(), channel.completion_buffer());
+            if (wait_completions_status.failed()) return wait_completions_status;
             if (completed == 0) return {status_code_t::io_k, "An index read never completed"};
             completion_t const& completion = channel.completion_buffer().front();
             if (!completion.completed_in_full())

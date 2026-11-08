@@ -584,17 +584,27 @@ class nvme_store {
                                                                sealed.deltas.range_tombstones().bytes());
     }
 
+    /** Claims a memory-run record and the room of the view naming its run, or answers
+     *  @c capacity_exhausted_k while every record is taken, which the claimer meets by flushing
+     *  or by waiting on @c vacated. */
+    status_t try_claim(blobs::memory_run_claim_t& claimed) noexcept { return runs_.try_claim(claimed); }
+
+    /** Takes back what @p claimed holds, which this store claimed and nobody prepared. */
+    void give_back(blobs::memory_run_claim_t& claimed) noexcept { runs_.give_back(claimed); }
+
+    /** The count of memory-run records vacated so far, which a claimer finding every one
+     *  taken waits on. */
+    [[nodiscard]] std::uint32_t const& vacated() const noexcept { return runs_.vacated(); }
+
     /**
-     *  @brief Lays out the view naming @p sealed's run ahead of the current ones, so @c publish cannot fail.
-     *  @note Called by the thread holding the ledger's leader word, which then publishes or forgets it before it lets
-     *      the word go.
+     *  @brief Lays out the view naming @p sealed's run ahead of the current ones, out of the room
+     *      @p claimed holds, so @c publish cannot fail.
+     *  @note Called by the thread holding the ledger's leader word, which then publishes or forgets
+     *      it before it lets the word go.
      */
-    status_t prepare(sealed_commit_t& sealed) noexcept {
-        if (sealed.empty()) {
-            runs_.forget_prepared();
-            return {};
-        }
-        return runs_.prepare();
+    void prepare(sealed_commit_t& sealed, blobs::memory_run_claim_t&& claimed) noexcept {
+        if (sealed.empty()) runs_.forget_prepared();
+        else runs_.prepare(std::move(claimed));
     }
 
     /** Stamps @p sealed's run with @p stamp, publishes the view @c prepare laid out, and takes the run over, which the
@@ -1531,6 +1541,7 @@ class nvme_transaction {
     struct sealed_collection_t {
         collection_id_t collection {};
         typename store_t::sealed_commit_t commit;
+        blobs::memory_run_claim_t record;
     };
 
     /** Hashes a string of a collection through StringZilla, the same whether a tape or a caller holds it. */
@@ -1654,6 +1665,12 @@ class nvme_transaction {
                 made.failed())
                 return made;
             if (status_t const room = database_->make_room(collection, sealed.commit); room.failed()) return room;
+            // Claimed before the leader word, waiting on a flush when every record is out, so the
+            // share cannot be refused one.
+            if (!sealed.commit.empty())
+                if (status_t const claimed = database_->claim_memory_record(collection, sealed.record);
+                    claimed.failed())
+                    return claimed;
             if (sealed_.push_back(std::move(sealed)) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "No room to seal a commit"};
         }
@@ -1707,8 +1724,11 @@ class nvme_transaction {
         if (owner.conflicting_()) return {status_code_t::write_conflict_k, "Strings conflict"};
         for (std::size_t index = 0; index != owner.sealed_.size(); ++index) {
             sealed_collection_t& sealed = owner.sealed_[index];
-            if (status_t const prepared = owner.with_store_(
-                    sealed.collection, [&](store_t& store) noexcept { return store.prepare(sealed.commit); });
+            if (status_t const prepared = owner.with_store_(sealed.collection,
+                                                            [&](store_t& store) noexcept -> status_t {
+                                                                store.prepare(sealed.commit, std::move(sealed.record));
+                                                                return {};
+                                                            });
                 prepared.failed()) {
                 owner.forget_(index);
                 return prepared;

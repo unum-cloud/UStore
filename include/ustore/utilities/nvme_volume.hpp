@@ -456,7 +456,8 @@ class basic_directory_volume {
     basic_directory_volume(basic_directory_volume&& other) noexcept
         : disk_(std::exchange(other.disk_, nullptr)), allocator_(std::move(other.allocator_)),
           directories_(std::move(other.directories_)), run_files_(std::move(other.run_files_)),
-          unflushed_(std::move(other.unflushed_)), manifest_(std::move(other.manifest_)) {}
+          unflushed_(std::move(other.unflushed_)), unpublished_(std::move(other.unpublished_)),
+          manifest_(std::move(other.manifest_)), lock_(std::move(other.lock_)) {}
 
     basic_directory_volume& operator=(basic_directory_volume&& other) noexcept {
         if (this == &other) return *this;
@@ -466,7 +467,9 @@ class basic_directory_volume {
         directories_ = std::move(other.directories_);
         run_files_ = std::move(other.run_files_);
         unflushed_ = std::move(other.unflushed_);
+        unpublished_ = std::move(other.unpublished_);
         manifest_ = std::move(other.manifest_);
+        lock_ = std::move(other.lock_);
         return *this;
     }
 
@@ -475,9 +478,9 @@ class basic_directory_volume {
     /**
      *  @brief Opens every directory of @p config, reads the manifest when there is one, and unlinks
      *      every run file of this database the manifest does not name, which a crash left behind.
-     *  @return The volume, @c invalid_argument_k for an address that names no directory, or
-     *      @c malformed_k for a manifest of another database or one naming a directory this mount
-     *      did not list.
+     *  @return The volume, @c invalid_argument_k for an address that names no directory,
+     *      @c contended_k while another mount holds the manifest's directory, or @c malformed_k for
+     *      a manifest of another database or one naming a directory this mount did not list.
      */
     static expected<basic_directory_volume> mount(disk_type_& disk, [[maybe_unused]] io_channel_t& channel,
                                                   volume_config_t const& config, allocator_type_ allocator) noexcept {
@@ -498,6 +501,10 @@ class basic_directory_volume {
             [[maybe_unused]] st::status_t const placed = volume.directories_.push_back(st::assume_reserved,
                                                                                        std::move(directory));
         }
+        // A second mount would sweep the first one's unpublished runs as leftovers.
+        auto [locked, lock_status] = file_lock_t::acquire(volume.directories_[0].path.c_str());
+        if (lock_status.failed()) return lock_status;
+        volume.lock_ = std::move(locked);
         // The records grow in chunks that never move, so a small database pays for few of them.
         auto [files, make_status] = run_files_t::make(1, config.runs_capacity, allocator);
         if (make_status != st::status_t::success_k)
@@ -546,7 +553,7 @@ class basic_directory_volume {
         std::size_t chosen = directories_.size();
         std::uint64_t chosen_free = 0;
         for (std::size_t index = 0; index != directories_.size(); ++index) {
-            std::uint64_t const free = free_bytes_(directories_[index]);
+            std::uint64_t const free = free_bytes_(index);
             if (free < rounded || (chosen != directories_.size() && free <= chosen_free)) continue;
             chosen = index;
             chosen_free = free;
@@ -576,23 +583,41 @@ class basic_directory_volume {
         run_files_.vacate(extent.placement.index);
     }
 
-    /** Flushes every run file written since the last publication, then replaces the manifest
-     *  with @p json. */
+    /** Gives @p extent back after the next publication that succeeds, for a file the manifest on
+     *  disk may still name, as one whose publication failed past its rename does. */
+    void deallocate_after_publication(medium_extent_t const& extent) noexcept {
+        // Without room the file stays until the next mount sweeps it, which only costs
+        // its bytes meanwhile.
+        [[maybe_unused]] st::status_t const remembered = unpublished_.push_back(medium_extent_t {extent});
+    }
+
+    /** Flushes every run file written since the last publication and every directory that gained
+     *  one, then replaces the manifest with @p json, and gives back the files earlier
+     *  publications stopped naming. */
     status_t publish_manifest(io_channel_t& channel, std::span<char const> json) noexcept {
-        for (placement_handle_t const& handle : unflushed_) {
-            run_file_t* const file = run_files_.at(handle_of_(handle));
-            if (!file) continue;
-            auto [writer_channel, writer_channel_status] = channel.acquire();
-            if (writer_channel_status.failed()) return writer_channel_status;
-            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_channel),
-                                                                   file->medium.reference()};
-            if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
+        for (std::size_t index = 0; index != directories_.size(); ++index) {
+            bool gained = false;
+            for (placement_handle_t const& handle : unflushed_) {
+                run_file_t* const file = run_files_.at(handle_of_(handle));
+                if (!file || file->data_directory != index) continue;
+                gained = true;
+                auto [writer_channel, writer_channel_status] = channel.acquire();
+                if (writer_channel_status.failed()) return writer_channel_status;
+                basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_channel),
+                                                                       file->medium.reference()};
+                if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
+            }
+            if (gained)
+                if (status_t const synced = sync_directory(directories_[index].path.c_str()); synced.failed())
+                    return synced;
         }
         unflushed_.clear();
         char path[path_max_bytes_k];
         if (status_t const named = manifest_path_(path); named.failed()) return named;
         if (status_t const replaced = replace_file_durably(path, json); replaced.failed()) return replaced;
         ++manifest_.generation;
+        for (medium_extent_t const& extent : unpublished_) deallocate(extent);
+        unpublished_.clear();
         return {};
     }
 
@@ -610,7 +635,7 @@ class basic_directory_volume {
     /** Bytes every data directory still offers. */
     [[nodiscard]] std::uint64_t free_bytes() const noexcept {
         std::uint64_t free = 0;
-        for (directory_t const& directory : directories_) free += free_bytes_(directory);
+        for (std::size_t index = 0; index != directories_.size(); ++index) free += free_bytes_(index);
         return free;
     }
 
@@ -627,6 +652,7 @@ class basic_directory_volume {
                     first = closed;
         run_files_ = run_files_t {};
         disk_ = nullptr;
+        lock_ = file_lock_t {};
         return first;
     }
 
@@ -662,10 +688,19 @@ class basic_directory_volume {
     basic_directory_volume(disk_type_& disk, allocator_type_ const& allocator) noexcept
         : disk_(&disk), allocator_(allocator) {}
 
-    [[nodiscard]] static std::uint64_t free_bytes_(directory_t const& directory) noexcept {
+    /** Bytes directory @p index may still take: its quota less its runs, or its filesystem's
+     *  free bytes less the runs created there since the last publication, which their sparse
+     *  files have not claimed yet. */
+    [[nodiscard]] std::uint64_t free_bytes_(std::size_t index) const noexcept {
+        directory_t const& directory = directories_[index];
         if (directory.quota != 0) return directory.quota > directory.used ? directory.quota - directory.used : 0;
         expected<std::uint64_t> const free = free_bytes_of(directory.path.c_str());
-        return free ? *free : 0;
+        if (!free) return 0;
+        std::uint64_t claimed = 0;
+        for (placement_handle_t const& handle : unflushed_)
+            if (run_file_t const* const file = run_files_.at(handle_of_(handle)); file && file->data_directory == index)
+                claimed += file->bytes;
+        return *free > claimed ? *free - claimed : 0;
     }
 
     status_t manifest_path_(std::span<char> into) const noexcept {
@@ -767,8 +802,16 @@ class basic_directory_volume {
     /** Run files written since the last publication, which it flushes before it commits. */
     st::vector<placement_handle_t> unflushed_;
 
+    /** Run files the next publication that succeeds gives back, which the manifest on disk
+     *  may still name. */
+    st::vector<medium_extent_t> unpublished_;
+
     /** The manifest the mount read, whose generation counts every publication since. */
     manifest_t manifest_;
+
+    /** Held on the manifest's directory for the life of the mount, so no second mount sweeps
+     *  this one's runs. */
+    file_lock_t lock_;
 };
 
 #pragma endregion Directory Volume
@@ -804,7 +847,7 @@ class basic_slotted_volume {
     basic_slotted_volume(basic_slotted_volume&& other) noexcept
         : disk_(std::exchange(other.disk_, nullptr)), allocator_(std::move(other.allocator_)),
           media_(std::move(other.media_)), manifest_(std::move(other.manifest_)),
-          manifest_owner_(other.manifest_owner_) {}
+          manifest_owner_(other.manifest_owner_), unpublished_(std::move(other.unpublished_)) {}
 
     basic_slotted_volume& operator=(basic_slotted_volume&& other) noexcept {
         if (this == &other) return *this;
@@ -814,6 +857,7 @@ class basic_slotted_volume {
         media_ = std::move(other.media_);
         manifest_ = std::move(other.manifest_);
         manifest_owner_ = other.manifest_owner_;
+        unpublished_ = std::move(other.unpublished_);
         return *this;
     }
 
@@ -910,6 +954,14 @@ class basic_slotted_volume {
         medium.slots.deallocate(extent);
     }
 
+    /** Gives @p extent back after the next publication that succeeds, for a run the manifest on
+     *  the medium may still name, as one whose publication failed past its owner block does. */
+    void deallocate_after_publication(medium_extent_t const& extent) noexcept {
+        // Without room the slot stays taken until the next mount scans it, which only costs
+        // its bytes meanwhile.
+        [[maybe_unused]] st::status_t const remembered = unpublished_.push_back(medium_extent_t {extent});
+    }
+
     /** Writes the owner blocks awaiting a write, @p json into the idle region, flushes every
      *  medium, then points the manifest slot's owner block at the new copy and flushes again. */
     status_t publish_manifest(io_channel_t& channel, std::span<char const> json) noexcept {
@@ -940,6 +992,8 @@ class basic_slotted_volume {
         if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
         manifest_owner_ = committed;
         ++manifest_.generation;
+        for (medium_extent_t const& extent : unpublished_) deallocate(extent);
+        unpublished_.clear();
         return {};
     }
 
@@ -1351,6 +1405,10 @@ class basic_slotted_volume {
 
     /** The manifest slot's owner block as last committed. */
     slot_owner_block_t manifest_owner_ {};
+
+    /** Runs the next publication that succeeds gives back, which the manifest on the media
+     *  may still name. */
+    st::vector<medium_extent_t> unpublished_;
 };
 
 #pragma endregion Slotted Volume
@@ -1414,6 +1472,10 @@ class any_volume {
 
     void deallocate(medium_extent_t const& extent) noexcept {
         visit_(*this, [&](auto& held) noexcept { held.deallocate(extent); });
+    }
+
+    void deallocate_after_publication(medium_extent_t const& extent) noexcept {
+        visit_(*this, [&](auto& held) noexcept { held.deallocate_after_publication(extent); });
     }
 
     status_t publish_manifest(io_channel_t& channel, std::span<char const> json) noexcept {

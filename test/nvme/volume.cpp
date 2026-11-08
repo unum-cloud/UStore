@@ -266,6 +266,54 @@ std::size_t directory_places_by_free_space(fixture_type_& fixture) {
     return failures;
 }
 
+/** Runs allocated back to back over uncapped directories of one filesystem spread one per
+ *  directory, since a run claims its bytes before its sparse file does. */
+template <typename fixture_type_>
+std::size_t directory_spreads_unwritten_runs(fixture_type_& fixture) {
+    constexpr std::size_t directories_k = 4;
+    // Large enough that another writer on the filesystem cannot move its free bytes that far
+    // between two probes.
+    constexpr std::uint64_t run_bytes_k = 16ull * 1024ull * 1024ull;
+    std::size_t failures = 0;
+    expected<typename fixture_type_::guard_t> guard = fixture.channels.acquire();
+    failures += expect(guard.has_value());
+    if (!guard) return failures;
+    io_channel_t& channel = guard->channel();
+    auto [volume, mount_status] = fixture.mount_volume(channel, directories_k);
+    failures += expect(mount_status.succeeded());
+    if (mount_status.failed()) return failures;
+
+    std::array<std::size_t, directories_k> placed {};
+    for (std::size_t index = 0; index != directories_k; ++index) {
+        auto [extent, allocate_status] = volume.allocate(uuid_generator(), run_bytes_k);
+        failures += expect(allocate_status.succeeded());
+        if (allocate_status.failed()) return failures;
+        ++placed[extent.data_directory];
+    }
+    for (std::size_t const runs : placed) failures += expect_eq(runs, std::size_t {1});
+    return failures;
+}
+
+/** A second mount of the directories a live volume holds is refused, since its sweep would
+ *  unlink the first mount's unpublished runs, and mounts once the first is gone. */
+template <typename fixture_type_>
+std::size_t directory_refuses_a_second_mount(fixture_type_& fixture) {
+    std::size_t failures = 0;
+    expected<typename fixture_type_::guard_t> guard = fixture.channels.acquire();
+    failures += expect(guard.has_value());
+    if (!guard) return failures;
+    io_channel_t& channel = guard->channel();
+    {
+        auto [volume, mount_status] = fixture.mount_volume(channel);
+        failures += expect(mount_status.succeeded());
+        if (mount_status.failed()) return failures;
+        failures += expect(volume.allocate(uuid_generator(), small_run_bytes_k).has_value());
+        failures += expect_status(fixture.mount_volume(channel), status_code_t::contended_k);
+    }
+    failures += expect(fixture.mount_volume(channel).has_value());
+    return failures;
+}
+
 #pragma endregion Directory Cases
 
 #pragma region Slotted Cases
@@ -600,6 +648,10 @@ int main(int argc, char const* argv[]) {
            [](auto& fixture) { return directory_ignores_an_unrenamed_copy(fixture); });
         on("directory_free_space", needed_medium_t::any_k,
            [](auto& fixture) { return case_result_t {directory_places_by_free_space(fixture)}; });
+        on("directory_spreads_unwritten_runs", needed_medium_t::any_k,
+           [](auto& fixture) { return case_result_t {directory_spreads_unwritten_runs(fixture)}; });
+        on("directory_refuses_a_second_mount", needed_medium_t::any_k,
+           [](auto& fixture) { return case_result_t {directory_refuses_a_second_mount(fixture)}; });
         on("slotted_reclaims_leftovers", needed_medium_t::file_k,
            [](auto& fixture) { return case_result_t {slotted_keeps_named_and_reclaims_leftovers(fixture)}; });
         on("slotted_zeroes_dropped_run", needed_medium_t::file_k,

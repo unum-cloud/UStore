@@ -984,8 +984,9 @@ status_t read_collections_records(recovery_t const& recovery, std::span<data_add
     arena_config.bytes = channels_config.arena_bytes();
     auto [arena, arena_status] = registered_memory_arena<fu::standard_atomic_ref>::make(disk, budget, arena_config);
     if (arena_status.failed()) return arena_status;
-    auto [channels, channels_status] = basic_io_channel_pool<recovery_disk_t, fu::standard_atomic_ref>::make(
-        disk, arena.registration(), 0, 1, channels_config);
+    auto [channels, channels_status] =
+        basic_io_channel_pool<recovery_disk_t, fu::standard_atomic_ref, fu::standard_yield_t>::make(
+            disk, arena.registration(), 0, 1, channels_config);
     status_t result = channels_status;
     recovery_volume_t volume {&disk};
     for (std::size_t index = 0; result.succeeded() && index != recovery.runs.size(); ++index) {

@@ -1020,6 +1020,39 @@ case_result_t crash_between_seal_and_schema(mount_type_ const& mount) {
     return failures;
 }
 
+/** A collection is listed from the stamp its create drew and up to the one its unlisting drew,
+ *  so a reader pinned before the create or past the unlisting finds no store tag, and one pinned
+ *  between still does. */
+template <typename mount_type_>
+std::size_t collections_list_by_stamp(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+
+    transaction_stamp_t const before = store.ledger().published();
+    expected<collection_id_t> const listed = create_named(store, "listed", test_config(8, 0));
+    failures += expect(listed.has_value());
+    if (!listed) return failures;
+    transaction_stamp_t const created = store.ledger().published();
+    std::uint16_t tag = 0;
+    failures += expect_status(store.listed_store_tag(*listed, before, tag), status_code_t::not_found_k);
+    failures += expect(store.listed_store_tag(*listed, created, tag).succeeded());
+    failures += expect(store.listed_store_tag(*listed, head_stamp_k, tag).succeeded());
+    failures += expect_eq(tag, static_cast<std::uint16_t>(value_layout_t::inline_12_bytes_k));
+
+    failures += expect(store.unlist_collection(*listed).succeeded());
+    failures += expect(store.listed_store_tag(*listed, created, tag).succeeded());
+    failures += expect_status(store.listed_store_tag(*listed, head_stamp_k, tag), status_code_t::not_found_k);
+    failures += expect_status(store.listed_store_tag(*listed, store.ledger().published(), tag),
+                              status_code_t::not_found_k);
+    return failures;
+}
+
 /**
  *  @brief A crash between a flush and the catalog save loses a suffix of commits and never half of one.
  *
@@ -1095,6 +1128,65 @@ case_result_t crash_keeps_a_prefix_of_commits(mount_type_ const& mount) {
     failures += expect((*reopened)->insert(left, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
     failures += expect((*reopened)->select(left, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
     failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {3});
+    return failures;
+}
+
+/**
+ *  @brief A merge of memory runs keeps every version the flush after it promises a mount.
+ *
+ *  The merged collection writes a key twice around a commit of a second collection that stays in
+ *  memory, so the manifest its flush publishes is durable only below that commit. A crash then
+ *  truncates there, and the first write of the key, which the merge had folded under the second, is
+ *  what the mount must still find.
+ */
+template <typename mount_type_>
+case_result_t merges_keep_what_the_flush_promises(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+
+    // Two runs of tier zero merge, and the merged run with one more delta makes a flush due.
+    collection_config_t merging = test_config(8, 0);
+    merging.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
+    merging.memory_runs_max_deltas = 2;
+    expected<collection_id_t> const merged = create_named(store, "merged", merging);
+    expected<collection_id_t> const beside = create_named(store, "beside", test_config(8, 0));
+    failures += expect(merged.has_value() && beside.has_value());
+    if (failures != 0) return failures;
+    any_collection_id_t const id {*merged};
+
+    auto write = [&](any_collection_id_t const& written_id, stored_key_t key, std::uint64_t value) noexcept {
+        std::array<byte_t, 8> const counter = counted(value);
+        return expect(store.insert(written_id, key, stored_value_view_t {counter}).succeeded());
+    };
+    failures += write(id, stored_key_t {0}, 1);
+    failures += write(any_collection_id_t {*beside}, stored_key_t {0}, 2);
+    failures += write(id, stored_key_t {0}, 3);
+    failures += write(id, stored_key_t {1}, 4);
+
+    std::array<byte_t, 8> into {};
+    stored_value_size_t size = 0;
+    failures += expect(store.select(id, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
+    failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {3});
+    failures += expect(capture_data_directory(*(*stack)->fixture).succeeded());
+    (*stack)->store.reset();
+    (*stack)->volume = typename types_t::volume_t {};
+    failures += expect(restore_data_directory(*(*stack)->fixture).succeeded());
+    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
+    failures += expect(reopened.has_value());
+    if (failures != 0) return failures;
+
+    // The second collection's commit was never durable, so the mount resumes below it, at
+    // the first write.
+    failures += expect((*reopened)->select(id, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
+    failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
+    failures += expect(!(*reopened)->contains(any_collection_id_t {*beside}, stored_key_t {0}));
     return failures;
 }
 
@@ -1853,6 +1945,170 @@ std::size_t threads_commit_serializably(mount_type_ const& mount) {
     return failures;
 }
 
+/**
+ *  @brief Threads writing one key per commit into a collection with a small memory-run
+ *      pool all land.
+ *
+ *  The pool holds 29 records, so the threads take every record long before the bounds make a flush
+ *  due, and a writer past the last record must wait for the flush that gives records back instead
+ *  of being refused.
+ */
+template <typename mount_type_>
+std::size_t head_writes_wait_for_records(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    constexpr std::size_t threads_k = 8;
+    constexpr std::size_t writes_k = 200;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+    expected<collection_id_t> const written = create_named(store, "written", test_config(8, 0));
+    failures += expect(written.has_value());
+    if (!written) return failures;
+    any_collection_id_t const id {*written};
+
+    std::size_t refused {0};
+    std::array<std::thread, threads_k> writers;
+    for (std::size_t writer = 0; writer != threads_k; ++writer)
+        writers[writer] = std::thread {[&, writer]() noexcept {
+            for (std::size_t step = 0; step != writes_k; ++step) {
+                stored_key_t const key = static_cast<stored_key_t>(writer * writes_k + step);
+                std::array<byte_t, 8> const counter = counted(key);
+                if (status_t const inserted = store.insert(id, key, stored_value_view_t {counter}); inserted.failed()) {
+                    if (atomic_reference<std::size_t> {refused}.fetch_add(1, std::memory_order_relaxed) == 0)
+                        fmt::println(stderr, "  first refused write: {}", inserted.message);
+                }
+            }
+        }};
+    for (std::thread& writer : writers) writer.join();
+    failures += expect_eq(atomic_reference<std::size_t> {refused}.load(std::memory_order_relaxed), std::size_t {0});
+
+    std::size_t missing = 0;
+    std::array<byte_t, 8> into {};
+    for (stored_key_t key = 0; key != threads_k * writes_k; ++key) {
+        stored_value_size_t size = 0;
+        if (store.select(id, key, std::span<byte_t> {into}, size).failed() ||
+            counter_of(std::span<byte_t const> {into.data(), size}) != key)
+            ++missing;
+    }
+    failures += expect_eq(missing, std::size_t {0});
+    return failures;
+}
+
+/**
+ *  @brief Transactions writing only strings land when more of them pass the stall check than the
+ *      pool has records.
+ *
+ *  An open ingest holds the claim, so no merge or flush frees a record. The strings collection is
+ *  filled to one run below the stall bound, and a staged transaction holds the leader word while
+ *  eight writers seal past the stall check. Their requests would land one record past the pool's
+ *  29, so a writer must wait for one instead of having its share refused, and every write lands
+ *  once the claim goes back.
+ */
+template <typename mount_type_>
+std::size_t strings_shares_wait_for_records(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    using strings_store_t = typename types_t::strings_store_t;
+    using strings_transaction_t = strings::nvme_transaction<database_t, strings_store_t>;
+    using key_slot_t = typename strings_store_t::key_slot_t;
+    std::size_t failures = 0;
+    constexpr std::size_t writers_k = 8;
+    // One run below the stall bound of test_config, (F - 1)(T + 1) runs for F = 4 and T = 7.
+    constexpr std::size_t filled_runs_k = 23;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+    collection_id_t names;
+    std::memcpy(names.uuid.bytes, uuid_generator().bytes, sizeof(names.uuid.bytes));
+    failures += expect(store
+                           .create_collection(names, "names", static_cast<std::uint16_t>(value_layout_t::uuid_k),
+                                              test_config(sizeof(ustore_uuid_t), 0))
+                           .succeeded());
+    expected<collection_id_t> const held = create_named(store, "held", test_config(8, 0));
+    failures += expect(held.has_value());
+    if (failures != 0) return failures;
+
+    auto text_of = [](std::size_t index) { return fmt::format("string-{}", index); };
+    auto value_of = [](std::size_t index) {
+        std::array<byte_t, key_slot_t::size> value {};
+        for (std::size_t position = 0; position != value.size(); ++position) value[position] = painted(index, position);
+        return value;
+    };
+    // Writes string @p index into @p written over a fresh transaction, which the caller
+    // stages or commits.
+    auto begin_write = [&](strings_transaction_t& written, std::size_t index) {
+        auto [transaction, begin_status] = store.create_transaction();
+        if (begin_status.failed()) return expected<typename database_t::transaction_unique_ptr_t> {begin_status};
+        written.join(*transaction);
+        std::array<byte_t, key_slot_t::size> const value = value_of(index);
+        if (status_t const wrote = written.write(names, text_of(index), delta_view_t {delta_kind_t::write_k, value},
+                                                 invalid_transaction_stamp_k);
+            wrote.failed())
+            return expected<typename database_t::transaction_unique_ptr_t> {wrote};
+        return expected<typename database_t::transaction_unique_ptr_t> {std::move(transaction)};
+    };
+
+    std::size_t refused {0};
+    std::size_t started {0};
+    std::array<std::thread, writers_k> writers;
+    {
+        typename database_t::ingest_t ingest;
+        failures += expect(store.begin_ingest(any_collection_id_t {*held}, ingest).succeeded());
+        for (std::size_t index = 0; index != filled_runs_k; ++index) {
+            strings_transaction_t written {store};
+            auto transaction = begin_write(written, index);
+            failures += expect(transaction.has_value() && written.commit(**transaction).succeeded());
+        }
+        failures += expect_eq(store.memory_shape(any_collection_id_t {names}).runs, filled_runs_k);
+        if (failures != 0) return failures;
+
+        strings_transaction_t staged_strings {store};
+        auto staged = begin_write(staged_strings, filled_runs_k);
+        failures += expect(staged.has_value() && staged_strings.stage(**staged).succeeded());
+        if (failures != 0) return failures;
+        for (std::size_t writer = 0; writer != writers_k; ++writer)
+            writers[writer] = std::thread {[&, writer]() noexcept {
+                strings_transaction_t written {store};
+                auto transaction = begin_write(written, filled_runs_k + 1 + writer);
+                atomic_reference<std::size_t> {started}.fetch_add(1, std::memory_order_release);
+                status_t const committed = transaction ? written.commit(**transaction) : transaction.status();
+                if (committed.failed() &&
+                    atomic_reference<std::size_t> {refused}.fetch_add(1, std::memory_order_relaxed) == 0)
+                    fmt::println(stderr, "  first refused share: {}", committed.message);
+            }};
+        // Every writer seals past the stall check and parks behind the staged transaction or
+        // on a record.
+        while (atomic_reference<std::size_t> {started}.load(std::memory_order_acquire) != writers_k)
+            std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        failures += expect((*staged)->commit().succeeded());
+    }
+    for (std::thread& writer : writers) writer.join();
+    failures += expect_eq(atomic_reference<std::size_t> {refused}.load(std::memory_order_relaxed), std::size_t {0});
+
+    std::size_t missing = 0;
+    status_t const visited = store.visit_store(
+        any_collection_id_t {names}, [&]<typename store_type_>(store_type_& visited_store) noexcept -> status_t {
+            if constexpr (std::is_same_v<store_type_, strings_store_t>)
+                for (std::size_t index = 0; index != filled_runs_k + 1 + writers_k; ++index) {
+                    std::array<byte_t, key_slot_t::size> value {};
+                    if (visited_store.find(text_of(index), value) != lookup_result_t::written_k ||
+                        value != value_of(index))
+                        ++missing;
+                }
+            return {};
+        });
+    failures += expect(visited.succeeded());
+    failures += expect_eq(missing, std::size_t {0});
+    return failures;
+}
+
 /** Bytes the value a committer writes in round @p round takes, which differs from round to round. */
 [[nodiscard]] std::size_t round_bytes_of(std::uint64_t round) noexcept {
     return static_cast<std::size_t>(16 + round % 61);
@@ -2299,8 +2555,10 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "range_removal_survives_reopen", range_removal_survives_reopen);
         report(totals, mount, "strings_range_removal_survives_reopen", strings_range_removal_survives_reopen);
         report(totals, mount, "dropped_collection_is_gone", dropped_collection_is_gone);
+        report(totals, mount, "collections_list_by_stamp", collections_list_by_stamp);
         report(totals, mount, "crash_before_schema", crash_between_seal_and_schema);
         report(totals, mount, "crash_keeps_a_prefix", crash_keeps_a_prefix_of_commits);
+        report(totals, mount, "merges_keep_what_the_flush_promises", merges_keep_what_the_flush_promises);
         report(totals, mount, "user_data", user_data_round_trips);
         report(totals, mount, "archive_both_ways", archive_saves_incrementally_both_ways);
         report(totals, mount, "commit_is_all_or_nothing", commit_is_all_or_nothing);
@@ -2310,6 +2568,8 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "runs_scan_one_at_a_time", runs_scan_one_at_a_time);
         report(totals, mount, "drop_proceeds_beside_the_snapshot", drop_proceeds_beside_the_snapshot);
         report(totals, mount, "threads_commit_serializably", threads_commit_serializably);
+        report(totals, mount, "head_writes_wait_for_records", head_writes_wait_for_records);
+        report(totals, mount, "strings_shares_wait_for_records", strings_shares_wait_for_records);
         report(totals, mount, "readers_beside_committers_and_flushes", readers_beside_committers_and_flushes);
         report(totals, mount, "lookups_outrun_the_write_path", lookups_outrun_the_write_path);
         report(totals, mount, "feed_reads_across_flushes_and_merges", feed_reads_across_flushes_and_merges);

@@ -388,6 +388,10 @@ inline status_t create_directories(char const* path) noexcept {
 
 #if USTORE_OS_WINDOWS_
 
+/** Makes the entries of the directory @p path durable, which NTFS already does for every
+ *  entry it journals. */
+inline status_t sync_directory([[maybe_unused]] char const* path) noexcept { return {}; }
+
 /** Replaces @p path with @p bytes so a crash leaves the old file or the new one whole: a sibling
  *  @c .tmp is written and flushed, then moved over @p path with write-through. */
 inline status_t replace_file_durably(char const* path, std::span<char const> bytes) noexcept {
@@ -466,6 +470,16 @@ inline expected<std::uint64_t> free_bytes_of(char const* directory) noexcept {
 
 #else
 
+/** Makes the entries of the directory @p path durable, as a file created there is only once its
+ *  directory is @c fsync -ed. */
+inline status_t sync_directory(char const* path) noexcept {
+    int const directory = ::open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) return {status_code_t::io_k, "A directory would not open to be synced"};
+    bool const durable = ::fsync(directory) == 0;
+    [[maybe_unused]] int const closed = ::close(directory);
+    return durable ? status_t {} : status_t {status_code_t::io_k, "A directory would not sync"};
+}
+
 /** Replaces @p path with @p bytes so a crash leaves the old file or the new one whole: a
  *  sibling @c .tmp is written and @c fdatasync -ed, renamed over @p path, and the directory is
  *  @c fsync -ed. */
@@ -494,11 +508,7 @@ inline status_t replace_file_durably(char const* path, std::span<char const> byt
     if (slash == directory) slash[1] = '\0';
     else if (slash) *slash = '\0';
     else std::memcpy(directory, ".", 2);
-    int const parent = ::open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (parent < 0) return {status_code_t::io_k, "The manifest's directory would not open"};
-    bool const durable = ::fsync(parent) == 0;
-    [[maybe_unused]] int const closed_parent = ::close(parent);
-    return durable ? status_t {} : status_t {status_code_t::io_k, "The manifest's directory would not sync"};
+    return sync_directory(directory);
 }
 
 /** Reads the whole of @p path into @p into, answering @c not_found_k for a missing file. */
@@ -587,8 +597,8 @@ inline expected<std::uint64_t> free_bytes_of(char const* directory) noexcept {
 
 #pragma region File Locks
 
-/** An exclusive advisory lock on a file or a device, held until it dies, which serializes the
- *  processes claiming slots of one raw medium. */
+/** An exclusive advisory lock on a file, a directory or a device, held until it dies, which
+ *  serializes the mounts claiming slots of one raw medium or the runs of one data directory. */
 class file_lock_t {
   public:
 #if USTORE_OS_WINDOWS_
@@ -622,12 +632,13 @@ class file_lock_t {
 
 inline expected<file_lock_t> file_lock_t::acquire(char const* path) noexcept {
     file_lock_t lock;
+    // Backup semantics open a directory as well as a file.
     lock.held_ = ::CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (lock.held_ == unlocked_k) return status_t {status_code_t::io_k, "A raw medium would not open to be locked"};
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (lock.held_ == unlocked_k) return status_t {status_code_t::io_k, "A path would not open to be locked"};
     OVERLAPPED whole {};
     if (!::LockFileEx(lock.held_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &whole))
-        return status_t {status_code_t::contended_k, "Another process claims slots of that raw medium"};
+        return status_t {status_code_t::contended_k, "Another mount holds that medium or directory"};
     return lock;
 }
 
@@ -641,11 +652,11 @@ inline void file_lock_t::release_() noexcept {
 inline expected<file_lock_t> file_lock_t::acquire(char const* path) noexcept {
     file_lock_t lock;
     lock.held_ = ::open(path, O_RDONLY | O_CLOEXEC);
-    if (lock.held_ < 0) return status_t {status_code_t::io_k, "A raw medium would not open to be locked"};
+    if (lock.held_ < 0) return status_t {status_code_t::io_k, "A path would not open to be locked"};
     if (::flock(lock.held_, LOCK_EX | LOCK_NB) != 0)
         return errno == EWOULDBLOCK
-                   ? status_t {status_code_t::contended_k, "Another process claims slots of that raw medium"}
-                   : status_t {status_code_t::io_k, "A raw medium would not be locked"};
+                   ? status_t {status_code_t::contended_k, "Another mount holds that medium or directory"}
+                   : status_t {status_code_t::io_k, "A path would not be locked"};
     return lock;
 }
 

@@ -1406,7 +1406,9 @@ std::size_t counter_fold_reads_alike_everywhere(mount_type_ const& mount) {
             deltas[key] = keyed_delta<stored_key_t> {key, delta};
         }
         auto [sealed, seal_status] = store->seal(std::span<keyed_delta<stored_key_t>> {deltas});
-        return expect(seal_status.succeeded() && store->commit(sealed).succeeded());
+        memory_run_claim_t claimed;
+        if (seal_status.failed() || store->try_claim(claimed).failed()) return expect(false);
+        return expect(store->commit(sealed, std::move(claimed)).succeeded());
     };
 
     // Point reads, the size a find answers where no level's value needs a read, and one batch, all against the map.

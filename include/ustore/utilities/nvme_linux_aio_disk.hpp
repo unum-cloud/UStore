@@ -454,27 +454,32 @@ class linux_aio_files_disk {
      *  @return How many completions were moved, which is zero when nothing has landed.
      */
     expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
-        queue_pair_slot_t* const slot = slot_of_(queue_pair);
-        if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this disk's"};
-        std::uint32_t const base = window_of_(queue_pair.id());
+        return reap_(queue_pair, into, 0L);
+    }
 
-        std::size_t moved = 0;
-        if (slot->flights_count != 0 && !into.empty()) {
-            std::size_t const room = into.size() < slot->flights_count ? into.size() : slot->flights_count;
-            long const landed = ::syscall(__NR_io_getevents, slot->context, 0L, static_cast<long>(room), &events_[base],
-                                          nullptr);
-            if (landed < 0 && errno != EINTR)
-                return native_file_failure(errno, "The kernel would not hand completions back");
-            for (long index = 0; index < landed; ++index) {
-                ::io_event const& event = events_[base + static_cast<std::size_t>(index)];
-                std::uint32_t const seat = static_cast<std::uint32_t>(event.data);
-                --slot->flights_count;
-                into[moved++] = retire_(*slot, base, seat, translate_(flights_[base + seat], event.res));
-            }
+    /**
+     *  @brief Moves at least one completion of @p queue_pair into @p into, sleeping in the kernel
+     *      until one lands.
+     *  @param[in] queue_pair The queue pair waiting, held by the thread that submitted on it.
+     *  @param[out] into Room for completions, which bounds how many one call moves.
+     *  @return How many completions were moved, which is zero only once nothing is outstanding.
+     *
+     *  @note The disk's own completions and whatever is still staged come first, so @c io_getevents
+     *      parks the thread with a minimum of one only while the kernel holds every request.
+     */
+    expected<std::size_t> wait_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
+        if (into.empty()) return status_t {status_code_t::invalid_argument_k, "A wait needs room for a completion"};
+        for (;;) {
+            queue_pair_slot_t const* const slot = slot_of_(queue_pair);
+            if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this disk's"};
+            if (outstanding_(*slot) == 0) return std::size_t {0};
+            long const minimum = slot->locals_count == 0 && slot->staged_count == 0 ? 1L : 0L;
+            if (minimum != 0 && slot->flights_count == 0)
+                return status_t {status_code_t::io_k, "The queue pair awaits requests the kernel never took"};
+            auto [moved, reap_status] = reap_(queue_pair, into, minimum);
+            if (reap_status.failed()) return reap_status;
+            if (moved != 0) return moved;
         }
-        issue_(*slot, base);
-        moved += drain_locals_(*slot, base, into.subspan(moved));
-        return moved;
     }
 
     /**
@@ -674,6 +679,32 @@ class linux_aio_files_disk {
     /** Where one queue pair's seats, staging, events and local completions sit inside the shared windows. */
     [[nodiscard]] std::uint32_t window_of_(queue_pair_id_t id) const noexcept {
         return static_cast<std::uint32_t>(id) * depth_limit_;
+    }
+
+    /** Copies what the kernel answered into @p into, waiting for @p minimum events, then submits
+     *  what that released and appends the disk's own completions. */
+    expected<std::size_t> reap_(queue_pair_t const& queue_pair, std::span<completion_t> into, long minimum) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this disk's"};
+        std::uint32_t const base = window_of_(queue_pair.id());
+
+        std::size_t moved = 0;
+        if (slot->flights_count != 0 && !into.empty()) {
+            std::size_t const room = into.size() < slot->flights_count ? into.size() : slot->flights_count;
+            long const landed = ::syscall(__NR_io_getevents, slot->context, minimum, static_cast<long>(room),
+                                          &events_[base], nullptr);
+            if (landed < 0 && errno != EINTR)
+                return native_file_failure(errno, "The kernel would not hand completions back");
+            for (long index = 0; index < landed; ++index) {
+                ::io_event const& event = events_[base + static_cast<std::size_t>(index)];
+                std::uint32_t const seat = static_cast<std::uint32_t>(event.data);
+                --slot->flights_count;
+                into[moved++] = retire_(*slot, base, seat, translate_(flights_[base + seat], event.res));
+            }
+        }
+        issue_(*slot, base);
+        moved += drain_locals_(*slot, base, into.subspan(moved));
+        return moved;
     }
 
     /** Requests taken and not yet handed back: every occupied seat and every unreaped local completion. */
@@ -1030,6 +1061,11 @@ class linux_aio_files_disk {
 
     /** Answers nothing, since nothing was ever submitted. */
     expected<std::size_t> poll_completions(queue_pair_t const&, std::span<completion_t>) noexcept {
+        return status_t {status_code_t::unsupported_k, "This platform has no Linux AIO"};
+    }
+
+    /** Waits for nothing, since nothing was ever submitted. */
+    expected<std::size_t> wait_completions(queue_pair_t const&, std::span<completion_t>) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no Linux AIO"};
     }
 

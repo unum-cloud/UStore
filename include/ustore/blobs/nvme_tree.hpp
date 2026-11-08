@@ -481,7 +481,11 @@ class lsm_tree {
                     std::uint64_t const room = window.extent.length - at;
                     std::uint64_t const length = block_bytes < room ? block_bytes : room;
                     pending[tag % depth] = piece_of_(window, request, at, length);
-                    if (reader.enqueue_read(medium, extent_t {window.extent.offset + at, length}, tag).failed()) break;
+                    extent_t const piece {window.extent.offset + at, length};
+                    if (status_t const queued = reader.enqueue_read(medium, piece, tag); queued.failed()) {
+                        if (reader.outstanding() == 0) return queued;
+                        break;
+                    }
                     ++tag;
                     if (at + length == window.extent.length) {
                         ++request;
@@ -490,8 +494,8 @@ class lsm_tree {
                     else ++chunk;
                 }
                 if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
-                auto [polled, poll_completions_status] = reader.poll_completions(adapter);
-                if (poll_completions_status.failed()) return poll_completions_status;
+                auto [polled, wait_completions_status] = reader.wait_completions(adapter);
+                if (wait_completions_status.failed()) return wait_completions_status;
             }
             return first;
         }
@@ -816,6 +820,18 @@ class lsm_tree {
         levels.levels_.clear();
     }
 
+    /** Empties @p levels, vacating every run no other set names and giving its bytes back once a
+     *  later publication that names none of them succeeds. */
+    void abandon_after_publication_(level_set_t& levels) noexcept {
+        for (level_t const& level : levels.levels_)
+            for (run_handle_t const handle : level.runs())
+                if (sorted_run_t* const run = runs_->at(handle); run && --run->level_sets_naming == 0) {
+                    volume_->deallocate_after_publication(run->extent());
+                    runs_->vacate(handle); // Its last set's readers already left, as in abandon_.
+                }
+        levels.levels_.clear();
+    }
+
     /** Empties @p levels, vacating every run no other set names and leaving its bytes to the
      *  manifest that names it. */
     void forget_(level_set_t& levels) noexcept {
@@ -902,15 +918,15 @@ class lsm_tree {
     /**
      *  @brief Makes the spare set current, calls @p published, then empties the set it replaced.
      *
-     *  The hook publishes the new set to readers and returns only once none is left in the old
-     *  one, so the runs only the old set named are unreachable by then; their bytes go back to
-     *  the volume only once the hook recorded the new set, and a failed record leaves them to
-     *  the next mount.
+     *  The hook publishes the new set to readers and returns only once none is left in the old one,
+     *  so the runs only the old set named are unreachable by then; their bytes go back to the
+     *  volume once the hook recorded the new set, or after the next publication that succeeds when
+     *  the record failed, since the manifest on disk may still name them.
      */
     status_t replace_(lsm_tree_publication_hook_t const& published) noexcept {
         current_level_set_ ^= 1;
         status_t const recorded = published.notify != nullptr ? published.notify(published.context) : status_t {};
-        if (recorded.failed()) forget_(spare_());
+        if (recorded.failed()) abandon_after_publication_(spare_());
         else abandon_(spare_());
         return recorded;
     }

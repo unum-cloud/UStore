@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cassert> // `assert`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 
@@ -80,6 +81,15 @@ class collection_view {
     /** A view naming @p runs, listed newest first with stamps that never overlap, which a commit lays out before
      *  its own run is stamped so that publishing it allocates nothing. */
     [[nodiscard]] static collection_view of(runs_t&& runs) noexcept { return collection_view {std::move(runs)}; }
+
+    /** Names @p newest ahead of every run @p older names, in the room its runs were reserved
+     *  with, which a commit's leader does to a view no reader reaches yet, allocating nothing. */
+    void lay_out(run_t const& newest, std::span<run_t const* const> older) noexcept {
+        assert(runs_.capacity() > older.size() && "A claimed view reserves a run for every record");
+        [[maybe_unused]] st::status_t const sized = runs_.resize(older.size() + 1);
+        runs_[0] = &newest;
+        for (std::size_t index = 0; index != older.size(); ++index) runs_[index + 1] = older[index];
+    }
 
     /** The runs, newest first. */
     [[nodiscard]] std::span<run_t const* const> runs() const noexcept { return runs_; }

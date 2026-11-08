@@ -383,11 +383,12 @@ status_t ingest_finish(ustore_ingest_finish_t const& arguments, view_t const& vi
         [&]<typename path_type_>(path_type_& path) noexcept { return write_held(ingest, path, view.scratch); },
         ingest.path);
     if (wrote.failed()) return wrote;
-    expected<transaction_stamp_t> const landed = ingest.database.store->publish_ingest(ingest.database_ingest,
-                                                                                       arguments.durability);
-    if (!landed) return landed.status();
-    if (arguments.commit_stamp) *arguments.commit_stamp = *landed;
-    return compact_due(ingest.database);
+    ingest_outcome_t const landed = ingest.database.store->publish_ingest(ingest.database_ingest, arguments.durability);
+    if (landed.stamp == invalid_transaction_stamp_k) return landed.status;
+    if (arguments.commit_stamp) *arguments.commit_stamp = landed.stamp;
+    // The ingest has landed, so a compaction it left due is met again by the next write making room
+    [[maybe_unused]] status_t const compacted = compact_due(ingest.database);
+    return landed.status;
 }
 
 /** Implements @c ustore_ingest_free, dropping every run never published and giving the claim back. */

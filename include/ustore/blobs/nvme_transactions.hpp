@@ -874,11 +874,15 @@ enum class watch_purpose_t : std::uint8_t {
     /** The transaction read the key. */
     read_k = 0x01,
 
+    /** The transaction relies on the key standing as it found it, which a removal or a whole
+     *  write since breaks and a change delta folded onto it leaves alone. */
+    existence_k = 0x02,
+
     /** The transaction tracks the key without reading or writing it. */
     track_k = 0x04,
 
     /** Every purpose, which a count with no filter asks for. */
-    all_k = read_k | track_k,
+    all_k = read_k | existence_k | track_k,
 };
 
 /** The purposes of either watch. */
@@ -1094,6 +1098,9 @@ struct transaction_state {
 
         /** Its deltas and the run they become. */
         sealed_commit<stored_key_t, atomic_reference_, row_kit_type_> commit;
+
+        /** The memory-run record the run lands in, claimed before the leader word. */
+        memory_run_claim_t record;
     };
 
     /** Every written collection's sealed deltas, between a stage or a commit and its landing. */
@@ -1155,7 +1162,7 @@ concept nvme_store_concept = requires(
     st::vector<lsm_tree_run_record_t>& listed, typename store_type_::run_pool_t& run_pool,
     typename store_type_::ingest_runs_t& ingest_runs, typename store_type_::stored_key_t stored_key,
     std::span<byte_t> into, stored_value_size_t& size, typename store_type_::sealed_commit_t& sealed,
-    transaction_stamp_t stamp, std::size_t thread_index) {
+    memory_run_claim_t& claimed, transaction_stamp_t stamp, std::size_t thread_index) {
     typename store_type_::key_slot_t;
     typename store_type_::fold_t;
     {
@@ -1173,7 +1180,10 @@ concept nvme_store_concept = requires(
     { viewed.written_since(stored_key, stamp) } noexcept -> std::same_as<bool>;
     { viewed.range_written_since(stored_key, stored_key, stamp) } noexcept -> std::same_as<bool>;
     { viewed.memory_pressure(sealed) } noexcept -> std::same_as<memory_pressure_t>;
-    { store.prepare(sealed) } noexcept -> std::same_as<status_t>;
+    { store.try_claim(claimed) } noexcept -> std::same_as<status_t>;
+    { store.give_back(claimed) } noexcept;
+    { viewed.vacated() } noexcept -> std::same_as<std::uint32_t const&>;
+    { store.prepare(sealed, std::move(claimed)) } noexcept;
     { store.publish(sealed, stamp) } noexcept;
     { store.forget_prepared() } noexcept;
     { viewed.memory_shape() } noexcept -> std::same_as<memory_shape_t>;
@@ -1204,12 +1214,15 @@ template <typename store_type_, typename stored_key_type_, template <typename> t
 concept transaction_store_concept = requires(
     store_type_& store, collection_id_t collection_id, stored_key_type_ stored_key,
     transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_> const& deltas,
-    sealed_commit<stored_key_type_, atomic_reference_, row_kit_type_>& sealed, transaction_stamp_t stamp) {
+    sealed_commit<stored_key_type_, atomic_reference_, row_kit_type_>& sealed, memory_run_claim_t& claimed,
+    transaction_stamp_t stamp) {
     { store.ledger() } -> std::same_as<commit_ledger<atomic_reference_, waiter_type_>&>;
     { store.written_since(collection_id, stored_key, stamp) } -> std::same_as<bool>;
     { store.range_written_since(collection_id, stored_key, stored_key, stamp) } -> std::same_as<bool>;
+    { store.replaced_since(collection_id, stored_key, stamp) } -> std::same_as<bool>;
     { store.seal_collection(collection_id, deltas, sealed) } -> std::same_as<status_t>;
-    { store.prepare_collection(collection_id, sealed) } -> std::same_as<status_t>;
+    { store.claim_memory_record(collection_id, claimed) } -> std::same_as<status_t>;
+    { store.prepare_collection(collection_id, sealed, std::move(claimed)) } -> std::same_as<status_t>;
     { store.publish_collection(collection_id, sealed, stamp) } -> std::same_as<void>;
     { store.forget_collection(collection_id) } -> std::same_as<void>;
     { store.maintain(collection_id) } -> std::same_as<status_t>;
@@ -1299,7 +1312,6 @@ class transaction_registry {
     inline status_t prepare_(transaction_state_t& data, transaction_stamp_t start_stamp) noexcept;
     inline void forget_(transaction_state_t& data, std::size_t prepared) noexcept;
     inline void maintain_(transaction_state_t& data) noexcept;
-    inline bool flushed_records_(transaction_state_t& data) noexcept;
     static inline status_t prepare_commit_(void* context) noexcept;
     static inline void publish_commit_(void* context, transaction_stamp_t stamp) noexcept;
 
@@ -1317,6 +1329,8 @@ class transaction_registry {
 
     inline status_t watch_now_(transaction_stamp_t start_stamp, collection_id_t group_id,
                                std::span<stored_key_t const> stored_keys) noexcept;
+    inline status_t watch_existence_now_(transaction_stamp_t start_stamp, collection_id_t group_id,
+                                         std::span<stored_key_t const> stored_keys) noexcept;
     inline bool conflicting_(transaction_state_t const& data) noexcept;
 
 #pragma endregion Conflict Check
@@ -1358,22 +1372,16 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
                                      row_kit_type_>::stage_(transaction_state_t& data, transaction_stamp_t start_stamp,
                                                             transaction_stamp_t& stage_stamp) noexcept {
 
-    // Sealed before the leader word is taken, so the sort, the copy and any flush hold up
-    // no other committer.
+    // Sealed and claimed before the leader word is taken, so the sort, the copy and any flush hold
+    // up no other committer.
     if (status_t const sealed = seal_(data); sealed.failed()) return sealed;
-    for (;;) {
-        store_->ledger().lead();
-        stage_stamp = current_stamp_();
-        status_t const prepared = prepare_(data, start_stamp);
-        if (prepared.succeeded()) return status_t {};
-        store_->ledger().stop_leading();
-        // A stage refused a memory-run record prepares again only once a flush gave records back,
-        // so it never spins.
-        if (prepared != status_code_t::capacity_exhausted_k || !flushed_records_(data)) {
-            data.sealed.clear();
-            return prepared;
-        }
-    }
+    store_->ledger().lead();
+    stage_stamp = current_stamp_();
+    status_t const prepared = prepare_(data, start_stamp);
+    if (prepared.succeeded()) return status_t {};
+    store_->ledger().stop_leading();
+    data.sealed.clear();
+    return prepared;
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
@@ -1407,10 +1415,6 @@ transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_ty
     request.prepare = &prepare_commit_;
     request.publish = &publish_commit_;
     expected<transaction_stamp_t> committed = store_->ledger().submit(request);
-    // A commit refused a memory-run record resubmits only once a flush gave records back, so
-    // it never spins.
-    while (committed == status_code_t::capacity_exhausted_k && flushed_records_(data))
-        committed = store_->ledger().submit(request);
     if (committed) maintain_(data);
     data.sealed.clear();
     return committed;
@@ -1441,6 +1445,11 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
         typename transaction_state_t::sealed_collection_t sealed;
         sealed.id = collection.id;
         status = store_->seal_collection(collection.id, data.deltas, sealed.commit);
+        // Claimed before the leader word, waiting on a flush when every record is out, so the
+        // commit cannot be refused one; a flush never needs a record, so holding this claim while
+        // waiting for the next cannot deadlock.
+        if (status.succeeded() && !sealed.commit.empty())
+            status = store_->claim_memory_record(collection.id, sealed.record);
         if (status.succeeded()) [[maybe_unused]]
             st::status_t const kept = data.sealed.push_back(st::assume_reserved, std::move(sealed));
     });
@@ -1461,7 +1470,8 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
     if (current_stamp_() != start_stamp && conflicting_(data))
         return status_t {status_code_t::write_conflict_k, "Keys conflict"};
     for (std::size_t index = 0; index != data.sealed.size(); ++index)
-        if (status_t const prepared = store_->prepare_collection(data.sealed[index].id, data.sealed[index].commit);
+        if (status_t const prepared = store_->prepare_collection(data.sealed[index].id, data.sealed[index].commit,
+                                                                 std::move(data.sealed[index].record));
             prepared.failed()) {
             forget_(data, index);
             return prepared;
@@ -1483,18 +1493,6 @@ template <typename stored_key_type_, typename store_type_, template <typename> t
 inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
                                  row_kit_type_>::forget_(transaction_state_t& data, std::size_t prepared) noexcept {
     for (std::size_t index = 0; index != prepared; ++index) store_->forget_collection(data.sealed[index].id);
-}
-
-/** Flushes every collection @p data sealed, answering whether any of them gave
- *  memory-run records back. */
-template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, typename row_kit_type_>
-inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
-                                 row_kit_type_>::flushed_records_(transaction_state_t& data) noexcept {
-    bool freed = false;
-    for (typename transaction_state_t::sealed_collection_t const& sealed : data.sealed)
-        freed |= store_->flushed_records(sealed.id);
-    return freed;
 }
 
 /** Merges, flushes and compacts whatever the landed commit left due in the collections it wrote; a
@@ -1544,6 +1542,20 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
     return status_t {};
 }
 
+/** Refuses with @c write_conflict_k when a commit since @p start_stamp removed or wholly wrote
+ *  any of @p stored_keys, which an existence watch checking in place asks. */
+template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
+          typename waiter_type_, typename row_kit_type_>
+inline status_t
+transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
+                     row_kit_type_>::watch_existence_now_(transaction_stamp_t start_stamp, collection_id_t group_id,
+                                                          std::span<stored_key_t const> stored_keys) noexcept {
+    for (stored_key_t const& stored_key : stored_keys)
+        if (store_->replaced_since(group_id, stored_key, start_stamp))
+            return status_t {status_code_t::write_conflict_k, "A key was removed or replaced since the start"};
+    return status_t {};
+}
+
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, typename row_kit_type_>
 inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
@@ -1562,7 +1574,11 @@ inline bool transaction_registry<stored_key_type_, store_type_, atomic_reference
             collection_id_t const group_id = group.key();
             [[maybe_unused]] st::status_t const watched = group.value().stored_keys.for_each(
                 [&](auto const& watch) noexcept -> st::walk_control_t {
-                    conflict = store_->written_since(group_id, watch.key(), watch.value().watch_stamp);
+                    // A watch for existence alone lets change deltas through; any other purpose
+                    // sees every write.
+                    conflict = watch.value().purpose == watch_purpose_t::existence_k
+                                   ? store_->replaced_since(group_id, watch.key(), watch.value().watch_stamp)
+                                   : store_->written_since(group_id, watch.key(), watch.value().watch_stamp);
                     return conflict ? st::walk_control_t::halt_k : st::walk_control_t::resume_k;
                 });
             return conflict ? st::walk_control_t::halt_k : st::walk_control_t::resume_k;
@@ -1754,6 +1770,23 @@ class transaction_core {
         watch_later<watch_schedule_>(collection_id, stored_keys, watch_stamp_for<watch_schedule_>(),
                                      watch_purpose_t::track_k);
         return {};
+    }
+
+    /** Watches @p stored_keys of @p collection_id for being removed or wholly written, letting
+     *  change deltas through, which an edit folding onto a key that must still stand takes. */
+    template <watch_schedule_t watch_schedule_>
+    status_t watch_existence(collection_id_t collection_id, std::span<stored_key_t const> stored_keys) noexcept {
+        if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
+        if constexpr (watch_schedule_ == watch_schedule_t::now_k)
+            return registry_.watch_existence_now_(start_stamp_, collection_id, stored_keys);
+        else {
+            if (status_t const prepared = watch_now_or_prepare<watch_schedule_>(collection_id, stored_keys);
+                prepared.failed())
+                return prepared;
+            watch_later<watch_schedule_>(collection_id, stored_keys, watch_stamp_for<watch_schedule_>(),
+                                         watch_purpose_t::existence_k);
+            return {};
+        }
     }
 
     /** Watches every key of @p collection_id from @p lower to @p upper inclusive, the absent

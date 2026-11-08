@@ -15,6 +15,7 @@
 #include <cstdint> // `std::uint64_t`
 
 #include <array>   // `std::array`
+#include <chrono>  // `std::chrono::milliseconds`
 #include <memory>  // `std::unique_ptr`
 #include <span>    // `std::span`
 #include <thread>  // `std::thread`
@@ -205,9 +206,10 @@ std::size_t channels_separate_executor_threads(mount_type_ const& mount) {
     return failures;
 }
 
-/** Spare channels run out, and the mount says so rather than handing one queue pair to two threads. */
+/** A thread finding every spare channel out waits for one to be released rather than being
+ *  refused, and never shares a queue pair with the thread holding it. */
 template <typename mount_type_>
-std::size_t channels_refuse_beyond_their_spares(mount_type_ const& mount) {
+std::size_t channels_wait_beyond_their_spares(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
@@ -226,13 +228,22 @@ std::size_t channels_refuse_beyond_their_spares(mount_type_ const& mount) {
         if (!guard) break;
         failures += expect(guards.push_back(std::move(*guard)) == st::status_t::success_k);
     }
-    expected<guard_t> const beyond = (*fixture)->channels.acquire();
-    failures += expect(!beyond.has_value());
-    failures += expect_status(beyond, status_code_t::capacity_exhausted_k);
-
-    guards.clear();
-    expected<guard_t> reclaimed = (*fixture)->channels.acquire();
-    failures += expect(reclaimed.has_value());
+    io_channel_t const* const released_channel = &guards[0].channel();
+    bool releasing {false};
+    bool acquired_early {false};
+    io_channel_t const* waited_channel = nullptr;
+    std::thread waiter {[&]() noexcept {
+        expected<guard_t> waited = (*fixture)->channels.acquire();
+        if (!atomic_reference<bool> {releasing}.load(std::memory_order_acquire))
+            atomic_reference<bool> {acquired_early}.store(true, std::memory_order_relaxed);
+        if (waited) waited_channel = &waited->channel();
+    }};
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    atomic_reference<bool> {releasing}.store(true, std::memory_order_release);
+    guards.erase(0);
+    waiter.join();
+    failures += expect(!atomic_reference<bool> {acquired_early}.load(std::memory_order_relaxed));
+    failures += expect(waited_channel == released_channel);
     return failures;
 }
 
@@ -503,7 +514,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "pool_exhausts_and_recycles", pool_exhausts_and_recycles);
         report(totals, mount, "pool_recycles_exactly_once", pool_recycles_exactly_once);
         report(totals, mount, "separate_threads", channels_separate_executor_threads);
-        report(totals, mount, "refuse_beyond_spares", channels_refuse_beyond_their_spares);
+        report(totals, mount, "wait_beyond_spares", channels_wait_beyond_their_spares);
         report(totals, mount, "second_pipeline_refused", second_pipeline_is_refused);
         report(totals, mount, "pipeline_reads_back", pipeline_reads_back_what_it_wrote);
         report(totals, mount, "pipeline_holds_its_depth", pipeline_holds_its_depth);

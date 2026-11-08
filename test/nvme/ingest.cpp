@@ -228,7 +228,9 @@ expected<transaction_stamp_t> ingest_rows(database_type_& store, collection_id_t
             return written;
         }
     }
-    return store.publish_ingest(ingest, durability);
+    ingest_outcome_t const published = store.publish_ingest(ingest, durability);
+    if (published.status.failed()) return published.status;
+    return published.stamp;
 }
 
 /** Keys of @p keys @p store answers @p value for. */

@@ -396,7 +396,7 @@ struct basic_fixture {
 
     using disk_t = disk_type_;
     using volume_t = basic_directory_volume<disk_type_, waiter_t, volume_allocator_t>;
-    using channel_pool_t = basic_io_channel_pool<disk_type_, atomic_reference>;
+    using channel_pool_t = basic_io_channel_pool<disk_type_, atomic_reference, waiter_t>;
     using guard_t = typename channel_pool_t::guard_t;
 
     /** The budgets every allocation is charged to, shared so a case can hold them past the fixture's death. */

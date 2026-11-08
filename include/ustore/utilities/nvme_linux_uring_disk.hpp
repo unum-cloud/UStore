@@ -664,6 +664,27 @@ class linux_uring_files_disk {
     }
 
     /**
+     *  @brief Moves at least one completion of @p queue_pair into @p into, sleeping in the kernel
+     *      until one lands.
+     *  @param[in] queue_pair The queue pair waiting, held by the thread that submitted on it.
+     *  @param[out] into Room for completions, which bounds how many one call moves.
+     *  @return How many completions were moved, which is zero only once nothing is outstanding.
+     *
+     *  @note The ring is entered with @c min_complete of one, which runs the task work a
+     *      cooperative ring defers and parks the thread until a completion posts.
+     */
+    expected<std::size_t> wait_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
+        if (into.empty()) return status_t {status_code_t::invalid_argument_k, "A wait needs room for a completion"};
+        for (;;) {
+            auto [moved, poll_completions_status] = poll_completions(queue_pair, into);
+            if (poll_completions_status.failed()) return poll_completions_status;
+            if (moved != 0 || slot_of_(queue_pair)->flights_count == 0) return moved;
+            ring_t const& ring = rings_[static_cast<std::size_t>(queue_pair.id())];
+            if (status_t const entered = enter_for_one_completion_(ring); entered.failed()) return entered;
+        }
+    }
+
+    /**
      *  @brief Asks the kernel to stop everything @p queue pair has in flight, which poll reports cancelled.
      *  @param[in] queue_pair The queue pair to stop, whose started requests still run to their own end.
      *
@@ -1113,6 +1134,16 @@ class linux_uring_files_disk {
         [[maybe_unused]] long const entered = enter_(ring, 0u, 0u, getevents);
     }
 
+    /** Parks the calling thread in @p ring until a completion posts, running deferred task work. */
+    static status_t enter_for_one_completion_(ring_t const& ring) noexcept {
+        std::uint32_t const getevents = 1u << 0; // IORING_ENTER_GETEVENTS
+        long const entered = enter_(ring, 0u, 1u, getevents);
+        // A signal, or an overflow the next poll flushes, leaves the wait to the caller's next turn
+        if (entered < 0 && errno != EINTR && errno != EAGAIN && errno != EBUSY)
+            return native_file_failure(errno, "The ring would not wait for a completion");
+        return {};
+    }
+
     /** Whether the kernel queued completion work that only an entry into the ring runs. */
     [[nodiscard]] static bool runs_task_work_(ring_t const& ring) noexcept {
         unsigned const task_run = 1u << 2; // IORING_SQ_TASKRUN, from Linux 5.19
@@ -1515,6 +1546,11 @@ class linux_uring_files_disk {
 
     /** Answers nothing, since nothing was ever submitted. */
     expected<std::size_t> poll_completions(queue_pair_t const&, std::span<completion_t>) noexcept {
+        return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
+    }
+
+    /** Waits for nothing, since nothing was ever submitted. */
+    expected<std::size_t> wait_completions(queue_pair_t const&, std::span<completion_t>) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
