@@ -1371,8 +1371,9 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
     view_t view = runner;
     if (!decode_call(arguments, view))
         return {status_code_t::invalid_argument_k, "The view was made by neither view constructor"};
-    if (view.transaction ? view.transaction->engine != &engine : view.snapshot && view.snapshot->engine != &engine)
-        return {status_code_t::invalid_argument_k, "The view belongs to another engine"};
+    if ((view.transaction && view.transaction->database != database) ||
+        (view.snapshot && view.snapshot->database != database))
+        return {status_code_t::invalid_argument_k, "The view reads another database"};
 
     if constexpr (requires { arguments.arena; }) arena_rewind(arguments.arena);
     arena_rewind(runner.scratch);

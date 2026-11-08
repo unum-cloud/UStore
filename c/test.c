@@ -167,6 +167,50 @@ int main(void) {
     failures += expect(presences && presences[0] == 7 && lengths && lengths[1] == 5, __LINE__);
     failures += expect(tape_holds(&values, 0, "red") && tape_holds(&values, 2, "blue"), __LINE__);
 
+    // A transaction or snapshot of one database is refused through another of the same engine
+    ustore_database_t other = NULL;
+    ustore_database_init_ram_t init_other = {.database = &other, .outcome = &outcome};
+    ustore_database_init_ram(&init_other);
+    failures += expect_success(&outcome, __LINE__);
+    ustore_key_t const foreign_key = key_from(9);
+    ustore_transaction_t foreign = NULL;
+    ustore_transaction_init_t begin_foreign = {.transaction = &foreign, .database = database, .outcome = &outcome};
+    ustore_transaction_init(&begin_foreign);
+    failures += expect_success(&outcome, __LINE__);
+    ustore_blobs_write_t foreign_write = {.database = database,
+                                          .outcome = &outcome,
+                                          .transaction = foreign,
+                                          .count = 1,
+                                          .collections = blobs_view,
+                                          .keys = {&foreign_key, 0},
+                                          .values = narrow_tape};
+    ustore_blobs_write(&foreign_write);
+    failures += expect_success(&outcome, __LINE__);
+    ustore_transaction_commit_t misdirected = {.database = other, .outcome = &outcome, .transaction = foreign};
+    ustore_transaction_commit(&misdirected);
+    failures += expect(outcome.status == ustore_status_invalid_argument_k, __LINE__);
+    ustore_blobs_read_t foreign_read = {.database = database,
+                                        .outcome = &outcome,
+                                        .count = 1,
+                                        .collections = blobs_view,
+                                        .keys = {&foreign_key, 0},
+                                        .presences = &presences,
+                                        .arena = arena};
+    ustore_blobs_read(&foreign_read);
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(presences && (presences[0] & 1) == 0, __LINE__);
+    ustore_transaction_free(foreign);
+    ustore_snapshot_t pinned = NULL;
+    ustore_snapshot_init_t pin = {.snapshot = &pinned, .database = database, .outcome = &outcome};
+    ustore_snapshot_init(&pin);
+    failures += expect_success(&outcome, __LINE__);
+    foreign_read.database = other;
+    foreign_read.view = ustore_snapshot_view(pinned);
+    ustore_blobs_read(&foreign_read);
+    failures += expect(outcome.status == ustore_status_invalid_argument_k, __LINE__);
+    ustore_snapshot_free(pinned);
+    ustore_database_free(other);
+
     // A scan repeats one start key for its single task through a zero stride
     ustore_length_t const* scan_offsets = NULL;
     ustore_key_t const* found_keys = NULL;
