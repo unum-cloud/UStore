@@ -1,0 +1,20 @@
+# The Mojo binding, which `dlopen`s the engine rather than linking it, so `ustore` is a run dependency and a
+# consumer naming this package by `git` or `path` needs no linker flags of its own.
+
+[package]
+authors = ["Ash Vardanian <info@unum.cloud>"]
+description = "GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass"
+license = "Apache-2.0"
+name = "ustore_mojo"
+version = "1.0.0-rc.1"
+
+[package.build]
+backend = { name = "pixi-build-mojo", version = "0.*" }
+
+# The backend only auto-discovers a package under `<name>/` or `src/`, and this one lives under
+# `ustore/`, so it is named here.
+[package.build.config]
+pkg = { name = "ustore", path = "ustore" }
+
+[package.run-dependencies]
+ustore = { path = ".." }
