@@ -311,7 +311,7 @@ std::size_t uring_reports_the_alignment_statx_reports(linux_uring_files_disk_t& 
 }
 
 /** A range past one gibibyte pins as a run of table slots: a transfer inside the second slot moves
- *  through it, and one across the boundary moves unpinned. */
+ *  through it, and one across the boundary moves unpinned, which the disk counts. */
 std::size_t uring_pins_a_range_past_a_gibibyte(linux_uring_files_disk_t& disk, medium_reference_t medium) {
     std::size_t const boundary = linux_uring_registered_range_bytes_k;
     return on_queue_pair(
@@ -353,6 +353,8 @@ std::size_t uring_pins_a_range_past_a_gibibyte(linux_uring_files_disk_t& disk, m
             struct rlimit locked {};
             if (::getrlimit(RLIMIT_MEMLOCK, &locked) == 0 && locked.rlim_cur == RLIM_INFINITY)
                 failures += expect(disk.pinning() == range_pinning_t::pinned_k);
+            std::uint64_t const crossed = disk.pinning() == range_pinning_t::pinned_k ? 2 : 0;
+            failures += expect_eq(disk.crossing_requests(), crossed);
             return failures;
         });
 }

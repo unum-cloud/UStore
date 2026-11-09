@@ -1009,8 +1009,7 @@ static int arrow_keywords(ustore_py_context_t const* context, char const* verb, 
             char const* const spelled = PyUnicode_Check(value) ? PyUnicode_AsUTF8AndSize(value, &length) : NULL;
             if (!spelled && PyErr_Occurred()) return -1;
             ustore_bytes_view_t const bytes = {(uint8_t const*)spelled, (ustore_size_t)length};
-            *order = spelled ? ustore_ingest_order_from_name(bytes) : ustore_ingest_sorted_k;
-            if (!spelled || strcmp(ustore_ingest_order_name(*order), spelled) != 0) {
+            if (!spelled || ustore_ingest_order_from_name(bytes, order) != ustore_status_success_k) {
                 PyErr_Format(PyExc_ValueError, "The 'order' option is \"sorted\" or \"unsorted\", not %R", value);
                 return -1;
             }

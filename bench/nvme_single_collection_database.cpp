@@ -338,12 +338,13 @@ status_t run_workload(settings_t const& settings, workload_t const& workload) no
         expected<resources_ptr_t> opened = open_resources<atomic_reference, waiter_t>(config);
         if (!opened) return opened.status();
         resources_ptr_t const resources = std::move(*opened);
-        bool const pinned = resources->storage.pinning() == range_pinning_t::pinned_k;
-        fmt::println("- {}: {} transport, {} arena, {} threads, {} keys", workload.name,
+        fmt::println("- {}: {} transport, {} threads, {} keys", workload.name,
                      storage_transport_names_k[static_cast<std::size_t>(resources->storage.report().transport)],
-                     pinned ? "pinned" : "unpinned", workload.threads, workload.population_count);
+                     workload.threads, workload.population_count);
         ran = resources->storage.visit(
             [&](auto& mount) noexcept { return run_rows<layout_>(mount, resources, settings, workload); });
+        fmt::println("- {}: pin_refused_bytes {} crossing_requests {}", workload.name,
+                     resources->storage.pin_refused_bytes(), resources->storage.crossing_requests());
     }
     std::filesystem::remove_all(directory, error);
     return ran;

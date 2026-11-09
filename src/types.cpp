@@ -243,39 +243,48 @@ ustore_status_t ustore_outcome_status(ustore_outcome_t* outcome) { return host_v
 
 char const* ustore_status_name(ustore_status_t status) { return name_in(status_names_k, status); }
 
-ustore_status_t ustore_status_from_name(ustore_bytes_view_t name) {
-    std::string_view const text = string_of(name);
-    for (enumerator_spelling<ustore_status_t> const& spelling : status_names_k)
-        if (spelling.name == text) return spelling.value;
-    return ustore_status_invalid_argument_k;
+ustore_status_t ustore_status_from_name(ustore_bytes_view_t name, ustore_status_t* status) {
+    return value_in(status_names_k, name, status);
 }
 
 char const* ustore_mood_name(ustore_mood_t mood) { return name_in(mood_names_k, mood); }
-ustore_mood_t ustore_mood_from_name(ustore_bytes_view_t name) { return value_in(mood_names_k, name); }
+ustore_status_t ustore_mood_from_name(ustore_bytes_view_t name, ustore_mood_t* mood) {
+    return value_in(mood_names_k, name, mood);
+}
 char const* ustore_cpu_class_name(ustore_cpu_class_t cpu_class) { return name_in(cpu_class_names_k, cpu_class); }
-ustore_cpu_class_t ustore_cpu_class_from_name(ustore_bytes_view_t name) { return value_in(cpu_class_names_k, name); }
+ustore_status_t ustore_cpu_class_from_name(ustore_bytes_view_t name, ustore_cpu_class_t* cpu_class) {
+    return value_in(cpu_class_names_k, name, cpu_class);
+}
 char const* ustore_pattern_kind_name(ustore_pattern_kind_t kind) { return name_in(pattern_kind_names_k, kind); }
-ustore_pattern_kind_t ustore_pattern_kind_from_name(ustore_bytes_view_t name) {
-    return value_in(pattern_kind_names_k, name);
+ustore_status_t ustore_pattern_kind_from_name(ustore_bytes_view_t name, ustore_pattern_kind_t* kind) {
+    return value_in(pattern_kind_names_k, name, kind);
 }
 char const* ustore_case_sensitivity_name(ustore_case_sensitivity_t sensitivity) {
     return name_in(case_sensitivity_names_k, sensitivity);
 }
-ustore_case_sensitivity_t ustore_case_sensitivity_from_name(ustore_bytes_view_t name) {
-    return value_in(case_sensitivity_names_k, name);
+ustore_status_t ustore_case_sensitivity_from_name(ustore_bytes_view_t name, ustore_case_sensitivity_t* sensitivity) {
+    return value_in(case_sensitivity_names_k, name, sensitivity);
 }
 char const* ustore_predicate_cost_name(ustore_predicate_cost_t cost) { return name_in(predicate_cost_names_k, cost); }
-ustore_predicate_cost_t ustore_predicate_cost_from_name(ustore_bytes_view_t name) {
-    return value_in(predicate_cost_names_k, name);
+ustore_status_t ustore_predicate_cost_from_name(ustore_bytes_view_t name, ustore_predicate_cost_t* cost) {
+    return value_in(predicate_cost_names_k, name, cost);
 }
 char const* ustore_gds_name(ustore_gds_t gds) { return name_in(gds_names_k, gds); }
-ustore_gds_t ustore_gds_from_name(ustore_bytes_view_t name) { return value_in(gds_names_k, name); }
+ustore_status_t ustore_gds_from_name(ustore_bytes_view_t name, ustore_gds_t* gds) {
+    return value_in(gds_names_k, name, gds);
+}
 char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t vendor) { return name_in(gpu_vendor_names_k, vendor); }
-ustore_gpu_vendor_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name) { return value_in(gpu_vendor_names_k, name); }
+ustore_status_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name, ustore_gpu_vendor_t* vendor) {
+    return value_in(gpu_vendor_names_k, name, vendor);
+}
 char const* ustore_gpu_class_name(ustore_gpu_class_t gpu_class) { return name_in(gpu_class_names_k, gpu_class); }
-ustore_gpu_class_t ustore_gpu_class_from_name(ustore_bytes_view_t name) { return value_in(gpu_class_names_k, name); }
+ustore_status_t ustore_gpu_class_from_name(ustore_bytes_view_t name, ustore_gpu_class_t* gpu_class) {
+    return value_in(gpu_class_names_k, name, gpu_class);
+}
 char const* ustore_transport_name(ustore_transport_t transport) { return name_in(transport_names_k, transport); }
-ustore_transport_t ustore_transport_from_name(ustore_bytes_view_t name) { return value_in(transport_names_k, name); }
+ustore_status_t ustore_transport_from_name(ustore_bytes_view_t name, ustore_transport_t* transport) {
+    return value_in(transport_names_k, name, transport);
+}
 
 void ustore_version(int* major, int* minor, int* patch) {
     *major = USTORE_VERSION_MAJOR;
@@ -328,9 +337,11 @@ void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
     finish(outcome, make_executor(*pool, *topology, domains, *arguments->executor));
 }
 
-/** Makes in @p made an executor of @p threads host threads spread over the whole machine, as the NVMe and VRAM
- *  executors take, allowed the ForkUnion capabilities in @p allowed, whose scratch lives near each thread. */
-static status_t spawn_across_machine(std::size_t threads, fu_capabilities_t allowed, ustore_executor_t& made) noexcept {
+/** Makes in @p made an executor of @p threads host threads spread over the whole machine, as the
+ *  NVMe and VRAM executors take, treating its caller as @p exclusivity says, allowed the ForkUnion
+ *  capabilities in @p allowed, whose scratch lives near each thread. */
+static status_t spawn_across_machine(std::size_t threads, caller_exclusivity_t exclusivity, fu_capabilities_t allowed,
+                                     ustore_executor_t& made) noexcept {
     st::expected<topology_t> topology = topology_t::make();
     if (!topology) return pool_failure(topology.status());
     st::vector<fu_memory_domain_id_t> domains;
@@ -339,7 +350,7 @@ static status_t spawn_across_machine(std::size_t threads, fu_capabilities_t allo
         if (threads > 1) return {status_code_t::unsupported_k, "This build spawns no threads"};
         threads = 1;
     }
-    st::expected<executor_t> pool = executor_t::make(*topology, threads, spawned_exclusivity(), allowed);
+    st::expected<executor_t> pool = executor_t::make(*topology, threads, exclusivity, allowed);
     if (!pool) return pool_failure(pool.status());
     return make_executor(std::move(*pool), *topology, domains, made);
 }
@@ -360,8 +371,8 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
         if (st::expected<std::size_t> const cores = executor_t::logical_cores_count(); cores)
             threads = std::clamp<std::size_t>(*cores / 2, 1, 8);
     ustore_executor_t made = nullptr;
-    if (status_t const status = spawn_across_machine(std::max<std::size_t>(threads, 1), forkunion_allowed_of(ceiling),
-                                                     made);
+    if (status_t const status = spawn_across_machine(std::max<std::size_t>(threads, 1), spawned_exclusivity(),
+                                                     forkunion_allowed_of(ceiling), made);
         status.failed())
         return finish(outcome, status);
     made->device = arguments->nvme;
@@ -382,9 +393,11 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     gpu_device_t const& device = devices[static_cast<std::size_t>(arguments->device)];
     if (device.vendor != gpu_vendor_t::nvidia_k && arguments->gds == ustore_gds_direct_k)
         return finish(outcome, {status_code_t::device_k, "GPUDirect Storage reaches NVIDIA devices alone"});
-    // One caller-exclusive host thread keeps the device fed and serves the deferred calls
+    // The caller is the one host thread: it stages, feeds the device and waits on it
     ustore_executor_t made = nullptr;
-    if (status_t const status = spawn_across_machine(1, fu_capabilities_all_k, made); status.failed())
+    if (status_t const status = spawn_across_machine(1, caller_exclusivity_t::caller_inclusive_k, fu_capabilities_all_k,
+                                                     made);
+        status.failed())
         return finish(outcome, status);
     gpu_runtime_t& runtime = gpu_runtime();
     if (status_t const status = runtime.spawn(device, gpu_class_of(device), arguments->stream, arguments->scratch_limit,

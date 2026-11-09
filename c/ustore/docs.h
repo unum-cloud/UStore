@@ -95,14 +95,18 @@ typedef enum ustore_docs_modification_t {
 /** The canonical spelling of a field type, as @c ustore_docs_field_type_f64_k spells "f64", or "unrecognized". */
 USTORE_EXPORT char const* ustore_docs_field_type_name(ustore_docs_field_type_t field_type);
 
-/** Reads a field type back from its canonical spelling; @c ustore_docs_field_type_json_k when unrecognized. */
-USTORE_EXPORT ustore_docs_field_type_t ustore_docs_field_type_from_name(ustore_bytes_view_t name);
+/** Reads a field type back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_docs_field_type_from_name(ustore_bytes_view_t name,
+                                                               ustore_docs_field_type_t* field_type);
 
 /** The canonical spelling of a modification, as @c ustore_docs_modify_merge_k spells "merge", or "unrecognized". */
 USTORE_EXPORT char const* ustore_docs_modification_name(ustore_docs_modification_t modification);
 
-/** Reads a modification back from its canonical spelling; @c ustore_docs_modify_upsert_k when unrecognized. */
-USTORE_EXPORT ustore_docs_modification_t ustore_docs_modification_from_name(ustore_bytes_view_t name);
+/** Reads a modification back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_docs_modification_from_name(ustore_bytes_view_t name,
+                                                                 ustore_docs_modification_t* modification);
 
 /**
  *  @brief The arguments of @c ustore_docs_write, which writes whole documents or fields inside them.

@@ -210,7 +210,9 @@ struct command_line_t {
 
     if (object == "collection") {
         if (!argument.empty()) return "Too many arguments";
-        if (!line.modality.empty() && !ustore_modality_from_name(bytes_of(line.modality)))
+        ustore_modality_t modality {};
+        if (!line.modality.empty() &&
+            ustore_modality_from_name(bytes_of(line.modality), &modality) != ustore_status_success_k)
             return "The modality is none of blobs, docs, graph, strings or pages";
         if (!line.ingest.empty() && line.ingest != "sorted" && line.ingest != "unsorted")
             return "The ingest order is neither sorted nor unsorted";
@@ -315,8 +317,8 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     create.database = database;
     create.outcome = &outcome;
     create.name = bytes_of(name);
-    create.modality = line.modality.empty() ? ustore_modality_docs_k
-                                            : ustore_modality_from_name(bytes_of(line.modality));
+    create.modality = ustore_modality_docs_k;
+    if (!line.modality.empty()) ustore_modality_from_name(bytes_of(line.modality), &create.modality);
     create.collection = &id;
     ustore_collection_create(&create);
     if (failed(outcome)) {
@@ -383,8 +385,8 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     importing.database = database;
     importing.outcome = &outcome;
     importing.collection_name = bytes_of(line.collection);
-    importing.modality = line.modality.empty() ? ustore_modality_t {}
-                                               : ustore_modality_from_name(bytes_of(line.modality));
+    importing.modality = ustore_modality_t {};
+    if (!line.modality.empty()) ustore_modality_from_name(bytes_of(line.modality), &importing.modality);
     importing.path = bytes_of(line.input);
     importing.format = dataset_formats_k[line.format.selected];
     importing.ingestion = line.ingest.empty()       ? ustore_dataset_ingestion_batched_k

@@ -456,8 +456,11 @@ void input_release(ArrowArrayStream* stream) noexcept { stream->release = nullpt
 /** What @p schema holds: its @c ustore.modality, else what its columns spell, where documents read
  *  as blobs, or zero when neither tells. */
 [[nodiscard]] ustore_modality_t modality_of(ipc_schema_t const& schema) noexcept {
-    if (std::string_view const named = metadata_value(schema.metadata, modality_key_k); !named.empty())
-        return ustore_modality_from_name(bytes_of(named));
+    if (std::string_view const named = metadata_value(schema.metadata, modality_key_k); !named.empty()) {
+        ustore_modality_t modality {};
+        ustore_modality_from_name(bytes_of(named), &modality);
+        return modality;
+    }
     if (field_named(schema, "source") && field_named(schema, "target")) return ustore_modality_graph_k;
     ipc_field_t const* const key = field_named(schema, "key");
     ipc_field_t const* const value = field_named(schema, "value");

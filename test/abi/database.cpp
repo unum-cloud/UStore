@@ -1292,50 +1292,47 @@ case_result_t database_find_at_snapshot(config_t const& config) {
     return failures;
 }
 
-/** Every status spelling reads back as its status, while a value or a name no status carries
- *  maps onto none. */
-std::size_t status_names(config_t const&) {
-    std::size_t failures = 0;
-    std::size_t spelled = 0;
-    // Values no status carries reach the library as a C caller passes them, never loaded as
-    // the enum here
-    for (int value = 0; value != 64; ++value) {
-        std::string_view const name = ustore_status_name(static_cast<ustore_status_t>(value));
-        if (name == "unrecognized") continue;
-        ++spelled;
-        failures += expect(ustore_status_from_name(bytes_of(name)) == value);
-    }
-    failures += expect_eq(spelled, std::size_t {19});
-    failures += expect(std::string_view {ustore_status_name(ustore_status_deferred_k)} == "deferred");
-    failures += expect(std::string_view {ustore_status_name(ustore_status_read_only_k)} == "read-only");
-    failures += expect(ustore_status_from_name(bytes_of(std::string_view {"unrecognized"})) ==
-                       ustore_status_invalid_argument_k);
-    return failures;
-}
-
 /** Fails unless exactly @p count values below 64 have a spelling, each reading back as its value,
- *  while a name no enumerator carries reads back as the zero enumerator. */
+ *  while a name no enumerator carries is refused and leaves the output as it was. */
 template <typename enum_type_>
-std::size_t expect_spellings(char const* (*name_of)(enum_type_), enum_type_ (*from_name)(ustore_bytes_view_t),
-                             std::size_t count) {
+std::size_t expect_spellings(char const* (*name_of)(enum_type_),
+                             ustore_status_t (*from_name)(ustore_bytes_view_t, enum_type_*), std::size_t count) {
     std::size_t failures = 0;
     std::size_t spelled = 0;
+    enum_type_ read {};
     // Values no enumerator carries reach the library as a C caller passes them, never loaded as
     // the enum here
     for (int value = 0; value != 64; ++value) {
         std::string_view const name = name_of(static_cast<enum_type_>(value));
         if (name == "unrecognized") continue;
         ++spelled;
-        failures += expect(static_cast<int>(from_name(bytes_of(name))) == value);
+        failures += expect(from_name(bytes_of(name), &read) == ustore_status_success_k);
+        failures += expect(static_cast<int>(read) == value);
     }
     failures += expect_eq(spelled, count);
-    failures += expect(static_cast<int>(from_name(bytes_of(std::string_view {"unrecognized"}))) == 0);
+    enum_type_ const kept = read;
+    failures += expect(from_name(bytes_of(std::string_view {"bogus"}), &read) == ustore_status_invalid_argument_k);
+    failures += expect(read == kept);
+    failures += expect(from_name(bytes_of(std::string_view {"bogus"}), nullptr) == ustore_status_invalid_argument_k);
     return failures;
 }
 
-/** Every closed set spells each of its enumerators and reads every spelling back. */
+/** Every status spelling reads back as its status, while a name no status carries is refused. */
+std::size_t status_names(config_t const&) {
+    std::size_t failures = 0;
+    failures += expect_spellings(ustore_status_name, ustore_status_from_name, 19);
+    failures += expect(std::string_view {ustore_status_name(ustore_status_deferred_k)} == "deferred");
+    failures += expect(std::string_view {ustore_status_name(ustore_status_read_only_k)} == "read-only");
+    return failures;
+}
+
+/** Every closed set spells each of its enumerators, reads every spelling back and refuses the
+ *  rest. */
 std::size_t closed_set_names(config_t const&) {
     std::size_t failures = 0;
+    failures += expect_spellings(ustore_cpu_class_name, ustore_cpu_class_from_name, 11);
+    failures += expect_spellings(ustore_gpu_vendor_name, ustore_gpu_vendor_from_name, 2);
+    failures += expect_spellings(ustore_gpu_class_name, ustore_gpu_class_from_name, 8);
     failures += expect_spellings(ustore_mood_name, ustore_mood_from_name, 2);
     failures += expect_spellings(ustore_durability_name, ustore_durability_from_name, 2);
     failures += expect_spellings(ustore_watch_name, ustore_watch_from_name, 2);

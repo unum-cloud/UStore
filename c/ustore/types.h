@@ -38,9 +38,10 @@
  *
  *  A deferred call on a caller-exclusive executor returns once handed to the executor's thread 0,
  *  which runs it there, forks included, and finishes it, so polling alone sees it final. A deferred
- *  call on a caller-inclusive executor, whose threads need their caller, runs at submission and is
- *  final when it returns. Submission copies the structure; everything it points to stays borrowed
- *  until final, and @c outcome->status reads @c ustore_status_deferred_k until then.
+ *  call on a caller-inclusive executor, whose threads need their caller, or on a VRAM executor,
+ *  whose caller stages and feeds its devices, runs at submission and is final on return. Submission
+ *  copies the structure; everything it points to stays borrowed until final, and @c outcome->status
+ *  reads @c ustore_status_deferred_k until then.
  *
  *  A call lets go of its arena and of the handles it names, then of its executor, and only then
  *  stores the message and the final status with release ordering. A caller that reads the status
@@ -49,7 +50,8 @@
  *  waits for the calls naming its handle, so one issued from a callback of such a call waits on
  *  itself. A call stops early only when its progress handler returns @c ustore_cancel_k.
  *
- *  One thread keeps several executors busy by giving each a deferred call and polling the statuses:
+ *  One thread keeps several executors busy by giving each a deferred call and polling the statuses.
+ *  A VRAM call is final when it returns, so a manager submits it last:
  *
  *  @code{.c}
  *  ustore_outcome_t ram_outcome = {0}, nvme_outcome = {0};
@@ -397,13 +399,9 @@ typedef enum ustore_completion_t {
  *  a value no status carries. */
 USTORE_EXPORT char const* ustore_status_name(ustore_status_t status);
 
-/**
- *  Reads a status back from its canonical spelling.
- *
- *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k No status carries the @p name.
- */
-USTORE_EXPORT ustore_status_t ustore_status_from_name(ustore_bytes_view_t name);
+/** Reads a status back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_status_from_name(ustore_bytes_view_t name, ustore_status_t* status);
 
 /** Whether the call a progress callback watches carries on or unwinds. */
 typedef enum ustore_continuation_t {
@@ -441,8 +439,9 @@ typedef enum ustore_pattern_kind_t {
 /** The canonical spelling of a pattern kind, as @c ustore_pattern_regex_k spells "regex", or "unrecognized". */
 USTORE_EXPORT char const* ustore_pattern_kind_name(ustore_pattern_kind_t kind);
 
-/** Reads a pattern kind back from its canonical spelling; @c ustore_pattern_regex_k when unrecognized. */
-USTORE_EXPORT ustore_pattern_kind_t ustore_pattern_kind_from_name(ustore_bytes_view_t name);
+/** Reads a pattern kind back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_pattern_kind_from_name(ustore_bytes_view_t name, ustore_pattern_kind_t* kind);
 
 /** Whether patterns compare bytes as they are or after Unicode case folding. */
 typedef enum ustore_case_sensitivity_t {
@@ -458,8 +457,10 @@ typedef enum ustore_case_sensitivity_t {
 /** The canonical spelling of a case sensitivity, as @c ustore_uncased_k spells "uncased", or "unrecognized". */
 USTORE_EXPORT char const* ustore_case_sensitivity_name(ustore_case_sensitivity_t sensitivity);
 
-/** Reads a case sensitivity back from its canonical spelling; @c ustore_cased_k when unrecognized. */
-USTORE_EXPORT ustore_case_sensitivity_t ustore_case_sensitivity_from_name(ustore_bytes_view_t name);
+/** Reads a case sensitivity back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_case_sensitivity_from_name(ustore_bytes_view_t name,
+                                                                ustore_case_sensitivity_t* sensitivity);
 
 /**
  *  @brief Patterns a scan keeps the values or strings matching, shared by every task of the call and compiled once per
@@ -535,8 +536,9 @@ typedef enum ustore_mood_t {
 /** The canonical spelling of a mood, as @c ustore_mood_spinning_k spells "spinning", or "unrecognized". */
 USTORE_EXPORT char const* ustore_mood_name(ustore_mood_t mood);
 
-/** Reads a mood back from its canonical spelling; @c ustore_mood_parked_k when unrecognized. */
-USTORE_EXPORT ustore_mood_t ustore_mood_from_name(ustore_bytes_view_t name);
+/** Reads a mood back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_mood_from_name(ustore_bytes_view_t name, ustore_mood_t* mood);
 
 /** The CPU generation a database or an executor confines itself to, named as the sibling libraries name it. */
 typedef enum ustore_cpu_class_t {
@@ -580,8 +582,9 @@ typedef enum ustore_cpu_class_t {
  *  @c ustore_cpu_class_unknown_k spells "automatic", or "unrecognized". */
 USTORE_EXPORT char const* ustore_cpu_class_name(ustore_cpu_class_t cpu_class);
 
-/** Reads a CPU class back from its canonical spelling; @c ustore_cpu_class_unknown_k when unrecognized. */
-USTORE_EXPORT ustore_cpu_class_t ustore_cpu_class_from_name(ustore_bytes_view_t name);
+/** Reads a CPU class back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_cpu_class_from_name(ustore_bytes_view_t name, ustore_cpu_class_t* cpu_class);
 
 /**
  *  @brief The host memory domains a RAM executor serves, NUMA nodes as the operating system numbers them.
@@ -702,8 +705,9 @@ typedef enum ustore_transport_t {
  *  "unrecognized". */
 USTORE_EXPORT char const* ustore_transport_name(ustore_transport_t transport);
 
-/** Reads a transport back from its canonical spelling; @c ustore_transport_automatic_k when unrecognized. */
-USTORE_EXPORT ustore_transport_t ustore_transport_from_name(ustore_bytes_view_t name);
+/** Reads a transport back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_transport_from_name(ustore_bytes_view_t name, ustore_transport_t* transport);
 
 /**
  *  @brief How the threads of an NVMe executor move bytes between the drives and memory, where every zero size or count
@@ -791,8 +795,9 @@ typedef enum ustore_gds_t {
  *  "compatibility", or "unrecognized". */
 USTORE_EXPORT char const* ustore_gds_name(ustore_gds_t gds);
 
-/** Reads a GPUDirect Storage mode back from its canonical spelling; @c ustore_gds_automatic_k when unrecognized. */
-USTORE_EXPORT ustore_gds_t ustore_gds_from_name(ustore_bytes_view_t name);
+/** Reads a GPUDirect Storage mode back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_gds_from_name(ustore_bytes_view_t name, ustore_gds_t* gds);
 
 /** The GPU vendors one binary drives at once, each through a runtime opened on first use. */
 typedef enum ustore_gpu_vendor_t {
@@ -811,8 +816,9 @@ typedef enum ustore_gpu_vendor_t {
 /** The canonical spelling of a GPU vendor, as @c ustore_gpu_vendor_amd_k spells "amd", or "unrecognized". */
 USTORE_EXPORT char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t vendor);
 
-/** Reads a GPU vendor back from its canonical spelling; @c ustore_gpu_vendor_unknown_k when unrecognized. */
-USTORE_EXPORT ustore_gpu_vendor_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name);
+/** Reads a GPU vendor back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name, ustore_gpu_vendor_t* vendor);
 
 /** The GPU generations UStore tells apart, the device twin of @c ustore_cpu_class_t: a class implies its vendor, and
  *  within a vendor a newer device takes the newest class it satisfies. */
@@ -850,8 +856,9 @@ typedef enum ustore_gpu_class_t {
 /** The canonical spelling of a GPU class, as @c ustore_gpu_class_amd_cdna3_k spells "amd-cdna3", or "unrecognized". */
 USTORE_EXPORT char const* ustore_gpu_class_name(ustore_gpu_class_t gpu_class);
 
-/** Reads a GPU class back from its canonical spelling; @c ustore_gpu_class_unknown_k when unrecognized. */
-USTORE_EXPORT ustore_gpu_class_t ustore_gpu_class_from_name(ustore_bytes_view_t name);
+/** Reads a GPU class back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_gpu_class_from_name(ustore_bytes_view_t name, ustore_gpu_class_t* gpu_class);
 
 /** One GPU as UStore numbers it: its position in the listing of @c ustore_gpu_devices is the ordinal
  *  @c ustore_executor_for_vram_t::device names it by. */
@@ -931,17 +938,16 @@ typedef struct ustore_executor_for_vram_t {
 } ustore_executor_for_vram_t;
 
 /**
- *  @brief Opens one submission stream on @c device, or borrows the caller's, fed by a host thread.
+ *  @brief Opens one submission stream on @c device, or borrows the caller's, fed by its caller.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  A blocking call queues on that stream from the calling thread, and a deferred one from the
- *  executor's caller-exclusive host thread, which waits on the stream in the caller's place, so a
- *  multi-GPU caller makes one executor per device. Its calls read through an engine's device verbs,
- *  which refuse changes, the control plane and every call no device tower serves yet with
- *  @c ustore_status_unsupported_k, and arenas it makes live on its device.
- *  @c ustore_database_open_nvme takes one of an NVIDIA device as its @c compactions, reading its
- *  device and scratch limit once. Every build spawns one, as the vendor's runtime opens at the
- *  first call and the library links none.
+ *  Every call queues on that stream from the calling thread, which waits on it there, so a deferred
+ *  call is final when it returns, as a blocking one is, and a multi-GPU caller makes one executor
+ *  per device. Its calls read through an engine's device verbs, which refuse changes, the control
+ *  plane and every call no device tower serves yet with @c ustore_status_unsupported_k, and arenas
+ *  it makes live on its device. @c ustore_database_open_nvme takes one of an NVIDIA device as its
+ *  @c compactions, reading its device and scratch limit once. Every build makes one, as the
+ *  vendor's runtime opens at the first call and the library links none.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the @c gds mode is

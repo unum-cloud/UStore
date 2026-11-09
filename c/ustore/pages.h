@@ -63,8 +63,10 @@ typedef enum ustore_page_encoding_t {
  *  "unrecognized". */
 USTORE_EXPORT char const* ustore_page_encoding_name(ustore_page_encoding_t encoding);
 
-/** Reads an encoding back from its canonical spelling; @c ustore_page_encoding_html_k when unrecognized. */
-USTORE_EXPORT ustore_page_encoding_t ustore_page_encoding_from_name(ustore_bytes_view_t name);
+/** Reads an encoding back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_page_encoding_from_name(ustore_bytes_view_t name,
+                                                             ustore_page_encoding_t* encoding);
 
 /** The arguments of @c ustore_pages_import, which replaces whole pages with parsed markup. */
 typedef struct ustore_pages_import_t {

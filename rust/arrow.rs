@@ -325,12 +325,7 @@ impl FromStr for IngestOrder {
 
     /// Reads "sorted" or "unsorted" back.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_ingest_order_from_name,
-            ffi::ustore_ingest_order_name,
-            IngestOrder::from_raw,
-        )
+        read_spelling(text, ffi::ustore_ingest_order_from_name, IngestOrder::from_raw)
     }
 }
 
@@ -1424,7 +1419,7 @@ pub(crate) mod ffi {
         pub fn ustore_ingest_finish(arguments: *mut ustore_ingest_finish_t);
         pub fn ustore_ingest_free(ingest: ustore_ingest_t);
         pub fn ustore_ingest_order_name(order: ustore_enum_t) -> *const c_char;
-        pub fn ustore_ingest_order_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_ingest_order_from_name(name: ustore_bytes_view_t, order: *mut ustore_enum_t) -> ustore_status_t;
     }
 }
 

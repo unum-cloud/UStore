@@ -1734,6 +1734,8 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
             .keys = static_cast<ustore_size_t>(state.store->population_count()),
             .memory_bytes = static_cast<ustore_size_t>(state.resources->memory_constraint.used()),
             .disk_bytes = static_cast<ustore_size_t>(state.store->size_bytes()),
+            .pin_refused_bytes = static_cast<ustore_size_t>(state.resources->storage.pin_refused_bytes()),
+            .crossing_requests = static_cast<ustore_size_t>(state.resources->storage.crossing_requests()),
         });
 }
 

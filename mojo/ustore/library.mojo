@@ -588,193 +588,218 @@ struct Library(ImplicitlyCopyable):
         """The engine's spelling of a status, "unrecognized" for a code it does not name. Calls `ustore_status_name`."""
         return text_at(self.symbols().status_name(c_int(status.code)))
 
-    def status_from_name(self, name: StringSlice) -> Status:
-        """Reads a spelling back; `INVALID_ARGUMENT` when unrecognized. Calls `ustore_status_from_name`."""
-        return Status.of(self.symbols().status_from_name(BytesView.of(name).arguments()))
+    def status_from_name(self, name: StringSlice) raises Error -> Status:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_status_from_name`."""
+        return Status.of(self._read_name(self.symbols().status_from_name, name, "ustore_status_from_name"))
 
     def pattern_kind_name(self, kind: PatternKind) -> String:
         """The engine's spelling of a pattern kind. Calls `ustore_pattern_kind_name`."""
         return text_at(self.symbols().pattern_kind_name(kind.code))
 
-    def pattern_kind_from_name(self, name: StringSlice) -> PatternKind:
-        """Reads a spelling back; `REGEX` when unrecognized. Calls `ustore_pattern_kind_from_name`."""
-        return PatternKind(self.symbols().pattern_kind_from_name(BytesView.of(name).arguments()))
+    def pattern_kind_from_name(self, name: StringSlice) raises Error -> PatternKind:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_pattern_kind_from_name`."""
+        return PatternKind(
+            self._read_name(self.symbols().pattern_kind_from_name, name, "ustore_pattern_kind_from_name")
+        )
 
     def case_sensitivity_name(self, sensitivity: CaseSensitivity) -> String:
         """The engine's spelling of a case sensitivity. Calls `ustore_case_sensitivity_name`."""
         return text_at(self.symbols().case_sensitivity_name(sensitivity.code))
 
-    def case_sensitivity_from_name(self, name: StringSlice) -> CaseSensitivity:
-        """Reads a spelling back; `CASED` when unrecognized. Calls `ustore_case_sensitivity_from_name`."""
-        return CaseSensitivity(self.symbols().case_sensitivity_from_name(BytesView.of(name).arguments()))
+    def case_sensitivity_from_name(self, name: StringSlice) raises Error -> CaseSensitivity:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_case_sensitivity_from_name`."""
+        return CaseSensitivity(
+            self._read_name(self.symbols().case_sensitivity_from_name, name, "ustore_case_sensitivity_from_name")
+        )
 
     def mood_name(self, mood: Mood) -> String:
         """The engine's spelling of a mood. Calls `ustore_mood_name`."""
         return text_at(self.symbols().mood_name(mood.code))
 
-    def mood_from_name(self, name: StringSlice) -> Mood:
-        """Reads a spelling back; `PARKED` when unrecognized. Calls `ustore_mood_from_name`."""
-        return Mood(self.symbols().mood_from_name(BytesView.of(name).arguments()))
+    def mood_from_name(self, name: StringSlice) raises Error -> Mood:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_mood_from_name`."""
+        return Mood(self._read_name(self.symbols().mood_from_name, name, "ustore_mood_from_name"))
 
     def cpu_class_name(self, cpu_class: CPUClass) -> String:
         """The engine's spelling of a CPU class, "automatic" for `UNKNOWN`. Calls `ustore_cpu_class_name`."""
         return text_at(self.symbols().cpu_class_name(cpu_class.code))
 
-    def cpu_class_from_name(self, name: StringSlice) -> CPUClass:
-        """Reads a spelling back; `UNKNOWN` when unrecognized. Calls `ustore_cpu_class_from_name`."""
-        return CPUClass(self.symbols().cpu_class_from_name(BytesView.of(name).arguments()))
+    def cpu_class_from_name(self, name: StringSlice) raises Error -> CPUClass:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_cpu_class_from_name`."""
+        return CPUClass(self._read_name(self.symbols().cpu_class_from_name, name, "ustore_cpu_class_from_name"))
 
     def transport_name(self, transport: Transport) -> String:
         """The engine's spelling of a transport. Calls `ustore_transport_name`."""
         return text_at(self.symbols().transport_name(transport.code))
 
-    def transport_from_name(self, name: StringSlice) -> Transport:
-        """Reads a spelling back; `AUTOMATIC` when unrecognized. Calls `ustore_transport_from_name`."""
-        return Transport(self.symbols().transport_from_name(BytesView.of(name).arguments()))
+    def transport_from_name(self, name: StringSlice) raises Error -> Transport:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_transport_from_name`."""
+        return Transport(self._read_name(self.symbols().transport_from_name, name, "ustore_transport_from_name"))
 
     def gds_name(self, gds: Gds) -> String:
         """The engine's spelling of a GPUDirect Storage mode. Calls `ustore_gds_name`."""
         return text_at(self.symbols().gds_name(gds.code))
 
-    def gds_from_name(self, name: StringSlice) -> Gds:
-        """Reads a spelling back; `AUTOMATIC` when unrecognized. Calls `ustore_gds_from_name`."""
-        return Gds(self.symbols().gds_from_name(BytesView.of(name).arguments()))
+    def gds_from_name(self, name: StringSlice) raises Error -> Gds:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_gds_from_name`."""
+        return Gds(self._read_name(self.symbols().gds_from_name, name, "ustore_gds_from_name"))
 
     def gpu_vendor_name(self, vendor: GPUVendor) -> String:
         """The engine's spelling of a GPU vendor. Calls `ustore_gpu_vendor_name`."""
         return text_at(self.symbols().gpu_vendor_name(vendor.code))
 
-    def gpu_vendor_from_name(self, name: StringSlice) -> GPUVendor:
-        """Reads a spelling back; `UNKNOWN` when unrecognized. Calls `ustore_gpu_vendor_from_name`."""
-        return GPUVendor(self.symbols().gpu_vendor_from_name(BytesView.of(name).arguments()))
+    def gpu_vendor_from_name(self, name: StringSlice) raises Error -> GPUVendor:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_gpu_vendor_from_name`."""
+        return GPUVendor(self._read_name(self.symbols().gpu_vendor_from_name, name, "ustore_gpu_vendor_from_name"))
 
     def gpu_class_name(self, gpu_class: GPUClass) -> String:
         """The engine's spelling of a GPU class. Calls `ustore_gpu_class_name`."""
         return text_at(self.symbols().gpu_class_name(gpu_class.code))
 
-    def gpu_class_from_name(self, name: StringSlice) -> GPUClass:
-        """Reads a spelling back; `UNKNOWN` when unrecognized. Calls `ustore_gpu_class_from_name`."""
-        return GPUClass(self.symbols().gpu_class_from_name(BytesView.of(name).arguments()))
+    def gpu_class_from_name(self, name: StringSlice) raises Error -> GPUClass:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_gpu_class_from_name`."""
+        return GPUClass(self._read_name(self.symbols().gpu_class_from_name, name, "ustore_gpu_class_from_name"))
 
     def predicate_cost_name(self, cost: PredicateCost) -> String:
         """The engine's spelling of a predicate cost. Calls `ustore_predicate_cost_name`."""
         return text_at(self.symbols().predicate_cost_name(cost.code))
 
-    def predicate_cost_from_name(self, name: StringSlice) -> PredicateCost:
-        """Reads a spelling back; `CHEAP` when unrecognized. Calls `ustore_predicate_cost_from_name`."""
-        return PredicateCost(self.symbols().predicate_cost_from_name(BytesView.of(name).arguments()))
+    def predicate_cost_from_name(self, name: StringSlice) raises Error -> PredicateCost:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_predicate_cost_from_name`."""
+        return PredicateCost(
+            self._read_name(self.symbols().predicate_cost_from_name, name, "ustore_predicate_cost_from_name")
+        )
 
     def durability_name(self, durability: Durability) -> String:
         """The engine's spelling of a durability. Calls `ustore_durability_name`."""
         return text_at(self.symbols().durability_name(durability.code))
 
-    def durability_from_name(self, name: StringSlice) -> Durability:
-        """Reads a spelling back; `BUFFERED` when unrecognized. Calls `ustore_durability_from_name`."""
-        return Durability(self.symbols().durability_from_name(BytesView.of(name).arguments()))
+    def durability_from_name(self, name: StringSlice) raises Error -> Durability:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_durability_from_name`."""
+        return Durability(self._read_name(self.symbols().durability_from_name, name, "ustore_durability_from_name"))
 
     def watch_name(self, watch: Watch) -> String:
         """The engine's spelling of a watch. Calls `ustore_watch_name`."""
         return text_at(self.symbols().watch_name(watch.code))
 
-    def watch_from_name(self, name: StringSlice) -> Watch:
-        """Reads a spelling back; `KEYS` when unrecognized. Calls `ustore_watch_from_name`."""
-        return Watch(self.symbols().watch_from_name(BytesView.of(name).arguments()))
+    def watch_from_name(self, name: StringSlice) raises Error -> Watch:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_watch_from_name`."""
+        return Watch(self._read_name(self.symbols().watch_from_name, name, "ustore_watch_from_name"))
 
     def scan_mode_name(self, mode: ScanMode) -> String:
         """The engine's spelling of a scan mode. Calls `ustore_scan_mode_name`."""
         return text_at(self.symbols().scan_mode_name(mode.code))
 
-    def scan_mode_from_name(self, name: StringSlice) -> ScanMode:
-        """Reads a spelling back; `ORDERED` when unrecognized. Calls `ustore_scan_mode_from_name`."""
-        return ScanMode(self.symbols().scan_mode_from_name(BytesView.of(name).arguments()))
+    def scan_mode_from_name(self, name: StringSlice) raises Error -> ScanMode:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_scan_mode_from_name`."""
+        return ScanMode(self._read_name(self.symbols().scan_mode_from_name, name, "ustore_scan_mode_from_name"))
 
     def scan_direction_name(self, direction: ScanDirection) -> String:
         """The engine's spelling of a scan direction. Calls `ustore_scan_direction_name`."""
         return text_at(self.symbols().scan_direction_name(direction.code))
 
-    def scan_direction_from_name(self, name: StringSlice) -> ScanDirection:
-        """Reads a spelling back; `ASCENDING` when unrecognized. Calls `ustore_scan_direction_from_name`."""
-        return ScanDirection(self.symbols().scan_direction_from_name(BytesView.of(name).arguments()))
+    def scan_direction_from_name(self, name: StringSlice) raises Error -> ScanDirection:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_scan_direction_from_name`."""
+        return ScanDirection(
+            self._read_name(self.symbols().scan_direction_from_name, name, "ustore_scan_direction_from_name")
+        )
 
     def drop_mode_name(self, mode: DropMode) -> String:
         """The engine's spelling of a drop mode. Calls `ustore_drop_mode_name`."""
         return text_at(self.symbols().drop_mode_name(mode.code))
 
-    def drop_mode_from_name(self, name: StringSlice) -> DropMode:
-        """Reads a spelling back; `COLLECTION` when unrecognized. Calls `ustore_drop_mode_from_name`."""
-        return DropMode(self.symbols().drop_mode_from_name(BytesView.of(name).arguments()))
+    def drop_mode_from_name(self, name: StringSlice) raises Error -> DropMode:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_drop_mode_from_name`."""
+        return DropMode(self._read_name(self.symbols().drop_mode_from_name, name, "ustore_drop_mode_from_name"))
 
     def isolation_name(self, isolation: Isolation) -> String:
         """The engine's spelling of an isolation. Calls `ustore_isolation_name`."""
         return text_at(self.symbols().isolation_name(isolation.code))
 
-    def isolation_from_name(self, name: StringSlice) -> Isolation:
-        """Reads a spelling back; `STRICT_SERIALIZABLE` when unrecognized. Calls `ustore_isolation_from_name`."""
-        return Isolation(self.symbols().isolation_from_name(BytesView.of(name).arguments()))
+    def isolation_from_name(self, name: StringSlice) raises Error -> Isolation:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_isolation_from_name`."""
+        return Isolation(self._read_name(self.symbols().isolation_from_name, name, "ustore_isolation_from_name"))
 
     def engine_name(self, engine: Engine) -> String:
         """The engine's spelling of an engine. Calls `ustore_engine_name`."""
         return text_at(self.symbols().engine_name(engine.code))
 
-    def engine_from_name(self, name: StringSlice) -> Engine:
-        """Reads a spelling back; `RAM` when unrecognized. Calls `ustore_engine_from_name`."""
-        return Engine(self.symbols().engine_from_name(BytesView.of(name).arguments()))
+    def engine_from_name(self, name: StringSlice) raises Error -> Engine:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_engine_from_name`."""
+        return Engine(self._read_name(self.symbols().engine_from_name, name, "ustore_engine_from_name"))
 
     def modality_name(self, modality: Modality) -> String:
         """The engine's spelling of a modality. Calls `ustore_modality_name`."""
         return text_at(self.symbols().modality_name(modality.code))
 
-    def modality_from_name(self, name: StringSlice) -> Modality:
-        """Reads a spelling back; `NONE` when unrecognized. Calls `ustore_modality_from_name`."""
-        return Modality(self.symbols().modality_from_name(BytesView.of(name).arguments()))
+    def modality_from_name(self, name: StringSlice) raises Error -> Modality:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_modality_from_name`."""
+        return Modality(self._read_name(self.symbols().modality_from_name, name, "ustore_modality_from_name"))
 
     def change_kind_name(self, kind: ChangeKind) -> String:
         """The engine's spelling of a change kind. Calls `ustore_change_kind_name`."""
         return text_at(self.symbols().change_kind_name(kind.code))
 
-    def change_kind_from_name(self, name: StringSlice) -> ChangeKind:
-        """Reads a spelling back; `WRITE` when unrecognized. Calls `ustore_change_kind_from_name`."""
-        return ChangeKind(self.symbols().change_kind_from_name(BytesView.of(name).arguments()))
+    def change_kind_from_name(self, name: StringSlice) raises Error -> ChangeKind:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_change_kind_from_name`."""
+        return ChangeKind(self._read_name(self.symbols().change_kind_from_name, name, "ustore_change_kind_from_name"))
 
     def ingest_order_name(self, order: IngestOrder) -> String:
         """The engine's spelling of an ingest order. Calls `ustore_ingest_order_name`."""
         return text_at(self.symbols().ingest_order_name(order.code))
 
-    def ingest_order_from_name(self, name: StringSlice) -> IngestOrder:
-        """Reads a spelling back; `SORTED` when unrecognized. Calls `ustore_ingest_order_from_name`."""
-        return IngestOrder(self.symbols().ingest_order_from_name(BytesView.of(name).arguments()))
+    def ingest_order_from_name(self, name: StringSlice) raises Error -> IngestOrder:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_ingest_order_from_name`."""
+        return IngestOrder(
+            self._read_name(self.symbols().ingest_order_from_name, name, "ustore_ingest_order_from_name")
+        )
 
     def docs_field_type_name(self, field_type: FieldType) -> String:
         """The engine's spelling of a field type, as `F64` spells "f64". Calls `ustore_docs_field_type_name`."""
         return text_at(self.symbols().docs_field_type_name(field_type.code))
 
-    def docs_field_type_from_name(self, name: StringSlice) -> FieldType:
-        """Reads a spelling back; `JSON` when unrecognized. Calls `ustore_docs_field_type_from_name`."""
-        return FieldType(self.symbols().docs_field_type_from_name(BytesView.of(name).arguments()))
+    def docs_field_type_from_name(self, name: StringSlice) raises Error -> FieldType:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_docs_field_type_from_name`."""
+        return FieldType(
+            self._read_name(self.symbols().docs_field_type_from_name, name, "ustore_docs_field_type_from_name")
+        )
 
     def docs_modification_name(self, modification: Modification) -> String:
         """The engine's spelling of a modification. Calls `ustore_docs_modification_name`."""
         return text_at(self.symbols().docs_modification_name(modification.code))
 
-    def docs_modification_from_name(self, name: StringSlice) -> Modification:
-        """Reads a spelling back; `UPSERT` when unrecognized. Calls `ustore_docs_modification_from_name`."""
-        return Modification(self.symbols().docs_modification_from_name(BytesView.of(name).arguments()))
+    def docs_modification_from_name(self, name: StringSlice) raises Error -> Modification:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_docs_modification_from_name`."""
+        return Modification(
+            self._read_name(self.symbols().docs_modification_from_name, name, "ustore_docs_modification_from_name")
+        )
 
     def vertex_role_name(self, role: VertexRole) -> String:
         """The engine's spelling of a vertex role. Calls `ustore_vertex_role_name`."""
         return text_at(self.symbols().vertex_role_name(role.code))
 
-    def vertex_role_from_name(self, name: StringSlice) -> VertexRole:
-        """Reads a spelling back; `UNKNOWN` when unrecognized. Calls `ustore_vertex_role_from_name`."""
-        return VertexRole(self.symbols().vertex_role_from_name(BytesView.of(name).arguments()))
+    def vertex_role_from_name(self, name: StringSlice) raises Error -> VertexRole:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_vertex_role_from_name`."""
+        return VertexRole(self._read_name(self.symbols().vertex_role_from_name, name, "ustore_vertex_role_from_name"))
 
     def page_encoding_name(self, encoding: PageEncoding) -> String:
         """The engine's spelling of a page encoding. Calls `ustore_page_encoding_name`."""
         return text_at(self.symbols().page_encoding_name(encoding.code))
 
-    def page_encoding_from_name(self, name: StringSlice) -> PageEncoding:
-        """Reads a spelling back; `HTML` when unrecognized. Calls `ustore_page_encoding_from_name`."""
-        return PageEncoding(self.symbols().page_encoding_from_name(BytesView.of(name).arguments()))
+    def page_encoding_from_name(self, name: StringSlice) raises Error -> PageEncoding:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_page_encoding_from_name`."""
+        return PageEncoding(
+            self._read_name(self.symbols().page_encoding_from_name, name, "ustore_page_encoding_from_name")
+        )
+
+    def _read_name(self, from_name: FromName, name: StringSlice, symbol: StaticString) raises Error -> c_int:
+        """Reads `name` back through one of the `_from_name` family, raising the status it refuses with."""
+        var value = c_int(0)
+        var code = from_name(BytesView.of(name).arguments(), Pointer(to=value))
+        if code != c_int(0):
+            var status = Status.of(code)
+            raise Error(status, symbol, None, self.symbols().status_name(c_int(status.code)), self)
+        return value
 
     def _error(self, outcome: Outcome, symbol: StaticString) -> Error:
         """The failure a final outcome reports, its status spelled by the engine's own table."""

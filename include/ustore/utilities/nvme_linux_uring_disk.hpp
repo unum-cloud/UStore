@@ -258,6 +258,7 @@ class linux_uring_files_disk {
         registered_memories_epoch_ = other.registered_memories_epoch_;
         media_epoch_ = other.media_epoch_;
         pin_refused_epoch_ = other.pin_refused_epoch_;
+        crossing_requests_ = other.crossing_requests_;
         depth_limit_ = other.depth_limit_;
         queue_pairs_limit_ = other.queue_pairs_limit_;
         registered_memories_limit_ = other.registered_memories_limit_;
@@ -362,6 +363,12 @@ class linux_uring_files_disk {
     [[nodiscard]] range_pinning_t pinning() const noexcept {
         return pin_refused_epoch_ == registered_memories_epoch_ ? range_pinning_t::unpinned_k
                                                                 : range_pinning_t::pinned_k;
+    }
+
+    /** Requests sent unpinned while their ranges were pinned, as each crossed a gibibyte that no
+     *  one table slot names. */
+    [[nodiscard]] std::uint64_t crossing_requests() const noexcept {
+        return atomic_reference_<std::uint64_t const> {crossing_requests_}.load(std::memory_order_relaxed);
     }
 
 #pragma region Queue Pairs
@@ -1391,6 +1398,8 @@ class linux_uring_files_disk {
                             linux_uring_registered_range_bytes_k;
         // A request across a gibibyte boundary spans two table slots, which no fixed transfer names
         range_pinning_t const addressed = across ? range_pinning_t::unpinned_k : pinning;
+        if (addressed != pinning)
+            atomic_reference_<std::uint64_t> {crossing_requests_}.add(1, std::memory_order_relaxed);
         switch (addressed) {
         case range_pinning_t::pinned_k:
             entry.opcode = request.kind == request_kind_t::read_k ? read_pinned : write_pinned;
@@ -1498,6 +1507,9 @@ class linux_uring_files_disk {
     /** The registered memory epoch at which the locked-memory cap refused a pin, or zero while none was refused. */
     epoch_t pin_refused_epoch_ = 0;
 
+    /** Requests sent unpinned while their ranges were pinned, as @c crossing_requests reports. */
+    std::uint64_t crossing_requests_ = 0;
+
     /** Requests one queue pair may keep in flight, and the stride of every queue pair's window. */
     queue_depth_t depth_limit_ = 0;
 
@@ -1545,6 +1557,9 @@ class linux_uring_files_disk {
 
     /** Answers that nothing is pinned, since nothing was ever registered. */
     [[nodiscard]] range_pinning_t pinning() const noexcept { return range_pinning_t::unpinned_k; }
+
+    /** Answers that no request crossed a pinned gibibyte, since nothing was ever pinned. */
+    [[nodiscard]] std::uint64_t crossing_requests() const noexcept { return 0; }
 
     /** Refuses the queue pair, since there is no ring to queue pair a share of. */
     expected<queue_pair_t> acquire_queue_pair(std::uint32_t) noexcept {

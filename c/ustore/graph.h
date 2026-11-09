@@ -47,8 +47,9 @@ typedef enum ustore_vertex_role_t {
 /** The canonical spelling of a role, as @c ustore_vertex_role_source_k spells "source", or "unrecognized". */
 USTORE_EXPORT char const* ustore_vertex_role_name(ustore_vertex_role_t vertex_role);
 
-/** Reads a role back from its canonical spelling; @c ustore_vertex_role_unknown_k when unrecognized. */
-USTORE_EXPORT ustore_vertex_role_t ustore_vertex_role_from_name(ustore_bytes_view_t name);
+/** Reads a role back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_vertex_role_from_name(ustore_bytes_view_t name, ustore_vertex_role_t* vertex_role);
 
 /** A strided run of roles, one per task, where @c NULL data stands for @c ustore_vertex_role_any_k. */
 typedef struct ustore_vertex_roles_view_t {

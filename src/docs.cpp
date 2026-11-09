@@ -107,14 +107,14 @@ char const* ustore_docs_field_type_name(ustore_docs_field_type_t field_type) {
     return name_in(docs_field_type_names_k, field_type);
 }
 
-ustore_docs_field_type_t ustore_docs_field_type_from_name(ustore_bytes_view_t name) {
-    return value_in(docs_field_type_names_k, name);
+ustore_status_t ustore_docs_field_type_from_name(ustore_bytes_view_t name, ustore_docs_field_type_t* field_type) {
+    return value_in(docs_field_type_names_k, name, field_type);
 }
 
 char const* ustore_docs_modification_name(ustore_docs_modification_t modification) {
     return name_in(docs_modification_names_k, modification);
 }
 
-ustore_docs_modification_t ustore_docs_modification_from_name(ustore_bytes_view_t name) {
-    return value_in(docs_modification_names_k, name);
+ustore_status_t ustore_docs_modification_from_name(ustore_bytes_view_t name, ustore_docs_modification_t* modification) {
+    return value_in(docs_modification_names_k, name, modification);
 }

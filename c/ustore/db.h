@@ -145,8 +145,9 @@ typedef enum ustore_predicate_cost_t {
  *  "unrecognized". */
 USTORE_EXPORT char const* ustore_predicate_cost_name(ustore_predicate_cost_t cost);
 
-/** Reads a predicate cost back from its canonical spelling; @c ustore_predicate_cheap_k when unrecognized. */
-USTORE_EXPORT ustore_predicate_cost_t ustore_predicate_cost_from_name(ustore_bytes_view_t name);
+/** Reads a predicate cost back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_predicate_cost_from_name(ustore_bytes_view_t name, ustore_predicate_cost_t* cost);
 
 /** The caller's verdict on the keys a scan lists, always asked on the host, as a scan on a device executor lists its
  *  pages there too. */
@@ -601,6 +602,14 @@ typedef struct ustore_database_description_t {
     /** Bytes the files of the database take on disk. */
     ustore_size_t disk_bytes;
 
+    /** Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each
+     *  request pins its own. */
+    ustore_size_t pin_refused_bytes;
+
+    /** Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a
+     *  gibibyte of it. */
+    ustore_size_t crossing_requests;
+
 } ustore_database_description_t;
 
 /** The arguments of @c ustore_database_describe. */
@@ -887,52 +896,61 @@ typedef enum ustore_modality_t {
 /** The canonical spelling of a durability, as @c ustore_durability_flushed_k spells "flushed", or "unrecognized". */
 USTORE_EXPORT char const* ustore_durability_name(ustore_durability_t durability);
 
-/** Reads a durability back from its canonical spelling; @c ustore_durability_buffered_k when unrecognized. */
-USTORE_EXPORT ustore_durability_t ustore_durability_from_name(ustore_bytes_view_t name);
+/** Reads a durability back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_durability_from_name(ustore_bytes_view_t name, ustore_durability_t* durability);
 
 /** The canonical spelling of a watch, as @c ustore_watch_none_k spells "none", or "unrecognized". */
 USTORE_EXPORT char const* ustore_watch_name(ustore_watch_t watch);
 
-/** Reads a watch back from its canonical spelling; @c ustore_watch_keys_k when unrecognized. */
-USTORE_EXPORT ustore_watch_t ustore_watch_from_name(ustore_bytes_view_t name);
+/** Reads a watch back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_watch_from_name(ustore_bytes_view_t name, ustore_watch_t* watch);
 
 /** The canonical spelling of a scan mode, as @c ustore_scan_unordered_k spells "unordered", or "unrecognized". */
 USTORE_EXPORT char const* ustore_scan_mode_name(ustore_scan_mode_t scan_mode);
 
-/** Reads a scan mode back from its canonical spelling; @c ustore_scan_ordered_k when unrecognized. */
-USTORE_EXPORT ustore_scan_mode_t ustore_scan_mode_from_name(ustore_bytes_view_t name);
+/** Reads a scan mode back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_scan_mode_from_name(ustore_bytes_view_t name, ustore_scan_mode_t* scan_mode);
 
 /** The canonical spelling of a scan direction, as @c ustore_scan_descending_k spells
  *  "descending", or "unrecognized". */
 USTORE_EXPORT char const* ustore_scan_direction_name(ustore_scan_direction_t scan_direction);
 
-/** Reads a scan direction from its canonical spelling, @c ustore_scan_ascending_k if unknown. */
-USTORE_EXPORT ustore_scan_direction_t ustore_scan_direction_from_name(ustore_bytes_view_t name);
+/** Reads a scan direction back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_scan_direction_from_name(ustore_bytes_view_t name,
+                                                              ustore_scan_direction_t* scan_direction);
 
 /** The canonical spelling of a drop mode, as @c ustore_drop_pairs_k spells "pairs", or "unrecognized". */
 USTORE_EXPORT char const* ustore_drop_mode_name(ustore_drop_mode_t drop_mode);
 
-/** Reads a drop mode back from its canonical spelling; @c ustore_drop_collection_k when unrecognized. */
-USTORE_EXPORT ustore_drop_mode_t ustore_drop_mode_from_name(ustore_bytes_view_t name);
+/** Reads a drop mode back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_drop_mode_from_name(ustore_bytes_view_t name, ustore_drop_mode_t* drop_mode);
 
 /** The canonical spelling of an isolation, as @c ustore_isolation_strict_serializable_k spells "strict-serializable",
  *  or "unrecognized". */
 USTORE_EXPORT char const* ustore_isolation_name(ustore_isolation_t isolation);
 
-/** Reads an isolation back from its canonical spelling; @c ustore_isolation_strict_serializable_k when unrecognized. */
-USTORE_EXPORT ustore_isolation_t ustore_isolation_from_name(ustore_bytes_view_t name);
+/** Reads an isolation back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_isolation_from_name(ustore_bytes_view_t name, ustore_isolation_t* isolation);
 
 /** The canonical spelling of an engine, as @c ustore_engine_rocksdb_k spells "rocksdb", or "unrecognized". */
 USTORE_EXPORT char const* ustore_engine_name(ustore_engine_t engine);
 
-/** Reads an engine back from its canonical spelling; @c ustore_engine_ram_k when unrecognized. */
-USTORE_EXPORT ustore_engine_t ustore_engine_from_name(ustore_bytes_view_t name);
+/** Reads an engine back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_engine_from_name(ustore_bytes_view_t name, ustore_engine_t* engine);
 
 /** The canonical spelling of a modality, as @c ustore_modality_graph_k spells "graph", or "unrecognized". */
 USTORE_EXPORT char const* ustore_modality_name(ustore_modality_t modality);
 
-/** Reads a modality back from its canonical spelling; zero, naming no modality, when unrecognized. */
-USTORE_EXPORT ustore_modality_t ustore_modality_from_name(ustore_bytes_view_t name);
+/** Reads a modality back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_modality_from_name(ustore_bytes_view_t name, ustore_modality_t* modality);
 
 #pragma region Collections
 
@@ -1372,8 +1390,9 @@ typedef enum ustore_change_kind_t {
 /** A change kind's canonical name, "removal" for @c ustore_change_removal_k, or "unrecognized". */
 USTORE_EXPORT char const* ustore_change_kind_name(ustore_change_kind_t change_kind);
 
-/** Reads a change kind from its canonical spelling; @c ustore_change_write_k if unrecognized. */
-USTORE_EXPORT ustore_change_kind_t ustore_change_kind_from_name(ustore_bytes_view_t name);
+/** Reads a change kind back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_change_kind_from_name(ustore_bytes_view_t name, ustore_change_kind_t* change_kind);
 
 /**
  *  @brief An opaque feed of the changes committed to one collection after a stamp, oldest first.
@@ -1515,8 +1534,9 @@ typedef enum ustore_ingest_order_t {
 /** The canonical spelling of an order, as @c ustore_ingest_unsorted_k spells "unsorted", or "unrecognized". */
 USTORE_EXPORT char const* ustore_ingest_order_name(ustore_ingest_order_t order);
 
-/** Reads an order back from its canonical spelling; @c ustore_ingest_sorted_k when unrecognized. */
-USTORE_EXPORT ustore_ingest_order_t ustore_ingest_order_from_name(ustore_bytes_view_t name);
+/** Reads an order back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_ingest_order_from_name(ustore_bytes_view_t name, ustore_ingest_order_t* order);
 
 /**
  *  @brief An ingest under way into one collection, which lands every row appended to it as one commit of its own.

@@ -85,6 +85,6 @@ char const* ustore_vertex_role_name(ustore_vertex_role_t vertex_role) {
     return name_in(vertex_role_names_k, vertex_role);
 }
 
-ustore_vertex_role_t ustore_vertex_role_from_name(ustore_bytes_view_t name) {
-    return value_in(vertex_role_names_k, name);
+ustore_status_t ustore_vertex_role_from_name(ustore_bytes_view_t name, ustore_vertex_role_t* vertex_role) {
+    return value_in(vertex_role_names_k, name, vertex_role);
 }

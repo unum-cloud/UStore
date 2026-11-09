@@ -248,7 +248,7 @@ class executor_handle_t {
 
     operator ustore_executor_t() const noexcept { return executor_; }
 
-    /** Spawns host threads for the RAM, RocksDB and LevelDB engines. */
+    /** Creates an executor of host threads for the RAM, RocksDB and LevelDB engines. */
     static expected<executor_handle_t> for_ram(ustore_executor_for_ram_t options = {}) noexcept {
         return make_(ustore_executor_for_ram, options);
     }
@@ -258,14 +258,15 @@ class executor_handle_t {
         return make_(ustore_executor_on_pool, options);
     }
 
-    /** Spawns threads for the NVMe engine, each owning its own I/O ring, which tell the databases opened on them how
-     *  to move bytes and borrow the VRAM executor @p options name for compactions. */
+    /** Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O
+     *  ring, which tells the databases opened on it how to move bytes and borrow the VRAM executor
+     *  @p options name for compactions. */
     static expected<executor_handle_t> for_nvme(ustore_executor_for_nvme_t options = {}) noexcept {
         return make_(ustore_executor_for_nvme, options);
     }
 
-    /** Spawns one host thread driving the NVIDIA or AMD device @p options name by its UStore ordinal, on which an NVMe
-     *  database compacts when the device is NVIDIA. */
+    /** Opens one submission stream on the NVIDIA or AMD device @p options name by its UStore
+     *  ordinal, fed by the calling thread; an NVMe database compacts on it on an NVIDIA device. */
     static expected<executor_handle_t> for_vram(ustore_executor_for_vram_t options = {}) noexcept {
         return make_(ustore_executor_for_vram, options);
     }

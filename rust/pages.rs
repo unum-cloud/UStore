@@ -72,12 +72,7 @@ impl FromStr for PageEncoding {
 
     /// Calls `ustore_page_encoding_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_page_encoding_from_name,
-            ffi::ustore_page_encoding_name,
-            PageEncoding::from_raw,
-        )
+        read_spelling(text, ffi::ustore_page_encoding_from_name, PageEncoding::from_raw)
     }
 }
 
@@ -346,7 +341,10 @@ pub(crate) mod ffi {
         pub fn ustore_pages_sample(arguments: *mut ustore_pages_sample_t);
         pub fn ustore_pages_measure(arguments: *mut ustore_pages_measure_t);
         pub fn ustore_page_encoding_name(encoding: ustore_enum_t) -> *const c_char;
-        pub fn ustore_page_encoding_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_page_encoding_from_name(
+            name: ustore_bytes_view_t,
+            encoding: *mut ustore_enum_t,
+        ) -> crate::db::ffi::ustore_status_t;
     }
 }
 

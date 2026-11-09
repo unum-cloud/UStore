@@ -213,35 +213,49 @@ ustore_view_t ustore_transaction_view(ustore_transaction_t transaction, ustore_w
 ustore_view_t ustore_snapshot_view(ustore_snapshot_t snapshot) { return tagged_view(snapshot, view_tag_t::snapshot_k); }
 
 char const* ustore_durability_name(ustore_durability_t durability) { return name_in(durability_names_k, durability); }
-ustore_durability_t ustore_durability_from_name(ustore_bytes_view_t name) { return value_in(durability_names_k, name); }
+ustore_status_t ustore_durability_from_name(ustore_bytes_view_t name, ustore_durability_t* durability) {
+    return value_in(durability_names_k, name, durability);
+}
 char const* ustore_watch_name(ustore_watch_t watch) { return name_in(watch_names_k, watch); }
-ustore_watch_t ustore_watch_from_name(ustore_bytes_view_t name) { return value_in(watch_names_k, name); }
+ustore_status_t ustore_watch_from_name(ustore_bytes_view_t name, ustore_watch_t* watch) {
+    return value_in(watch_names_k, name, watch);
+}
 char const* ustore_scan_mode_name(ustore_scan_mode_t scan_mode) { return name_in(scan_mode_names_k, scan_mode); }
-ustore_scan_mode_t ustore_scan_mode_from_name(ustore_bytes_view_t name) { return value_in(scan_mode_names_k, name); }
+ustore_status_t ustore_scan_mode_from_name(ustore_bytes_view_t name, ustore_scan_mode_t* scan_mode) {
+    return value_in(scan_mode_names_k, name, scan_mode);
+}
 char const* ustore_scan_direction_name(ustore_scan_direction_t scan_direction) {
     return name_in(scan_direction_names_k, scan_direction);
 }
-ustore_scan_direction_t ustore_scan_direction_from_name(ustore_bytes_view_t name) {
-    return value_in(scan_direction_names_k, name);
+ustore_status_t ustore_scan_direction_from_name(ustore_bytes_view_t name, ustore_scan_direction_t* scan_direction) {
+    return value_in(scan_direction_names_k, name, scan_direction);
 }
 char const* ustore_change_kind_name(ustore_change_kind_t change_kind) {
     return name_in(change_kind_names_k, change_kind);
 }
-ustore_change_kind_t ustore_change_kind_from_name(ustore_bytes_view_t name) {
-    return value_in(change_kind_names_k, name);
+ustore_status_t ustore_change_kind_from_name(ustore_bytes_view_t name, ustore_change_kind_t* change_kind) {
+    return value_in(change_kind_names_k, name, change_kind);
 }
 char const* ustore_drop_mode_name(ustore_drop_mode_t drop_mode) { return name_in(drop_mode_names_k, drop_mode); }
-ustore_drop_mode_t ustore_drop_mode_from_name(ustore_bytes_view_t name) { return value_in(drop_mode_names_k, name); }
+ustore_status_t ustore_drop_mode_from_name(ustore_bytes_view_t name, ustore_drop_mode_t* drop_mode) {
+    return value_in(drop_mode_names_k, name, drop_mode);
+}
 char const* ustore_isolation_name(ustore_isolation_t isolation) { return name_in(isolation_names_k, isolation); }
-ustore_isolation_t ustore_isolation_from_name(ustore_bytes_view_t name) { return value_in(isolation_names_k, name); }
+ustore_status_t ustore_isolation_from_name(ustore_bytes_view_t name, ustore_isolation_t* isolation) {
+    return value_in(isolation_names_k, name, isolation);
+}
 char const* ustore_engine_name(ustore_engine_t engine) { return name_in(engine_names_k, engine); }
-ustore_engine_t ustore_engine_from_name(ustore_bytes_view_t name) { return value_in(engine_names_k, name); }
+ustore_status_t ustore_engine_from_name(ustore_bytes_view_t name, ustore_engine_t* engine) {
+    return value_in(engine_names_k, name, engine);
+}
 char const* ustore_modality_name(ustore_modality_t modality) { return name_in(modality_names_k, modality); }
-ustore_modality_t ustore_modality_from_name(ustore_bytes_view_t name) { return value_in(modality_names_k, name); }
+ustore_status_t ustore_modality_from_name(ustore_bytes_view_t name, ustore_modality_t* modality) {
+    return value_in(modality_names_k, name, modality);
+}
 char const* ustore_ingest_order_name(ustore_ingest_order_t order) { return name_in(ingest_order_names_k, order); }
 
-ustore_ingest_order_t ustore_ingest_order_from_name(ustore_bytes_view_t name) {
-    return value_in(ingest_order_names_k, name);
+ustore_status_t ustore_ingest_order_from_name(ustore_bytes_view_t name, ustore_ingest_order_t* order) {
+    return value_in(ingest_order_names_k, name, order);
 }
 
 void ustore_transaction_free(ustore_transaction_t transaction) {

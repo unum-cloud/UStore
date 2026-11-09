@@ -434,8 +434,8 @@ comptime OutcomeStatus = def(Pointer[Outcome, MutAnyOrigin]) thin abi("C") -> c_
 comptime NameOf = def(c_int) thin abi("C") -> CString
 """The `_name` family: an enumerator's static spelling."""
 
-comptime FromName = def(BytesViewArguments) thin abi("C") -> c_int
-"""The `_from_name` family: reads a spelling back into its enumerator."""
+comptime FromName = def(BytesViewArguments, Pointer[c_int, MutAnyOrigin]) thin abi("C") -> c_int
+"""The `_from_name` family: reads a spelling back into its enumerator, or refuses it with a status."""
 
 comptime ViewOf = def(Address) thin abi("C") -> Address
 """`ustore_snapshot_view`: the view a handle names, allocating nothing."""
@@ -972,7 +972,8 @@ struct Executor:
         threads: Int = 0,
         cpu_class: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
-        """Spawns host threads for the RAM, RocksDB and LevelDB engines. Calls `ustore_executor_for_ram`.
+        """Creates an executor of host threads for the RAM, RocksDB and LevelDB engines.
+        Calls `ustore_executor_for_ram`.
 
         Args:
             library: The loaded engine, kept so the shared object stays mapped.
@@ -1025,7 +1026,7 @@ struct Executor:
         threads: Int = 0,
         cpu_class: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
-        """Spawns threads for the NVMe engine, each submitting and polling its own I/O ring.
+        """Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O ring.
         Calls `ustore_executor_for_nvme`.
 
         Args:
@@ -1055,7 +1056,7 @@ struct Executor:
         scratch_limit: Int = 0,
         gds: Gds = Gds.AUTOMATIC,
     ) raises Error -> Self:
-        """Opens one submission stream on `device`, or borrows the caller's, fed by one host thread.
+        """Opens one submission stream on `device`, or borrows the caller's, fed by the calling thread.
         Calls `ustore_executor_for_vram`.
 
         Args:

@@ -707,16 +707,16 @@ static PyObject* Database_flush(PyObject* self, PyObject* Py_UNUSED(arguments)) 
     return ustore_py_call_run(&context, &flush_verb, call, &flush);
 }
 
-static char const doc_Database_describe[] =                                                  //
-    "describe() answers a Description.\n"                                                    //
-    "\n"                                                                                     //
-    "Reports the engine serving the database, what it supports, its isolation, and the\n"    //
-    "keys, memory and disk it holds, every size the engine's estimate and zero where it\n"   //
-    "keeps none. Calls `ustore_database_describe`.\n"                                        //
-    "\n"                                                                                     //
-    "Returns:\n"                                                                             //
-    "  Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes` and\n" //
-    "  `disk_bytes` of the database.";
+static char const doc_Database_describe[] =                                                //
+    "describe() answers a Description.\n"                                                  //
+    "\n"                                                                                   //
+    "Reports the engine serving the database, what it supports, its isolation, and the\n"  //
+    "keys, memory and disk it holds, every size the engine's estimate and zero where it\n" //
+    "keeps none. Calls `ustore_database_describe`.\n"                                      //
+    "\n"                                                                                   //
+    "Returns:\n"                                                                           //
+    "  Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,\n"  //
+    "  `disk_bytes`, `pin_refused_bytes` and `crossing_requests` of the database.";
 
 /** A description of the database, which the library fills whole. */
 typedef struct describe_call_t {
@@ -732,14 +732,16 @@ static void describe_submit(void* arguments) { ustore_database_describe((ustore_
 
 static PyObject* describe_answer(void* erased) {
     ustore_database_description_t const* const description = &((describe_call_t const*)erased)->description;
-    PyObject* fields[6] = {capabilities_object(description->capabilities)};
+    PyObject* fields[8] = {capabilities_object(description->capabilities)};
     fields[1] = fields[0] ? ustore_py_enum_to_object(ustore_py_enum_engine_k, (int)description->engine) : NULL;
     fields[2] = fields[1] ? ustore_py_enum_to_object(ustore_py_enum_isolation_k, (int)description->isolation) : NULL;
     fields[3] = fields[2] ? PyLong_FromUnsignedLongLong(description->keys) : NULL;
     fields[4] = fields[3] ? PyLong_FromUnsignedLongLong(description->memory_bytes) : NULL;
     fields[5] = fields[4] ? PyLong_FromUnsignedLongLong(description->disk_bytes) : NULL;
-    PyObject* const described = fields[5] ? PyStructSequence_New(DescriptionType) : NULL;
-    for (Py_ssize_t index = 0; index != 6; ++index)
+    fields[6] = fields[5] ? PyLong_FromUnsignedLongLong(description->pin_refused_bytes) : NULL;
+    fields[7] = fields[6] ? PyLong_FromUnsignedLongLong(description->crossing_requests) : NULL;
+    PyObject* const described = fields[7] ? PyStructSequence_New(DescriptionType) : NULL;
+    for (Py_ssize_t index = 0; index != 8; ++index)
         if (described) PyStructSequence_SetItem(described, index, fields[index]);
         else Py_XDECREF(fields[index]);
     return described;
@@ -1597,8 +1599,8 @@ static char const doc_On[] =                                                    
     "What a Database, Transaction or Snapshot addresses, with the executor that runs its calls.\n" //
     "\n"                                                                                           //
     "Built through `on(executor)`, `watched()` or `unwatched()`, never by name. Its verbs and\n"   //
-    "`view[name]` answer what the origin's do, each blocking until it finishes: on the\n"          //
-    "executor, after every call submitted to it before, or on the calling thread without one.\n"   //
+    "`view[name]` answer what the origin's do, each blocking on the executor, or on the calling\n" //
+    "thread without one, and returning with its final status stored and every output readable.\n"  //
     "A view never changes after it is made, so threads share it freely.";
 
 static char const doc_DeferredOn[] =                                                            //
@@ -1681,13 +1683,14 @@ static PyObject* view_on(PyObject* self, PyObject* executor_object, PyTypeObject
     return view_new(type, origin, (Executor*)executor_object, watch);
 }
 
-static char const doc_on[] =                                                                   //
-    "on(executor) answers an On whose calls block on the executor.\n"                          //
-    "\n"                                                                                       //
-    "Every call runs after the ones submitted to the executor before it finishes, so a read\n" //
-    "through it sees what earlier deferred writes wrote.\n"                                    //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
+static char const doc_on[] =                                                                     //
+    "on(executor) answers an On whose calls block on the executor.\n"                            //
+    "\n"                                                                                         //
+    "A blocking call returns with its final status stored and every output readable. An\n"       //
+    "executor runs one call at a time, and a call that finds another one holding it, from any\n" //
+    "thread, finishes `Status.CONTENDED` without running.\n"                                     //
+    "\n"                                                                                         //
+    "Args:\n"                                                                                    //
     "  executor (Executor): The threads that run the calls.";
 
 static PyObject* receiver_on(PyObject* self, PyObject* executor) { return view_on(self, executor, &OnType); }

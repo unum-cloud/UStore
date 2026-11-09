@@ -11,12 +11,13 @@ Date: November 8, 2026
 
 from std.os import listdir, remove, rmdir
 from std.tempfile import mkdtemp
-from std.testing import TestSuite, assert_equal, assert_false, assert_true
+from std.testing import TestSuite, assert_equal, assert_false, assert_raises, assert_true
 
 from ustore import (
     Admission,
     Arena,
     BlobsScanConfig,
+    CollectionID,
     CollectionsView,
     Continuation,
     Database,
@@ -27,6 +28,7 @@ from ustore import (
     KeysView,
     Library,
     Modality,
+    Mood,
     Predicate,
     Progress,
     Residency,
@@ -94,7 +96,7 @@ def test_keys_spell_integers_big_endian() raises:
 
 
 def test_library_reports_its_version_and_names() raises:
-    """The engine reports major version 1 and spells its enumerators both ways."""
+    """The engine reports major version 1, spells its enumerators both ways and refuses other names."""
     if not _engine_is_present():
         print("skipped: no UStore library on the loader path")
         return
@@ -102,6 +104,8 @@ def test_library_reports_its_version_and_names() raises:
     assert_equal(library.version()[0], 1)
     assert_equal(library.status_name(Status.NOT_FOUND), "not-found")
     assert_true(library.status_from_name("not-found") == Status.NOT_FOUND)
+    with assert_raises():
+        _ = library.durability_from_name("bogus")
     assert_equal(library.modality_name(Modality.GRAPH), "graph")
 
 
@@ -256,6 +260,95 @@ def test_deferred_calls_match_blocking_ones() raises:
     assert_equal(_text(read.wait().values()[0]), "deferred")
 
 
+@fieldwise_init
+struct _Holder:
+    """What a predicate writes through, on the executor its own scan holds, and the status the write finished with."""
+
+    var database: Pointer[Database, MutAnyOrigin]
+    var executor: Pointer[Executor, MutAnyOrigin]
+    var collection: CollectionID
+    var refused: Status
+
+
+def _write_on_the_held_executor(
+    keys: Span[Key, MutAnyOrigin], admissions: Span[Admission, MutAnyOrigin], holder: Pointer[_Holder, MutAnyOrigin]
+):
+    """A predicate admitting every key, which writes on the executor its own scan holds."""
+    for index in range(len(keys)):
+        admissions[index] = Admission.ADMIT
+    var key = Key(9)
+    var values = Tape(["inner"])
+    try:
+        holder[].database[].on(holder[].executor[]).write(
+            CollectionsView.repeating(holder[].collection),
+            KeysView.repeating(key),
+            StringsView.of(values.bytes, values.offsets),
+        )
+        holder[].refused = Status.SUCCESS
+    except error:
+        holder[].refused = error.status
+
+
+def test_a_held_executor_refuses_the_next_call() raises:
+    """A call finding another one holding its executor, here from that call's own predicate, finishes `CONTENDED`
+    without running, and the executor serves the next call once the holder returns."""
+    if not _engine_is_present():
+        print("skipped: no UStore library on the loader path")
+        return
+    var library = Library()
+    var executor = Executor.for_ram(library, threads=1)
+    var db = Database.init_ram(Executor(library))
+    var people = db.collection_create("people", Modality.BLOBS)
+    var key = Key(1)
+    var values = Tape(["held"])
+    db.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
+
+    var holder = _Holder(
+        Pointer(to=db).unsafe_origin_cast[MutAnyOrigin](),
+        Pointer(to=executor).unsafe_origin_cast[MutAnyOrigin](),
+        people,
+        Status.DEFERRED,
+    )
+    var arena = Arena(executor)
+    var start = Key(0)
+    var scanned = db.on(executor).scan(
+        CollectionsView.repeating(people),
+        KeysView.repeating(start),
+        10,
+        arena,
+        BlobsScanConfig(predicate=Predicate.of[_write_on_the_held_executor](Pointer(to=holder))),
+    )
+    assert_true(holder.refused == Status.CONTENDED, "a call on a held executor must finish contended")
+    assert_equal(len(scanned.run(0)), 1)
+    var inner = Key(9)
+    db.on(executor).write(
+        CollectionsView.repeating(people), KeysView.repeating(inner), StringsView.of(values.bytes, values.offsets)
+    )
+
+
+def test_a_drain_frees_the_executor_in_either_mood() raises:
+    """A drain only waits until no call holds the executor, so the next call on it runs, whichever mood it left."""
+    if not _engine_is_present():
+        print("skipped: no UStore library on the loader path")
+        return
+    var library = Library()
+    var executor = Executor.for_ram(library, threads=2)
+    var db = Database.init_ram(Executor(library))
+    var people = db.collection_create("people", Modality.BLOBS)
+    var key = Key(5)
+    var values = Tape(["drained"])
+    var arena = Arena(executor)
+    var moods: List[Mood] = [Mood.SPINNING, Mood.PARKED]
+    for mood in moods:
+        var write = db.deferred(executor).write(
+            CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets)
+        )
+        executor.drain(mood)
+        var read = db.on(executor).read(CollectionsView.repeating(people), KeysView.repeating(key), arena)
+        assert_equal(_text(read.values()[0]), "drained")
+        _ = write.wait()
+
+
 def _stop_at_first_report(finished: Int, total: Int, reports: Pointer[Int, MutAnyOrigin]) -> Continuation:
     """A progress handler counting its reports and cancelling at the first."""
     reports[] += 1
@@ -382,6 +475,8 @@ def main() raises:
     suite.test[test_docs_write_and_read]()
     suite.test[test_graph_edges_round_trip]()
     suite.test[test_deferred_calls_match_blocking_ones]()
+    suite.test[test_a_held_executor_refuses_the_next_call]()
+    suite.test[test_a_drain_frees_the_executor_in_either_mood]()
     suite.test[test_progress_cancels_a_scan]()
     suite.test[test_predicate_filters_a_scan]()
     suite.test[test_transactions_commit_their_writes]()

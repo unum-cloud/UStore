@@ -572,6 +572,8 @@ pub(crate) mod ffi {
         pub keys: ustore_size_t,
         pub memory_bytes: ustore_size_t,
         pub disk_bytes: ustore_size_t,
+        pub pin_refused_bytes: ustore_size_t,
+        pub crossing_requests: ustore_size_t,
     }
 
     #[repr(C)]
@@ -722,47 +724,59 @@ pub(crate) mod ffi {
 
     extern "C" {
         pub fn ustore_status_name(status: ustore_status_t) -> *const c_char;
-        pub fn ustore_status_from_name(name: ustore_bytes_view_t) -> ustore_status_t;
+        pub fn ustore_status_from_name(name: ustore_bytes_view_t, status: *mut ustore_status_t) -> ustore_status_t;
         pub fn ustore_outcome_wait(outcome: *mut ustore_outcome_t) -> ustore_status_t;
         pub fn ustore_outcome_status(outcome: *mut ustore_outcome_t) -> ustore_status_t;
         pub fn ustore_version_name() -> *const c_char;
 
         pub fn ustore_mood_name(mood: ustore_enum_t) -> *const c_char;
-        pub fn ustore_mood_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_mood_from_name(name: ustore_bytes_view_t, mood: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_cpu_class_name(cpu_class: ustore_enum_t) -> *const c_char;
-        pub fn ustore_cpu_class_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_cpu_class_from_name(name: ustore_bytes_view_t, cpu_class: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_durability_name(durability: ustore_enum_t) -> *const c_char;
-        pub fn ustore_durability_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_durability_from_name(
+            name: ustore_bytes_view_t,
+            durability: *mut ustore_enum_t,
+        ) -> ustore_status_t;
         pub fn ustore_watch_name(watch: ustore_enum_t) -> *const c_char;
-        pub fn ustore_watch_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_watch_from_name(name: ustore_bytes_view_t, watch: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_drop_mode_name(drop_mode: ustore_enum_t) -> *const c_char;
-        pub fn ustore_drop_mode_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_drop_mode_from_name(name: ustore_bytes_view_t, drop_mode: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_scan_direction_name(scan_direction: ustore_enum_t) -> *const c_char;
         pub fn ustore_change_kind_name(change_kind: ustore_enum_t) -> *const c_char;
-        pub fn ustore_change_kind_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
-        pub fn ustore_scan_direction_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_change_kind_from_name(
+            name: ustore_bytes_view_t,
+            change_kind: *mut ustore_enum_t,
+        ) -> ustore_status_t;
+        pub fn ustore_scan_direction_from_name(
+            name: ustore_bytes_view_t,
+            scan_direction: *mut ustore_enum_t,
+        ) -> ustore_status_t;
         pub fn ustore_scan_mode_name(scan_mode: ustore_enum_t) -> *const c_char;
-        pub fn ustore_scan_mode_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_scan_mode_from_name(name: ustore_bytes_view_t, scan_mode: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_isolation_name(isolation: ustore_enum_t) -> *const c_char;
-        pub fn ustore_isolation_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_isolation_from_name(name: ustore_bytes_view_t, isolation: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_pattern_kind_name(kind: ustore_enum_t) -> *const c_char;
-        pub fn ustore_pattern_kind_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_pattern_kind_from_name(name: ustore_bytes_view_t, kind: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_case_sensitivity_name(sensitivity: ustore_enum_t) -> *const c_char;
-        pub fn ustore_case_sensitivity_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_case_sensitivity_from_name(
+            name: ustore_bytes_view_t,
+            sensitivity: *mut ustore_enum_t,
+        ) -> ustore_status_t;
         pub fn ustore_predicate_cost_name(cost: ustore_enum_t) -> *const c_char;
-        pub fn ustore_predicate_cost_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_predicate_cost_from_name(name: ustore_bytes_view_t, cost: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_gds_name(gds: ustore_enum_t) -> *const c_char;
-        pub fn ustore_gds_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_gds_from_name(name: ustore_bytes_view_t, gds: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_gpu_vendor_name(vendor: ustore_enum_t) -> *const c_char;
-        pub fn ustore_gpu_vendor_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_gpu_vendor_from_name(name: ustore_bytes_view_t, vendor: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_gpu_class_name(gpu_class: ustore_enum_t) -> *const c_char;
-        pub fn ustore_gpu_class_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_gpu_class_from_name(name: ustore_bytes_view_t, gpu_class: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_transport_name(transport: ustore_enum_t) -> *const c_char;
-        pub fn ustore_transport_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_transport_from_name(name: ustore_bytes_view_t, transport: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_engine_name(engine: ustore_enum_t) -> *const c_char;
-        pub fn ustore_engine_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_engine_from_name(name: ustore_bytes_view_t, engine: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_modality_name(modality: ustore_enum_t) -> *const c_char;
-        pub fn ustore_modality_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_modality_from_name(name: ustore_bytes_view_t, modality: *mut ustore_enum_t) -> ustore_status_t;
 
         pub fn ustore_executor_for_ram(arguments: *mut ustore_executor_for_ram_t);
         pub fn ustore_executor_on_pool(arguments: *mut ustore_executor_on_pool_t);
@@ -912,12 +926,13 @@ impl FromStr for Status {
 
     /// Calls `ustore_status_from_name`, refusing "success", which names no failure.
     fn from_str(text: &str) -> Result<Self> {
-        // SAFETY: the name outlives the call, which reads it without a terminator.
-        let raw = unsafe { ffi::ustore_status_from_name(text.as_bytes().into()) };
-        // An unknown name reads as `invalid-argument`, so only a status that spells back the same was named.
+        let mut raw = ffi::ustore_status_t(0);
+        // SAFETY: the name and the output outlive the call, which reads the name unterminated.
+        let read = unsafe { ffi::ustore_status_from_name(text.as_bytes().into(), &mut raw) };
+        Status::from_raw(read).map_err(|status| fail(status, "no status is spelled that way"))?;
         match Status::from_raw(raw) {
-            Err(status) if status.name() == text => Ok(status),
-            _ => Err(fail(Status::InvalidArgument, "no status is spelled that way")),
+            Err(status) => Ok(status),
+            Ok(()) => Err(fail(Status::InvalidArgument, "no status is spelled that way")),
         }
     }
 }
@@ -985,21 +1000,18 @@ pub(crate) fn spelling(
     unsafe { static_string(name(value)) }
 }
 
-/// Reads a spelling back through one of the library's `ustore_*_from_name` functions, refusing one the library spells
-/// otherwise, since each answers its enum's zero for a name it does not know.
+/// Reads a spelling back through one of the library's `ustore_*_from_name` functions, which
+/// refuse a name they do not know.
 pub(crate) fn read_spelling<Value>(
     text: &str,
-    from_name: unsafe extern "C" fn(ffi::ustore_bytes_view_t) -> ffi::ustore_enum_t,
-    name: unsafe extern "C" fn(ffi::ustore_enum_t) -> *const c_char,
+    from_name: unsafe extern "C" fn(ffi::ustore_bytes_view_t, *mut ffi::ustore_enum_t) -> ffi::ustore_status_t,
     lift: fn(ffi::ustore_enum_t) -> Option<Value>,
 ) -> Result<Value> {
-    // SAFETY: the text outlives the call, which reads it without a terminator.
-    let value = unsafe { from_name(text.as_bytes().into()) };
-    match spelling(name, value) == text {
-        true => lift(value),
-        false => None,
-    }
-    .ok_or(fail(Status::InvalidArgument, "no enumerator is spelled that way"))
+    let mut value: ffi::ustore_enum_t = 0;
+    // SAFETY: the text and the output outlive the call, which reads the text without a terminator.
+    let read = unsafe { from_name(text.as_bytes().into(), &mut value) };
+    Status::from_raw(read).map_err(|status| fail(status, "no enumerator is spelled that way"))?;
+    lift(value).ok_or(fail(Status::InvalidArgument, "no enumerator is spelled that way"))
 }
 
 /// The version of the library the program runs against, like "1.0.0".
@@ -1240,12 +1252,7 @@ impl FromStr for Durability {
 
     /// Calls `ustore_durability_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_durability_from_name,
-            ffi::ustore_durability_name,
-            Durability::from_raw,
-        )
+        read_spelling(text, ffi::ustore_durability_from_name, Durability::from_raw)
     }
 }
 
@@ -1287,12 +1294,7 @@ impl FromStr for Watch {
 
     /// Calls `ustore_watch_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_watch_from_name,
-            ffi::ustore_watch_name,
-            Watch::from_raw,
-        )
+        read_spelling(text, ffi::ustore_watch_from_name, Watch::from_raw)
     }
 }
 
@@ -1330,12 +1332,7 @@ impl FromStr for DropMode {
 
     /// Calls `ustore_drop_mode_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_drop_mode_from_name,
-            ffi::ustore_drop_mode_name,
-            DropMode::from_raw,
-        )
+        read_spelling(text, ffi::ustore_drop_mode_from_name, DropMode::from_raw)
     }
 }
 
@@ -1372,12 +1369,7 @@ impl FromStr for ScanDirection {
 
     /// Reads "ascending" or "descending" back.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_scan_direction_from_name,
-            ffi::ustore_scan_direction_name,
-            ScanDirection::from_raw,
-        )
+        read_spelling(text, ffi::ustore_scan_direction_from_name, ScanDirection::from_raw)
     }
 }
 
@@ -1414,12 +1406,7 @@ impl FromStr for ScanMode {
 
     /// Reads "ordered" or "unordered" back.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_scan_mode_from_name,
-            ffi::ustore_scan_mode_name,
-            ScanMode::from_raw,
-        )
+        read_spelling(text, ffi::ustore_scan_mode_from_name, ScanMode::from_raw)
     }
 }
 
@@ -1507,7 +1494,7 @@ impl FromStr for Mood {
 
     /// Calls `ustore_mood_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(text, ffi::ustore_mood_from_name, ffi::ustore_mood_name, Mood::from_raw)
+        read_spelling(text, ffi::ustore_mood_from_name, Mood::from_raw)
     }
 }
 
@@ -1894,12 +1881,7 @@ impl FromStr for Modality {
 
     /// Calls `ustore_modality_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_modality_from_name,
-            ffi::ustore_modality_name,
-            Modality::from_raw,
-        )
+        read_spelling(text, ffi::ustore_modality_from_name, Modality::from_raw)
     }
 }
 
@@ -1935,12 +1917,7 @@ impl FromStr for Isolation {
 
     /// Calls `ustore_isolation_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_isolation_from_name,
-            ffi::ustore_isolation_name,
-            Isolation::from_raw,
-        )
+        read_spelling(text, ffi::ustore_isolation_from_name, Isolation::from_raw)
     }
 }
 
@@ -1981,7 +1958,7 @@ impl FromStr for Gds {
 
     /// Calls `ustore_gds_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(text, ffi::ustore_gds_from_name, ffi::ustore_gds_name, Gds::from_raw)
+        read_spelling(text, ffi::ustore_gds_from_name, Gds::from_raw)
     }
 }
 
@@ -2016,12 +1993,7 @@ impl FromStr for GPUVendor {
 
     /// Calls `ustore_gpu_vendor_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_gpu_vendor_from_name,
-            ffi::ustore_gpu_vendor_name,
-            GPUVendor::from_raw,
-        )
+        read_spelling(text, ffi::ustore_gpu_vendor_from_name, GPUVendor::from_raw)
     }
 }
 
@@ -2074,12 +2046,7 @@ impl FromStr for GPUClass {
 
     /// Calls `ustore_gpu_class_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_gpu_class_from_name,
-            ffi::ustore_gpu_class_name,
-            GPUClass::from_raw,
-        )
+        read_spelling(text, ffi::ustore_gpu_class_from_name, GPUClass::from_raw)
     }
 }
 
@@ -2212,12 +2179,7 @@ impl FromStr for CPUClass {
 
     /// Calls `ustore_cpu_class_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_cpu_class_from_name,
-            ffi::ustore_cpu_class_name,
-            CPUClass::from_raw,
-        )
+        read_spelling(text, ffi::ustore_cpu_class_from_name, CPUClass::from_raw)
     }
 }
 
@@ -2262,12 +2224,7 @@ impl FromStr for Transport {
 
     /// Calls `ustore_transport_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_transport_from_name,
-            ffi::ustore_transport_name,
-            Transport::from_raw,
-        )
+        read_spelling(text, ffi::ustore_transport_from_name, Transport::from_raw)
     }
 }
 
@@ -2308,12 +2265,7 @@ impl FromStr for Engine {
 
     /// Calls `ustore_engine_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_engine_from_name,
-            ffi::ustore_engine_name,
-            Engine::from_raw,
-        )
+        read_spelling(text, ffi::ustore_engine_from_name, Engine::from_raw)
     }
 }
 
@@ -2332,7 +2284,7 @@ pub struct DataDirectory<'path> {
 pub struct RAMOptions<'options> {
     /// How transactions see each other.
     pub isolation: Isolation,
-    /// The executor the open runs on, after the calls submitted there before it; `None` opens on the calling thread.
+    /// The executor the open runs on; `None` opens on the calling thread.
     pub executor: Option<&'options Executor>,
     /// The CPU class the database confines itself to, failing with [`Status::Unsupported`] where the CPU does not run
     /// it; `None` takes what the CPU offers.
@@ -2346,7 +2298,7 @@ pub struct RocksDBOptions<'options> {
     pub directory: &'options str,
     /// Directories the table files fill in order, or none to keep them in `directory`.
     pub data_directories: &'options [DataDirectory<'options>],
-    /// The executor the open runs on, after the calls submitted there before it; `None` opens on the calling thread.
+    /// The executor the open runs on; `None` opens on the calling thread.
     pub executor: Option<&'options Executor>,
 }
 
@@ -2365,7 +2317,7 @@ impl<'options> RocksDBOptions<'options> {
 pub struct LevelDBOptions<'options> {
     /// The database's directory, which must exist.
     pub directory: &'options str,
-    /// The executor the open runs on, after the calls submitted there before it; `None` opens on the calling thread.
+    /// The executor the open runs on; `None` opens on the calling thread.
     pub executor: Option<&'options Executor>,
 }
 
@@ -2387,7 +2339,7 @@ pub struct NVMEOptions<'path> {
     pub manifest: &'path str,
     /// Further data directories the runs land on, the one with the most free bytes taking each.
     pub data_directories: &'path [DataDirectory<'path>],
-    /// The executor the open runs on, after the calls submitted there before it; `None` opens on the calling thread.
+    /// The executor the open runs on; `None` opens on the calling thread.
     /// The database moves bytes as one of [`Executor::for_nvme`] says, read once at the open, and with that call's
     /// defaults for any other executor and for none.
     pub executor: Option<&'path Executor>,
@@ -2508,6 +2460,12 @@ pub struct Description {
     pub memory_bytes: u64,
     /// Bytes the files of the database take on disk.
     pub disk_bytes: u64,
+    /// Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each
+    /// request pins its own.
+    pub pin_refused_bytes: u64,
+    /// Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a
+    /// gibibyte of it.
+    pub crossing_requests: u64,
 }
 
 impl Description {
@@ -2727,6 +2685,8 @@ impl Database {
             keys: description.keys as usize,
             memory_bytes: description.memory_bytes,
             disk_bytes: description.disk_bytes,
+            pin_refused_bytes: description.pin_refused_bytes,
+            crossing_requests: description.crossing_requests,
         })
     }
 
@@ -2888,7 +2848,7 @@ impl<Parent, Completion> Copy for On<'_, Parent, Completion> {}
 pub type DeferredOn<'view, Parent = Database> = On<'view, Parent, Deferring>;
 
 impl<'view, Parent, Completion> On<'view, Parent, Completion> {
-    /// This view with every call through it running on `executor`, after the calls submitted there before it.
+    /// This view with every call through it running on `executor`.
     pub fn on<'with>(self, executor: &'with Executor) -> On<'with, Parent, Completion>
     where
         'view: 'with,
@@ -3298,12 +3258,7 @@ impl FromStr for PatternKind {
 
     /// Calls `ustore_pattern_kind_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_pattern_kind_from_name,
-            ffi::ustore_pattern_kind_name,
-            PatternKind::from_raw,
-        )
+        read_spelling(text, ffi::ustore_pattern_kind_from_name, PatternKind::from_raw)
     }
 }
 
@@ -3319,12 +3274,7 @@ impl FromStr for CaseSensitivity {
 
     /// Calls `ustore_case_sensitivity_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_case_sensitivity_from_name,
-            ffi::ustore_case_sensitivity_name,
-            CaseSensitivity::from_raw,
-        )
+        read_spelling(text, ffi::ustore_case_sensitivity_from_name, CaseSensitivity::from_raw)
     }
 }
 
@@ -3340,12 +3290,7 @@ impl FromStr for PredicateCost {
 
     /// Calls `ustore_predicate_cost_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_predicate_cost_from_name,
-            ffi::ustore_predicate_cost_name,
-            PredicateCost::from_raw,
-        )
+        read_spelling(text, ffi::ustore_predicate_cost_from_name, PredicateCost::from_raw)
     }
 }
 
@@ -3873,8 +3818,8 @@ unsafe impl Send for Executor {}
 unsafe impl Sync for Executor {}
 
 impl Executor {
-    /// Spawns host threads for the RAM, RocksDB and LevelDB engines across the compute domains local to
-    /// `memory_domains`, NUMA nodes as the operating system numbers them.
+    /// Creates an executor of host threads for the RAM, RocksDB and LevelDB engines across the
+    /// compute domains local to `memory_domains`, NUMA nodes as the operating system numbers them.
     ///
     /// An empty list derives every domain the process may allocate on, and an identifier no domain carries is refused
     /// with [`Status::InvalidArgument`]. The scratch of each thread, and every arena the executor makes, lives on the
@@ -3922,9 +3867,9 @@ impl Executor {
         Executor::created(handle, outcome)
     }
 
-    /// Spawns the threads of the NVMe engine, each submitting and polling its own I/O ring, where zero `threads`
-    /// derives them from the cores, and tells every database [`Database::open_nvme`] opens on it to move bytes as
-    /// `io` says.
+    /// Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O
+    /// ring, where zero `threads` derives them from the cores, and tells every database
+    /// [`Database::open_nvme`] opens on it to move bytes as `io` says.
     ///
     /// Calls `ustore_executor_for_nvme`.
     pub fn for_nvme(threads: usize, io: &IOOptions) -> Result<Self> {
@@ -3942,10 +3887,11 @@ impl Executor {
         Executor::created(handle, outcome)
     }
 
-    /// Opens one submission stream on `device`, a [`GPUDevice::ordinal`] of either vendor, or borrows the caller's
-    /// `stream`, all of it driven by one host thread - which is why this takes no thread count - moving bytes as `gds`
-    /// says. Zero `scratch_limit` lets scratch grow as calls ask. It fails with [`Status::Device`] for an ordinal no
-    /// device carries. [`NVMEOptions::compactions`] places the merges of an NVMe database on one of an NVIDIA device.
+    /// Opens one submission stream on `device`, a [`GPUDevice::ordinal`] of either vendor, or
+    /// borrows the caller's `stream`, fed by the calling thread, which is why this takes no thread
+    /// count, moving bytes as `gds` says. Zero `scratch_limit` lets scratch grow as calls ask. It
+    /// fails with [`Status::Device`] for an ordinal no device carries. [`NVMEOptions::compactions`]
+    /// places the merges of an NVMe database on one of an NVIDIA device.
     ///
     /// Calls `ustore_executor_for_vram`.
     ///
@@ -4434,12 +4380,7 @@ impl FromStr for ChangeKind {
 
     /// Reads "write", "removal" or "change" back.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_change_kind_from_name,
-            ffi::ustore_change_kind_name,
-            ChangeKind::from_raw,
-        )
+        read_spelling(text, ffi::ustore_change_kind_from_name, ChangeKind::from_raw)
     }
 }
 

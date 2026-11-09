@@ -62,8 +62,8 @@ The preview SDK is the `sdk` component alone: the stripped shared library, the C
 Every call takes a single pointer to an argument struct named after it with a `_t` suffix, so arguments are named and every omitted one is zero.
 Every struct opens with its handle, then `executor`, `outcome` and `completion`, so every call reports through a `ustore_outcome_t` whose `status` names the result and whose static `message` is never freed.
 Statuses read `ustore_status_<name>_k`, from `ustore_status_success_k` through every failure.
-Every closed set is a C enum, and each one a binding spells has a pair of functions: `<prefix>_<enum>_name`, such as `ustore_isolation_name`, answers a static lowercase spelling like `strict-serializable`, or `unrecognized` for a value no enumerator carries, and `<prefix>_<enum>_from_name` reads a `ustore_bytes_view_t` back, answering the enum's zero enumerator for a name it does not know.
-`ustore_status_from_name` alone answers `ustore_status_invalid_argument_k` for an unknown name, and `ustore_version_name` spells the version of the library the program runs against, like `1.0.0`.
+Every closed set is a C enum, and each one a binding spells has a pair of functions: `<prefix>_<enum>_name`, such as `ustore_isolation_name`, answers a static lowercase spelling like `strict-serializable`, or `unrecognized` for a value no enumerator carries, and `<prefix>_<enum>_from_name` reads a `ustore_bytes_view_t` back into its output, failing with `ustore_status_invalid_argument_k` for a name it does not know.
+`ustore_version_name` spells the version of the library the program runs against, like `1.0.0`.
 Every call is a batch of `count` tasks, and each of its inputs takes one of three shapes:
 
 - __One run of bytes__, a `ustore_bytes_view_t` of a pointer and a length, carries a path or a name, never null-terminated by contract.
@@ -96,7 +96,7 @@ ForkUnion spawns the threads near every domain or near one alone, so naming seve
 `ustore_executor_on_pool` borrows a ForkUnion pool another library owns, which must outlive the executor, and places its scratch and arenas by the same `ram` options; a dispatch on a pool that runs another is refused, so a call finding the pool running its lender's dispatch finishes `ustore_status_contended_k` instead of forking over the lender.
 `ustore_executor_for_nvme` spawns the threads of the NVMe engine, and its `nvme` options tell every database `ustore_database_open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, read once at the open.
 It may borrow an executor of `ustore_executor_for_vram`, whose CUDA device and scratch limit the compactions take, and which answers `ustore_status_unsupported_k` in a library built without CUDA.
-That executor queues every call on one stream of its device, its own or one the caller lends through `stream`, from the calling thread of a blocking call or from its one host thread for a deferred call.
+That executor queues every call on one stream of its device, its own or one the caller lends through `stream`, from the calling thread, which waits on it there, so a deferred call is final when it returns.
 A call blocks by default and returns with its outcome final, while `ustore_completion_deferred_k` returns once the call is submitted:
 
 ```c
@@ -189,6 +189,7 @@ ustore_database_compact(&(ustore_database_compact_t){.database = database, .outc
 
 A description's `capabilities` say whether the engine supports transactions, collections and snapshots, `engine` names the engine, and `isolation` says how its transactions see each other: as the `ram` engine was opened, and `ustore_isolation_snapshot_k` elsewhere.
 `keys`, `memory_bytes` and `disk_bytes` are the engine's estimates of the keys across every collection and of the bytes the data takes, and zero where it keeps none, as LevelDB keeps no count of its keys.
+`pin_refused_bytes` and `crossing_requests` report where the NVMe engine went unpinned: the arena bytes the locked-memory cap refused to pin, and the requests that crossed a gibibyte of a pinned arena.
 `ustore_database_clear` empties every collection as its `mode` names:
 
 - `ustore_drop_pairs_k` removes every pair, keeping the collections and their names;

@@ -112,7 +112,7 @@ See [`nvme/README.md`](nvme/README.md) for its layers.
 `include/ustore/utilities/ram_device.hpp` holds pools by type: an `executor_t` is spawned and deleted here and is the only kind parked when idle, a `lent_pool_t` is borrowed from another library and never deleted or parked, and both dispatch through a `pool_view_t`.
 Every `ustore_executor_t` that `src/types.cpp` builds holds one of them, one scratch per pool thread plus one for the call holding it, and that `holding_call_t`.
 Its `device` variant is the kind tag: nothing beyond the pool on RAM, the rings' options on NVMe, and on VRAM a `cuda_executor_t` holding the device ordinal, the one stream every call queues on, made or borrowed, and the scratch limit.
-A VRAM executor runs one caller-exclusive host thread, which serves its deferred calls, and every device verb table an engine leaves to `unsupported_vram_tables_k` answers `ustore_status_unsupported_k` until its device tower lands.
+A VRAM executor is caller-inclusive with one thread, its caller, which stages, feeds the device and waits on it, and every device verb table an engine leaves to `unsupported_vram_tables_k` answers `ustore_status_unsupported_k` until its device tower lands.
 `ustore_executor_for_ram` spawns its `executor_t` over a `topology_t`, which owns a `fu_topology_t`: `fu_pool_spawn` over every memory domain, `fu_pool_spawn_near_memory_domain` near one of several, and the whole machine for several but not all, since ForkUnion has no spawn over a subset.
 Zero threads take 7/8 of the cores of the compute domains local to the named memory domains, rounded down and at least one.
 `ustore_executor_on_pool` builds a `lent_pool_t` through `lent_pool_t::borrow`, which refuses a null pool or one holding no threads.

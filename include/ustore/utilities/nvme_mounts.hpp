@@ -267,6 +267,12 @@ class any_files_disk {
         return linux_uring ? linux_uring->pinning() : range_pinning_t::unpinned_k;
     }
 
+    /** Requests the held transport sent unpinned across a pinned gibibyte; only io_uring pins. */
+    [[nodiscard]] std::uint64_t crossing_requests() const noexcept {
+        linux_uring_disk_t const* const linux_uring = std::get_if<linux_uring_disk_t>(&held_);
+        return linux_uring ? linux_uring->crossing_requests() : 0;
+    }
+
     /** Whether the arena must come from DMA memory, which only SPDK over a PCIe controller asks. */
     [[nodiscard]] bool needs_dma_memory() const noexcept {
         linux_spdk_disk_t const* const linux_spdk = std::get_if<linux_spdk_disk_t>(&held_);
@@ -690,6 +696,21 @@ class mounted_storage {
     [[nodiscard]] range_pinning_t pinning() const noexcept {
         files_mount_t const* const files = std::get_if<files_mount_t>(&held_);
         return files ? files->disk().pinning() : range_pinning_t::unpinned_k;
+    }
+
+    /** Bytes of the io_uring arena the locked-memory cap refused to pin, so each request pins its
+     *  own, or zero. */
+    [[nodiscard]] std::uint64_t pin_refused_bytes() const noexcept {
+        bool const refused = report_.transport == io_transport_t::linux_uring_k &&
+                             pinning() == range_pinning_t::unpinned_k;
+        return refused ? report_.arena_bytes : 0;
+    }
+
+    /** Requests the mounted transport sent unpinned while its arena was pinned, as each crossed a
+     *  gibibyte. */
+    [[nodiscard]] std::uint64_t crossing_requests() const noexcept {
+        files_mount_t const* const files = std::get_if<files_mount_t>(&held_);
+        return files ? files->disk().crossing_requests() : 0;
     }
 
     /** Calls @p visitor with the mount that is open, or reports that none is. */

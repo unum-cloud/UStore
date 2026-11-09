@@ -2898,6 +2898,10 @@ static PyStructSequence_Field description_fields[] = {
     {"keys", "Keys across every collection, as the engine estimates them."},
     {"memory_bytes", "Bytes of memory the engine holds for the data, or zero where it keeps no estimate."},
     {"disk_bytes", "Bytes the files of the database take on disk."},
+    {"pin_refused_bytes",
+     "Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request pins its own."},
+    {"crossing_requests",
+     "Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."},
     {NULL, NULL},
 };
 
@@ -2905,7 +2909,7 @@ static PyStructSequence_Desc description_description = {
     "ustore.Description",
     "What an open database reports about itself, as `describe()` answers it, every size the engine's estimate.",
     description_fields,
-    6,
+    8,
 };
 
 PyTypeObject* GPUDeviceType = NULL;

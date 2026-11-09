@@ -13,7 +13,6 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `std::fopen`, `std::fclose`
-#include <cstdlib> // `std::malloc`, `std::aligned_alloc`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
 #include <array>      // `std::array`
@@ -36,44 +35,8 @@
 #include "ustore/strings/nvme_store.hpp"      // `strings::nvme_store`, `strings::nvme_transaction`
 #include "ustore/utilities/nvme_manifest.hpp" // `manifest_t`
 
-#include "nvme/fixture.hpp" // `run_on_transport`, `painted`
-
-/** Calls of @c operator new on every thread, which a warm read leaves unchanged; the database
- *  starts no thread of its own. */
-std::size_t operator_new_calls = 0;
-
-void* operator new(std::size_t size) {
-    ++operator_new_calls;
-    if (void* memory = std::malloc(size ? size : 1)) return memory;
-    throw std::bad_alloc {};
-}
-
-void* operator new(std::size_t size, std::nothrow_t const&) noexcept {
-    ++operator_new_calls;
-    return std::malloc(size ? size : 1);
-}
-
-void* operator new(std::size_t size, std::align_val_t alignment) {
-    ++operator_new_calls;
-    std::size_t const bytes = (size + static_cast<std::size_t>(alignment) - 1) &
-                              ~(static_cast<std::size_t>(alignment) - 1);
-    if (void* memory = std::aligned_alloc(static_cast<std::size_t>(alignment),
-                                          bytes ? bytes : static_cast<std::size_t>(alignment)))
-        return memory;
-    throw std::bad_alloc {};
-}
-
-void* operator new(std::size_t size, std::align_val_t alignment, std::nothrow_t const&) noexcept {
-    ++operator_new_calls;
-    std::size_t const bytes = (size + static_cast<std::size_t>(alignment) - 1) &
-                              ~(static_cast<std::size_t>(alignment) - 1);
-    return std::aligned_alloc(static_cast<std::size_t>(alignment), bytes ? bytes : static_cast<std::size_t>(alignment));
-}
-
-void operator delete(void* memory) noexcept { std::free(memory); }
-void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
-void operator delete(void* memory, std::align_val_t) noexcept { std::free(memory); }
-void operator delete(void* memory, std::size_t, std::align_val_t) noexcept { std::free(memory); }
+#include "nvme/allocation_watch.hpp" // `allocation_watch_g`
+#include "nvme/fixture.hpp"          // `run_on_transport`, `painted`
 
 namespace unum::ustore::test {
 
@@ -2066,9 +2029,9 @@ std::size_t warm_batched_select_allocates_nothing(mount_type_ const& mount) {
                             sink);
     };
     failures += expect(select_once().succeeded());
-    std::size_t const before = operator_new_calls;
+    std::size_t const before = allocation_watch_g.calls;
     failures += expect(select_once().succeeded());
-    std::size_t const allocated = operator_new_calls - before;
+    std::size_t const allocated = allocation_watch_g.calls - before;
     fmt::println("    warm batched select: {} calls of operator new", allocated);
     failures += expect_eq(allocated, std::size_t {0});
     failures += expect_eq(carried, expected_bytes);

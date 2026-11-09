@@ -488,7 +488,11 @@ int main(void) {
 
     // Names spell every closed set and read back
     ustore_bytes_view_t const graph_name = bytes_of(ustore_modality_name(ustore_modality_graph_k));
-    failures += expect(ustore_modality_from_name(graph_name) == ustore_modality_graph_k, __LINE__);
+    ustore_modality_t modality = 0;
+    failures += expect(ustore_modality_from_name(graph_name, &modality) == ustore_status_success_k, __LINE__);
+    failures += expect(modality == ustore_modality_graph_k, __LINE__);
+    failures += expect(ustore_modality_from_name(bytes_of("bogus"), &modality) == ustore_status_invalid_argument_k,
+                       __LINE__);
 
     ustore_arena_free(arena);
     ustore_database_free(database);

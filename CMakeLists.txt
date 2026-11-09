@@ -564,6 +564,10 @@ if (${USTORE_BUILD_TEST})
             set(storage_arguments_ --directory ${CMAKE_BINARY_DIR}/test_data)
             # Every suite reaching the tree's merger links the compactor, which makes no lane without a CUDA compiler
             target_link_libraries(${storage_exe_} PRIVATE ustore_nvme_compaction)
+            # The suites counting allocations share one replacement of the global allocation functions
+            if (storage_name_ MATCHES "^(tree|database)$")
+                target_sources(${storage_exe_} PRIVATE test/nvme/allocation_watch.cpp)
+            endif ()
             # The LSM suite merges on the device where the build carries one, launching the kernels the library embeds,
             # so it links the bundles, and on the transports that need no hardware option its device case may no longer
             # skip

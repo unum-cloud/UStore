@@ -6,6 +6,7 @@ Date: September 18, 2026
 """
 
 import asyncio
+import contextlib
 import gc
 import weakref
 from uuid import UUID
@@ -520,32 +521,34 @@ def test_a_deferred_call_holds_its_arena(database, blobs):
 
 
 def test_shorthand_on_a_deferred_view_owns_its_arena(database, blobs, arena):
-    """`get`, `contains` and a mapping view answer a Deferred of the copy they make, through an arena of their own."""
+    """`get`, `contains` and a mapping view answer a Deferred of the copy they make, through an arena of their own,
+    each on an executor of its own, since an executor runs one call at a time."""
     database.write([1, 2], [b"a", b"bb"], collection=blobs)
-    with ustore.Executor.for_ram(2) as executor:
-        later = database.deferred(executor)
+    with contextlib.ExitStack() as executors:
+        later = [database.deferred(executors.enter_context(ustore.Executor.for_ram(1))) for _ in range(4)]
         getting, holding, subscripting = (
-            later.get(1, collection=blobs),
-            later.contains(2, collection=blobs),
-            later["blobs"].blobs[[1, 3]],
+            later[0].get(1, collection=blobs),
+            later[1].contains(2, collection=blobs),
+            later[2]["blobs"].blobs[[1, 3]],
         )
         held = database.read([2], arena, collection=blobs)[0]
-        missing = later["blobs"].blobs[3]
+        missing = later[3]["blobs"].blobs[3]
         assert (getting.wait(), holding.wait(), subscripting.wait()) == (b"a", True, [b"a", None])
-        assert later["blobs"].blobs[2].wait() == b"bb"
+        assert later[0]["blobs"].blobs[2].wait() == b"bb"
         with pytest.raises(KeyError):
             missing.wait()
         assert bytes(held) == b"bb"
 
 
 def test_await_under_asyncio(database, blobs, arena):
-    with ustore.Executor.for_ram(2) as executor:
-        later = database.deferred(executor)
+    """Gathered calls run at once, so each takes an executor of its own."""
+    with contextlib.ExitStack() as executors:
+        later = [database.deferred(executors.enter_context(ustore.Executor.for_ram(1))) for _ in range(4)]
 
         async def main() -> tuple[list[bytes], list[bytes | None]]:
-            await later.write([1, 2], [b"a", b"bb"], collection=blobs)
-            values = await later.read([1, 2], arena, collection=blobs)
-            found = await asyncio.gather(*(later.get(key, collection=blobs) for key in range(4)))
+            await later[0].write([1, 2], [b"a", b"bb"], collection=blobs)
+            values = await later[0].read([1, 2], arena, collection=blobs)
+            found = await asyncio.gather(*(later[key].get(key, collection=blobs) for key in range(4)))
             return [bytes(value) for value in values], found
 
         assert asyncio.run(main()) == ([b"a", b"bb"], [None, b"a", b"bb", None])
@@ -584,6 +587,16 @@ def test_a_held_executor_refuses_the_next_call(database, blobs):
         outcomes = outcomes_of(calls)
     assert ustore.Status.CONTENDED in outcomes
     assert set(outcomes) <= {ustore.Status.SUCCESS, ustore.Status.CONTENDED}
+
+
+def test_a_drain_frees_the_executor_in_either_mood(database, blobs):
+    """A drain only waits until no call holds the executor, so the next call on it runs, whichever mood it left."""
+    with ustore.Executor.for_ram(2) as executor:
+        for mood in (ustore.Mood.SPINNING, ustore.Mood.PARKED):
+            writing = database.deferred(executor).write(list(range(256)), b"v" * 1024, collection=blobs)
+            executor.drain(mood)
+            assert database.on(executor).get(255, collection=blobs) == b"v" * 1024
+            assert writing.wait() is None
 
 
 def test_close_waits_for_deferred_calls(open_database):

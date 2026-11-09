@@ -315,8 +315,14 @@ pub(crate) mod ffi {
         pub fn ustore_docs_measure(arguments: *mut ustore_docs_measure_t);
         pub fn ustore_docs_modification_name(modification: ustore_enum_t) -> *const c_char;
         pub fn ustore_docs_field_type_name(field_type: ustore_enum_t) -> *const c_char;
-        pub fn ustore_docs_field_type_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
-        pub fn ustore_docs_modification_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_docs_field_type_from_name(
+            name: ustore_bytes_view_t,
+            field_type: *mut ustore_enum_t,
+        ) -> crate::db::ffi::ustore_status_t;
+        pub fn ustore_docs_modification_from_name(
+            name: ustore_bytes_view_t,
+            modification: *mut ustore_enum_t,
+        ) -> crate::db::ffi::ustore_status_t;
     }
 }
 
@@ -562,12 +568,7 @@ impl FromStr for Modification {
 
     /// Calls `ustore_docs_modification_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_docs_modification_from_name,
-            ffi::ustore_docs_modification_name,
-            Modification::from_raw,
-        )
+        read_spelling(text, ffi::ustore_docs_modification_from_name, Modification::from_raw)
     }
 }
 
@@ -650,12 +651,7 @@ impl FromStr for FieldType {
 
     /// Calls `ustore_docs_field_type_from_name`.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_docs_field_type_from_name,
-            ffi::ustore_docs_field_type_name,
-            FieldType::from_raw,
-        )
+        read_spelling(text, ffi::ustore_docs_field_type_from_name, FieldType::from_raw)
     }
 }
 

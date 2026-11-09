@@ -776,7 +776,7 @@ class GPUDevice(structseq[Any], tuple[int, GPUVendor, int, GPUClass, int, int, s
         """The vendor's own name for the device."""
 
 @final
-class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, int, int, int]):
+class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, int, int, int, int, int]):
     """What an open database reports about itself, as `describe()` answers it, every size the engine's estimate."""
 
     @property
@@ -802,6 +802,15 @@ class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, int, in
     @property
     def disk_bytes(self) -> int:
         """Bytes the files of the database take on disk."""
+
+    @property
+    def pin_refused_bytes(self) -> int:
+        """Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request
+        pins its own."""
+
+    @property
+    def crossing_requests(self) -> int:
+        """Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."""
 
 @type_check_only
 class _Reads:
@@ -1272,7 +1281,8 @@ class _Receivers:
     """The views a database, a transaction, a snapshot or a view derives."""
 
     def on(self, executor: Executor) -> On:
-        """A view whose calls block on `executor`, after every call submitted to it before."""
+        """A view whose calls block on `executor`, each returning with its final status stored and every
+        output readable."""
 
     def deferred(self, executor: Executor) -> DeferredOn:
         """A view whose calls `executor` runs while each verb answers a `Deferred` at once."""
@@ -1814,8 +1824,9 @@ class DeferredOn:
     def on(self, executor: Executor) -> On:
         """on(executor) answers an On whose calls block on the executor.
 
-        Every call runs after the ones submitted to the executor before it finishes, so a read
-        through it sees what earlier deferred writes wrote.
+        A blocking call returns with its final status stored and every output readable. An
+        executor runs one call at a time, and a call that finds another one holding it, from any
+        thread, finishes `Status.CONTENDED` without running.
 
         Args:
           executor (Executor): The threads that run the calls.
@@ -2417,8 +2428,8 @@ class DeferredOn:
         keeps none. Calls `ustore_database_describe`.
 
         Returns:
-          Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes` and
-          `disk_bytes` of the database.
+          Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,
+          `disk_bytes`, `pin_refused_bytes` and `crossing_requests` of the database.
         """
 
     def write(

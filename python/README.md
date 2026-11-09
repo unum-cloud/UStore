@@ -334,6 +334,7 @@ A verb takes any `int` that is an enumerator, refusing a bool, which would read 
 `Error.status` and `Deferred.status` are `Status` members, `measure()` answers a `Measurement` struct sequence, `database.capabilities` a `Capabilities` one of `transactions` and `snapshots`, and `Columns.types` holds `FieldType` members.
 
 `describe()` answers a `Description` struct sequence of the `capabilities`, the `engine`, the `isolation`, and the `keys`, `memory_bytes` and `disk_bytes` the engine estimates, zero where it keeps no estimate.
+Its `pin_refused_bytes` and `crossing_requests` report where the NVMe engine went unpinned: the arena bytes the locked-memory cap refused to pin, and the requests that crossed a gibibyte of a pinned arena.
 `clear(mode)` empties every collection at once, as `collection_drop` empties one, and `compact()` reclaims the space overwritten and removed data takes, one collection at a time.
 A snapshot's `save(path)` writes it out as a new database of the same engine, holding exactly the collections and names the snapshot records:
 

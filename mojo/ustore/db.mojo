@@ -446,8 +446,8 @@ def _predicate[
 
 @fieldwise_init
 struct Predicate(Defaultable, ImplicitlyCopyable):
-    """The caller's verdict on the keys a scan lists, `ustore_predicate_t`, asked on the calling side in
-    pages of keys, never concurrently with itself within one call."""
+    """The caller's verdict on the keys a scan lists, `ustore_predicate_t`, always asked on the host, as a
+    scan on a device executor lists its pages there too."""
 
     var callback: Address
     """The handler's C entry point; `NULL_ADDRESS` admits every key."""
@@ -666,10 +666,14 @@ struct DatabaseDescription(Answer, Defaultable, ImplicitlyCopyable):
     """Bytes of memory the engine holds for the data."""
     var disk_bytes: c_size_t
     """Bytes the files of the database take on disk."""
+    var pin_refused_bytes: c_size_t
+    """Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request pins its own."""
+    var crossing_requests: c_size_t
+    """Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."""
 
     def __init__(out self):
         """Zeroes every field, which is what a failed report leaves."""
-        self = Self(Capabilities(0), Engine.RAM, Isolation.STRICT_SERIALIZABLE, 0, 0, 0)
+        self = Self(Capabilities(0), Engine.RAM, Isolation.STRICT_SERIALIZABLE, 0, 0, 0, 0, 0)
 
     def __init__(out self, arena: Address, generation: Int, written: DatabaseDescription, count: Int):
         """Adopts the description a call wrote."""
@@ -1568,7 +1572,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         return Scope(self.library, self.address, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, Watch.KEYS)
 
     def on(ref self, ref executor: Executor) -> On[ImmOrigin(origin_of(self, executor))]:
-        """The same verbs, blocking on `executor` after every call submitted there before them. Binding-only."""
+        """The same verbs, blocking on `executor`. Binding-only."""
         var scope = self._scope()
         scope.executor = executor.address
         return On[ImmOrigin(origin_of(self, executor))](scope)

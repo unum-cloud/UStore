@@ -78,7 +78,7 @@ A view is `Copy` and borrows the database, transaction or snapshot it came from,
 The receiver also decides where a verb runs and how it completes, while the verb and its arguments stay the same:
 
 - `database.head().read(..)` runs on the calling thread.
-- `database.head().on(&executor).read(..)` blocks on the executor, after the calls submitted there before it.
+- `database.head().on(&executor).read(..)` blocks on the executor.
 - `database.head().deferred(&executor).read(..)` submits the call and answers a `Deferred`.
 
 `Transaction::on` and `Transaction::deferred` are the same for the view of a transaction watching its keys, and `Snapshot::on` and `Snapshot::deferred` for the view of a snapshot.

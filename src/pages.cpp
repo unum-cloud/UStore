@@ -97,6 +97,6 @@ char const* ustore_page_encoding_name(ustore_page_encoding_t encoding) {
     return name_in(page_encoding_names_k, encoding);
 }
 
-ustore_page_encoding_t ustore_page_encoding_from_name(ustore_bytes_view_t name) {
-    return value_in(page_encoding_names_k, name);
+ustore_status_t ustore_page_encoding_from_name(ustore_bytes_view_t name, ustore_page_encoding_t* encoding) {
+    return value_in(page_encoding_names_k, name, encoding);
 }

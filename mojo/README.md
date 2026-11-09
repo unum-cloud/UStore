@@ -49,7 +49,7 @@ A database, transaction or snapshot runs a verb on the calling thread, `handle.o
 
 ```mojo
 db.write(collections, keys, values)                       # the head, on the calling thread
-db.on(executor).write(collections, keys, values)          # blocking, after every earlier submission
+db.on(executor).write(collections, keys, values)          # blocking, on the executor
 var call = db.deferred(executor).read(collections, keys, arena)  # Deferred[...]
 print(call.wait().present(0))
 ```

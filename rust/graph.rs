@@ -249,7 +249,10 @@ pub(crate) mod ffi {
         pub fn ustore_graph_sample_vertices(arguments: *mut ustore_graph_sample_vertices_t);
         pub fn ustore_graph_measure_vertices(arguments: *mut ustore_graph_measure_vertices_t);
         pub fn ustore_vertex_role_name(vertex_role: ustore_enum_t) -> *const c_char;
-        pub fn ustore_vertex_role_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
+        pub fn ustore_vertex_role_from_name(
+            name: ustore_bytes_view_t,
+            vertex_role: *mut ustore_enum_t,
+        ) -> crate::db::ffi::ustore_status_t;
     }
 }
 
@@ -306,12 +309,7 @@ impl FromStr for Role {
 
     /// Calls `ustore_vertex_role_from_name`, refusing "unknown", which no call takes.
     fn from_str(text: &str) -> Result<Self> {
-        read_spelling(
-            text,
-            ffi::ustore_vertex_role_from_name,
-            ffi::ustore_vertex_role_name,
-            Role::from_raw,
-        )
+        read_spelling(text, ffi::ustore_vertex_role_from_name, Role::from_raw)
     }
 }
 

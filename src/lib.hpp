@@ -25,13 +25,14 @@
  *
  *  An executor serves one call at a time, held from its claim to its end, and a second call from
  *  any thread finishes contended, so nothing queues. A blocking call, and every call on a lent or
- *  caller-inclusive pool, runs on the calling thread. A deferred call on an owned caller-exclusive
- *  pool is copied into the executor and dispatched to pool thread 0, which serves it in the
- *  caller's place while the other threads return at once, so polling alone finishes it. Inside the
- *  call every fork of the pool forks the other threads, so a verb splits its batch the same way in
- *  both modes. A call ends in one order: its own claims and handle counts, the executor claim, then
- *  the message and the status with release ordering, so a caller seeing it final may submit again
- *  or free at once. The next call, a drain or a free joins that dispatch before using the pool.
+ *  caller-inclusive pool, runs on the calling thread, and a VRAM executor's one host thread is its
+ *  caller, which stages, feeds the device and waits on it. A deferred call on an owned
+ *  caller-exclusive pool is copied into the executor and dispatched to pool thread 0, which serves
+ *  it in the caller's place while the other threads return at once, so polling alone finishes it.
+ *  Inside the call every fork of the pool forks the other threads, so a verb splits its batch the
+ *  same way in both modes. A call ends in one order: its own claims and handle counts, the executor
+ *  claim, then the message and the status with release ordering, so a caller seeing it final may
+ *  submit again or free at once. The next call, a drain or a free first joins that dispatch.
  *
  *  Every executor call raises the count of its database, of the transaction, snapshot or cursor it
  *  names, and of its arena at its claim, and lowers them at its end, so freeing any of those
@@ -132,13 +133,16 @@ char const* name_in(enumerator_spelling<enum_type_> const (&names)[count_], enum
     return "unrecognized";
 }
 
-/** The enumerator of @p names spelled @p name, or the zero enumerator for a name none carries. */
+/** Writes to @p value the enumerator of @p names spelled @p name, or refuses a name none
+ *  carries. */
 template <typename enum_type_, std::size_t count_>
-enum_type_ value_in(enumerator_spelling<enum_type_> const (&names)[count_], ustore_bytes_view_t name) noexcept {
+ustore_status_t value_in(enumerator_spelling<enum_type_> const (&names)[count_], ustore_bytes_view_t name,
+                         enum_type_* value) noexcept {
+    if (!value) return ustore_status_invalid_argument_k;
     std::string_view const text = string_of(name);
     for (enumerator_spelling<enum_type_> const& spelling : names)
-        if (spelling.name == text) return spelling.value;
-    return enum_type_ {};
+        if (spelling.name == text) return *value = spelling.value, ustore_status_success_k;
+    return ustore_status_invalid_argument_k;
 }
 
 #pragma endregion Names
@@ -1504,7 +1508,7 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
 
 /** Whether deferred calls on @p executor are delegated to its pool thread 0: an owned
  *  caller-exclusive pool has one of its own, while a lent pool's dispatches and joins stay its
- *  lender's, and an inclusive pool runs nothing without its caller. */
+ *  lender's, and an inclusive pool, as every VRAM executor's is, needs its caller to run. */
 inline bool delegates(ustore_executor_handle_t const& executor) noexcept {
     executor_t const* const owned = std::get_if<executor_t>(&executor.pool);
     return owned && owned->view().caller_exclusivity() == caller_exclusivity_t::caller_exclusive_k;
