@@ -83,6 +83,10 @@ struct view_t {
     /** The stamp every verb of the call reads at outside a transaction and a snapshot, which the
      *  router pinned for a call of several verbs, or zero for each verb to pin its own. */
     ustore_stamp_t stamp = 0;
+
+    /** What the engine took for every verb of a call of several verbs to read its one collection
+     *  through instead of a stamp, which only that engine reads, or null. */
+    void const* reading = nullptr;
 };
 
 /** Bytes an engine's pin of one call's stamp may take in @c call_pin_t, checked by each engine. */
@@ -94,6 +98,9 @@ struct call_pin_t {
 
     /** The stamp the verbs read at, zero while nothing is pinned. */
     ustore_stamp_t stamp = 0;
+
+    /** The reading of the call's one collection the verbs read through instead, or null. */
+    void const* reading = nullptr;
 
     /** Gives the pin back, set by the engine that took it. */
     void (*release)(call_pin_t&) noexcept = nullptr;
@@ -178,8 +185,10 @@ struct database_verbs_t {
     status_t (*changes_cursor_next)(ustore_changes_cursor_next_t const&, view_t const&) noexcept;
     void (*changes_cursor_free)(ustore_changes_cursor_t) noexcept;
 
-    /** Pins the newest stamp into @p pin for one call's verbs; null without stamps. */
-    void (*pin_call)(ustore_database_t, call_pin_t& pin) noexcept;
+    /** Pins the newest stamp into @p pin for one call's verbs, or takes a reading of the one
+     *  @p collection they read where it is not null; null without stamps. */
+    void (*pin_call)(ustore_database_t, ustore_collection_id_t const* collection, view_t const& view,
+                     call_pin_t& pin) noexcept;
 };
 
 /** The verbs of blobs collections served at one home. */

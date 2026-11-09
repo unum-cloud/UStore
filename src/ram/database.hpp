@@ -2657,7 +2657,7 @@ void changes_cursor_free(ustore_changes_cursor_t cursor) noexcept {
 
 /** Claims the newest stamp of @p database's order into the room of @p pin, for one call's verbs. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-void pin_call(ustore_database_t database, call_pin_t& pin) noexcept {
+void pin_call(ustore_database_t database, ustore_collection_id_t const*, view_t const&, call_pin_t& pin) noexcept {
     static_assert(sizeof(claim_t) <= call_pin_bytes_k && alignof(claim_t) <= alignof(std::max_align_t),
                   "An order claim fits the room the router keeps for it");
     database_state<cpu_class_, isolation_>& state = *state_of<database_state<cpu_class_, isolation_>>(database);

@@ -585,7 +585,7 @@ std::size_t thread_index_of(database_state<cpu_class_> const& state, view_t cons
 }
 
 /** The access of a call reading through @p view: its transaction, its snapshot's stamp, the
- *  stamp the router pinned for the call, or the head, which @c read_at_one_state holds. */
+ *  stamp or the reading the router took, or the head, which @c read_at_one_state holds. */
 template <cpu_class_t cpu_class_>
 call_access<cpu_class_> access_of(database_state<cpu_class_>& state, view_t const& view) noexcept {
     std::size_t const thread_index = thread_index_of(state, view);
@@ -602,7 +602,9 @@ call_access<cpu_class_> access_of(database_state<cpu_class_>& state, view_t cons
                 watch_schedule_t::never_k,
                 view.scratch,
                 view.stamp ? static_cast<transaction_stamp_t>(view.stamp) : head_stamp_k,
-                thread_index};
+                thread_index,
+                nullptr,
+                static_cast<collection_reading_of<cpu_class_> const*>(view.reading)};
     transaction_state<cpu_class_>& transaction = *state_of<transaction_state<cpu_class_>>(view.transaction);
     return {state,        transaction.held.get(), schedule_of(view.watch), view.scratch,
             head_stamp_k, thread_index,           &transaction.strings};
@@ -2501,13 +2503,30 @@ void snapshot_free(ustore_snapshot_t handle) noexcept {
     close_reader(state);
 }
 
-/** Pins the newest stamp of the store's ledger into the room of @p pin, for one call's verbs. */
+/** Takes a reading of @p collection into the room of @p pin for one call's verbs on @p view's
+ *  thread, or pins the newest stamp of the store's ledger there for a call naming several. */
 template <cpu_class_t cpu_class_>
-void pin_call(ustore_database_t database, call_pin_t& pin) noexcept {
+void pin_call(ustore_database_t database, ustore_collection_id_t const* collection, view_t const& view,
+              call_pin_t& pin) noexcept {
     using pin_t = typename basic_database_of<cpu_class_>::pin_t;
+    using reading_t = collection_reading_of<cpu_class_>;
     static_assert(sizeof(pin_t) <= call_pin_bytes_k && alignof(pin_t) <= alignof(std::max_align_t),
                   "A ledger pin fits the room the router keeps for it");
+    static_assert(sizeof(reading_t) <= call_pin_bytes_k && alignof(reading_t) <= alignof(std::max_align_t),
+                  "A collection reading fits the room the router keeps for it");
     database_state<cpu_class_>& state = *state_of<database_state<cpu_class_>>(database);
+    if (collection) {
+        // A collection gone since the call resolved it is left to the verbs, which refuse it.
+        auto [taken, taken_status] = state.store->read_collection(*collection, head_stamp_k,
+                                                                  thread_index_of(state, view));
+        if (taken_status.succeeded()) {
+            pin.reading = new (pin.room) reading_t {std::move(taken)};
+            pin.release = [](call_pin_t& pinned) noexcept {
+                std::launder(reinterpret_cast<reading_t*>(pinned.room))->~reading_t();
+            };
+            return;
+        }
+    }
     pin_t* const held = new (pin.room) pin_t {};
     pin.stamp = static_cast<ustore_stamp_t>(state.store->ledger().pin_reader(*held));
     pin.release = [](call_pin_t& pinned) noexcept { std::launder(reinterpret_cast<pin_t*>(pinned.room))->~pin_t(); };

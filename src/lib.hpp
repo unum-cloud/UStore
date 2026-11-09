@@ -760,18 +760,31 @@ status_t list_cursor_keys(engine_t const& engine, ustore_database_t database, cu
 
 #pragma endregion Cursors
 
-/** Hands @p action @p view with every verb of the call reading at one stamp the engine of
- *  @p database pins for it, or @p view itself inside a transaction or a snapshot, or for an engine
+/** Hands @p action @p view with every verb of the call reading at one state the engine of
+ *  @p database holds for it: a reading of @p collection, the one the call reads where it is not
+ *  null, or a pinned stamp; or @p view itself inside a transaction or a snapshot, or for an engine
  *  pinning no stamps. */
 template <typename action_type_>
-status_t with_call_stamp(engine_t const& engine, ustore_database_t database, view_t const& view,
-                         action_type_&& action) noexcept {
-    if (view.transaction || view.snapshot || view.stamp || !engine.database->pin_call) return action(view);
+status_t with_call_stamp(engine_t const& engine, ustore_database_t database, ustore_collection_id_t const* collection,
+                         view_t const& view, action_type_&& action) noexcept {
+    if (view.transaction || view.snapshot || view.stamp || view.reading || !engine.database->pin_call)
+        return action(view);
     call_pin_t pin;
-    engine.database->pin_call(database, pin);
+    engine.database->pin_call(database, collection, view, pin);
     view_t pinned = view;
     pinned.stamp = pin.stamp;
+    pinned.reading = pin.reading;
     return action(pinned);
+}
+
+/** The one collection every task of @p arguments names, or null for a call naming several. */
+template <typename arguments_type_>
+ustore_collection_id_t const* one_collection(arguments_type_ const& arguments) noexcept {
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    if (!arguments.count) return nullptr;
+    for (std::size_t task = 1; task != arguments.count; ++task)
+        if (!(collections[static_cast<std::ptrdiff_t>(task)] == collections[0])) return nullptr;
+    return &collections[0];
 }
 
 /** Finishes a call: the message, then the status with release ordering, which its waiters
@@ -1431,9 +1444,10 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
         if constexpr (home_k != home_t::host_k)
             if (status_t const opened = open_device_call(arguments, executor...); opened.failed()) return opened;
         if constexpr (requires { arguments.cursor->cursor; })
-            return with_call_stamp(engine, database, view, [&](view_t const& pinned) noexcept {
-                return pull(engine, arguments, *arguments.cursor, pinned, executor...);
-            });
+            return with_call_stamp(engine, database, &arguments.cursor->cursor.collection, view,
+                                   [&](view_t const& pinned) noexcept {
+                                       return pull(engine, arguments, *arguments.cursor, pinned, executor...);
+                                   });
         else if constexpr (home_k != home_t::host_k && !requires { verb_slot<arguments_type_>::template verb<home_k>; })
             return status_t {status_code_t::unsupported_k, "Changes and the control plane run on host executors"};
         else if constexpr (requires { verb_slot<arguments_type_>::database; }) {
@@ -1468,15 +1482,16 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
                                                            executor...);
                 if (match_status.failed()) return match_status;
                 if (!match.matches_everything())
-                    return with_call_stamp(engine, database, view, [&](view_t const& pinned) noexcept {
-                        return call_staged(
-                            [&](arguments_type_ const& matched, auto&... rest) noexcept {
-                                if constexpr (home_k == home_t::host_k)
-                                    return scan_matched(engine.host, match, matched, rest...);
-                                else return scan_matched_on_device(engine.host, match, matched, rest...);
-                            },
-                            arguments, pinned, executor...);
-                    });
+                    return with_call_stamp(
+                        engine, database, one_collection(arguments), view, [&](view_t const& pinned) noexcept {
+                            return call_staged(
+                                [&](arguments_type_ const& matched, auto&... rest) noexcept {
+                                    if constexpr (home_k == home_t::host_k)
+                                        return scan_matched(engine.host, match, matched, rest...);
+                                    else return scan_matched_on_device(engine.host, match, matched, rest...);
+                                },
+                                arguments, pinned, executor...);
+                        });
             }
             return call_staged(verb, arguments, view, executor...);
         }
