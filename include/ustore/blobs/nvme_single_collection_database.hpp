@@ -855,18 +855,21 @@ class basic_single_collection_database {
             std::uint32_t const observed = vacated.load(std::memory_order_acquire);
             status_t const taken = collection_.try_claim(claimed);
             if (taken != status_code_t::capacity_exhausted_k) return taken;
-            // A flush frees every published run's record; with none published, every record is out
-            // with a commit.
-            if (collection_.memory_shape().runs != 0) {
-                claim_guard_t const held = claim_guard_t::taken_if_free(*this);
-                if (held.holding()) {
-                    if (status_t const adopted = adopt_channels_(); adopted.failed()) return adopted;
-                    if (status_t const flushed = flush_and_compact_(); flushed.failed()) return flushed;
-                    continue;
+            // Only a vacate frees a record, so the claim is retried once the word moves rather
+            // than under the lock the vacate takes.
+            while (vacated.load(std::memory_order_acquire) == observed) {
+                // A flush frees every published run's record; with none published, every record
+                // is out with a commit.
+                if (collection_.memory_shape().runs != 0) {
+                    claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+                    if (held.holding()) {
+                        if (status_t const adopted = adopt_channels_(); adopted.failed()) return adopted;
+                        if (status_t const flushed = flush_and_compact_(); flushed.failed()) return flushed;
+                        break;
+                    }
                 }
-            }
-            if (vacated.load(std::memory_order_acquire) == observed)
                 waiter_type_ {}(&collection_.vacated(), observed, std::size_t {0});
+            }
         }
     }
 

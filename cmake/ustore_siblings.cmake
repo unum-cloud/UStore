@@ -45,7 +45,7 @@ endforeach ()
 # ForkUnion's C ABI, linked statically into every engine and suite
 ustore_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
-    3bb4413729ce4532a613f0379375045b37cf5356
+    1bd5eaeee9588d9c6df33206cc7627377f18fb1c
 )
 
 # SmashTable's containers, header-only

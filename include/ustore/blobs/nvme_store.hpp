@@ -1909,19 +1909,23 @@ class nvme_store {
             if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
         if (sealed->empty()) return {};
         memory_run_claim_t claimed;
+        atomic_reference_<std::uint32_t const> const vacated {runs_.vacated()};
         for (;;) {
-            atomic_reference_<std::uint32_t const> const vacated {runs_.vacated()};
             std::uint32_t const observed = vacated.load(std::memory_order_acquire);
             status_t const taken = try_claim(claimed);
             if (taken.succeeded()) break;
             if (taken != status_code_t::capacity_exhausted_k) return taken;
-            // A flush frees every published run's record; with none published, every record is out
-            // with a commit.
-            if (runs_.memory_shape().runs != 0) {
-                if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
-            }
-            else if (vacated.load(std::memory_order_acquire) == observed)
+            // Only a vacate frees a record, so the claim is retried once the word moves rather
+            // than under the lock the vacate takes.
+            while (vacated.load(std::memory_order_acquire) == observed) {
+                // A flush frees every published run's record; with none published, every record
+                // is out with a commit.
+                if (runs_.memory_shape().runs != 0) {
+                    if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
+                    break;
+                }
                 waiter_type_ {}(&runs_.vacated(), observed, std::size_t {0});
+            }
         }
         return commit(*sealed, std::move(claimed));
     }

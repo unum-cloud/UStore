@@ -1850,7 +1850,6 @@ class basic_database {
         for (;;) {
             std::uint32_t const* vacated = nullptr;
             std::uint32_t observed = 0;
-            bool flushable = false;
             {
                 reader_t const inside = ledger_.epochs().enter();
                 collection_entry_t* const found = entry_with_id_(collection_id);
@@ -1859,9 +1858,7 @@ class basic_database {
                     [&](auto& collection) noexcept -> status_t {
                         vacated = &collection.vacated();
                         observed = atomic_reference_<std::uint32_t const> {*vacated}.load(std::memory_order_acquire);
-                        status_t const status = collection.try_claim(claimed);
-                        flushable = collection.memory_shape().runs != 0;
-                        return status;
+                        return collection.try_claim(claimed);
                     },
                     found->held);
                 if (taken.succeeded()) {
@@ -1872,25 +1869,37 @@ class basic_database {
                 }
                 if (taken != status_code_t::capacity_exhausted_k) return taken;
             }
-            // A flush frees every published run's record; with none published, every record is out
-            // with a commit.
-            if (flushable) {
-                claim_guard_t const held = claim_guard_t::taken_if_free(*this);
-                if (held.holding()) {
-                    collection_entry_t* const claimed_entry = entry_with_id_(collection_id);
-                    if (!claimed_entry)
-                        return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
-                    if (status_t const flushed = std::visit(
-                            [&](auto& collection) noexcept { return flush_and_compact_(collection); },
-                            claimed_entry->held);
-                        flushed.failed())
-                        return flushed;
-                    continue;
+            // Only a vacate frees a record, so the claim is retried once the word moves rather
+            // than under the lock the vacate takes. Entries never move, so the word stays
+            // readable if a drop destroys the store.
+            atomic_reference_<std::uint32_t const> const vacated_now {*vacated};
+            while (vacated_now.load(std::memory_order_acquire) == observed) {
+                bool flushable = false;
+                {
+                    reader_t const inside = ledger_.epochs().enter();
+                    collection_entry_t* const found = entry_with_id_(collection_id);
+                    if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+                    flushable = std::visit(
+                        [](auto& collection) noexcept { return collection.memory_shape().runs != 0; }, found->held);
                 }
-            }
-            // Entries never move, so the word stays readable if a drop destroys the store.
-            if (atomic_reference_<std::uint32_t const> {*vacated}.load(std::memory_order_acquire) == observed)
+                // A flush frees every published run's record; with none published, every record
+                // is out with a commit.
+                if (flushable) {
+                    claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+                    if (held.holding()) {
+                        collection_entry_t* const claimed_entry = entry_with_id_(collection_id);
+                        if (!claimed_entry)
+                            return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+                        if (status_t const flushed = std::visit(
+                                [&](auto& collection) noexcept { return flush_and_compact_(collection); },
+                                claimed_entry->held);
+                            flushed.failed())
+                            return flushed;
+                        break;
+                    }
+                }
                 waiter_type_ {}(vacated, observed, std::size_t {0});
+            }
         }
     }
 
