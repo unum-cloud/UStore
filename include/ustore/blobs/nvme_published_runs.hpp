@@ -1376,7 +1376,11 @@ class published_runs {
                 memory_runs_.vacate(record);
                 return published;
             }
-            for (memory_run_handle_t const replaced : away) memory_runs_.vacate(replaced);
+            // The merged run views the replaced runs' buffers, so it takes them before they go.
+            for (memory_run_handle_t const replaced : away) {
+                memory_runs_[record.index].run.inherit(std::move(memory_runs_[replaced.index].run));
+                memory_runs_.vacate(replaced);
+            }
         }
     }
 
@@ -1655,8 +1659,8 @@ class published_runs {
         typename memory_run_t::allocator_t const allocator {*constraint_};
         auto [tombstones, tombstones_status] = gathered_range_tombstones(group, allocator);
         if (tombstones_status.failed()) return tombstones_status;
-        return memory_run_t::merged(versions, std::move(tombstones), group.back()->oldest_stamp(), group.back()->tier(),
-                                    allocator);
+        return memory_run_t::merged(group, versions, std::move(tombstones), group.back()->oldest_stamp(),
+                                    group.back()->tier(), allocator);
     }
 
     /** Deltas every memory run of @p view holds. */

@@ -451,10 +451,13 @@ class memory_run {
      *      version did not survive, so neighbouring runs still never overlap.
      *  @param[in] tier The tier of the runs it replaces, which the run is one above.
      *  @param[in] allocator Where the merged run's columns are allocated.
+     *
+     *  The runs replaced are named as @c blobs::memory_run::merged names them, though the run
+     *  copies the strings and the 16-byte values whole and views nothing of theirs.
      */
-    static expected<memory_run> merged(std::span<stamped_delta_t const> versions, range_tombstones_t&& tombstones,
-                                       transaction_stamp_t oldest_stamp, std::uint32_t tier,
-                                       allocator_t allocator = {}) noexcept {
+    static expected<memory_run> merged(std::span<memory_run const* const>, std::span<stamped_delta_t const> versions,
+                                       range_tombstones_t&& tombstones, transaction_stamp_t oldest_stamp,
+                                       std::uint32_t tier, allocator_t allocator = {}) noexcept {
         transaction_stamp_t newest_stamp = std::max(oldest_stamp, tombstones.newest_stamp());
         for (stamped_delta_t const& version : versions) newest_stamp = std::max(newest_stamp, version.stamp);
         auto [deltas, merged_status] = sealed_deltas_t::merged(versions, std::move(tombstones), allocator);
@@ -475,6 +478,9 @@ class memory_run {
         run.tier_ = tier + 1;
         return run;
     }
+
+    /** Takes nothing over from the run replaced, as a merged run of strings copies every byte. */
+    void inherit(memory_run&&) noexcept {}
 
     /** How many merges built the run: tier zero for one commit's, and one above the runs a merge replaced. */
     [[nodiscard]] std::uint32_t tier() const noexcept { return tier_; }

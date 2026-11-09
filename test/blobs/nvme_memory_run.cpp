@@ -17,7 +17,8 @@
 #include <algorithm>       // `std::sort`, `std::upper_bound`
 #include <array>           // `std::array`
 #include <map>             // `std::map`
-#include <memory>          // `std::addressof`
+#include <memory>          // `std::addressof`, `std::make_unique`, `std::unique_ptr`
+#include <optional>        // `std::optional`
 #include <random>          // `std::mt19937_64`, `std::uniform_int_distribution`
 #include <source_location> // `std::source_location`
 #include <span>            // `std::span`
@@ -337,6 +338,148 @@ static std::size_t random_streams_match_model() {
     return failures;
 }
 
+/** Appends a change's bytes to the value below it, into bytes the case frees once a merge returns,
+ *  so a merged run must copy every folded value it keeps. */
+struct appending_fold_t {
+    std::vector<bytes_t>* folded = nullptr;
+
+    expected<std::span<byte_t const>> apply(std::span<byte_t const> base, std::span<delta_view_t const> deltas,
+                                            utilities::arena_allocator<byte_t>&) const noexcept {
+        bytes_t& joined = folded->emplace_back(base.begin(), base.end());
+        for (delta_view_t const& delta : deltas) {
+            if (delta.kind != delta_kind_t::change_k) joined.clear();
+            joined.insert(joined.end(), delta.bytes.begin(), delta.bytes.end());
+        }
+        return std::span<byte_t const> {joined};
+    }
+
+    expected<std::span<byte_t const>> compose(std::span<delta_view_t const> deltas,
+                                              utilities::arena_allocator<byte_t>& arena) const noexcept {
+        return apply({}, deltas, arena);
+    }
+
+    bool closes(delta_view_t const& delta) const noexcept { return delta.kind != delta_kind_t::change_k; }
+};
+
+/** The value of @p stored_key at the head of @p runs, newest first, with its changes appended, or
+ *  none. */
+static std::optional<bytes_t> value_at_head(std::span<run_t const* const> runs, stored_key_t stored_key) {
+    std::vector<delta_view_t> chain;
+    auto gather = [&]() {
+        for (run_t const* run : runs)
+            for (std::size_t position = run->lower_bound(stored_key);
+                 position != run->size() && run->stored_key(position) == stored_key; ++position) {
+                chain.push_back(run->delta(position));
+                if (chain.back().kind != delta_kind_t::change_k) return;
+            }
+    };
+    gather();
+    std::optional<bytes_t> value;
+    for (std::size_t index = chain.size(); index-- != 0;) {
+        if (chain[index].kind == delta_kind_t::remove_k) value.reset();
+        else if (chain[index].kind == delta_kind_t::write_k || !value) value.emplace();
+        if (chain[index].kind != delta_kind_t::remove_k)
+            value->insert(value->end(), chain[index].bytes.begin(), chain[index].bytes.end());
+    }
+    return value;
+}
+
+/** Commits of writes, removals and changes, every other one lending its bytes, merge four runs of a
+ *  tier at a time up to tier three, each merge copying only the values it folded and freeing the
+ *  runs it took the buffers of, and every key reads back as the model. */
+static std::size_t merges_keep_values_intact() {
+    constexpr std::size_t fan_in_k = 4;
+    constexpr std::size_t commits_count_k = fan_in_k * fan_in_k * fan_in_k;
+    constexpr stored_key_t keys_count_k = 24;
+    std::size_t failures = 0;
+    std::mt19937_64 generator(11);
+    std::uniform_int_distribution<std::size_t> deltas_count(1, 6), kind_pick(0, 19), length_pick(0, 48);
+    std::uniform_int_distribution<stored_key_t> key_pick(0, keys_count_k - 1);
+    std::uniform_int_distribution<int> byte_pick(0, 255);
+
+    std::map<stored_key_t, std::optional<bytes_t>> model;
+    // Oldest first, so the runs of one tier due for a merge sit at the back.
+    std::vector<std::unique_ptr<run_t>> runs;
+    auto newest_first = [&]() {
+        std::vector<run_t const*> listed;
+        for (std::size_t index = runs.size(); index-- != 0;) listed.push_back(runs[index].get());
+        return listed;
+    };
+    for (transaction_stamp_t stamp = 1; stamp <= commits_count_k && failures == 0; ++stamp) {
+        std::vector<keyed_delta_t> deltas;
+        std::vector<bytes_t> payloads(deltas_count(generator));
+        for (bytes_t& payload : payloads) {
+            stored_key_t const stored_key = key_pick(generator);
+            bool repeated = false;
+            for (keyed_delta_t const& delta : deltas) repeated |= delta.stored_key == stored_key;
+            if (repeated) continue;
+            std::size_t const kind_roll = kind_pick(generator);
+            delta_kind_t const kind = kind_roll < 12   ? delta_kind_t::write_k
+                                      : kind_roll < 15 ? delta_kind_t::remove_k
+                                                       : delta_kind_t::change_k;
+            if (kind != delta_kind_t::remove_k) payload.resize(length_pick(generator));
+            for (byte_t& value : payload) value = static_cast<byte_t>(byte_pick(generator));
+            deltas.push_back(keyed_delta_t {stored_key, {kind, payload}});
+            std::optional<bytes_t>& modelled = model[stored_key];
+            if (kind == delta_kind_t::remove_k) modelled.reset();
+            else if (kind == delta_kind_t::write_k || !modelled) modelled = payload;
+            else modelled->insert(modelled->end(), payload.begin(), payload.end());
+        }
+        // Every other commit lends its bytes, as a transaction of one collection does, to the run.
+        sealed_t::buffer_t lent;
+        if (stamp % 2 == 0) {
+            std::size_t filled = 0;
+            for (keyed_delta_t const& delta : deltas) filled += delta.delta.bytes.size();
+            failures += check(lent.resize(filled) == st::status_t::success_k);
+            filled = 0;
+            for (keyed_delta_t& delta : deltas) {
+                std::size_t const size = delta.delta.bytes.size();
+                if (size == 0) continue;
+                std::memcpy(lent.data() + filled, delta.delta.bytes.data(), size);
+                delta.delta.bytes = std::span<byte_t const> {lent.data() + filled, size};
+                filled += size;
+            }
+        }
+        byte_t const* const lent_bytes = lent.data();
+        expected<sealed_t> sealed = sealed_t::seal(deltas, {}, {}, std::span<byte_t const> {lent});
+        if (check(sealed.has_value())) return failures + 1;
+        sealed->adopt(lent);
+        failures += check(lent_bytes == nullptr || (lent.empty() && sealed->bases().front() == lent_bytes));
+        expected<run_t> stamped = run_t::stamped(std::move(*sealed), stamp);
+        if (check(stamped.has_value())) return failures + 1;
+        runs.push_back(std::make_unique<run_t>(std::move(*stamped)));
+
+        while (runs.size() >= fan_in_k && runs[runs.size() - fan_in_k]->tier() == runs.back()->tier()) {
+            std::vector<run_t const*> const listed = newest_first();
+            std::span<run_t const* const> const group {listed.data(), fan_in_k};
+            st::vector<stamped_delta<stored_key_t>> versions;
+            std::vector<bytes_t> folded;
+            utilities::arena_allocator<byte_t> unused;
+            failures += check(
+                kept_versions(group, compaction_stamps_t {}, appending_fold_t {&folded}, versions, unused).succeeded());
+            auto [tombstones, tombstones_status] = gathered_range_tombstones(group, st::default_allocator<byte_t> {});
+            failures += check(tombstones_status.succeeded());
+            expected<run_t> merged = run_t::merged(group, std::span<stamped_delta<stored_key_t> const> {versions},
+                                                   std::move(tombstones), group.back()->oldest_stamp(),
+                                                   group.back()->tier());
+            if (check(merged.has_value())) return failures + 1;
+            for (std::size_t index = runs.size() - fan_in_k; index != runs.size(); ++index)
+                merged->inherit(std::move(*runs[index]));
+            runs.resize(runs.size() - fan_in_k);
+            runs.push_back(std::make_unique<run_t>(std::move(*merged)));
+        }
+
+        std::vector<run_t const*> const listed = newest_first();
+        for (stored_key_t stored_key = 0; stored_key != keys_count_k; ++stored_key) {
+            std::optional<bytes_t> const read = value_at_head(std::span<run_t const* const> {listed}, stored_key);
+            std::map<stored_key_t, std::optional<bytes_t>>::const_iterator const found = model.find(stored_key);
+            failures += check(read == (found == model.end() ? std::nullopt : found->second));
+        }
+    }
+    failures += check(runs.size() == 1 && runs.front()->tier() == 3);
+    return failures;
+}
+
 /** A view a publisher allocated and frees once replaced, counting itself out when freed. */
 struct held_view_t {
     view_t view;
@@ -499,6 +642,7 @@ int main() {
     counted("memory_run.removal_and_empty_value_differ", removal_and_empty_value_differ);
     counted("memory_run.range_tombstones_hide_older_runs", range_tombstones_hide_older_runs);
     counted("memory_run.sort_orders_by_key", sort_orders_by_key);
+    counted("memory_run.merges_keep_values_intact", merges_keep_values_intact);
     counted("collection_view.random_streams_match_model", random_streams_match_model);
     counted("collection_view.readers_against_one_publisher", readers_against_one_publisher);
     fmt::println("total {} passed, {} failed", total - failed, failed);

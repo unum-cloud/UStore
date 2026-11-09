@@ -1595,7 +1595,8 @@ class basic_database {
                 st::assume_reserved, keyed_delta<stored_key_t> {stored_key, delta});
         });
         return seal_into_(collection_id, sealed, [&](auto const& collection) noexcept {
-            return collection.seal(std::span<keyed_delta<stored_key_t>> {deltas}, written.ranges(collection_id));
+            return collection.seal(std::span<keyed_delta<stored_key_t>> {deltas}, written.ranges(collection_id),
+                                   written.lendable_bytes());
         });
     }
 

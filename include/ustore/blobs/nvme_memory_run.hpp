@@ -4,17 +4,21 @@
  *  @date October 18, 2026
  *  @brief One commit's deltas for one collection, sealed into sorted columns and stamped once into an immutable run.
  *
- *  A committer seals its private deltas off every shared path, sorting them and copying their
- *  bytes, and the leader that orders the commit stamps the sealed columns into a @c memory_run,
- *  which no one changes afterwards. A delta is a key, a kind and the bytes between two neighbouring
- *  offsets, so a removal and an empty value differ by kind and neither needs a sentinel. The stamps
- *  and the kinds are packed columns, which spend no bits at all on a run of one commit's writes.
+ *  A committer seals its private deltas off every shared path, sorting them, and the leader that
+ *  orders the commit stamps the sealed columns into a @c memory_run, which no one changes
+ *  afterwards. A delta is a key, a kind, a size and a location in one of the byte buffers the run
+ *  views, so a removal and an empty value differ by kind and neither needs a sentinel. A
+ *  transaction writing one collection lends its own buffer, which the run takes over once stamped,
+ *  and a merge views its sources' buffers and takes them over once they retire, so a value byte is
+ *  copied into memory once. The stamps and the kinds are packed columns, which spend no bits at
+ *  all on a run of one commit's writes.
  */
 
 #pragma once
 
+#include <cassert> // `assert`
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint64_t`
+#include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
 #include <algorithm> // `std::max`, `std::min`
@@ -38,6 +42,19 @@ namespace unum::ustore::blobs {
 
 using utilities::delta_kind_t;
 using utilities::delta_view_t;
+
+/** Where the bytes of one delta sit: the buffer among those its run views, and the first byte
+ *  inside it. */
+struct value_location_t {
+
+    /** The buffer, numbered in the order the run views its buffers. */
+    std::uint32_t buffer = 0;
+
+    /** The first byte of the value inside that buffer. */
+    stored_value_offset_t offset = 0;
+};
+
+static_assert(sizeof(value_location_t) == 8, "A location sits in a hot column, so it takes one word");
 
 /** One delta a transaction hands over for sealing: the key it is filed under, its kind and its bytes. */
 template <typename stored_key_type_>
@@ -63,13 +80,19 @@ struct stamped_delta {
 
     /** What it does to the key's value, and the bytes it carries, owned by the run it is carried from. */
     delta_view_t delta;
+
+    /** Where its run holds those bytes, counting the buffers of the runs merged before it, which
+     *  a merged run keeps unless a fold moved the bytes elsewhere. */
+    value_location_t location;
 };
 
 /**
- *  @brief The deltas one transaction wrote to one collection, sorted by key and copied into columns, not yet stamped.
+ *  @brief The deltas one transaction wrote to one collection, sorted by key into columns that
+ *      locate their bytes, not yet stamped.
  *
- *  Sealing runs on the committing thread before the commit is ordered, so the sort and the copy never sit on a path
- *  another commit waits on.
+ *  Sealing runs on the committing thread before the commit is ordered, so the sort and any copy
+ *  never sit on a path another commit waits on. Readers resolve a location through @c bases_, so a
+ *  buffer handed between runs moves no byte, and stamped deltas own every buffer they view.
  */
 template <typename stored_key_type_, typename allocator_type_ = st::default_allocator<byte_t>,
           typename row_kit_type_ = st::native_row_kit_t>
@@ -90,6 +113,9 @@ class sealed_deltas {
         st::immutable_packed_array<std::uint8_t,
                                    typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint64_t>>;
 
+    /** One buffer of value bytes: a transaction's, taken over, or one a seal or merge filled. */
+    using buffer_t = st::vector<byte_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<byte_t>>;
+
     sealed_deltas() noexcept = default;
     sealed_deltas(sealed_deltas&&) noexcept = default;
     sealed_deltas& operator=(sealed_deltas&&) noexcept = default;
@@ -97,19 +123,22 @@ class sealed_deltas {
     sealed_deltas& operator=(sealed_deltas const&) = delete;
 
     /**
-     *  @brief Sorts @p deltas by key in place and copies them and @p ranges into columns on
+     *  @brief Sorts @p deltas by key in place and seals them and @p ranges into columns on
      *      @p allocator; a delta inside a range lands with the commit that removes the range, so
      *      the range hides none of them.
+     *  @param[in] lent The bytes a transaction wrote into its buffer, which every delta views and
+     *      @c adopt takes over once the commit is stamped, or none, which copies the bytes once in
+     *      key order into a buffer of the deltas' own.
      *
      *  @par Statuses:
      *  - @c invalid_argument_k No delta and no range, two deltas of one key, a removal carrying
-     *    bytes, or a range ending at or before its start.
+     *    bytes, a delta's bytes outside @p lent, or a range ending at or before its start.
      *  - @c capacity_exhausted_k More bytes than one sorted run file holds, which every offset
      *    is bounded by.
      *  - @c out_of_memory_k A column could not be allocated.
      */
     static expected<sealed_deltas> seal(std::span<keyed_delta_t> deltas, std::span<range_t const> ranges = {},
-                                        allocator_t allocator = {}) noexcept {
+                                        allocator_t allocator = {}, std::span<byte_t const> lent = {}) noexcept {
         if (deltas.empty() && ranges.empty())
             return status_t {status_code_t::invalid_argument_k, "A seal takes at least one delta or range"};
         utilities::sort_by_stored_key(deltas);
@@ -124,6 +153,10 @@ class sealed_deltas {
                 return status_t {status_code_t::invalid_argument_k, "A removal carries no bytes"};
             if (delta.kind == delta_kind_t::remove_range_k)
                 return status_t {status_code_t::invalid_argument_k, "A range removal seals as a range"};
+            if (!lent.empty() && !delta.bytes.empty() &&
+                (delta.bytes.data() < lent.data() ||
+                 delta.bytes.data() + delta.bytes.size() > lent.data() + lent.size()))
+                return status_t {status_code_t::invalid_argument_k, "A lent buffer holds the bytes of every delta"};
             total_bytes += delta.bytes.size();
             least_kind = std::min(least_kind, static_cast<std::uint8_t>(delta.kind));
             greatest_kind = std::max(greatest_kind, static_cast<std::uint8_t>(delta.kind));
@@ -131,9 +164,41 @@ class sealed_deltas {
         // A memory run flushes into one sorted run file, whose length bounds every offset either holds.
         if (total_bytes > storage_limits_t::sorted_run_file_max_size_k)
             return status_t {status_code_t::capacity_exhausted_k, "The sealed deltas outgrow one run file"};
-        auto [sealed, sealed_status] = columns_of_<keyed_delta_t>(deltas, total_bytes, least_kind, greatest_kind,
-                                                                  allocator);
-        if (sealed_status.failed()) return sealed_status;
+        sealed_deltas sealed(allocator);
+        // Empty values view nothing, so a buffer of overwritten values alone stays with its owner.
+        bool const lends = !lent.empty() && total_bytes != 0;
+        buffer_t copied {typename buffer_t::allocator_t(allocator)};
+        if (sealed.locations_.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k ||
+            sealed.sizes_.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k ||
+            sealed.bases_.reserve(1) != st::status_t::success_k ||
+            sealed.buffers_.reserve(1) != st::status_t::success_k ||
+            (!lends &&
+             copied.resize(st::assume_uninitialized, static_cast<std::size_t>(total_bytes)) != st::status_t::success_k))
+            return status_t {status_code_t::out_of_memory_k, "No room to seal the deltas"};
+        stored_value_offset_t copied_offset = 0;
+        for (std::size_t index = 0; index != deltas.size(); ++index) {
+            std::span<byte_t const> const bytes = deltas[index].delta.bytes;
+            sealed.sizes_[index] = static_cast<stored_value_size_t>(bytes.size());
+            if (lends) {
+                stored_value_offset_t const offset =
+                    bytes.empty() ? 0 : static_cast<stored_value_offset_t>(bytes.data() - lent.data());
+                sealed.locations_[index] = value_location_t {0, offset};
+                continue;
+            }
+            sealed.locations_[index] = value_location_t {0, copied_offset};
+            if (!bytes.empty()) std::memcpy(copied.data() + copied_offset, bytes.data(), bytes.size());
+            copied_offset += static_cast<stored_value_offset_t>(bytes.size());
+        }
+        if (total_bytes != 0) {
+            [[maybe_unused]] st::status_t const based = sealed.bases_.push_back(
+                st::assume_reserved, lends ? lent.data() : static_cast<byte_t const*>(copied.data()));
+            if (!lends) [[maybe_unused]]
+                st::status_t const owned = sealed.buffers_.push_back(st::assume_reserved, std::move(copied));
+        }
+        sealed.held_bytes_ = lends ? lent.size() : total_bytes;
+        if (status_t const indexed = sealed.index_<keyed_delta_t>(deltas, least_kind, greatest_kind, allocator);
+            indexed.failed())
+            return indexed;
         // The commit's stamp lands in the column allocated here, so stamping allocates nothing.
         st::vector<std::uint64_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint64_t>>
             unstamped {typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint64_t>(allocator)};
@@ -148,41 +213,111 @@ class sealed_deltas {
     }
 
     /**
-     *  @brief Copies @p versions into columns on @p allocator, in the order given, which a merge of runs hands over
-     *      in key order with the versions of one key newest first.
+     *  @brief Seals @p versions, kept of the runs of @p group, into columns on @p allocator in the
+     *      order a merge hands them over: by key, with the versions of one key newest first.
+     *
+     *  The versions keep their locations in the buffers of @p group, which the merged deltas view
+     *  through the same bases and take over through @c inherit once the runs of @p group retire.
+     *  Only a version a fold moved is copied, into one buffer of the merged deltas' own.
+     *
      *  @retval out_of_memory_k A column could not be allocated.
      */
-    static expected<sealed_deltas> merged(std::span<stamped_delta<stored_key_t> const> versions,
+    template <typename run_type_>
+    static expected<sealed_deltas> merged(std::span<run_type_ const* const> group,
+                                          std::span<stamped_delta<stored_key_t> const> versions,
                                           range_tombstones_t&& tombstones, allocator_t allocator = {}) noexcept {
-        std::uint64_t total_bytes = 0;
+        sealed_deltas sealed(allocator);
+        std::size_t inherited = 0;
+        for (run_type_ const* run : group) inherited += run->deltas().bases().size();
+        if (sealed.locations_.resize(st::assume_uninitialized, versions.size()) != st::status_t::success_k ||
+            sealed.sizes_.resize(st::assume_uninitialized, versions.size()) != st::status_t::success_k ||
+            sealed.bases_.reserve(inherited + 1) != st::status_t::success_k ||
+            sealed.buffers_.reserve(inherited + 1) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room to merge the deltas"};
+        for (run_type_ const* run : group) {
+            for (byte_t const* base : run->deltas().bases()) [[maybe_unused]]
+                st::status_t const based = sealed.bases_.push_back(st::assume_reserved, std::move(base));
+            sealed.held_bytes_ += run->deltas().held_bytes_;
+        }
+        auto const in_place = [&](stamped_delta<stored_key_t> const& version) noexcept {
+            return version.delta.bytes.data() == sealed.bases_[version.location.buffer] + version.location.offset;
+        };
+
+        std::uint64_t folded_bytes = 0;
         std::uint8_t least_kind = versions.empty() ? 0 : static_cast<std::uint8_t>(versions[0].delta.kind);
         std::uint8_t greatest_kind = least_kind;
         for (stamped_delta<stored_key_t> const& version : versions) {
-            total_bytes += version.delta.bytes.size();
+            if (!version.delta.bytes.empty() && !in_place(version)) folded_bytes += version.delta.bytes.size();
             least_kind = std::min(least_kind, static_cast<std::uint8_t>(version.delta.kind));
             greatest_kind = std::max(greatest_kind, static_cast<std::uint8_t>(version.delta.kind));
         }
-        auto [sealed, sealed_status] = columns_of_(versions, total_bytes, least_kind, greatest_kind, allocator);
-        if (sealed_status.failed()) return sealed_status;
+        buffer_t folded {typename buffer_t::allocator_t(allocator)};
+        if (folded.resize(st::assume_uninitialized, static_cast<std::size_t>(folded_bytes)) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the folded values of a merge"};
+        value_location_t folding {static_cast<std::uint32_t>(inherited), 0};
+        for (std::size_t index = 0; index != versions.size(); ++index) {
+            stamped_delta<stored_key_t> const& version = versions[index];
+            std::span<byte_t const> const bytes = version.delta.bytes;
+            sealed.sizes_[index] = static_cast<stored_value_size_t>(bytes.size());
+            if (bytes.empty() || in_place(version)) {
+                sealed.locations_[index] = bytes.empty() ? value_location_t {} : version.location;
+                continue;
+            }
+            std::memcpy(folded.data() + folding.offset, bytes.data(), bytes.size());
+            sealed.locations_[index] = folding;
+            folding.offset += static_cast<stored_value_offset_t>(bytes.size());
+        }
+        if (folded_bytes != 0) {
+            [[maybe_unused]] st::status_t const based = sealed.bases_.push_back(
+                st::assume_reserved, static_cast<byte_t const*>(folded.data()));
+            [[maybe_unused]] st::status_t const owned = sealed.buffers_.push_back(st::assume_reserved,
+                                                                                  std::move(folded));
+            sealed.held_bytes_ += folded_bytes;
+        }
+        if (status_t const indexed = sealed.index_(versions, least_kind, greatest_kind, allocator); indexed.failed())
+            return indexed;
         sealed.tombstones_ = std::move(tombstones);
         return std::move(sealed);
+    }
+
+    /** Takes over @p buffer when the deltas were sealed viewing its bytes, which moves no byte and
+     *  allocates nothing, as the seal reserved the room; a buffer the deltas never viewed stays
+     *  with its owner. */
+    void adopt(buffer_t& buffer) noexcept {
+        if (buffers_.size() == bases_.size() || bases_[0] != buffer.data()) return;
+        [[maybe_unused]] st::status_t const adopted = buffers_.push_back(st::assume_reserved, std::move(buffer));
+    }
+
+    /** Takes over the buffers of @p replaced, one of the deltas a merge built these from, once no
+     *  reader holds them, which allocates nothing, as the merge reserved the room. */
+    void inherit(sealed_deltas&& replaced) noexcept {
+        for (buffer_t& buffer : replaced.buffers_) [[maybe_unused]]
+            st::status_t const inherited = buffers_.push_back(st::assume_reserved, std::move(buffer));
     }
 
     /** Deltas sealed, at most one per key. */
     [[nodiscard]] std::size_t size() const noexcept { return stored_keys_.size(); }
 
-    /** Bytes every delta's value takes together. */
-    [[nodiscard]] std::size_t values_bytes() const noexcept { return values_.size(); }
+    /** Bytes written into the buffers the deltas view, overwritten values' included, which the
+     *  memory bounds count. */
+    [[nodiscard]] std::size_t values_bytes() const noexcept { return static_cast<std::size_t>(held_bytes_); }
+
+    /** The first byte of every buffer the deltas view, which a location names by its position. */
+    [[nodiscard]] std::span<byte_t const* const> bases() const noexcept { return bases_; }
+
+    /** Where the bytes of the delta at sorted @p position sit. */
+    [[nodiscard]] value_location_t location(std::size_t position) const noexcept { return locations_[position]; }
 
     /** The key at sorted @p position. */
     [[nodiscard]] stored_key_t stored_key(std::size_t position) const noexcept { return stored_keys_.select(position); }
 
     /** The delta at sorted @p position: its kind and the bytes it carries. */
     [[nodiscard]] delta_view_t delta(std::size_t position) const noexcept {
-        std::size_t const begin = offsets_[position];
-        std::size_t const end = offsets_[position + 1];
-        return delta_view_t {static_cast<delta_kind_t>(kinds_[position]),
-                             std::span<byte_t const>(values_.data() + begin, end - begin)};
+        delta_kind_t const kind = static_cast<delta_kind_t>(kinds_[position]);
+        std::size_t const size = sizes_[position];
+        if (size == 0) return delta_view_t {kind, {}};
+        value_location_t const location = locations_[position];
+        return delta_view_t {kind, std::span<byte_t const>(bases_[location.buffer] + location.offset, size)};
     }
 
     /** The first sorted position whose key is not below @p stored_key, or @c size when every key is. */
@@ -194,46 +329,40 @@ class sealed_deltas {
     [[nodiscard]] range_tombstones_t const& range_tombstones() const noexcept { return tombstones_; }
 
     /** Stamps every range tombstone with the commit's @p stamp, which allocates nothing. */
-    void stamp_range_tombstones(transaction_stamp_t stamp) noexcept { tombstones_.assign_stamp(stamp); }
+    void stamp_range_tombstones(transaction_stamp_t stamp) noexcept {
+        assert(buffers_.size() == bases_.size() && "A commit is stamped once its deltas own every buffer they view");
+        tombstones_.assign_stamp(stamp);
+    }
 
   private:
     using key_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_key_t>;
     using stored_keys_t =
         st::immutable_splus_tree<stored_key_t, st::keys_per_row<stored_key_t>(st::default_row_bytes_k), row_kit_type_,
                                  key_allocator_t>;
-    using offsets_t =
-        st::vector<stored_value_offset_t,
-                   typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_value_offset_t>>;
-    using values_t = st::vector<byte_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<byte_t>>;
+
+    template <typename value_type_>
+    using column =
+        st::vector<value_type_, typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>>;
 
     explicit sealed_deltas(allocator_t const& allocator) noexcept
         : stored_keys_(typename stored_keys_t::allocator_t(allocator)),
-          offsets_(typename offsets_t::allocator_t(allocator)), values_(typename values_t::allocator_t(allocator)) {}
+          locations_(typename column<value_location_t>::allocator_t(allocator)),
+          sizes_(typename column<stored_value_size_t>::allocator_t(allocator)),
+          bases_(typename column<byte_t const*>::allocator_t(allocator)),
+          buffers_(typename column<buffer_t>::allocator_t(allocator)) {}
 
-    /** Copies the keys, the bytes and the kinds of @p deltas, in their order, into sealed columns. */
+    /** Builds the tree of the keys and packs the kinds of @p deltas, in their order. */
     template <typename delta_type_>
-    static expected<sealed_deltas> columns_of_(std::span<delta_type_ const> deltas, std::uint64_t total_bytes,
-                                               std::uint8_t least_kind, std::uint8_t greatest_kind,
-                                               allocator_t const& allocator) noexcept {
-        sealed_deltas sealed(allocator);
+    status_t index_(std::span<delta_type_ const> deltas, std::uint8_t least_kind, std::uint8_t greatest_kind,
+                    allocator_t const& allocator) noexcept {
         st::vector<stored_key_t, key_allocator_t> keys {key_allocator_t(allocator)};
-        if (keys.resize(deltas.size()) != st::status_t::success_k ||
-            sealed.offsets_.resize(deltas.size() + 1) != st::status_t::success_k ||
-            sealed.values_.resize(static_cast<std::size_t>(total_bytes)) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "No room to seal the deltas"};
-        stored_value_offset_t offset = 0;
-        for (std::size_t index = 0; index != deltas.size(); ++index) {
-            std::span<byte_t const> const bytes = deltas[index].delta.bytes;
-            keys[index] = deltas[index].stored_key;
-            sealed.offsets_[index] = offset;
-            if (!bytes.empty()) std::memcpy(sealed.values_.data() + offset, bytes.data(), bytes.size());
-            offset += static_cast<stored_value_offset_t>(bytes.size());
-        }
-        sealed.offsets_[deltas.size()] = offset;
+        if (keys.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room to seal the deltas"};
+        for (std::size_t index = 0; index != deltas.size(); ++index) keys[index] = deltas[index].stored_key;
         st::expected<stored_keys_t> tree = stored_keys_t::make(std::span<stored_key_t const> {keys},
                                                                key_allocator_t(allocator));
-        if (!tree) return status_t {status_code_t::out_of_memory_k, "No room for the tree of the sealed keys"};
-        sealed.stored_keys_ = std::move(*tree);
+        if (!tree) return {status_code_t::out_of_memory_k, "No room for the tree of the sealed keys"};
+        stored_keys_ = std::move(*tree);
 
         std::uint8_t pulled = 0;
         auto fill = [&](std::size_t position) noexcept {
@@ -243,19 +372,30 @@ class sealed_deltas {
         };
         st::expected<kinds_t> kinds = kinds_t::make(deltas.size(), least_kind, greatest_kind, fill,
                                                     typename kinds_t::allocator_t(allocator));
-        if (!kinds) return status_t {status_code_t::out_of_memory_k, "No room to pack the kinds of sealed deltas"};
-        sealed.kinds_ = std::move(*kinds);
-        return sealed;
+        if (!kinds) return {status_code_t::out_of_memory_k, "No room to pack the kinds of sealed deltas"};
+        kinds_ = std::move(*kinds);
+        return {};
     }
 
     /** The keys in ascending order, as an S+ tree every lookup descends. */
     stored_keys_t stored_keys_;
 
-    /** One offset per delta and one past the last, so a delta's bytes run from its offset to the next one. */
-    offsets_t offsets_;
+    /** Where every delta's bytes sit, in key order. */
+    column<value_location_t> locations_;
 
-    /** Every delta's bytes back to back, in key order. */
-    values_t values_;
+    /** Bytes every delta carries, in key order, none for a removal. */
+    column<stored_value_size_t> sizes_;
+
+    /** The first byte of every buffer the locations name, which readers resolve through, so a
+     *  buffer handed from run to run moves no byte. */
+    column<byte_t const*> bases_;
+
+    /** The buffers the deltas own, which trail @c bases_ until @c adopt takes a lent one, or until
+     *  @c inherit takes the buffers of a merged run's sources. */
+    column<buffer_t> buffers_;
+
+    /** Bytes written into the buffers the deltas view, as @c values_bytes reports them. */
+    std::uint64_t held_bytes_ = 0;
 
     /** Every delta's @c delta_kind_t, packed. */
     kinds_t kinds_;
@@ -312,6 +452,7 @@ class memory_run {
     /**
      *  @brief The run one merge makes of @p versions, which come in key order with the versions of a key newest first,
      *      for runs of one tier it replaces.
+     *  @param[in] group The runs replaced, whose buffers the run views until it inherits them.
      *  @param[in] versions The versions to merge, in key order with the versions of a key newest first.
      *  @param[in] tombstones The range tombstones the merged run keeps.
      *  @param[in] oldest_stamp The oldest stamp of the runs it replaces, which the run keeps covering where that
@@ -320,13 +461,14 @@ class memory_run {
      *  @param[in] tier The tier of the runs it replaces, which the run is one above.
      *  @param[in] allocator Where the merged run's columns are allocated.
      */
-    static expected<memory_run> merged(std::span<stamped_delta<stored_key_t> const> versions,
+    static expected<memory_run> merged(std::span<memory_run const* const> group,
+                                       std::span<stamped_delta<stored_key_t> const> versions,
                                        range_tombstones_t&& tombstones, transaction_stamp_t oldest_stamp,
                                        std::uint32_t tier, allocator_t allocator = {}) noexcept {
         transaction_stamp_t newest_stamp = std::max(oldest_stamp, tombstones.newest_stamp());
         for (stamped_delta<stored_key_t> const& version : versions)
             newest_stamp = std::max(newest_stamp, version.stamp);
-        auto [deltas, merged_status] = sealed_deltas_t::merged(versions, std::move(tombstones), allocator);
+        auto [deltas, merged_status] = sealed_deltas_t::merged(group, versions, std::move(tombstones), allocator);
         if (merged_status.failed()) return merged_status;
         transaction_stamp_t pulled = unwritten_stamp_k;
         auto fill = [&](std::size_t position) noexcept {
@@ -345,13 +487,20 @@ class memory_run {
         return run;
     }
 
+    /** Takes over the buffers of @p replaced, one of the runs this one was merged from, once no
+     *  reader can reach it and before it is freed, which allocates nothing. */
+    void inherit(memory_run&& replaced) noexcept { deltas_.inherit(std::move(replaced.deltas_)); }
+
     /** How many merges built the run: tier zero for one commit's, and one above the runs a merge replaced. */
     [[nodiscard]] std::uint32_t tier() const noexcept { return tier_; }
 
     /** Deltas the run holds, every version counted. */
     [[nodiscard]] std::size_t size() const noexcept { return deltas_.size(); }
 
-    /** Bytes every delta's value takes together. */
+    /** The sealed columns, which a merge reads the buffers of. */
+    [[nodiscard]] sealed_deltas_t const& deltas() const noexcept { return deltas_; }
+
+    /** Bytes written into the buffers the run views, overwritten values' included. */
     [[nodiscard]] std::size_t values_bytes() const noexcept { return deltas_.values_bytes(); }
 
     /** Bytes the run charges against its store's memory bounds: its values, as its keys take a
@@ -385,7 +534,7 @@ class memory_run {
 
   private:
 
-    /** The sorted keys, offsets, bytes and kinds. */
+    /** The sorted keys, locations, sizes, kinds and the buffers they view. */
     sealed_deltas_t deltas_;
 
     /** The stamp of every delta in sorted order. */
@@ -446,7 +595,8 @@ expected<range_tombstones<typename run_type_::stored_key_t, allocator_type_>> ga
  *  bytes landing in @p arena. A version a range tombstone of @p runs hides from every reader turns
  *  into a removal before that, so a change above it folds onto nothing, and such removals drop once
  *  the chains are folded, as the tombstone stays with the merged runs. The versions view the runs'
- *  keys and bytes, so the runs outlive them until a merged run or a flushed one copies them.
+ *  keys and bytes, and locate the bytes among the runs' buffers in order, so the runs outlive them
+ *  until a merged run inherits their buffers or a flushed one is written.
  */
 template <typename run_type_, utilities::fold_concept fold_type_, typename versions_type_>
 status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps_t const& survival,
@@ -465,6 +615,18 @@ status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps
         typename std::allocator_traits<typename versions_type_::allocator_type>::template rebind_alloc<std::uint32_t>;
     st::vector<std::size_t, positions_allocator_t> positions {positions_allocator_t {versions.get_allocator()}};
     utilities::loser_tree<tournament_allocator_t> tournament {tournament_allocator_t {versions.get_allocator()}};
+    // A merge views all its runs' buffers in order, so a location counts those before its run.
+    constexpr bool located = requires(run_type_ const& run) { run.deltas().bases(); };
+    st::vector<std::uint32_t, tournament_allocator_t> first_buffers {tournament_allocator_t {versions.get_allocator()}};
+    if constexpr (located) {
+        if (first_buffers.resize(st::assume_uninitialized, runs.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A merge could not hold its versions"};
+        std::uint32_t buffers = 0;
+        for (std::size_t index = 0; index != runs.size(); ++index) {
+            first_buffers[index] = buffers;
+            buffers += static_cast<std::uint32_t>(runs[index]->deltas().bases().size());
+        }
+    }
     // Every run sits in key order with a key's versions newest first, so a tournament of the runs'
     // heads merges them, an exhausted run's head preceding none.
     auto const precedes = [&](std::uint32_t first, std::uint32_t second) noexcept {
@@ -484,8 +646,12 @@ status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps
         std::uint32_t const head = tournament.least();
         run_type_ const& run = *runs[head];
         std::size_t const position = positions[head]++;
-        [[maybe_unused]] st::status_t const placed = versions.push_back(
-            st::assume_reserved, version_t {run.stored_key(position), run.stamp(position), run.delta(position)});
+        version_t version {run.stored_key(position), run.stamp(position), run.delta(position)};
+        if constexpr (located) {
+            version.location = run.deltas().location(position);
+            version.location.buffer += first_buffers[head];
+        }
+        [[maybe_unused]] st::status_t const placed = versions.push_back(st::assume_reserved, std::move(version));
         tournament.replay(precedes);
     }
     auto const hidden = [&](version_t const& version) noexcept {

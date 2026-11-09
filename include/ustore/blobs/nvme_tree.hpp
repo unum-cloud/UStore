@@ -512,8 +512,9 @@ class lsm_tree {
      *  @param[in] stamps The stamp of every key slot, in the same order.
      *  @param[in] kinds The @c delta_kind_t of every key slot, in the same order.
      *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
-     *  @param[in] stored_values The values back to back in sorted order, one of @p value_max_size bytes per key slot
-     *      for a fixed width.
+     *  @param[in] stored_values The values back to back in sorted order, one of @p value_max_size
+     *      bytes per key slot for a fixed width, as one span or as a @c gathered_values_concept
+     *      that gathers them into the write blocks.
      *  @param[in] value_offsets Where each value starts inside @p stored_values and one past the last, for a variable
      *      width alone.
      *  @param[in] value_max_size The largest value the collection admits, kept in the run's header.
@@ -521,8 +522,9 @@ class lsm_tree {
      *  @param[in] tails The tails of the keys the key slots' heads cut short, in the same order, none for whole keys.
      *  @param[in] tombstones The flushed commits' range tombstones, which the run keeps whole.
      */
+    template <typename values_type_ = std::span<byte_t const>>
     status_t flush(io_channel_t& channel, std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
-                   std::span<std::uint8_t const> kinds, std::uint64_t floor, std::span<byte_t const> stored_values,
+                   std::span<std::uint8_t const> kinds, std::uint64_t floor, values_type_ const& stored_values,
                    std::span<stored_value_offset_t const> value_offsets, stored_value_size_t value_max_size,
                    lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
                    key_tails_column_t const& tails = {},

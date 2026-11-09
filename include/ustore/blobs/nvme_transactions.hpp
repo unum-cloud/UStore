@@ -152,7 +152,8 @@ class transaction_deltas {
     /** The deltas of every written collection. */
     collections_t collections_by_id;
 
-    /** The bytes every written value of every collection sits in. */
+    /** The bytes every written value of every collection sits in, sized by the first write that
+     *  lands bytes, as a landed commit of one collection takes it over. */
     st::vector<std::byte, constrained_allocator<std::byte, atomic_reference_>> insertions_buffer;
 
     /** The first free byte of @c insertions_buffer. */
@@ -175,6 +176,15 @@ class transaction_deltas {
 #pragma region Interface Methods
 
     inline bool empty() const noexcept { return elements_count_ == 0; }
+
+    /** The bytes a landed commit takes over with the buffer: every written byte when one collection
+     *  holds them and they fill half the buffer or more, so a run holds at most twice the bytes its
+     *  memory bounds count, or none, which the seal copies. */
+    [[nodiscard]] std::span<std::byte const> lendable_bytes() const noexcept {
+        bool const lends = collections_by_id.size() == 1 && 2 * next_inserted_offset >= insertions_buffer.size();
+        return lends ? std::span<std::byte const> {insertions_buffer}.first(next_inserted_offset)
+                     : std::span<std::byte const> {};
+    }
     inline std::size_t count() const noexcept { return elements_count_; }
 
     /** The keys written inside @p id. */
@@ -283,7 +293,7 @@ class transaction_deltas {
     /** The budget the deltas of every collection are charged to. */
     resources_shared_ptr<atomic_reference_, waiter_type_> resources_;
 
-    /** The bytes @c insertions_buffer holds. */
+    /** The bytes @c insertions_buffer holds once sized. */
     std::size_t capacity_bytes_ = 0;
 
     /** The keys every collection together admits. */
@@ -303,10 +313,7 @@ inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row
     : collections_by_id({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}),
       insertions_buffer(constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}),
       next_inserted_offset(0), resources_(resources), capacity_bytes_(capacity_bytes),
-      elements_max_count_(elements_max_count), elements_count_(0) {
-    // A budget that refuses the bytes leaves no capacity, and `can_fit` then refuses every write.
-    if (st::failed(insertions_buffer.resize(capacity_bytes))) capacity_bytes_ = 0;
-}
+      elements_max_count_(elements_max_count), elements_count_(0) {}
 
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
           typename row_kit_type_>
@@ -531,6 +538,9 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     if (collection->stored_values.reserve_more(1) == collection_deltas_t::stored_values_t::reserve_result_t::failed_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another key"};
 
+    if (!stored_value.empty() && insertions_buffer.size() != capacity_bytes_ &&
+        insertions_buffer.resize(st::assume_uninitialized, capacity_bytes_) != st::status_t::success_k)
+        return status_t {status_code_t::out_of_memory_k, "No room for the bytes of the transaction"};
     stored_value_offset_t inserted_offset = 0;
     if (!stored_value.empty()) {
         inserted_offset = static_cast<stored_value_offset_t>(next_inserted_offset);
@@ -682,6 +692,9 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     if (!can_fit(held ? 0 : 1, folded.bytes.size())) [[unlikely]]
         return status_t {status_code_t::capacity_exhausted_k,
                          "The transaction holds transaction_max_deltas or transaction_max_bytes"};
+    if (!folded.bytes.empty() && insertions_buffer.size() != capacity_bytes_ &&
+        insertions_buffer.resize(st::assume_uninitialized, capacity_bytes_) != st::status_t::success_k)
+        return status_t {status_code_t::out_of_memory_k, "No room for the bytes of the transaction"};
     stored_value_offset_t inserted_offset = 0;
     if (!folded.bytes.empty()) {
         inserted_offset = static_cast<stored_value_offset_t>(next_inserted_offset);
@@ -1518,8 +1531,10 @@ template <typename stored_key_type_, typename store_type_, template <typename> t
 inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
                                  row_kit_type_>::publish_commit_(void* context, transaction_stamp_t stamp) noexcept {
     commit_t const& committing = *static_cast<commit_t const*>(context);
-    for (auto& sealed : committing.data->sealed)
+    for (auto& sealed : committing.data->sealed) {
+        sealed.commit.adopt(committing.data->deltas.insertions_buffer);
         committing.owner->store_->publish_collection(sealed.id, sealed.commit, stamp);
+    }
     for (transaction_share_t* share = committing.data->shares; share != nullptr; share = share->next)
         share->publish(share->context, stamp);
 }

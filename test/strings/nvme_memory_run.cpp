@@ -498,7 +498,7 @@ static std::size_t merges_keep_visible_versions() {
             utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
             failures += check(
                 kept_versions(group, survival, utilities::last_write_fold_t {}, versions, folded_bytes).succeeded());
-            expected<run_t> merged = run_t::merged(std::span<stamped_delta_t const> {versions},
+            expected<run_t> merged = run_t::merged(group, std::span<stamped_delta_t const> {versions},
                                                    *gathered_range_tombstones(group, st::default_allocator<byte_t> {}),
                                                    group.back()->oldest_stamp(), group.back()->tier());
             if (check(merged.has_value())) return failures + 1;

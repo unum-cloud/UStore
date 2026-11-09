@@ -834,7 +834,8 @@ class basic_single_collection_database {
             [[maybe_unused]] st::status_t const placed = deltas.push_back(
                 st::assume_reserved, keyed_delta<stored_key_t> {stored_key, delta});
         });
-        auto [taken, seal_status] = collection_.seal(std::span<keyed_delta<stored_key_t>> {deltas});
+        auto [taken, seal_status] = collection_.seal(std::span<keyed_delta<stored_key_t>> {deltas}, {},
+                                                     written.lendable_bytes());
         if (seal_status.failed()) return seal_status;
         sealed = std::move(taken);
         return make_room_(sealed);

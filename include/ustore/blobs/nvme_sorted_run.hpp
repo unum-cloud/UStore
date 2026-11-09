@@ -78,6 +78,7 @@
 
 #include <algorithm>   // `std::min`, `std::max`
 #include <array>       // `std::array`
+#include <concepts>    // `std::convertible_to`
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -592,6 +593,15 @@ inline expected<kinds_column_t> pack_kinds(std::span<std::uint8_t const> kinds) 
 
 #pragma region Sorted Run
 
+/** Values a run write takes piecewise: @c size bytes in all, @c gather filling @c into with the
+ *  bytes from @c from on, so a flush copies each value once, from where its memory runs hold it
+ *  straight into a write block. */
+template <typename values_type_>
+concept gathered_values_concept = requires(values_type_ const& values, std::uint64_t from, std::span<byte_t> into) {
+    { values.size() } noexcept -> std::convertible_to<std::uint64_t>;
+    { values.gather(from, into) } noexcept;
+};
+
 /**
  *  @brief One immutable run of key slots and the values they locate, held as one extent
  *      of one volume.
@@ -748,7 +758,8 @@ class lsm_sorted_run {
      *  @param[in] kinds The @c delta_kind_t of every key slot, in the same order.
      *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
      *  @param[in] stored_values The values back to back in sorted order, which for a fixed-width
-     *      run are @p value_max_size bytes per key slot, removals included.
+     *      run are @p value_max_size bytes per key slot, removals included, as one span or as a
+     *      @c gathered_values_concept that gathers them a block at a time.
      *  @param[in] value_offsets Where each key slot's value starts inside @p stored_values and one past the last, for
      *      a variable-width run alone; none otherwise.
      *  @param[in] value_max_size The largest value the writing collection admits, which is the width of every value
@@ -759,10 +770,11 @@ class lsm_sorted_run {
      *  @return The run, opened again from the volume, or the status that stopped the write with its
      *      extent given back.
      */
+    template <typename values_type_ = std::span<byte_t const>>
     static expected<lsm_sorted_run> write(volume_type_& volume, io_channel_t& channel, uuid_t const& collection,
                                           uuid_t const& content_id, std::span<key_slot_t const> key_slots,
                                           std::span<std::uint64_t const> stamps, std::span<std::uint8_t const> kinds,
-                                          std::uint64_t floor, std::span<byte_t const> stored_values,
+                                          std::uint64_t floor, values_type_ const& stored_values,
                                           std::span<stored_value_offset_t const> value_offsets,
                                           stored_value_size_t value_max_size, key_tails_column_t const& tails = {},
                                           range_tombstones_t const& tombstones = range_tombstones_t {}) noexcept {
@@ -783,15 +795,17 @@ class lsm_sorted_run {
      *      @c write takes.
      *  @return The reservation @c write_sections fills, or the status that refused the run with nothing reserved.
      */
+    template <typename values_type_ = std::span<byte_t const>>
     static expected<sorted_run_reservation_t> reserve(
         volume_type_& volume, io_channel_t& channel, uuid_t const& collection, uuid_t const& content_id,
         std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
-        std::span<std::uint8_t const> kinds, std::uint64_t floor, std::span<byte_t const> stored_values,
+        std::span<std::uint8_t const> kinds, std::uint64_t floor, values_type_ const& stored_values,
         std::span<stored_value_offset_t const> value_offsets, stored_value_size_t value_max_size,
         key_tails_column_t const& tails = {}, range_tombstones_t const& tombstones = range_tombstones_t {}) noexcept {
         if (!content_id.is_valid())
             return status_t {status_code_t::invalid_argument_k, "A run is named by a valid identifier"};
-        if (status_t const checked = check_values_(stored_values, value_offsets, key_slots.size(), value_max_size);
+        if (status_t const checked = check_values_(stored_values.size(), value_offsets, key_slots.size(),
+                                                   value_max_size);
             checked.failed())
             return checked;
         if (stamps.size() != key_slots.size() || kinds.size() != key_slots.size())
@@ -874,9 +888,10 @@ class lsm_sorted_run {
      *  @return Success, or the status that stopped the write, after which the caller
      *      deallocates the extent.
      */
+    template <typename values_type_ = std::span<byte_t const>>
     static status_t write_sections(volume_type_& volume, io_channel_t& channel,
                                    sorted_run_reservation_t const& reservation, std::span<key_slot_t const> key_slots,
-                                   std::span<byte_t const> stored_values,
+                                   values_type_ const& stored_values,
                                    std::span<stored_value_offset_t const> value_offsets) noexcept {
         std::uint64_t const block_bytes = block_bytes_of_(channel);
         if (block_bytes < sorted_run_layout_t::header_bytes())
@@ -1479,15 +1494,16 @@ class lsm_sorted_run {
         }
     }
 
-    /** Refuses @p stored_values and @p value_offsets unless they lay out the values of @p key_slots_count key slots
-     *  as this layout stores them: none inline, @p value_max_size bytes each at a fixed width, and located by one
-     *  ascending offset per key slot and one past the last at a variable width. */
-    static status_t check_values_(std::span<byte_t const> stored_values,
+    /** Refuses @p stored_values_bytes and @p value_offsets unless they lay out the values of
+     *  @p key_slots_count key slots as this layout stores them: none inline, @p value_max_size
+     *  bytes each at a fixed width, and located by one ascending offset per key slot and one past
+     *  the last at a variable width. */
+    static status_t check_values_(std::uint64_t stored_values_bytes,
                                   std::span<stored_value_offset_t const> value_offsets, std::size_t key_slots_count,
                                   stored_value_size_t value_max_size) noexcept {
         if constexpr (carries_value_offsets_k) {
             if (value_offsets.size() != key_slots_count + 1 || value_offsets.front() != 0 ||
-                value_offsets.back() != stored_values.size())
+                value_offsets.back() != stored_values_bytes)
                 return {status_code_t::invalid_argument_k,
                         "A run takes one value offset per key slot and one past them"};
             for (std::size_t index = 1; index != value_offsets.size(); ++index)
@@ -1501,7 +1517,7 @@ class lsm_sorted_run {
             std::uint64_t const expected_bytes = holds_values_inline_k
                                                      ? 0
                                                      : std::uint64_t {key_slots_count} * value_max_size;
-            if (stored_values.size() != expected_bytes)
+            if (stored_values_bytes != expected_bytes)
                 return {status_code_t::invalid_argument_k,
                         holds_values_inline_k ? "An inline run carries no stored values"
                                               : "A fixed-width run takes one value of its width per key slot"};
@@ -1620,10 +1636,11 @@ class lsm_sorted_run {
         return tails.at(index).compare(tails.at(index - 1));
     }
 
-    /** Stages @p bytes zero-padded to @p section bytes at @p offset of @p extent, a block
-     *  at a time. */
+    /** Stages @p bytes zero-padded to @p section bytes at @p offset of @p extent, a block at a
+     *  time, gathering each block's share when @p bytes is a @c gathered_values_concept. */
+    template <typename bytes_type_ = std::span<byte_t const>>
     static status_t write_bytes_(write_pipeline_t& writer, medium_extent_t const& extent, std::uint64_t offset,
-                                 std::uint64_t section, std::span<byte_t const> bytes) noexcept {
+                                 std::uint64_t section, bytes_type_ const& bytes) noexcept {
         for (std::uint64_t written = 0; written != section;) {
             auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
             if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
@@ -1634,7 +1651,11 @@ class lsm_sorted_run {
             std::span<byte_t> const payload = block.bytes().first(static_cast<std::size_t>(chunk));
             std::uint64_t const left = bytes.size() > written ? bytes.size() - written : 0;
             std::uint64_t const carried = left < chunk ? left : chunk;
-            if (carried != 0) std::memcpy(payload.data(), bytes.data() + written, static_cast<std::size_t>(carried));
+            if constexpr (gathered_values_concept<bytes_type_>) {
+                if (carried != 0) bytes.gather(written, payload.first(static_cast<std::size_t>(carried)));
+            }
+            else if (carried != 0)
+                std::memcpy(payload.data(), bytes.data() + written, static_cast<std::size_t>(carried));
             std::memset(payload.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
             if (status_t const queued = writer.enqueue_write(std::move(block), extent.slice(offset + written, chunk));
                 queued.failed())

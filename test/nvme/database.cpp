@@ -1534,6 +1534,150 @@ std::size_t commit_is_all_or_nothing(mount_type_ const& mount) {
     return failures;
 }
 
+/** A transaction writing one collection hands its buffer to the run its commit lands, so a read of
+ *  the run's values views the very bytes the transaction wrote, which no seal copied; one filling
+ *  less than half its buffer is copied, so a run never holds twice what its bounds count. */
+template <typename mount_type_>
+std::size_t single_collection_commit_keeps_its_bytes(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    constexpr std::size_t keys_k = 6;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+    expected<collection_id_t> const own = create_named(store, "own", test_config(0, value_max_size_k));
+    failures += expect(own.has_value());
+    if (failures != 0) return failures;
+
+    // Commits a transaction of @p capacity bytes over the keys of @p round, answering how many
+    // values a read views outside the bytes the transaction wrote.
+    auto moved_values = [&](std::size_t capacity, std::size_t round) {
+        std::size_t moved = keys_k;
+        transaction_config_t shape;
+        shape.max_bytes = capacity;
+        shape.max_deltas = keys_k;
+        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction(shape);
+        failures += expect(transaction.has_value());
+        if (!transaction) return moved;
+        std::array<stored_key_t, keys_k> keys {};
+        std::array<byte_t const*, keys_k> written {};
+        for (std::size_t key = 0; key != keys_k; ++key) {
+            std::array<byte_t, 512> value {};
+            std::size_t const width = blob_bytes_of(key);
+            for (std::size_t position = 0; position != width; ++position)
+                value[position] = painted(key + round, position);
+            keys[key] = static_cast<stored_key_t>(key);
+            failures += expect(
+                (*transaction)
+                    ->insert(any_collection_id_t {*own}, keys[key], stored_value_view_t {value.data(), width})
+                    .succeeded());
+            delta_view_t held;
+            failures += expect((*transaction)->uncommitted_delta(*own, keys[key], held));
+            written[key] = held.bytes.data();
+        }
+        failures += expect((*transaction)->commit().succeeded());
+
+        std::array<lookup_result_t, keys_k> results {};
+        std::array<byte_t const*, keys_k> viewed {};
+        failures += expect(
+            store
+                .select(any_collection_id_t {*own}, std::span<stored_key_t const> {keys},
+                        std::span<lookup_result_t> {results},
+                        [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
+                            if (offset == 0) viewed[request] = bytes.data();
+                        })
+                .succeeded());
+        moved = 0;
+        for (std::size_t key = 0; key != keys_k; ++key)
+            moved += results[key] != lookup_result_t::written_k || viewed[key] != written[key];
+        return moved;
+    };
+    std::size_t filled = 0;
+    for (std::size_t key = 0; key != keys_k; ++key) filled += blob_bytes_of(key);
+    failures += expect_eq(moved_values(filled, 0), std::size_t {0});
+    failures += expect_eq(moved_values(filled * 4, 1), keys_k);
+    return failures;
+}
+
+/** Transactions writing one collection, and some writing a second beside it, land tier-zero runs
+ *  that merge four at a time, then flush, and every key reads back what its last commit wrote, from
+ *  the merged runs and from the level. */
+template <typename mount_type_>
+std::size_t merged_and_flushed_values_read_back(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    constexpr std::size_t rounds_k = 64;
+    constexpr std::uint64_t keys_k = 40;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+    expected<collection_id_t> const own = create_named(store, "own", test_config(0, value_max_size_k));
+    expected<collection_id_t> const beside = create_named(store, "beside", test_config(0, value_max_size_k));
+    failures += expect(own.has_value());
+    failures += expect(beside.has_value());
+    if (failures != 0) return failures;
+
+    // The round that last wrote each key, plus one, so zero stands for a key never written.
+    std::array<std::uint64_t, keys_k> own_rounds {};
+    std::array<std::uint64_t, keys_k> beside_rounds {};
+    auto paint = [](std::uint64_t key, std::uint64_t round, std::array<byte_t, 512>& value) noexcept {
+        std::size_t const width = blob_bytes_of(key + round);
+        for (std::size_t position = 0; position != width; ++position) value[position] = painted(key + round, position);
+        return width;
+    };
+    auto read_back = [&](collection_id_t collection, std::span<std::uint64_t const> rounds) {
+        std::size_t mismatches = 0;
+        for (std::uint64_t key = 0; key != keys_k; ++key) {
+            if (rounds[key] == 0) continue;
+            std::array<byte_t, 512> wanted {};
+            std::size_t const width = paint(key, rounds[key] - 1, wanted);
+            std::array<byte_t, 512> into {};
+            stored_value_size_t size = 0;
+            status_t const selected = store.select(any_collection_id_t {collection}, static_cast<stored_key_t>(key),
+                                                   std::span<byte_t> {into}, size);
+            mismatches += selected.failed() || size != width || std::memcmp(into.data(), wanted.data(), width) != 0;
+        }
+        return expect_eq(mismatches, std::size_t {0});
+    };
+
+    for (std::uint64_t round = 0; round != rounds_k && failures == 0; ++round) {
+        // Sized to the widest values, so a buffer of one collection is over half full and lent.
+        transaction_config_t shape;
+        shape.max_deltas = (round % 6 == 5 ? 2 : 1) * (1 + round % 5);
+        shape.max_bytes = shape.max_deltas * blob_bytes_of(96);
+        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction(shape);
+        failures += expect(transaction.has_value());
+        if (!transaction) break;
+        for (std::uint64_t step = 0; step != 1 + round % 5; ++step) {
+            stored_key_t const key = static_cast<stored_key_t>((round * 7 + step * 3) % keys_k);
+            std::array<byte_t, 512> value {};
+            std::size_t const width = paint(key, round, value);
+            failures += expect((*transaction)
+                                   ->insert(any_collection_id_t {*own}, key, stored_value_view_t {value.data(), width})
+                                   .succeeded());
+            own_rounds[key] = round + 1;
+            if (round % 6 != 5) continue;
+            failures += expect(
+                (*transaction)
+                    ->insert(any_collection_id_t {*beside}, key, stored_value_view_t {value.data(), width})
+                    .succeeded());
+            beside_rounds[key] = round + 1;
+        }
+        failures += expect((*transaction)->commit().succeeded());
+        if (round % 16 == 15) failures += read_back(*own, own_rounds) + read_back(*beside, beside_rounds);
+    }
+    failures += expect(store.memory_shape(any_collection_id_t {*own}).runs < rounds_k / 4);
+    failures += expect(store.flush().succeeded());
+    failures += read_back(*own, own_rounds) + read_back(*beside, beside_rounds);
+    return failures;
+}
+
 /** A transaction that conflicts on one collection stages nothing, and leaves the other untouched. */
 template <typename mount_type_>
 std::size_t conflict_leaves_the_other_collection_untouched(mount_type_ const& mount) {
@@ -2562,6 +2706,8 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "user_data", user_data_round_trips);
         report(totals, mount, "archive_both_ways", archive_saves_incrementally_both_ways);
         report(totals, mount, "commit_is_all_or_nothing", commit_is_all_or_nothing);
+        report(totals, mount, "single_collection_commit_keeps_its_bytes", single_collection_commit_keeps_its_bytes);
+        report(totals, mount, "merged_and_flushed_values_read_back", merged_and_flushed_values_read_back);
         report(totals, mount, "conflict_spares_the_other", conflict_leaves_the_other_collection_untouched);
         report(totals, mount, "rollback_and_renew", rollback_and_renew_behave);
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
