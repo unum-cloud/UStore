@@ -156,9 +156,9 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     collection_reading_of<cpu_class_> held;
     if (status_t const one = read_at_one_state(access, collections, arguments.count, held); one.failed()) return one;
     auto read_slice = [&](std::size_t begin, std::size_t length, view_t const& slice) noexcept -> status_t {
-        call_access<cpu_class_> const sliced {state,         nullptr,       watch_schedule_t::never_k,
-                                              slice.scratch, access.stamp,  thread_index_of(state, slice),
-                                              nullptr,       access.reading};
+        call_access<cpu_class_> const sliced {state,          access.transaction, access.schedule,
+                                              slice.scratch,  access.stamp,       thread_index_of(state, slice),
+                                              access.strings, access.reading};
         for (std::size_t first = begin; first != begin + length;) {
             std::size_t const last = run_end(collections, first, begin + length);
             if (status_t const read = read_strings(sliced, collections[first], texts, first, last, outputs);

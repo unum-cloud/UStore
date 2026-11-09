@@ -631,6 +631,41 @@ std::size_t strings_one_head_two_writers(config_t const& config) {
     return failures;
 }
 
+/** A read through a transaction finds the strings it wrote and those committed before it began,
+ *  and not one another commit wrote after it began. */
+std::size_t strings_transaction_reads_its_own(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t fixture {config};
+    if (!fixture.ready()) return failures + 1;
+    ustore_outcome_t described {};
+    ustore_database_description_t description {};
+    ustore_database_describe_t describe {};
+    describe.database = fixture.database;
+    describe.outcome = &described;
+    describe.description = &description;
+    ustore_database_describe(&describe);
+    failures += expect_success(described);
+    if (!(description.capabilities & ustore_capabilities_transactions_k)) return failures;
+
+    std::array<std::string_view, 3> const texts {"before", "own", "after"};
+    std::array<ustore_key_t, 3> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
+    failures += write_one(fixture, texts[0], keys[0]);
+    transaction_holder_t reader;
+    failures += begin_transaction(fixture, reader);
+    if (failures != 0) return failures;
+    ustore_outcome_t outcome = write_strings(fixture, std::span {&texts[1], 1}, std::span {&keys[1], 1},
+                                             reader.transaction);
+    failures += expect_success(outcome);
+    failures += write_one(fixture, texts[2], keys[2]);
+
+    read_results_t results;
+    failures += read_strings(fixture, texts, results, ustore_transaction_view(reader.transaction, ustore_watch_keys_k));
+    failures += expect(results.present(0) && results.value_of(0) == keys[0]);
+    failures += expect(results.present(1) && results.value_of(1) == keys[1]);
+    failures += expect(!results.present(2));
+    return failures;
+}
+
 /** A string of 64 KiB is a key like any other, beside a shorter one of the same head: it reads
  *  back, a walk of a prefix lists it whole, and a removal takes it away. */
 std::size_t strings_long_string(config_t const& config) {
@@ -945,6 +980,7 @@ int main(int argc, char** argv) {
     report(totals, "strings.shared_heads", strings_shared_heads, config);
     report(totals, "strings.name_taken_across_modalities", strings_name_taken_across_modalities, config);
     report(totals, "strings.one_head_two_writers", strings_one_head_two_writers, config);
+    report(totals, "strings.transaction_reads_its_own", strings_transaction_reads_its_own, config);
     report(totals, "strings.long_string", strings_long_string, config);
     report(totals, "strings.scan_pagination", strings_scan_pagination, config);
     report(totals, "strings.range_end_bound", strings_range_end_bound, config);
