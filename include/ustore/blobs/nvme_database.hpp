@@ -703,6 +703,40 @@ class basic_database {
         transaction_stamp_t unlisted_stamp = invalid_transaction_stamp_k;
     };
 
+    /**
+     *  @brief One collection read at one state for a whole call: the ledger's epochs entered once
+     *      on the calling thread, the collection found once and the view of its store loaded once.
+     *
+     *  Every read through it walks that view with no pin, as the epochs keep the view and the runs
+     *  it names alive while merges publish newer ones, and other threads of the call may read
+     *  through it while it lives. Its thread holds the epochs until it dies, which every
+     *  publication of a view waits out, so it lives through no write.
+     */
+    class collection_reading_t {
+      public:
+        collection_reading_t() noexcept = default;
+        collection_reading_t(collection_reading_t const&) = delete;
+        collection_reading_t& operator=(collection_reading_t const&) = delete;
+        collection_reading_t(collection_reading_t&&) noexcept = default;
+        collection_reading_t& operator=(collection_reading_t&&) noexcept = default;
+
+        /** The collection read. */
+        [[nodiscard]] collection_id_t id() const noexcept { return entry_->id; }
+
+      private:
+        friend class basic_database;
+
+        /** The calling thread's announcement in the ledger's epochs, which keeps the entry and the
+         *  view alive. */
+        typename epoch_domain<atomic_reference_, waiter_type_>::reader_t inside_;
+
+        /** The collection read. */
+        collection_entry_t* entry_ = nullptr;
+
+        /** The view of its store and the stamp every read answers at, at that store's index. */
+        std::variant<typename store_types_::reading_t...> reading_;
+    };
+
 #pragma endregion Types
 
 #pragma region Construction
@@ -1039,6 +1073,43 @@ class basic_database {
 
 #pragma region Lookups
 
+    /**
+     *  @brief Enters the ledger's epochs on executor thread @p thread_index, finds @p id and loads
+     *      the view its store publishes for a read at @p stamp, which every read of one call then
+     *      walks through the answer.
+     *  @return @c not_found_k for a collection the database does not name.
+     */
+    expected<collection_reading_t> read_collection(any_collection_id_t const& id, transaction_stamp_t stamp,
+                                                   std::size_t thread_index = outside_executor_k) noexcept {
+        collection_reading_t read;
+        read.inside_ = ledger_.epochs().enter(thread_index);
+        read.entry_ = entry_at_(id);
+        if (!read.entry_) return status_t {status_code_t::not_found_k, "The database names no such collection"};
+        auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
+            if (read.entry_->held.index() == index_)
+                read.reading_.template emplace<index_>(std::get<index_>(read.entry_->held).reading(stamp));
+        };
+        [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
+            (rung(std::integral_constant<std::size_t, indices_> {}), ...);
+        }(std::index_sequence_for<store_types_...> {});
+        return read;
+    }
+
+    /** Calls @p visitor as <tt>visitor(store, reading)</tt> with the store @p read reads and the
+     *  reading of it, answering what it answers. */
+    template <typename visitor_type_>
+    status_t visit_reading(collection_reading_t const& read, visitor_type_&& visitor) noexcept {
+        status_t visited;
+        auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
+            if (read.reading_.index() == index_)
+                visited = visitor(std::get<index_>(read.entry_->held), std::get<index_>(read.reading_));
+        };
+        [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
+            (rung(std::integral_constant<std::size_t, indices_> {}), ...);
+        }(std::index_sequence_for<store_types_...> {});
+        return visited;
+    }
+
     /** What @p id carries for @p stored_key as a reader pinned at @p stamp sees it, and the bytes its value takes;
      *  a collection the database does not name carries nothing. Executor thread @p thread_index reads on its own
      *  epoch slot, as every lookup below does. */
@@ -1046,16 +1117,24 @@ class basic_database {
                                        stored_value_size_t& size, transaction_stamp_t stamp = head_stamp_k,
                                        std::size_t thread_index = outside_executor_k) noexcept {
         size = 0;
-        reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_(id);
-        if (!found) return lookup_result_t::missing_k;
-        return std::visit(
-            [&]<typename store_type_>(store_type_ const& collection) noexcept {
-                if constexpr (keyed_by_database<store_type_>())
-                    return collection.find(stored_key, size, stamp, thread_index);
-                else return lookup_result_t::missing_k;
-            },
-            found->held);
+        auto [read, read_status] = read_collection(id, stamp, thread_index);
+        if (read_status.failed()) return lookup_result_t::missing_k;
+        return find(read, stored_key, size);
+    }
+
+    /** What the collection @p read reads carries for @p stored_key, and its value's bytes. */
+    [[nodiscard]] lookup_result_t find(collection_reading_t const& read, stored_key_t stored_key,
+                                       stored_value_size_t& size) noexcept {
+        size = 0;
+        lookup_result_t found = lookup_result_t::missing_k;
+        [[maybe_unused]] status_t const visited = visit_reading(
+            read,
+            [&]<typename store_type_>(store_type_ const& collection,
+                                      typename store_type_::reading_t const& reading) noexcept -> status_t {
+                if constexpr (keyed_by_database<store_type_>()) found = collection.find(reading, stored_key, size);
+                return {};
+            });
+        return found;
     }
 
     /** Whether @p id carries @p stored_key with a value rather than a remove delta, as a reader pinned at @p stamp
@@ -1074,7 +1153,18 @@ class basic_database {
     status_t stored_value_size(any_collection_id_t const& id, stored_key_t stored_key, stored_value_size_t& size,
                                transaction_stamp_t stamp = head_stamp_k,
                                std::size_t thread_index = outside_executor_k) noexcept {
-        lookup_result_t const found = find(id, stored_key, size, stamp, thread_index);
+        size = 0;
+        auto [read, read_status] = read_collection(id, stamp, thread_index);
+        if (read_status.failed()) return {status_code_t::not_found_k, "That collection misses it"};
+        return stored_value_size(read, stored_key, size, thread_index);
+    }
+
+    /** Bytes the value of @p stored_key takes in the collection @p read reads, as @c
+     *  stored_value_size above measures them, executor thread @p thread_index taking its own
+     *  channel for a fold. */
+    status_t stored_value_size(collection_reading_t const& read, stored_key_t stored_key, stored_value_size_t& size,
+                               std::size_t thread_index = outside_executor_k) noexcept {
+        lookup_result_t const found = find(read, stored_key, size);
         if (found == lookup_result_t::written_k) return {};
         if (found != lookup_result_t::incomplete_k) return {status_code_t::not_found_k, "That collection misses it"};
         std::uint64_t measured = 0;
@@ -1082,10 +1172,10 @@ class basic_database {
         auto const count = [&](std::size_t, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
             measured = std::max<std::uint64_t>(measured, offset + bytes.size());
         };
-        if (status_t const read = select(id, std::span<stored_key_t const> {&stored_key, 1},
-                                         std::span<lookup_result_t> {&folded, 1}, count, stamp, thread_index);
-            read.failed())
-            return read;
+        if (status_t const selected = select(read, std::span<stored_key_t const> {&stored_key, 1},
+                                             std::span<lookup_result_t> {&folded, 1}, count, thread_index);
+            selected.failed())
+            return selected;
         if (folded != lookup_result_t::written_k) return {status_code_t::not_found_k, "That collection misses it"};
         size = static_cast<stored_value_size_t>(measured);
         return {};
@@ -1104,18 +1194,26 @@ class basic_database {
                     stored_value_size_t& size, transaction_stamp_t stamp = head_stamp_k,
                     std::size_t thread_index = outside_executor_k) noexcept {
         size = 0;
-        reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t* const found = entry_at_(id);
-        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+        auto [read, read_status] = read_collection(id, stamp, thread_index);
+        if (read_status.failed()) return read_status;
+        return select(read, stored_key, into, size, thread_index);
+    }
+
+    /** Copies the value the collection @p read reads holds for @p stored_key into @p into, as @c
+     *  select above copies it, executor thread @p thread_index taking its own channel. */
+    status_t select(collection_reading_t const& read, stored_key_t stored_key, std::span<byte_t> into,
+                    stored_value_size_t& size, std::size_t thread_index = outside_executor_k) noexcept {
+        size = 0;
         auto [channel, acquire_status] = channels_->acquire(thread_index);
         if (acquire_status.failed()) return acquire_status;
-        return std::visit(
-            [&]<typename store_type_>(store_type_& collection) noexcept -> status_t {
+        return visit_reading(
+            read,
+            [&]<typename store_type_>(store_type_& collection,
+                                      typename store_type_::reading_t const& reading) noexcept -> status_t {
                 if constexpr (keyed_by_database<store_type_>())
-                    return collection.select(channel.channel(), stored_key, into, size, stamp, thread_index);
+                    return collection.select(channel.channel(), reading, stored_key, into, size);
                 else return keyed_otherwise_();
-            },
-            found->held);
+            });
     }
 
     /**
@@ -1131,18 +1229,27 @@ class basic_database {
     status_t select(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys,
                     std::span<lookup_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
                     std::size_t thread_index = outside_executor_k) noexcept {
-        reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_(id);
-        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+        auto [read, read_status] = read_collection(id, stamp, thread_index);
+        if (read_status.failed()) return read_status;
+        return select(read, stored_keys, results, sink, thread_index);
+    }
+
+    /** Reads the values of @p stored_keys out of the collection @p read reads, as the batched @c
+     *  select above reads them, executor thread @p thread_index taking its own channel. */
+    template <typename sink_type_>
+    status_t select(collection_reading_t const& read, std::span<stored_key_t const> stored_keys,
+                    std::span<lookup_result_t> results, sink_type_&& sink,
+                    std::size_t thread_index = outside_executor_k) noexcept {
         auto [channel, acquire_status] = channels_->acquire(thread_index);
         if (acquire_status.failed()) return acquire_status;
-        return std::visit(
-            [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
+        return visit_reading(
+            read,
+            [&]<typename store_type_>(store_type_ const& collection,
+                                      typename store_type_::reading_t const& reading) noexcept -> status_t {
                 if constexpr (keyed_by_database<store_type_>())
-                    return collection.select(channel.channel(), stored_keys, results, sink, stamp, thread_index);
+                    return collection.select(channel.channel(), reading, stored_keys, results, sink);
                 else return keyed_otherwise_();
-            },
-            found->held);
+            });
     }
 
     /**
@@ -1210,6 +1317,41 @@ class basic_database {
         }
     }
 
+    /** Hands @p visitor every key of the collection @p read reads from @p from on in @p direction,
+     *  as @c scan above does, every page read through @p read inside the epochs it holds, so @p
+     *  visitor runs inside them too and must not write; executor thread @p thread_index takes its
+     *  own channel to fold a chain of changes. */
+    template <typename visitor_type_>
+    status_t scan(collection_reading_t const& read, stored_key_t from, visitor_type_&& visitor,
+                  std::size_t thread_index = outside_executor_k,
+                  scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
+        return visit_reading(
+            read,
+            [&]<typename store_type_>(store_type_ const& collection,
+                                      typename store_type_::reading_t const& reading) noexcept -> status_t {
+                if constexpr (keyed_by_database<store_type_>()) {
+                    using scanner_t = nvme_store_cursor<typename store_type_::key_slot_t, volume_t, atomic_reference_,
+                                                        waiter_type_, typename store_type_::fold_t,
+                                                        typename store_type_::device_fold_t, row_kit_type_>;
+                    auto [scanner, over_status] = scanner_t::over(collection, reading, from, direction);
+                    if (over_status.failed()) return over_status;
+                    while (!scanner.reached_end()) {
+                        lookup_result_t state = scanner.state();
+                        stored_value_size_t size = scanner.size();
+                        if (state == lookup_result_t::incomplete_k) {
+                            status_t const measured = stored_value_size(read, scanner.stored_key(), size, thread_index);
+                            if (measured.failed() && !(measured == status_code_t::not_found_k)) return measured;
+                            state = measured.succeeded() ? lookup_result_t::written_k : lookup_result_t::removed_k;
+                        }
+                        if (!visitor(scanner.stored_key(), state, size)) return {};
+                        if (status_t const advanced = scanner.advance(); advanced.failed()) return advanced;
+                    }
+                    return {};
+                }
+                else return keyed_otherwise_();
+            });
+    }
+
     /**
      *  @brief Counts the runs of @p id a reader at @p stamp walks, for an unordered scan that walks each run on its
      *      own: every level's runs, then the memory runs oldest first.
@@ -1217,15 +1359,27 @@ class basic_database {
      */
     expected<counted_runs_t> runs_count(any_collection_id_t const& id, transaction_stamp_t stamp = head_stamp_k,
                                         std::size_t thread_index = outside_executor_k) noexcept {
-        reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_(id);
-        if (!found) return status_t {status_code_t::not_found_k, "The database names no such collection"};
-        return std::visit(
-            [&]<typename store_type_>(store_type_ const& collection) noexcept -> expected<counted_runs_t> {
-                if constexpr (keyed_by_database<store_type_>()) return collection.count_runs(stamp, thread_index);
+        auto [read, read_status] = read_collection(id, stamp, thread_index);
+        if (read_status.failed()) return read_status;
+        return runs_count(read);
+    }
+
+    /** Counts the runs of the collection @p read reads, as @c runs_count above counts them, which
+     *  no flush rearranges while @p read lives. */
+    expected<counted_runs_t> runs_count(collection_reading_t const& read) noexcept {
+        counted_runs_t counted;
+        status_t const visited = visit_reading(
+            read,
+            [&]<typename store_type_>(store_type_ const& collection,
+                                      typename store_type_::reading_t const& reading) noexcept -> status_t {
+                if constexpr (keyed_by_database<store_type_>()) {
+                    counted = collection.count_runs(reading);
+                    return {};
+                }
                 else return keyed_otherwise_();
-            },
-            found->held);
+            });
+        if (visited.failed()) return visited;
+        return counted;
     }
 
     /**
@@ -1248,16 +1402,24 @@ class basic_database {
     status_t scan_run(any_collection_id_t const& id, counted_runs_t const& counted, std::uint64_t run_index,
                       stored_key_t from, visitor_type_&& visitor, transaction_stamp_t stamp = head_stamp_k,
                       std::size_t thread_index = outside_executor_k) noexcept {
-        reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_(id);
-        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        return std::visit(
-            [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
+        auto [read, read_status] = read_collection(id, stamp, thread_index);
+        if (read_status.failed()) return read_status;
+        return scan_run(read, counted, run_index, from, visitor);
+    }
+
+    /** Hands @p visitor the keys of one run of the collection @p read reads, as @c scan_run above
+     *  does. */
+    template <typename visitor_type_>
+    status_t scan_run(collection_reading_t const& read, counted_runs_t const& counted, std::uint64_t run_index,
+                      stored_key_t from, visitor_type_&& visitor) noexcept {
+        return visit_reading(
+            read,
+            [&]<typename store_type_>(store_type_ const& collection,
+                                      typename store_type_::reading_t const& reading) noexcept -> status_t {
                 if constexpr (keyed_by_database<store_type_>())
-                    return collection.scan_run(counted, run_index, from, visitor, stamp, thread_index);
+                    return collection.scan_run(reading, counted, run_index, from, visitor);
                 else return keyed_otherwise_();
-            },
-            found->held);
+            });
     }
 
     /**

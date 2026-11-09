@@ -251,6 +251,13 @@ class nvme_store {
     /** The strings one range removal hides. */
     using range_t = range_tombstone<std::string_view>;
 
+    /** One reader inside the ledger's epochs, announced until it dies, which keeps every view
+     *  loaded meanwhile. */
+    using reader_t = typename published_runs_t::reader_t;
+
+    /** The view a read walks and the stamp it answers at, which every read of a call may share. */
+    using reading_t = typename published_runs_t::reading_t;
+
 #pragma endregion Types
 
 #pragma region Construction
@@ -308,6 +315,17 @@ class nvme_store {
 
 #pragma region Lookups
 
+    /** Announces executor thread @p thread_index in the ledger's epochs until the answer dies,
+     *  which keeps every reading taken meanwhile walkable. */
+    [[nodiscard]] reader_t enter(std::size_t thread_index = outside_executor_k) const noexcept {
+        return runs_.enter(thread_index);
+    }
+
+    /** The view a read at @p stamp walks and the stamp it answers at, for a caller inside the
+     *  ledger's epochs, which every read of one call may walk with no pin, as the epochs keep the
+     *  view and its runs alive. */
+    [[nodiscard]] reading_t reading(transaction_stamp_t stamp) const noexcept { return runs_.reading(stamp); }
+
     /**
      *  @brief Whether anything carries @p text, copying its 16-byte value into @p value from a memory run or from a
      *      cell, with no I/O.
@@ -320,7 +338,13 @@ class nvme_store {
                                        transaction_stamp_t stamp = head_stamp_k,
                                        std::size_t thread_index = outside_executor_k) const noexcept {
         reader_t const inside = runs_.enter(thread_index);
-        reading_t const read = runs_.reading(stamp);
+        return find(runs_.reading(stamp), text, value);
+    }
+
+    /** As @c find above, through @p read, which a caller inside the ledger's epochs took for every
+     *  read of a call. */
+    [[nodiscard]] lookup_result_t find(reading_t const& read, std::string_view text,
+                                       std::span<byte_t, key_slot_t::size> value) const noexcept {
         found_t found;
         if (!newest_(*read.view, text, read.stamp, found)) return lookup_result_t::missing_k;
         if (found.delta.kind == delta_kind_t::remove_k || hidden_(*read.view, text, read.stamp, found))
@@ -376,10 +400,18 @@ class nvme_store {
      */
     status_t read_page(std::string_view prefix, std::string_view from, transaction_stamp_t stamp,
                        std::size_t thread_index, strings_page_t& page) const noexcept {
+        reader_t const inside = runs_.enter(thread_index);
+        return read_page(reading_t {runs_.view(), stamp}, prefix, from, page);
+    }
+
+    /** As @c read_page above, through @p read, which a caller inside the ledger's epochs took for
+     *  every read of a call. */
+    status_t read_page(reading_t const& read, std::string_view prefix, std::string_view from,
+                       strings_page_t& page) const noexcept {
         page.texts.clear();
         page.listed.clear();
-        reader_t const inside = runs_.enter(thread_index);
-        view_t const& view = *runs_.view();
+        view_t const& view = *read.view;
+        transaction_stamp_t const stamp = read.stamp;
         level_set_t const& levels = *view.levels;
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
@@ -442,10 +474,18 @@ class nvme_store {
      */
     status_t read_page_down(std::string_view prefix, std::string_view below, transaction_stamp_t stamp,
                             std::size_t thread_index, strings_page_t& page) const noexcept {
+        reader_t const inside = runs_.enter(thread_index);
+        return read_page_down(reading_t {runs_.view(), stamp}, prefix, below, page);
+    }
+
+    /** As @c read_page_down above, through @p read, which a caller inside the ledger's epochs took
+     *  for every read of a call. */
+    status_t read_page_down(reading_t const& read, std::string_view prefix, std::string_view below,
+                            strings_page_t& page) const noexcept {
         page.texts.clear();
         page.listed.clear();
-        reader_t const inside = runs_.enter(thread_index);
-        view_t const& view = *runs_.view();
+        view_t const& view = *read.view;
+        transaction_stamp_t const stamp = read.stamp;
         level_set_t const& levels = *view.levels;
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
@@ -849,12 +889,6 @@ class nvme_store {
   private:
 
 #pragma region Private Types
-
-    /** One reader inside the ledger's epochs, announced until it dies. */
-    using reader_t = typename published_runs_t::reader_t;
-
-    /** The view a read walks and the stamp it reads at. */
-    using reading_t = typename published_runs_t::reading_t;
 
     /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
     using stamped_deltas_t = st::vector<stamped_delta_t>;

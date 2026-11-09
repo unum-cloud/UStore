@@ -277,6 +277,13 @@ class nvme_store {
     /** One change a feed of this collection hands out. */
     using stored_change_t = stored_change<stored_key_t>;
 
+    /** One reader inside the ledger's epochs, announced until it dies, which keeps every view
+     *  loaded meanwhile. */
+    using reader_t = typename published_runs_t::reader_t;
+
+    /** The view a read walks and the stamp it answers at, which every read of a call may share. */
+    using reading_t = typename published_runs_t::reading_t;
+
     /** How the values of this collection are stored. */
     static constexpr value_layout_t value_layout_k = key_slot_t::value_layout_k;
 
@@ -359,6 +366,17 @@ class nvme_store {
 
 #pragma region Lookups
 
+    /** Announces executor thread @p thread_index in the ledger's epochs until the answer dies,
+     *  which keeps every reading taken meanwhile walkable. */
+    [[nodiscard]] reader_t enter(std::size_t thread_index = outside_executor_k) const noexcept {
+        return runs_.enter(thread_index);
+    }
+
+    /** The view a read at @p stamp walks and the stamp it answers at, for a caller inside the
+     *  ledger's epochs, which every read of one call may walk with no pin, as the epochs keep the
+     *  view and its runs alive. */
+    [[nodiscard]] reading_t reading(transaction_stamp_t stamp) const noexcept { return runs_.reading(stamp); }
+
     /**
      *  @brief Whether anything carries @p stored_key, and how many bytes its value takes.
      *  @param[in] stored_key The key to look for.
@@ -371,9 +389,15 @@ class nvme_store {
     [[nodiscard]] lookup_result_t find(stored_key_t stored_key, stored_value_size_t& size,
                                        transaction_stamp_t stamp = head_stamp_k,
                                        std::size_t thread_index = outside_executor_k) const noexcept {
-        size = 0;
         reader_t const inside = runs_.enter(thread_index);
-        reading_t const read = runs_.reading(stamp);
+        return find(runs_.reading(stamp), stored_key, size);
+    }
+
+    /** As @c find above, through @p read, which a caller inside the ledger's epochs took for every
+     *  read of a call. */
+    [[nodiscard]] lookup_result_t find(reading_t const& read, stored_key_t stored_key,
+                                       stored_value_size_t& size) const noexcept {
+        size = 0;
         delta_view_t found;
         transaction_stamp_t version = unwritten_stamp_k;
         if (read.view->memory_runs.find(stored_key, read.stamp, found, version)) {
@@ -402,9 +426,15 @@ class nvme_store {
      */
     status_t select(io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size,
                     transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = outside_executor_k) noexcept {
-        size = 0;
         reader_t const inside = runs_.enter(thread_index);
-        reading_t const read = runs_.reading(stamp);
+        return select(channel, runs_.reading(stamp), stored_key, into, size);
+    }
+
+    /** As @c select above, through @p read, which a caller inside the ledger's epochs took for
+     *  every read of a call. */
+    status_t select(io_channel_t& channel, reading_t const& read, stored_key_t stored_key, std::span<byte_t> into,
+                    stored_value_size_t& size) noexcept {
+        size = 0;
         delta_view_t found;
         transaction_stamp_t found_version = unwritten_stamp_k;
         if (read.view->memory_runs.find(stored_key, read.stamp, found, found_version)) {
@@ -469,10 +499,17 @@ class nvme_store {
     status_t select(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
                     std::span<lookup_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
                     std::size_t thread_index = outside_executor_k) const noexcept {
+        reader_t const inside = runs_.enter(thread_index);
+        return select(channel, runs_.reading(stamp), stored_keys, results, sink);
+    }
+
+    /** As the batched @c select above, through @p read, which a caller inside the ledger's epochs
+     *  took for every read of a call. */
+    template <typename sink_type_>
+    status_t select(io_channel_t& channel, reading_t const& read, std::span<stored_key_t const> stored_keys,
+                    std::span<lookup_result_t> results, sink_type_&& sink) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched select answers one result per key"};
-        reader_t const inside = runs_.enter(thread_index);
-        reading_t const read = runs_.reading(stamp);
         level_set_t const& levels = *read.view->levels;
 
         // The tree takes its keys contiguous, so the request each deferred key came from travels beside it.
@@ -594,7 +631,12 @@ class nvme_store {
     [[nodiscard]] counted_runs_t count_runs(transaction_stamp_t stamp = head_stamp_k,
                                             std::size_t thread_index = outside_executor_k) const noexcept {
         reader_t const inside = runs_.enter(thread_index);
-        reading_t const read = runs_.reading(stamp);
+        return count_runs(runs_.reading(stamp));
+    }
+
+    /** The runs a reader through @p read walks, which a caller inside the ledger's epochs took for
+     *  every read of a call, so no flush rearranges them before @c scan_run walks them. */
+    [[nodiscard]] counted_runs_t count_runs(reading_t const& read) const noexcept {
         return counted_runs_t {level_runs_(*read.view->levels) + read.view->memory_runs.runs().size(),
                                read.view->layout_generation};
     }
@@ -617,9 +659,16 @@ class nvme_store {
     status_t scan_run(counted_runs_t const& counted, std::uint64_t run_index, stored_key_t from,
                       visitor_type_&& visitor, transaction_stamp_t stamp = head_stamp_k,
                       std::size_t thread_index = outside_executor_k) const noexcept {
-        if (run_index >= counted.count) return {status_code_t::invalid_argument_k, "No run counted at that index"};
         reader_t const inside = runs_.enter(thread_index);
-        reading_t const read = runs_.reading(stamp);
+        return scan_run(runs_.reading(stamp), counted, run_index, from, visitor);
+    }
+
+    /** As @c scan_run above, through @p read, which a caller inside the ledger's epochs took for
+     *  every read of a call. */
+    template <typename visitor_type_>
+    status_t scan_run(reading_t const& read, counted_runs_t const& counted, std::uint64_t run_index, stored_key_t from,
+                      visitor_type_&& visitor) const noexcept {
+        if (run_index >= counted.count) return {status_code_t::invalid_argument_k, "No run counted at that index"};
         if (read.view->layout_generation != counted.layout_generation)
             return {status_code_t::contended_k, "The runs were rearranged since they were counted"};
         level_set_t const& levels = *read.view->levels;
@@ -1256,12 +1305,6 @@ class nvme_store {
                                    row_kit_t>;
 
 #pragma region Private Types
-
-    /** One reader inside the ledger's epochs, announced until it dies. */
-    using reader_t = typename published_runs_t::reader_t;
-
-    /** The view a read walks and the stamp it reads at. */
-    using reading_t = typename published_runs_t::reading_t;
 
     /** One commit of this store alone, as the sequencer hands it to its two steps. */
     struct alone_t {

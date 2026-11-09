@@ -136,8 +136,11 @@ status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t co
         if (value.size() < end && grown.succeeded()) grown = growth_status(value.resize(end));
         if (grown.succeeded() && !bytes.empty()) std::memcpy(value.data() + offset, bytes.data(), bytes.size());
     };
-    if (status_t const read = access.state.store->select(collection, keys, results, sink, read_stamp_of(access),
-                                                         access.thread_index);
+    if (status_t const read = with_reading(access, collection, access.thread_index,
+                                           [&](collection_reading_of<cpu_class_> const& reading) noexcept {
+                                               return access.state.store->select(reading, keys, results, sink,
+                                                                                 access.thread_index);
+                                           });
         read.failed())
         return read;
     if (grown.failed()) return grown;
@@ -302,7 +305,9 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     if (status_t const resolved = resolve_runs(state, view, collections, count, ustore_modality_graph_k);
         resolved.failed())
         return resolved;
-    call_access<cpu_class_> const access = access_of(state, view);
+    call_access<cpu_class_> access = access_of(state, view);
+    collection_reading_of<cpu_class_> held;
+    if (status_t const one = read_at_one_state(access, collections, count, held); one.failed()) return one;
 
     strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
     strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
@@ -323,9 +328,9 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     auto [firsts, firsts_status] = arena_allocate<std::size_t>(view.scratch, count);
     if (firsts_status.failed()) return firsts_status;
     auto measure_slice = [&](std::size_t first, std::size_t length, view_t const& slice) noexcept -> status_t {
-        call_access<cpu_class_> const sliced_access {state,         access.transaction, access.schedule,
-                                                     slice.scratch, access.stamp,       thread_index_of(state, slice),
-                                                     access.strings};
+        call_access<cpu_class_> const sliced_access {state,          access.transaction, access.schedule,
+                                                     slice.scratch,  access.stamp,       thread_index_of(state, slice),
+                                                     access.strings, access.reading};
         if (status_t const read = read_task_vertices(sliced_access, collections + static_cast<std::ptrdiff_t>(first),
                                                      keys.subspan(first, length), reads.subspan(first, length));
             read.failed())

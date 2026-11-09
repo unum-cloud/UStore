@@ -1926,6 +1926,57 @@ std::size_t runs_scan_one_at_a_time(mount_type_ const& mount) {
     return failures;
 }
 
+/** A head read of one collection through one reading pins no stamp in the ledger: its lookups,
+ *  its copy and its walk run with no reader listed, the walk's visitor included. */
+template <typename mount_type_>
+std::size_t head_reading_pins_nothing(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+    expected<collection_id_t> const created = create_named(store, "unpinned", test_config(0, value_max_size_k));
+    failures += expect(created.has_value());
+    if (!created) return failures;
+    any_collection_id_t const unpinned {*created};
+
+    std::array<byte_t, 8> const value = counted(7);
+    for (std::uint64_t key = 1; key <= 4; ++key)
+        failures += expect(store.insert(unpinned, stored_key_t {key}, stored_value_view_t {value}).succeeded());
+    failures += expect(store.flush().succeeded());
+    failures += expect(store.insert(unpinned, stored_key_t {5}, stored_value_view_t {value}).succeeded());
+
+    auto [read, read_status] = store.read_collection(unpinned, head_stamp_k);
+    failures += expect(read_status.succeeded());
+    if (read_status.failed()) return failures;
+    stored_value_size_t size = 0;
+    failures += expect(store.find(read, stored_key_t {1}, size) == lookup_result_t::written_k);
+    failures += expect_eq(size, static_cast<stored_value_size_t>(value.size()));
+    failures += expect(store.stored_value_size(read, stored_key_t {5}, size).succeeded());
+    std::array<byte_t, 8> copied {};
+    failures += expect(store.select(read, stored_key_t {3}, std::span<byte_t> {copied}, size).succeeded());
+    failures += expect(copied == value);
+    std::size_t walked = 0;
+    std::size_t pinned_inside = 0;
+    failures += expect(store
+                           .scan(read, stored_key_t {1},
+                                 [&](stored_key_t, lookup_result_t state, stored_value_size_t) noexcept {
+                                     walked += state == lookup_result_t::written_k;
+                                     pinned_inside += store.ledger().newest_reader() != unwritten_stamp_k;
+                                     return true;
+                                 })
+                           .succeeded());
+    failures += expect_eq(walked, std::size_t {5});
+    failures += expect_eq(pinned_inside, std::size_t {0});
+    st::vector<transaction_stamp_t> pinned;
+    failures += expect(store.ledger().pinned_readers(pinned).succeeded());
+    failures += expect_eq(pinned.size(), std::size_t {0});
+    return failures;
+}
+
 /**
  *  @brief Dropping a collection waits for no snapshot, since a snapshot is a pinned stamp that holds no level set,
  *      and the snapshot finds the collection gone afterwards.
@@ -2712,6 +2763,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "rollback_and_renew", rollback_and_renew_behave);
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
         report(totals, mount, "runs_scan_one_at_a_time", runs_scan_one_at_a_time);
+        report(totals, mount, "head_reading_pins_nothing", head_reading_pins_nothing);
         report(totals, mount, "drop_proceeds_beside_the_snapshot", drop_proceeds_beside_the_snapshot);
         report(totals, mount, "threads_commit_serializably", threads_commit_serializably);
         report(totals, mount, "head_writes_wait_for_records", head_writes_wait_for_records);

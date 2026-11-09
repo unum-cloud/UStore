@@ -115,9 +115,8 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
 template <cpu_class_t cpu_class_>
 status_t read_strings(call_access<cpu_class_> const& access, collection_id_t collection, strings_arg_t const& texts,
                       std::size_t first, std::size_t last, strings_read_outputs_t& outputs) noexcept {
-    transaction_stamp_t const stamp = read_stamp_of(access);
     transaction_stamp_t const watch_stamp = watch_stamp_of(access);
-    return visit_strings(access, collection, [&](auto const& store) noexcept -> status_t {
+    return visit_strings(access, collection, [&](auto const& store, auto const& reading) noexcept -> status_t {
         for (std::size_t index = first; index != last; ++index) {
             std::string_view const text = string_of(texts[index]);
             ustore_key_t value;
@@ -132,7 +131,7 @@ status_t read_strings(call_access<cpu_class_> const& access, collection_id_t col
                 if (watch_stamp != invalid_transaction_stamp_k)
                     if (status_t const watched = access.strings->watch(collection, text, watch_stamp); watched.failed())
                         return watched;
-                present = store.find(text, bytes, stamp, access.thread_index) == lookup_result_t::written_k;
+                present = store.find(reading, text, bytes) == lookup_result_t::written_k;
             }
             if (present) outputs.assign_present(index, value);
             else outputs.assign_missing(index);
@@ -153,10 +152,13 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
         return resolved;
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
-    call_access<cpu_class_> const access = access_of(state, view);
+    call_access<cpu_class_> access = access_of(state, view);
+    collection_reading_of<cpu_class_> held;
+    if (status_t const one = read_at_one_state(access, collections, arguments.count, held); one.failed()) return one;
     auto read_slice = [&](std::size_t begin, std::size_t length, view_t const& slice) noexcept -> status_t {
-        call_access<cpu_class_> const sliced {state,         nullptr,      watch_schedule_t::never_k,
-                                              slice.scratch, access.stamp, thread_index_of(state, slice)};
+        call_access<cpu_class_> const sliced {state,         nullptr,       watch_schedule_t::never_k,
+                                              slice.scratch, access.stamp,  thread_index_of(state, slice),
+                                              nullptr,       access.reading};
         for (std::size_t first = begin; first != begin + length;) {
             std::size_t const last = run_end(collections, first, begin + length);
             if (status_t const read = read_strings(sliced, collections[first], texts, first, last, outputs);
@@ -193,13 +195,15 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     if (st::failed(slices.resize(slice_slots(view))))
         return {status_code_t::out_of_memory_k, "Failed to allocate the slices of a scan"};
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
-    call_access<cpu_class_> const access = access_of(state, view);
+    call_access<cpu_class_> access = access_of(state, view);
+    collection_reading_of<cpu_class_> held;
+    if (status_t const one = read_at_one_state(access, collections, arguments.count, held); one.failed()) return one;
     auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
         strings_scan_slice_t& sliced = slices[slice.thread_index];
         sliced = {first_task, length, outputs.slice_in(slice.scratch)};
-        call_access<cpu_class_> const sliced_access {state,         access.transaction, access.schedule,
-                                                     slice.scratch, access.stamp,       thread_index_of(state, slice),
-                                                     access.strings};
+        call_access<cpu_class_> const sliced_access {state,          access.transaction, access.schedule,
+                                                     slice.scratch,  access.stamp,       thread_index_of(state, slice),
+                                                     access.strings, access.reading};
         for (std::size_t task = first_task; task != first_task + length; ++task) {
             strings_window_t const window {
                 .prefix = prefixes ? string_of(prefixes[task]) : std::string_view {},
@@ -242,7 +246,10 @@ status_t strings_sample(ustore_strings_sample_t const& arguments, view_t const& 
     auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
     sample_generator_t generator = sample_generator_t::seeded(&outputs);
-    call_access<cpu_class_> const access = access_of(state, view);
+    call_access<cpu_class_> access = access_of(state, view);
+    collection_reading_of<cpu_class_> held;
+    if (status_t const one = read_at_one_state(access, samples.collections, arguments.count, held); one.failed())
+        return one;
     st::vector<kept_string_t> kept;
     for (std::size_t task = 0; task != samples.size(); ++task) {
         sample_task_t const sample = samples[task];
@@ -289,7 +296,9 @@ status_t strings_measure(ustore_strings_measure_t const& arguments, strings_arg_
         return resolved;
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
-    call_access<cpu_class_> const access = access_of(state, view);
+    call_access<cpu_class_> access = access_of(state, view);
+    collection_reading_of<cpu_class_> held;
+    if (status_t const one = read_at_one_state(access, collections, arguments.count, held); one.failed()) return one;
     for (std::size_t task = 0; task != arguments.count; ++task) {
         strings_window_t const window {
             .start = starts ? string_of(starts[task]) : std::string_view {},

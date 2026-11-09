@@ -97,6 +97,20 @@ class nvme_store_cursor {
         return cursor;
     }
 
+    /** A walk over @p source as @c over above, every page of which reads through @p read, which a
+     *  caller inside the ledger's epochs took and keeps walkable while the cursor lives. */
+    static expected<nvme_store_cursor> over(nvme_store_t const& source, typename nvme_store_t::reading_t const& read,
+                                            stored_key_t from = limit<stored_key_t>::min(),
+                                            scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
+        nvme_store_cursor cursor;
+        cursor.source_ = &source;
+        cursor.direction_ = direction;
+        cursor.stamp_ = read.stamp;
+        cursor.view_ = read.view;
+        if (status_t const filled = cursor.fill_(from); filled.failed()) return filled;
+        return cursor;
+    }
+
 #pragma endregion Construction
 
 #pragma region Walk
@@ -172,10 +186,19 @@ class nvme_store_cursor {
     /** Reads the keys from @p from on into the page inside the ledger's epochs, from the view
      *  published now, with one key past the page beside it, which the next page starts at. */
     status_t fill_(stored_key_t from) noexcept {
+        // A walk lent a reading keeps its view between pages, which the lender's epochs keep alive.
+        if (view_) return read_page_(from);
         reader_t const inside = source_->runs_.enter(thread_index_);
         // Every version at or below the pinned stamp stays in whichever view a
         // merge publishes later.
         view_ = source_->runs_.view();
+        status_t const read = read_page_(from);
+        view_ = nullptr;
+        return read;
+    }
+
+    /** Reads the keys from @p from on into the page from the view the walk holds now. */
+    status_t read_page_(stored_key_t from) noexcept {
         at_ = 0;
         filled_ = 0;
         status_t const positioned = position_(from);
@@ -183,7 +206,6 @@ class nvme_store_cursor {
         while (positioned.succeeded() && filled_ != page_.size() &&
                (descending ? next_down_(page_[filled_]) : next_(page_[filled_])))
             ++filled_;
-        view_ = nullptr;
         return positioned;
     }
 
@@ -423,7 +445,8 @@ class nvme_store_cursor {
     /** The executor thread the scan announces on while it reads a page. */
     std::size_t thread_index_ = outside_executor_k;
 
-    /** The view the page being read walks, null between pages, when no reader keeps it alive. */
+    /** The view the page being read walks, null between pages, when no reader keeps it alive, or
+     *  the view a lender's reading names for every page. */
     view_t const* view_ = nullptr;
 
     /** The next sorted position inside every memory run of the view, newest run first. */

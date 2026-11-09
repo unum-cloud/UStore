@@ -178,6 +178,10 @@ using database_transaction_of = typename basic_database_of<cpu_class_>::transact
 template <cpu_class_t cpu_class_>
 using strings_transaction_of = nvme_transaction<basic_database_of<cpu_class_>, strings_store_of<cpu_class_>>;
 
+/** One collection of that database read at one state for a whole call. */
+template <cpu_class_t cpu_class_>
+using collection_reading_of = typename basic_database_of<cpu_class_>::collection_reading_t;
+
 /** @p uuid as the collection ID the C ABI addresses a collection by. */
 constexpr ustore_collection_id_t collection_id_of(uuid_t const& uuid) noexcept {
     ustore_collection_id_t collection {};
@@ -560,8 +564,12 @@ struct call_access {
     /** The strings the transaction writes and watches, null with no transaction. */
     strings_transaction_of<cpu_class_>* strings = nullptr;
 
-    /** The pin holding @c stamp for a call at the head, which every read of the call shares,
-     *  released when the call returns. */
+    /** The one collection a call outside a transaction reads through one view for the whole
+     *  call, or null for every read to load the view its own stamp reads. */
+    collection_reading_of<cpu_class_> const* reading = nullptr;
+
+    /** The pin holding @c stamp for a call reading several collections at the head, which
+     *  every read of the call shares, released when the call returns. */
     typename basic_database_of<cpu_class_>::pin_t pin;
 };
 
@@ -576,8 +584,8 @@ std::size_t thread_index_of(database_state<cpu_class_> const& state, view_t cons
     return view.executor && view.executor == state.executor ? view.thread_index : outside_executor_k;
 }
 
-/** The access of a call reading through @p view: its transaction, its snapshot's stamp, the stamp
- *  the router pinned for the call, or the head's newest stamp, pinned until the call returns. */
+/** The access of a call reading through @p view: its transaction, its snapshot's stamp, the
+ *  stamp the router pinned for the call, or the head, which @c read_at_one_state holds. */
 template <cpu_class_t cpu_class_>
 call_access<cpu_class_> access_of(database_state<cpu_class_>& state, view_t const& view) noexcept {
     std::size_t const thread_index = thread_index_of(state, view);
@@ -588,16 +596,67 @@ call_access<cpu_class_> access_of(database_state<cpu_class_>& state, view_t cons
                 view.scratch,
                 state_of<snapshot_state<cpu_class_>>(view.snapshot)->pin.stamp(),
                 thread_index};
-    if (!view.transaction) {
-        call_access<cpu_class_> access {state,        nullptr,      watch_schedule_t::never_k,
-                                        view.scratch, head_stamp_k, thread_index};
-        if (view.stamp) access.stamp = static_cast<transaction_stamp_t>(view.stamp);
-        else access.stamp = state.store->ledger().pin_reader(access.pin);
-        return access;
-    }
+    if (!view.transaction)
+        return {state,
+                nullptr,
+                watch_schedule_t::never_k,
+                view.scratch,
+                view.stamp ? static_cast<transaction_stamp_t>(view.stamp) : head_stamp_k,
+                thread_index};
     transaction_state<cpu_class_>& transaction = *state_of<transaction_state<cpu_class_>>(view.transaction);
     return {state,        transaction.held.get(), schedule_of(view.watch), view.scratch,
             head_stamp_k, thread_index,           &transaction.strings};
+}
+
+/** The stamp a read through @p access answers at: its transaction's start, its snapshot's, or
+ *  the head's. */
+template <cpu_class_t cpu_class_>
+transaction_stamp_t read_stamp_of(call_access<cpu_class_> const& access) noexcept {
+    return access.transaction ? access.transaction->start_stamp() : access.stamp;
+}
+
+/** Where the tasks on the collection of task @p first end: the next task naming another one. */
+inline std::size_t run_end(strided_iterator<ustore_collection_id_t const> collections, std::size_t first,
+                           std::size_t count) noexcept {
+    std::size_t end = first + 1;
+    while (end != count && collections[end] == collections[first]) ++end;
+    return end;
+}
+
+/**
+ *  @brief Holds one state for every read of a call through @p access over the @p count
+ *      collections @p collections names, outside a transaction and a pinned stamp.
+ *
+ *  One collection is read through its view, loaded once into @p held, and several at a stamp
+ *  pinned for the call, as a merge keeps the versions at a stamp only for a pinned reader.
+ */
+template <cpu_class_t cpu_class_>
+status_t read_at_one_state(call_access<cpu_class_>& access, strided_iterator<ustore_collection_id_t const> collections,
+                           std::size_t count, collection_reading_of<cpu_class_>& held) noexcept {
+    if (access.transaction || access.stamp != head_stamp_k || count == 0) return {};
+    bool const one = run_end(collections, 0, count) == count;
+    if (one && access.reading && access.reading->id() == collections[0]) return {};
+    access.reading = nullptr;
+    if (!one) {
+        access.stamp = access.state.store->ledger().pin_reader(access.pin);
+        return {};
+    }
+    auto [taken, taken_status] = access.state.store->read_collection(collections[0], head_stamp_k, access.thread_index);
+    if (taken_status.failed()) return taken_status;
+    held = std::move(taken);
+    access.reading = &held;
+    return {};
+}
+
+/** Calls @p reads with a reading of @p collection at the state @p access reads, on executor thread
+ *  @p thread_index: the one the call holds, or one loaded now at its stamp; answers as it does. */
+template <cpu_class_t cpu_class_, typename reads_type_>
+status_t with_reading(call_access<cpu_class_> const& access, collection_id_t collection, std::size_t thread_index,
+                      reads_type_&& reads) noexcept {
+    if (access.reading && access.reading->id() == collection) return reads(*access.reading);
+    auto [taken, taken_status] = access.state.store->read_collection(collection, read_stamp_of(access), thread_index);
+    if (taken_status.failed()) return taken_status;
+    return reads(taken);
 }
 
 /** Watches @p keys of @p collection through the transaction of @p access, when it watches at all. */
@@ -663,6 +722,30 @@ expected<value_view_t> fold_own_change(call_access<cpu_class_> const& access, co
     return folded;
 }
 
+/** The value of @p key in @p collection as @p access sees it outside a transaction, measured and
+ *  copied through one reading into its scratch, or a missing value. */
+template <cpu_class_t cpu_class_>
+expected<value_view_t> read_committed_value(call_access<cpu_class_> const& access, collection_id_t collection,
+                                            stored_key_t key) noexcept {
+    basic_database_of<cpu_class_>& store = *access.state.store;
+    expected<value_view_t> read = value_view_t {};
+    status_t const visited = with_reading(access, collection, access.thread_index,
+                                          [&](collection_reading_of<cpu_class_> const& reading) noexcept -> status_t {
+                                              stored_value_size_t size = 0;
+                                              status_t const measured = store.stored_value_size(reading, key, size,
+                                                                                                access.thread_index);
+                                              if (measured == status_code_t::not_found_k) return {};
+                                              if (measured.failed()) return measured;
+                                              read = copied_value(access, size, [&](std::span<byte_t> into) noexcept {
+                                                  stored_value_size_t copied = 0;
+                                                  return store.select(reading, key, into, copied, access.thread_index);
+                                              });
+                                              return read.status();
+                                          });
+    if (visited.failed()) return visited;
+    return read;
+}
+
 /**
  *  @brief The value of @p key in @p collection as @p access sees it, copied into its scratch, or
  *      a missing value.
@@ -674,39 +757,34 @@ expected<value_view_t> fold_own_change(call_access<cpu_class_> const& access, co
 template <cpu_class_t cpu_class_>
 expected<value_view_t> read_value(call_access<cpu_class_> const& access, collection_id_t collection,
                                   stored_key_t key) noexcept {
-    basic_database_of<cpu_class_>& store = *access.state.store;
     database_transaction_of<cpu_class_>* const transaction = access.transaction;
+    if (!transaction) return read_committed_value(access, collection, key);
     delta_view_t own_delta;
-    bool const changed = transaction && transaction->uncommitted_delta(collection, key, own_delta) &&
+    bool const changed = transaction->uncommitted_delta(collection, key, own_delta) &&
                          own_delta.kind == delta_kind_t::change_k;
-    if (transaction) {
-        lookup_result_t const own_status = transaction->lookup_uncommitted(collection, key);
-        if (own_status == lookup_result_t::removed_k) return value_view_t {};
-        if (own_status == lookup_result_t::written_k && !changed) {
-            stored_value_size_t size = 0;
-            if (status_t const measured = transaction->stored_value_size_uncommitted(collection, key, size);
-                measured.failed())
-                return measured;
-            return copied_value(access, size, [&](std::span<byte_t> into) noexcept {
-                stored_value_size_t copied = 0;
-                return transaction->select_uncommitted(collection, key, into, copied);
-            });
-        }
+    lookup_result_t const own_status = transaction->lookup_uncommitted(collection, key);
+    if (own_status == lookup_result_t::removed_k) return value_view_t {};
+    if (own_status == lookup_result_t::written_k && !changed) {
+        stored_value_size_t size = 0;
+        if (status_t const measured = transaction->stored_value_size_uncommitted(collection, key, size);
+            measured.failed())
+            return measured;
+        return copied_value(access, size, [&](std::span<byte_t> into) noexcept {
+            stored_value_size_t copied = 0;
+            return transaction->select_uncommitted(collection, key, into, copied);
+        });
     }
 
     // A value may change its size between the measurement and the copy, which the copy refuses rather than truncates
     for (std::size_t attempt = 0; attempt != read_attempts_k; ++attempt) {
         stored_value_size_t size = 0;
         std::size_t const thread_index = access.thread_index;
-        status_t const measured = transaction
-                                      ? transaction->stored_value_size_committed(collection, key, size, thread_index)
-                                      : store.stored_value_size(collection, key, size, access.stamp, thread_index);
+        status_t const measured = transaction->stored_value_size_committed(collection, key, size, thread_index);
         bool const missing = measured == status_code_t::not_found_k;
         if (measured.failed() && !missing) return measured;
         if (!missing) {
             expected<value_view_t> read = copied_value(access, size, [&](std::span<byte_t> into) noexcept {
                 stored_value_size_t copied = 0;
-                if (!transaction) return store.select(collection, key, into, copied, access.stamp, thread_index);
                 if (access.schedule == watch_schedule_t::never_k)
                     return transaction->template select_committed<watch_schedule_t::never_k>(collection, key, into,
                                                                                              copied, thread_index);
@@ -771,20 +849,23 @@ struct own_write_t {
  *      @p direction descending, as @p access sees it, in that order, as <tt>visitor(key, size)</tt>
  *      answering whether the walk carries on.
  *
- *  The store's walk holds the view it loaded, which a flush waits for, so @p visitor collects and calls nothing of the
- *  database.
+ *  The store's walk holds the view it loaded, which a flush waits for, so @p visitor collects
+ *  keys and writes nothing.
  */
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t walk(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t from,
               visitor_type_&& visitor, scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
     basic_database_of<cpu_class_>& store = *access.state.store;
     if (!access.transaction)
-        return store.scan(
-            collection, from,
-            [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
-                return state != lookup_result_t::written_k || visitor(key, size);
-            },
-            access.stamp, access.thread_index, direction);
+        return with_reading(access, collection, access.thread_index,
+                            [&](collection_reading_of<cpu_class_> const& reading) noexcept {
+                                return store.scan(
+                                    reading, from,
+                                    [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
+                                        return state != lookup_result_t::written_k || visitor(key, size);
+                                    },
+                                    access.thread_index, direction);
+                            });
 
     bool const descending = direction == scan_direction_t::descending_k;
     auto const before = [descending](stored_key_t const& first, stored_key_t const& second) noexcept {
@@ -877,32 +958,31 @@ status_t collect_keys_descending(call_access<cpu_class_> const& access, collecti
 }
 
 /** Collects into @p keys up to @p limit keys of @p collection from @p lower up to @p upper
- *  inclusive, walking each run on its own with no merge across them, as an unordered scan may list
- *  a key another run removed or repeats. Answers @c contended_k when a flush, a compaction or a
- *  merge rearranged the runs meanwhile, so the caller walks in order instead. */
+ *  inclusive, walking each run of one reading on its own with no merge across them, as an unordered
+ *  scan may list a key another run removed or repeats. */
 template <cpu_class_t cpu_class_, typename keys_type_>
 status_t collect_keys_unordered(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t lower,
                                 stored_key_t upper, std::size_t limit, keys_type_& keys) noexcept {
     basic_database_of<cpu_class_>& store = *access.state.store;
-    typename basic_database_of<cpu_class_>::pin_t pin;
-    transaction_stamp_t const stamp = access.stamp == head_stamp_k ? store.ledger().pin_reader(pin) : access.stamp;
-    auto [counted, counted_status] = store.runs_count(collection, stamp, access.thread_index);
-    if (counted_status.failed()) return counted_status;
-    status_t room;
-    for (std::uint64_t run = 0; run != counted.count && keys.size() < limit; ++run) {
-        status_t const walked = store.scan_run(
-            collection, counted, run, lower,
-            [&](stored_key_t key, lookup_result_t state, stored_value_size_t) noexcept {
-                if (upper < key) return false;
-                if (state == lookup_result_t::removed_k) return true;
-                room = growth_status(keys.push_back(stored_key_t {key}));
-                return room.succeeded() && keys.size() < limit;
-            },
-            stamp, access.thread_index);
-        if (walked.failed()) return walked;
-        if (room.failed()) return room;
-    }
-    return {};
+    return with_reading(access, collection, access.thread_index,
+                        [&](collection_reading_of<cpu_class_> const& reading) noexcept -> status_t {
+                            auto [counted, counted_status] = store.runs_count(reading);
+                            if (counted_status.failed()) return counted_status;
+                            status_t room;
+                            for (std::uint64_t run = 0; run != counted.count && keys.size() < limit; ++run) {
+                                status_t const walked = store.scan_run(
+                                    reading, counted, run, lower,
+                                    [&](stored_key_t key, lookup_result_t state, stored_value_size_t) noexcept {
+                                        if (upper < key) return false;
+                                        if (state == lookup_result_t::removed_k) return true;
+                                        room = growth_status(keys.push_back(stored_key_t {key}));
+                                        return room.succeeded() && keys.size() < limit;
+                                    });
+                                if (walked.failed()) return walked;
+                                if (room.failed()) return room;
+                            }
+                            return {};
+                        });
 }
 
 /** The key after @p key, or answers false for the largest key, which has none. */
@@ -1101,14 +1181,6 @@ status_t resolve_runs(database_state<cpu_class_>& state, view_t const& view,
     return {};
 }
 
-/** Where the tasks on the collection of task @p first end: the next task naming another one. */
-inline std::size_t run_end(strided_iterator<ustore_collection_id_t const> collections, std::size_t first,
-                           std::size_t count) noexcept {
-    std::size_t end = first + 1;
-    while (end != count && collections[end] == collections[first]) ++end;
-    return end;
-}
-
 /** The resolver of this engine, which its docs and pages verbs run first. */
 template <cpu_class_t cpu_class_>
 status_t resolve_modality(ustore_database_t database, ustore_collections_view_t collections, ustore_size_t count,
@@ -1132,24 +1204,22 @@ struct string_task_t {
     ustore_uuid_t value {};
 };
 
-/** Calls @p visitor with the strings store of @p collection inside the database's epochs, which keep it alive until
- *  @p visitor returns, answering what it answers, or refuses a collection another store keeps. */
+/** Calls @p visitor as <tt>visitor(store, reading)</tt> with the strings store of @p collection and
+ *  its reading at the state @p access reads, inside the database's epochs, answering what it
+ *  answers, or refuses a collection another store keeps. */
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t visit_strings(call_access<cpu_class_> const& access, collection_id_t collection,
                        visitor_type_&& visitor) noexcept {
-    return access.state.store->visit_store(
-        collection,
-        [&]<typename store_type_>(store_type_& store) noexcept -> status_t {
-            if constexpr (std::is_same_v<store_type_, strings_store_of<cpu_class_>>) return visitor(store);
-            else return collection_holds_another_modality();
-        },
-        access.thread_index);
-}
-
-/** The stamp a read through @p access answers at: its transaction's start, its snapshot's, or the head's. */
-template <cpu_class_t cpu_class_>
-transaction_stamp_t read_stamp_of(call_access<cpu_class_> const& access) noexcept {
-    return access.transaction ? access.transaction->start_stamp() : access.stamp;
+    return with_reading(
+        access, collection, access.thread_index, [&](collection_reading_of<cpu_class_> const& read) noexcept {
+            return access.state.store->visit_reading(
+                read,
+                [&]<typename store_type_>(store_type_& store, typename store_type_::reading_t const& reading) noexcept {
+                    if constexpr (std::is_same_v<store_type_, strings_store_of<cpu_class_>>)
+                        return status_t {visitor(store, reading)};
+                    else return collection_holds_another_modality();
+                });
+        });
 }
 
 /** The stamp a commit after which conflicts with what @p access reads and writes, or none when it watches nothing. */
@@ -1192,55 +1262,50 @@ status_t read_string(call_access<cpu_class_> const& access, collection_id_t coll
         if (present) std::memcpy(bytes.data(), own_delta.bytes.data(), bytes.size());
         return {};
     }
-    transaction_stamp_t const stamp = read_stamp_of(access);
     if (transaction_stamp_t const watch_stamp = watch_stamp_of(access); watch_stamp != invalid_transaction_stamp_k)
         if (status_t const watched = access.strings->watch(collection, text, watch_stamp); watched.failed())
             return watched;
-    return visit_strings(access, collection, [&](auto const& store) noexcept -> status_t {
-        present = store.find(text, bytes, stamp, access.thread_index) == lookup_result_t::written_k;
+    return visit_strings(access, collection, [&](auto const& store, auto const& reading) noexcept -> status_t {
+        present = store.find(reading, text, bytes) == lookup_result_t::written_k;
         return {};
     });
 }
 
 /**
- *  @brief Hands @p visitor every string of @p collection starting with @p prefix and not below @p start, in order, as
- *      the store holds them at @p stamp, each with what its newest version carries, a removal included.
- *  @param[in] visitor Called as @c visitor(text, state, value) outside the epochs, answering whether the walk carries
- *      on, with the key the string maps onto; the text lives until it returns.
+ *  @brief Hands @p visitor every string of @p collection starting with @p prefix and not below
+ *      @p start, in order, as @p access reads them, each with what its newest version carries.
+ *  @param[in] visitor Called as <tt>visitor(text, state, value)</tt> inside the epochs, answering
+ *      whether the walk carries on, with the key the string maps onto, so it writes nothing; the
+ *      text lives until it returns.
  *
- *  A page is read inside the epochs at a time, finding the collection again for each, so a commit waits for one page
- *  at most, and a head walk pins the stamp it starts at, so every page reads the same commits.
+ *  Every page reads through one reading of the collection, so the walk sees one state with no pin.
  */
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t walk_strings(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view prefix,
-                      std::string_view start, transaction_stamp_t stamp, visitor_type_&& visitor) noexcept {
-    typename basic_database_of<cpu_class_>::pin_t pin;
-    if (stamp == head_stamp_k) stamp = access.state.store->ledger().pin_reader(pin);
+                      std::string_view start, visitor_type_&& visitor) noexcept {
     strings_page_t page;
     st::vector<char> from;
     std::string_view const first = std::max(start, prefix);
     if (from.resize(first.size()) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "A walk could not hold where it starts"};
     if (!first.empty()) std::memcpy(from.data(), first.data(), first.size());
-    for (;;) {
-        std::string_view const resumed {from.begin(), from.end()};
-        if (status_t const read = visit_strings(access, collection,
-                                                [&](auto const& store) noexcept {
-                                                    return store.read_page(prefix, resumed, stamp, access.thread_index,
-                                                                           page);
-                                                });
-            read.failed())
-            return read;
-        for (std::size_t index = 0; index != page.size(); ++index)
-            if (!visitor(page.text(index), page.listed[index].state, page.listed[index].value)) return {};
-        if (page.size() != strings_page_k) return {};
-        // The smallest string past the last one listed is that string and one zero byte more.
-        std::string_view const last = page.text(page.size() - 1);
-        if (from.resize(last.size() + 1) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A walk could not hold where it resumes"};
-        if (!last.empty()) std::memcpy(from.data(), last.data(), last.size());
-        from[last.size()] = '\0';
-    }
+    return visit_strings(access, collection, [&](auto const& store, auto const& reading) noexcept -> status_t {
+        for (;;) {
+            if (status_t const read = store.read_page(reading, prefix, std::string_view {from.begin(), from.end()},
+                                                      page);
+                read.failed())
+                return read;
+            for (std::size_t index = 0; index != page.size(); ++index)
+                if (!visitor(page.text(index), page.listed[index].state, page.listed[index].value)) return {};
+            if (page.size() != strings_page_k) return {};
+            // The smallest string past the last one listed is that string and one zero byte more.
+            std::string_view const last = page.text(page.size() - 1);
+            if (from.resize(last.size() + 1) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A walk could not hold where it resumes"};
+            if (!last.empty()) std::memcpy(from.data(), last.data(), last.size());
+            from[last.size()] = '\0';
+        }
+    });
 }
 
 /** Hands @p visitor every string of @p collection starting with @p prefix and below @p below, or
@@ -1248,33 +1313,29 @@ status_t walk_strings(call_access<cpu_class_> const& access, collection_id_t col
  *  page per run at a time. */
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t walk_strings_down(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view prefix,
-                           std::string_view below, transaction_stamp_t stamp, visitor_type_&& visitor) noexcept {
-    typename basic_database_of<cpu_class_>::pin_t pin;
-    if (stamp == head_stamp_k) stamp = access.state.store->ledger().pin_reader(pin);
+                           std::string_view below, visitor_type_&& visitor) noexcept {
     strings_page_t page;
     st::vector<char> until;
     if (until.resize(below.size()) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "A walk could not hold where it starts"};
     if (!below.empty()) std::memcpy(until.data(), below.data(), below.size());
-    for (;;) {
-        std::string_view const resumed {until.begin(), until.end()};
-        if (status_t const read = visit_strings(access, collection,
-                                                [&](auto const& store) noexcept {
-                                                    return store.read_page_down(prefix, resumed, stamp,
-                                                                                access.thread_index, page);
-                                                });
-            read.failed())
-            return read;
-        for (std::size_t index = 0; index != page.size(); ++index)
-            if (!visitor(page.text(index), page.listed[index].state, page.listed[index].value)) return {};
-        if (page.size() != strings_page_k) return {};
-        // No string sits below the empty one, and an empty bound would mean none at all.
-        std::string_view const last = page.text(page.size() - 1);
-        if (last.empty()) return {};
-        if (until.resize(last.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A walk could not hold where it resumes"};
-        std::memcpy(until.data(), last.data(), last.size());
-    }
+    return visit_strings(access, collection, [&](auto const& store, auto const& reading) noexcept -> status_t {
+        for (;;) {
+            if (status_t const read = store.read_page_down(reading, prefix,
+                                                           std::string_view {until.begin(), until.end()}, page);
+                read.failed())
+                return read;
+            for (std::size_t index = 0; index != page.size(); ++index)
+                if (!visitor(page.text(index), page.listed[index].state, page.listed[index].value)) return {};
+            if (page.size() != strings_page_k) return {};
+            // No string sits below the empty one, and an empty bound would mean none at all.
+            std::string_view const last = page.text(page.size() - 1);
+            if (last.empty()) return {};
+            if (until.resize(last.size()) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "A walk could not hold where it resumes"};
+            std::memcpy(until.data(), last.data(), last.size());
+        }
+    });
 }
 
 /**
@@ -1346,7 +1407,7 @@ status_t walk_window_strings(call_access<cpu_class_> const& access, collection_i
         return carries_on;
     };
     status_t walked;
-    if (!descending) walked = walk_strings(access, collection, window.prefix, lower, read_stamp_of(access), merged);
+    if (!descending) walked = walk_strings(access, collection, window.prefix, lower, merged);
     else {
         // The window's start is inclusive, so the walk starts below the least string past it.
         st::vector<char> below;
@@ -1357,7 +1418,7 @@ status_t walk_window_strings(call_access<cpu_class_> const& access, collection_i
             below[window.upper().size()] = '\0';
         }
         walked = walk_strings_down(access, collection, window.prefix, std::string_view {below.begin(), below.end()},
-                                   read_stamp_of(access), merged);
+                                   merged);
     }
     if (walked.failed()) return walked;
     for (; carries_on && next != own_strings.size(); ++next) emit_own(own_strings[next]);
@@ -1494,7 +1555,7 @@ status_t empty_strings(database_state<cpu_class_>& state, ustore_arena_t scratch
         tasks.clear();
         status_t room;
         status_t const walked = walk_strings(
-            head, collection, {}, std::string_view {from.begin(), from.end()}, head_stamp_k,
+            head, collection, {}, std::string_view {from.begin(), from.end()},
             [&](std::string_view text, lookup_result_t found, ustore_key_t const&) noexcept {
                 if (found != lookup_result_t::written_k) return true;
                 std::size_t const offset = texts.size();
@@ -2286,7 +2347,7 @@ status_t save_strings(call_access<cpu_class_> const& access, collection_id_t col
         tasks.clear();
         status_t room;
         status_t const walked = walk_strings(
-            access, collection, {}, std::string_view {from.begin(), from.end()}, access.stamp,
+            access, collection, {}, std::string_view {from.begin(), from.end()},
             [&](std::string_view text, lookup_result_t found, ustore_key_t const& value) noexcept {
                 if (found != lookup_result_t::written_k) return true;
                 std::size_t const offset = texts.size();
