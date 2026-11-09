@@ -115,17 +115,18 @@ expected<typename store_type_::run_pool_t> make_run_pool(stack_type_& stack) noe
     return store_type_::run_pool_t::make(run_records_k, stack.fixture->resources->memory_constraint);
 }
 
-/** Mounts a fixture through @p mount, takes one channel and formats one volume over it. */
+/** Mounts a fixture of @p reshaped through @p mount, takes one channel and formats one
+ *  volume over it. */
 template <typename mount_type_>
 expected<std::unique_ptr<typename collection_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
-    mount_type_ const& mount) noexcept {
+    mount_type_ const& mount, fixture_config_t const& reshaped) noexcept {
     using types_t = collection_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
     using volume_t = typename types_t::volume_t;
     auto stack = std::unique_ptr<stack_t> {new (std::nothrow) stack_t {}};
     if (!stack) return status_t {status_code_t::out_of_memory_k, "The stack did not fit"};
 
-    auto [fixture, mount_status] = mount();
+    auto [fixture, mount_status] = mount(reshaped);
     if (mount_status.failed()) return mount_status;
     stack->fixture = std::move(fixture);
 
@@ -138,6 +139,14 @@ expected<std::unique_ptr<typename collection_types<typename mount_type_::fixture
     stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*volume)}};
     if (!stack->volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
     return stack;
+}
+
+/** Mounts a fixture of the suite's config through @p mount, as @c make_stack of a
+ *  reshaped one does. */
+template <typename mount_type_>
+expected<std::unique_ptr<typename collection_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
+    mount_type_ const& mount) noexcept {
+    return make_stack(mount, mount.config);
 }
 
 #pragma endregion Fixtures
@@ -582,6 +591,78 @@ std::size_t full_memory_runs_flush_themselves(mount_type_ const& mount) {
     stored_value_size_t size = 0;
     failures += expect(store->find(stored_key_t {900002}, size) == lookup_result_t::written_k);
     failures += expect_eq(static_cast<std::size_t>(size), wide.size() / 2);
+    return failures;
+}
+
+/** Memory runs past one slot flush as several runs of level zero, and a range removal across
+ *  their cut still hides what an older run holds. */
+template <typename mount_type_>
+std::size_t flush_past_one_slot_cuts_runs(mount_type_ const& mount) {
+    using types_t = collection_types<typename mount_type_::fixture_t>;
+    using variable_store_t = typename types_t::variable_store_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    constexpr std::size_t older_k = 64;
+    constexpr std::size_t batches_k = 17;
+    constexpr std::size_t batch_keys_k = 1024;
+    constexpr stored_key_t start_k = 16385;
+    constexpr stored_key_t end_k = 34001;
+    // The memory runs hold a little over one slot, and the memory disk the runs flushed from them.
+    fixture_config_t shape = mount.config;
+    shape.memory_limit = 3ull * 1024ull * 1024ull * 1024ull;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount, shape);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+
+    collection_config_t config = test_config(0, value_max_size_k);
+    config.memory_runs_max_bytes = 2ull * 1024ull * 1024ull * 1024ull;
+    config.memory_runs_max_deltas = 2 * (older_k + batches_k * batch_keys_k);
+    expected<typename variable_store_t::run_pool_t> runs = make_run_pool<variable_store_t>(**stack);
+    failures += expect(runs.has_value());
+    if (!runs) return failures;
+    expected<variable_store_t> store = variable_store_t::mount(
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger, *runs);
+    failures += expect(store.has_value());
+    if (!store) return failures;
+
+    st::vector<expectation_t> model;
+    failures += expect(model.resize(older_k + batches_k * batch_keys_k) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    for (std::size_t index = 0; index != older_k; ++index)
+        model[index] = expectation_t {1 + index * 544, lookup_result_t::written_k, 100 + index, index * 7 + 3};
+    std::span<expectation_t const> const older {model.data(), older_k};
+    failures += write_model(*store, (*stack)->channel(), older);
+    failures += expect(store->flush((*stack)->channel()).succeeded());
+    failures += expect(store->remove_range((*stack)->channel(), start_k, end_k).succeeded());
+    for (std::size_t index = 0; index != older_k; ++index)
+        if (model[index].stored_key >= start_k && model[index].stored_key < end_k)
+            model[index] = expectation_t {model[index].stored_key, lookup_result_t::removed_k};
+
+    st::vector<byte_t> batch;
+    st::vector<stored_key_t> keys;
+    st::vector<stored_value_size_t> sizes;
+    failures += expect(batch.resize(batch_keys_k * value_max_size_k) == st::status_t::success_k);
+    failures += expect(keys.resize(batch_keys_k) == st::status_t::success_k);
+    failures += expect(sizes.resize(batch_keys_k) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    for (std::size_t batch_index = 0; batch_index != batches_k; ++batch_index) {
+        for (std::size_t index = 0; index != batch_keys_k; ++index) {
+            std::size_t const written = batch_index * batch_keys_k + index;
+            expectation_t& entry = model[older_k + written];
+            entry = expectation_t {written * 2, lookup_result_t::written_k, value_max_size_k, written * 5 + 11};
+            keys[index] = entry.stored_key;
+            sizes[index] = value_max_size_k;
+            paint_into(entry, std::span<byte_t> {batch}.subspan(index * value_max_size_k, value_max_size_k));
+        }
+        failures += expect(store
+                               ->insert((*stack)->channel(), std::span<stored_key_t const> {keys},
+                                        std::span<byte_t const> {batch}, std::span<stored_value_size_t const> {sizes})
+                               .succeeded());
+    }
+    failures += expect_eq(store->tree().levels().level(0).size(), std::size_t {1});
+    failures += expect_status(store->flush((*stack)->channel()), status_code_t::success_k);
+    failures += expect(store->tree().levels().level(0).size() > std::size_t {2});
+    failures += check_model(*store, (*stack)->channel(), std::span<expectation_t const> {model});
     return failures;
 }
 
@@ -1512,6 +1593,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "misses_and_remove_deltas", misses_and_remove_deltas);
         report(totals, mount, "buffer_before_tree", memory_runs_answer_before_the_tree);
         report(totals, mount, "full_buffer_flushes", full_memory_runs_flush_themselves);
+        report(totals, mount, "flush_past_one_slot", flush_past_one_slot_cuts_runs);
         report(totals, mount, "burst_past_records", burst_past_records_lands_every_commit);
         report(totals, mount, "unaligned_exact_span", unaligned_exact_span_is_taken);
         report(totals, mount, "widest_and_empty", widest_and_empty_values);

@@ -290,6 +290,26 @@ class range_tombstones {
         return false;
     }
 
+    /** The pieces of every tombstone from @p lower up to @p upper, exclusive, which one of several
+     *  runs cut from the same versions carries, so no piece hides a key of another run. */
+    expected<range_tombstones> clipped(stored_key_t const& lower, stored_key_t const& upper,
+                                       allocator_t allocator = {}) const noexcept {
+        range_tombstones pieces {allocator};
+        if (pieces.ranges_.reserve(ranges_.size()) != st::status_t::success_k ||
+            pieces.stamps_.reserve(ranges_.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for range tombstones"};
+        for (std::size_t index = 0; index != ranges_.size(); ++index) {
+            range_t piece = ranges_[index];
+            if (piece.start < lower) piece.start = lower;
+            if (upper < piece.end) piece.end = upper;
+            if (!(piece.start < piece.end)) continue;
+            [[maybe_unused]] st::status_t const cut = pieces.ranges_.push_back(st::assume_reserved, std::move(piece));
+            [[maybe_unused]] st::status_t const stamped = pieces.stamps_.push_back(st::assume_reserved,
+                                                                                   std::uint64_t {stamps_[index]});
+        }
+        return pieces;
+    }
+
     /** The least key a tombstone hides, or the greatest key of the type for none. */
     [[nodiscard]] stored_key_t lower_stored_key() const noexcept {
         return ranges_.empty() ? limit<stored_key_t>::max() : ranges_[0].start;

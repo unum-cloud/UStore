@@ -172,28 +172,33 @@ class nvme_store_cursor;
 #pragma region Store
 
 /**
- *  @brief The store of one collection: immutable memory runs and a value cache in front of an LSM tree of sorted runs,
- *      behind one published view.
+ *  @brief The store of one collection: immutable memory runs and a value cache in front of an LSM
+ *      tree of sorted runs, behind one published view.
  *
- *  A reader announces itself in its ledger's epochs, loads the published stamp and then the view, and walks immutable
- *  runs with no lock. A committer seals its deltas into one memory run on its own thread, and the ledger's leader
- *  publishes a view naming it ahead of the others. A merge folds F runs of one tier into one run of the next tier,
- *  and a flush writes the memory runs of one view as one run of level zero, each with no lock held, then takes the
- *  leader word only to publish a view without exactly those runs. Whoever replaces a view frees the view and the runs
- *  it no longer names before returning, once every reader that entered before has left. Merges, flushes, compactions
- *  and truncations of one store are serialized by its owner. The volume, the budget and every channel are borrowed
- *  and must outlive the store, and a channel belongs to the thread holding it.
+ *  A reader announces itself in its ledger's epochs, loads the published stamp and then the view,
+ *  and walks immutable runs with no lock. A committer seals its deltas into one memory run on its
+ *  own thread, and the ledger's leader publishes a view naming it ahead of the others. A merge
+ *  folds F runs of one tier into one run of the next tier, and a flush writes the memory runs of
+ *  one view as runs of level zero, one per slot, each with no lock held, then takes the leader word
+ *  only to publish a view without exactly those runs. Whoever replaces a view returns only once it
+ *  freed that view and the runs only it named, which waits for every reader that could hold them.
+ *  Merges, flushes, compactions and truncations of one store are serialized by its owner. The
+ *  volume, the budget and every channel are borrowed and must outlive the store, and a channel
+ *  belongs to the thread holding it.
  *
- *  The fold decides what a change delta does: a read collects a key's versions newest first down to the first that
- *  closes the chain and applies them, and every merge composes the changes no reader tells apart. A store of blobs
- *  folds with @c last_write_fold_t, writes no change, and reads and merges exactly as if it had no fold.
+ *  The fold decides what a change delta does: a read collects a key's versions newest first down to
+ *  the first that closes the chain and applies them, and every merge composes the changes no reader
+ *  tells apart. A store of blobs folds with @c last_write_fold_t, writes no change, and reads and
+ *  merges exactly as if it had no fold.
  *
- *  @tparam atomic_reference_ The reference the published view, the cache, the budget and the ledger own their words
- *      through.
- *  @tparam waiter_type_ What a core waiting on a read, a barrier or the ledger does between attempts, before it parks.
+ *  @tparam atomic_reference_ The reference the published view, the cache, the budget and the ledger
+ *      own their words through.
+ *  @tparam waiter_type_ What a core waiting on a read, a barrier or the ledger does between
+ *      attempts, before it parks.
  *  @tparam fold_type_ What a change delta does, which reads and merges fold with.
- *  @tparam device_fold_type_ What composes the changes of a merge on a device, or @c no_device_fold_t where nothing
- *      does, which keeps every merge holding a change on the host.
+ *  @tparam device_fold_type_ What composes the changes of a merge on a device, or
+ *      @c no_device_fold_t where nothing does, which keeps every merge holding a change
+ *      on the host.
  *  @tparam row_kit_type_ The SmashTable kit the memory runs' trees search with.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
@@ -1172,10 +1177,12 @@ class nvme_store {
     [[nodiscard]] bool maintenance_due() const noexcept { return runs_.maintenance_due(); }
 
     /**
-     *  @brief Writes the memory runs of the published view as one run of level zero with no lock held, then publishes
-     *      a view naming that run instead of exactly those runs, keeping every memory run committed meanwhile.
-     *  @note The owner serializes flushes, compactions and truncations of one collection, and the calling thread is
-     *      inside no epoch, since the publication waits for every reader that could hold a run it frees.
+     *  @brief Writes the memory runs of the published view as runs of level zero, one per slot they
+     *      fill, with no lock held, then publishes a view naming those runs instead of exactly the
+     *      memory runs, keeping every memory run committed meanwhile.
+     *  @note The owner serializes flushes, compactions and truncations of one collection, and the
+     *      calling thread is inside no epoch, since the publication waits for every reader that
+     *      could hold a run it frees.
      */
     status_t flush(io_channel_t& channel) noexcept {
         return runs_.flush([&](tree_t& tree, std::span<memory_run_t const* const> flushed,
@@ -1188,17 +1195,59 @@ class nvme_store {
             utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
             if (status_t const kept = kept_versions(flushed, survival, fold_, versions, folded_bytes); kept.failed())
                 return kept;
-            if (status_t const laid = lay_out_versions_(std::span<stamped_delta_t const> {versions}, drained);
-                laid.failed())
-                return laid;
             auto [tombstones, tombstones_status] = gathered_range_tombstones(flushed, st::default_allocator<byte_t> {});
             if (tombstones_status.failed()) return tombstones_status;
-            laid_out_values_t const values = laid_out_values_(std::span<stamped_delta_t const> {versions}, drained, 0);
-            return tree.flush(channel, std::span<key_slot_t const> {drained.key_slots},
-                              std::span<std::uint64_t const> {drained.stamps},
-                              std::span<std::uint8_t const> {drained.kinds}, survival.floor, values,
-                              std::span<stored_value_offset_t const> {drained.value_offsets}, value_max_size_,
-                              published, {}, tombstones);
+
+            st::vector<sorted_run_t> written;
+            auto write = [&](std::size_t begin, std::size_t end) noexcept -> status_t {
+                std::span<stamped_delta_t const> const run_versions =
+                    std::span<stamped_delta_t const> {versions}.subspan(begin, end - begin);
+                drained.clear();
+                if (status_t const laid = lay_out_versions_(run_versions, drained); laid.failed()) return laid;
+                auto [pieces, pieces_status] = tombstones.clipped(
+                    begin == 0 ? limit<stored_key_t>::min() : versions[begin].stored_key,
+                    end == versions.size() ? limit<stored_key_t>::max() : versions[end].stored_key);
+                if (pieces_status.failed()) return pieces_status;
+                if (written.reserve(written.size() + 1) != st::status_t::success_k)
+                    return {status_code_t::out_of_memory_k, "A flush could not hold another run"};
+                auto [run, write_status] = sorted_run_t::write(
+                    tree.volume(), channel, runs_.config().lsm_tree.collection, uuid_generator(),
+                    std::span<key_slot_t const> {drained.key_slots}, std::span<std::uint64_t const> {drained.stamps},
+                    std::span<std::uint8_t const> {drained.kinds}, survival.floor,
+                    laid_out_values_(run_versions, drained, 0),
+                    std::span<stored_value_offset_t const> {drained.value_offsets}, value_max_size_, {}, pieces);
+                if (write_status.failed()) return write_status;
+                [[maybe_unused]] st::status_t const placed = written.push_back(st::assume_reserved, std::move(run));
+                return {};
+            };
+            // A run past one slot is cut where a key begins, so every version of a key lands
+            // in one run.
+            std::size_t run_first = 0;
+            std::size_t key_first = 0;
+            std::uint64_t run_bytes = 0;
+            std::uint64_t key_bytes = 0;
+            status_t status;
+            for (std::size_t index = 0; index != versions.size() && status.succeeded(); ++index) {
+                if (index == 0 || versions[index].stored_key != versions[index - 1].stored_key) {
+                    key_first = index;
+                    key_bytes = 0;
+                }
+                std::uint64_t const value = is_fixed(value_layout_k) ? value_size_ : versions[index].delta.bytes.size();
+                run_bytes += value;
+                key_bytes += value;
+                if (key_first == run_first ||
+                    !flushed_run_overflows_(index + 1 - run_first, run_bytes, tombstones.size()))
+                    continue;
+                status = write(run_first, key_first);
+                run_first = key_first;
+                run_bytes = key_bytes;
+            }
+            if (status.succeeded()) status = write(run_first, versions.size());
+            if (status.failed()) {
+                for (sorted_run_t const& run : written) tree.volume().deallocate(run.extent());
+                return status;
+            }
+            return tree.flush(std::span<sorted_run_t> {written}, published);
         });
     }
 
@@ -1898,6 +1947,19 @@ class nvme_store {
     /** Whether a run of @p key_slots key slots and @p values bytes outgrows one slot. */
     [[nodiscard]] static bool ingested_run_overflows_(std::uint64_t key_slots, std::uint64_t values) noexcept {
         return ingested_run_bytes_(key_slots, values) > utilities::sorted_run_bytes_max_k;
+    }
+
+    /** Whether a flushed run of @p key_slots key slots, @p values bytes of values and
+     *  @p tombstones range tombstones outgrows one slot, its stamps counted whole and its kinds
+     *  at a byte each. */
+    [[nodiscard]] static bool flushed_run_overflows_(std::uint64_t key_slots, std::uint64_t values,
+                                                     std::uint64_t tombstones) noexcept {
+        std::uint64_t const run = sorted_run_layout_t::blob_bytes(
+            key_slots, values, key_slots * sizeof(std::uint64_t) + portable_alignment_k,
+            key_slots + portable_alignment_k);
+        std::uint64_t const ranges = round_up_to_multiple(sorted_run_layout_t::range_tombstones_bytes(tombstones),
+                                                          portable_alignment_k);
+        return run + ranges > utilities::sorted_run_bytes_max_k;
     }
 
     /** Writes the rows @p ingested laid out as one run of stamp zero, and empties the layout for the next. */

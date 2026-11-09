@@ -1389,13 +1389,18 @@ class published_runs {
     }
 
     /**
-     *  @brief Writes the memory runs of the published view as one run of level zero with no lock held, then publishes
-     *      a view naming that run instead of exactly those runs, keeping every memory run committed meanwhile.
-     *  @param[in] drain Called as @c drain(tree, flushed, survival, published) with the memory runs to write, newest
-     *      first, the versions a pinned reader or a mount still needs, and the hook to hand @c lsm_tree::flush, which
-     *      it calls on @c tree once it laid the runs out, answering what the flush answered.
-     *  @note The owner serializes flushes, compactions and truncations of one store, and the calling thread is inside
-     *      no epoch, since the publication waits for every reader that could hold a run it frees.
+     *  @brief Writes the memory runs of the published view as runs of level zero with no lock held,
+     *      then publishes a view naming those runs instead of exactly the memory runs, keeping
+     *      every memory run committed meanwhile.
+     *  @param[in] drain Called as <tt>drain(tree, flushed, survival, published)</tt>, answering what
+     *      the flush answered.
+     *  @note The owner serializes flushes, compactions and truncations of one store, and the
+     *      calling thread is inside no epoch, since the publication waits for every reader that
+     *      could hold a run it frees.
+     *
+     *  @p drain gets the memory runs to write, newest first, the versions a pinned reader or a
+     *  mount still needs, and the hook to hand @c lsm_tree::flush, which it calls on @c tree once
+     *  it laid the runs out.
      */
     template <typename drain_type_>
     status_t flush(drain_type_&& drain) noexcept {

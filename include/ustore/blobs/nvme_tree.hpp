@@ -537,17 +537,33 @@ class lsm_tree {
             *volume_, channel, config_.collection, uuid_generator(), key_slots, stamps, kinds, floor, stored_values,
             value_offsets, value_max_size, tails, tombstones);
         if (write_sorted_run_status.failed()) return write_sorted_run_status;
-        auto [flushed, take_status] = runs_->take(std::move(written));
-        if (take_status.failed()) {
-            volume_->deallocate(written.extent());
-            return take_status;
+        return flush(std::span<sorted_run_t> {&written, 1}, published);
+    }
+
+    /**
+     *  @brief Publishes @p runs onto level zero as one change, each written from the versions of
+     *      one flush and holding keys no other of them holds.
+     *  @return Success, or the status that stopped it with every run given back to the volume.
+     */
+    status_t flush(std::span<sorted_run_t> runs,
+                   lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
+        st::vector<run_handle_t> taken;
+        status_t status = taken.reserve(runs.size()) == st::status_t::success_k
+                              ? status_t {}
+                              : status_t {status_code_t::out_of_memory_k,
+                                          "A tree could not track the runs a flush wrote"};
+        for (std::size_t index = 0; index != runs.size() && status.succeeded(); ++index) {
+            auto [handle, take_status] = runs_->take(std::move(runs[index]));
+            status = take_status;
+            if (status.succeeded()) [[maybe_unused]]
+                st::status_t const placed = taken.push_back(std::move(handle));
         }
-        std::span<run_handle_t const> const placed {&flushed, 1};
-        if (status_t const prepared = prepare_next_({}, 0, placed); prepared.failed()) {
-            runs_->discard(*volume_, placed);
-            return prepared;
-        }
-        return publish_(published);
+        if (status.succeeded()) status = prepare_next_({}, 0, std::span<run_handle_t const> {taken});
+        if (status.succeeded()) return publish_(published);
+        runs_->discard(*volume_, std::span<run_handle_t const> {taken});
+        for (sorted_run_t const& run : runs)
+            if (run.attached()) volume_->deallocate(run.extent());
+        return status;
     }
 
     /**
