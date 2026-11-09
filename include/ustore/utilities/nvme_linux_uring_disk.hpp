@@ -537,6 +537,15 @@ class linux_uring_files_disk {
         // one for long
         native_file_t const file = atomic_reference_<native_file_t> {slot->file}.exchange(invalid_native_file_k,
                                                                                           std::memory_order_acq_rel);
+        // A ring that never submits again would keep the closed file and its blocks
+        std::uint32_t const files_update = 6; // IORING_REGISTER_FILES_UPDATE
+        int const cleared = invalid_native_file_k;
+        linux_uring_rsrc_update_t update {};
+        update.offset = static_cast<std::uint32_t>(slot - media_.data());
+        update.data = reinterpret_cast<std::uint64_t>(&cleared);
+        for (ring_t const& ring : rings_)
+            if (ring.file >= 0) [[maybe_unused]]
+                long const updated = register_(ring, files_update, &update, 1);
         close_native_file(file);
         ++slot->generation;
         slot->capacity = 0;
