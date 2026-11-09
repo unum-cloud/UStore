@@ -38,7 +38,8 @@
 #include "ustore/utilities/algorithm.hpp"   // `radix_sort`, `word_byte`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growth_status`
 
-#include "database.hpp" // `call_access`, `access_of`, `resolve_runs`, `watch_keys`, `serve_write`
+#include "database.hpp"         // `call_access`, `access_of`, `resolve_runs`, `watch_keys`, `serve_write`
+#include "utilities/slices.hpp" // `for_task_slices`
 
 namespace unum::ustore::nvme {
 
@@ -310,7 +311,6 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     auto [reads, reads_status] = arena_allocate<vertex_read_t>(view.scratch, count);
     if (reads_status.failed()) return reads_status;
     for (std::size_t index = 0; index != count; ++index) keys[index] = stored_of(vertices[index].uuid);
-    if (status_t const read = read_task_vertices(access, collections, keys, reads); read.failed()) return read;
 
     auto [degrees, degrees_status] = arena_allocate<ustore_vertex_degree_t>(arguments.arena, count);
     if (degrees_status.failed()) return degrees_status;
@@ -320,21 +320,39 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     // Each present vertex's adjacency is checked once, then walked again for its edges
     auto [adjacencies, adjacencies_status] = arena_allocate<vertex_adjacency_t>(view.scratch, count);
     if (adjacencies_status.failed()) return adjacencies_status;
+    auto [firsts, firsts_status] = arena_allocate<std::size_t>(view.scratch, count);
+    if (firsts_status.failed()) return firsts_status;
+    auto measure_slice = [&](std::size_t first, std::size_t length, view_t const& slice) noexcept -> status_t {
+        call_access<cpu_class_> const sliced_access {state,         access.transaction, access.schedule,
+                                                     slice.scratch, access.stamp,       thread_index_of(state, slice),
+                                                     access.strings};
+        if (status_t const read = read_task_vertices(sliced_access, collections + static_cast<std::ptrdiff_t>(first),
+                                                     keys.subspan(first, length), reads.subspan(first, length));
+            read.failed())
+            return read;
+        for (std::size_t index = first; index != first + length; ++index) {
+            if (!reads[index].present) {
+                degrees[index] = ustore_vertex_degree_missing_k;
+                continue;
+            }
+            expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertices[index], reads[index].base,
+                                                                                    reads[index].pending);
+            if (!adjacency) return adjacency.status();
+            std::construct_at(&adjacencies[index], *adjacency);
+            degrees[index] = static_cast<ustore_vertex_degree_t>(
+                adjacency->degree(half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k)));
+        }
+        return {};
+    };
+    // A transaction's reads join its watch set, so only a read at one stamp splits the batch
+    status_t const measured = access.transaction ? measure_slice(0, count, view)
+                                                 : for_task_slices(view, count, measure_slice);
+    if (measured.failed()) return measured;
     std::size_t exported = 0;
     for (std::size_t index = 0; index != count; ++index) {
+        firsts[index] = exported;
         if (!offsets.empty()) offsets[index] = static_cast<ustore_length_t>(exported);
-        if (!reads[index].present) {
-            degrees[index] = ustore_vertex_degree_missing_k;
-            continue;
-        }
-        expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertices[index], reads[index].base,
-                                                                                reads[index].pending);
-        if (!adjacency) return adjacency.status();
-        std::construct_at(&adjacencies[index], *adjacency);
-        std::size_t const degree = adjacency->degree(
-            half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k));
-        degrees[index] = static_cast<ustore_vertex_degree_t>(degree);
-        exported += degree;
+        if (reads[index].present) exported += degrees[index];
     }
     if (!offsets.empty()) offsets[count] = static_cast<ustore_length_t>(exported);
     *arguments.degrees_per_vertex = degrees.data();
@@ -343,24 +361,29 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
 
     auto [tape, tape_status] = arena_allocate<ustore_key_t>(arguments.arena, 3 * exported);
     if (tape_status.failed()) return tape_status;
-    ustore_key_t* written = tape.data();
-    for (std::size_t index = 0; index != count; ++index) {
-        if (!reads[index].present) continue;
-        ustore_key_t const vertex = vertices[index];
-        role_t const wanted = half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k);
-        vertex_adjacency_t const& adjacency = adjacencies[index];
-        for (role_t const role : {dedge_source_k, dedge_target_k}) {
-            if (!(role & wanted)) continue;
-            for (half_edge_cursor_t cursor = adjacency.half_edges(); cursor.valid(); cursor.next()) {
-                graph::labeled_half_edge_t const half_edge = cursor.current();
-                if (!(half_edge.role & role)) continue;
-                bool const outgoing = role == dedge_source_k;
-                *written++ = outgoing ? vertex : half_edge.neighbor_id;
-                *written++ = outgoing ? half_edge.neighbor_id : vertex;
-                *written++ = half_edge.edge_id;
+    // Adjacencies only read views the first pass took, so the fill splits inside transactions too
+    auto fill_slice = [&](std::size_t first, std::size_t length, view_t const&) noexcept -> status_t {
+        for (std::size_t index = first; index != first + length; ++index) {
+            if (!reads[index].present) continue;
+            ustore_key_t* written = tape.data() + 3 * firsts[index];
+            ustore_key_t const vertex = vertices[index];
+            role_t const wanted = half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k);
+            vertex_adjacency_t const& adjacency = adjacencies[index];
+            for (role_t const role : {dedge_source_k, dedge_target_k}) {
+                if (!(role & wanted)) continue;
+                for (half_edge_cursor_t cursor = adjacency.half_edges(); cursor.valid(); cursor.next()) {
+                    graph::labeled_half_edge_t const half_edge = cursor.current();
+                    if (!(half_edge.role & role)) continue;
+                    bool const outgoing = role == dedge_source_k;
+                    *written++ = outgoing ? vertex : half_edge.neighbor_id;
+                    *written++ = outgoing ? half_edge.neighbor_id : vertex;
+                    *written++ = half_edge.edge_id;
+                }
             }
         }
-    }
+        return {};
+    };
+    if (status_t const filled = for_task_slices(view, count, fill_slice); filled.failed()) return filled;
     *arguments.edges_per_vertex = tape.data();
     return {};
 }

@@ -88,15 +88,15 @@ ustore_arena_init(&(ustore_arena_init_t){.arena = &arena, .outcome = &outcome});
 
 An executor owns the threads that run calls and the scratch they use, and a `NULL` executor runs a call on the calling thread.
 Its kind picks where calls compute: a RAM or NVMe executor serves every engine on host threads, and a VRAM executor serves the reads and scans an engine computes on its one device, refusing changes, the control plane and every call no device tower serves yet with `ustore_status_unsupported_k`.
-`ustore_executor_for_ram` spawns its threads and holds up to `deferred_limit` deferred calls at once, 256 for zero.
+`ustore_executor_for_ram` spawns its threads, caller-exclusive, so its first thread can serve a call in the caller's place.
 Its `ram` options name the memory domains it serves, NUMA nodes as the operating system numbers them, where `NULL` derives every domain the process may allocate on and an unknown one is refused with `ustore_status_invalid_argument_k`.
-Each thread keeps its scratch on its local domain when the options name it, and on the first named domain otherwise, as does every arena the executor makes.
-Zero threads take 7/8 of the cores local to those domains, rounded down and at least one, leaving the rest to the driver thread, to blocking calls on their callers' threads, and to the background flushes and compactions of RocksDB and LevelDB.
+Each thread keeps its scratch on its local domain when the options name it, and on the first named domain otherwise, and the call's own scratch and every arena the executor makes live where its first thread's does.
+Zero threads take 7/8 of the cores local to those domains, rounded down and at least one, leaving the rest to blocking calls on their callers' threads, and to the background flushes and compactions of RocksDB and LevelDB.
 ForkUnion spawns the threads near every domain or near one alone, so naming several domains but not all spreads them over the whole machine.
-`ustore_executor_on_pool` borrows a ForkUnion pool another library owns, which must outlive the executor, and places its scratch and arenas by the same `ram` options; a dispatch on a pool that runs another is refused, so a batch finding the pool running its lender's dispatch runs on the executor's own driver thread instead of forking over the lender.
+`ustore_executor_on_pool` borrows a ForkUnion pool another library owns, which must outlive the executor, and places its scratch and arenas by the same `ram` options; a dispatch on a pool that runs another is refused, so a call finding the pool running its lender's dispatch finishes `ustore_status_contended_k` instead of forking over the lender.
 `ustore_executor_for_nvme` spawns the threads of the NVMe engine, and its `nvme` options tell every database `ustore_database_open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, read once at the open.
 It may borrow an executor of `ustore_executor_for_vram`, whose CUDA device and scratch limit the compactions take, and which answers `ustore_status_unsupported_k` in a library built without CUDA.
-That executor queues every call on one stream of its device, its own or one the caller lends through `stream`, so one host thread keeps the device fed.
+That executor queues every call on one stream of its device, its own or one the caller lends through `stream`, from the calling thread of a blocking call or from its one host thread for a deferred call.
 A call blocks by default and returns with its outcome final, while `ustore_completion_deferred_k` returns once the call is submitted:
 
 ```c
@@ -107,26 +107,38 @@ ustore_executor_for_ram(&(ustore_executor_for_ram_t){
     .ram = {memory_domains, 1},
 });
 
-ustore_outcome_t outcomes[4] = {{0}};
-for (size_t batch = 0; batch != 4; ++batch) {
-    reads[batch].executor = executor, reads[batch].outcome = &outcomes[batch], reads[batch].arena = arenas[batch];
+ustore_outcome_t outcomes[2] = {{0}};
+for (size_t batch = 0; batch != 2; ++batch) { // one call per executor at a time, so two executors overlap two reads
+    reads[batch].executor = executors[batch], reads[batch].outcome = &outcomes[batch], reads[batch].arena = arenas[batch];
     reads[batch].completion = ustore_completion_deferred_k;
     ustore_blobs_read(&reads[batch]);
 }
-for (size_t batch = 0; batch != 4; ++batch) ustore_outcome_wait(&outcomes[batch]);
+while (ustore_outcome_status(&outcomes[0]) == ustore_status_deferred_k ||
+       ustore_outcome_status(&outcomes[1]) == ustore_status_deferred_k)
+    do_other_work(); // polling alone finishes both
 ```
 
 Submission copies the argument struct, so the caller may reuse or drop it at once, while everything it points to, the outcome, inputs, outputs and arena alike, stays borrowed until the call is final.
 A deferred call's status reads `ustore_status_deferred_k` until it finishes; the library then stores the message and the final status with release ordering and touches nothing the struct points to after that.
 The caller reads the status with acquire ordering, polling through `ustore_outcome_status` or waiting through `ustore_outcome_wait`, and never loads the field itself.
-Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted before it finishes, and before any submitted after it starts.
-A blocking call on an executor runs on the calling thread, while deferred calls run in batches on the executor's threads.
-`ustore_executor_drain` waits for every call submitted before it began, and sets whether the threads park or spin once idle.
-A call is refused with `ustore_status_contended_k` rather than waited for when the executor's deferred table is full, when its arena, its transaction or its cursor serves another call, or when it drains or blocks from a callback its own executor runs.
-Freeing a database, transaction, snapshot, cursor or arena waits until every deferred call naming it finishes, so a binding may drop its handle before those calls finish, but never from a callback of one of them.
+An executor serves one call at a time, and nothing queues: a call on an executor serving another, from any thread, finishes at once with `ustore_status_contended_k`.
+A blocking call on an executor runs on the calling thread, and a deferred call is delegated to the executor's first thread, which serves it in the caller's place, so polling alone finishes it.
+Inside a call every fork of the executor's pool splits the call's batch over the other threads, in both modes.
+A call ends in one order: it releases its arena, cursor and transaction and its counts on the handles it names, then the executor, and stores its status last, so a caller seeing it final may submit again or free at once.
+On a borrowed pool, whose lender keeps its dispatches and joins, and on a caller-inclusive pool, as a build without OS threads spawns, a deferred call runs at submission and is final when it returns.
+`ustore_executor_drain` waits until no call holds the executor, then parks its threads or keeps them spinning.
+A call is refused with `ustore_status_contended_k` rather than waited for when its executor, arena, transaction or cursor serves another call, or when it drains its executor from a callback of that executor's own call.
+Freeing a database, transaction, snapshot, cursor or arena waits until every executor call naming it ends, so a binding may drop its handle before those calls finish, but never from a callback of one of them.
 A progress callback never waits on a call its own executor has not finished, and polls the status instead.
 [The C++ wrappers](https://github.com/unum-cloud/UStore/blob/main/cpp/README.md#receivers-and-deferred-calls) and the Rust and Python bindings choose the executor and the completion by receiver, as `database.on(executor)` and `database.deferred(executor)`, so blocking calls read as they would without executors; the Design sections of `rust/README.md` and `python/README.md` state the rules every binding keeps.
 A call stops early only when its progress callback returns `ustore_cancel_k`, as [Progress and Cancellation](#progress-and-cancellation) describes.
+
+### Inclusive and Exclusive Executors
+
+A pool is caller-inclusive when the thread that spawned or lent it counts as one of its threads, and caller-exclusive when it only dispatches and waits.
+An inclusive pool needs its caller to run anything, so a deferred call on it runs at submission and is final when it returns.
+An exclusive pool, which every executor UStore spawns is, delegates a deferred call to its own first thread, one call at a time, and forks the other threads for it.
+So one manager thread in `int main()` can overlap a USearch RAM executor, a UStore NVMe executor and a UForm VRAM executor, giving each one deferred call and polling the three statuses, with no thread of its own per engine.
 
 ## Opening the Database
 
@@ -625,14 +637,14 @@ An edit of a missing page answers `ustore_status_not_found_k`, an edit of a miss
 - __Deferred calls report through the same outcome.__
   `ustore_outcome_status` polls and `ustore_outcome_wait` blocks, both with the acquire ordering the final store pairs with.
 - __No life of its own.__
-  Threads live only in executors and deferred calls only in each executor's deferred table, and every `*_free` waits for the calls naming its handle first.
+  Threads live only in executors, each serving one call at a time, and every `*_free` waits for the calls naming its handle first.
 - __Three shapes in, three out.__
   An input is one run of bytes, a strided run of fixed-width elements, or a ragged batch of strings in an Arrow tape or behind an accessor, and an output is a packed array, a tape of bytes, or packed keys split by offsets.
   So Arrow arrays pass as they are, and a runtime's own objects pass through an accessor, without copies on either side.
 - __Arenas are lent and reused, never shared.__
   Every output whose length scales with the call lands in an arena the caller passes, and each call rewinds it, so the previous call's views go stale the moment the next one starts.
 - __Nothing costs anything until it is used.__
-  Blocking calls take no slot of the deferred table, and an arena allocates only when a call writes into it.
+  A blocking call runs on its caller's thread, and an arena allocates only when a call writes into it.
 - __One shape for every call.__
   Each verb takes one struct set by designator, so a call names only what it changes and the struct grows without breaking source.
 - __Failures are statuses.__

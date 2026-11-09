@@ -2740,7 +2740,7 @@ mod tests {
     #[test]
     fn documents_and_gists_block_or_defer_on_an_executor() {
         let (database, docs, _) = populated();
-        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let executor = Executor::for_ram(&[], 2).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let blocking = database.head().on(&executor);
         let deferred = database.head().deferred(&executor);
@@ -2768,7 +2768,7 @@ mod tests {
     fn whole_documents_write_through_a_deferred_view() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let docs = created(&database, Modality::Docs);
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let deferred = database.head().deferred(&executor);
         let (upsert, buffered) = (Modification::Upsert, Durability::Buffered);
 
@@ -2795,7 +2795,7 @@ mod tests {
     fn documents_by_id_write_through_a_deferred_view() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let docs = created(&database, Modality::Docs);
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let texts: CharsTape<u64> = [r#"{"_id":7,"name":"Ada"}"#].into_iter().collect();
         database
             .head()
@@ -2821,7 +2821,7 @@ mod tests {
     #[test]
     fn fields_write_through_a_deferred_view() {
         let (database, docs, mut arena) = populated();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let paths: CharsTape<u32> = ["died", "/navy/rank"].into_iter().collect();
         let values: CharsTape<u64> = ["1852", r#""Commodore""#].into_iter().collect();
         database
@@ -2848,7 +2848,7 @@ mod tests {
     #[test]
     fn fields_read_through_a_deferred_view() {
         let (database, docs, mut arena) = populated();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let deferred = database.head().deferred(&executor);
 
         let paths: CharsTape<u64> = ["name", "/navy/rank"].into_iter().collect();
@@ -2867,7 +2867,7 @@ mod tests {
     #[test]
     fn gathers_run_through_a_deferred_view() {
         let (database, docs, mut arena) = populated();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let columns = vec![Column::new::<u64>("born"), Column::new::<Text>(String::from("name"))];
         let gathered = database
             .head()

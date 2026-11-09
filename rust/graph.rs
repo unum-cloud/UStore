@@ -1677,7 +1677,7 @@ mod tests {
     #[test]
     fn graph_verbs_block_or_defer_on_an_executor() {
         let (database, _, graph) = populated();
-        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let executor = Executor::for_ram(&[], 2).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let blocking = database.head().on(&executor);
         let deferred = database.head().deferred(&executor);

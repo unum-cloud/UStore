@@ -1248,7 +1248,7 @@ mod tests {
     #[test]
     fn strings_cross_a_deferred_view_as_an_owned_tape() {
         let (database, strings, mut arena) = populated();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let deferred = database.head().deferred(&executor);
         let texts: CharsTape<u64> = ["cherry", "date"].into_iter().collect();
         deferred
@@ -1382,7 +1382,7 @@ mod tests {
     #[test]
     fn names_resolve_through_a_deferred_view() {
         let (database, mut arena) = three_named();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let deferred = database.head().deferred(&executor);
         let found = deferred
             .collection_find(String::from("places"), &mut arena)
@@ -1401,7 +1401,7 @@ mod tests {
     #[test]
     fn names_walk_through_a_deferred_view() {
         let (database, mut arena) = three_named();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let deferred = database.head().deferred(&executor);
         let listing = deferred
             .collection_names(String::from("pl"), None, 10, &mut arena)

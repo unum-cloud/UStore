@@ -246,7 +246,7 @@ ustore_ingest_order_t ustore_ingest_order_from_name(ustore_bytes_view_t name) {
 
 void ustore_transaction_free(ustore_transaction_t transaction) {
     if (!transaction) return;
-    wait_deferred_calls(transaction->deferred_calls);
+    wait_named_calls(transaction->named_calls);
     release_parent(transaction);
 }
 
@@ -264,7 +264,7 @@ void ustore_changes_cursor_next(ustore_changes_cursor_next_t* arguments) { route
 
 void ustore_changes_cursor_free(ustore_changes_cursor_t cursor) {
     if (!cursor) return;
-    wait_deferred_calls(cursor->cursor.deferred_calls);
+    wait_named_calls(cursor->cursor.named_calls);
     ustore_database_t const database = cursor->cursor.database;
     if (cursor->state) engine_of(database).database->changes_cursor_free(cursor);
     delete cursor;
@@ -273,13 +273,13 @@ void ustore_changes_cursor_free(ustore_changes_cursor_t cursor) {
 
 void ustore_snapshot_free(ustore_snapshot_t snapshot) {
     if (!snapshot) return;
-    wait_deferred_calls(snapshot->deferred_calls);
+    wait_named_calls(snapshot->named_calls);
     release_parent(snapshot);
 }
 
 void ustore_database_free(ustore_database_t database) {
     if (!database) return;
-    wait_deferred_calls(database->deferred_calls);
+    wait_named_calls(database->named_calls);
     release_hold(database);
 }
 

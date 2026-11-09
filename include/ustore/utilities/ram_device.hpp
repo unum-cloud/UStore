@@ -115,6 +115,25 @@ class pool_view_t {
         return fu_pool_threads_count(pool_, &threads) == fu_success_k ? threads : 0;
     }
 
+    /** What the thread that spawned or lent the pool does on every dispatch it makes. */
+    [[nodiscard]] caller_exclusivity_t caller_exclusivity() const noexcept {
+        fu_caller_exclusivity_t exclusivity = fu_caller_inclusive_k;
+        fu_pool_caller_exclusivity(pool_, &exclusivity);
+        return exclusivity == fu_caller_exclusive_k ? caller_exclusivity_t::caller_exclusive_k
+                                                    : caller_exclusivity_t::caller_inclusive_k;
+    }
+
+    /** Starts @p callback over @p context on every thread and returns while it runs, writing the
+     *  token @c unsafe_join takes into @p generation; a busy pool refuses as would-block. */
+    [[nodiscard]] st::status_t unsafe_for_threads(fu_for_threads_t callback, void* context,
+                                                  fu_generation_t& generation) const noexcept {
+        return status_from_(fu_pool_unsafe_for_threads(pool_, callback, context, &generation));
+    }
+
+    /** Waits until every thread returned from the dispatch @p generation names; on a
+     *  caller-exclusive pool a zero token waits for whatever dispatch is in flight. */
+    void unsafe_join(fu_generation_t generation) const noexcept { fu_pool_unsafe_join(pool_, generation); }
+
     /** The ForkUnion pool itself, for lending it to a library that borrows pools. */
     [[nodiscard]] fu_pool_t pool() const noexcept { return pool_; }
 
@@ -299,8 +318,8 @@ class executor_t {
     /** The right to dispatch on the pool, which stays owned here. */
     [[nodiscard]] pool_view_t view() const noexcept { return pool_view_t {pool_}; }
 
-    /** Puts the idle threads to sleep, each checking for work every @p micros, until the next dispatch wakes them. */
-    void park(std::size_t micros) noexcept { fu_pool_sleep(pool_, micros); }
+    /** Puts the idle threads to sleep in the kernel until the next dispatch wakes them. */
+    void park() noexcept { fu_pool_sleep(pool_, 0); }
 
     /**
      *  @brief Starts @c loop_ over @p context on every thread and returns while it runs.
@@ -351,8 +370,8 @@ class executor_t {
     fu_pool_t pool_ = nullptr;
 };
 
-/** A pool lent by another library: dispatched on during a batch unless its lender's dispatch runs, never deleted,
- *  never parked. */
+/** A pool lent by another library: dispatched on unless its lender's dispatch runs, and never
+ *  deleted or parked. */
 class lent_pool_t {
   public:
 

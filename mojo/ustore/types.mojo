@@ -92,7 +92,7 @@ struct Status(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     comptime UNINITIALIZED = Self(12)
     """The call needs a database or transaction that was never opened."""
     comptime CONTENDED = Self(14)
-    """The call was refused rather than waited for, like a submission to a full deferred table."""
+    """The call was refused rather than waited for, like a call on an executor serving another one."""
     comptime CANCELLED = Self(15)
     """A progress handler stopped the call, which unwound and published nothing."""
     comptime UNSUPPORTED = Self(16)
@@ -856,7 +856,6 @@ struct ExecutorForRamArguments(ImplicitlyCopyable):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var ram: RamOptionsArguments
     var threads: c_size_t
-    var deferred_limit: c_size_t
     var cpu_class: CPUClass
 
 
@@ -868,7 +867,6 @@ struct ExecutorOnPoolArguments(ImplicitlyCopyable):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var ram: RamOptionsArguments
     var pool: Address
-    var deferred_limit: c_size_t
 
 
 @fieldwise_init
@@ -879,7 +877,6 @@ struct ExecutorForNvmeArguments(ImplicitlyCopyable):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var nvme: NvmeOptions
     var threads: c_size_t
-    var deferred_limit: c_size_t
     var cpu_class: CPUClass
 
 
@@ -893,7 +890,6 @@ struct ExecutorForVramArguments(ImplicitlyCopyable):
     var stream: Address
     var scratch_limit: c_size_t
     var gds: Gds
-    var deferred_limit: c_size_t
 
 
 @fieldwise_init
@@ -939,8 +935,8 @@ def _created(
 struct Executor:
     """The threads or rings a verb runs on, freed once it and every device arena it made go out of scope.
 
-    `Executor(library)` owns nothing: every verb handed it runs on the calling thread. Calls on one
-    executor start in submission order, and a blocking call runs alone.
+    `Executor(library)` owns nothing: every verb handed it runs on the calling thread. An executor
+    serves one call at a time, and a call on one serving another finishes `CONTENDED`.
     """
 
     var library: Library
@@ -974,7 +970,6 @@ struct Executor:
         library: Library,
         ram: RamOptions[ram_origin] = RamOptions(),
         threads: Int = 0,
-        deferred_limit: Int = 0,
         cpu_class: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
         """Spawns host threads for the RAM, RocksDB and LevelDB engines. Calls `ustore_executor_for_ram`.
@@ -983,7 +978,6 @@ struct Executor:
             library: The loaded engine, kept so the shared object stays mapped.
             ram: The memory domains it serves; copied, not borrowed.
             threads: Threads to spawn; zero takes 7/8 of the cores those domains carry.
-            deferred_limit: Deferred calls it holds at once; zero takes a default.
             cpu_class: The class its threads confine their waits and atomics to; `UNKNOWN` derives.
 
         Raises:
@@ -994,7 +988,7 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForRamArguments(created, outcome, ram.arguments(), c_size_t(threads), c_size_t(deferred_limit), cpu_class),
+            ExecutorForRamArguments(created, outcome, ram.arguments(), c_size_t(threads), cpu_class),
             library.symbols().executor_for_ram,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_ram"), vram=False)
@@ -1002,7 +996,7 @@ struct Executor:
     @staticmethod
     def on_pool[
         ram_origin: ImmOrigin, //
-    ](library: Library, pool: Address, ram: RamOptions[ram_origin] = RamOptions(), deferred_limit: Int = 0) raises Error -> Self:
+    ](library: Library, pool: Address, ram: RamOptions[ram_origin] = RamOptions()) raises Error -> Self:
         """Schedules onto a borrowed ForkUnion pool, so several libraries in one process share one set of
         threads. Calls `ustore_executor_on_pool`.
 
@@ -1010,7 +1004,6 @@ struct Executor:
             library: The loaded engine, kept so the shared object stays mapped.
             pool: A live ForkUnion `fu_pool_t`, which must outlive the executor.
             ram: The memory domains it serves; copied, not borrowed.
-            deferred_limit: Deferred calls it holds at once; zero takes a default.
 
         Raises:
             `Error` if the pool or the domains are refused.
@@ -1020,7 +1013,7 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorOnPoolArguments(created, outcome, ram.arguments(), pool, c_size_t(deferred_limit)),
+            ExecutorOnPoolArguments(created, outcome, ram.arguments(), pool),
             library.symbols().executor_on_pool,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_on_pool"), vram=False)
@@ -1030,7 +1023,6 @@ struct Executor:
         library: Library,
         nvme: NvmeOptions = NvmeOptions(),
         threads: Int = 0,
-        deferred_limit: Int = 0,
         cpu_class: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
         """Spawns threads for the NVMe engine, each submitting and polling its own I/O ring.
@@ -1040,7 +1032,6 @@ struct Executor:
             library: The loaded engine, kept so the shared object stays mapped.
             nvme: How the databases it opens move bytes; copied, not borrowed.
             threads: Threads to spawn; zero derives them from the cores.
-            deferred_limit: Deferred calls it holds at once; zero takes a default.
             cpu_class: The class its threads confine their waits and atomics to; `UNKNOWN` derives.
 
         Raises:
@@ -1051,7 +1042,7 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForNvmeArguments(created, outcome, nvme, c_size_t(threads), c_size_t(deferred_limit), cpu_class),
+            ExecutorForNvmeArguments(created, outcome, nvme, c_size_t(threads), cpu_class),
             library.symbols().executor_for_nvme,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_nvme"), vram=False)
@@ -1063,9 +1054,8 @@ struct Executor:
         stream: Address = NULL_ADDRESS,
         scratch_limit: Int = 0,
         gds: Gds = Gds.AUTOMATIC,
-        deferred_limit: Int = 0,
     ) raises Error -> Self:
-        """Opens one submission stream on `device`, or borrows the caller's, driven by one host thread.
+        """Opens one submission stream on `device`, or borrows the caller's, fed by one host thread.
         Calls `ustore_executor_for_vram`.
 
         Args:
@@ -1074,7 +1064,6 @@ struct Executor:
             stream: A borrowed stream on that device, which must outlive the executor; null creates one.
             scratch_limit: Ceiling on the device scratch a call takes; zero lets it grow.
             gds: How reads and compactions move bytes between the drives and the device.
-            deferred_limit: Deferred calls it holds at once; zero takes a default.
 
         Raises:
             `Error` with `DEVICE` if no device carries the ordinal.
@@ -1084,15 +1073,13 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForVramArguments(
-                created, outcome, Int32(device), stream, c_size_t(scratch_limit), gds, c_size_t(deferred_limit)
-            ),
+            ExecutorForVramArguments(created, outcome, Int32(device), stream, c_size_t(scratch_limit), gds),
             library.symbols().executor_for_vram,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_vram"), vram=True)
 
     def drain(self, mood: Mood = Mood.PARKED) raises Error:
-        """Waits for every call submitted before the drain, then adopts `mood` whenever it next idles.
+        """Waits until no call holds the executor, then parks its threads or keeps them spinning.
         Calls `ustore_executor_drain`.
 
         Raises:

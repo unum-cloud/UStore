@@ -564,18 +564,21 @@ def test_await_raises_what_wait_raises(database, blobs):
         assert missing.status is ustore.Status.SUCCESS
 
 
-def test_a_view_blocks_after_earlier_deferred_calls(database, blobs):
+def test_a_deferred_call_finishes_by_polling(database, blobs):
+    """The executor's own thread serves a deferred call, so polling its status alone sees it final."""
     with ustore.Executor.for_ram(2) as executor:
         writing = database.deferred(executor).write([1], [b"a"], collection=blobs)
+        while writing.status is ustore.Status.DEFERRED:
+            pass
         on = database.on(executor)
         assert on.get(1, collection=blobs) == b"a"
         assert on["blobs"].blobs[1] == b"a"
         assert writing.wait() is None
 
 
-def test_a_full_deferred_table_refuses_the_next_call(database, blobs):
-    """A table of one call refuses the submissions that find it full, which raise once waited for."""
-    with ustore.Executor.for_ram(1, deferred_limit=1) as executor:
+def test_a_held_executor_refuses_the_next_call(database, blobs):
+    """An executor serves one call at a time, so submissions finding it held raise once waited for."""
+    with ustore.Executor.for_ram(1) as executor:
         later = database.deferred(executor)
         calls = [later.write(list(range(256)), b"v" * 1024, collection=blobs) for _ in range(64)]
         outcomes = outcomes_of(calls)
@@ -596,7 +599,7 @@ def test_close_waits_for_deferred_calls(open_database):
 
 def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path):
     """Every host has NUMA node zero, an identifier no node carries is refused, and so is a null pool."""
-    with ustore.Executor.for_ram(threads=1, memory_domains=[0], deferred_limit=4) as executor:
+    with ustore.Executor.for_ram(threads=1, memory_domains=[0]) as executor:
         database.on(executor).set(1, b"a", collection=blobs)
         assert database.deferred(executor).get(1, collection=blobs).wait() == b"a"
     with pytest.raises(ustore.InvalidArgumentError):

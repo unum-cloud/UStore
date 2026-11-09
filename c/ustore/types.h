@@ -29,43 +29,37 @@
  *
  *  @section types_asynchrony Asynchrony
  *
- *  Synchronous and asynchronous calls share one shape, so no verb has an asynchronous twin. The
- *  argument structure is the whole request and the outcome is all the caller observes until it
- *  finishes, which lets a thread pool, a GPU stream, or a remote client serving the same header
- *  over the network sit behind the same verbs without changing a call site. Every call names its
- *  completion: a blocking call, the default, returns with its final status stored and every output
- *  readable, and a call whose @c completion is @c ustore_completion_deferred_k returns once
- *  submitted, as an io_uring entry does. A call with a @c NULL executor runs on the calling thread
- *  and is final when it returns, whatever its @c completion. Submission copies the structure;
- *  everything it points to stays borrowed until final.
+ *  Every call names its @c completion, and blocking and deferred calls share one shape. A blocking
+ *  call, the default, returns with its final status stored and every output readable. A call with a
+ *  @c NULL executor runs on the calling thread and is final on return, whatever its completion.
  *
- *  The outcome's status reads @c ustore_status_deferred_k until final, even for a call refused at
- *  submission. The message, then the final status, are stored with release ordering and a wake, and the
- *  library touches nothing the structure points to after that store. The caller reads the status with
- *  acquire ordering, polling through @c ustore_outcome_status or waiting through @c ustore_outcome_wait.
- *  Device work stores the final status from a host callback that still fires after a device fault, so an
- *  outcome may live in any host memory.
+ *  An executor runs one call at a time. A call that finds another one holding its executor, from
+ *  any thread, finishes @c ustore_status_contended_k without running.
  *
- *  Scheduling is bounded on both sides. Calls on one executor start in submission order, and a
- *  blocking call runs alone: after every call submitted before it finishes, and before any
- *  submitted after it starts. Executors own their threads and streams, so verbs take no stream and
- *  no event, and a caller orders dependent deferred calls itself, by waiting on the first before
- *  submitting the second. Each executor holds a fixed number of deferred calls in its deferred
- *  table, sized by @c deferred_limit, so a deferred submission that finds the table full finishes
- *  at once with @c ustore_status_contended_k instead of allocating or blocking, while blocking
- *  calls take no slot. An arena and a transaction each serve one call at a time, and a second call
- *  naming one finishes @c ustore_status_contended_k. A call stops early only when its progress
- *  callback returns @c ustore_cancel_k, so @c ustore_status_deferred_k is the only status an
- *  unfinished call shows.
+ *  A deferred call on a caller-exclusive executor returns once handed to the executor's thread 0,
+ *  which runs it there, forks included, and finishes it, so polling alone sees it final. A deferred
+ *  call on a caller-inclusive executor, whose threads need their caller, runs at submission and is
+ *  final when it returns. Submission copies the structure; everything it points to stays borrowed
+ *  until final, and @c outcome->status reads @c ustore_status_deferred_k until then.
+ *
+ *  A call lets go of its arena and of the handles it names, then of its executor, and only then
+ *  stores the message and the final status with release ordering. A caller that reads the status
+ *  final with acquire ordering may reuse the arena, submit the next call or free any handle at
+ *  once. Waits, drains and frees only wait: the executor's own threads finish every call. A free
+ *  waits for the calls naming its handle, so one issued from a callback of such a call waits on
+ *  itself. A call stops early only when its progress handler returns @c ustore_cancel_k.
+ *
+ *  One thread keeps several executors busy by giving each a deferred call and polling the statuses:
  *
  *  @code{.c}
- *  ustore_outcome_t outcomes[4] = {0};
- *  for (size_t scan = 0; scan != 4; ++scan) {
- *      scans[scan].executor = executor, scans[scan].outcome = &outcomes[scan], scans[scan].arena = arenas[scan];
- *      scans[scan].completion = ustore_completion_deferred_k;
- *      ustore_blobs_scan(&scans[scan]);
- *  }
- *  for (size_t scan = 0; scan != 4; ++scan) ustore_outcome_wait(&outcomes[scan]);
+ *  ustore_outcome_t ram_outcome = {0}, nvme_outcome = {0};
+ *  ram_read.outcome = &ram_outcome, ram_read.completion = ustore_completion_deferred_k;
+ *  nvme_read.outcome = &nvme_outcome, nvme_read.completion = ustore_completion_deferred_k;
+ *  ustore_blobs_read(&ram_read);  // on a RAM executor
+ *  ustore_blobs_read(&nvme_read); // on an NVMe executor
+ *  while (ustore_outcome_status(&ram_outcome) == ustore_status_deferred_k ||
+ *         ustore_outcome_status(&nvme_outcome) == ustore_status_deferred_k)
+ *      prepare_next_batch();
  *  @endcode
  *
  *  @section types_memory Memory
@@ -316,8 +310,8 @@ typedef enum ustore_status_t {
     /** The call needs a database or transaction that was never opened. */
     ustore_status_uninitialized_k = 12,
 
-    /** The call was refused rather than waited for: its executor's deferred table is full, its arena or its
-     *  transaction serves another call, or it drains or blocks from a callback its own executor runs. */
+    /** The call was refused rather than waited for: another call holds its executor, arena, cursor
+     *  or transaction, or a drain came from inside a callback of the call it would wait on. */
     ustore_status_contended_k = 14,
 
     /** A progress callback stopped the call, which unwound and published nothing. */
@@ -499,21 +493,21 @@ typedef struct ustore_patterns_t {
  *  Its kind picks where calls compute: host threads for every engine, or one device for the reads
  *  and scans an engine computes there, where a change, the control plane and every call no device
  *  tower serves yet answer @c ustore_status_unsupported_k, and an arena or cursor of another kind
- *  of executor @c ustore_status_device_k. Calls on one executor start in submission order, and a
- *  blocking call runs alone: after every call submitted before it finishes, and before any
- *  submitted after it starts. Databases stay freely concurrent. A blocking call runs on the calling
- *  thread, while one driver thread hands deferred calls in batches to the executor's threads. In a
+ *  of executor @c ustore_status_device_k. An executor serves one call at a time, and a second call
+ *  finishes @c ustore_status_contended_k, while databases stay freely concurrent. A blocking call
+ *  runs on the calling thread, and a deferred call is delegated to the first thread of a
+ *  caller-exclusive pool, whose every fork inside the call splits it over the other threads. In a
  *  build without OS threads, an executor runs every call at submission, before returning. It owns
  *  the scratch and staging its calls need, placed where it computes and grown to a high-water mark,
- *  so a steady workload allocates once: a RAM executor keeps the scratch of each thread on the
- *  memory domain local to it.
+ *  so a steady workload allocates once, and a RAM executor keeps the scratch of each thread on the
+ *  memory domain local to that thread.
  *
- *  An executor holds its deferred calls in a deferred table sized at creation by @c deferred_limit, so submitting
- *  never allocates, and a deferred submission that finds the table full stores @c ustore_status_contended_k as its
- *  final status. A call leaves the table before its status turns final, so the table is full only of calls no
- *  caller has seen final. From inside a progress callback its own executor runs, @c ustore_executor_drain and a
- *  blocking call on that executor report @c ustore_status_contended_k, so nothing waits on itself. Frees cannot
- *  report, so @c ustore_executor_free is never called there, nor the free of a handle a deferred call names.
+ *  Every other call on an executor, from inside a progress callback of its own call, reports
+ *  @c ustore_status_contended_k. A drain reports it only from the thread running the call's body,
+ *  as a callback on another thread of a split batch is not told apart, so such a callback never
+ *  drains its own executor, which would wait on itself. Frees cannot report, so neither
+ *  @c ustore_executor_free nor the free of a handle the running call names is ever called from a
+ *  callback of that call.
  *
  *  The library stages only to change layout on the side that computes, or to make pageable memory
  *  DMA-able, and never routes device bytes through the host:
@@ -527,13 +521,13 @@ typedef struct ustore_patterns_t {
  */
 typedef struct ustore_executor_handle_t* ustore_executor_t;
 
-/** What an executor's threads or rings do once it goes idle. */
+/** What an executor's threads do between a drain and its next call. */
 typedef enum ustore_mood_t {
 
-    /** Parked, so the next call pays a wake-up. */
+    /** Sleep in the kernel until the next call, freeing the cores. */
     ustore_mood_parked_k = 0,
 
-    /** Spinning, trading power for the next call's latency. */
+    /** Keep polling, trading the cores for the lowest wake-up latency. */
     ustore_mood_spinning_k = 1,
 
 } ustore_mood_t;
@@ -623,9 +617,6 @@ typedef struct ustore_executor_for_ram_t {
      *  those domains carry, rounded down and at least one. */
     ustore_size_t threads;
 
-    /** Deferred calls the executor holds at once, sizing its deferred table, where zero takes a default. */
-    ustore_size_t deferred_limit;
-
     /** The CPU class the threads confine their waits and atomics to, where zero takes what the CPU offers. */
     ustore_cpu_class_t cpu_class;
 
@@ -635,10 +626,11 @@ typedef struct ustore_executor_for_ram_t {
  *  @brief Creates an executor of host threads for the RAM, RocksDB and LevelDB engines.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  The default thread count leaves an eighth of the cores to the driver thread, to blocking calls, which run on their
- *  callers' threads, and to the background flushes and compactions of RocksDB and LevelDB. The threads interleave
- *  across the compute domains local to the memory domains named, where ForkUnion spawns near them: every domain the
- *  process may allocate on, or one alone. Naming several but not all spreads them over the whole machine.
+ *  The default thread count leaves an eighth of the cores to blocking calls, which run on their
+ *  callers' threads, and to the background flushes and compactions of RocksDB and LevelDB. The
+ *  threads interleave across the compute domains local to the memory domains named, where ForkUnion
+ *  spawns near them: every domain the process may allocate on, or one alone. Naming several but not
+ *  all spreads them over the whole machine.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, a memory domain
@@ -646,7 +638,6 @@ typedef struct ustore_executor_for_ram_t {
  *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
  *    are asked of a build without them, the CPU does not run the @c cpu_class, or the operating
  *    system denies ForkUnion an operation.
- *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments);
 
@@ -666,9 +657,6 @@ typedef struct ustore_executor_on_pool_t {
     /** The ForkUnion @c fu_pool_t to borrow; it must outlive the executor, and keeps its lender's mood. */
     void* pool;
 
-    /** Deferred calls the executor holds at once, sizing its deferred table, where zero takes a default. */
-    ustore_size_t deferred_limit;
-
 } ustore_executor_on_pool_t;
 
 /**
@@ -676,15 +664,17 @@ typedef struct ustore_executor_on_pool_t {
  *      libraries in one process share one set of threads.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  A dispatch on a pool that runs another is refused, so a batch finding the pool running its lender's dispatch runs
- *  on the executor's own driver thread instead of forking over the lender.
+ *  A dispatch on a pool that runs another is refused, so a call finding the pool running its
+ *  lender's dispatch finishes @c ustore_status_contended_k rather than forking over the lender, and
+ *  so does the creation. The lender keeps the dispatches and joins of its pool, so a deferred call
+ *  runs at submission on the calling thread and is final when it returns.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, a memory domain
  *    identifier names no domain, or ForkUnion refuses the @c pool or another argument.
  *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, or the operating
  *    system denies ForkUnion an operation.
- *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
+ *  - @c ustore_status_contended_k The @c pool runs its lender's dispatch.
  */
 USTORE_EXPORT void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments);
 
@@ -762,9 +752,6 @@ typedef struct ustore_executor_for_nvme_t {
     /** Threads to spawn, each owning one submission ring, where zero derives them from the cores. */
     ustore_size_t threads;
 
-    /** Deferred calls the executor holds at once, sizing its deferred table, where zero takes a default. */
-    ustore_size_t deferred_limit;
-
     /** The CPU class the threads confine their waits and atomics to, where zero takes what the CPU offers. */
     ustore_cpu_class_t cpu_class;
 
@@ -783,7 +770,6 @@ typedef struct ustore_executor_for_nvme_t {
  *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
  *    are asked of a build without them, the CPU does not run the @c cpu_class, or the operating
  *    system denies ForkUnion an operation.
- *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments);
 
@@ -942,21 +928,20 @@ typedef struct ustore_executor_for_vram_t {
     /** How reads and compactions move bytes between the drives and the device. */
     ustore_gds_t gds;
 
-    /** Deferred calls the executor holds at once, sizing its deferred table, where zero takes a default. */
-    ustore_size_t deferred_limit;
-
 } ustore_executor_for_vram_t;
 
 /**
- *  @brief Opens one submission stream on @c device, or borrows the caller's, driven by one host thread.
+ *  @brief Opens one submission stream on @c device, or borrows the caller's, fed by a host thread.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  Every call queues on that stream in order, so one host thread keeps the device fed, and a multi-GPU caller makes
- *  one executor per device. Its calls read through an engine's device verbs, which refuse changes and the control
- *  plane, and every call no device tower serves yet, with @c ustore_status_unsupported_k, and arenas it makes live on
- *  its device. @c ustore_database_open_nvme takes one of an NVIDIA device as its @c compactions, reading its device
- *  and scratch limit once. Every build spawns one, as the vendor's runtime opens at the first call and the library
- *  links none.
+ *  A blocking call queues on that stream from the calling thread, and a deferred one from the
+ *  executor's caller-exclusive host thread, which waits on the stream in the caller's place, so a
+ *  multi-GPU caller makes one executor per device. Its calls read through an engine's device verbs,
+ *  which refuse changes, the control plane and every call no device tower serves yet with
+ *  @c ustore_status_unsupported_k, and arenas it makes live on its device.
+ *  @c ustore_database_open_nvme takes one of an NVIDIA device as its @c compactions, reading its
+ *  device and scratch limit once. Every build spawns one, as the vendor's runtime opens at the
+ *  first call and the library links none.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the @c gds mode is
@@ -965,41 +950,42 @@ typedef struct ustore_executor_for_vram_t {
  *    system denies ForkUnion an operation.
  *  - @c ustore_status_device_k No device carries the ordinal, its driver refuses a stream or an
  *    event, or @c ustore_gds_direct_k names a device other than NVIDIA.
- *  - @c ustore_status_capacity_exhausted_k The @c deferred_limit is past 2^30.
  */
 USTORE_EXPORT void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments);
 
 /** The arguments of @c ustore_executor_drain. */
 typedef struct ustore_executor_drain_t {
 
-    /** The executor to drain. */
+    /** The executor whose call is awaited. */
     ustore_executor_t executor;
 
-    /** Output for the outcome: an executor-level failure, such as a lost device, never one of a drained call. */
+    /** Output for an executor-level failure, such as a device fault, never a drained call's. */
     ustore_outcome_t* outcome;
 
-    /** What the threads do whenever the executor next goes idle, where the last drain wins. */
+    /** What the executor's threads do until its next call. */
     ustore_mood_t mood;
 
 } ustore_executor_drain_t;
 
 /**
- *  @brief Waits for every call submitted before the drain began, so later submissions never delay it.
+ *  @brief Waits until no call holds the executor, then applies the mood, reporting only
+ *      executor-level failures, and contention from a callback of the call it would wait on.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  A borrowed pool keeps its lender's mood.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c mood is unknown.
- *  - @c ustore_status_contended_k A callback drains the executor running it.
+ *  - @c ustore_status_contended_k A callback on the thread serving the holding call drains it.
  */
 USTORE_EXPORT void ustore_executor_drain(ustore_executor_drain_t* arguments);
 
 /**
- *  @brief Drains every call, then frees the executor's threads, rings and scratch, and hands a borrowed pool back to
- *      its lender; @c NULL is safe, and it cannot fail, so takes no outcome.
+ *  @brief Waits until no call holds the executor, releases its scratch and streams, returns a
+ *      borrowed pool and frees it; @c NULL is safe, and it cannot fail, so takes no outcome.
  *  @param[in,out] executor The executor to be freed; invalid afterwards.
  *
- *  Waits until every call running on the executor, blocking or deferred, is final. Arenas it made stay valid, each
- *  keeping its memory until freed.
+ *  Arenas it made stay valid, each keeping its memory until freed.
  */
 USTORE_EXPORT void ustore_executor_free(ustore_executor_t executor);
 

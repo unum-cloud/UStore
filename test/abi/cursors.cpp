@@ -27,7 +27,7 @@
 
 #include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
 
-#include "abi/fixture.hpp" // `write_text`, `held_scan_t`, `submit_held`, `open_cursor`, `pull_of`, `expect_page`
+#include "abi/fixture.hpp" // `write_text`, `held_scan_t`, `wait_held`, `open_cursor`, `pull_of`, `expect_page`
 #include "harness.hpp"     // `suite_exit_code`, `expect`, `expect_eq`, `expect_near`, `expect_status`
 
 using namespace unum::ustore;
@@ -208,26 +208,27 @@ case_result_t cursor_snapshot_view(config_t const& config) {
 /** What a thread freeing a cursor saw of the deferred pull naming it once the free returned. */
 struct cursor_freeing_t {
     ustore_blobs_cursor_t cursor = nullptr;
-    ustore_outcome_t* outcome = nullptr;
-    ustore_status_t status_after_free = ustore_status_deferred_k;
+    hold_stage_t const* stage = nullptr;
+    hold_stage_t stage_after_free = hold_stage_t::submitted_k;
     std::uint32_t freed = 0;
 };
 
-/** Frees the cursor of @p freeing, then records the status of the pull that named it. */
+/** Frees the cursor of @p freeing, then records how far the pull naming it got. */
 void free_cursor(cursor_freeing_t& freeing) noexcept {
     ustore_blobs_cursor_free(freeing.cursor);
-    freeing.status_after_free = ustore_outcome_status(freeing.outcome);
+    freeing.stage_after_free = fu::standard_atomic_ref<hold_stage_t const> {*freeing.stage}.load(
+        std::memory_order_acquire);
     fu::standard_atomic_ref<std::uint32_t> {freeing.freed}.store(1, std::memory_order_release);
 }
 
-/** Freeing a cursor waits until the deferred pull naming it is final, here a pull held behind
- *  an unfinished call. */
+/** Freeing a cursor waits until the deferred pull naming it ends, here a pull held inside its
+ *  progress callback, which has returned before the free does. */
 case_result_t cursor_free_waits(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     st::expected<executor_t> freeing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
     auto [collection, create_status] = create_collection(database, "cursor.free", ustore_modality_blobs_k);
     failures += expect(spawn_status.succeeded() && freeing_thread.has_value() && create_status.succeeded());
@@ -239,25 +240,28 @@ case_result_t cursor_free_waits(config_t const& config) {
     failures += expect(arena_status.succeeded() && cursor_status.succeeded());
     if (failures != 0) return failures;
 
-    held_scan_t held;
-    failures += submit_held(held, executor);
+    held_scan_t held {.executor = executor};
     ustore_outcome_t outcome {};
     pulled_keys_t pulled;
     ustore_blobs_cursor_next_t next = pull_of(database, cursor, pulled, arena, 8, outcome);
     next.executor = executor;
     next.completion = ustore_completion_deferred_k;
+    next.progress = &hold_until_released;
+    next.progress_state = &held;
     ustore_blobs_cursor_next(&next);
+    failures += wait_held(held);
 
-    cursor_freeing_t freeing {.cursor = cursor, .outcome = &outcome};
+    cursor_freeing_t freeing {.cursor = cursor, .stage = &held.stage};
     st::expected<fu_generation_t> const generation = freeing_thread->start<&free_cursor>(freeing);
     failures += expect(generation.has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     failures += expect(fu::standard_atomic_ref<std::uint32_t> {freeing.freed}.load(std::memory_order_acquire) == 0);
 
-    failures += release_held(held);
+    fu::standard_atomic_ref<hold_stage_t> {held.stage}.store(hold_stage_t::released_k, std::memory_order_release);
     if (generation) freeing_thread->join(*generation);
     else free_cursor(freeing);
-    failures += expect(freeing.status_after_free == ustore_status_success_k);
+    failures += expect(freeing.stage_after_free == hold_stage_t::returned_k);
+    failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
     failures += expect_page(pulled, keys, "held");
     ustore_executor_free(executor);
     return failures;

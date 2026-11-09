@@ -348,8 +348,8 @@ class InternalError(Error):
     """The engine failed in a way no other status names, which points at a defect."""
 
 class ContendedError(Error):
-    """The call was refused rather than waited for: a full deferred table, an arena serving another call or exporting
-    a buffer, or a transaction serving another call; retry it once that one finishes or the buffer is released."""
+    """The call was refused rather than waited for: an executor, an arena or a transaction serving another call, or an
+    arena exporting a buffer; retry it once that one finishes or the buffer is released."""
 
 class CancelledError(Error):
     """A progress callback stopped the call, which unwound and published nothing."""
@@ -609,12 +609,12 @@ class Executor:
     """The threads that run calls, shared by any number of databases."""
 
     @classmethod
-    def for_ram(cls, threads: int = 0, *, memory_domains: Sequence[int] | None = None, deferred_limit: int = 0) -> Self:
+    def for_ram(cls, threads: int = 0, *, memory_domains: Sequence[int] | None = None) -> Self:
         """Host threads for the RAM, RocksDB and LevelDB engines near `memory_domains`, every NUMA node for None, where
         zero threads take 7/8 of the cores those nodes carry. Calls `ustore_executor_for_ram`."""
 
     @classmethod
-    def on_pool(cls, pool: int, /, *, memory_domains: Sequence[int] | None = None, deferred_limit: int = 0) -> Self:
+    def on_pool(cls, pool: int, /, *, memory_domains: Sequence[int] | None = None) -> Self:
         """The threads of a ForkUnion `fu_pool_t` at address `pool`, which another library runs and which must outlive
         the executor. Calls `ustore_executor_on_pool`."""
 
@@ -624,7 +624,6 @@ class Executor:
         threads: int = 0,
         *,
         transport: Transport = Transport.AUTOMATIC,
-        deferred_limit: int = 0,
         shared_io_channels: int = 0,
         queue_depth: int = 0,
         request_buffer_bytes: int = 0,
@@ -642,7 +641,6 @@ class Executor:
         *,
         scratch_limit: int = 0,
         gds: Gds = Gds.AUTOMATIC,
-        deferred_limit: int = 0,
     ) -> Self:
         """One stream on `device`, a `GPUDevice.ordinal` of either vendor, every call queues on, fed by one host thread,
         which `Database.open_nvme` takes as its `compactions` on an NVIDIA device, refused with `DeviceError` for an
@@ -650,10 +648,10 @@ class Executor:
         `ustore_executor_for_vram`."""
 
     def drain(self, mood: Mood = Mood.PARKED) -> None:
-        """Waits for every call submitted before the drain began, setting what the threads do once idle."""
+        """Waits until no call holds the executor, then parks its threads or keeps them spinning."""
 
     def close(self) -> None:
-        """Waits for every submitted call, then frees the threads."""
+        """Waits until no call holds the executor, then frees the threads."""
     def __enter__(self) -> Self: ...
     def __exit__(
         self,

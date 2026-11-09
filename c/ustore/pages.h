@@ -118,9 +118,8 @@ typedef struct ustore_pages_import_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
@@ -209,9 +208,8 @@ typedef struct ustore_pages_insert_t {
  *    insert names a @c transaction, @c ustore_watch_none_k comes without one, one call edits past
  *    4 Gi tasks, a fragment or a page is past 4 GiB, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
- *  - @c ustore_status_contended_k The arena or the @c transaction serves another call, the
- *    executor's deferred table is full, a callback blocks on the executor running it, or an NVMe
- *    value keeps changing size across reads.
+ *  - @c ustore_status_contended_k The arena or the @c transaction serves another call, the executor
+ *    serves another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device, the @c encoding is HTML,
@@ -275,9 +273,8 @@ typedef struct ustore_pages_remove_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
@@ -349,9 +346,8 @@ typedef struct ustore_pages_move_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
@@ -426,9 +422,8 @@ typedef struct ustore_pages_splice_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
@@ -499,9 +494,8 @@ typedef struct ustore_pages_set_attributes_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c collections, @c keys, @c elements, @c fields or
@@ -567,9 +561,8 @@ typedef struct ustore_pages_remove_attributes_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c collections, @c keys, @c elements or @c fields are
@@ -654,8 +647,8 @@ typedef struct ustore_pages_read_t {
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, a callback blocks on the executor running
- *    it, or an NVMe value keeps changing size across reads.
+ *    another call, the executor serves another call, or an NVMe value keeps changing size across
+ *    reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The @c outputs_encoding is HTML, Markdown or JSON.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
@@ -746,8 +739,8 @@ typedef struct ustore_pages_scan_t {
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, a callback blocks on the executor running
- *    it, or an NVMe value keeps changing size across reads.
+ *    another call, the executor serves another call, or an NVMe value keeps changing size across
+ *    reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor's device loaded no bundle of the library's kernels
  *    and a @c filter is given.
@@ -876,8 +869,8 @@ typedef struct ustore_pages_cursor_next_t {
  *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
  *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
- *    another call, the executor's deferred table is full, a callback blocks on the executor running
- *    it, or an NVMe value keeps changing size across reads.
+ *    another call, the executor serves another call, or an NVMe value keeps changing size across
+ *    reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The @c outputs_encoding is HTML, Markdown or JSON, or
  *    the pulling executor's device loaded no bundle of the library's kernels and the walk
@@ -944,8 +937,7 @@ typedef struct ustore_pages_sample_t {
  *    sample goes through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
@@ -1017,8 +1009,7 @@ typedef struct ustore_pages_measure_t {
  *  @par Statuses:
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.

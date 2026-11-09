@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstring> // `std::memcpy`
 
 #include <type_traits> // `std::is_same_v`
 
@@ -19,10 +20,11 @@
 
 #include "ustore/graph/half_edges.hpp"      // `half_edge_t`
 #include "ustore/graph/ram_store.hpp"       // `export_edges`, `stage_edges`, `stage_vertex_removal`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_copy`, `arena_allocator`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`
 
 #include "database.hpp"          // `database_state`, `with_source`, `stage_runs_of`, `serve_write`, `scan_keys`
 #include "utilities/batches.hpp" // `edges_batch_t`, `edges_of`
+#include "utilities/slices.hpp"  // `for_task_slices`, `slice_slots`
 
 namespace unum::ustore::ram {
 
@@ -41,27 +43,50 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_read_
     edges_batch_t const tasks {collections, strided(arguments.vertices), strided(arguments.roles), arguments.count};
     auto [degrees, degrees_status] = arena_allocate<ustore_vertex_degree_t>(arguments.arena, arguments.count);
     if (degrees_status.failed()) return degrees_status;
-    st::vector<ustore_key_t, arena_allocator<ustore_key_t>> edges {{view.scratch}};
-    st::vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
+    // Each slice exports its edges into its thread's scratch, joined in task order once all return
+    using edges_tape_t = st::vector<ustore_key_t, arena_allocator<ustore_key_t>>;
+    st::vector<edges_tape_t, arena_allocator<edges_tape_t>> slices_edges {{view.scratch}};
+    if (st::failed(slices_edges.resize(slice_slots(view))))
+        return {status_code_t::out_of_memory_k, "Failed to allocate the slices of an edges read"};
 
     status_t outcome;
-    store_status_t const exported = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(source, collections, arguments.count, outcome,
-                            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
-                                                        std::size_t end) noexcept -> store_status_t {
-                                using entry_t = entry_of<entries_type_>;
-                                if constexpr (!std::is_same_v<entry_t, half_edge_t>) return refused_modality(outcome);
-                                else {
-                                    auto store = source.view(entries);
-                                    if (!store) return store.status();
-                                    return export_edges(*store, tasks, first, end, degrees,
-                                                        arguments.edges_per_vertex ? &edges : nullptr, walked, outcome);
-                                }
-                            });
+    store_status_t const exported = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
+        auto export_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
+            edges_tape_t& edges = slices_edges[slice.thread_index];
+            edges = edges_tape_t {{slice.scratch}};
+            st::vector<half_edge_t, arena_allocator<half_edge_t>> walked {{slice.scratch}};
+            status_t slice_outcome;
+            store_status_t const runs = for_each_run(
+                source, collections + static_cast<std::ptrdiff_t>(first_task), length, slice_outcome,
+                [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                            std::size_t end) noexcept -> store_status_t {
+                    using entry_t = entry_of<entries_type_>;
+                    if constexpr (!std::is_same_v<entry_t, half_edge_t>) return refused_modality(slice_outcome);
+                    else {
+                        auto store = source.view(entries);
+                        if (!store) return store.status();
+                        return export_edges(*store, tasks, first_task + first, first_task + end, degrees,
+                                            arguments.edges_per_vertex ? &edges : nullptr, walked, slice_outcome);
+                    }
+                });
+            return reported(runs, slice_outcome);
+        };
+        // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
+        if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
+            outcome = for_task_slices(view, arguments.count, export_slice);
+        else outcome = export_slice(0, arguments.count, view);
+        return store_status_t::success_k;
     });
     if (status_t const status = reported(exported, outcome); status.failed()) return status;
-    auto [copied_edges, edges_status] = arena_copy<ustore_key_t>(arguments.arena, edges);
+    std::size_t edges_keys = 0;
+    for (edges_tape_t const& edges : slices_edges) edges_keys += edges.size();
+    auto [copied_edges, edges_status] = arena_allocate<ustore_key_t>(arguments.arena, edges_keys);
     if (edges_status.failed()) return edges_status;
+    std::size_t joined = 0;
+    for (edges_tape_t const& edges : slices_edges) {
+        if (edges.size()) std::memcpy(copied_edges.data() + joined, edges.data(), edges.size() * sizeof(ustore_key_t));
+        joined += edges.size();
+    }
 
     // A missing vertex spans no edges
     auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(arguments.arena,

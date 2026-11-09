@@ -12,26 +12,30 @@
  *  against every build, and every other one names its engine's open as the template argument of
  *  @c route_init, which routes it as any call. Every call of the table is @c noexcept, so nothing
  *  here catches. The router claims the arena and the transaction of a call, refuses a change to a
- *  database opened read-only, then runs the call on the calling thread, blocking on its executor,
- *  or queues it in the executor's deferred table, and finishes its outcome when the engine returns.
+ *  database opened read-only, then claims its executor, runs the call on the calling thread or
+ *  delegates it to the executor's pool thread 0, and finishes its outcome when the engine returns.
  *
- *  A call keeps whatever it needs only while it runs in a scratch, so its arena holds only its outputs. Each pool
- *  thread of an executor and its blocking caller keep one scratch, rewound before every call and kept at its
- *  high-water mark until the executor is freed, and a call without an executor makes a scratch of its own on the
- *  calling thread, starting from one page of its stack, and frees whatever it grew into once final. The router
- *  gathers there the views every accessor of a ragged input writes, on the thread that runs the call, before the
- *  engine sees it, so every engine reads tapes and accessors alike.
+ *  A call keeps whatever it needs only while it runs in a scratch, so its arena holds only its
+ *  outputs. Each pool thread of an executor keeps one scratch for the slices it serves, and the
+ *  call holding the executor one more, all rewound as a call starts and kept at a high-water mark
+ *  until the executor is freed. A call without an executor makes a scratch of its own on the
+ *  calling thread, starting from one page of its stack, and frees whatever it grew into once final.
+ *  The router gathers there the views every accessor of a ragged input writes, on the thread that
+ *  runs the call, before the engine sees it, so every engine reads tapes and accessors alike.
  *
- *  An executor owns a pool, spawned or lent, and one driver thread, which hands runs of consecutive deferred calls to
- *  the pool with a blocking dispatch, and runs a batch itself when a lent pool refuses the dispatch while it runs its
- *  lender's. One compare-and-swap on @c submitted takes a call's ticket and, for a deferred call, its table position,
- *  so their orders agree, and every ticket below @c finished is final. A blocking call takes a ticket and no slot, and
- *  runs on the calling thread once every ticket before it is final. The driver frees a batch's table positions before
- *  it finishes any of the batch's outcomes, so a caller that sees a call final may submit the next one at once.
+ *  An executor serves one call at a time, held from its claim to its end, and a second call from
+ *  any thread finishes contended, so nothing queues. A blocking call, and every call on a lent or
+ *  caller-inclusive pool, runs on the calling thread. A deferred call on an owned caller-exclusive
+ *  pool is copied into the executor and dispatched to pool thread 0, which serves it in the
+ *  caller's place while the other threads return at once, so polling alone finishes it. Inside the
+ *  call every fork of the pool forks the other threads, so a verb splits its batch the same way in
+ *  both modes. A call ends in one order: its own claims and handle counts, the executor claim, then
+ *  the message and the status with release ordering, so a caller seeing it final may submit again
+ *  or free at once. The next call, a drain or a free joins that dispatch before using the pool.
  *
- *  A deferred call raises the deferred count of its database, of the transaction, snapshot or cursor it names, and of
- *  its arena when it takes its slot, and lowers them once its outcome is final, so freeing any of those handles waits
- *  for zero.
+ *  Every executor call raises the count of its database, of the transaction, snapshot or cursor it
+ *  names, and of its arena at its claim, and lowers them at its end, so freeing any of those
+ *  handles waits for zero.
  *
  *  Cursors live here, with no engine slot of their own: a pull lists the next page through the engine's scan and reads
  *  its values through the engine's read in one call. A cursor holds its database, and the transaction or snapshot it
@@ -40,6 +44,7 @@
 
 #pragma once
 
+#include <cassert> // `assert`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 
@@ -76,8 +81,8 @@ struct cursor_t {
     /** Whether a pull fills the cursor, so a second pull naming it finds it contended. */
     claim_t claim = claim_t::free_k;
 
-    /** Deferred pulls naming the cursor that are not final, through the floor class's reference. */
-    std::uint32_t deferred_calls = 0;
+    /** Executor pulls naming the cursor that have not ended, through the floor reference. */
+    std::uint32_t named_calls = 0;
 
     /** Where the walk's match was compiled once, freed with the cursor. */
     ustore_arena_handle_t compiled {};
@@ -784,6 +789,9 @@ inline bool take(claim_t& word) noexcept { return host_verbs().take(&word); }
 /** Hands @p word back to the next call. */
 inline void release(claim_t& word) noexcept { host_verbs().release(&word); }
 
+/** Waits until no call holds @p word. */
+inline void wait_while_claimed(claim_t const& word) noexcept { host_verbs().wait_while_claimed(&word); }
+
 /** The arena @p arguments fill, or null for a call without outputs in one. */
 template <typename arguments_type_>
 ustore_arena_t arena_of(arguments_type_ const& arguments) noexcept {
@@ -798,27 +806,22 @@ ustore_transaction_t transaction_of(arguments_type_ const& arguments) noexcept {
     return decode_call(arguments, view) ? view.transaction : nullptr;
 }
 
-/** The deferred count of the cursor @p arguments pull, or of the transaction or snapshot they read
- *  through, or null for none, as the cursor's holds keep what it reads through alive. */
+/** The named-call counts of the database, of the cursor @p arguments pull or the transaction or
+ *  snapshot they read through, and of their arena, each null when absent; a cursor's own holds keep
+ *  what it reads through alive. */
 template <typename arguments_type_>
-std::uint32_t* named_calls_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (requires { arguments.cursor->cursor; }) return &arguments.cursor->cursor.deferred_calls;
+std::array<std::uint32_t*, 3> named_calls_of(arguments_type_ const& arguments) noexcept {
+    ustore_arena_t const arena = arena_of(arguments);
+    ustore_database_t const database = database_of(arguments);
+    std::uint32_t* viewed = nullptr;
+    if constexpr (requires { arguments.cursor->cursor; }) viewed = &arguments.cursor->cursor.named_calls;
     else {
         view_t view;
         decode_call(arguments, view);
-        if (view.transaction) return &view.transaction->deferred_calls;
-        return view.snapshot ? &view.snapshot->deferred_calls : nullptr;
+        if (view.transaction) viewed = &view.transaction->named_calls;
+        else if (view.snapshot) viewed = &view.snapshot->named_calls;
     }
-}
-
-/** The deferred counts of the database, the transaction, snapshot or cursor, and the arena
- *  @p arguments name, each null when absent. */
-template <typename arguments_type_>
-std::array<std::uint32_t*, 3> deferred_counts_of(arguments_type_ const& arguments) noexcept {
-    ustore_arena_t const arena = arena_of(arguments);
-    ustore_database_t const database = database_of(arguments);
-    return {database ? &database->deferred_calls : nullptr, named_calls_of(arguments),
-            arena ? &arena->deferred_calls : nullptr};
+    return {database ? &database->named_calls : nullptr, viewed, arena ? &arena->named_calls : nullptr};
 }
 
 /** An init names no handle yet, only an output for the database it opens, so it counts nowhere. */
@@ -826,8 +829,24 @@ template <typename arguments_type_>
     requires one_of<arguments_type_, ustore_database_init_ram_t, ustore_database_open_ram_t,
                     ustore_database_open_rocksdb_t, ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t,
                     ustore_database_open_nvme_t>
-std::array<std::uint32_t*, 3> deferred_counts_of(arguments_type_ const&) noexcept {
+std::array<std::uint32_t*, 3> named_calls_of(arguments_type_ const&) noexcept {
     return {};
+}
+
+/** Counts one more call on every handle @p arguments name, answering the counts to lower at its
+ *  end, before the call runs, as a transaction init rewrites the handle its arguments point to. */
+template <typename arguments_type_>
+std::array<std::uint32_t*, 3> raise_named_calls(arguments_type_ const& arguments) noexcept {
+    std::array<std::uint32_t*, 3> const counts = named_calls_of(arguments);
+    for (std::uint32_t* const count : counts)
+        if (count) floor_atomic_ref<std::uint32_t> {*count}.fetch_add(1, std::memory_order_relaxed);
+    return counts;
+}
+
+/** Counts one call off each of @p counts that is not null, so a free waiting for zero goes on. */
+inline void lower_named_calls(std::array<std::uint32_t*, 3> const& counts) noexcept {
+    for (std::uint32_t* const count : counts)
+        if (count) floor_atomic_ref<std::uint32_t> {*count}.fetch_sub(1, std::memory_order_release);
 }
 
 /** The claim of the cursor @p arguments pull, or null for a call naming none. */
@@ -914,8 +933,8 @@ void refuse(arguments_type_& arguments, status_t status) noexcept {
     finish(*arguments.outcome, status);
 }
 
-/** Waits until no deferred call counted in @p calls is left, so the handle counting them may be freed. */
-inline void wait_deferred_calls(std::uint32_t& calls) noexcept {
+/** Waits until no executor call counted in @p calls is left, so their handle may be freed. */
+inline void wait_named_calls(std::uint32_t& calls) noexcept {
     floor_atomic_ref<std::uint32_t const> const counted {calls};
     for (std::uint32_t seen = counted.load(std::memory_order_acquire); seen != 0;
          seen = counted.load(std::memory_order_acquire))
@@ -1403,7 +1422,10 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
         return {status_code_t::invalid_argument_k, "The view reads another database"};
 
     if constexpr (requires { arguments.arena; }) arena_rewind(arguments.arena);
-    arena_rewind(runner.scratch);
+    // Slices keep their scratch from one fork to the next, so every scratch rewinds once per call
+    if (runner.executor)
+        for (ustore_arena_handle_t& scratch : runner.executor->scratches) arena_rewind(&scratch);
+    else arena_rewind(runner.scratch);
     return visit_home(view, [&]<typename... executors_types_>(executors_types_&... executor) noexcept -> status_t {
         constexpr home_t home_k = home_of_executors<executors_types_...>;
         if constexpr (home_k != home_t::host_k)
@@ -1465,59 +1487,45 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
 
 #pragma region Routing
 
-/** The tickets taken, in the low half of @c ustore_executor_handle_t::submitted. */
-constexpr std::uint32_t tickets_of(std::uint64_t submitted) noexcept { return static_cast<std::uint32_t>(submitted); }
-
-/** The table positions taken, in the high half of @c ustore_executor_handle_t::submitted. */
-constexpr std::uint32_t positions_of(std::uint64_t submitted) noexcept {
-    return static_cast<std::uint32_t>(submitted >> 32);
+/** Whether deferred calls on @p executor are delegated to its pool thread 0: an owned
+ *  caller-exclusive pool has one of its own, while a lent pool's dispatches and joins stay its
+ *  lender's, and an inclusive pool runs nothing without its caller. */
+inline bool delegates(ustore_executor_handle_t const& executor) noexcept {
+    executor_t const* const owned = std::get_if<executor_t>(&executor.pool);
+    return owned && owned->view().caller_exclusivity() == caller_exclusivity_t::caller_exclusive_k;
 }
 
-/** Packs @p tickets and @p positions into one word, so one compare-and-swap takes both. */
-constexpr std::uint64_t submitted_of(std::uint32_t tickets, std::uint32_t positions) noexcept {
-    return (static_cast<std::uint64_t>(positions) << 32) | tickets;
+/** Waits until the dispatch of the last call delegated on @p executor has left pool thread 0, or
+ *  returns at once on a pool that never delegates. */
+inline void join_delegated(ustore_executor_handle_t const& executor) noexcept {
+    if (delegates(executor)) std::get_if<executor_t>(&executor.pool)->view().unsafe_join(0);
 }
 
-/** Whether @p counter has reached @p ticket, comparing 32-bit counters that wrap. */
-constexpr bool reached(std::uint32_t counter, std::uint32_t ticket) noexcept {
-    return static_cast<std::int32_t>(counter - ticket) >= 0;
+/** Whether the calling thread serves the body of the call holding @p executor, so waiting on the
+ *  executor would wait on itself. */
+inline bool runs_holding_call(ustore_executor_handle_t& executor) noexcept {
+    floor_atomic_ref<std::thread::id> const body_thread {executor.holding_call.body_thread};
+    return body_thread.load(std::memory_order_relaxed) == std::this_thread::get_id();
 }
 
-/** Waits until every ticket below @p ticket is final. */
-inline void wait_finished(ustore_executor_handle_t& executor, std::uint32_t ticket) noexcept {
-    floor_atomic_ref<std::uint32_t const> const finished {executor.finished};
-    for (std::uint32_t seen = finished.load(std::memory_order_acquire); !reached(seen, ticket);
-         seen = finished.load(std::memory_order_acquire))
-        host_verbs().await_change(&executor.finished, seen);
+/** The view the call holding @p executor serves in: its own scratch and index, past the pool's. */
+inline view_t call_view(ustore_executor_handle_t& executor) noexcept {
+    std::size_t const thread_index = executor.scratches.size() - 1;
+    return view_t {.scratch = &executor.scratches[thread_index], .executor = &executor, .thread_index = thread_index};
 }
 
-/** Marks every ticket below @p ticket final for whoever waits for one. */
-inline void advance_finished(ustore_executor_handle_t& executor, std::uint32_t ticket) noexcept {
-    floor_atomic_ref<std::uint32_t> {executor.finished}.store(ticket, std::memory_order_release);
-}
-
-/** Whether the calling thread runs a call of @p executor, so waiting on the executor would wait on itself. */
-inline bool runs_here(ustore_executor_handle_t& executor) noexcept {
-    std::thread::id const self = std::this_thread::get_id();
-    for (runner_t& runner : executor.runners)
-        if (floor_atomic_ref<std::thread::id> {runner.thread}.load(std::memory_order_relaxed) == self) return true;
-    return false;
-}
-
-/** Runs @p body on the calling thread as runner @p thread_index of @p executor, over its scratch,
- *  recorded there while it does. */
-template <typename body_type_>
-void run_as(ustore_executor_handle_t& executor, std::size_t thread_index, body_type_&& body) noexcept {
-    runner_t& runner = executor.runners[thread_index];
-    floor_atomic_ref<std::thread::id> const recorded {runner.thread};
-    recorded.store(std::this_thread::get_id(), std::memory_order_relaxed);
-    body(view_t {.scratch = &runner.scratch, .executor = &executor, .thread_index = thread_index});
-    recorded.store(std::thread::id {}, std::memory_order_relaxed);
-}
-
-/** The right to dispatch on @p pool, owned or lent. */
-inline pool_view_t view_of(std::variant<executor_t, lent_pool_t> const& pool) noexcept {
-    return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
+/** Ends the call holding @p executor: its claims and handle counts, the executor claim, then its
+ *  status. Once the claim is free nothing here reads the executor, as a free may delete it, and the
+ *  next call joins the dispatch of a delegated one before using the pool. */
+inline void end_call(ustore_executor_handle_t& executor) noexcept {
+    holding_call_t& call = executor.holding_call;
+    ustore_outcome_t& outcome = *call.outcome;
+    status_t const recorded = call.recorded;
+    release(call.claims);
+    lower_named_calls(call.named_calls);
+    floor_atomic_ref<std::thread::id> {call.body_thread}.store(std::thread::id {}, std::memory_order_relaxed);
+    release(call.claim);
+    finish(outcome, recorded);
 }
 
 /** Serves @p arguments in the scratch and on the thread @p runner names, leaving the outputs of a
@@ -1567,70 +1575,43 @@ void run_alone(call_type_* call) noexcept {
     arena_free_blocks(scratch, first);
 }
 
-/** Serves the copy @p erased holds on the thread @p runner names into @p result, leaving its
- *  outcome, claims and deferred counts to the driver, which first frees its table position. */
+/** Serves on pool thread 0 the delegated copy of the call holding the executor at @p context, then
+ *  ends it; the other threads return at once, free for the forks the call makes. */
 template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
-void run_deferred(void* erased, deferred_result_t& result, view_t const& runner) noexcept {
-    call_type_& call = *std::get_if<call_type_>(static_cast<deferred_arguments_t*>(erased));
-    // Counted before the call runs, as a transaction init rewrites the handle its arguments point to
-    result.deferred_counts = deferred_counts_of(call);
-    result.claims = claims_of(call);
-    result.outcome = call.outcome;
-    result.status = serve_(call, runner);
+void serve_delegated(void* context, std::size_t thread, std::size_t) noexcept {
+    if (thread != 0) return;
+    ustore_executor_handle_t& executor = *static_cast<ustore_executor_handle_t*>(context);
+    holding_call_t& call = executor.holding_call;
+    floor_atomic_ref<std::thread::id> {call.body_thread}.store(std::this_thread::get_id(), std::memory_order_relaxed);
+    call.recorded = serve_(*std::get_if<call_type_>(&call.delegated_arguments), call_view(executor));
+    end_call(executor);
 }
 
-/** Runs @p call on the calling thread after every call submitted before it finishes, and before any after. */
-template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
-void run_blocking(ustore_executor_handle_t& executor, call_type_* call) noexcept {
-    if (runs_here(executor))
-        return refuse(*call, {status_code_t::contended_k, "A callback cannot block on the executor running it"});
-    floor_atomic_ref<std::uint64_t> const submitted {executor.submitted};
-    std::uint64_t observed = submitted.load(std::memory_order_relaxed);
-    while (!submitted.compare_exchange_weak(observed, submitted_of(tickets_of(observed) + 1, positions_of(observed)),
-                                            std::memory_order_relaxed)) {}
-    std::uint32_t const ticket = tickets_of(observed);
-    wait_finished(executor, ticket);
-    run_as(executor, executor.runners.size() - 1,
-           [call](view_t const& runner) noexcept { run<call_type_, serve_>(call, runner); });
-    advance_finished(executor, ticket + 1);
-}
-
-/** Copies @p call into the deferred table of @p executor, finishing it contended when the table is full. */
-template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
-void submit(ustore_executor_handle_t& executor, call_type_* call) noexcept {
-    if (floor_atomic_ref<driver_state_t> {executor.state}.load(std::memory_order_relaxed) == driver_state_t::absent_k)
-        return run_alone<call_type_, serve_>(call);
-
-    host_verbs().publish(call->outcome, ustore_status_deferred_k, std::memory_order_relaxed);
-    floor_atomic_ref<std::uint64_t> const submitted {executor.submitted};
-    floor_atomic_ref<std::uint32_t const> const head {executor.head};
-    std::uint64_t observed = submitted.load(std::memory_order_relaxed);
-    do {
-        // A stale `observed` reads as a negative count and fails the exchange below
-        std::uint32_t const held = positions_of(observed) - head.load(std::memory_order_acquire);
-        if (static_cast<std::int32_t>(held) >= static_cast<std::int32_t>(executor.deferred_limit))
-            return refuse(*call, {status_code_t::contended_k, "The executor's deferred table is full"});
-    } while (!submitted.compare_exchange_weak(
-        observed, submitted_of(tickets_of(observed) + 1, positions_of(observed) + 1), std::memory_order_relaxed));
-
-    std::uint32_t const position = positions_of(observed);
-    for (std::uint32_t* const count : deferred_counts_of(*call))
-        if (count) floor_atomic_ref<std::uint32_t> {*count}.fetch_add(1, std::memory_order_relaxed);
-    deferred_slot_t& slot = executor.deferred[position & (executor.deferred.size() - 1)];
-    slot.arguments.template emplace<call_type_>(*call);
-    slot.run = &run_deferred<call_type_, serve_>;
-    slot.ticket = tickets_of(observed);
-    floor_atomic_ref<std::uint32_t> {slot.ready}.store(position + 1, std::memory_order_release);
-    floor_atomic_ref<std::uint32_t> {executor.doorbell}.fetch_add(1, std::memory_order_release);
-}
-
-/** Runs @p call on the calling thread, blocking on its executor, or submits it, as its executor and completion ask. */
+/** Runs @p call on the calling thread, alone or holding its executor, or delegates it to the pool's
+ *  thread 0, as its executor and completion ask; a call finding the executor held is refused. */
 template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void dispatch(call_type_* call) noexcept {
     ustore_executor_handle_t* const executor = call->executor;
     if (!executor) return run_alone<call_type_, serve_>(call);
-    if (call->completion == ustore_completion_blocking_k) return run_blocking<call_type_, serve_>(*executor, call);
-    submit<call_type_, serve_>(*executor, call);
+    holding_call_t& holding = executor->holding_call;
+    if (!take(holding.claim)) return refuse(*call, {status_code_t::contended_k, "Another call holds the executor"});
+    join_delegated(*executor);
+    holding.outcome = call->outcome;
+    holding.named_calls = raise_named_calls(*call);
+    holding.claims = claims_of(*call);
+    host_verbs().publish(call->outcome, ustore_status_deferred_k, std::memory_order_relaxed);
+    if (call->completion == ustore_completion_blocking_k || !delegates(*executor)) {
+        floor_atomic_ref<std::thread::id> {holding.body_thread}.store(std::this_thread::get_id(),
+                                                                      std::memory_order_relaxed);
+        holding.recorded = serve_(*call, call_view(*executor));
+        return end_call(*executor);
+    }
+    holding.delegated_arguments.template emplace<call_type_>(*call);
+    // Thread 0 may end the call before this returns, so the token stays local; joins pass zero
+    fu_generation_t generation = 0;
+    [[maybe_unused]] st::status_t const dispatched =
+        view_of(executor->pool).unsafe_for_threads(&serve_delegated<call_type_, serve_>, executor, generation);
+    assert(!st::failed(dispatched) && "An owned pool is idle once joined under the executor claim");
 }
 
 /** Leaves the outputs of @p arguments null or zero and claims what they hold, then dispatches them
@@ -1743,7 +1724,7 @@ expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noexcept {
 template <typename cursor_type_>
 void free_cursor(cursor_type_* cursor) noexcept {
     if (!cursor) return;
-    wait_deferred_calls(cursor->cursor.deferred_calls);
+    wait_named_calls(cursor->cursor.named_calls);
     view_t view;
     decode_view(cursor->cursor.view, view);
     release_parent(view.transaction);

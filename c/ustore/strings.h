@@ -70,8 +70,8 @@ typedef struct ustore_strings_write_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, or the executor serves
+ *    another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c collections, @c strings or @c values are missing or
@@ -130,8 +130,8 @@ typedef struct ustore_strings_remove_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, or the executor serves
+ *    another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
@@ -199,8 +199,7 @@ typedef struct ustore_strings_read_t {
  *    holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  */
@@ -297,8 +296,7 @@ typedef struct ustore_strings_scan_t {
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k The executor's device loaded no bundle of the library's kernels
  *    and @c patterns are given.
@@ -425,8 +423,7 @@ typedef struct ustore_strings_cursor_next_t {
  *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
  *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k The pulling executor's device loaded no bundle of the library's
  *    kernels and the walk has @c patterns.
@@ -491,8 +488,7 @@ typedef struct ustore_strings_sample_t {
  *    sample goes through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
@@ -568,8 +564,7 @@ typedef struct ustore_strings_measure_t {
  *  @par Statuses:
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.

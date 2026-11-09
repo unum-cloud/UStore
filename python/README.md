@@ -85,18 +85,17 @@ import asyncio
 
 
 async def main(directory, keys, key, payloads):
-    with ustore.Executor.for_ram(8, deferred_limit=256) as executor:
+    with ustore.Executor.for_ram(8) as executor:
         database = ustore.Database.open_rocksdb(directory, executor=executor)  # blocks on the executor
         arena = ustore.Arena(executor)                       # placed where the executor computes
-        values = database.on(executor).read(keys, arena, collection="movies")  # blocking, after earlier submissions
+        values = database.on(executor).read(keys, arena, collection="movies")  # blocking, on the calling thread
         poster = database.on(executor)["movies"].blobs[key]  # shorthand, copied out of a one-off arena
 
         later = database.deferred(executor)
         reading = later.read(keys, arena, collection="movies")  # ustore.Deferred, submitted now, holding the arena
-        fetching = later["movies"].blobs[key]                # a Deferred owning its one-off arena
         reading.status                                       # ustore.Status.DEFERRED until final
         values = await reading                               # or: reading.wait()
-        poster = await fetching                              # a missing key raises KeyError
+        poster = await later["movies"].blobs[key]            # one call at a time; a missing key raises KeyError
 
         transaction = database.transaction(ustore.Watch.KEYS)
         await transaction.deferred(executor).write(keys, payloads, collection="movies")
@@ -119,42 +118,43 @@ A collection name resolves on the calling thread when the call is made, and a ma
 Python's `in` must answer a bool, an assignment and `del` discard what they answer, and the table view and most graph methods chain several calls, so through a deferred view they raise `TypeError` naming the verb to call instead, such as `contains` for `in`.
 
 ```python
-async def fan_out(database, executor, keys, key, sources, targets):
-    later, types = database.deferred(executor), [ustore.FieldType.STRING, ustore.FieldType.I64]
-    gathering = later.docs_gather(keys, ["name", "tweets"], types, ustore.Arena(executor), collection="people")
-    linking = later.graph_write_edges(sources, targets, collection="follows")
-    present = later.contains(key, collection="movies")       # Deferred[bool], since `key in ...` must answer a bool
-    document = later["people"].docs[key]                     # Deferred of the parsed document
-    edges = later["follows"].graph.read_edges(keys)          # Deferred[Neighborhoods] over a one-off arena
-    return await gathering, await linking, await present, await document, await edges
+async def fan_out(database, executors, keys, key, sources, targets):
+    first, second, third = (database.deferred(executor) for executor in executors)  # one call per executor at once
+    types = [ustore.FieldType.STRING, ustore.FieldType.I64]
+    gathering = first.docs_gather(keys, ["name", "tweets"], types, ustore.Arena(executors[0]), collection="people")
+    linking = second.graph_write_edges(sources, targets, collection="follows")
+    present = third.contains(key, collection="movies")       # Deferred[bool], since `key in ...` must answer a bool
+    gathered, linked, found = await gathering, await linking, await present
+    document = await first["people"].docs[key]               # the parsed document
+    edges = await second["follows"].graph.read_edges(keys)   # Neighborhoods over a one-off arena
+    return gathered, linked, found, document, edges
 ```
 
 A `Deferred` keeps the outcome, the inputs the library borrows, the output slots and its arena, since submission copies the argument struct and lets it go.
 It holds its arena as a blocking call does, until it is waited on or dropped, and dropping an unfinished one waits for its call.
 The collector frees a cycle through a finished one, and leaves a cycle through an unfinished one for a later collection, never clearing what the library still reads.
-A transaction serves one call at a time, so a second call while a deferred one runs raises `ContendedError`, as does a submission that finds the executor's deferred table full or an arena serving another call.
+An executor, a transaction and an arena each serve one call at a time, so a second call while a deferred one runs raises `ContendedError` once awaited.
 Closing a database, transaction or snapshot, or dropping an arena, waits in C for the deferred calls naming it.
 
 ## Executors
 
 An executor owns host threads, and a database owns its data, so one executor serves any number of databases.
-`Executor.for_ram(threads=0, *, memory_domains=None, deferred_limit=0)` spawns the threads of the RAM, RocksDB and LevelDB engines near the NUMA nodes `memory_domains` names, every node the process may allocate on for `None`.
+`Executor.for_ram(threads=0, *, memory_domains=None)` spawns the threads of the RAM, RocksDB and LevelDB engines near the NUMA nodes `memory_domains` names, every node the process may allocate on for `None`.
 It keeps the scratch of each thread on that thread's node and every arena it makes on the first node named, and refuses a node no machine carries with `InvalidArgumentError`.
-Zero threads take 7/8 of the cores those nodes carry, leaving the rest to blocking calls, which run on their callers' threads, and to the engines' own background flushes and compactions.
-A zero `deferred_limit` takes the library's table size:
+Zero threads take 7/8 of the cores those nodes carry, leaving the rest to blocking calls, which run on their callers' threads, and to the engines' own background flushes and compactions:
 
 ```python
-executor = ustore.Executor.for_ram(8, memory_domains=[0], deferred_limit=256)
+executor = ustore.Executor.for_ram(8, memory_domains=[0])
 executor.drain(ustore.Mood.SPINNING)                    # waits, then keeps idle threads hot
 arena = ustore.Arena(executor)                          # outputs of calls on this executor land here
 ```
 
-`Executor.on_pool(pool, /, *, memory_domains=None, deferred_limit=0)` borrows a ForkUnion `fu_pool_t` another library already runs, given as the integer address `ctypes` or `cffi` hands over, so one process keeps one set of threads; the pool must outlive the executor.
-`Executor.for_nvme(threads=0, *, transport=Transport.AUTOMATIC, deferred_limit=0, **sizes)` makes the I/O rings of the NVMe engine, and tells every database `open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, each size keyword naming a field of `ustore_nvme_options_t`.
-`Executor.for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC, deferred_limit=0)` drives one CUDA device through one stream every call queues on, whose merges `Database.open_nvme(..., compactions=...)` takes, and raises `UnsupportedError` in a build without CUDA.
+`Executor.on_pool(pool, /, *, memory_domains=None)` borrows a ForkUnion `fu_pool_t` another library already runs, given as the integer address `ctypes` or `cffi` hands over, so one process keeps one set of threads; the pool must outlive the executor.
+`Executor.for_nvme(threads=0, *, transport=Transport.AUTOMATIC, **sizes)` makes the I/O rings of the NVMe engine, and tells every database `open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, each size keyword naming a field of `ustore_nvme_options_t`.
+`Executor.for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC)` drives one CUDA device through one stream every call queues on, whose merges `Database.open_nvme(..., compactions=...)` takes, and raises `UnsupportedError` in a build without CUDA.
 
-Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted before it finishes.
-A deferred submission that finds the table full finishes with `Status.CONTENDED` and raises `ContendedError` once awaited.
+An executor serves one call at a time: a call submitted while another holds it finishes with `Status.CONTENDED` and raises `ContendedError` once awaited.
+A deferred call runs on the executor's first thread in the caller's place, so polling `status` alone finishes it, and progress callbacks run on the executor's threads, taking the GIL as they enter Python.
 Used as a context manager, an executor waits for its calls and closes on exit, after which a receiver naming it raises `UninitializedError`.
 Calling `ustore.Executor()` raises a `TypeError` naming the factories, since what an executor spawns cannot be derived from nothing.
 

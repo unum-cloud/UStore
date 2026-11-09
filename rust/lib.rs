@@ -87,7 +87,7 @@
 //! }
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
-//! let executor = Executor::for_ram(&[], 8, 256)?;
+//! let executor = Executor::for_ram(&[], 8)?;
 //! let mut arena = Arena::new_in(&executor)?;
 //! let people = database.collection_create("people", Modality::Blobs)?;
 //! let [ada, grace] = [1u64, 2].map(Key::from);
@@ -131,7 +131,7 @@
 //! use ustore::{Arena, Database, Executor, Key, Modality, RAMOptions};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
-//! let executor = Executor::for_ram(&[], 2, 0)?;
+//! let executor = Executor::for_ram(&[], 2)?;
 //! let mut arena = Arena::new_in(&executor)?;
 //! let people = database.collection_create("people", Modality::Blobs)?;
 //! let keys = [Key::from(1u64)];
@@ -147,7 +147,7 @@
 //! use ustore::{CompactConfig, Database, Executor, RAMOptions};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
-//! let executor = Executor::for_ram(&[], 2, 0)?;
+//! let executor = Executor::for_ram(&[], 2)?;
 //! let mut counting = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Continue(()) };
 //! let progress = Some(&mut counting as &mut ustore::ProgressCallback);
 //! let compaction = database.head().deferred(&executor).compact(CompactConfig { progress })?;

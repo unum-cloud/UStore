@@ -135,8 +135,8 @@ typedef struct ustore_graph_read_edges_t {
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, a callback blocks on the executor running
- *    it, or an NVMe value keeps changing size across reads.
+ *    another call, the executor serves another call, or an NVMe value keeps changing size across
+ *    reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A stored value is no vertex.
@@ -190,9 +190,8 @@ typedef struct ustore_graph_write_edges_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c collections, @c sources or @c targets are missing,
@@ -256,9 +255,8 @@ typedef struct ustore_graph_remove_edges_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c collections, @c sources or @c targets are missing,
@@ -316,9 +314,8 @@ typedef struct ustore_graph_write_vertices_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
@@ -384,9 +381,8 @@ typedef struct ustore_graph_remove_vertices_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The @c transaction serves another call, the executor's deferred
- *    table is full, a callback blocks on the executor running it, or an NVMe value keeps changing
- *    size across reads.
+ *  - @c ustore_status_contended_k The @c transaction serves another call, the executor serves
+ *    another call, or an NVMe value keeps changing size across reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *
@@ -484,8 +480,8 @@ typedef struct ustore_graph_scan_vertices_t {
  *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, a callback blocks on the executor running
- *    it, or an NVMe value keeps changing size across reads.
+ *    another call, the executor serves another call, or an NVMe value keeps changing size across
+ *    reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
@@ -601,8 +597,8 @@ typedef struct ustore_graph_vertices_cursor_next_t {
  *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
  *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
- *    another call, the executor's deferred table is full, a callback blocks on the executor running
- *    it, or an NVMe value keeps changing size across reads.
+ *    another call, the executor serves another call, or an NVMe value keeps changing size across
+ *    reads.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
@@ -665,8 +661,7 @@ typedef struct ustore_graph_sample_vertices_t {
  *    sample goes through a staged transaction, or a collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
@@ -738,8 +733,7 @@ typedef struct ustore_graph_measure_vertices_t {
  *  @par Statuses:
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the transaction the @c view reads through serves
- *    another call, the executor's deferred table is full, or a callback blocks on the executor
- *    running it.
+ *    another call, or the executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.

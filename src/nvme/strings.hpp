@@ -23,6 +23,7 @@
 #include "utilities/batches.hpp"  // `strings_arg_t`, `validate_choices`, `validate_direction`, `samples_of`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/slices.hpp"   // `for_task_slices`
 
 namespace unum::ustore::nvme {
 
@@ -133,8 +134,8 @@ status_t read_strings(call_access<cpu_class_> const& access, collection_id_t col
                         return watched;
                 present = store.find(text, bytes, stamp, access.thread_index) == lookup_result_t::written_k;
             }
-            if (present) outputs.push_present(value);
-            else outputs.push_missing();
+            if (present) outputs.assign_present(index, value);
+            else outputs.assign_missing(index);
         }
         return {};
     });
@@ -153,12 +154,22 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
-    for (std::size_t first = 0; first != arguments.count;) {
-        std::size_t const last = run_end(collections, first, arguments.count);
-        if (status_t const read = read_strings(access, collections[first], texts, first, last, outputs); read.failed())
-            return read;
-        first = last;
-    }
+    auto read_slice = [&](std::size_t begin, std::size_t length, view_t const& slice) noexcept -> status_t {
+        call_access<cpu_class_> const sliced {state,         nullptr,      watch_schedule_t::never_k,
+                                              slice.scratch, access.stamp, thread_index_of(state, slice)};
+        for (std::size_t first = begin; first != begin + length;) {
+            std::size_t const last = run_end(collections, first, begin + length);
+            if (status_t const read = read_strings(sliced, collections[first], texts, first, last, outputs);
+                read.failed())
+                return read;
+            first = last;
+        }
+        return {};
+    };
+    // A transaction's reads join its watch set, so only a read at one stamp splits the batch
+    status_t const read = access.transaction ? read_slice(0, arguments.count, view)
+                                             : for_task_slices(view, arguments.count, read_slice);
+    if (read.failed()) return read;
     outputs.finish(arguments);
     return {};
 }
@@ -178,21 +189,40 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
         return resolved;
     auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
+    st::vector<strings_scan_slice_t, arena_allocator<strings_scan_slice_t>> slices {{view.scratch}};
+    if (st::failed(slices.resize(slice_slots(view))))
+        return {status_code_t::out_of_memory_k, "Failed to allocate the slices of a scan"};
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
     call_access<cpu_class_> const access = access_of(state, view);
-    for (std::size_t task = 0; task != arguments.count; ++task) {
-        strings_window_t const window {
-            .prefix = prefixes ? string_of(prefixes[task]) : std::string_view {},
-            .start = starts ? string_of(starts[task]) : std::string_view {},
-            .end = ends ? string_of(ends[task]) : std::string_view {},
-            .direction = arguments.direction,
-        };
-        outputs.open_task(task);
-        if (status_t const scanned = scan_strings(access, collections[task], window, arguments.wanted, outputs);
-            scanned.failed())
-            return scanned;
-        if (!progress.advance(1)) return progress_cancelled_k;
-    }
+    auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
+        strings_scan_slice_t& sliced = slices[slice.thread_index];
+        sliced = {first_task, length, outputs.slice_in(slice.scratch)};
+        call_access<cpu_class_> const sliced_access {state,         access.transaction, access.schedule,
+                                                     slice.scratch, access.stamp,       thread_index_of(state, slice),
+                                                     access.strings};
+        for (std::size_t task = first_task; task != first_task + length; ++task) {
+            strings_window_t const window {
+                .prefix = prefixes ? string_of(prefixes[task]) : std::string_view {},
+                .start = starts ? string_of(starts[task]) : std::string_view {},
+                .end = ends ? string_of(ends[task]) : std::string_view {},
+                .direction = arguments.direction,
+            };
+            sliced.outputs.open_task(task);
+            if (status_t const scanned = scan_strings(sliced_access, collections[task], window, arguments.wanted,
+                                                      sliced.outputs);
+                scanned.failed())
+                return scanned;
+            if (!progress.advance(1)) return progress_cancelled_k;
+        }
+        return {};
+    };
+    // A transaction's reads join its watch set, so only a read at one stamp splits the batch
+    status_t const scanned = access.transaction ? scan_slice(0, arguments.count, view)
+                                                : for_task_slices(view, arguments.count, scan_slice);
+    if (scanned.failed()) return scanned;
+    for (strings_scan_slice_t const& slice : slices)
+        if (status_t const adopted = outputs.adopt(slice.outputs, slice.first, slice.length); adopted.failed())
+            return adopted;
     return outputs.finish(arguments);
 }
 

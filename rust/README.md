@@ -124,10 +124,12 @@ let reading = deferred.read(people, vec![ada, grace], &mut arena)?;
 let values = reading.await?; // or: reading.wait()?
 assert_eq!(values.get(0), Some(b"Ada".as_slice()));
 
-// submit four scans, each into an arena of its own, then await each
-let mut arenas = (0..4).map(|_| Arena::new_in(&executor)).collect::<Result<Vec<_>, _>>()?;
-let scans = arenas.iter_mut().zip(starts)
-    .map(|(arena, start)| deferred.scan(people, start, 1000, arena)).collect::<Result<Vec<_>, _>>()?;
+// an executor serves one call at a time, so four scans overlap on four executors, each into an arena of its own
+let executors = (0..4).map(|_| Executor::for_ram(&[], 2)).collect::<Result<Vec<_>, _>>()?;
+let mut arenas = executors.iter().map(Arena::new_in).collect::<Result<Vec<_>, _>>()?;
+let scans = executors.iter().zip(arenas.iter_mut()).zip(starts)
+    .map(|((executor, arena), start)| database.head().deferred(executor).scan(people, start, 1000, arena))
+    .collect::<Result<Vec<_>, _>>()?;
 for scan in scans { consume(scan.await?); }
 
 transaction.deferred(&executor).write(people, (keys, names), Durability::Buffered)?.await?;
@@ -160,8 +162,9 @@ let values = block_on(async { deferred.read(people, vec![ada], &mut arena)?.awai
 Every poll of an awaited `Deferred` reads the status the same way, and one not yet final asks to be polled again, since the library has no wake-up, while `wait` blocks without spinning.
 Once final, a call hands back what the same blocking call would: a read its `Values` borrowing the arena, writes and removals their inputs as they are, a stage its `ReadStamp`, and a commit its `CommitStamp`.
 A call the binding refuses before it reaches the library, such as a tape holding fewer values than keys, fails at the verb itself.
-A call the library refuses at submission, such as one finding the executor's deferred table full with `Status::Contended`, is final at once and fails at `.await` or `wait`.
-A transaction serves one call at a time, so a call on a transaction serving an unfinished deferred one answers `Status::Contended` as well.
+A call the library refuses at submission, such as one finding its executor serving another call with `Status::Contended`, is final at once and fails at `.await` or `wait`.
+A transaction serves one call at a time too, so a call on a transaction serving an unfinished deferred one answers `Status::Contended` as well.
+A deferred call runs on the executor's first thread in the caller's place, so polling alone finishes it, and its progress handler runs on the executor's threads.
 
 The crate starts no thread and keeps no count of its own.
 A deferred call allocates one box holding its outcome, owned inputs and output slots until it is final, while the argument struct is not among them, since submission copies it.
@@ -173,14 +176,14 @@ A forgotten one leaks the box rather than lending the library memory it would re
 
 A view without an executor runs every call on the calling thread.
 An `Executor` is the threads that run calls, shared by any number of databases and views, and is `Send` and `Sync`.
-Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted before it finishes, and before any submitted after it starts.
+An executor serves one call at a time, and a call submitted while another holds it answers `Status::Contended`.
 
 ```rust
 use ustore::{Arena, Executor, Mood, RocksDBOptions};
 
-let executor = Executor::for_ram(&[], 8, 256)?;           // memory domains, threads, deferred_limit
-let near = Executor::for_ram(&[0], 0, 0)?;                // 7/8 of the cores local to NUMA node 0
-let shared = unsafe { Executor::on_pool(&[], pool, 0)? }; // borrows a ForkUnion pool's threads
+let executor = Executor::for_ram(&[], 8)?;             // memory domains, threads
+let near = Executor::for_ram(&[0], 0)?;                // 7/8 of the cores local to NUMA node 0
+let shared = unsafe { Executor::on_pool(&[], pool)? }; // borrows another library's threads
 let people = Database::open_rocksdb(&RocksDBOptions { executor: Some(&executor), ..RocksDBOptions::at("/var/lib/people") })?;
 let mut arena = Arena::new_in(&executor)?;
 let (names, _) = people.head().on(&executor).collection_find("names", &mut arena)?;
@@ -190,12 +193,12 @@ executor.drain(Mood::Parked)?;
 
 `Executor::for_ram` spawns the threads for the RAM, RocksDB and LevelDB engines across the compute domains local to the memory domains it names, NUMA nodes as the operating system numbers them, where an empty list derives every domain the process may allocate on.
 The scratch of each thread and every arena the executor makes live on those domains, and an identifier no domain carries is refused with `Status::InvalidArgument`.
-Zero threads take 7/8 of the cores those domains carry, leaving the rest to the driver thread, to blocking calls and to the background work of RocksDB and LevelDB, and a zero `deferred_limit` takes 256.
+Zero threads take 7/8 of the cores those domains carry, leaving the rest to blocking calls and to the background work of RocksDB and LevelDB.
 `Executor::on_pool` borrows the threads of a ForkUnion `fu_pool_t`, so several libraries in one process share them, and is `unsafe`, since the pool must outlive the executor.
 `Executor::for_nvme` spawns the threads of the NVMe engine, one I/O ring apiece, and its `IOOptions` tell every database opened on it how to move bytes: the transport, the channels and their buffers.
 `Executor::for_vram` drives one CUDA device through one stream, its own or one the caller lends, failing with `Status::Unsupported` in a library built without CUDA, and is `unsafe`, since a lent stream must outlive the executor; `NVMEOptions::compactions` places an NVMe database's merges on it.
 `On::on` names the executor and keeps the view blocking, so its verbs answer exactly as they do on the calling thread.
-`Executor::drain` waits for every call submitted before the drain began and leaves the threads in `Mood::Parked` or `Mood::Spinning` whenever they next go idle, and dropping the executor drains it.
+`Executor::drain` waits until no call holds the executor, then parks its threads for `Mood::Parked` or keeps them spinning for `Mood::Spinning`, and dropping the executor waits the same way.
 
 Opening a database blocks, and `RAMOptions`, `RocksDBOptions`, `LevelDBOptions` and `NVMEOptions` name the executor the open runs on, where `None` opens on the calling thread.
 The NVMe engine reads the `IOOptions` of its executor once, at the open, so the executor may be dropped before the database.

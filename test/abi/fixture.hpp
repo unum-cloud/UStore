@@ -76,15 +76,14 @@ inline void submit_writes(ustore_database_t database, ustore_collection_id_t con
     }
 }
 
-/** An executor of two threads whose deferred table holds @p deferred_limit calls. */
-expected<ustore_executor_t> spawn_executor(ustore_size_t deferred_limit) noexcept {
+/** An executor of two threads. */
+expected<ustore_executor_t> spawn_executor() noexcept {
     ustore_executor_t executor = nullptr;
     ustore_outcome_t outcome {};
     ustore_executor_for_ram_t spawn {
         .executor = &executor,
         .outcome = &outcome,
         .threads = 2,
-        .deferred_limit = deferred_limit,
     };
     ustore_executor_for_ram(&spawn);
     if (outcome.status != ustore_status_success_k) return status_t {outcome};
@@ -202,9 +201,10 @@ inline ustore_continuation_t hold_until_released(ustore_size_t, ustore_size_t, v
     return ustore_continue_k;
 }
 
-/** Submits @p held to @p executor and waits until its callback holds it, so later deferred calls
- *  wait behind it. */
-inline std::size_t submit_held(held_scan_t& held, ustore_executor_t executor) noexcept {
+/** Readies @p held for @p executor with @p completion, reading through @p view, its callback
+ *  holding the scan once submitted, so the executor, the arena and the view stay claimed. */
+inline std::size_t arm_held(held_scan_t& held, ustore_executor_t executor, ustore_view_t view,
+                            ustore_completion_t completion) noexcept {
     auto [arena, arena_status] = arena_t::make(executor);
     if (arena_status.failed()) return 1;
     held.arena = std::move(arena);
@@ -213,7 +213,8 @@ inline std::size_t submit_held(held_scan_t& held, ustore_executor_t executor) no
         .database = &held.database,
         .executor = executor,
         .outcome = &held.outcome,
-        .completion = ustore_completion_deferred_k,
+        .completion = completion,
+        .view = view,
         .count = 1,
         .collections = {&held.collection, 0},
         .start_keys = {&held.start_key, 0},
@@ -221,10 +222,22 @@ inline std::size_t submit_held(held_scan_t& held, ustore_executor_t executor) no
         .progress = &hold_until_released,
         .progress_state = &held,
     };
-    ustore_blobs_scan(&held.scan);
+    return 0;
+}
+
+/** Waits until the callback of @p held holds its scan. */
+inline std::size_t wait_held(held_scan_t& held) noexcept {
     fu::standard_atomic_ref<hold_stage_t> const stage {held.stage};
     return expect(
         spin_until([&stage]() noexcept { return stage.load(std::memory_order_acquire) == hold_stage_t::entered_k; }));
+}
+
+/** Submits @p held to @p executor as a deferred call reading through @p view, and waits until the
+ *  callback holds the scan. */
+inline std::size_t submit_held(held_scan_t& held, ustore_executor_t executor, ustore_view_t view = nullptr) noexcept {
+    if (arm_held(held, executor, view, ustore_completion_deferred_k) != 0) return 1;
+    ustore_blobs_scan(&held.scan);
+    return wait_held(held);
 }
 
 /** Lets the callback of @p held return, and waits until the scan finishes. */

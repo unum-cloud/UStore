@@ -50,7 +50,7 @@ static struct {
     {ustore_status_uninitialized_k, "ustore.UninitializedError", &ErrorType, NULL,
      "The call needs a handle that is closed or was never opened, or reads a result a later call rewound."},
     {ustore_status_contended_k, "ustore.ContendedError", &ErrorType, NULL,
-     "A full deferred table, or an arena or transaction serving another call, refused the call instead of waiting."},
+     "An executor, arena or transaction serving another call refused the call instead of waiting."},
     {ustore_status_cancelled_k, "ustore.CancelledError", &ErrorType, NULL,
      "A progress callback stopped the call, which unwound and published nothing."},
     {ustore_status_unsupported_k, "ustore.UnsupportedError", &ErrorType, &PyExc_NotImplementedError,
@@ -2405,10 +2405,9 @@ static char const doc_Executor[] =                                              
     "\n"                                                                                       //
     "Built through `Executor.for_ram()`, `on_pool()`, `for_nvme()` or `for_vram()`, never\n"   //
     "by name. A receiver names it through `on(executor)`, whose calls block on it, or\n"       //
-    "`deferred(executor)`, whose calls it runs while the caller carries on. Calls start in\n"  //
-    "submission order, and a blocking call runs alone: after every call submitted before it\n" //
-    "finishes. Its deferred table holds `deferred_limit` calls, and a submission that finds\n" //
-    "it full raises ContendedError once waited for.\n"                                         //
+    "`deferred(executor)`, whose calls its own first thread runs while the caller carries\n"   //
+    "on, so polling alone finishes them. It serves one call at a time: a second call while\n"  //
+    "one runs raises ContendedError once waited for. Progress callbacks run on its threads.\n" //
     "\n"                                                                                       //
     "Used as a context manager, it waits for its calls and frees its threads on exit.";
 
@@ -2504,8 +2503,7 @@ static PyObject* executor_made(PyObject* type, ustore_executor_t handle, ustore_
 }
 
 static char const doc_Executor_for_ram[] =                                                       //
-    "for_ram(threads=0, *, memory_domains=None, deferred_limit=0) answers an executor of host\n" //
-    "threads.\n"                                                                                 //
+    "for_ram(threads=0, *, memory_domains=None) answers an executor of host threads.\n"          //
     "\n"                                                                                         //
     "Runs the calls of the RAM, RocksDB and LevelDB engines, keeping the scratch of every\n"     //
     "thread on its local memory domain and every arena it makes on the first one named. Calls\n" //
@@ -2517,8 +2515,6 @@ static char const doc_Executor_for_ram[] =                                      
     "    work.\n"                                                                                //
     "  memory_domains (Sequence[int], optional): NUMA nodes the threads stay near and keep\n"    //
     "    their memory on; None derives every node the process may allocate on.\n"                //
-    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero takes\n"  //
-    "    the library's default.\n"                                                               //
     "Returns:\n"                                                                                 //
     "  Executor: The new executor.\n"                                                            //
     "Raises:\n"                                                                                  //
@@ -2526,14 +2522,13 @@ static char const doc_Executor_for_ram[] =                                      
 
 static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                   PyObject* keyword_names_tuple) {
-    static char const* const names[] = {"threads", "memory_domains", "deferred_limit"};
-    PyObject* values[3];
-    size_t threads = 0, deferred_limit = 0, memory_domains_count = 0;
+    static char const* const names[] = {"threads", "memory_domains"};
+    PyObject* values[2];
+    size_t threads = 0, memory_domains_count = 0;
     int32_t* memory_domains = NULL;
-    if (factory_arguments("for_ram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 3, 1,
+    if (factory_arguments("for_ram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 2, 1,
                           0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
-        (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0) ||
         identifiers_from_object(values[1], "memory_domains", &memory_domains, &memory_domains_count) != 0)
         return NULL;
 
@@ -2544,7 +2539,6 @@ static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py
         .outcome = &outcome,
         .ram = {memory_domains, (ustore_size_t)memory_domains_count},
         .threads = (ustore_size_t)threads,
-        .deferred_limit = (ustore_size_t)deferred_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_ram(&made);
@@ -2554,33 +2548,31 @@ static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py
 }
 
 static char const doc_Executor_on_pool[] =                                                      //
-    "on_pool(pool, /, *, memory_domains=None, deferred_limit=0) answers an executor over a\n"   //
-    "ForkUnion pool another library already runs.\n"                                            //
+    "on_pool(pool, /, *, memory_domains=None) answers an executor over a ForkUnion pool\n"      //
+    "another library already runs.\n"                                                           //
     "\n"                                                                                        //
     "Runs the calls of the RAM, RocksDB and LevelDB engines on the borrowed threads, so one\n"  //
-    "process keeps one set of them, while the executor keeps its own scratch and deferred\n"    //
-    "table. The pool keeps its lender's mood. Calls `ustore_executor_on_pool`.\n"               //
+    "process keeps one set of them, while the executor keeps its own scratch. The pool keeps\n" //
+    "its lender's mood. Calls `ustore_executor_on_pool`.\n"                                     //
     "\n"                                                                                        //
     "Args:\n"                                                                                   //
     "  pool (int): The address of the `fu_pool_t` to borrow, as `ctypes` and `cffi` hand\n"     //
     "    pointers over; the pool must outlive the executor.\n"                                  //
     "  memory_domains (Sequence[int], optional): NUMA nodes the scratch and the arenas\n"       //
     "    live on; None derives every node the process may allocate on.\n"                       //
-    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero takes\n" //
-    "    the library's default.\n"                                                              //
     "Returns:\n"                                                                                //
     "  Executor: The new executor.\n"                                                           //
     "Raises:\n"                                                                                 //
-    "  InvalidArgumentError: The address is null, or a memory domain names no NUMA node.";
+    "  InvalidArgumentError: The address is null, or a memory domain names no NUMA node.\n"     //
+    "  ContendedError: The pool runs its lender's dispatch.";
 
 static PyObject* Executor_on_pool(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                   PyObject* keyword_names_tuple) {
-    static char const* const names[] = {"pool", "memory_domains", "deferred_limit"};
-    PyObject* values[3];
-    size_t deferred_limit = 0, memory_domains_count = 0;
-    if (factory_arguments("on_pool", arguments, positional_arguments_count, keyword_names_tuple, names, values, 3, 1,
-                          1) != 0 ||
-        (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0))
+    static char const* const names[] = {"pool", "memory_domains"};
+    PyObject* values[2];
+    size_t memory_domains_count = 0;
+    if (factory_arguments("on_pool", arguments, positional_arguments_count, keyword_names_tuple, names, values, 2, 1,
+                          1) != 0)
         return NULL;
     if (!values[0]) {
         PyErr_SetString(PyExc_TypeError, "on_pool() takes the address of the pool by position");
@@ -2601,7 +2593,6 @@ static PyObject* Executor_on_pool(PyObject* type, PyObject* const* arguments, Py
         .outcome = &outcome,
         .ram = {memory_domains, (ustore_size_t)memory_domains_count},
         .pool = pool,
-        .deferred_limit = (ustore_size_t)deferred_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_on_pool(&made);
@@ -2611,8 +2602,8 @@ static PyObject* Executor_on_pool(PyObject* type, PyObject* const* arguments, Py
 }
 
 static char const doc_Executor_for_nvme[] =                                                     //
-    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, deferred_limit=0, **sizes)\n"        //
-    "answers an executor of I/O rings.\n"                                                       //
+    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, **sizes) answers an executor of\n"   //
+    "I/O rings.\n"                                                                              //
     "\n"                                                                                        //
     "Runs the calls of the NVMe engine, every thread submitting and polling a ring of its\n"    //
     "own, and tells every database Database.open_nvme() opens on it how to move bytes. Every\n" //
@@ -2624,8 +2615,6 @@ static char const doc_Executor_for_nvme[] =                                     
     "Args:\n"                                                                                   //
     "  threads (int, optional): Threads to spawn; zero derives them from the cores.\n"          //
     "  transport (Transport, optional): How bytes move between the files and memory.\n"         //
-    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero\n"       //
-    "    takes the library's default.\n"                                                        //
     "Returns:\n"                                                                                //
     "  Executor: The new executor.";
 
@@ -2637,26 +2626,23 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, P
                                    PyObject* keyword_names_tuple) {
     static char const* const names[] = {"threads",
                                         "transport",
-                                        "deferred_limit",
                                         "shared_io_channels",
                                         "queue_depth",
                                         "request_buffer_bytes",
                                         "request_buffers_count",
                                         "stream_buffer_bytes",
                                         "stream_buffers_count"};
-    PyObject* values[9];
-    size_t threads = 0, deferred_limit = 0, sizes[6] = {0};
+    PyObject* values[8];
+    size_t threads = 0, sizes[6] = {0};
     int transport = ustore_transport_automatic_k;
-    if (factory_arguments("for_nvme", arguments, positional_arguments_count, keyword_names_tuple, names, values, 9, 1,
+    if (factory_arguments("for_nvme", arguments, positional_arguments_count, keyword_names_tuple, names, values, 8, 1,
                           0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
-        (values[1] &&
-         ustore_py_enum_from_object(values[1], "transport", ustore_py_enum_transport_k, &transport) != 0) ||
-        (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0))
+        (values[1] && ustore_py_enum_from_object(values[1], "transport", ustore_py_enum_transport_k, &transport) != 0))
         return NULL;
     for (size_t index = 0; index != 6; ++index)
-        if (values[3 + index] &&
-            ustore_py_size_from_object(values[3 + index], nvme_size_names[index], &sizes[index]) != 0)
+        if (values[2 + index] &&
+            ustore_py_size_from_object(values[2 + index], nvme_size_names[index], &sizes[index]) != 0)
             return NULL;
 
     ustore_executor_t handle = NULL;
@@ -2675,7 +2661,6 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, P
                 .stream_buffers_count = (ustore_size_t)sizes[5],
             },
         .threads = (ustore_size_t)threads,
-        .deferred_limit = (ustore_size_t)deferred_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_nvme(&made);
@@ -2683,39 +2668,36 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, P
     return executor_made(type, handle, &outcome);
 }
 
-static char const doc_Executor_for_vram[] =                                                    //
-    "for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC, deferred_limit=0) answers an\n"   //
-    "executor of one GPU, NVIDIA or AMD.\n"                                                    //
-    "\n"                                                                                       //
-    "Every call queues on one stream of the device, so one host thread keeps it fed, and\n"    //
-    "every arena it makes lives there; a multi-GPU caller makes one per device.\n"             //
-    "Database.open_nvme() takes one of an NVIDIA device as its `compactions`. Calls\n"         //
-    "`ustore_executor_for_vram`.\n"                                                            //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  device (int): The ordinal of the device, its position in `gpu_devices()`.\n"            //
-    "  scratch_limit (int, optional): Bytes of device scratch a call or a merge takes; zero\n" //
-    "    lets scratch grow as calls ask.\n"                                                    //
-    "  gds (Gds, optional): How bytes move between the drives and the device.\n"               //
-    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero\n"      //
-    "    takes the library's default.\n"                                                       //
-    "Returns:\n"                                                                               //
-    "  Executor: The new executor.\n"                                                          //
-    "Raises:\n"                                                                                //
+static char const doc_Executor_for_vram[] =                                                     //
+    "for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC) answers an executor of one GPU,\n" //
+    "NVIDIA or AMD.\n"                                                                          //
+    "\n"                                                                                        //
+    "Every call queues on one stream of the device, so one host thread keeps it fed, and\n"     //
+    "every arena it makes lives there; a multi-GPU caller makes one per device.\n"              //
+    "Database.open_nvme() takes one of an NVIDIA device as its `compactions`. Calls\n"          //
+    "`ustore_executor_for_vram`.\n"                                                             //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  device (int): The ordinal of the device, its position in `gpu_devices()`.\n"             //
+    "  scratch_limit (int, optional): Bytes of device scratch a call or a merge takes; zero\n"  //
+    "    lets scratch grow as calls ask.\n"                                                     //
+    "  gds (Gds, optional): How bytes move between the drives and the device.\n"                //
+    "Returns:\n"                                                                                //
+    "  Executor: The new executor.\n"                                                           //
+    "Raises:\n"                                                                                 //
     "  DeviceError: No device carries the ordinal, or its driver refuses a stream.";
 
 static PyObject* Executor_for_vram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                    PyObject* keyword_names_tuple) {
-    static char const* const names[] = {"device", "scratch_limit", "gds", "deferred_limit"};
-    PyObject* values[4];
-    size_t scratch_limit = 0, deferred_limit = 0;
+    static char const* const names[] = {"device", "scratch_limit", "gds"};
+    PyObject* values[3];
+    size_t scratch_limit = 0;
     long device = 0;
     int gds = ustore_gds_automatic_k;
-    if (factory_arguments("for_vram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 4, 1,
+    if (factory_arguments("for_vram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 3, 1,
                           0) != 0 ||
         (values[1] && ustore_py_size_from_object(values[1], "scratch_limit", &scratch_limit) != 0) ||
-        (values[2] && ustore_py_enum_from_object(values[2], "gds", ustore_py_enum_gds_k, &gds) != 0) ||
-        (values[3] && ustore_py_size_from_object(values[3], "deferred_limit", &deferred_limit) != 0))
+        (values[2] && ustore_py_enum_from_object(values[2], "gds", ustore_py_enum_gds_k, &gds) != 0))
         return NULL;
     if (!values[0]) {
         PyErr_SetString(PyExc_TypeError, "for_vram() needs the ordinal of its device");
@@ -2736,7 +2718,6 @@ static PyObject* Executor_for_vram(PyObject* type, PyObject* const* arguments, P
         .device = (int32_t)device,
         .scratch_limit = (ustore_size_t)scratch_limit,
         .gds = (ustore_gds_t)gds,
-        .deferred_limit = (ustore_size_t)deferred_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_vram(&made);
@@ -2766,8 +2747,8 @@ static void Executor_dealloc(Executor* self) {
 static char const doc_Executor_drain[] =                                                    //
     "drain(mood=Mood.PARKED) answers None.\n"                                               //
     "\n"                                                                                    //
-    "Waits for every call submitted before the drain began, so later submissions never\n"   //
-    "delay it.\n"                                                                           //
+    "Waits until no call holds the executor, then parks its threads or keeps them\n"        //
+    "spinning, as `mood` asks.\n"                                                           //
     "\n"                                                                                    //
     "Args:\n"                                                                               //
     "  mood (Mood, optional): What the threads do once the executor next goes idle:\n"      //
@@ -2800,10 +2781,10 @@ static PyObject* Executor_drain(PyObject* self, PyObject* const* arguments, Py_s
     Py_RETURN_NONE;
 }
 
-static char const doc_Executor_close[] =                                                       //
-    "close() answers None.\n"                                                                  //
-    "\n"                                                                                       //
-    "Waits for every submitted call, then frees the threads. A receiver naming the executor\n" //
+static char const doc_Executor_close[] =                                                     //
+    "close() answers None.\n"                                                                //
+    "\n"                                                                                     //
+    "Waits until no call holds the executor, then frees the threads. A receiver naming it\n" //
     "refuses calls afterwards, and closing twice is safe.";
 
 static PyObject* Executor_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {

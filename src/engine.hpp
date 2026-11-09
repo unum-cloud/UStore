@@ -76,8 +76,8 @@ struct view_t {
     /** The executor whose thread runs the call, or null for a call run alone. */
     ustore_executor_t executor = nullptr;
 
-    /** Which thread of @c executor runs the call: a pool thread's index, or the pool's size for a blocking call and a
-     *  batch the driver runs itself, so no other call of that executor runs on the same index meanwhile. */
+    /** Which thread of @c executor serves the work: a pool thread's index for a slice of a call,
+     *  or the pool's size for the call's body, which runs on its caller or on pool thread 0. */
     std::size_t thread_index = 0;
 
     /** The stamp every verb of the call reads at outside a transaction and a snapshot, which the
@@ -633,8 +633,8 @@ struct nvme_placement_t {
     /** Threads the executor runs, each keeping an I/O channel of its own, or zero for the engine's default. */
     std::size_t threads = 0;
 
-    /** The executor whose threads, its blocking caller's included, keep a channel and an epoch slot of their own in
-     *  the databases it opens, or null for an executor of no NVMe placement. */
+    /** The executor whose pool threads and holding call keep a channel and an epoch slot of their
+     *  own in the databases it opens, or null for an executor of no NVMe placement. */
     ustore_executor_handle_t const* executor = nullptr;
 };
 
@@ -674,17 +674,8 @@ constexpr entry_layout_t entry_layout_of(ustore_modality_t modality) noexcept {
 
 #pragma region Executors
 
-/** Deferred calls an executor holds at once when its constructor names no limit. */
-constexpr std::size_t deferred_limit_default_k = 256;
-
-/** The most deferred calls an executor holds, keeping every unfinished ticket within half the range of its counter. */
-constexpr std::size_t deferred_limit_max_k = std::size_t {1} << 30;
-
-/** Microseconds a parked pool sleeps between checks for the next batch. */
-constexpr std::size_t parked_check_micros_k = 1000;
-
-/** Every argument struct that names an executor, the inits, opens and views of the engines included, so a deferred
- *  submission keeps its call by value. */
+/** Every argument struct that names an executor, the inits, opens and views of the engines
+ *  included, so a delegated call keeps its arguments by value. */
 using deferred_arguments_t = std::variant<
     ustore_database_describe_t, ustore_database_clear_t, ustore_database_compact_t, ustore_database_flush_t,
     ustore_snapshot_init_t, ustore_snapshot_save_t, ustore_collection_list_t, ustore_collection_create_t,
@@ -704,68 +695,44 @@ using deferred_arguments_t = std::variant<
     ustore_database_init_ram_t, ustore_database_open_ram_t, ustore_database_open_rocksdb_t,
     ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t, ustore_database_open_nvme_t>;
 
-/** What a deferred call leaves its driver, which publishes it once the call's table position is free again. */
-struct deferred_result_t {
+/** The one call that holds a UStore executor, from its claim to its end. */
+struct holding_call_t {
 
-    /** The caller's outcome, which the driver finishes. */
+    /** Free, or held by the call from its claim to its end. */
+    claim_t claim = claim_t::free_k;
+
+    /** A delegated call's copy, served on pool thread 0, as the caller's struct may die first. */
+    deferred_arguments_t delegated_arguments;
+
+    /** The caller's outcome, which @c end_call finishes last. */
     ustore_outcome_t* outcome = nullptr;
 
-    /** What the engine answered. */
-    status_t status;
+    /** What the engine answered, which @c end_call publishes. */
+    status_t recorded;
 
-    /** The deferred counts the call raised at submission, which the driver lowers once the outcome is final. */
-    std::array<std::uint32_t*, 3> deferred_counts {};
+    /** The counts of the database, the transaction, snapshot or cursor, and the arena the call
+     *  names, raised at its claim and lowered at its end, each null when absent. */
+    std::array<std::uint32_t*, 3> named_calls {};
 
-    /** The arena, cursor and transaction claims the call took, which the driver releases just
-     *  before the outcome. */
+    /** The arena, cursor and transaction claims the call took, released first at its end. */
     std::array<claim_t*, 3> claims {};
+
+    /** The thread serving the call, its caller or pool thread 0 for a delegated one, empty while
+     *  the executor is free, through the floor class's reference. */
+    std::thread::id body_thread;
 };
 
-/** One slot of the deferred table: a copy of the caller's argument struct and the routing that runs it. */
-struct deferred_slot_t {
-
-    /** A copy of the caller's argument struct, whose pointees stay borrowed until the call is final. */
-    deferred_arguments_t arguments;
-
-    /** Serves @c arguments in a runner's scratch and on its thread into a result for the driver to publish, as
-     *  @c run_deferred does. */
-    void (*run)(void* arguments, deferred_result_t& result, view_t const& runner) noexcept = nullptr;
-
-    /** The call's place among every call on the executor, blocking ones included. */
-    std::uint32_t ticket = 0;
-
-    /** The slot's table position plus one once filled, stored with release ordering. */
-    std::uint32_t ready = 0;
-};
-
-/** Whether the driver keeps serving the deferred table. */
-enum class driver_state_t : std::uint32_t {
-
-    /** Serving every deferred call submitted. */
-    serving_k,
-
-    /** Returning once the table is empty, as @c ustore_executor_free asks. */
-    stopping_k,
-
-    /** Never started, in a build without OS threads, where every call runs at submission. */
-    absent_k,
-};
+/** The right to dispatch on @p pool, owned or lent. */
+inline utilities::pool_view_t view_of(
+    std::variant<utilities::executor_t, utilities::lent_pool_t> const& pool) noexcept {
+    return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
+}
 
 /** What one handle may use: the masks this machine runs when nothing is pinned, the pinned class's masks when it runs
  *  them, as @c pick_cpu_ceiling picks them once at open. */
 struct cpu_ceiling_t {
     sz_capability_t strings = sz_cap_serial_k;
     fu::capabilities_t sync = fu::capabilities_unknown_k;
-};
-
-/** Where an executor runs calls: one pool thread, or the calling thread of a blocking call. */
-struct runner_t {
-
-    /** The thread running a call here, empty while idle, through the floor class's reference. */
-    std::thread::id thread;
-
-    /** The scratch every call run here works in, freed with the executor. */
-    ustore_arena_handle_t scratch;
 };
 
 #pragma endregion Executors
@@ -1194,6 +1161,7 @@ struct class_verbs_t {
     ustore_status_t (*wait)(ustore_outcome_t const*) noexcept;
     bool (*take)(claim_t*) noexcept;
     void (*release)(claim_t*) noexcept;
+    void (*wait_while_claimed)(claim_t const*) noexcept;
 
     /** Waits until the word stops reading the value seen, watching its address, so
      *  no store notifies. */
@@ -1205,6 +1173,7 @@ class_verbs_t class_verbs_of() noexcept {
     using status_ref_t = atomic_ref_of<cpu_class_, ustore_status_t>;
     using status_reader_t = atomic_ref_of<cpu_class_, ustore_status_t const>;
     using claim_ref_t = atomic_ref_of<cpu_class_, claim_t>;
+    using claim_reader_t = atomic_ref_of<cpu_class_, claim_t const>;
     using word_reader_t = atomic_ref_of<cpu_class_, std::uint32_t const>;
     using waiter_t = waiter_of<cpu_class_>;
     return {
@@ -1225,6 +1194,11 @@ class_verbs_t class_verbs_of() noexcept {
             return claim_ref_t(*word).exchange(claim_t::held_k, std::memory_order_seq_cst) == claim_t::free_k;
         },
         [](claim_t* word) noexcept { claim_ref_t(*word).store(claim_t::free_k, std::memory_order_release); },
+        [](claim_t const* word) noexcept {
+            claim_reader_t const claim {*word};
+            while (claim.load(std::memory_order_acquire) == claim_t::held_k)
+                waiter_t {}(word, claim_t::held_k, 0u, fu::wait_uncapped_k);
+        },
         [](std::uint32_t const* word, std::uint32_t seen) noexcept {
             word_reader_t const watched {*word};
             while (watched.load(std::memory_order_acquire) == seen) waiter_t {}(word, seen, 0u, fu::wait_uncapped_k);
@@ -1285,9 +1259,8 @@ struct ustore_database_handle_t {
     /** The kernels and waits every call on the database may use, picked once at open. */
     cpu_ceiling_t ceiling;
 
-    /** Deferred calls naming the database that have not finished, through the
-     *  floor class's reference. */
-    std::uint32_t deferred_calls = 0;
+    /** Executor calls naming the database that have not ended, through the floor reference. */
+    std::uint32_t named_calls = 0;
 
     /** The caller's hold plus one per transaction, snapshot or cursor keeping the database open,
      *  through the floor class's reference. */
@@ -1302,9 +1275,8 @@ struct ustore_transaction_handle_t {
     ustore_database_t database = nullptr;
     claim_t claim = claim_t::free_k;
 
-    /** Deferred calls naming the transaction that have not finished, through the
-     *  floor class's reference. */
-    std::uint32_t deferred_calls = 0;
+    /** Executor calls naming the transaction that have not ended, through the floor reference. */
+    std::uint32_t named_calls = 0;
 
     /** The caller's hold plus one per cursor reading through the transaction, through the
      *  floor class's reference. */
@@ -1326,59 +1298,28 @@ struct ustore_snapshot_handle_t {
     void* state = nullptr;
     ustore_database_t database = nullptr;
 
-    /** Deferred calls naming the snapshot that have not finished, through the
-     *  floor class's reference. */
-    std::uint32_t deferred_calls = 0;
+    /** Executor calls naming the snapshot that have not ended, through the floor reference. */
+    std::uint32_t named_calls = 0;
 
     /** The caller's hold plus one per cursor reading through the snapshot, through the
      *  floor class's reference. */
     std::uint32_t holds = 1;
 };
 
-/** What @c ustore_executor_t points to: the threads that run calls, a pool owned or lent, the driver handing it
- *  batches, the deferred table, and what the executor computes with. */
+/** What @c ustore_executor_t points to: the pool its calls fork on, the scratch of every thread,
+ *  the one call holding it, and what the executor computes with. */
 struct ustore_executor_handle_t {
 
-    /** The pool that runs deferred calls. */
+    /** The pool every call forks on, owned or lent; an exclusive one also runs delegated calls. */
     std::variant<executor_t, lent_pool_t> pool;
 
-    /** One thread, waiting on @c doorbell while the table is empty. */
-    executor_t driver;
+    /** One scratch per pool thread and one for the call at index @c threads, each kept local. */
+    st::vector<ustore_arena_handle_t> scratches;
 
-    /** A ring of power-of-two slots, of which @c deferred_limit hold calls at once. */
-    st::vector<deferred_slot_t> deferred;
+    /** The one call that holds the executor, from its claim to its end. */
+    holding_call_t holding_call;
 
-    /** One result per call of the batch the driver serves, read after the batch's table positions are free. */
-    st::vector<deferred_result_t> results;
-
-    /** One runner per pool thread, plus one for a blocking call and a batch the driver runs itself. */
-    st::vector<runner_t> runners;
-
-    /** Tickets taken in the low half and table positions taken in the high half. */
-    std::uint64_t submitted = 0;
-
-    /** The driver's loop, which @c ustore_executor_free joins. */
-    fu_generation_t generation = 0;
-
-    /** Deferred calls the table holds at once. */
-    std::uint32_t deferred_limit = 0;
-
-    /** Table positions the driver finished with, freeing the slots behind it. */
-    std::uint32_t head = 0;
-
-    /** Every ticket below it is final. */
-    std::uint32_t finished = 0;
-
-    /** Rung after every submission, waking the driver. */
-    std::uint32_t doorbell = 0;
-
-    /** What the pool and the driver do once the table empties. */
-    ustore_mood_t mood = ustore_mood_parked_k;
-
-    /** Whether the driver keeps serving. */
-    driver_state_t state = driver_state_t::serving_k;
-
-    /** The memory domain every host arena the executor makes lives on, the first one it serves. */
+    /** The memory domain of pool thread 0, holding the call's scratch and every arena made here. */
     fu_memory_domain_id_t memory_domain = 0;
 
     /** Nothing beyond the pool on RAM, the rings' options on NVMe, the device's stream on VRAM of either vendor; the

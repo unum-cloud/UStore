@@ -10,6 +10,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstring> // `std::memcpy`
 
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
@@ -48,9 +49,9 @@ class read_outputs_t {
     std::size_t index_ = 0;
     std::size_t length_ = 0;
 
-    /** The bytes of @p value that task @c index_ reads: from its offset, at most its limit. */
-    value_view_t ranged_(value_view_t value) const noexcept {
-        task_window_t const ranged = window(index_, value.size());
+    /** The bytes of @p value that task @p task reads: from its offset, at most its limit. */
+    value_view_t ranged_(std::size_t task, value_view_t value) const noexcept {
+        task_window_t const ranged = window(task, value.size());
         return value_view_t {value.data() + ranged.offset, ranged.length};
     }
 
@@ -129,7 +130,7 @@ class read_outputs_t {
 
     /** Appends a found value, which stays where it lies until @c finish copies it. */
     void append(value_view_t value) noexcept {
-        if (offsets_ || limits_) value = ranged_(value);
+        if (offsets_ || limits_) value = ranged_(index_, value);
         if (presences_) presences_[index_] = true;
         if (lengths_) lengths_[index_] = static_cast<ustore_length_t>(value.size());
         if (found_) found_[index_] = value;
@@ -142,6 +143,27 @@ class read_outputs_t {
         if (lengths_) lengths_[index_] = 0;
         if (found_) found_[index_] = {};
         ++index_;
+    }
+
+    /** Places the value found for task @p task, as @c append does, for slices of a split batch. */
+    void assign(std::size_t task, value_view_t value) noexcept {
+        if (offsets_ || limits_) value = ranged_(task, value);
+        if (presences_) presences_[task] = true;
+        if (lengths_) lengths_[task] = static_cast<ustore_length_t>(value.size());
+        if (found_) found_[task] = value;
+    }
+
+    /** Places a missing value for task @p task, as @c append_missing does. */
+    void assign_missing(std::size_t task) noexcept {
+        if (lengths_) lengths_[task] = 0;
+        if (found_) found_[task] = {};
+    }
+
+    /** Counts the first @p count tasks placed, once every slice placing them returned. */
+    void assigned(std::size_t count) noexcept {
+        index_ = count;
+        length_ = 0;
+        for (std::size_t task = 0; found_ && task != count; ++task) length_ += found_[task].size();
     }
 
     /** Copies every value into the arena at once, unless it lies there already, behind offsets as
@@ -168,7 +190,6 @@ class read_outputs_t {
 class strings_read_outputs_t {
     bits_span_t presences_ {};
     ustore_key_t* keys_ = nullptr;
-    std::size_t index_ = 0;
 
   public:
 
@@ -185,17 +206,15 @@ class strings_read_outputs_t {
         return outputs;
     }
 
-    /** Appends the key a present string maps onto. */
-    void push_present(ustore_key_t key) noexcept {
-        if (presences_) presences_[index_] = true;
-        if (keys_) keys_[index_] = key;
-        ++index_;
+    /** Places the key the present string of task @p task maps onto. */
+    void assign_present(std::size_t task, ustore_key_t key) noexcept {
+        if (presences_) presences_[task] = true;
+        if (keys_) keys_[task] = key;
     }
 
-    /** Appends a missing string, which reads as the nil UUID. */
-    void push_missing() noexcept {
-        if (keys_) keys_[index_] = ustore_key_t {};
-        ++index_;
+    /** Places the missing string of task @p task, which reads as the nil UUID. */
+    void assign_missing(std::size_t task) noexcept {
+        if (keys_) keys_[task] = ustore_key_t {};
     }
 
     /** Exports every column into the outputs of @p arguments. */
@@ -204,6 +223,8 @@ class strings_read_outputs_t {
         if (arguments.values) *arguments.values = keys_;
     }
 };
+
+struct scan_slice_t;
 
 /** The columns of batched scans and samples: an offset per task in their arena, then the keys, which grow in scratch
  *  and are copied in once their count is known. */
@@ -246,7 +267,48 @@ class scan_outputs_t {
         *arguments.keys = keys.data();
         return {};
     }
+
+    /** The outputs one slice of a split scan fills: offsets of its tasks land in this column, local
+     *  to the slice until @c finish rebases them, and its keys grow in @p scratch. */
+    scan_outputs_t slice_in(ustore_arena_t scratch) const noexcept {
+        scan_outputs_t slice;
+        slice.offsets_ = offsets_;
+        slice.keys_ = st::vector<ustore_key_t, arena_allocator<ustore_key_t>> {{scratch}};
+        return slice;
+    }
+
+    /** Closes the offsets of a scan split into @p slices, rebasing each run of tasks past the keys
+     *  of the runs before it, and copies every key into the arena of @p arguments once. */
+    template <typename arguments_type_>
+    status_t finish(arguments_type_ const& arguments, std::span<scan_slice_t const> slices) noexcept;
 };
+
+/** One slice of a split scan: the run of tasks it filled, and its outputs. */
+struct scan_slice_t {
+    std::size_t first = 0;
+    std::size_t length = 0;
+    scan_outputs_t outputs;
+};
+
+template <typename arguments_type_>
+status_t scan_outputs_t::finish(arguments_type_ const& arguments, std::span<scan_slice_t const> slices) noexcept {
+    std::size_t total = 0;
+    for (scan_slice_t const& slice : slices) total += slice.outputs.size();
+    auto [keys, status] = arena_allocate<ustore_key_t>(arguments.arena, total);
+    if (status.failed()) return status;
+    std::size_t base = 0;
+    for (scan_slice_t const& slice : slices) {
+        for (std::size_t task = slice.first; task != slice.first + slice.length; ++task)
+            offsets_[task] += static_cast<ustore_length_t>(base);
+        if (slice.outputs.size())
+            std::memcpy(keys.data() + base, slice.outputs.keys_.data(), slice.outputs.size() * sizeof(ustore_key_t));
+        base += slice.outputs.size();
+    }
+    offsets_.back() = static_cast<ustore_length_t>(total);
+    *arguments.offsets = offsets_.data();
+    *arguments.keys = keys.data();
+    return {};
+}
 
 /** The columns of batched strings scans: an offset per task in their arena, then the found strings, which grow in
  *  scratch and are copied in once, as narrow as their bytes allow. */
@@ -289,6 +351,33 @@ class strings_scan_outputs_t {
         *arguments.offsets = tasks_offsets_.data();
         return {};
     }
+
+    /** The outputs one slice of a split scan fills: offsets of its tasks land in this column, local
+     *  to the slice until @c adopt rebases them, and its strings grow in @p scratch. */
+    strings_scan_outputs_t slice_in(ustore_arena_t scratch) const noexcept {
+        strings_scan_outputs_t slice;
+        slice.tasks_offsets_ = tasks_offsets_;
+        slice.strings_ = growing_strings<arena_allocator<byte_t>> {scratch};
+        return slice;
+    }
+
+    /** Appends the strings of @p slice, which filled tasks [ @p first, @p first + @p length ),
+     *  rebasing their offsets past the strings already here, as slices merge in task order. */
+    status_t adopt(strings_scan_outputs_t const& slice, std::size_t first, std::size_t length) noexcept {
+        std::size_t const base = size();
+        for (std::size_t task = first; task != first + length; ++task)
+            tasks_offsets_[task] += static_cast<ustore_length_t>(base);
+        for (std::size_t index = 0; index != slice.size(); ++index)
+            if (status_t const pushed = push(slice[index]); pushed.failed()) return pushed;
+        return {};
+    }
+};
+
+/** One slice of a split strings scan: the run of tasks it filled, and its outputs. */
+struct strings_scan_slice_t {
+    std::size_t first = 0;
+    std::size_t length = 0;
+    strings_scan_outputs_t outputs;
 };
 
 /** The columns of a collection listing, which grow in scratch while the collections system collection is walked and

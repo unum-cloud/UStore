@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date September 27, 2026
  *  @brief Implements <tt>c/ustore/types.h</tt>: outcomes, the spelling of statuses and moods, the
- *      version, executors with their drivers, and arenas.
+ *      version, executors, and arenas.
  */
 
 #include <cstddef> // `std::size_t`
@@ -12,7 +12,6 @@
 
 #include <algorithm>   // `std::find`, `std::max`, `std::reverse`
 #include <array>       // `std::array`
-#include <bit>         // `std::bit_ceil`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -23,7 +22,7 @@
 
 #include "ustore/types.h" // `ustore_executor_for_ram_t`, `ustore_arena_init_t`, `ustore_version`
 
-#include "lib.hpp" // `ustore_executor_handle_t`, `finish`, `release`, `run_as`, `wait_finished`, `enumerator_spelling`
+#include "lib.hpp" // `ustore_executor_handle_t`, `finish`, `wait_while_claimed`, `runs_holding_call`, `enumerator_spelling`
 
 namespace unum::ustore {
 
@@ -138,71 +137,6 @@ constexpr auto version_name_k = [] {
     return text;
 }();
 
-/** Finishes the outcomes of the first @p count results of @p executor, each right after releasing
- *  the claims its call took and before lowering the deferred counts it raised. No call takes its
- *  arena while another call of the batch still runs, its caller may reuse the arena once the
- *  outcome is final, and a free waiting on it returns after that. */
-void publish_results(ustore_executor_handle_t& executor, std::uint32_t count) noexcept {
-    for (std::uint32_t task = 0; task != count; ++task) {
-        deferred_result_t const& result = executor.results[task];
-        release(result.claims);
-        finish(*result.outcome, result.status);
-        for (std::uint32_t* const deferred_calls : result.deferred_counts) {
-            if (!deferred_calls) continue;
-            floor_atomic_ref<std::uint32_t> {*deferred_calls}.fetch_sub(1, std::memory_order_release);
-        }
-    }
-}
-
-/** Runs the ready slots from @c head whose tickets follow one another as one batch, answering how many it ran.
- *
- *  The batch's table positions are freed before any of its outcomes is final, so a caller seeing one final may submit
- *  again at once. Nothing reads a slot after that, since a submission may refill it. */
-std::uint32_t serve_batch(ustore_executor_handle_t& executor) noexcept {
-    std::uint32_t const head = floor_atomic_ref<std::uint32_t> {executor.head}.load(std::memory_order_relaxed);
-    std::size_t const mask = executor.deferred.size() - 1;
-    deferred_slot_t& first = executor.deferred[head & mask];
-    if (floor_atomic_ref<std::uint32_t> {first.ready}.load(std::memory_order_acquire) != head + 1) return 0;
-    std::uint32_t const first_ticket = first.ticket;
-    std::uint32_t count = 1;
-    for (; count != executor.deferred_limit; ++count) {
-        deferred_slot_t& slot = executor.deferred[(head + count) & mask];
-        if (floor_atomic_ref<std::uint32_t> {slot.ready}.load(std::memory_order_acquire) != head + count + 1 ||
-            slot.ticket != first_ticket + count)
-            break;
-    }
-
-    wait_finished(executor, first_ticket);
-    auto serve_task = [&executor, head, mask](std::size_t task, std::size_t thread) noexcept {
-        deferred_slot_t& slot = executor.deferred[(head + task) & mask];
-        run_as(executor, thread,
-               [&](view_t const& runner) noexcept { slot.run(&slot.arguments, executor.results[task], runner); });
-    };
-    // A lent pool running its lender's dispatch refuses ours and runs nothing, so the driver runs the batch itself
-    if (st::failed(view_of(executor.pool).for_n_dynamic(count, serve_task)))
-        for (std::uint32_t task = 0; task != count; ++task) serve_task(task, executor.runners.size() - 1);
-    floor_atomic_ref<std::uint32_t> {executor.head}.store(head + count, std::memory_order_release);
-    publish_results(executor, count);
-    advance_finished(executor, first_ticket + count);
-    return count;
-}
-
-/** Serves the deferred table of @p executor on its driver thread until @c ustore_executor_free stops it. */
-void drive(ustore_executor_handle_t& executor) noexcept {
-    floor_atomic_ref<std::uint32_t const> const doorbell {executor.doorbell};
-    for (;;) {
-        std::uint32_t const rung = doorbell.load(std::memory_order_acquire);
-        if (serve_batch(executor) != 0) continue;
-        if (floor_atomic_ref<driver_state_t> {executor.state}.load(std::memory_order_acquire) ==
-            driver_state_t::stopping_k)
-            return;
-        if (floor_atomic_ref<ustore_mood_t> {executor.mood}.load(std::memory_order_relaxed) == ustore_mood_spinning_k)
-            continue;
-        if (executor_t* const owned = std::get_if<executor_t>(&executor.pool)) owned->park(parked_check_micros_k);
-        host_verbs().await_change(&executor.doorbell, rung);
-    }
-}
-
 /** How a pool spawned here treats the thread spawning it: apart from its workers, or as its only thread in a build
  *  without OS threads. */
 caller_exclusivity_t spawned_exclusivity() noexcept {
@@ -217,6 +151,8 @@ status_t pool_failure(st::status_t status) noexcept {
     case st::status_t::invalid_argument_k: return {status_code_t::invalid_argument_k, "The pool holds no threads"};
     case st::status_t::operation_not_permitted_k:
         return {status_code_t::unsupported_k, "The system refused to start the threads"};
+    case st::status_t::operation_would_block_k:
+        return {status_code_t::contended_k, "The lent pool runs its lender's dispatch"};
     default: return {status_code_t::internal_k, "ForkUnion failed for an unknown reason"};
     }
 }
@@ -271,45 +207,32 @@ nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept {
 
 } // namespace unum::ustore
 
-/** Makes in @p made the executor running calls on @p pool, with its driver allowed the ForkUnion capabilities in
- *  @p allowed and a table of @p deferred_limit calls, keeping the scratch of every pool thread on the memory domain
- *  of @p topology local to it when @p domains hold it, and every other scratch and arena on the first of them. */
+/** Makes in @p made the executor running calls on @p pool, refusing a lent pool its lender keeps
+ *  busy. Each pool thread's scratch lives on its local memory domain of @p topology when @p domains
+ *  hold it, and on the first of them otherwise; the call's scratch and every arena the executor
+ *  makes live where pool thread 0's does. */
 static status_t make_executor(std::variant<executor_t, lent_pool_t> pool, topology_t const& topology,
-                              std::span<fu_memory_domain_id_t const> domains, std::size_t deferred_limit,
-                              fu_capabilities_t allowed, ustore_executor_t& made) noexcept {
-    std::size_t const limit = deferred_limit ? deferred_limit : deferred_limit_default_k;
-    if (limit > deferred_limit_max_k)
-        return {status_code_t::capacity_exhausted_k, "An executor holds at most 2^30 deferred calls"};
-    st::expected<executor_t> driver = executor_t::make_unpinned(1, spawned_exclusivity(), allowed);
-    if (!driver) return pool_failure(driver.status());
+                              std::span<fu_memory_domain_id_t const> domains, ustore_executor_t& made) noexcept {
     std::size_t const threads = view_of(pool).threads_count();
-    ustore_executor_handle_t* const executor = new (std::nothrow)
-        ustore_executor_handle_t {std::move(pool), std::move(*driver)};
+    ustore_executor_handle_t* const executor = new (std::nothrow) ustore_executor_handle_t {std::move(pool)};
     if (!executor) return {status_code_t::out_of_memory_k, "Failed to allocate the executor"};
-    executor->deferred_limit = static_cast<std::uint32_t>(limit);
-    if (st::failed(executor->deferred.resize(std::bit_ceil(limit))) || st::failed(executor->results.resize(limit)) ||
-        st::failed(executor->runners.resize(threads + 1))) {
+    if (st::failed(executor->scratches.resize(threads + 1))) {
         delete executor;
-        return {status_code_t::out_of_memory_k, "Failed to allocate the deferred table"};
+        return {status_code_t::out_of_memory_k, "Failed to allocate the scratch of the threads"};
     }
 
     executor->memory_domain = domains.front();
-    for (runner_t& runner : executor->runners) runner.scratch.memory = host_blocks_t {.memory_domain = domains.front()};
-    // A lent pool running its lender's dispatch refuses this one, leaving every scratch on the first domain
-    [[maybe_unused]] st::status_t const placed =
-        view_of(executor->pool).for_threads([&](std::size_t thread, std::size_t compute_domain) noexcept {
-            fu_memory_domain_id_t const local = topology.memory_domain_near(compute_domain);
-            if (serves(domains, local))
-                executor->runners[thread].scratch.memory = host_blocks_t {.memory_domain = local};
-        });
-
-    if (!executor_t::spawns_threads()) executor->state = driver_state_t::absent_k;
-    else if (st::expected<fu_generation_t> started = executor->driver.start<&drive>(*executor); started)
-        executor->generation = *started;
-    else {
+    auto place_scratch = [&](std::size_t thread, std::size_t compute_domain) noexcept {
+        fu_memory_domain_id_t const local = topology.memory_domain_near(compute_domain);
+        fu_memory_domain_id_t const placed = serves(domains, local) ? local : domains.front();
+        executor->scratches[thread].memory = host_blocks_t {.memory_domain = placed};
+        if (thread == 0) executor->memory_domain = placed;
+    };
+    if (st::status_t const placed = view_of(executor->pool).for_threads(place_scratch); st::failed(placed)) {
         delete executor;
-        return pool_failure(started.status());
+        return pool_failure(placed);
     }
+    executor->scratches.back().memory = host_blocks_t {.memory_domain = executor->memory_domain};
     made = executor;
     return {};
 }
@@ -387,8 +310,7 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
                                                                      spawned_exclusivity(), allowed)
                                              : executor_t::make(*topology, threads, spawned_exclusivity(), allowed);
     if (!pool) return finish(outcome, pool_failure(pool.status()));
-    finish(outcome, make_executor(std::move(*pool), *topology, domains, arguments->deferred_limit, allowed,
-                                  *arguments->executor));
+    finish(outcome, make_executor(std::move(*pool), *topology, domains, *arguments->executor));
 }
 
 void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
@@ -403,14 +325,12 @@ void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
     st::vector<fu_memory_domain_id_t> domains;
     if (status_t const status = read_memory_domains(arguments->ram, *topology, domains); status.failed())
         return finish(outcome, status);
-    finish(outcome, make_executor(*pool, *topology, domains, arguments->deferred_limit, fu_capabilities_all_k,
-                                  *arguments->executor));
+    finish(outcome, make_executor(*pool, *topology, domains, *arguments->executor));
 }
 
 /** Makes in @p made an executor of @p threads host threads spread over the whole machine, as the NVMe and VRAM
  *  executors take, allowed the ForkUnion capabilities in @p allowed, whose scratch lives near each thread. */
-static status_t spawn_across_machine(std::size_t threads, std::size_t deferred_limit, fu_capabilities_t allowed,
-                                     ustore_executor_t& made) noexcept {
+static status_t spawn_across_machine(std::size_t threads, fu_capabilities_t allowed, ustore_executor_t& made) noexcept {
     st::expected<topology_t> topology = topology_t::make();
     if (!topology) return pool_failure(topology.status());
     st::vector<fu_memory_domain_id_t> domains;
@@ -421,7 +341,7 @@ static status_t spawn_across_machine(std::size_t threads, std::size_t deferred_l
     }
     st::expected<executor_t> pool = executor_t::make(*topology, threads, spawned_exclusivity(), allowed);
     if (!pool) return pool_failure(pool.status());
-    return make_executor(std::move(*pool), *topology, domains, deferred_limit, allowed, made);
+    return make_executor(std::move(*pool), *topology, domains, made);
 }
 
 void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
@@ -440,8 +360,8 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
         if (st::expected<std::size_t> const cores = executor_t::logical_cores_count(); cores)
             threads = std::clamp<std::size_t>(*cores / 2, 1, 8);
     ustore_executor_t made = nullptr;
-    if (status_t const status = spawn_across_machine(std::max<std::size_t>(threads, 1), arguments->deferred_limit,
-                                                     forkunion_allowed_of(ceiling), made);
+    if (status_t const status = spawn_across_machine(std::max<std::size_t>(threads, 1), forkunion_allowed_of(ceiling),
+                                                     made);
         status.failed())
         return finish(outcome, status);
     made->device = arguments->nvme;
@@ -462,10 +382,9 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     gpu_device_t const& device = devices[static_cast<std::size_t>(arguments->device)];
     if (device.vendor != gpu_vendor_t::nvidia_k && arguments->gds == ustore_gds_direct_k)
         return finish(outcome, {status_code_t::device_k, "GPUDirect Storage reaches NVIDIA devices alone"});
-    // One host thread keeps the device fed, as every call only queues work on its stream
+    // One caller-exclusive host thread keeps the device fed and serves the deferred calls
     ustore_executor_t made = nullptr;
-    if (status_t const status = spawn_across_machine(1, arguments->deferred_limit, fu_capabilities_all_k, made);
-        status.failed())
+    if (status_t const status = spawn_across_machine(1, fu_capabilities_all_k, made); status.failed())
         return finish(outcome, status);
     gpu_runtime_t& runtime = gpu_runtime();
     if (status_t const status = runtime.spawn(device, gpu_class_of(device), arguments->stream, arguments->scratch_limit,
@@ -503,24 +422,22 @@ void ustore_executor_drain(ustore_executor_drain_t* arguments) {
     if (arguments->mood != ustore_mood_parked_k && arguments->mood != ustore_mood_spinning_k)
         return finish(outcome, {status_code_t::invalid_argument_k, "The mood is neither parked nor spinning"});
     if (!executor) return finish(outcome, {});
-    if (runs_here(*executor))
+    if (runs_holding_call(*executor))
         return finish(outcome, {status_code_t::contended_k, "A callback cannot drain the executor running it"});
-    floor_atomic_ref<ustore_mood_t> {executor->mood}.store(arguments->mood, std::memory_order_relaxed);
-    wait_finished(*executor,
-                  tickets_of(floor_atomic_ref<std::uint64_t> {executor->submitted}.load(std::memory_order_acquire)));
+    wait_while_claimed(executor->holding_call.claim);
+    join_delegated(*executor);
+    // A lent pool keeps its lender's mood, and every dispatch wakes a parked pool
+    if (executor_t* const owned = std::get_if<executor_t>(&executor->pool);
+        owned && arguments->mood == ustore_mood_parked_k)
+        owned->park();
     finish(outcome, {});
 }
 
 void ustore_executor_free(ustore_executor_t executor) {
     if (!executor) return;
-    wait_finished(*executor,
-                  tickets_of(floor_atomic_ref<std::uint64_t> {executor->submitted}.load(std::memory_order_acquire)));
-    if (executor->state == driver_state_t::serving_k) {
-        floor_atomic_ref<driver_state_t> {executor->state}.store(driver_state_t::stopping_k, std::memory_order_release);
-        floor_atomic_ref<std::uint32_t> {executor->doorbell}.fetch_add(1, std::memory_order_release);
-        executor->driver.join(executor->generation);
-    }
-    for (runner_t& runner : executor->runners) arena_free_blocks(runner.scratch);
+    wait_while_claimed(executor->holding_call.claim);
+    join_delegated(*executor);
+    for (ustore_arena_handle_t& scratch : executor->scratches) arena_free_blocks(scratch);
     delete executor;
 }
 
@@ -546,7 +463,7 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
 
 void ustore_arena_free(ustore_arena_t arena) {
     if (!arena) return;
-    wait_deferred_calls(arena->deferred_calls);
+    wait_named_calls(arena->named_calls);
     destroy_arena(arena);
 }
 

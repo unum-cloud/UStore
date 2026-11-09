@@ -402,7 +402,6 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub ram: ustore_ram_options_t,
         pub threads: ustore_size_t,
-        pub deferred_limit: ustore_size_t,
         pub cpu_class: ustore_enum_t,
     }
 
@@ -412,7 +411,6 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub ram: ustore_ram_options_t,
         pub pool: *mut c_void,
-        pub deferred_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -432,7 +430,6 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub nvme: ustore_nvme_options_t,
         pub threads: ustore_size_t,
-        pub deferred_limit: ustore_size_t,
         pub cpu_class: ustore_enum_t,
     }
 
@@ -462,7 +459,6 @@ pub(crate) mod ffi {
         pub stream: *mut c_void,
         pub scratch_limit: ustore_size_t,
         pub gds: ustore_gds_t,
-        pub deferred_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -3863,10 +3859,10 @@ struct Lent<Verb: sealed::Calling> {
 
 /// The threads that run calls, shared by any number of databases and views.
 ///
-/// Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted before
-/// it finishes, and before any submitted after it starts. An executor holds at most `deferred_limit` deferred calls at
-/// once, so a submission finding its deferred table full finishes at once with [`Status::Contended`]. Dropping the
-/// executor drains it.
+/// An executor serves one call at a time, so a call submitted while another holds it finishes at
+/// once with [`Status::Contended`]. A deferred call runs on the executor's first thread in the
+/// caller's place, so polling its status alone finishes it, and progress callbacks run on the
+/// executor's threads. Dropping the executor waits for the call holding it.
 #[derive(Debug)]
 pub struct Executor {
     handle: ffi::ustore_executor_t,
@@ -3878,16 +3874,15 @@ unsafe impl Sync for Executor {}
 
 impl Executor {
     /// Spawns host threads for the RAM, RocksDB and LevelDB engines across the compute domains local to
-    /// `memory_domains`, NUMA nodes as the operating system numbers them, holding up to `deferred_limit` deferred calls
-    /// at once, or 256 for zero.
+    /// `memory_domains`, NUMA nodes as the operating system numbers them.
     ///
     /// An empty list derives every domain the process may allocate on, and an identifier no domain carries is refused
     /// with [`Status::InvalidArgument`]. The scratch of each thread, and every arena the executor makes, lives on the
     /// domains named. Zero `threads` takes 7/8 of the cores those domains carry, rounded down and at least one, which
-    /// leaves the rest to the driver thread, to blocking calls and to the background work of RocksDB and LevelDB.
+    /// leaves the rest to blocking calls and to the background work of RocksDB and LevelDB.
     ///
     /// Calls `ustore_executor_for_ram`.
-    pub fn for_ram(memory_domains: &[i32], threads: usize, deferred_limit: usize) -> Result<Self> {
+    pub fn for_ram(memory_domains: &[i32], threads: usize) -> Result<Self> {
         let mut handle: ffi::ustore_executor_t = ptr::null_mut();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_for_ram_t {
@@ -3895,7 +3890,6 @@ impl Executor {
             outcome: &mut outcome,
             ram: ram_options(memory_domains),
             threads: threads as ffi::ustore_size_t,
-            deferred_limit: deferred_limit as ffi::ustore_size_t,
             cpu_class: CPUClass::to_raw(None),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return and copies the domains.
@@ -3906,14 +3900,14 @@ impl Executor {
     /// Creates an executor for the RAM, RocksDB and LevelDB engines over a ForkUnion pool it borrows, so several
     /// libraries in one process share one set of threads, while it keeps their scratch on `memory_domains`.
     ///
-    /// A batch finding the pool running its lender's dispatch runs on the executor's own driver thread instead of
-    /// forking over the lender.
+    /// A call finding the pool running its lender's dispatch finishes with [`Status::Contended`]
+    /// rather than forking over the lender, and so does this creation.
     ///
     /// Calls `ustore_executor_on_pool`.
     ///
     /// # Safety
     /// `pool` must address a live ForkUnion `fu_pool_t` that outlives the executor.
-    pub unsafe fn on_pool(memory_domains: &[i32], pool: *mut c_void, deferred_limit: usize) -> Result<Self> {
+    pub unsafe fn on_pool(memory_domains: &[i32], pool: *mut c_void) -> Result<Self> {
         let mut handle: ffi::ustore_executor_t = ptr::null_mut();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_on_pool_t {
@@ -3921,7 +3915,6 @@ impl Executor {
             outcome: &mut outcome,
             ram: ram_options(memory_domains),
             pool,
-            deferred_limit: deferred_limit as ffi::ustore_size_t,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and the caller vouches
         // for the pool.
@@ -3934,7 +3927,7 @@ impl Executor {
     /// `io` says.
     ///
     /// Calls `ustore_executor_for_nvme`.
-    pub fn for_nvme(threads: usize, io: &IOOptions, deferred_limit: usize) -> Result<Self> {
+    pub fn for_nvme(threads: usize, io: &IOOptions) -> Result<Self> {
         let mut handle: ffi::ustore_executor_t = ptr::null_mut();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_for_nvme_t {
@@ -3942,7 +3935,6 @@ impl Executor {
             outcome: &mut outcome,
             nvme: nvme_options(io),
             threads: threads as ffi::ustore_size_t,
-            deferred_limit: deferred_limit as ffi::ustore_size_t,
             cpu_class: CPUClass::to_raw(None),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
@@ -3960,13 +3952,7 @@ impl Executor {
     /// # Safety
     /// `stream` must be null or a live stream on `device` that outlives the executor: a `cudaStream_t` on NVIDIA and a
     /// `hipStream_t` on AMD.
-    pub unsafe fn for_vram(
-        device: i32,
-        stream: *mut c_void,
-        scratch_limit: usize,
-        gds: Gds,
-        deferred_limit: usize,
-    ) -> Result<Self> {
+    pub unsafe fn for_vram(device: i32, stream: *mut c_void, scratch_limit: usize, gds: Gds) -> Result<Self> {
         let mut handle: ffi::ustore_executor_t = ptr::null_mut();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_for_vram_t {
@@ -3976,7 +3962,6 @@ impl Executor {
             stream,
             scratch_limit: scratch_limit as ffi::ustore_size_t,
             gds,
-            deferred_limit: deferred_limit as ffi::ustore_size_t,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and the caller vouches
         // for the stream.
@@ -3993,8 +3978,7 @@ impl Executor {
         }
     }
 
-    /// Waits for every call submitted before the drain began, then leaves the threads in `mood` whenever they next go
-    /// idle.
+    /// Waits until no call holds the executor, then parks or spins its threads as `mood` asks.
     pub fn drain(&self, mood: Mood) -> Result<()> {
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_drain_t {
@@ -4709,7 +4693,7 @@ mod tests {
 
     #[test]
     fn databases_open_on_every_engine_or_report_it_missing() {
-        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let executor = Executor::for_ram(&[], 2).unwrap();
         let ram = temporary_directory("database_ram");
         let rocksdb = temporary_directory("database_rocksdb");
         let leveldb = temporary_directory("database_leveldb");
@@ -4833,7 +4817,7 @@ mod tests {
         let refused = database.clear(DropMode::Collection).unwrap_err();
         assert_eq!(refused.status, Status::InvalidArgument);
         drop(snapshot);
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         database
             .head()
             .deferred(&executor)
@@ -4887,7 +4871,7 @@ mod tests {
         assert!(resurfaced.is_err(), "the panic resurfaces once the call is final");
 
         // A deferred call owns its handler, which outlives the `Deferred`, and resurfaces the panic from `wait`.
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let leaked: &'static mut ProgressCallback<'static> =
             Box::leak(Box::new(|_: usize, _: usize| -> ControlFlow<()> {
                 panic!("a deferred progress fault")
@@ -4900,7 +4884,7 @@ mod tests {
     fn flushes_run_blocking_or_deferred() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         database.flush().unwrap();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         database.head().deferred(&executor).flush().unwrap().wait().unwrap();
     }
 
@@ -4908,26 +4892,26 @@ mod tests {
     fn executors_take_memory_domains_or_refuse_them() {
         let unknown = [1 << 20];
         assert_eq!(
-            Executor::for_ram(&unknown, 1, 0).unwrap_err().status,
+            Executor::for_ram(&unknown, 1).unwrap_err().status,
             Status::InvalidArgument
         );
         // SAFETY: a null pool is refused before anything reads it.
-        let lent = unsafe { Executor::on_pool(&[], ptr::null_mut(), 0) };
+        let lent = unsafe { Executor::on_pool(&[], ptr::null_mut()) };
         assert_eq!(lent.unwrap_err().status, Status::InvalidArgument);
         let blocking = IOOptions {
             transport: Transport::Blocking,
             ..IOOptions::default()
         };
-        drop(Executor::for_nvme(1, &blocking, 0).unwrap());
+        drop(Executor::for_nvme(1, &blocking).unwrap());
         // A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries.
         // SAFETY: a null stream lends nothing, so the executor creates its own.
-        let devices = unsafe { Executor::for_vram(1 << 20, ptr::null_mut(), 0, Gds::Automatic, 0) }
+        let devices = unsafe { Executor::for_vram(1 << 20, ptr::null_mut(), 0, Gds::Automatic) }
             .unwrap_err()
             .status;
         assert!(devices == Status::Unsupported || devices == Status::Device);
 
         // Zero threads derive their count from the cores of every domain.
-        let derived = Executor::for_ram(&[], 0, 0).unwrap();
+        let derived = Executor::for_ram(&[], 0).unwrap();
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let blobs = created(&database, Modality::Blobs);
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
@@ -5043,7 +5027,7 @@ mod tests {
         );
 
         // A deferred view of the head drops the collection whole.
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         database.head().write(people, &entries, Durability::Buffered).unwrap();
         database
             .head()
@@ -5211,7 +5195,7 @@ mod tests {
     fn snapshots_hold_the_state_they_were_taken_at() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let blobs = created(&database, Modality::Blobs);
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new().unwrap();
         let before = [crate::blobs::Entry::new(key(5), b"before")];
         database.head().write(blobs, &before, Durability::Buffered).unwrap();
@@ -5242,7 +5226,7 @@ mod tests {
 
         let directory = temporary_directory("snapshot_saves");
         let deferred_directory = temporary_directory("snapshot_saves_deferred");
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let snapshot = database.snapshot().unwrap();
         snapshot.save(directory.path()).unwrap();
         snapshot
@@ -5281,7 +5265,7 @@ mod tests {
     fn transaction_verbs_block_or_defer_on_an_executor() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let blobs = created(&database, Modality::Blobs);
-        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let executor = Executor::for_ram(&[], 2).unwrap();
         let mut arena = Arena::new().unwrap();
 
         // A blocking view on the executor answers the stamps directly.
@@ -5328,7 +5312,7 @@ mod tests {
     #[test]
     fn collections_list_through_a_deferred_view() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let people = database.collection_create("people", Modality::Blobs).unwrap();
         let snapshot = database.snapshot().unwrap();
@@ -5358,14 +5342,14 @@ mod tests {
             device: None,
         };
         assert_eq!(Arena::new().unwrap().describe(), Ok(host));
-        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let executor = Executor::for_ram(&[], 2).unwrap();
         assert_eq!(Arena::new_in(&executor).unwrap().describe(), Ok(host));
     }
 
     #[test]
     fn one_arena_serves_every_verb_in_turn() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
-        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let executor = Executor::for_ram(&[], 2).unwrap();
         let people = database.collection_create("people", Modality::Docs).unwrap();
         let names = created(&database, Modality::Blobs);
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
@@ -5424,7 +5408,7 @@ mod tests {
     #[test]
     fn deferred_calls_resolve_through_await() {
         let (database, blobs) = crowded(1_000);
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let deferred = database.head().deferred(&executor);
 
@@ -5474,7 +5458,7 @@ mod tests {
 
     #[test]
     fn a_forgotten_deferred_call_holds_its_database_open() {
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let (database, blobs) = crowded(100_000);
         let scan = database
@@ -5494,7 +5478,7 @@ mod tests {
 
     #[test]
     fn a_dropped_deferred_call_waits_until_it_is_final() {
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let (database, blobs) = crowded(100_000);
         let scan = database
@@ -5512,9 +5496,9 @@ mod tests {
     }
 
     #[test]
-    fn a_full_deferred_table_answers_contended() {
+    fn a_held_executor_answers_contended() {
         let (database, blobs) = crowded(100_000);
-        let executor = Executor::for_ram(&[], 1, 1).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let mut scanned = Arena::new_in(&executor).unwrap();
         let mut measured = Arena::new_in(&executor).unwrap();
         let head = database.head().deferred(&executor);
@@ -5537,7 +5521,7 @@ mod tests {
     #[test]
     fn a_transaction_serving_a_deferred_call_answers_contended() {
         let (database, blobs) = crowded(100_000);
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let transaction = database.transaction().unwrap();
         let mut arena = Arena::new().unwrap();
         let mut deferred_arena = Arena::new_in(&executor).unwrap();
@@ -5562,24 +5546,16 @@ mod tests {
     }
 
     #[test]
-    fn a_drain_returns_once_every_earlier_call_is_final() {
+    fn a_drain_returns_once_the_holding_call_is_final() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let blobs = created(&database, Modality::Blobs);
-        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let executor = Executor::for_ram(&[], 2).unwrap();
         let head = database.head().deferred(&executor);
-        let writes: Vec<_> = (0..4)
-            .map(|index| {
-                let value: stringtape::BytesTape<u64> = [b"value".as_slice()].into_iter().collect();
-                head.write(blobs, ([key(index)], value), Durability::Buffered).unwrap()
-            })
-            .collect();
-
-        executor.drain(Mood::Spinning).unwrap();
-        for write in &writes {
+        for (index, mood) in [Mood::Spinning, Mood::Parked, Mood::Spinning].into_iter().enumerate() {
+            let value: stringtape::BytesTape<u64> = [b"value".as_slice()].into_iter().collect();
+            let write = head.write(blobs, ([key(index as u64)], value), Durability::Buffered).unwrap();
+            executor.drain(mood).unwrap();
             assert_eq!(write.status(), Ok(()));
-        }
-        executor.drain(Mood::Parked).unwrap();
-        for write in writes {
             write.wait().unwrap();
         }
     }

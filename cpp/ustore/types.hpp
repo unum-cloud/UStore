@@ -218,8 +218,8 @@ struct receiver_t {
     receiver_t on(ustore_executor_t runner) const noexcept { return {database, runner, transaction, snapshot}; }
 };
 
-/** Owns an executor, the threads or I/O rings that run calls on any number of databases, and frees it once drained.
- *  It never copies, and outlives every call submitted to it. */
+/** Owns an executor, the threads or I/O rings that run calls on any number of databases, one at a
+ *  time. It frees the executor once no call holds it, never copies, and outlives every call. */
 class executor_handle_t {
     ustore_executor_t executor_ = nullptr;
 
@@ -270,7 +270,7 @@ class executor_handle_t {
         return make_(ustore_executor_for_vram, options);
     }
 
-    /** Waits for every call submitted before the drain, leaving the threads in @p mood whenever they go idle. */
+    /** Waits until no call holds the executor, then parks or spins its threads as @p mood asks. */
     status_t drain(ustore_mood_t mood = ustore_mood_parked_k) noexcept {
         ustore_outcome_t outcome {};
         ustore_executor_drain_t drain {.executor = executor_, .outcome = &outcome, .mood = mood};

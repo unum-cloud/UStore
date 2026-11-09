@@ -464,14 +464,14 @@ std::size_t database_failed_reports_zeroed(config_t const& config) {
     failures += expect_failure(outcome);
     failures += expect(collection == ustore_collection_id_t {});
 
-    // An executor whose table outgrows its counters is never made
+    // An executor pinned to a CPU class no build names is never made
     ustore_executor_t executor = reinterpret_cast<ustore_executor_t>(stale_handle);
     ustore_executor_for_ram_t spawn {.executor = &executor,
                                      .outcome = &outcome,
                                      .threads = 1,
-                                     .deferred_limit = ustore_size_t {1} << 31};
+                                     .cpu_class = static_cast<ustore_cpu_class_t>(1 << 20)};
     ustore_executor_for_ram(&spawn);
-    failures += expect_status(outcome, status_code_t::capacity_exhausted_k);
+    failures += expect_status(outcome, status_code_t::invalid_argument_k);
     failures += expect(executor == nullptr);
     return failures;
 }
@@ -1856,7 +1856,7 @@ case_result_t progress_cancel_compact(config_t const& config) {
 std::size_t progress_serialized(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(open_status.succeeded() && spawn_status.succeeded());
     if (failures != 0) return failures;
     auto [arena, arena_status] = arena_t::make(executor);

@@ -54,6 +54,7 @@
 #include "utilities/batches.hpp"  // `scan_batch_t`, `strings_arg_t`, `places_of`, `scans_of`, `measures_of`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `strings_read_outputs_t`, `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/slices.hpp"   // `for_task_slices`
 
 namespace unum::ustore::ram {
 using namespace unum::ustore::blobs;
@@ -724,9 +725,9 @@ store_status_t read_keys(view_type_ const& view, place_batch_t const& places, st
                          read_outputs_t& outputs) noexcept {
     store_status_t const reserved = view.prepare(end - first);
     if (st::failed(reserved)) return reserved;
-    auto const found = [&](entry_type_ const& entry) noexcept { outputs.append(value_of(entry)); };
-    auto const missing = [&]() noexcept { outputs.append_missing(); };
     for (std::size_t index = first; index != end; ++index) {
+        auto const found = [&](entry_type_ const& entry) noexcept { outputs.assign(index, value_of(entry)); };
+        auto const missing = [&]() noexcept { outputs.assign_missing(index); };
         store_status_t const looked_up = view.find(entry_for<entry_type_>(places[index].key), found, missing);
         if (st::failed(looked_up)) return looked_up;
     }
@@ -879,9 +880,9 @@ store_status_t read_strings(view_type_ const& view, strings_arg_t const& texts, 
                             strings_read_outputs_t& outputs) noexcept {
     store_status_t const reserved = view.prepare(end - first);
     if (st::failed(reserved)) return reserved;
-    auto const found = [&](string_pair_t const& pair) noexcept { outputs.push_present(pair.mapped); };
-    auto const missing = [&]() noexcept { outputs.push_missing(); };
     for (std::size_t index = first; index != end; ++index) {
+        auto const found = [&](string_pair_t const& pair) noexcept { outputs.assign_present(index, pair.mapped); };
+        auto const missing = [&]() noexcept { outputs.assign_missing(index); };
         auto [key, key_status] = string_key_from(string_of(texts[index]));
         if (st::failed(key_status)) return key_status;
         store_status_t const looked_up = view.find(key, found, missing);
@@ -1879,20 +1880,31 @@ status_t read_values(database_state<cpu_class_, isolation_>& state, arguments_ty
     if (outputs_status.failed()) return outputs_status;
 
     // The source's claim keeps every version found alive until the outputs copy its value
-    store_status_t const read = with_source(state, view, [&](auto& source) noexcept {
-        store_status_t const runs = for_each_run(
-            source, places.collections_begin, places.size(), outcome,
-            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
-                                        std::size_t end) noexcept -> store_status_t {
-                if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>) return refused_modality(outcome);
-                else {
-                    auto store = source.view(entries);
-                    if (!store) return store.status();
-                    return read_keys<entry_type_>(*store, places, first, end, outputs);
-                }
-            });
-        if (st::succeeded(runs) && outcome.succeeded()) outcome = outputs.finish(arguments);
-        return runs;
+    store_status_t const read = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
+        auto read_slice = [&](std::size_t first_task, std::size_t length, view_t const&) noexcept -> status_t {
+            status_t sliced;
+            store_status_t const runs = for_each_run(
+                source, places.collections_begin + static_cast<std::ptrdiff_t>(first_task), length, sliced,
+                [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                            std::size_t end) noexcept -> store_status_t {
+                    if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
+                        return refused_modality(sliced);
+                    else {
+                        auto store = source.view(entries);
+                        if (!store) return store.status();
+                        return read_keys<entry_type_>(*store, places, first_task + first, first_task + end, outputs);
+                    }
+                });
+            return reported(runs, sliced);
+        };
+        // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
+        if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
+            outcome = for_task_slices(view, places.size(), read_slice);
+        else outcome = read_slice(0, places.size(), view);
+        if (outcome.failed()) return store_status_t::success_k;
+        outputs.assigned(places.size());
+        outcome = outputs.finish(arguments);
+        return store_status_t::success_k;
     });
     return reported(read, outcome);
 }
@@ -1933,6 +1945,7 @@ status_t read_into_scratch(source_type_& source, place_batch_t const& places, vi
         failure = runs;
         return translate(runs);
     }
+    outputs.assigned(places.size());
     return outputs.finish(read);
 }
 
@@ -1945,31 +1958,48 @@ status_t scan_keys(database_state<cpu_class_, isolation_>& state, arguments_type
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
+    st::vector<scan_slice_t, arena_allocator<scan_slice_t>> slices {{view.scratch}};
+    if (st::failed(slices.resize(slice_slots(view))))
+        return {status_code_t::out_of_memory_k, "Failed to allocate the slices of a scan"};
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
 
     status_t outcome;
-    store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(source, scans.collections, scans.size(), outcome,
-                            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
-                                                        std::size_t end) noexcept -> store_status_t {
-                                if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
-                                    return refused_modality(outcome);
-                                else {
-                                    auto store = source.view(entries);
-                                    if (!store) return store.status();
-                                    for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
-                                        outputs.open_task(task);
-                                        store_status_t const scanned = scan_window<entry_type_>(
-                                            *store, scans[task], arguments.mode, outputs, outcome);
-                                        if (st::failed(scanned) || outcome.failed()) return scanned;
-                                        if (!progress.advance(1)) outcome = progress_cancelled_k;
-                                    }
-                                    return store_status_t::success_k;
-                                }
-                            });
+    store_status_t const walked = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
+        auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
+            scan_slice_t& sliced = slices[slice.thread_index];
+            sliced = {first_task, length, outputs.slice_in(slice.scratch)};
+            status_t slice_outcome;
+            store_status_t const runs = for_each_run(
+                source, scans.collections + static_cast<std::ptrdiff_t>(first_task), length, slice_outcome,
+                [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                            std::size_t end) noexcept -> store_status_t {
+                    if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
+                        return refused_modality(slice_outcome);
+                    else {
+                        auto store = source.view(entries);
+                        if (!store) return store.status();
+                        for (std::size_t task = first_task + first; task != first_task + end; ++task) {
+                            sliced.outputs.open_task(task);
+                            store_status_t const scanned = scan_window<entry_type_>(*store, scans[task], arguments.mode,
+                                                                                    sliced.outputs, slice_outcome);
+                            if (st::failed(scanned) || slice_outcome.failed()) return scanned;
+                            if (progress.advance(1)) continue;
+                            slice_outcome = progress_cancelled_k;
+                            break;
+                        }
+                        return store_status_t::success_k;
+                    }
+                });
+            return reported(runs, slice_outcome);
+        };
+        // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
+        if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
+            outcome = for_task_slices(view, scans.size(), scan_slice);
+        else outcome = scan_slice(0, scans.size(), view);
+        return store_status_t::success_k;
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
-    return outputs.finish(arguments);
+    return outputs.finish(arguments, slices);
 }
 
 /** Implements the sample of collections whose stores hold @p entry_type_, refusing any other, as a
@@ -2021,26 +2051,34 @@ status_t measure_keys(database_state<cpu_class_, isolation_>& state, arguments_t
     if (outputs_status.failed()) return outputs_status;
 
     status_t outcome;
-    store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
+    store_status_t const walked = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
         return for_each_run(source, measures.collections, measures.size(), outcome,
                             [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
                                                         std::size_t end) noexcept -> store_status_t {
                                 if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
                                     return refused_modality(outcome);
                                 else {
-                                    auto store = source.view(entries);
-                                    if (!store) return store.status();
-                                    for (std::size_t task = first; task != end; ++task) {
-                                        scan_task_t const range = measures[task];
-                                        window_measure_t measured;
-                                        if (range.limit != 0)
-                                            if (store_status_t const measuring = measure_window<entry_type_>(
-                                                    *store, range.keys, measured);
-                                                st::failed(measuring))
-                                                return measuring;
-                                        outputs.assign(task, measured.cardinality, measured.value_bytes,
-                                                       measured.space_bytes);
-                                    }
+                                    auto measure_slice = [&](std::size_t first_task, std::size_t length,
+                                                             view_t const&) noexcept -> status_t {
+                                        auto store = source.view(entries);
+                                        if (!store) return translate(store.status());
+                                        std::size_t const end_task = first + first_task + length;
+                                        for (std::size_t task = first + first_task; task != end_task; ++task) {
+                                            scan_task_t const range = measures[task];
+                                            window_measure_t measured;
+                                            if (range.limit != 0)
+                                                if (store_status_t const measuring = measure_window<entry_type_>(
+                                                        *store, range.keys, measured);
+                                                    st::failed(measuring))
+                                                    return translate(measuring);
+                                            outputs.assign(task, measured.cardinality, measured.value_bytes,
+                                                           measured.space_bytes);
+                                        }
+                                        return status_t {};
+                                    };
+                                    if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
+                                        outcome = for_task_slices(view, end - first, measure_slice);
+                                    else outcome = measure_slice(0, end - first, view);
                                     return store_status_t::success_k;
                                 }
                             });
@@ -2096,7 +2134,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_cl
  *  versions it frees carry no byte count. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_compact_t const& arguments,
-               view_t const&) noexcept {
+               view_t const& view) noexcept {
     claim_t claim;
     reader_source<cpu_class_, isolation_> source {state, state.order.take_snapshot(claim)};
     listed_collections<cpu_class_, isolation_> listed;
@@ -2105,12 +2143,21 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_co
         st::failed(collected))
         return translate(collected);
     progress_t progress {arguments.progress, arguments.progress_state, listed.size()};
-    for (std::size_t index = 0; index != listed.size(); ++index) {
+    auto [statuses, statuses_status] = arena_allocate<status_t>(view.scratch, listed.size());
+    if (statuses_status.failed()) return statuses_status;
+    // Each collection's store locks only its own partitions, so collections vacuum on any threads
+    auto vacuum_collection = [&](std::size_t index, std::size_t) noexcept {
         store_status_t const vacuumed = std::visit([](auto& entries) noexcept { return entries.vacuum().status(); },
                                                    listed[index].store->entries);
-        if (st::failed(vacuumed)) return translate(vacuumed);
-        if (!progress.advance(1)) return progress_cancelled_k;
-    }
+        statuses[index] = translate(vacuumed);
+        if (statuses[index].succeeded() && !progress.advance(1)) statuses[index] = progress_cancelled_k;
+    };
+    if (!view.executor)
+        for (std::size_t index = 0; index != listed.size(); ++index) vacuum_collection(index, 0);
+    else if (st::failed(view_of(view.executor->pool).for_n_dynamic(listed.size(), vacuum_collection)))
+        return {status_code_t::contended_k, "The lent pool runs its lender's dispatch"};
+    for (status_t const& status : statuses)
+        if (status.failed()) return status;
     if (store_status_t const vacuumed = state.collections_by_id.vacuum().status(); st::failed(vacuumed))
         return translate(vacuumed);
     if (store_status_t const vacuumed = state.collection_ids_by_name.vacuum().status(); st::failed(vacuumed))

@@ -46,6 +46,7 @@
 #include "engine.hpp"            // `blobs_verbs<home_t::host_k>`, `view_t`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
 #include "utilities/outputs.hpp" // `read_outputs_t`
+#include "utilities/slices.hpp"  // `for_task_slices`, `slice_slots`
 
 namespace unum::ustore {
 using namespace unum::ustore::utilities;
@@ -488,17 +489,17 @@ status_t read_document_fields(documents_type_ const& source, ustore_docs_read_t 
     auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
 
-    // A value is present when its field is, and its text stays in scratch until the outputs copy it
-    auto export_one = [&](json_cell_t const& value) noexcept -> status_t {
+    // A value is present when its field is, and its text stays in its slice's scratch until copied
+    auto export_one = [&](json_cell_t const& value, std::size_t task, ustore_arena_t scratch) noexcept -> status_t {
         if (value.token == json_token_t::missing_k) {
-            outputs.append_missing();
+            outputs.assign_missing(task);
             return {};
         }
         bool const container = value.token == json_token_t::object_k || value.token == json_token_t::array_k;
         if (arguments.outputs_type == ustore_docs_field_type_json_k || container) {
-            auto [text, text_status] = json_text_of<strings_kit_type_>(value, view.scratch);
+            auto [text, text_status] = json_text_of<strings_kit_type_>(value, scratch);
             if (text_status.failed()) return text_status;
-            outputs.append(text);
+            outputs.assign(task, text);
             return {};
         }
 
@@ -506,12 +507,12 @@ status_t read_document_fields(documents_type_ const& source, ustore_docs_read_t 
         std::string_view text;
         [[maybe_unused]] conversion_t const conversion = json_to_string(value, print_buffer, text);
         if (text.data() == print_buffer) {
-            auto [printed, printed_status] = arena_allocate<char>(view.scratch, text.size());
+            auto [printed, printed_status] = arena_allocate<char>(scratch, text.size());
             if (printed_status.failed()) return printed_status;
             std::memcpy(printed.data(), text.data(), text.size());
             text = {printed.data(), text.size()};
         }
-        outputs.append(text);
+        outputs.assign(task, text);
         return {};
     };
 
@@ -530,8 +531,14 @@ status_t read_document_fields(documents_type_ const& source, ustore_docs_read_t 
             view.scratch, values);
         extracted.failed())
         return extracted;
-    for (std::size_t task = 0; task != arguments.count; ++task)
-        if (status_t const status = export_one(values[task]); status.failed()) return status;
+    auto export_slice = [&](std::size_t first, std::size_t length, view_t const& slice) noexcept -> status_t {
+        for (std::size_t task = first; task != first + length; ++task)
+            if (status_t const status = export_one(values[task], task, slice.scratch); status.failed()) return status;
+        return {};
+    };
+    if (status_t const exported = for_task_slices(view, arguments.count, export_slice); exported.failed())
+        return exported;
+    outputs.assigned(arguments.count);
     return outputs.finish(arguments);
 }
 
@@ -605,6 +612,8 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
     // The three bitmaps of a column share one allocation, each starting aligned as every output does
     std::size_t const bitmap_stride = round_up_to_multiple(divide_round_up(docs_count, bits_in_byte_k),
                                                            arena_alignment_k);
+    auto [texts_bytes_of_slices, slots_status] = arena_allocate<std::size_t>(view.scratch, slice_slots(view));
+    if (slots_status.failed()) return slots_status;
     printed_number_buffer_t print_buffer;
     for (std::size_t field_index = 0; field_index != fields_count; ++field_index) {
         ustore_docs_field_type_t const type = arguments.outputs_types[field_index];
@@ -618,64 +627,76 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
         // A text column spans a null after every text, and a binary one does not
         string_end_t const end = type == ustore_docs_field_type_string_k ? string_end_t::null_terminated_k
                                                                          : string_end_t::bare_k;
+        auto convert_slice = [&](std::size_t first, std::size_t length, view_t const& slice) noexcept -> status_t {
+            printed_number_buffer_t print_buffer;
+            std::size_t& slice_texts_bytes = texts_bytes_of_slices[slice.thread_index];
+            for (std::size_t document_index = first; document_index != first + length; ++document_index) {
+                json_cell_t const value = values[field_index * docs_count + document_index];
+                ustore_byte_t* const scalar_column = scalars.data();
+                conversion_t conversion = conversion_t::collides_k;
+
+                switch (type) {
+                case ustore_docs_field_type_bool_k:
+                    conversion = gather_scalar<bool>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_uuid_k:
+                    conversion = gather_uuid(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_f64_k:
+                    conversion = gather_scalar<double>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_f32_k:
+                    conversion = gather_scalar<float>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_f16_k:
+                    conversion = gather_half(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_i64_k:
+                    conversion = gather_scalar<std::int64_t>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_i32_k:
+                    conversion = gather_scalar<std::int32_t>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_i16_k:
+                    conversion = gather_scalar<std::int16_t>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_i8_k:
+                    conversion = gather_scalar<std::int8_t>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_u64_k:
+                    conversion = gather_scalar<std::uint64_t>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_u32_k:
+                    conversion = gather_scalar<std::uint32_t>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_u16_k:
+                    conversion = gather_scalar<std::uint16_t>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_u8_k:
+                    conversion = gather_scalar<std::uint8_t>(value, scalar_column, document_index);
+                    break;
+                case ustore_docs_field_type_string_k:
+                case ustore_docs_field_type_binary_k: {
+                    std::string_view text;
+                    conversion = json_to_string(value, print_buffer, text);
+                    slice_texts_bytes += text.size() + (end == string_end_t::null_terminated_k);
+                    break;
+                }
+                default: break;
+                }
+
+                std::size_t const slot = document_index / bits_in_byte_k;
+                ustore_octet_t const mask = static_cast<ustore_octet_t>(1u << (document_index % bits_in_byte_k));
+                record_conversion(conversion, mask, bitmaps[slot], bitmaps[bitmap_stride + slot],
+                                  bitmaps[2 * bitmap_stride + slot]);
+            }
+            return {};
+        };
+        for (std::size_t& slice_bytes : texts_bytes_of_slices) slice_bytes = 0;
+        if (status_t const converted = for_task_slices(view, docs_count, convert_slice); converted.failed())
+            return converted;
         std::size_t texts_bytes = 0;
-
-        for (std::size_t document_index = 0; document_index != docs_count; ++document_index) {
-            json_cell_t const value = values[field_index * docs_count + document_index];
-            ustore_byte_t* const scalar_column = scalars.data();
-            conversion_t conversion = conversion_t::collides_k;
-
-            switch (type) {
-            case ustore_docs_field_type_bool_k:
-                conversion = gather_scalar<bool>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_uuid_k: conversion = gather_uuid(value, scalar_column, document_index); break;
-            case ustore_docs_field_type_f64_k:
-                conversion = gather_scalar<double>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_f32_k:
-                conversion = gather_scalar<float>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_f16_k: conversion = gather_half(value, scalar_column, document_index); break;
-            case ustore_docs_field_type_i64_k:
-                conversion = gather_scalar<std::int64_t>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_i32_k:
-                conversion = gather_scalar<std::int32_t>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_i16_k:
-                conversion = gather_scalar<std::int16_t>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_i8_k:
-                conversion = gather_scalar<std::int8_t>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_u64_k:
-                conversion = gather_scalar<std::uint64_t>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_u32_k:
-                conversion = gather_scalar<std::uint32_t>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_u16_k:
-                conversion = gather_scalar<std::uint16_t>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_u8_k:
-                conversion = gather_scalar<std::uint8_t>(value, scalar_column, document_index);
-                break;
-            case ustore_docs_field_type_string_k:
-            case ustore_docs_field_type_binary_k: {
-                std::string_view text;
-                conversion = json_to_string(value, print_buffer, text);
-                texts_bytes += text.size() + (end == string_end_t::null_terminated_k);
-                break;
-            }
-            default: break;
-            }
-
-            std::size_t const slot = document_index / bits_in_byte_k;
-            ustore_octet_t const mask = static_cast<ustore_octet_t>(1u << (document_index % bits_in_byte_k));
-            record_conversion(conversion, mask, bitmaps[slot], bitmaps[bitmap_stride + slot],
-                              bitmaps[2 * bitmap_stride + slot]);
-        }
+        for (std::size_t const slice_bytes : texts_bytes_of_slices) texts_bytes += slice_bytes;
 
         // The texts are sized first, so a second conversion copies each straight into the arena
         ustore_strings_view_t column_strings {};

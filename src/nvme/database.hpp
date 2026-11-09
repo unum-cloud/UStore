@@ -1698,14 +1698,13 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const& 
 }
 
 /**
- *  @brief Fans the slices of one merge out over the threads of the executor a blocking compact runs
- *      on, one slice per thread.
+ *  @brief Fans the slices of one merge out over the threads of the executor a compact holds, one
+ *      slice per thread.
  *
- *  A blocking call runs once every earlier ticket finished and before the driver dispatches the
- *  next batch, so this dispatch is the pool's only one. Each slice reads on the channel of the
- *  thread running it, which nothing else takes meanwhile, and writes on a shared channel, of which
- *  the open keeps one more per thread. A pool that refuses the dispatch leaves every slice to the
- *  calling thread, in turn.
+ *  The compact holds its executor, eager or delegated, so this dispatch is the pool's only one.
+ *  Each slice reads on the channel of the thread running it, which nothing else takes meanwhile,
+ *  and writes on a shared channel, of which the open keeps one more per thread. A lent pool running
+ *  its lender's dispatch refuses the merge as contended.
  */
 template <cpu_class_t cpu_class_>
 class compaction_fan_out {
@@ -1713,7 +1712,7 @@ class compaction_fan_out {
     using channel_pool_t = typename storage_mount_of<cpu_class_>::channel_pool_t;
 
     compaction_fan_out(pool_view_t pool, channel_pool_t& channels, view_t const& caller) noexcept
-        : pool_(pool), channels_(channels), scratch_(caller.scratch), caller_thread_(caller.thread_index) {}
+        : pool_(pool), channels_(channels), scratch_(caller.scratch) {}
 
     /** One slice per thread of the pool. */
     [[nodiscard]] std::size_t slices() const noexcept { return pool_.threads_count(); }
@@ -1737,31 +1736,26 @@ class compaction_fan_out {
             statuses[task] = slice(task, reading.channel(), writing.channel());
         };
         if (st::failed(pool_.for_n_dynamic(statuses.size(), run_slice)))
-            for (std::size_t task = 0; task != statuses.size(); ++task) run_slice(task, caller_thread_);
+            return {status_code_t::contended_k, "The lent pool runs its lender's dispatch"};
         for (status_t const& status : statuses)
             if (status.failed()) return status;
         return {};
     }
 
   private:
-    /** The executor's pool, idle while the blocking call runs. */
+    /** The executor's pool, idle but for this call's forks. */
     pool_view_t pool_;
 
     /** The mount's channels, one per executor thread and the shared ones. */
     channel_pool_t& channels_;
 
-    /** The calling thread's scratch, which holds every slice's status. */
+    /** The call's scratch, which holds every slice's status. */
     ustore_arena_t scratch_;
-
-    /** The calling thread's index among the executor's, whose channel it reads on when it runs
-     *  the slices itself. */
-    std::size_t caller_thread_ = 0;
 };
 
 /** Implements @c ustore_database_compact: flushing every collection, then merging every level
- *  over its bounds, reporting one unit per pass, as a pass merges every collection at once. A
- *  blocking call on the executor that opened the database fans every merge on the host out over
- *  that executor's threads. */
+ *  over its bounds, reporting one unit per pass, as a pass merges every collection at once. Any
+ *  call on the executor that opened the database fans each host merge out over its threads. */
 template <cpu_class_t cpu_class_>
 status_t database_compact(ustore_database_compact_t const& arguments, view_t const& view) noexcept {
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
@@ -1773,7 +1767,7 @@ status_t database_compact(ustore_database_compact_t const& arguments, view_t con
             fan_out = compaction_fan_out_t {threads.emplace(view_of(view.executor->pool), mount.channels(), view)};
         return status_t {};
     };
-    if (arguments.completion == ustore_completion_blocking_k && view.executor && view.executor == state.executor)
+    if (view.executor && view.executor == state.executor)
         if (status_t const visited = state.resources->storage.visit(fan_out_on); visited.failed()) return visited;
     progress_t progress {arguments.progress, arguments.progress_state, compaction_passes_k};
     for (std::size_t pass = 0; pass != compaction_passes_k; ++pass) {
@@ -2063,8 +2057,7 @@ inline status_t read_options(ustore_database_open_nvme_t const& arguments, resou
     }
     compactions = arguments.compactions;
 
-    // Every thread of the executor, its blocking caller included, keeps a channel, and every other thread shares the
-    // rest
+    // Every pool thread and the holding call keep a channel, and every other thread shares the rest
     resources.threads = placement.threads + 1;
     resources.shared_io_channels = engine_shared_io_channels_k;
     ustore_nvme_options_t const& moving = placement.nvme;

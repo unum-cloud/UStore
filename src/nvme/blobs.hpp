@@ -25,6 +25,7 @@
 #include "utilities/batches.hpp"  // `places_of`, `validate_write`, `samples_of`, `sample_generator_t`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `task_window_t`, `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/slices.hpp"   // `for_task_slices`
 
 namespace unum::ustore::nvme {
 
@@ -99,11 +100,13 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
  *      every run of keys of one collection, a missing key reading as a missing value.
  *
  *  Sizes and bytes come from the one stamp the call pinned, so every window has its room in one
- *  block of the arena, and a read of no values reads only the sizes.
+ *  block of the arena, and a read of no values reads only the sizes. Both passes split the batch
+ *  over the threads of @p view's executor, each slice on its thread's channel and epoch slot.
  */
 template <cpu_class_t cpu_class_>
-status_t read_values_batched(call_access<cpu_class_> const& access, ustore_blobs_read_t const& arguments,
-                             place_batch_t const& places, read_outputs_t& outputs) noexcept {
+status_t read_values_batched(call_access<cpu_class_> const& access, view_t const& view,
+                             ustore_blobs_read_t const& arguments, place_batch_t const& places,
+                             read_outputs_t& outputs) noexcept {
     basic_database_of<cpu_class_>& store = *access.state.store;
     std::size_t const count = places.size();
     auto [keys, keys_status] = arena_allocate<stored_key_t>(access.scratch, count);
@@ -112,20 +115,25 @@ status_t read_values_batched(call_access<cpu_class_> const& access, ustore_blobs
     if (windows_status.failed()) return windows_status;
     auto [present, present_status] = arena_allocate<bool>(access.scratch, count);
     if (present_status.failed()) return present_status;
-    std::size_t total = 0;
-    for (std::size_t index = 0; index != count; ++index) {
-        place_t const place = places[index];
-        keys[index] = stored_of(place.key.uuid);
-        stored_value_size_t size = 0;
-        status_t const measured = store.stored_value_size(place.collection, keys[index], size, access.stamp,
-                                                          access.thread_index);
-        if (measured.failed() && measured != status_code_t::not_found_k) return measured;
-        present[index] = measured.succeeded();
-        windows[index] = present[index] ? outputs.window(index, size) : task_window_t {};
-        total += windows[index].length;
-    }
+    auto measure_slice = [&](std::size_t first, std::size_t length, view_t const& slice) noexcept -> status_t {
+        std::size_t const thread_index = thread_index_of(access.state, slice);
+        for (std::size_t index = first; index != first + length; ++index) {
+            place_t const place = places[index];
+            keys[index] = stored_of(place.key.uuid);
+            stored_value_size_t size = 0;
+            status_t const measured = store.stored_value_size(place.collection, keys[index], size, access.stamp,
+                                                              thread_index);
+            if (measured.failed() && measured != status_code_t::not_found_k) return measured;
+            present[index] = measured.succeeded();
+            windows[index] = present[index] ? outputs.window(index, size) : task_window_t {};
+        }
+        return {};
+    };
+    if (status_t const measured = for_task_slices(view, count, measure_slice); measured.failed()) return measured;
 
     if (arguments.values) {
+        std::size_t total = 0;
+        for (std::size_t index = 0; index != count; ++index) total += windows[index].length;
         auto [room, room_status] = arena_allocate<byte_t>(outputs.arena(), total);
         if (room_status.failed()) return room_status;
         auto [rooms, rooms_status] = arena_allocate<byte_t*>(access.scratch, count);
@@ -134,26 +142,34 @@ status_t read_values_batched(call_access<cpu_class_> const& access, ustore_blobs
         if (results_status.failed()) return results_status;
         for (std::size_t index = 0, at = 0; index != count; at += windows[index].length, ++index)
             rooms[index] = room.data() + at;
-        for (std::size_t first = 0; first != count;) {
-            collection_id_t const collection = places[first].collection;
-            std::size_t last = first + 1;
-            while (last != count && places[last].collection == collection) ++last;
-            // Only the bytes of each window land, at their place in its room
-            auto sink = [&, first](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
-                task_window_t const window = windows[first + request];
-                std::uint64_t const begin = std::max<std::uint64_t>(offset, window.offset);
-                std::uint64_t const end = std::min<std::uint64_t>(offset + bytes.size(), window.offset + window.length);
-                if (begin < end)
-                    std::memcpy(rooms[first + request] + (begin - window.offset), bytes.data() + (begin - offset),
-                                static_cast<std::size_t>(end - begin));
-            };
-            if (status_t const read = store.select(collection, keys.subspan(first, last - first),
-                                                   results.subspan(first, last - first), sink, access.stamp,
-                                                   access.thread_index);
-                read.failed())
-                return read;
-            first = last;
-        }
+        auto select_slice = [&](std::size_t begin, std::size_t length, view_t const& slice) noexcept -> status_t {
+            std::size_t const thread_index = thread_index_of(access.state, slice);
+            for (std::size_t first = begin; first != begin + length;) {
+                collection_id_t const collection = places[first].collection;
+                std::size_t last = first + 1;
+                while (last != begin + length && places[last].collection == collection) ++last;
+                // Only the bytes of each window land, at their place in its room
+                auto sink = [&, first](std::size_t request, std::uint64_t offset,
+                                       std::span<byte_t const> bytes) noexcept {
+                    task_window_t const window = windows[first + request];
+                    std::uint64_t const window_begin = std::max<std::uint64_t>(offset, window.offset);
+                    std::uint64_t const window_end = std::min<std::uint64_t>(offset + bytes.size(),
+                                                                             window.offset + window.length);
+                    if (window_begin < window_end)
+                        std::memcpy(rooms[first + request] + (window_begin - window.offset),
+                                    bytes.data() + (window_begin - offset),
+                                    static_cast<std::size_t>(window_end - window_begin));
+                };
+                if (status_t const read = store.select(collection, keys.subspan(first, last - first),
+                                                       results.subspan(first, last - first), sink, access.stamp,
+                                                       thread_index);
+                    read.failed())
+                    return read;
+                first = last;
+            }
+            return {};
+        };
+        if (status_t const read = for_task_slices(view, count, select_slice); read.failed()) return read;
         outputs.adopt(room);
     }
     for (std::size_t index = 0; index != count; ++index)
@@ -176,7 +192,8 @@ status_t read_values(ustore_blobs_read_t const& arguments, view_t const& view) n
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
     if (!access.transaction) {
-        if (status_t const read = read_values_batched(access, arguments, places, outputs); read.failed()) return read;
+        if (status_t const read = read_values_batched(access, view, arguments, places, outputs); read.failed())
+            return read;
         return outputs.finish(arguments);
     }
     for (std::size_t index = 0; index != places.size(); ++index) {
@@ -211,43 +228,60 @@ status_t scan_values(ustore_blobs_scan_t const& arguments, view_t const& view) n
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
+    st::vector<scan_slice_t, arena_allocator<scan_slice_t>> slices {{view.scratch}};
+    if (st::failed(slices.resize(slice_slots(view))))
+        return {status_code_t::out_of_memory_k, "Failed to allocate the slices of a scan"};
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
     call_access<cpu_class_> const access = access_of(state, view);
-    st::vector<stored_key_t, arena_allocator<stored_key_t>> found {{view.scratch}};
-    for (std::size_t task = 0; task != scans.size(); ++task) {
-        scan_task_t const scan = scans[task];
-        outputs.open_task(task);
-        found.clear();
-        stored_key_t const lower = stored_of(scan.keys.lower.uuid);
-        stored_key_t const upper = stored_of(scan.keys.upper.uuid);
-        bool const descending = scan.direction == ustore_scan_descending_k;
-        // An unordered scan walks each run alone outside a transaction, whose own deltas merge only in order
-        status_t collected;
-        if (scan.limit != 0 && arguments.mode == ustore_scan_unordered_k && !access.transaction)
-            collected = collect_keys_unordered(access, scan.collection, lower, upper, scan.limit, found);
-        if (scan.limit != 0 && (arguments.mode != ustore_scan_unordered_k || access.transaction ||
-                                collected == status_code_t::contended_k)) {
+    auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
+        scan_slice_t& sliced = slices[slice.thread_index];
+        sliced = {first_task, length, outputs.slice_in(slice.scratch)};
+        call_access<cpu_class_> const sliced_access {state,         access.transaction, access.schedule,
+                                                     slice.scratch, access.stamp,       thread_index_of(state, slice),
+                                                     access.strings};
+        st::vector<stored_key_t, arena_allocator<stored_key_t>> found {{slice.scratch}};
+        for (std::size_t task = first_task; task != first_task + length; ++task) {
+            scan_task_t const scan = scans[task];
+            sliced.outputs.open_task(task);
             found.clear();
-            collected = descending ? collect_keys_descending(access, scan.collection, lower, upper, scan.limit, found)
-                                   : collect_keys(access, scan.collection, lower, upper, scan.limit, found);
-        }
-        if (collected.failed()) return collected;
-        for (std::size_t index = 0; index != found.size(); ++index)
-            if (status_t const pushed = outputs.push(key_of(found[index])); pushed.failed()) return pushed;
-        if (status_t const watched = watch_keys(access, scan.collection, std::span<stored_key_t const> {found});
-            watched.failed())
-            return watched;
-        // A full page covered the keys up to its last in its direction, a short one the whole range
-        bool const full = found.size() == scan.limit && !found.empty();
-        stored_key_t const watched_lower = full && descending ? found[found.size() - 1] : lower;
-        stored_key_t const watched_upper = full && !descending ? found[found.size() - 1] : upper;
-        if (scan.limit != 0)
-            if (status_t const watched = watch_range(access, scan.collection, watched_lower, watched_upper);
+            stored_key_t const lower = stored_of(scan.keys.lower.uuid);
+            stored_key_t const upper = stored_of(scan.keys.upper.uuid);
+            bool const descending = scan.direction == ustore_scan_descending_k;
+            // Unordered scans walk each run alone, as only a transaction's deltas need the order
+            status_t collected;
+            if (scan.limit != 0 && arguments.mode == ustore_scan_unordered_k && !sliced_access.transaction)
+                collected = collect_keys_unordered(sliced_access, scan.collection, lower, upper, scan.limit, found);
+            if (scan.limit != 0 && (arguments.mode != ustore_scan_unordered_k || sliced_access.transaction ||
+                                    collected == status_code_t::contended_k)) {
+                found.clear();
+                collected = descending ? collect_keys_descending(sliced_access, scan.collection, lower, upper,
+                                                                 scan.limit, found)
+                                       : collect_keys(sliced_access, scan.collection, lower, upper, scan.limit, found);
+            }
+            if (collected.failed()) return collected;
+            for (std::size_t index = 0; index != found.size(); ++index)
+                if (status_t const pushed = sliced.outputs.push(key_of(found[index])); pushed.failed()) return pushed;
+            if (status_t const watched = watch_keys(sliced_access, scan.collection,
+                                                    std::span<stored_key_t const> {found});
                 watched.failed())
                 return watched;
-        if (!progress.advance(1)) return progress_cancelled_k;
-    }
-    return outputs.finish(arguments);
+            // A full page covered the keys up to its last one, and a short page the whole range
+            bool const full = found.size() == scan.limit && !found.empty();
+            stored_key_t const watched_lower = full && descending ? found[found.size() - 1] : lower;
+            stored_key_t const watched_upper = full && !descending ? found[found.size() - 1] : upper;
+            if (scan.limit != 0)
+                if (status_t const watched = watch_range(sliced_access, scan.collection, watched_lower, watched_upper);
+                    watched.failed())
+                    return watched;
+            if (!progress.advance(1)) return progress_cancelled_k;
+        }
+        return {};
+    };
+    // A transaction's reads join its watch set, so only a read at one stamp splits the batch
+    status_t const scanned = access.transaction ? scan_slice(0, scans.size(), view)
+                                                : for_task_slices(view, scans.size(), scan_slice);
+    if (scanned.failed()) return scanned;
+    return outputs.finish(arguments, slices);
 }
 
 /** Implements @c ustore_blobs_scan over the keys of blobs collections alone. */

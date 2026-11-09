@@ -1404,7 +1404,7 @@ mod tests {
     #[test]
     fn verbs_block_or_defer_on_an_executor() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
-        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let executor = Executor::for_ram(&[], 2).unwrap();
         let blocking = database.head().on(&executor);
         let deferred = database.head().deferred(&executor);
         let blobs = created(&database, Modality::Blobs);
@@ -1457,7 +1457,7 @@ mod tests {
     #[test]
     fn a_refused_deferred_call_never_reaches_the_library() {
         let (database, blobs, mut arena) = populated();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         static ONE_ALONE: [CollectionID; 1] = [CollectionID(UUID([0; 16]))];
         let refused = database
             .head()
@@ -1672,7 +1672,7 @@ mod tests {
     #[test]
     fn cursors_read_through_the_snapshot_they_were_opened_at() {
         let (database, blobs, mut arena) = populated();
-        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let executor = Executor::for_ram(&[], 1).unwrap();
         let snapshot = database.snapshot().unwrap();
         let mut cursor = snapshot
             .on(&executor)

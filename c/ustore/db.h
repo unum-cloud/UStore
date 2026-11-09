@@ -312,8 +312,7 @@ typedef struct ustore_database_init_ram_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_device_k The executor computes on a device.
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, or the isolation or the
  *    CPU class is unknown.
  *  - @c ustore_status_unsupported_k The CPU does not run the @c cpu_class.
@@ -354,8 +353,7 @@ typedef struct ustore_database_open_ram_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_device_k The executor computes on a device.
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c directory is empty, the @c database output
  *    is @c NULL, or the isolation or the CPU class is unknown.
  *  - @c ustore_status_unsupported_k The CPU does not run the @c cpu_class.
@@ -392,13 +390,12 @@ typedef struct ustore_database_open_rocksdb_t {
 } ustore_database_open_rocksdb_t;
 
 /**
- *  Serves a directory in place through the RocksDB engine, creating the database when it holds none.
+ *  @brief Serves a directory in place through the RocksDB engine, creating the database if absent.
  *
  *  @par Statuses:
  *  - @c ustore_status_unsupported_k The library was built without the engine.
  *  - @c ustore_status_device_k The executor computes on a device.
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
  *    empty, or the counted @c data_directories are @c NULL or one has an empty path.
  *  - @c ustore_status_not_found_k The directory does not exist.
@@ -444,8 +441,7 @@ typedef struct ustore_database_view_rocksdb_t {
  *  @par Statuses:
  *  - @c ustore_status_unsupported_k The library was built without the engine.
  *  - @c ustore_status_device_k The executor computes on a device.
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
  *    empty, or the counted @c data_directories are @c NULL or one has an empty path.
  *  - @c ustore_status_not_found_k The directory does not exist.
@@ -475,13 +471,12 @@ typedef struct ustore_database_open_leveldb_t {
 } ustore_database_open_leveldb_t;
 
 /**
- *  Serves a directory in place through the LevelDB engine, creating the database when it holds none.
+ *  @brief Serves a directory in place through the LevelDB engine, creating the database if absent.
  *
  *  @par Statuses:
  *  - @c ustore_status_unsupported_k The library was built without the engine.
  *  - @c ustore_status_device_k The executor computes on a device.
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, or the @c directory is
  *    empty.
  *  - @c ustore_status_not_found_k The directory does not exist.
@@ -568,8 +563,7 @@ typedef struct ustore_database_open_nvme_t {
  *
  *  - @c ustore_status_device_k The executor computes on a device, or the @c compactions executor is
  *    no VRAM one.
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
  *    empty or names no @c .ustore.json file nor raw address, the counted @c data_directories are
  *    @c NULL, one has an empty path or a path past the platform's limit, the transport or the CPU
@@ -634,8 +628,7 @@ typedef struct ustore_database_describe_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_invalid_argument_k The @c description output is @c NULL, on the RAM and NVMe
@@ -672,8 +665,7 @@ typedef struct ustore_database_clear_t {
  *  to its holder.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
@@ -719,8 +711,7 @@ typedef struct ustore_database_compact_t {
  *  collections, keeping what it compacted.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
@@ -753,7 +744,7 @@ typedef struct ustore_database_flush_t {
  *  until its compaction lands.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor's deferred table is full.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
@@ -800,8 +791,7 @@ typedef struct ustore_snapshot_init_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_invalid_argument_k The @c snapshot output is @c NULL.
@@ -847,8 +837,7 @@ typedef struct ustore_snapshot_save_t {
  *  reads and then drops from every manifest it publishes.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c snapshot is @c NULL.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_invalid_argument_k The @c path is empty on the NVMe engine, or RocksDB finds a
@@ -996,8 +985,8 @@ typedef struct ustore_collection_list_t {
  *  - @c ustore_status_invalid_argument_k The @c arena or the @c written output is @c NULL, or
  *    the @c snapshot belongs to another engine.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
- *  - @c ustore_status_contended_k The arena serves another call, the executor's deferred table is
- *    full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The arena serves another call, or the executor serves another
+ *    call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A listed collection was dropped meanwhile, on the NVMe engine.
@@ -1047,8 +1036,7 @@ typedef struct ustore_collection_create_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c modality is unknown, the @c name starts with @c _ or
@@ -1117,8 +1105,8 @@ typedef struct ustore_collection_find_t {
  *  - @c ustore_status_invalid_argument_k The @c arena or the @c collections output is @c NULL,
  *    the @c names come in an unknown layout, or the @c snapshot belongs to another engine.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
- *  - @c ustore_status_contended_k The arena serves another call, the executor's deferred table is
- *    full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The arena serves another call, or the executor serves another
+ *    call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  */
@@ -1153,8 +1141,7 @@ typedef struct ustore_collection_drop_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on the
- *    executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
@@ -1200,8 +1187,8 @@ typedef struct ustore_transaction_init_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The transaction reset serves another call, the executor's deferred
- *    table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The transaction reset serves another call, or the executor serves
+ *    another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine has no
@@ -1249,8 +1236,8 @@ typedef struct ustore_transaction_stage_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The transaction serves another call, the executor's deferred table
- *    is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The transaction serves another call, or the executor serves
+ *    another call.
  *  - @c ustore_status_uninitialized_k The @c database or the @c transaction is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine has no
@@ -1301,8 +1288,8 @@ typedef struct ustore_transaction_commit_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The transaction serves another call, the executor's deferred table
- *    is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The transaction serves another call, or the executor serves
+ *    another call.
  *  - @c ustore_status_uninitialized_k The @c database or the @c transaction is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine has no
@@ -1347,8 +1334,8 @@ typedef struct ustore_transaction_rollback_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The transaction serves another call, the executor's deferred table
- *    is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The transaction serves another call, or the executor serves
+ *    another call.
  *  - @c ustore_status_uninitialized_k The @c database or the @c transaction is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine has no
@@ -1432,8 +1419,7 @@ typedef struct ustore_changes_cursor_init_t {
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
- *  - @c ustore_status_contended_k The executor's deferred table is full, or a callback blocks on
- *    the executor running it.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_unsupported_k The executor computes on a device, or the engine keeps no
  *    stamps, as LevelDB does.
@@ -1496,8 +1482,8 @@ typedef struct ustore_changes_cursor_next_t {
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or an output is @c NULL.
  *  - @c ustore_status_device_k The arena lives where another executor computes.
- *  - @c ustore_status_contended_k The arena or the cursor serves another call, the executor's
- *    deferred table is full, or a callback blocks on the executor running it.
+ *  - @c ustore_status_contended_k The arena or the cursor serves another call, or the executor
+ *    serves another call.
  *  - @c ustore_status_not_found_k The collection was dropped meanwhile.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.

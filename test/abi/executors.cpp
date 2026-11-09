@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date November 1, 2026
  *  @brief Checks the arena, outcome and executor contracts of the C ABI: where outputs land, how
- *      deferred calls wait on each other, and how the C++ receivers dispatch on an executor.
+ *      an executor serves one call at a time, and how the C++ receivers dispatch on an executor.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -33,6 +33,7 @@
 #include "abi/fixture.hpp" // `held_scan_t`, `submit_held`, `release_held`, `spawn_executor`, `round_trip`, `edge_of`
 #include "engine.hpp"      // `ustore_database_handle_t`
 #include "harness.hpp"     // `suite_exit_code`, `expect`, `expect_failure`, `expect_status`, `spin_until`
+#include "utilities/slices.hpp" // `tasks_per_word_k`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -125,7 +126,7 @@ std::size_t arena_failed_outputs_null(config_t const& config) {
     auto [blobs, blobs_status] = create_collection(database, "arena_failed_outputs_null.blobs",
                                                    ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
     auto [arena, arena_status] = arena_t::make(executor);
@@ -782,7 +783,7 @@ std::size_t executor_deferred_round_trip(config_t const& config) {
     auto [blobs, blobs_status] = create_collection(database, "executor_deferred_round_trip.blobs",
                                                    ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
     auto [executor_arena, executor_arena_status] = arena_t::make(executor);
@@ -824,123 +825,98 @@ std::size_t executor_deferred_round_trip(config_t const& config) {
     return failures;
 }
 
-/** A deferred call runs from the copy its submission took, so the caller may scribble
- *  over its argument struct at once and the library never writes it back, while polling
- *  through @c ustore_outcome_status reads the call deferred until it is final. */
-std::size_t executor_copied_submission(config_t const& config) {
+/** A deferred call runs from the copy its submission took, so the caller may scribble over its
+ *  argument struct at once and the library never writes it back, while polling through
+ *  @c ustore_outcome_status reads the call deferred until it is final. */
+std::size_t executor_copied_submission(config_t const&) {
     std::size_t failures = 0;
-    auto [database, open_status] = open_database<database_t>(config);
-    failures += expect(open_status.succeeded());
-    if (failures != 0) return failures;
-    auto [blobs, blobs_status] = create_collection(database, "executor_copied_submission.blobs",
-                                                   ustore_modality_blobs_k);
-    failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
-    auto [arena, arena_status] = arena_t::make(executor);
-    failures += expect(arena_status.succeeded());
 
-    std::array<ustore_key_t, 3> const keys {key_from_integer(400), key_from_integer(401), key_from_integer(402)};
-    failures += write_text(database, blobs, keys, "value");
-
-    // The read waits behind the held scan, so it cannot run before its struct is scribbled over
+    // The scan holds inside its callback, so it is still running when its struct is scribbled over
     held_scan_t held;
     failures += submit_held(held, executor);
-    read_columns_t columns;
-    ustore_outcome_t outcome {};
-    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
-    read.executor = executor;
-    read.completion = ustore_completion_deferred_k;
-    ustore_blobs_read(&read);
-    std::memset(&read, 0xA5, sizeof(read));
-    failures += expect(ustore_outcome_status(&outcome) == ustore_status_deferred_k);
-
+    std::memset(&held.scan, 0xA5, sizeof(held.scan));
+    failures += expect(ustore_outcome_status(&held.outcome) == ustore_status_deferred_k);
     failures += release_held(held);
+    auto const* const scribbled = reinterpret_cast<unsigned char const*>(&held.scan);
     failures += expect(
-        spin_until([&outcome]() noexcept { return ustore_outcome_status(&outcome) != ustore_status_deferred_k; }));
-    failures += expect(ustore_outcome_status(&outcome) == ustore_status_success_k);
-    failures += expect(columns.presences && tape_written(columns.values));
-    if (columns.presences && tape_written(columns.values)) {
-        failures += expect_eq(columns.presences[0], 0b111);
-        for (std::size_t index = 0; index != keys.size(); ++index) failures += expect_eq(columns.value(index), "value");
-    }
-    auto const* const scribbled = reinterpret_cast<unsigned char const*>(&read);
-    failures += expect(
-        std::all_of(scribbled, scribbled + sizeof(read), [](unsigned char byte) { return byte == 0xA5; }));
+        std::all_of(scribbled, scribbled + sizeof(held.scan), [](unsigned char byte) { return byte == 0xA5; }));
     ustore_executor_free(executor);
     return failures;
 }
 
-/** What a thread freeing an arena saw of the deferred call holding it once the free returned. */
+/** Writes @c stored_value_k under @p key in @p collection as a blocking call on @p executor,
+ *  answering the call's status. */
+ustore_status_t write_blocking(ustore_database_t database, ustore_collection_id_t const& collection,
+                               ustore_key_t const& key, ustore_executor_t executor) noexcept {
+    ustore_outcome_t outcome {};
+    ustore_blobs_write_t write {};
+    write.database = database;
+    write.executor = executor;
+    write.outcome = &outcome;
+    write.count = 1;
+    write.collections = {&collection, 0};
+    write.keys = {&key, 0};
+    write.values = stored_values_k.view();
+    ustore_blobs_write(&write);
+    return outcome.status;
+}
+
+/** What a thread freeing an arena saw of the held call naming it once the free returned. */
 struct arena_freeing_t {
-    ustore_arena_t arena = nullptr;
-    ustore_outcome_t* outcome = nullptr;
-    ustore_status_t status_after_free = ustore_status_deferred_k;
+    arena_t arena;
+    hold_stage_t const* stage = nullptr;
+    hold_stage_t stage_after_free = hold_stage_t::submitted_k;
     std::uint32_t freed = 0;
 };
 
-/** Frees the arena of @p freeing, then records the status of the call that held it. */
+/** Frees the arena of @p freeing, then records how far the call naming it got. */
 void free_arena(arena_freeing_t& freeing) noexcept {
-    ustore_arena_free(freeing.arena);
-    freeing.status_after_free = ustore_outcome_status(freeing.outcome);
+    { arena_t const freed = std::move(freeing.arena); }
+    freeing.stage_after_free = fu::standard_atomic_ref<hold_stage_t const> {*freeing.stage}.load(
+        std::memory_order_acquire);
     fu::standard_atomic_ref<std::uint32_t> {freeing.freed}.store(1, std::memory_order_release);
 }
 
-/** Freeing an arena waits until the deferred call holding it is final, here a read held behind
- *  an unfinished call. */
-std::size_t arena_free_waits(config_t const& config) {
+/** Freeing an arena waits until the call naming it ends, here a scan held inside its callback,
+ *  which has returned by then. Its status may turn final only after the free, as a call lowers its
+ *  counts before it stores the status. */
+std::size_t arena_free_waits(config_t const&) {
     std::size_t failures = 0;
-    auto [database, open_status] = open_database<database_t>(config);
-    failures += expect(open_status.succeeded());
-    if (failures != 0) return failures;
-    auto [blobs, blobs_status] = create_collection(database, "arena_free_waits.blobs", ustore_modality_blobs_k);
-    failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     st::expected<executor_t> freeing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
     failures += expect(spawn_status.succeeded() && freeing_thread.has_value());
     if (failures != 0) return failures;
 
-    ustore_key_t const key = key_from_integer(600);
-    failures += write_text(database, blobs, {&key, 1}, "value");
-    ustore_arena_t arena = nullptr;
-    ustore_outcome_t outcome {};
-    ustore_arena_init_t init {.arena = &arena, .executor = executor, .outcome = &outcome};
-    ustore_arena_init(&init);
-    failures += expect_success(outcome);
-
     held_scan_t held;
     failures += submit_held(held, executor);
-    read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
-    read.executor = executor;
-    read.completion = ustore_completion_deferred_k;
-    ustore_blobs_read(&read);
-
-    arena_freeing_t freeing {.arena = arena, .outcome = &outcome};
+    arena_freeing_t freeing {.arena = std::move(held.arena), .stage = &held.stage};
     st::expected<fu_generation_t> const generation = freeing_thread->start<&free_arena>(freeing);
     failures += expect(generation.has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     failures += expect(fu::standard_atomic_ref<std::uint32_t> {freeing.freed}.load(std::memory_order_acquire) == 0);
 
-    failures += release_held(held);
+    fu::standard_atomic_ref<hold_stage_t> {held.stage}.store(hold_stage_t::released_k, std::memory_order_release);
     if (generation) freeing_thread->join(*generation);
     else free_arena(freeing);
-    failures += expect(freeing.status_after_free == ustore_status_success_k);
+    failures += expect(freeing.stage_after_free == hold_stage_t::returned_k);
+    failures += expect(ustore_outcome_wait(&held.outcome) == ustore_status_success_k);
     ustore_executor_free(executor);
     return failures;
 }
 
-/** A deferred call finding the deferred table full finishes contended at once, and a drain from
- *  inside a callback its own executor runs answers contended rather than waiting on itself. */
-std::size_t executor_full_table(config_t const& config) {
+/** A call on an executor another call holds finishes contended at once, deferred or blocking, and a
+ *  drain from inside a callback of the holding call is refused rather than waiting. */
+std::size_t executor_held_contended(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    auto [blobs, blobs_status] = create_collection(database, "executor_full_table.blobs", ustore_modality_blobs_k);
+    auto [blobs, blobs_status] = create_collection(database, "executor_held_contended.blobs", ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(1);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
 
@@ -950,23 +926,62 @@ std::size_t executor_full_table(config_t const& config) {
     ustore_outcome_t outcome {};
     submit_writes(database, blobs, executor, {&key, 1}, {&outcome, 1});
     failures += expect_status(outcome, status_code_t::contended_k);
+    failures += expect(write_blocking(database, blobs, key, executor) == ustore_status_contended_k);
     failures += expect(held.drained == ustore_status_contended_k);
     failures += release_held(held);
+    failures += expect(write_blocking(database, blobs, key, executor) == ustore_status_success_k);
     ustore_executor_free(executor);
     return failures;
 }
 
-/** A blocking call on an executor runs after every deferred call submitted before it, so it
- *  sees their writes. */
-std::size_t executor_blocking_after_deferred(config_t const& config) {
+/** Runs the blocking scan @p held is armed with on the calling thread, which its callback holds. */
+void scan_blocking(held_scan_t& held) noexcept { ustore_blobs_scan(&held.scan); }
+
+/** A blocking call holds its executor from its caller's thread, so a call from another thread
+ *  finishes contended until the holder returns, after which the executor serves it. */
+std::size_t executor_contended_from_another_thread(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    auto [blobs, blobs_status] = create_collection(database, "executor_blocking_after_deferred.blobs",
+    auto [blobs, blobs_status] = create_collection(database, "executor_contended_from_another_thread.blobs",
+                                                   ustore_modality_blobs_k);
+    auto [executor, spawn_status] = spawn_executor();
+    st::expected<executor_t> holding_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
+    failures += expect(blobs_status.succeeded() && spawn_status.succeeded() && holding_thread.has_value());
+    if (failures != 0) return failures;
+
+    held_scan_t held;
+    failures += arm_held(held, executor, nullptr, ustore_completion_blocking_k);
+    st::expected<fu_generation_t> const generation = holding_thread->start<&scan_blocking>(held);
+    failures += expect(generation.has_value());
+    if (failures != 0) return failures;
+    failures += wait_held(held);
+    ustore_key_t const key = key_from_integer(1300);
+    ustore_outcome_t outcome {};
+    submit_writes(database, blobs, executor, {&key, 1}, {&outcome, 1});
+    failures += expect_status(outcome, status_code_t::contended_k);
+    failures += expect(held.drained == ustore_status_contended_k);
+    fu::standard_atomic_ref<hold_stage_t> {held.stage}.store(hold_stage_t::released_k, std::memory_order_release);
+    holding_thread->join(*generation);
+    failures += expect_success(held.outcome);
+    submit_writes(database, blobs, executor, {&key, 1}, {&outcome, 1});
+    failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+    ustore_executor_free(executor);
+    return failures;
+}
+
+/** A deferred call on a caller-exclusive executor finishes while its caller only polls its status,
+ *  as the executor's thread 0 serves it, and a blocking call afterwards sees what it wrote. */
+std::size_t executor_finishes_by_polling(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_finishes_by_polling.blobs",
                                                    ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
     auto [arena, arena_status] = arena_t::make(executor);
@@ -984,6 +999,9 @@ std::size_t executor_blocking_after_deferred(config_t const& config) {
     write.keys = {keys.data(), sizeof(ustore_key_t)};
     write.values = stored_values_k.view();
     ustore_blobs_write(&write);
+    failures += expect(
+        spin_until([&written]() noexcept { return ustore_outcome_status(&written) != ustore_status_deferred_k; }));
+    failures += expect_success(written);
 
     read_columns_t columns;
     ustore_outcome_t outcome {};
@@ -992,14 +1010,12 @@ std::size_t executor_blocking_after_deferred(config_t const& config) {
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(columns.presences && columns.presences[0] == 0b111);
-    failures += expect_success(written);
     ustore_executor_free(executor);
     return failures;
 }
 
-/** A caller that sees a deferred call final may submit the next one at once, even to a table of one
- *  slot and naming the same arena, since the driver frees the table position and the claim before
- *  it finishes the outcome. */
+/** A caller that sees a deferred call final may submit the next one at once, naming the same arena,
+ *  since a call releases its arena and its executor before its status turns final. */
 std::size_t executor_submit_after_wait(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -1008,7 +1024,7 @@ std::size_t executor_submit_after_wait(config_t const& config) {
     auto [blobs, blobs_status] = create_collection(database, "executor_submit_after_wait.blobs",
                                                    ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(1);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
     auto [arena, arena_status] = arena_t::make(executor);
@@ -1035,7 +1051,8 @@ std::size_t executor_submit_after_wait(config_t const& config) {
     return failures;
 }
 
-/** A drain returns once every call submitted before it is final, without waiting on any of them. */
+/** A drain waits for the call holding the executor, then applies its mood: after a parked drain the
+ *  next call wakes the threads, and after a spinning one it runs at once. */
 std::size_t executor_drain(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -1043,175 +1060,58 @@ std::size_t executor_drain(config_t const& config) {
     if (failures != 0) return failures;
     auto [blobs, blobs_status] = create_collection(database, "executor_drain.blobs", ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
 
-    std::array<ustore_key_t, 4> const keys {key_from_integer(78), key_from_integer(79), key_from_integer(80),
-                                            key_from_integer(81)};
-    std::array<ustore_outcome_t, 4> outcomes {};
-    submit_writes(database, blobs, executor, keys, outcomes);
-
     ustore_outcome_t outcome {};
-    ustore_executor_drain_t drain {.executor = executor, .outcome = &outcome, .mood = ustore_mood_spinning_k};
-    ustore_executor_drain(&drain);
-    failures += expect_success(outcome);
-    for (ustore_outcome_t& written : outcomes) failures += expect_success(written);
-    drain.mood = ustore_mood_parked_k;
-    ustore_executor_drain(&drain);
-    failures += expect_success(outcome);
-    ustore_executor_free(executor);
-    return failures;
-}
-
-/** A call naming an arena that an unfinished deferred call holds finishes contended, and succeeds
- *  once it is final. */
-std::size_t executor_contended_arena(config_t const& config) {
-    std::size_t failures = 0;
-    auto [database, open_status] = open_database<database_t>(config);
-    failures += expect(open_status.succeeded());
-    if (failures != 0) return failures;
-    auto [blobs, blobs_status] = create_collection(database, "executor_contended_arena.blobs", ustore_modality_blobs_k);
-    failures += expect(blobs_status.succeeded());
-    auto [executor, spawn_status] = spawn_executor(0);
-    failures += expect(spawn_status.succeeded());
-    if (failures != 0) return failures;
-    auto [arena, arena_status] = arena_t::make(executor);
-    failures += expect(arena_status.succeeded());
-
-    ustore_key_t const key = key_from_integer(82);
-    failures += write_text(database, blobs, {&key, 1}, "value");
-    held_scan_t held;
-    failures += submit_held(held, executor);
-    read_columns_t deferred_columns;
-    ustore_outcome_t deferred_outcome {};
-    ustore_blobs_read_t deferred_read = read_of(database, blobs, {&key, 1}, deferred_columns, arena, deferred_outcome);
-    deferred_read.executor = executor;
-    deferred_read.completion = ustore_completion_deferred_k;
-    ustore_blobs_read(&deferred_read);
-
-    read_columns_t columns;
-    ustore_outcome_t outcome {};
-    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
-    ustore_blobs_read(&read);
-    failures += expect_status(outcome, status_code_t::contended_k);
-
-    failures += release_held(held);
-    failures += expect(ustore_outcome_wait(&deferred_outcome) == ustore_status_success_k);
-    ustore_blobs_read(&read);
-    failures += expect_success(outcome);
-    failures += expect(tape_written(columns.values) && columns.value(0) == "value");
-    ustore_executor_free(executor);
-    return failures;
-}
-
-/** A deferred scan keeps its arena claimed until its outcome is final, so while a held scan of the
- *  same batch delays that outcome, a call on the arena keeps finishing contended. */
-std::size_t executor_claim_held_until_final(config_t const&) {
-    std::size_t failures = 0;
-    auto [executor, spawn_status] = spawn_executor(0);
-    failures += expect(spawn_status.succeeded());
-    if (failures != 0) return failures;
-    auto [arena, arena_status] = arena_t::make(executor);
-    failures += expect(arena_status.succeeded());
-    if (failures != 0) return failures;
-
-    // Both scans wait behind the first held one, so they run as one batch once it is released
-    held_scan_t first;
-    failures += submit_held(first, executor);
-    held_scan_t second;
-    auto [second_arena, second_arena_status] = arena_t::make(executor);
-    failures += expect(second_arena_status.succeeded());
-    if (failures != 0) return failures;
-    second.arena = std::move(second_arena);
-    second.executor = executor;
-    second.scan = first.scan;
-    second.scan.database = &second.database;
-    second.scan.outcome = &second.outcome;
-    second.scan.arena = second.arena;
-    second.scan.progress_state = &second;
-
-    ustore_outcome_t quick_outcome {};
-    ustore_blobs_scan_t quick = first.scan;
-    quick.outcome = &quick_outcome;
-    quick.arena = arena;
-    quick.progress = nullptr;
-    quick.progress_state = nullptr;
-    ustore_blobs_scan(&quick);
-    ustore_blobs_scan(&second.scan);
-    failures += release_held(first);
-    fu::standard_atomic_ref<hold_stage_t> const second_stage {second.stage};
-    failures += expect(spin_until([&second_stage]() noexcept {
-        return second_stage.load(std::memory_order_acquire) == hold_stage_t::entered_k;
-    }));
-
-    ustore_outcome_t outcome {};
-    ustore_blobs_scan_t blocking = quick;
-    blocking.executor = nullptr;
-    blocking.outcome = &outcome;
-    std::size_t taken_early = 0;
-    for (std::size_t round = 0; round != 200 && !taken_early; ++round) {
-        ustore_blobs_scan(&blocking);
-        taken_early += outcome.status != ustore_status_contended_k &&
-                       ustore_outcome_status(&quick_outcome) == ustore_status_deferred_k;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ustore_executor_drain_t drain {.executor = executor, .outcome = &outcome};
+    for (ustore_mood_t const mood : {ustore_mood_parked_k, ustore_mood_spinning_k, ustore_mood_parked_k}) {
+        ustore_key_t const key = key_from_integer(78 + mood);
+        ustore_outcome_t written {};
+        submit_writes(database, blobs, executor, {&key, 1}, {&written, 1});
+        drain.mood = mood;
+        ustore_executor_drain(&drain);
+        failures += expect_success(outcome);
+        failures += expect(ustore_outcome_wait(&written) == ustore_status_success_k);
     }
-    failures += expect_eq(taken_early, 0u);
-
-    failures += release_held(second);
-    failures += expect(ustore_outcome_wait(&quick_outcome) == ustore_status_success_k);
-    ustore_blobs_scan(&blocking);
-    failures += expect_success(outcome);
     ustore_executor_free(executor);
     return failures;
 }
 
-/** A call on a transaction that an unfinished deferred call reads through finishes contended, and
- *  succeeds once it finishes. */
-case_result_t executor_contended_transaction(config_t const& config) {
+/** A call naming an arena an unfinished call holds finishes contended, and so does one on a
+ *  transaction it reads through, each on the calling thread, until the holding call ends. */
+std::size_t executor_contended_arena(config_t const&) {
     std::size_t failures = 0;
-    auto [database, open_status] = open_database<database_t>(config);
-    failures += expect(open_status.succeeded());
-    if (failures != 0) return failures;
-    auto [blobs, blobs_status] = create_collection(database, "executor_contended_transaction.blobs",
-                                                   ustore_modality_blobs_k);
-    failures += expect(blobs_status.succeeded());
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
-    auto [arena, arena_status] = arena_t::make(executor);
-    failures += expect(arena_status.succeeded());
 
-    expected<transaction_t> transaction = database.transaction();
-    failures += expect(transaction.has_value());
-    if (failures != 0) return failures;
     held_scan_t held;
-    failures += submit_held(held, executor);
-    ustore_key_t const key = key_from_integer(83);
-    read_columns_t columns;
-    ustore_outcome_t deferred_outcome {};
-    ustore_blobs_read_t deferred_read = read_of(database, blobs, {&key, 1}, columns, arena, deferred_outcome);
-    deferred_read.executor = executor;
-    deferred_read.completion = ustore_completion_deferred_k;
-    deferred_read.view = ustore_transaction_view(transaction->transaction(), ustore_watch_keys_k);
-    ustore_blobs_read(&deferred_read);
-
+    ustore_transaction_handle_t transaction {.engine = &progress_engine_k, .database = &held.database};
+    failures += submit_held(held, executor, ustore_transaction_view(&transaction, ustore_watch_keys_k));
     ustore_outcome_t outcome {};
-    ustore_blobs_write_t write {};
-    write.database = database;
-    write.outcome = &outcome;
-    write.transaction = transaction->transaction();
-    write.count = 1;
-    write.collections = {&blobs, 0};
-    write.keys = {&key, 0};
-    write.values = stored_values_k.view();
-    ustore_blobs_write(&write);
+    ustore_blobs_scan_t on_arena = held.scan;
+    on_arena.executor = nullptr;
+    on_arena.view = nullptr;
+    on_arena.outcome = &outcome;
+    on_arena.progress = nullptr;
+    on_arena.progress_state = nullptr;
+    ustore_blobs_scan(&on_arena);
+    failures += expect_status(outcome, status_code_t::contended_k);
+    ustore_blobs_scan_t on_transaction = on_arena;
+    on_transaction.arena = nullptr;
+    on_transaction.view = ustore_transaction_view(&transaction, ustore_watch_keys_k);
+    auto [own_arena, own_arena_status] = arena_t::make();
+    failures += expect(own_arena_status.succeeded());
+    on_transaction.arena = own_arena;
+    ustore_blobs_scan(&on_transaction);
     failures += expect_status(outcome, status_code_t::contended_k);
 
     failures += release_held(held);
-    failures += expect(ustore_outcome_wait(&deferred_outcome) == ustore_status_success_k);
-    ustore_blobs_write(&write);
+    ustore_blobs_scan(&on_arena);
+    failures += expect_success(outcome);
+    ustore_blobs_scan(&on_transaction);
     failures += expect_success(outcome);
     ustore_executor_free(executor);
     return failures;
@@ -1247,7 +1147,7 @@ struct lender_loop_t {
 };
 
 /** Dispatches on the lender's pool until every write of @p lending is final, counting the
- *  dispatches the pool refused while it ran a borrower's batch. */
+ *  dispatches the pool refused while it ran a borrower's call. */
 void lend_until_finished(lender_loop_t& lending) noexcept {
     fu::standard_atomic_ref<std::size_t> const finished {lending.writes_finished};
     do {
@@ -1260,9 +1160,11 @@ void lend_until_finished(lender_loop_t& lending) noexcept {
     } while (finished.load(std::memory_order_acquire) != lending.writes_expected);
 }
 
-/** A borrowed pool finishes every deferred call while its lender's dispatch holds it, running them
- *  on the driver, and while its lender keeps dispatching on it from another thread; once the
- *  executor is freed, the lender dispatches alone. */
+/** A borrowed pool runs a deferred call at submission, as its lender keeps its dispatches and
+ *  joins, and a call that forks nothing succeeds while the lender's dispatch holds the pool, while
+ *  one splitting its batch is refused rather than forking over the lender. While the lender keeps
+ *  dispatching from another thread, every write lands once retried past a refusal, and once the
+ *  executor is freed the lender dispatches on its pool alone again. */
 std::size_t executor_on_pool(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -1282,36 +1184,44 @@ std::size_t executor_on_pool(config_t const& config) {
     failures += expect_success(outcome);
     if (failures != 0) return failures;
 
-    // Both lender threads sit inside one dispatch, so every batch of the borrower is
-    // refused the pool
     lender_hold_t hold;
     st::expected<fu_generation_t> const holding = lender->start<&hold_lender_thread>(hold);
     failures += expect(holding.has_value());
     if (failures != 0) return failures;
     fu::standard_atomic_ref<std::size_t> const entered {hold.entered};
     failures += expect(spin_until([&entered]() noexcept { return entered.load(std::memory_order_acquire) == 2; }));
-    std::array<ustore_key_t, 8> held_keys {};
-    std::array<ustore_outcome_t, 8> held_outcomes {};
-    for (std::size_t index = 0; index != held_keys.size(); ++index) held_keys[index] = key_from_integer(700 + index);
-    submit_writes(database, blobs, executor, held_keys, held_outcomes);
-    for (ustore_outcome_t& written : held_outcomes)
-        failures += expect(ustore_outcome_wait(&written) == ustore_status_success_k);
+    ustore_key_t const held_key = key_from_integer(700);
+    ustore_outcome_t written {};
+    submit_writes(database, blobs, executor, {&held_key, 1}, {&written, 1});
+    failures += expect_success(written);
+    failures += expect(write_blocking(database, blobs, held_key, executor) == ustore_status_success_k);
+    std::array<ustore_key_t, 2 * tasks_per_word_k> sliced_keys {};
+    for (std::size_t index = 0; index != sliced_keys.size(); ++index) sliced_keys[index] = key_from_integer(index);
+    auto [sliced_arena, sliced_arena_status] = arena_t::make(executor);
+    failures += expect(sliced_arena_status.succeeded());
+    read_columns_t sliced_columns;
+    ustore_blobs_read_t sliced = read_of(database, blobs, sliced_keys, sliced_columns, sliced_arena, outcome);
+    sliced.executor = executor;
+    ustore_blobs_read(&sliced);
+    failures += expect_status(outcome, status_code_t::contended_k);
     fu::standard_atomic_ref<std::uint32_t> {hold.released}.store(1, std::memory_order_release);
     lender->join(*holding);
 
-    // The lender dispatches over and over from a thread of its own while the borrower's writes
-    // come and go
     constexpr std::size_t writes_k = 64;
     lender_loop_t lending {.pool = *lender, .writes_expected = writes_k};
     st::expected<fu_generation_t> const looping = lending_thread->start<&lend_until_finished>(lending);
     failures += expect(looping.has_value());
     if (failures != 0) return failures;
     std::array<ustore_key_t, writes_k> keys {};
-    std::array<ustore_outcome_t, writes_k> outcomes {};
-    for (std::size_t index = 0; index != writes_k; ++index) keys[index] = key_from_integer(100 + index);
-    submit_writes(database, blobs, executor, keys, outcomes);
-    for (ustore_outcome_t& written : outcomes) {
-        failures += expect(ustore_outcome_wait(&written) == ustore_status_success_k);
+    for (std::size_t index = 0; index != writes_k; ++index) {
+        keys[index] = key_from_integer(100 + index);
+        ustore_status_t status = ustore_status_contended_k;
+        while (status == ustore_status_contended_k) {
+            ustore_outcome_t written {};
+            submit_writes(database, blobs, executor, {&keys[index], 1}, {&written, 1});
+            status = ustore_outcome_wait(&written);
+        }
+        failures += expect(status == ustore_status_success_k);
         fu::standard_atomic_ref<std::size_t> {lending.writes_finished}.add(1, std::memory_order_release);
     }
     lending_thread->join(*looping);
@@ -1376,7 +1286,7 @@ std::size_t executor_arena_on_device(config_t const&) {
  *  its callback returns. */
 std::size_t outcome_wait_blocks(config_t const&) {
     std::size_t failures = 0;
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
 
@@ -1390,11 +1300,11 @@ std::size_t outcome_wait_blocks(config_t const&) {
     return failures;
 }
 
-/** Freeing a database waits for the deferred call naming it, past the moment
- *  its callback returns. */
+/** Freeing a database waits for the deferred call naming it, past the moment its callback returns,
+ *  though the status of that call may turn final after the free, as it lowers its counts first. */
 std::size_t database_free_waits(config_t const&) {
     std::size_t failures = 0;
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
 
@@ -1406,18 +1316,18 @@ std::size_t database_free_waits(config_t const&) {
     // free stops waiting
     held.database.holds = 2;
     ustore_database_free(&held.database);
-    failures += expect(ustore_outcome_status(&held.outcome) == ustore_status_success_k);
     failures += expect(stage.load(std::memory_order_acquire) == hold_stage_t::returned_k);
+    failures += expect(ustore_outcome_wait(&held.outcome) == ustore_status_success_k);
     ustore_executor_free(executor);
     return failures;
 }
 
 /** An init runs on an executor as every call does: a blocking one returns with the database open,
- *  and a deferred one submitted behind an unfinished call runs from its copy and writes the
- *  database before its outcome is final. */
+ *  and a deferred one runs from its copy, whose original died with the frame that built it, and
+ *  writes the database before its outcome is final. */
 case_result_t database_init_on_executor(config_t const& config) {
     std::size_t failures = 0;
-    auto [executor, spawn_status] = spawn_executor(0);
+    auto [executor, spawn_status] = spawn_executor();
     auto [arena, arena_status] = arena_t::make();
     failures += expect(spawn_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
@@ -1434,14 +1344,8 @@ case_result_t database_init_on_executor(config_t const& config) {
     if (database) failures += write_text(database, blobs, {&key, 1}, "value");
     ustore_database_free(database);
 
-    // The init waits behind the held scan, so it runs only after its struct died with the frame
-    // that built it
-    held_scan_t held;
-    failures += submit_held(held, executor);
     database = nullptr;
     open_engine(config.options(), &database, &outcome, executor, ustore_completion_deferred_k);
-    failures += expect(ustore_outcome_status(&outcome) == ustore_status_deferred_k);
-    failures += release_held(held);
     failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
     failures += expect(database != nullptr);
     if (database) {
@@ -1456,12 +1360,366 @@ case_result_t database_init_on_executor(config_t const& config) {
     return failures;
 }
 
+/** A read of more keys than one word of tasks, and a scan of as many tasks, split over the
+ *  executor's threads, blocking or deferred, and match byte for byte what the same calls hand back
+ *  on the calling thread. */
+std::size_t executor_sliced_read(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_sliced_read.blobs", ustore_modality_blobs_k);
+    auto [executor, spawn_status] = spawn_executor();
+    failures += expect(blobs_status.succeeded() && spawn_status.succeeded());
+    if (failures != 0) return failures;
+
+    constexpr std::size_t keys_k = 300;
+    std::array<ustore_key_t, keys_k> keys {};
+    for (std::size_t index = 0; index != keys_k; ++index) {
+        keys[index] = key_from_integer(5000 + index);
+        if (index % 3 == 0) continue;
+        std::array<char, 32> text {};
+        std::size_t const length = fmt::format_to_n(text.data(), text.size(), "value-{}", index).size;
+        failures += write_text(database, blobs, {&keys[index], 1}, {text.data(), length});
+    }
+
+    auto [alone_arena, alone_arena_status] = arena_t::make();
+    failures += expect(alone_arena_status.succeeded());
+    read_columns_t alone;
+    ustore_outcome_t outcome {};
+    ustore_blobs_read_t read = read_of(database, blobs, keys, alone, alone_arena, outcome);
+    ustore_blobs_read(&read);
+    failures += expect_success(outcome);
+    if (failures != 0) return failures;
+
+    for (ustore_completion_t const completion : {ustore_completion_blocking_k, ustore_completion_deferred_k}) {
+        auto [arena, arena_status] = arena_t::make(executor);
+        failures += expect(arena_status.succeeded());
+        read_columns_t sliced;
+        ustore_blobs_read_t on_executor = read_of(database, blobs, keys, sliced, arena, outcome);
+        on_executor.executor = executor;
+        on_executor.completion = completion;
+        ustore_blobs_read(&on_executor);
+        failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+        if (!sliced.presences || !tape_written(sliced.values)) {
+            failures += expect(false);
+            continue;
+        }
+        failures += expect(std::memcmp(alone.presences, sliced.presences, (keys_k + 7) / 8) == 0);
+        for (std::size_t index = 0; index != keys_k; ++index)
+            failures += expect_eq(sliced.value(index), alone.value(index));
+    }
+
+    // One scan task per key, each listing the next two keys from it, through the same split
+    ustore_length_t const* alone_offsets = nullptr;
+    ustore_key_t const* alone_keys = nullptr;
+    ustore_blobs_scan_t scan {.database = database,
+                              .outcome = &outcome,
+                              .count = keys_k,
+                              .collections = {&blobs, 0},
+                              .start_keys = {keys.data(), sizeof(ustore_key_t)},
+                              .offsets = &alone_offsets,
+                              .keys = &alone_keys,
+                              .arena = alone_arena,
+                              .wanted = 2};
+    ustore_blobs_scan(&scan);
+    failures += expect_success(outcome);
+    for (ustore_completion_t const completion : {ustore_completion_blocking_k, ustore_completion_deferred_k}) {
+        auto [arena, arena_status] = arena_t::make(executor);
+        failures += expect(arena_status.succeeded());
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* found = nullptr;
+        ustore_blobs_scan_t on_executor = scan;
+        on_executor.executor = executor, on_executor.completion = completion;
+        on_executor.offsets = &offsets, on_executor.keys = &found, on_executor.arena = arena;
+        ustore_blobs_scan(&on_executor);
+        failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+        if (!offsets || !alone_offsets) {
+            failures += expect(false);
+            continue;
+        }
+        failures += expect(std::memcmp(offsets, alone_offsets, (keys_k + 1) * sizeof(ustore_length_t)) == 0);
+        failures += expect(std::memcmp(found, alone_keys, alone_offsets[keys_k] * sizeof(ustore_key_t)) == 0);
+    }
+    ustore_executor_free(executor);
+    return failures;
+}
+
+/** A read of one field and a gather of one column over more documents than one word of tasks
+ *  split over the executor's threads and match byte for byte what they hand back without one. */
+std::size_t executor_sliced_docs(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto [docs, docs_status] = create_collection(database, "executor_sliced_docs.docs", ustore_modality_docs_k);
+    auto [executor, spawn_status] = spawn_executor();
+    failures += expect(docs_status.succeeded() && spawn_status.succeeded());
+    if (failures != 0) return failures;
+
+    // Every third key holds no document, so presences and validities both have gaps
+    constexpr std::size_t docs_k = 200;
+    std::array<ustore_key_t, docs_k> keys {};
+    std::array<ustore_key_t, docs_k> written_keys {};
+    std::array<char, docs_k * 16> texts {};
+    std::array<std::uint32_t, docs_k + 1> offsets {};
+    std::size_t written = 0;
+    for (std::size_t index = 0; index != docs_k; ++index) {
+        keys[index] = key_from_integer(7000 + index);
+        if (index % 3 == 0) continue;
+        written_keys[written] = keys[index];
+        std::size_t const length = fmt::format_to_n(texts.data() + offsets[written], 16, "{{\"age\":{}}}", index).size;
+        offsets[written + 1] = static_cast<std::uint32_t>(offsets[written] + length);
+        ++written;
+    }
+    ustore_outcome_t outcome {};
+    ustore_docs_write_t write {.database = database,
+                               .outcome = &outcome,
+                               .count = written,
+                               .collections = {&docs, 0},
+                               .keys = {written_keys.data(), sizeof(ustore_key_t)},
+                               .values = u32_tape(texts.data(), offsets.data())};
+    ustore_docs_write(&write);
+    failures += expect_success(outcome);
+
+    char const age[] = "age";
+    std::array<std::uint32_t, docs_k + 1> field_offsets {};
+    std::array<char, docs_k * 3> field_texts {};
+    for (std::size_t index = 0; index != docs_k; ++index) {
+        std::memcpy(field_texts.data() + 3 * index, age, 3);
+        field_offsets[index + 1] = static_cast<std::uint32_t>(3 * (index + 1));
+    }
+    ustore_docs_field_type_t const i32_type = ustore_docs_field_type_i32_k;
+    struct docs_outputs_t {
+        ustore_octet_t const* presences = nullptr;
+        ustore_strings_view_t values {};
+        ustore_docs_column_view_t const* columns = nullptr;
+    };
+    auto read_and_gather = [&](ustore_executor_t on, ustore_completion_t completion, ustore_arena_t read_arena,
+                               ustore_arena_t gather_arena, docs_outputs_t& outputs) {
+        ustore_docs_read_t read {.database = database,
+                                 .executor = on,
+                                 .outcome = &outcome,
+                                 .completion = completion,
+                                 .count = docs_k,
+                                 .collections = {&docs, 0},
+                                 .keys = {keys.data(), sizeof(ustore_key_t)},
+                                 .fields = u32_tape(field_texts.data(), field_offsets.data()),
+                                 .presences = &outputs.presences,
+                                 .values = &outputs.values,
+                                 .arena = read_arena,
+                                 .outputs_type = ustore_docs_field_type_string_k};
+        ustore_docs_read(&read);
+        std::size_t checked = expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+        ustore_docs_gather_t gather {.database = database,
+                                     .executor = on,
+                                     .outcome = &outcome,
+                                     .completion = completion,
+                                     .count = docs_k,
+                                     .collections = {&docs, 0},
+                                     .keys = {keys.data(), sizeof(ustore_key_t)},
+                                     .fields_count = 1,
+                                     .fields = u32_tape(field_texts.data(), field_offsets.data()),
+                                     .columns = &outputs.columns,
+                                     .arena = gather_arena,
+                                     .outputs_types = &i32_type};
+        ustore_docs_gather(&gather);
+        return checked + expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+    };
+
+    auto [alone_read_arena, alone_read_status] = arena_t::make();
+    auto [alone_gather_arena, alone_gather_status] = arena_t::make();
+    failures += expect(alone_read_status.succeeded() && alone_gather_status.succeeded());
+    docs_outputs_t alone;
+    failures += read_and_gather(nullptr, ustore_completion_blocking_k, alone_read_arena, alone_gather_arena, alone);
+    if (failures != 0 || !alone.presences || !alone.columns) return failures + expect(false);
+    for (ustore_completion_t const completion : {ustore_completion_blocking_k, ustore_completion_deferred_k}) {
+        auto [read_arena, read_status] = arena_t::make(executor);
+        auto [gather_arena, gather_status] = arena_t::make(executor);
+        failures += expect(read_status.succeeded() && gather_status.succeeded());
+        docs_outputs_t sliced;
+        failures += read_and_gather(executor, completion, read_arena, gather_arena, sliced);
+        if (!sliced.presences || !sliced.columns) {
+            failures += expect(false);
+            continue;
+        }
+        failures += expect(std::memcmp(alone.presences, sliced.presences, (docs_k + 7) / 8) == 0);
+        for (std::size_t index = 0; index != docs_k; ++index)
+            failures += expect_eq(string_of(tape_string(sliced.values, index)),
+                                  string_of(tape_string(alone.values, index)));
+        failures += expect(std::memcmp(alone.columns[0].validities, sliced.columns[0].validities, (docs_k + 7) / 8) ==
+                           0);
+        failures += expect(
+            std::memcmp(alone.columns[0].scalars, sliced.columns[0].scalars, docs_k * sizeof(std::int32_t)) == 0);
+    }
+    ustore_executor_free(executor);
+    return failures;
+}
+
+/** A read of the edges of more vertices than one word of tasks splits over the executor's threads
+ *  and matches byte for byte the degrees, offsets and edges it hands back without one. */
+case_result_t executor_sliced_graph(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto [graph, graph_status] = create_collection(database, "executor_sliced_graph.graph", ustore_modality_graph_k);
+    auto [executor, spawn_status] = spawn_executor();
+    failures += expect(graph_status.succeeded() && spawn_status.succeeded());
+    if (failures != 0) return failures;
+
+    // A chain over the even vertices: each odd one is missing and each even one has two neighbors
+    constexpr std::size_t vertices_k = 300;
+    std::array<ustore_key_t, vertices_k> vertices {};
+    std::array<ustore_key_t, vertices_k> sources {}, targets {};
+    std::size_t edges = 0;
+    for (std::size_t index = 0; index != vertices_k; ++index) {
+        vertices[index] = key_from_integer(9000 + index);
+        if (index % 2 != 0 || index + 2 >= vertices_k) continue;
+        sources[edges] = key_from_integer(9000 + index), targets[edges] = key_from_integer(9000 + index + 2);
+        ++edges;
+    }
+    ustore_outcome_t outcome {};
+    ustore_graph_write_edges_t write {.database = database,
+                                      .outcome = &outcome,
+                                      .count = edges,
+                                      .collections = {&graph, 0},
+                                      .sources = {sources.data(), sizeof(ustore_key_t)},
+                                      .targets = {targets.data(), sizeof(ustore_key_t)}};
+    ustore_graph_write_edges(&write);
+    failures += expect_success(outcome);
+
+    struct edges_outputs_t {
+        ustore_vertex_degree_t const* degrees = nullptr;
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* edges = nullptr;
+    };
+    auto read_edges = [&](ustore_executor_t on, ustore_completion_t completion, ustore_arena_t arena,
+                          edges_outputs_t& outputs) {
+        ustore_graph_read_edges_t read {.database = database,
+                                        .executor = on,
+                                        .outcome = &outcome,
+                                        .completion = completion,
+                                        .count = vertices_k,
+                                        .collections = {&graph, 0},
+                                        .vertices = {vertices.data(), sizeof(ustore_key_t)},
+                                        .degrees_per_vertex = &outputs.degrees,
+                                        .edges_offsets = &outputs.offsets,
+                                        .edges_per_vertex = &outputs.edges,
+                                        .arena = arena};
+        ustore_graph_read_edges(&read);
+        return expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+    };
+    auto [alone_arena, alone_arena_status] = arena_t::make();
+    failures += expect(alone_arena_status.succeeded());
+    edges_outputs_t alone;
+    failures += read_edges(nullptr, ustore_completion_blocking_k, alone_arena, alone);
+    if (failures != 0 || !alone.offsets) return failures + expect(false);
+    for (ustore_completion_t const completion : {ustore_completion_blocking_k, ustore_completion_deferred_k}) {
+        auto [arena, arena_status] = arena_t::make(executor);
+        failures += expect(arena_status.succeeded());
+        edges_outputs_t sliced;
+        failures += read_edges(executor, completion, arena, sliced);
+        if (!sliced.offsets) {
+            failures += expect(false);
+            continue;
+        }
+        failures += expect(std::memcmp(alone.degrees, sliced.degrees, vertices_k * sizeof(ustore_vertex_degree_t)) ==
+                           0);
+        failures += expect(std::memcmp(alone.offsets, sliced.offsets, (vertices_k + 1) * sizeof(ustore_length_t)) == 0);
+        failures += expect(
+            std::memcmp(alone.edges, sliced.edges, 3 * alone.offsets[vertices_k] * sizeof(ustore_key_t)) == 0);
+    }
+    ustore_executor_free(executor);
+    return failures;
+}
+
+/** A scan of more prefixes than one word of tasks splits over the executor's threads and matches
+ *  byte for byte the offsets and strings it hands back without one. */
+case_result_t executor_sliced_strings(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto [words, words_status] = create_collection(database, "executor_sliced_strings.words",
+                                                   ustore_modality_strings_k);
+    auto [executor, spawn_status] = spawn_executor();
+    failures += expect(words_status.succeeded() && spawn_status.succeeded());
+    if (failures != 0) return failures;
+
+    // Strings w000 to w299, and per task the prefix naming its tens, so the pages of tasks overlap
+    constexpr std::size_t strings_k = 300;
+    std::array<char, strings_k * 4> texts {};
+    std::array<std::uint32_t, strings_k + 1> offsets {};
+    std::array<ustore_key_t, strings_k> keys {};
+    for (std::size_t index = 0; index != strings_k; ++index) {
+        fmt::format_to_n(texts.data() + 4 * index, 4, "w{:03}", index);
+        offsets[index + 1] = static_cast<std::uint32_t>(4 * (index + 1));
+        keys[index] = key_from_integer(11000 + index);
+    }
+    ustore_outcome_t outcome {};
+    ustore_strings_write_t write {.database = database,
+                                  .outcome = &outcome,
+                                  .count = strings_k,
+                                  .collections = {&words, 0},
+                                  .strings = u32_tape(texts.data(), offsets.data()),
+                                  .values = {keys.data(), sizeof(ustore_key_t)}};
+    ustore_strings_write(&write);
+    failures += expect_success(outcome);
+
+    ustore_length_t const* alone_offsets = nullptr;
+    ustore_strings_view_t alone_strings {};
+    auto [alone_arena, alone_arena_status] = arena_t::make();
+    failures += expect(alone_arena_status.succeeded());
+    // Each task's prefix is the first three bytes of one string, as one tape over the stored texts
+    std::array<char, strings_k * 3> prefixes {};
+    std::array<std::uint32_t, strings_k + 1> prefixes_offsets {};
+    for (std::size_t index = 0; index != strings_k; ++index) {
+        std::memcpy(prefixes.data() + 3 * index, texts.data() + 4 * index, 3);
+        prefixes_offsets[index + 1] = static_cast<std::uint32_t>(3 * (index + 1));
+    }
+    ustore_strings_scan_t scan {.database = database,
+                                .outcome = &outcome,
+                                .count = strings_k,
+                                .collections = {&words, 0},
+                                .prefixes = u32_tape(prefixes.data(), prefixes_offsets.data()),
+                                .offsets = &alone_offsets,
+                                .strings = &alone_strings,
+                                .arena = alone_arena,
+                                .wanted = 4};
+    ustore_strings_scan(&scan);
+    failures += expect_success(outcome);
+    if (failures != 0 || !alone_offsets) return failures + expect(false);
+    for (ustore_completion_t const completion : {ustore_completion_blocking_k, ustore_completion_deferred_k}) {
+        auto [arena, arena_status] = arena_t::make(executor);
+        failures += expect(arena_status.succeeded());
+        ustore_length_t const* sliced_offsets = nullptr;
+        ustore_strings_view_t sliced_strings {};
+        ustore_strings_scan_t on_executor = scan;
+        on_executor.executor = executor, on_executor.completion = completion, on_executor.arena = arena;
+        on_executor.offsets = &sliced_offsets, on_executor.strings = &sliced_strings;
+        ustore_strings_scan(&on_executor);
+        failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+        if (!sliced_offsets) {
+            failures += expect(false);
+            continue;
+        }
+        failures += expect(std::memcmp(alone_offsets, sliced_offsets, (strings_k + 1) * sizeof(ustore_length_t)) == 0);
+        failures += expect(sliced_strings.layout == alone_strings.layout);
+        for (std::size_t index = 0; index != alone_offsets[strings_k]; ++index)
+            failures += expect_eq(string_of(tape_string(sliced_strings, index)),
+                                  string_of(tape_string(alone_strings, index)));
+    }
+    ustore_executor_free(executor);
+    return failures;
+}
+
 #pragma endregion Deferred Calls
 
 #pragma region Placement
 
 /** A RAM executor refuses a memory domain the machine lacks, leaving its output null, as does one
- *  borrowing a pool, and keeps every arena it makes on the first domain it serves. */
+ *  borrowing a pool, and keeps every arena it makes on the domain of its thread 0. */
 std::size_t executor_memory_domains(config_t const&) {
     std::size_t failures = 0;
     st::expected<topology_t> topology = topology_t::make();
@@ -1741,9 +1999,8 @@ case_result_t executor_deferred_strings(config_t const& config) {
     return failures;
 }
 
-/** A database opened blocking on an executor keeps a write, and a deferred init submitted
- *  behind an unfinished call stays deferred until that call finishes, then opens the database
- *  holding that write. */
+/** A database opened blocking on an executor keeps a write, and a deferred init stays deferred
+ *  until thread 0 serves it, then opens the database holding that write. */
 case_result_t executor_deferred_open(config_t const& config) {
     if (!config.directory()) return case_result_t::skipped(needs_directory_k);
     std::size_t failures = 0;
@@ -1764,14 +2021,9 @@ case_result_t executor_deferred_open(config_t const& config) {
         failures += expect(head[key].assign("opened").succeeded());
     }
 
-    // The init waits behind the held scan, so it stays deferred until the scan is released
-    held_scan_t held;
-    failures += submit_held(held, executor);
     ustore_database_t reopened = nullptr;
     ustore_outcome_t outcome {};
     open_engine(config.options(), &reopened, &outcome, executor, ustore_completion_deferred_k);
-    failures += expect(ustore_outcome_status(&outcome) == ustore_status_deferred_k);
-    failures += release_held(held);
     ustore_outcome_wait(&outcome);
     failures += expect_success(outcome);
     if (failures != 0) return failures;
@@ -1782,52 +2034,33 @@ case_result_t executor_deferred_open(config_t const& config) {
     return failures;
 }
 
-/** A deferred call finding the deferred table full finishes contended at once, and so does a
- *  call on a transaction that an unfinished deferred call reads through; both succeed once
- *  the executor drains. */
+/** A deferred receiver call on an executor another call holds finishes contended at once, and
+ *  succeeds once the holding call is final. */
 std::size_t executor_contended(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    auto [narrow, narrow_status] = executor_handle_t::for_ram({.threads = 2, .deferred_limit = 1});
-    failures += expect(narrow_status.succeeded());
+    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
+    failures += expect(executor_status.succeeded());
     if (failures != 0) return failures;
 
-    auto [arena, arena_status] = arena_t::make(narrow);
+    auto [arena, arena_status] = arena_t::make(executor);
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
     std::array<ustore_key_t, 1> const keys {key_from_integer(77)};
     auto [head, head_status] = database["blobs"];
     failures += expect(head_status.succeeded());
-    deferred_database_t const deferred_database = database.deferred(narrow);
+    deferred_database_t const deferred_database = database.deferred(executor);
     deferred_blobs_collection_t collection = deferred_database[head];
     held_scan_t held;
-    failures += submit_held(held, narrow);
+    failures += submit_held(held, executor);
     deferred<blobs_read_t> refused = collection.read(keys, arena);
     failures += expect(refused.status() == status_code_t::contended_k);
     failures += expect_status(std::move(refused).wait(), status_code_t::contended_k);
     failures += release_held(held);
-    failures += expect(narrow.drain().succeeded());
+    failures += expect(executor.drain().succeeded());
     failures += expect(collection.read(keys, arena).wait().has_value());
-    if (!database.supports_transactions()) return failures;
-
-    auto [wide, wide_status] = executor_handle_t::for_ram({.threads = 2});
-    failures += expect(wide_status.succeeded());
-    if (failures != 0) return failures;
-    auto [wide_arena, wide_arena_status] = arena_t::make(wide);
-    failures += expect(wide_arena_status.succeeded());
-    if (failures != 0) return failures;
-    transaction_t transaction = *database.transaction();
-    held_scan_t held_again;
-    failures += submit_held(held_again, wide);
-    blobs_collection_t inside {transaction.receiver(), head};
-    deferred<blobs_read_t> reading = deferred_blobs_collection_t {transaction.receiver().on(wide), head}.read(
-        keys, wide_arena);
-    failures += expect_status(inside.at(keys[0]).assign("value"), status_code_t::contended_k);
-    failures += release_held(held_again);
-    failures += expect(std::move(reading).wait().has_value());
-    failures += expect(inside.at(keys[0]).assign("value").succeeded());
     return failures;
 }
 
@@ -1855,18 +2088,21 @@ int main(int argc, char** argv) {
     report(totals, "arena.free_waits", arena_free_waits, config);
     report(totals, "executor.deferred_round_trip", executor_deferred_round_trip, config);
     report(totals, "executor.copied_submission", executor_copied_submission, config);
-    report(totals, "executor.full_table", executor_full_table, config);
-    report(totals, "executor.blocking_after_deferred", executor_blocking_after_deferred, config);
+    report(totals, "executor.held_contended", executor_held_contended, config);
+    report(totals, "executor.contended_from_another_thread", executor_contended_from_another_thread, config);
+    report(totals, "executor.finishes_by_polling", executor_finishes_by_polling, config);
     report(totals, "executor.submit_after_wait", executor_submit_after_wait, config);
     report(totals, "executor.drain", executor_drain, config);
     report(totals, "executor.contended_arena", executor_contended_arena, config);
-    report(totals, "executor.claim_held_until_final", executor_claim_held_until_final, config);
-    report(totals, "executor.contended_transaction", executor_contended_transaction, config);
     report(totals, "executor.on_pool", executor_on_pool, config);
     report(totals, "executor.arena_on_device", executor_arena_on_device, config);
     report(totals, "outcome.wait_blocks", outcome_wait_blocks, config);
     report(totals, "database.free_waits", database_free_waits, config);
     report(totals, "database.init_on_executor", database_init_on_executor, config);
+    report(totals, "executor.sliced_read", executor_sliced_read, config);
+    report(totals, "executor.sliced_docs", executor_sliced_docs, config);
+    report(totals, "executor.sliced_graph", executor_sliced_graph, config);
+    report(totals, "executor.sliced_strings", executor_sliced_strings, config);
     report(totals, "executor.memory_domains", executor_memory_domains, config);
     report(totals, "executor.on_receivers", executor_on_receivers, config);
     report(totals, "executor.deferred_commit", executor_deferred_commit, config);

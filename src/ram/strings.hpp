@@ -22,6 +22,7 @@
 #include "utilities/batches.hpp"  // `strings_arg_t`, `validate_choices`, `validate_direction`, `samples_of`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/slices.hpp"   // `for_task_slices`
 
 namespace unum::ustore::ram {
 
@@ -94,18 +95,28 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_rea
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
 
-    store_status_t const read = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(source, collections, arguments.count, outcome,
-                            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
-                                                        std::size_t end) noexcept -> store_status_t {
-                                using entry_t = entry_of<entries_type_>;
-                                if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
-                                else {
-                                    auto store = source.view(entries);
-                                    if (!store) return store.status();
-                                    return read_strings(*store, texts, first, end, outputs);
-                                }
-                            });
+    store_status_t const read = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
+        auto read_slice = [&](std::size_t first_task, std::size_t length, view_t const&) noexcept -> status_t {
+            status_t sliced;
+            store_status_t const runs = for_each_run(
+                source, collections + static_cast<std::ptrdiff_t>(first_task), length, sliced,
+                [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                            std::size_t end) noexcept -> store_status_t {
+                    using entry_t = entry_of<entries_type_>;
+                    if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(sliced);
+                    else {
+                        auto store = source.view(entries);
+                        if (!store) return store.status();
+                        return read_strings(*store, texts, first_task + first, first_task + end, outputs);
+                    }
+                });
+            return reported(runs, sliced);
+        };
+        // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
+        if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
+            outcome = for_task_slices(view, arguments.count, read_slice);
+        else outcome = read_slice(0, arguments.count, view);
+        return store_status_t::success_k;
     });
     if (status_t const status = reported(read, outcome); status.failed()) return status;
     outputs.finish(arguments);
@@ -124,36 +135,56 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_sca
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
+    st::vector<strings_scan_slice_t, arena_allocator<strings_scan_slice_t>> slices {{view.scratch}};
+    if (st::failed(slices.resize(slice_slots(view))))
+        return {status_code_t::out_of_memory_k, "Failed to allocate the slices of a scan"};
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
 
     status_t outcome;
-    store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(source, collections, arguments.count, outcome,
-                            [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
-                                                        std::size_t end) noexcept -> store_status_t {
-                                using entry_t = entry_of<entries_type_>;
-                                if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
-                                else {
-                                    auto store = source.view(entries);
-                                    if (!store) return store.status();
-                                    for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
-                                        strings_window_t const window {
-                                            .prefix = prefixes ? string_of(prefixes[task]) : std::string_view {},
-                                            .start = starts ? string_of(starts[task]) : std::string_view {},
-                                            .end = ends ? string_of(ends[task]) : std::string_view {},
-                                            .direction = arguments.direction,
-                                        };
-                                        outputs.open_task(task);
-                                        store_status_t const scanned = scan_strings(*store, window, arguments.wanted,
-                                                                                    view.scratch, outputs, outcome);
-                                        if (st::failed(scanned) || outcome.failed()) return scanned;
-                                        if (!progress.advance(1)) outcome = progress_cancelled_k;
-                                    }
-                                    return store_status_t::success_k;
-                                }
-                            });
+    store_status_t const walked = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
+        auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
+            strings_scan_slice_t& sliced = slices[slice.thread_index];
+            sliced = {first_task, length, outputs.slice_in(slice.scratch)};
+            status_t slice_outcome;
+            store_status_t const runs = for_each_run(
+                source, collections + static_cast<std::ptrdiff_t>(first_task), length, slice_outcome,
+                [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                            std::size_t end) noexcept -> store_status_t {
+                    using entry_t = entry_of<entries_type_>;
+                    if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(slice_outcome);
+                    else {
+                        auto store = source.view(entries);
+                        if (!store) return store.status();
+                        for (std::size_t task = first_task + first; task != first_task + end; ++task) {
+                            strings_window_t const window {
+                                .prefix = prefixes ? string_of(prefixes[task]) : std::string_view {},
+                                .start = starts ? string_of(starts[task]) : std::string_view {},
+                                .end = ends ? string_of(ends[task]) : std::string_view {},
+                                .direction = arguments.direction,
+                            };
+                            sliced.outputs.open_task(task);
+                            store_status_t const scanned = scan_strings(*store, window, arguments.wanted, slice.scratch,
+                                                                        sliced.outputs, slice_outcome);
+                            if (st::failed(scanned) || slice_outcome.failed()) return scanned;
+                            if (progress.advance(1)) continue;
+                            slice_outcome = progress_cancelled_k;
+                            break;
+                        }
+                        return store_status_t::success_k;
+                    }
+                });
+            return reported(runs, slice_outcome);
+        };
+        // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
+        if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
+            outcome = for_task_slices(view, arguments.count, scan_slice);
+        else outcome = scan_slice(0, arguments.count, view);
+        return store_status_t::success_k;
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
+    for (strings_scan_slice_t const& slice : slices)
+        if (status_t const adopted = outputs.adopt(slice.outputs, slice.first, slice.length); adopted.failed())
+            return adopted;
     return outputs.finish(arguments);
 }
 
