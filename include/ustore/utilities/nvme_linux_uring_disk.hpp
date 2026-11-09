@@ -68,7 +68,7 @@ struct linux_uring_disk_config_t {
     /** Requests one queue pair may keep in flight, which is the credit a queue pair spends and polls back. */
     queue_depth_t depth_limit = 64;
 
-    /** Memory ranges the disk pins at once, which every ring keeps a table slot for. */
+    /** Buffer table slots each ring keeps, one per started gibibyte of every range. */
     std::uint16_t registered_memory_limit = 8;
 
     /** Targets the disk registers at once, which a directory of sorted runs raises above one. */
@@ -100,6 +100,9 @@ enum class range_pinning_t : std::uint8_t {
     /** The pin exceeded the locked-memory cap, so a request carries its pointer and the kernel pins per request. */
     unpinned_k,
 };
+
+/** The largest buffer io_uring pins in one table slot, refusing a longer one with @c EFAULT. */
+inline constexpr std::uint64_t linux_uring_registered_range_bytes_k = 1024ull * 1024ull * 1024ull;
 
 #pragma endregion Configuration
 
@@ -446,17 +449,27 @@ class linux_uring_files_disk {
      *
      *  @note The kernel learns of the range on each ring's own thread, at the next submission there, so a
      *      registration never races the thread entering the ring.
+     *  @note A range longer than the kernel pins in one slot claims a run of slots, one per started
+     *      gibibyte; the first carries the range and the rest stay empty under it.
      */
     expected<registered_memory_t> register_memory(std::span<byte_t> memory, memory_space_t space) noexcept {
         if (memory.empty()) return status_t {status_code_t::invalid_argument_k, "An empty range registers nothing"};
         if (space == memory_space_t::gpu_k)
             return status_t {status_code_t::unsupported_k, "This transport cannot address device memory"};
-        for (std::size_t index = 0; index != registered_memories_.size(); ++index) {
-            registered_memory_slot_t& slot = registered_memories_[index];
-            std::int32_t expected_free = 0;
-            if (!claim_(slot.registered)
-                     .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
+        std::size_t const pieces = divide_round_up(memory.size(), linux_uring_registered_range_bytes_k);
+        for (std::size_t index = 0; index + pieces <= registered_memories_.size(); ++index) {
+            std::size_t claimed = 0;
+            for (std::int32_t expected_free = 0; claimed != pieces; ++claimed, expected_free = 0)
+                if (!claim_(registered_memories_[index + claimed].registered)
+                         .compare_exchange_strong(expected_free, 1, std::memory_order_acquire,
+                                                  std::memory_order_relaxed))
+                    break;
+            if (claimed != pieces) {
+                while (claimed != 0)
+                    claim_(registered_memories_[index + --claimed].registered).store(0, std::memory_order_release);
                 continue;
+            }
+            registered_memory_slot_t& slot = registered_memories_[index];
             slot.base = memory.data();
             slot.length = memory.size();
             slot.space = space;
@@ -476,6 +489,11 @@ class linux_uring_files_disk {
         if (!slot) return {status_code_t::invalid_argument_k, "The registered_memory is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
             return {status_code_t::invalid_argument_k, "The range is still a medium of requests in flight"};
+        std::size_t const pieces = divide_round_up(slot->length, linux_uring_registered_range_bytes_k);
+        for (std::size_t piece = 1; piece != pieces; ++piece) {
+            ++slot[piece].generation;
+            claim_(slot[piece].registered).store(0, std::memory_order_release);
+        }
         ++slot->generation;
         slot->base = nullptr;
         slot->length = 0;
@@ -1113,17 +1131,27 @@ class linux_uring_files_disk {
      *
      *  The kernel charges every ring for every range, so the cap is met after a few rings; the first
      *  refusal at an epoch is remembered and later rings skip the attempt, which would pin and unpin
-     *  the whole arena only to be refused again.
+     *  the whole arena only to be refused again. A range pins as one gibibyte per slot of its run.
      */
     expected<range_pinning_t> pin_ranges_(ring_t& ring, std::size_t seat, std::int32_t registered_memories) noexcept {
         if (epoch_(pin_refused_epoch_).load(std::memory_order_acquire) == registered_memories)
             return range_pinning_t::unpinned_k;
         ::iovec* const vectors = &vectors_[seat * registered_memories_limit_];
-        for (std::size_t index = 0; index != registered_memories_limit_; ++index) {
+        for (std::size_t index = 0; index != registered_memories_limit_;) {
             registered_memory_slot_t& slot = registered_memories_[index];
             bool const live = claim_(slot.registered).load(std::memory_order_acquire) != 0;
-            vectors[index].iov_base = live ? slot.base : nullptr;
-            vectors[index].iov_len = live ? static_cast<std::size_t>(slot.length) : 0;
+            byte_t* base = live ? slot.base : nullptr;
+            std::uint64_t left = live ? slot.length : 0;
+            do {
+                std::uint64_t const piece = left < linux_uring_registered_range_bytes_k
+                                                ? left
+                                                : linux_uring_registered_range_bytes_k;
+                vectors[index].iov_base = piece != 0 ? base : nullptr;
+                vectors[index].iov_len = static_cast<std::size_t>(piece);
+                base += piece;
+                left -= piece;
+                ++index;
+            } while (left != 0 && index != registered_memories_limit_);
         }
         linux_uring_rsrc_update2_t update {};
         update.nr = registered_memories_limit_;
@@ -1358,10 +1386,15 @@ class linux_uring_files_disk {
         entry.off = request.extent.offset;
         entry.addr = reinterpret_cast<std::uint64_t>(memory->base + request.buffer.offset);
         entry.len = static_cast<std::uint32_t>(request.extent.length);
-        switch (pinning) {
+        std::uint64_t const piece = request.buffer.offset / linux_uring_registered_range_bytes_k;
+        bool const across = request.buffer.offset % linux_uring_registered_range_bytes_k + request.extent.length >
+                            linux_uring_registered_range_bytes_k;
+        // A request across a gibibyte boundary spans two table slots, which no fixed transfer names
+        range_pinning_t const addressed = across ? range_pinning_t::unpinned_k : pinning;
+        switch (addressed) {
         case range_pinning_t::pinned_k:
             entry.opcode = request.kind == request_kind_t::read_k ? read_pinned : write_pinned;
-            entry.buf_index = static_cast<std::uint16_t>(request.buffer.memory_id);
+            entry.buf_index = static_cast<std::uint16_t>(static_cast<std::uint64_t>(request.buffer.memory_id) + piece);
             return;
         case range_pinning_t::unpinned_k:
             entry.opcode = request.kind == request_kind_t::read_k ? read_unpinned : write_unpinned;
@@ -1471,7 +1504,7 @@ class linux_uring_files_disk {
     /** Leases the disk hands out at once, which is also the number of rings it holds. */
     std::uint16_t queue_pairs_limit_ = 0;
 
-    /** Memory ranges the disk records at once, and the width of every ring's buffer table. */
+    /** Slots for ranges, one per started gibibyte of each, and every ring's buffer table width. */
     std::uint16_t registered_memories_limit_ = 0;
 
     /** Targets the disk opens at once, and the width of every ring's file table. */

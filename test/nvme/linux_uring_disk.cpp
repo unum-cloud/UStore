@@ -20,10 +20,11 @@
 #include <cstdio>  // `std::fopen`, `std::fscanf`, `std::fclose`
 #include <cstring> // `std::strrchr`
 
-#include <fcntl.h>       // `AT_EMPTY_PATH`
-#include <linux/stat.h>  // `struct statx`, `STATX_DIOALIGN`
-#include <sys/syscall.h> // `__NR_statx`
-#include <unistd.h>      // `syscall`
+#include <fcntl.h>        // `AT_EMPTY_PATH`
+#include <linux/stat.h>   // `struct statx`, `STATX_DIOALIGN`
+#include <sys/resource.h> // `getrlimit`, `RLIMIT_MEMLOCK`
+#include <sys/syscall.h>  // `__NR_statx`
+#include <unistd.h>       // `syscall`
 
 #include <array>       // `std::array`
 #include <span>        // `std::span`
@@ -309,6 +310,53 @@ std::size_t uring_reports_the_alignment_statx_reports(linux_uring_files_disk_t& 
     return failures;
 }
 
+/** A range past one gibibyte pins as a run of table slots: a transfer inside the second slot moves
+ *  through it, and one across the boundary moves unpinned. */
+std::size_t uring_pins_a_range_past_a_gibibyte(linux_uring_files_disk_t& disk, medium_reference_t medium) {
+    std::size_t const boundary = linux_uring_registered_range_bytes_k;
+    return on_queue_pair(
+        disk, boundary + 2 * block_bytes_k,
+        [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t> buffer) {
+            std::size_t failures = 0;
+            test_buffer_t expected = make_buffer(2 * block_bytes_k);
+            paint(whole(expected), 3);
+            std::span<byte_t> const across = buffer.subspan(boundary - block_bytes_k, 2 * block_bytes_k);
+            paint(across, 3);
+
+            std::array<completion_t, polling_room_k> completions {};
+            auto const moved_in_full = [&](std::array<request_t, 2> const& batch) {
+                std::size_t moved_failures = expect(disk.submit(queue_pair, std::span<request_t const> {batch}) ==
+                                                    std::size_t {2});
+                moved_failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair,
+                                                                             std::span<completion_t> {completions},
+                                                                             2) == std::size_t {2});
+                moved_failures += expect(completions[0].completed_in_full() && completions[1].completed_in_full());
+                return moved_failures;
+            };
+            failures += moved_in_full({
+                write_request(medium, extent_t {block_bytes_k, 2 * block_bytes_k},
+                              registered_memory.reference(boundary - block_bytes_k), queue_pair.token(0)),
+                write_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(boundary),
+                              queue_pair.token(1)),
+            });
+            std::memset(buffer.data() + boundary - block_bytes_k, 0, 3 * block_bytes_k);
+            failures += moved_in_full({
+                read_request(medium, extent_t {block_bytes_k, 2 * block_bytes_k},
+                             registered_memory.reference(boundary - block_bytes_k), queue_pair.token(2)),
+                read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(boundary + block_bytes_k),
+                             queue_pair.token(3)),
+            });
+            failures += expect(std::memcmp(across.data(), expected.data(), 2 * block_bytes_k) == 0);
+            failures += expect(std::memcmp(buffer.data() + boundary + block_bytes_k, expected.data() + block_bytes_k,
+                                           block_bytes_k) == 0);
+
+            struct rlimit locked {};
+            if (::getrlimit(RLIMIT_MEMLOCK, &locked) == 0 && locked.rlim_cur == RLIM_INFINITY)
+                failures += expect(disk.pinning() == range_pinning_t::pinned_k);
+            return failures;
+        });
+}
+
 /** Both file transports report the medium behind a block device, which @c fstat alone sizes at zero. */
 std::size_t device_reports_its_capacity(std::string_view device) {
     std::size_t failures = 0;
@@ -376,6 +424,7 @@ void uring_transport(suite_totals_t& totals, char const* directory) {
         report(totals, "linux-uring.cancel_completions", uring_counts_completions_after_a_cancel, *disk, medium);
         report(totals, "linux-uring.narrow_poll_window", uring_polls_through_a_narrow_window, *disk, medium);
         report(totals, "linux-uring.overflowed_queue", uring_polls_an_overflowed_queue, *disk, medium);
+        report(totals, "linux-uring.range_past_a_gibibyte", uring_pins_a_range_past_a_gibibyte, *disk, medium);
         report(totals, "linux-uring.alignment_matches_statx", uring_reports_the_alignment_statx_reports, *disk,
                path.c_str());
     });

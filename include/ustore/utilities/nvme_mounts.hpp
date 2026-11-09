@@ -172,17 +172,23 @@ inline expected<volume_addresses_t> addresses_of(resources_config_t const& confi
 #if USTORE_OS_WINDOWS_
 
 /** Leaves the descriptor limit alone, which Windows does not impose on handles. */
-inline void raise_open_files_limit() noexcept {}
+inline std::size_t raise_open_files_limit() noexcept { return std::numeric_limits<std::size_t>::max(); }
 
 #else
 
 /** Raises the soft limit on open descriptors to the hard one, since a directory volume keeps a file
- *  open per run. */
-inline void raise_open_files_limit() noexcept {
+ *  open per run, and answers the descriptors the process may now hold. */
+inline std::size_t raise_open_files_limit() noexcept {
     struct rlimit limit {};
-    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur == limit.rlim_max) return;
-    limit.rlim_cur = limit.rlim_max;
-    [[maybe_unused]] int const raised = ::setrlimit(RLIMIT_NOFILE, &limit);
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) return std::numeric_limits<std::size_t>::max();
+    if (limit.rlim_cur != limit.rlim_max) {
+        rlim_t const soft = limit.rlim_cur;
+        limit.rlim_cur = limit.rlim_max;
+        if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) limit.rlim_cur = soft;
+    }
+    return limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > std::numeric_limits<std::size_t>::max()
+               ? std::numeric_limits<std::size_t>::max()
+               : static_cast<std::size_t>(limit.rlim_cur);
 }
 
 #endif
@@ -493,7 +499,6 @@ class basic_storage_mount {
         if (make_channel_pool_status.failed()) return make_channel_pool_status;
         channels_ = std::move(acquired);
 
-        raise_open_files_limit();
         volume_config_t volume;
         volume.database = addresses.database;
         volume.data_directories = std::span<data_address_t const> {addresses.data_directories};
@@ -610,6 +615,7 @@ class mounted_storage {
      */
     status_t mount(resources_config_t const& config, constraint_t& constraint, std::size_t threads) noexcept {
         if (mounted()) return {status_code_t::already_exists_k, "This database has already mounted its storage"};
+        std::size_t const descriptors = raise_open_files_limit();
 
         report_ = mount_report_t {};
         auto [addresses, addresses_status] = addresses_of(config);
@@ -635,10 +641,15 @@ class mounted_storage {
 
         std::uint16_t const owners = bounded_count_(threads + config.shared_io_channels,
                                                     static_cast<std::size_t>(queue_pair_id_t::unallocated_k));
-        // A directory volume registers a medium per run file, so the ring takes as many as
-        // its pool admits.
-        std::uint16_t const targets = std::numeric_limits<std::uint16_t>::max() - 1;
         if (owners == 0) return {status_code_t::capacity_exhausted_k, "A ring names fewer queue pairs than that"};
+        // A directory volume registers a medium per run file, and the kernel refuses a file table
+        // wider than the descriptor limit, which the rings and the volume's own files share.
+        std::size_t const volume_files = 2; // the lock, and one manifest file or directory at a time
+        std::size_t const reserved = owners + volume_files;
+        if (descriptors <= reserved)
+            return {status_code_t::capacity_exhausted_k, "The descriptor limit leaves no room for a run file"};
+        std::uint16_t const targets = static_cast<std::uint16_t>(
+            std::min<std::size_t>(descriptors - reserved, std::numeric_limits<std::uint16_t>::max() - 1));
 
         switch (report_.transport) {
         case io_transport_t::memory_k: {
@@ -719,10 +730,16 @@ class mounted_storage {
      *  over @p targets directories. */
     status_t mount_linux_uring_(resources_config_t const& config, constraint_t& constraint, std::size_t threads,
                                 std::uint16_t owners, std::uint16_t targets) noexcept {
+        // The arena registers as one table slot per gibibyte the kernel pins at most in one
+        std::uint16_t const ranges = bounded_count_(
+            divide_round_up(config.channels.arena_bytes() * owners, linux_uring_registered_range_bytes_k),
+            static_cast<std::size_t>(registered_memory_id_t::unregistered_k));
+        if (ranges == 0)
+            return {status_code_t::capacity_exhausted_k, "A ring registers fewer ranges than the arena spans"};
         linux_uring_disk_config_t ring;
         ring.queue_pairs_limit = owners;
         ring.depth_limit = config.channels.depth;
-        ring.registered_memory_limit = 1;
+        ring.registered_memory_limit = ranges;
         ring.media_limit = targets;
         ring.buffering = file_buffering_t::unbuffered_k;
         auto [disk, make_disk_status] = files_disk_t::linux_uring_disk_t::make(ring);

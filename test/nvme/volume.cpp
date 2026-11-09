@@ -17,6 +17,10 @@
 #include <cstdio>  // `std::fopen`, `std::fwrite`, `std::fseek`, `std::fclose`
 #include <cstring> // `std::memcpy`
 
+#include <sys/resource.h> // `setrlimit`, `getrlimit`, `RLIMIT_NOFILE`, `RLIMIT_MEMLOCK`
+#include <sys/wait.h>     // `waitpid`, `WIFEXITED`, `WEXITSTATUS`
+#include <unistd.h>       // `fork`, `_exit`
+
 #include <array>       // `std::array`
 #include <filesystem>  // `std::filesystem::resize_file`, `std::filesystem::exists`
 #include <span>        // `std::span`
@@ -592,6 +596,87 @@ std::size_t probed_transport_refuses_a_missing_ring() {
 
 #pragma endregion Addresses
 
+#pragma region Mount Limits
+
+/** A mount sizes its file table to the descriptor limit, and refuses a limit leaving no room for a
+ *  run file; each mount runs in a child, since a lowered hard limit never rises again. */
+std::size_t mount_fits_the_descriptor_limit(char const* directory) {
+    path_t const manifest {directory, "descriptor_limit/limits.ustore.json"};
+    auto const mounts_under = [&](rlim_t descriptors, status_code_t wanted) -> std::size_t {
+        pid_t const child = ::fork();
+        if (child == 0) {
+            struct rlimit const limit {descriptors, descriptors};
+            if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) ::_exit(1);
+            resources_config_t config;
+            config.threads = 1;
+            if (sz::failed(config.manifest.assign(string_view_t {manifest.c_str()}))) ::_exit(1);
+            expected<resources_shared_ptr_t> opened = open_resources<atomic_reference, waiter_t>(config);
+            if (!opened) ::_exit(opened.status().code == wanted ? 0 : 1);
+            std::size_t runs = 0;
+            [[maybe_unused]] status_t const visited = (*opened)->storage.visit([&](auto& mount) noexcept {
+                runs = mount.volume().runs_capacity();
+                return status_t {};
+            });
+            ::_exit(wanted == status_code_t::success_k && runs != 0 && runs < descriptors ? 0 : 1);
+        }
+        int status = 0;
+        bool const exited = child > 0 && ::waitpid(child, &status, 0) == child && WIFEXITED(status);
+        return expect(exited && WEXITSTATUS(status) == 0);
+    };
+    std::size_t failures = 0;
+    failures += mounts_under(64, status_code_t::success_k);
+    failures += mounts_under(4, status_code_t::capacity_exhausted_k);
+    return failures;
+}
+
+/** A mount whose channel arena outgrows the gibibyte io_uring pins per table slot still moves its
+ *  last block, pinned wherever the locked-memory cap allows. */
+std::size_t mount_moves_an_arena_past_a_gibibyte(char const* directory) {
+    std::size_t failures = 0;
+    path_t const manifest {directory, "wide_arena/wide.ustore.json"};
+    path_t const medium_path {directory, "wide_arena/medium.bin"};
+    resources_config_t config;
+    config.threads = 1;
+    config.shared_io_channels = 7;
+    config.channels.request_buffer_bytes = std::uint64_t {1} << 20;
+    if (sz::failed(config.manifest.assign(string_view_t {manifest.c_str()}))) return expect(false);
+    expected<resources_shared_ptr_t> opened = open_resources<atomic_reference, waiter_t>(config);
+    failures += expect_status(opened, status_code_t::success_k);
+    if (!opened) return failures;
+    mount_report_t const report = (*opened)->storage.report();
+    failures += expect(report.arena_bytes > linux_uring_registered_range_bytes_k);
+    status_t const moved = (*opened)->storage.visit([&](auto& mount) noexcept -> status_t {
+        auto [guard, acquire_status] = mount.channels().acquire(0);
+        if (acquire_status.failed()) return acquire_status;
+        medium_options_t request;
+        request.name = medium_path.c_str();
+        request.access = medium_access_t::create_read_write_k;
+        request.length = portable_alignment_k;
+        auto [medium, register_status] = mount.disk().register_medium(request);
+        if (register_status.failed()) return register_status;
+        queue_pair_t const& queue_pair = guard.channel().queue_pair();
+        std::uint64_t const last_block = mount.arena().size() - portable_alignment_k;
+        std::array<request_t, 1> const writes {write_request(medium.reference(), extent_t {0, portable_alignment_k},
+                                                             mount.arena().reference(last_block), queue_pair.token(0))};
+        std::array<completion_t, 1> completions {};
+        expected<std::size_t> const submitted = mount.disk().submit(queue_pair, std::span<request_t const> {writes});
+        expected<std::size_t> const waited = wait_completions<waiter_t>(mount.disk(), queue_pair,
+                                                                        std::span<completion_t> {completions});
+        status_t const released = mount.disk().unregister_medium(medium);
+        if (!submitted || *submitted != 1 || !waited || *waited != 1 || !completions[0].completed_in_full())
+            return {status_code_t::io_k, "The arena's last block would not move"};
+        return released;
+    });
+    failures += expect_status(moved, status_code_t::success_k);
+    struct rlimit locked {};
+    if (report.transport == io_transport_t::linux_uring_k && ::getrlimit(RLIMIT_MEMLOCK, &locked) == 0 &&
+        locked.rlim_cur == RLIM_INFINITY)
+        failures += expect((*opened)->storage.pinning() == range_pinning_t::pinned_k);
+    return failures;
+}
+
+#pragma endregion Mount Limits
+
 #pragma region Drivers
 
 /** What a case needs to stand in for its medium: any transport, or a file in place of a device. */
@@ -668,5 +753,9 @@ int main(int argc, char const* argv[]) {
     if (totals.selects("addresses")) report(totals, "addresses", addresses_read_their_forms());
     if (totals.selects("probed_transport"))
         report(totals, "probed_transport", probed_transport_refuses_a_missing_ring());
+    if (environment.directory && totals.selects("descriptor_limit"))
+        report(totals, "descriptor_limit", mount_fits_the_descriptor_limit(environment.directory));
+    if (environment.directory && totals.selects("arena_past_a_gibibyte"))
+        report(totals, "arena_past_a_gibibyte", mount_moves_an_arena_past_a_gibibyte(environment.directory));
     return suite_exit_code(totals);
 }
