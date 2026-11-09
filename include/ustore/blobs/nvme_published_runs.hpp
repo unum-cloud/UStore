@@ -944,6 +944,9 @@ class published_runs {
     /** The tree the flushed writes live in. */
     using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiter_type_, row_kit_type_>;
 
+    /** What one slice of a merge of that tree writes into, lent by the owner of the store. */
+    using merge_buffers_t = typename tree_t::merge_buffers_t;
+
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
 
@@ -1322,8 +1325,16 @@ class published_runs {
     template <utilities::fold_concept fold_type_>
     status_t merge_memory_runs(fold_type_ const& fold) noexcept {
         std::size_t const fan_in = config_.lsm_tree.level_enlarge_factor;
+        // Every pass reuses the room the first one grew.
         st::vector<memory_run_t const*> group;
-        if (group.resize(fan_in) != st::status_t::success_k)
+        st::vector<transaction_stamp_t> readers;
+        // The replaced runs, freed once the publication waited out every reader holding one.
+        st::vector<memory_run_handle_t> away;
+        stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {*constraint_}};
+        // The changes a merge folds sit here until the merged run copies them.
+        utilities::local_arena_t folded;
+        utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
+        if (group.resize(fan_in) != st::status_t::success_k || away.reserve(fan_in) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A merge could not list its memory runs"};
         for (;;) {
             {
@@ -1334,13 +1345,10 @@ class published_runs {
                 for (std::size_t index = 0; index != fan_in; ++index) group[index] = due[index];
             }
 
-            st::vector<transaction_stamp_t> readers;
             if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
-            // The replaced runs, freed here once the publication waited out every reader that
-            // could hold one.
-            st::vector<memory_run_handle_t> away;
-            if (away.reserve(fan_in) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "No room to merge memory runs"};
+            away.clear();
+            versions.clear();
+            utilities::arena_rewind(folded_bytes.arena);
             // Claimed before the merge is built, so a full pool skips it, leaving the runs to the
             // flush the stall runs.
             auto [record, claim_status] = memory_runs_.try_claim();
@@ -1353,10 +1361,6 @@ class published_runs {
             // and a mount truncated there needs every version at or below it, as the flush
             // itself keeps them.
             survival.horizon = ledger_->fold_horizon(ledger_->horizon_besides(view_pin_), folded_floor_);
-            stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {*constraint_}};
-            // The changes a merge folds sit here until the merged run copies them.
-            utilities::local_arena_t folded;
-            utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
             if (status_t const kept = kept_versions(std::span<memory_run_t const* const> {group}, survival, fold,
                                                     versions, folded_bytes);
                 kept.failed()) {
@@ -1435,8 +1439,8 @@ class published_runs {
      */
     template <utilities::fold_concept fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(io_channel_t& reading_channel, io_channel_t& writing_channel,
-                                           compactor_ref_t const& compactor, fold_type_ const& fold,
-                                           device_fold_type_ const& device_fold,
+                                           std::span<merge_buffers_t> buffers, compactor_ref_t const& compactor,
+                                           fold_type_ const& fold, device_fold_type_ const& device_fold,
                                            lsm_tree_publication_hook_t const& published,
                                            compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
         // A pinned reader keeps the version it reads, and the durable horizon keeps the version a mount falls back to.
@@ -1451,8 +1455,8 @@ class published_runs {
         publication.owner = this;
         publication.oldest_readable = stamps.horizon;
         publication.chained = &published;
-        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, compactor, nullptr,
-                             fold, device_fold, publication.hook(), stamps, fan_out);
+        return tree_.compact(reading_channel, writing_channel, buffers, compaction_placement_t::automatic_k, compactor,
+                             nullptr, fold, device_fold, publication.hook(), stamps, fan_out);
     }
 
     /**
@@ -1495,8 +1499,9 @@ class published_runs {
 
     /** Drops every version a mount found stamped above @p ceiling, which only a store holding no memory run takes. */
     template <utilities::fold_concept fold_type_>
-    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel, transaction_stamp_t ceiling,
-                            fold_type_ const& fold, lsm_tree_publication_hook_t const& published) noexcept {
+    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
+                            std::span<merge_buffers_t> buffers, transaction_stamp_t ceiling, fold_type_ const& fold,
+                            lsm_tree_publication_hook_t const& published) noexcept {
         // Merges before the mount may have folded anything at or below the stamp it resumes from.
         folded_floor_ = std::max(folded_floor_, ceiling);
         {
@@ -1509,7 +1514,7 @@ class published_runs {
         publication_t publication;
         publication.owner = this;
         publication.chained = &published;
-        return tree_.truncate_above(reading_channel, writing_channel, ceiling, fold, publication.hook());
+        return tree_.truncate_above(reading_channel, writing_channel, buffers, ceiling, fold, publication.hook());
     }
 
 #pragma endregion Maintenance

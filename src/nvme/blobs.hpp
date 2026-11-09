@@ -170,7 +170,7 @@ status_t read_values_batched(call_access<cpu_class_> const& access, view_t const
                 if (status_t const read = with_reading(
                         access, places[first].collection, thread_index,
                         [&](collection_reading_of<cpu_class_> const& reading) noexcept {
-                            return store.select(reading, keys.subspan(first, last - first),
+                            return store.select(reading, slice.scratch, keys.subspan(first, last - first),
                                                 results.subspan(first, last - first), sink, thread_index);
                         });
                     read.failed())

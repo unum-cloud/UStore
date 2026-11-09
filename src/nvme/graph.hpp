@@ -138,8 +138,8 @@ status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t co
     };
     if (status_t const read = with_reading(access, collection, access.thread_index,
                                            [&](collection_reading_of<cpu_class_> const& reading) noexcept {
-                                               return access.state.store->select(reading, keys, results, sink,
-                                                                                 access.thread_index);
+                                               return access.state.store->select(reading, access.scratch, keys, results,
+                                                                                 sink, access.thread_index);
                                            });
         read.failed())
         return read;

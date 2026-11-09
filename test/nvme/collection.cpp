@@ -1064,9 +1064,10 @@ template <typename cursor_type_, typename store_type_>
     for (expectation_t const& entry : wanted) present += entry.state == lookup_result_t::written_k;
     for (scan_direction_t const direction : {scan_direction_t::ascending_k, scan_direction_t::descending_k}) {
         bool const descending = direction == scan_direction_t::descending_k;
+        utilities::local_arena_t walk;
         expected<cursor_type_> scan = cursor_type_::over(
-            store, descending ? limit<stored_key_t>::max() : limit<stored_key_t>::min(), head_stamp_k,
-            outside_executor_k, direction);
+            store, walk.allocator().arena, descending ? limit<stored_key_t>::max() : limit<stored_key_t>::min(),
+            head_stamp_k, outside_executor_k, direction);
         failures += expect(scan.has_value());
         if (!scan) return failures;
         std::size_t listed = 0;
@@ -1129,7 +1130,8 @@ std::size_t range_removal_hides_older_runs(mount_type_ const& mount) {
     failures += expect(store->flush((*stack)->channel()).succeeded());
     failures += write_model(*store, (*stack)->channel(), all.subspan(100, 100));
     failures += expect(store->flush((*stack)->channel()).succeeded());
-    expected<compaction_outcome_t> const sunk = store->compact((*stack)->channel(), writing->channel(), {});
+    std::array<typename variable_store_t::merge_buffers_t, 1> buffers {};
+    expected<compaction_outcome_t> const sunk = store->compact((*stack)->channel(), writing->channel(), buffers, {});
     failures += expect(sunk.has_value() && *sunk == compaction_outcome_t::published_k);
     failures += write_model(*store, (*stack)->channel(), all.subspan(200));
     failures += expect(store->flush((*stack)->channel()).succeeded());
@@ -1161,7 +1163,8 @@ std::size_t range_removal_hides_older_runs(mount_type_ const& mount) {
     failures += expect(store->flush((*stack)->channel()).succeeded());
     failures += check();
     for (std::size_t pass = 0; pass != 4 && store->tree().levels().level(0).size() != 0; ++pass) {
-        expected<compaction_outcome_t> const merged = store->compact((*stack)->channel(), writing->channel(), {});
+        expected<compaction_outcome_t> const merged = store->compact((*stack)->channel(), writing->channel(), buffers,
+                                                                     {});
         failures += expect(merged.has_value() && *merged == compaction_outcome_t::published_k);
         failures += check();
     }
@@ -1172,7 +1175,7 @@ std::size_t range_removal_hides_older_runs(mount_type_ const& mount) {
         failures += write_model(*store, (*stack)->channel(), std::span<expectation_t const> {&rewritten, 1});
         failures += expect(store->flush((*stack)->channel()).succeeded());
     }
-    expected<compaction_outcome_t> const dropped = store->compact((*stack)->channel(), writing->channel(), {});
+    expected<compaction_outcome_t> const dropped = store->compact((*stack)->channel(), writing->channel(), buffers, {});
     failures += expect(dropped.has_value() && *dropped == compaction_outcome_t::published_k);
     std::uint64_t tombstones = 0;
     for (std::size_t number = 0; number != store->tree().levels().size(); ++number)
@@ -1243,7 +1246,8 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     expected<guard_t> writing = (*stack)->fixture->channels.acquire();
     failures += expect(writing.has_value());
     if (!writing) return failures;
-    expected<compaction_outcome_t> const merged = store->compact((*stack)->channel(), writing->channel(), {});
+    std::array<typename variable_store_t::merge_buffers_t, 1> buffers {};
+    expected<compaction_outcome_t> const merged = store->compact((*stack)->channel(), writing->channel(), buffers, {});
     failures += expect(merged.has_value());
     if (!merged) return failures;
     failures += expect(*merged == compaction_outcome_t::published_k);
@@ -1283,7 +1287,8 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     }
     failures += expect(store->memory_deltas_count() != 0);
 
-    expected<variable_cursor_t> scan = variable_cursor_t::over(*store);
+    utilities::local_arena_t walk;
+    expected<variable_cursor_t> scan = variable_cursor_t::over(*store, walk.allocator().arena);
     failures += expect(scan.has_value());
     if (!scan) return failures;
 
@@ -1467,7 +1472,9 @@ std::size_t counter_fold_reads_alike_everywhere(mount_type_ const& mount) {
     expected<guard_t> writing = (*stack)->fixture->channels.acquire();
     failures += expect(writing.has_value());
     if (!writing) return failures;
-    expected<compaction_outcome_t> const compacted = store->compact((*stack)->channel(), writing->channel(), {});
+    std::array<typename counter_store_t::merge_buffers_t, 1> buffers {};
+    expected<compaction_outcome_t> const compacted = store->compact((*stack)->channel(), writing->channel(), buffers,
+                                                                    {});
     failures += expect(compacted.has_value() && *compacted == compaction_outcome_t::published_k);
     auto const& levels = store->tree().levels();
     failures += expect(levels.size() == 2 && levels.level(0).empty());

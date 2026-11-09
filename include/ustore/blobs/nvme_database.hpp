@@ -1172,7 +1172,9 @@ class basic_database {
         auto const count = [&](std::size_t, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
             measured = std::max<std::uint64_t>(measured, offset + bytes.size());
         };
-        if (status_t const selected = select(read, std::span<stored_key_t const> {&stored_key, 1},
+        utilities::local_arena_t scratch;
+        if (status_t const selected = select(read, scratch.allocator().arena,
+                                             std::span<stored_key_t const> {&stored_key, 1},
                                              std::span<lookup_result_t> {&folded, 1}, count, thread_index);
             selected.failed())
             return selected;
@@ -1231,13 +1233,15 @@ class basic_database {
                     std::size_t thread_index = outside_executor_k) noexcept {
         auto [read, read_status] = read_collection(id, stamp, thread_index);
         if (read_status.failed()) return read_status;
-        return select(read, stored_keys, results, sink, thread_index);
+        utilities::local_arena_t scratch;
+        return select(read, scratch.allocator().arena, stored_keys, results, sink, thread_index);
     }
 
     /** Reads the values of @p stored_keys out of the collection @p read reads, as the batched @c
-     *  select above reads them, executor thread @p thread_index taking its own channel. */
+     *  select above reads them, carving what it tracks from @p scratch, which the caller rewinds,
+     *  executor thread @p thread_index taking its own channel. */
     template <typename sink_type_>
-    status_t select(collection_reading_t const& read, std::span<stored_key_t const> stored_keys,
+    status_t select(collection_reading_t const& read, ustore_arena_t scratch, std::span<stored_key_t const> stored_keys,
                     std::span<lookup_result_t> results, sink_type_&& sink,
                     std::size_t thread_index = outside_executor_k) noexcept {
         auto [channel, acquire_status] = channels_->acquire(thread_index);
@@ -1247,7 +1251,7 @@ class basic_database {
             [&]<typename store_type_>(store_type_ const& collection,
                                       typename store_type_::reading_t const& reading) noexcept -> status_t {
                 if constexpr (keyed_by_database<store_type_>())
-                    return collection.select(channel.channel(), reading, stored_keys, results, sink);
+                    return collection.select(channel.channel(), reading, scratch, stored_keys, results, sink);
                 else return keyed_otherwise_();
             });
     }
@@ -1256,6 +1260,7 @@ class basic_database {
      *  @brief Hands @p visitor every key of @p id from @p from up in ascending order, or down in
      *      descending order as @p direction says, memory runs included.
      *  @param[in] id The collection to walk, named by its ID or by its name.
+     *  @param[in] scratch Where each page carves its run cursors, which the caller rewinds.
      *  @param[in] from The first key the walk reports, which need not be in the collection.
      *  @param[in] visitor Called as @c visitor(stored_key, state, size) for the newest version of every key at or
      *      below @p stamp, removals included, answering whether the walk carries on.
@@ -1268,7 +1273,7 @@ class basic_database {
      *      meanwhile ends the walk with @c not_found_k.
      */
     template <typename visitor_type_>
-    status_t scan(any_collection_id_t const& id, stored_key_t from, visitor_type_&& visitor,
+    status_t scan(any_collection_id_t const& id, ustore_arena_t scratch, stored_key_t from, visitor_type_&& visitor,
                   transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = outside_executor_k,
                   scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
         // A head walk pins the stamp it starts at, so every page reads the same commits.
@@ -1289,8 +1294,8 @@ class basic_database {
                                 nvme_store_cursor<typename store_type_::key_slot_t, volume_t, atomic_reference_,
                                                   waiter_type_, typename store_type_::fold_t,
                                                   typename store_type_::device_fold_t, row_kit_type_>;
-                            auto [scanner, over_status] = scanner_t::over(collection, from, stamp, thread_index,
-                                                                          direction);
+                            auto [scanner, over_status] = scanner_t::over(collection, scratch, from, stamp,
+                                                                          thread_index, direction);
                             if (over_status.failed()) return over_status;
                             std::span<scan_entry<stored_key_t> const> const entries = scanner.page();
                             std::copy(entries.begin(), entries.end(), page.begin());
@@ -1322,7 +1327,7 @@ class basic_database {
      *  visitor runs inside them too and must not write; executor thread @p thread_index takes its
      *  own channel to fold a chain of changes. */
     template <typename visitor_type_>
-    status_t scan(collection_reading_t const& read, stored_key_t from, visitor_type_&& visitor,
+    status_t scan(collection_reading_t const& read, ustore_arena_t scratch, stored_key_t from, visitor_type_&& visitor,
                   std::size_t thread_index = outside_executor_k,
                   scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
         return visit_reading(
@@ -1333,7 +1338,7 @@ class basic_database {
                     using scanner_t = nvme_store_cursor<typename store_type_::key_slot_t, volume_t, atomic_reference_,
                                                         waiter_type_, typename store_type_::fold_t,
                                                         typename store_type_::device_fold_t, row_kit_type_>;
-                    auto [scanner, over_status] = scanner_t::over(collection, reading, from, direction);
+                    auto [scanner, over_status] = scanner_t::over(collection, reading, scratch, from, direction);
                     if (over_status.failed()) return over_status;
                     while (!scanner.reached_end()) {
                         lookup_result_t state = scanner.state();
@@ -1615,6 +1620,7 @@ class basic_database {
     /** Merges one overfull level of every collection that has one, which needs two channels at
      *  once, fanning each merge on the host out over @p fan_out. */
     status_t compact(compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
+        // The claim the channel comes with lends the database's one set of merge buffers.
         expected<claimed_channel_t> reading = claim_channel_();
         if (!reading) return reading.status();
         auto [writing, acquire_status] = channels_->acquire();
@@ -1628,8 +1634,11 @@ class basic_database {
         status_t first;
         for (std::size_t index = 0; index != collections_.size(); ++index) {
             auto [merged, compact_status] = std::visit(
-                [&](auto& held) noexcept {
-                    return held.compact(reading->channel(), writing.channel(), compactor_, published, fan_out);
+                [&]<typename store_type_>(store_type_& collection) noexcept -> expected<compaction_outcome_t> {
+                    auto [buffers, lent_status] = lent_merge_buffers_<store_type_>(fan_out.slices());
+                    if (lent_status.failed()) return lent_status;
+                    return collection.compact(reading->channel(), writing.channel(), buffers, compactor_, published,
+                                              fan_out);
                 },
                 collections_[index]->held);
             if (compact_status.failed() && first.succeeded()) first = compact_status;
@@ -2430,9 +2439,11 @@ class basic_database {
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = &recording;
+        auto [buffers, lent_status] = lent_merge_buffers_<collection_type_>(1);
+        if (lent_status.failed()) return lent_status;
         while (collection.needs_compaction()) {
-            auto [outcome, compact_status] = collection.compact(reading.channel(), writing.channel(), compactor_,
-                                                                published);
+            auto [outcome, compact_status] = collection.compact(reading.channel(), writing.channel(), buffers,
+                                                                compactor_, published);
             if (compact_status.failed()) return compact_status;
             if (outcome == compaction_outcome_t::nothing_to_compact_k) break;
         }
@@ -2566,6 +2577,29 @@ class basic_database {
         collection_entry_t* const found = entry_with_id_(collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit([&](auto& held) noexcept { return held.flush(channel); }, found->held);
+    }
+
+    /** Where @p store_type_ first sits among @c store_types_, one before its buffers' place in
+     *  @c merge_buffers_. */
+    template <typename store_type_>
+    static constexpr std::size_t store_index_() noexcept {
+        constexpr bool matches[] {std::is_same_v<store_type_, store_types_>...};
+        std::size_t index = 0;
+        while (!matches[index]) ++index;
+        return index;
+    }
+
+    /** The merge buffers lent to a merge of a collection of @p store_type_ over @p slices slices,
+     *  under the claim; a merge of another store's collection frees what the last one grew, as
+     *  their buffers differ in type. */
+    template <typename store_type_>
+    expected<std::span<typename store_type_::merge_buffers_t>> lent_merge_buffers_(std::size_t slices) noexcept {
+        constexpr std::size_t held_index = store_index_<store_type_>() + 1;
+        if (merge_buffers_.index() != held_index) merge_buffers_.template emplace<held_index>();
+        st::vector<typename store_type_::merge_buffers_t>& buffers = std::get<held_index>(merge_buffers_);
+        if (buffers.size() < slices && buffers.resize(slices) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for a merge's buffers"};
+        return std::span<typename store_type_::merge_buffers_t> {buffers}.first(slices);
     }
 
     /** Reserves room for one run pool per store, each made at its store's first collection
@@ -2894,8 +2928,11 @@ class basic_database {
         published.context = &recording;
         for (std::size_t index = 0; index != collections_.size(); ++index)
             if (status_t const truncated = std::visit(
-                    [&](auto& held) noexcept {
-                        return held.truncate_above(claimed->channel(), writing.channel(), durable_stamp, published);
+                    [&]<typename store_type_>(store_type_& collection) noexcept -> status_t {
+                        auto [buffers, lent_status] = lent_merge_buffers_<store_type_>(1);
+                        if (lent_status.failed()) return lent_status;
+                        return collection.truncate_above(claimed->channel(), writing.channel(), buffers, durable_stamp,
+                                                         published);
                     },
                     collections_[index]->held);
                 truncated.failed())
@@ -3038,6 +3075,10 @@ class basic_database {
     /** One pool of runs per store, made at its store's first collection and
      *  outliving every collection. */
     st::vector<any_run_pool_t> run_pools_;
+
+    /** The one set of merge buffers, of the store whose collection merged last, which the claim
+     *  lends to one merge at a time instead of every collection keeping the largest it grew. */
+    std::variant<std::monostate, st::vector<typename store_types_::merge_buffers_t>...> merge_buffers_;
 
     /** The queue pairs every call that moves bytes takes one of, null until the database is mounted. */
     channel_pool_t* channels_ = nullptr;

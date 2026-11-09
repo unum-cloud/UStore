@@ -17,9 +17,10 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/blobs/nvme_key_slot.hpp" // `limit`
-#include "ustore/blobs/nvme_store.hpp"    // `nvme_store`
-#include "ustore/utilities/folds.hpp"     // `fold_concept`
+#include "ustore/blobs/nvme_key_slot.hpp"   // `limit`
+#include "ustore/blobs/nvme_store.hpp"      // `nvme_store`
+#include "ustore/utilities/folds.hpp"       // `fold_concept`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 
 namespace unum::ustore::blobs {
 
@@ -83,12 +84,14 @@ class nvme_store_cursor {
     /** A walk over @p source positioned on its first key not below @p from, or not above it in
      *  @p direction descending, where @p source must outlive the cursor, seeing what a reader
      *  pinned at @p stamp sees, announced on executor thread @p thread_index's epoch slot while it
-     *  reads a page, the first of which it reads before returning. */
-    static expected<nvme_store_cursor> over(nvme_store_t const& source, stored_key_t from = limit<stored_key_t>::min(),
+     *  reads a page, the first of which it reads before returning, its run cursors carved from
+     *  @p scratch, which outlives it. */
+    static expected<nvme_store_cursor> over(nvme_store_t const& source, ustore_arena_t scratch,
+                                            stored_key_t from = limit<stored_key_t>::min(),
                                             transaction_stamp_t stamp = head_stamp_k,
                                             std::size_t thread_index = outside_executor_k,
                                             scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
-        nvme_store_cursor cursor;
+        nvme_store_cursor cursor {scratch};
         cursor.source_ = &source;
         cursor.thread_index_ = thread_index;
         cursor.direction_ = direction;
@@ -100,9 +103,9 @@ class nvme_store_cursor {
     /** A walk over @p source as @c over above, every page of which reads through @p read, which a
      *  caller inside the ledger's epochs took and keeps walkable while the cursor lives. */
     static expected<nvme_store_cursor> over(nvme_store_t const& source, typename nvme_store_t::reading_t const& read,
-                                            stored_key_t from = limit<stored_key_t>::min(),
+                                            ustore_arena_t scratch, stored_key_t from = limit<stored_key_t>::min(),
                                             scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
-        nvme_store_cursor cursor;
+        nvme_store_cursor cursor {scratch};
         cursor.source_ = &source;
         cursor.direction_ = direction;
         cursor.stamp_ = read.stamp;
@@ -182,6 +185,9 @@ class nvme_store_cursor {
 #pragma endregion Private Types
 
 #pragma region Private Methods
+
+    explicit nvme_store_cursor(ustore_arena_t scratch) noexcept
+        : memory_positions_ {{scratch}}, memory_ends_ {{scratch}}, cursors_ {{scratch}} {}
 
     /** Reads the keys from @p from on into the page inside the ledger's epochs, from the view
      *  published now, with one key past the page beside it, which the next page starts at. */
@@ -449,17 +455,18 @@ class nvme_store_cursor {
      *  the view a lender's reading names for every page. */
     view_t const* view_ = nullptr;
 
-    /** The next sorted position inside every memory run of the view, newest run first. */
-    st::vector<std::size_t> memory_positions_;
+    /** The next sorted position inside every memory run of the view, newest run first, keeping
+     *  its room from page to page, as the two below do. */
+    st::vector<std::size_t, utilities::arena_allocator<std::size_t>> memory_positions_;
 
     /** Per memory run, newest first, one past the last position a descending walk is yet to see. */
-    st::vector<std::size_t> memory_ends_;
+    st::vector<std::size_t, utilities::arena_allocator<std::size_t>> memory_ends_;
 
     /** The order the walk hands its keys out in. */
     scan_direction_t direction_ = scan_direction_t::ascending_k;
 
     /** One cursor per run of every level the view names. */
-    st::vector<run_cursor_t> cursors_;
+    st::vector<run_cursor_t, utilities::arena_allocator<run_cursor_t>> cursors_;
 
     /** The keys of the page, then the key the next page starts at. */
     std::array<entry_t, page_keys_k + 1> page_ {};

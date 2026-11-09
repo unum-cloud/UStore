@@ -644,6 +644,9 @@ class lsm_sorted_run {
     /** The pipeline every read of this run refills. */
     using read_pipeline_t = basic_read_pipeline<disk_t>;
 
+    /** One block of one value's read in flight, filed in its channel's ring under its tag. */
+    using read_piece_t = io_channel_t::read_piece_t;
+
     /** The pipeline the write path stages its three sections through. */
     using write_pipeline_t = basic_write_pipeline<disk_t, waiter_type_>;
 
@@ -1455,26 +1458,6 @@ class lsm_sorted_run {
 
   private:
 
-#pragma region Private Types
-
-    /** One block of one value's read, kept until its completion carries the block back. */
-    struct pending_read_t {
-
-        /** Which of the caller's requests this block belongs to. */
-        std::size_t request = 0;
-
-        /** Bytes of the block before the value's own bytes. */
-        std::uint32_t skipped = 0;
-
-        /** Bytes of the value this block carries. */
-        std::uint32_t carried = 0;
-
-        /** Bytes of the value that the blocks before this one carried. */
-        std::uint64_t offset = 0;
-    };
-
-#pragma endregion Private Types
-
 #pragma region Private Methods
 
     /** Where the value of the key slot at sorted @p position starts inside the values section, which for @p position
@@ -1544,17 +1527,17 @@ class lsm_sorted_run {
         if (block_bytes == 0)
             return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
-        std::size_t const depth = channel.queue_pair().depth();
-        st::vector<pending_read_t> pending;
-        if (pending.resize(depth) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not track its reads in flight"};
+        if (count > std::numeric_limits<std::uint32_t>::max())
+            return {status_code_t::invalid_argument_k, "A batched read takes at most 2^32 values"};
+        std::span<read_piece_t> const pieces = channel.read_pieces();
+        std::size_t const depth = pieces.size();
 
         auto [reader_channel, reader_channel_status] = channel.acquire();
         if (reader_channel_status.failed()) return reader_channel_status;
         read_pipeline_t reader {volume_->disk(), std::move(reader_channel), extent_.medium};
         status_t first;
         auto adapter = [&](completed_buffer_t const& completed) noexcept {
-            pending_read_t const& piece = pending[completed.tag % depth];
+            read_piece_t const& piece = pieces[completed.tag % depth];
             if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                 if (first.succeeded()) first = whole;
                 return;
@@ -1577,7 +1560,7 @@ class lsm_sorted_run {
                 std::uint64_t const at = chunk * block_bytes;
                 std::uint64_t const room = window.extent.length - at;
                 std::uint64_t const length = block_bytes < room ? block_bytes : room;
-                pending[tag % depth] = piece_of_(window, request, at, length);
+                pieces[tag % depth] = piece_of_(window, request, at, length);
                 extent_t const piece {window.extent.offset + at, length};
                 if (status_t const queued = reader.enqueue_read(piece, tag); queued.failed()) {
                     if (reader.outstanding() == 0) return queued;
@@ -1598,17 +1581,17 @@ class lsm_sorted_run {
     }
 
     /** The piece of @p window that the block at @p at of @p length carries, for @p request. */
-    [[nodiscard]] static pending_read_t piece_of_(value_window_t const& window, std::size_t request, std::uint64_t at,
-                                                  std::uint64_t length) noexcept {
+    [[nodiscard]] static read_piece_t piece_of_(value_window_t const& window, std::size_t request, std::uint64_t at,
+                                                std::uint64_t length) noexcept {
         std::uint64_t const wanted_first = window.skipped;
         std::uint64_t const wanted_last = window.skipped + window.bytes;
         std::uint64_t const first = at > wanted_first ? at : wanted_first;
         std::uint64_t const last = at + length < wanted_last ? at + length : wanted_last;
-        pending_read_t piece;
-        piece.request = request;
+        read_piece_t piece;
+        piece.request = static_cast<std::uint32_t>(request);
         piece.skipped = static_cast<std::uint32_t>(first - at);
         piece.carried = static_cast<std::uint32_t>(last > first ? last - first : 0);
-        piece.offset = first - wanted_first;
+        piece.offset = static_cast<std::uint32_t>(first - wanted_first);
         return piece;
     }
 

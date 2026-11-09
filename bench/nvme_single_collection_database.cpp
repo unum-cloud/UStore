@@ -286,10 +286,11 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
             st::vector<byte_t> value;
             if (reading_status.failed() || st::failed(value.resize(value_max_size)))
                 return loop.skip("no channel or no memory for a value");
-            expected<cursor_t> cursor = cursor_t::over(database->records());
+            utilities::local_arena_t walk;
+            expected<cursor_t> cursor = cursor_t::over(database->records(), walk.allocator().arena);
             if (!cursor) return loop.skip("the cursor did not open");
             for ([[maybe_unused]] std::size_t call : loop) {
-                if (cursor->reached_end()) cursor = cursor_t::over(database->records());
+                if (cursor->reached_end()) cursor = cursor_t::over(database->records(), walk.allocator().arena);
                 if (!cursor) return loop.skip("the cursor did not reopen");
                 stored_value_size_t size = 0;
                 status_t const completed = database->select(reading.channel(), cursor->stored_key(),

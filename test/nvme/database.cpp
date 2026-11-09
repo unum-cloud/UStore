@@ -13,16 +13,17 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `std::fopen`, `std::fclose`
+#include <cstdlib> // `std::malloc`, `std::aligned_alloc`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
-#include <array>       // `std::array`
-#include <chrono>      // `std::chrono::steady_clock`
+#include <array>      // `std::array`
+#include <chrono>     // `std::chrono::steady_clock`
 #include <filesystem> // `std::filesystem::directory_iterator`, `std::filesystem::remove`, `std::filesystem::resize_file`
-#include <limits>      // `std::numeric_limits`
-#include <memory>      // `std::unique_ptr`
-#include <new>         // `std::nothrow`
-#include <span>        // `std::span`
-#include <string>      // `std::string`
+#include <limits>     // `std::numeric_limits`
+#include <memory>     // `std::unique_ptr`
+#include <new>        // `std::nothrow`
+#include <span>       // `std::span`
+#include <string>     // `std::string`
 #include <string_view> // `std::string_view`
 #include <thread>      // `std::thread`
 #include <type_traits> // `std::is_same_v`
@@ -36,6 +37,43 @@
 #include "ustore/utilities/nvme_manifest.hpp" // `manifest_t`
 
 #include "nvme/fixture.hpp" // `run_on_transport`, `painted`
+
+/** Calls of @c operator new on every thread, which a warm read leaves unchanged; the database
+ *  starts no thread of its own. */
+std::size_t operator_new_calls = 0;
+
+void* operator new(std::size_t size) {
+    ++operator_new_calls;
+    if (void* memory = std::malloc(size ? size : 1)) return memory;
+    throw std::bad_alloc {};
+}
+
+void* operator new(std::size_t size, std::nothrow_t const&) noexcept {
+    ++operator_new_calls;
+    return std::malloc(size ? size : 1);
+}
+
+void* operator new(std::size_t size, std::align_val_t alignment) {
+    ++operator_new_calls;
+    std::size_t const bytes = (size + static_cast<std::size_t>(alignment) - 1) &
+                              ~(static_cast<std::size_t>(alignment) - 1);
+    if (void* memory = std::aligned_alloc(static_cast<std::size_t>(alignment),
+                                          bytes ? bytes : static_cast<std::size_t>(alignment)))
+        return memory;
+    throw std::bad_alloc {};
+}
+
+void* operator new(std::size_t size, std::align_val_t alignment, std::nothrow_t const&) noexcept {
+    ++operator_new_calls;
+    std::size_t const bytes = (size + static_cast<std::size_t>(alignment) - 1) &
+                              ~(static_cast<std::size_t>(alignment) - 1);
+    return std::aligned_alloc(static_cast<std::size_t>(alignment), bytes ? bytes : static_cast<std::size_t>(alignment));
+}
+
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete(void* memory, std::align_val_t) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t, std::align_val_t) noexcept { std::free(memory); }
 
 namespace unum::ustore::test {
 
@@ -775,7 +813,8 @@ case_result_t strings_range_removal_survives_reopen(mount_type_ const& mount) {
                                 else checked += expect(value == value_of(index));
                             }
                             // A walk down starts at the last string spared.
-                            strings::strings_page_t page;
+                            utilities::local_arena_t walk;
+                            typename store_type_::page_t page {walk.allocator().arena};
                             checked += expect(
                                 held.read_page_down({}, {}, head_stamp_k, outside_executor_k, page).succeeded());
                             std::string_view previous;
@@ -1961,8 +2000,9 @@ std::size_t head_reading_pins_nothing(mount_type_ const& mount) {
     failures += expect(copied == value);
     std::size_t walked = 0;
     std::size_t pinned_inside = 0;
+    utilities::local_arena_t walk;
     failures += expect(store
-                           .scan(read, stored_key_t {1},
+                           .scan(read, walk.allocator().arena, stored_key_t {1},
                                  [&](stored_key_t, lookup_result_t state, stored_value_size_t) noexcept {
                                      walked += state == lookup_result_t::written_k;
                                      pinned_inside += store.ledger().newest_reader() != unwritten_stamp_k;
@@ -1974,6 +2014,65 @@ std::size_t head_reading_pins_nothing(mount_type_ const& mount) {
     st::vector<transaction_stamp_t> pinned;
     failures += expect(store.ledger().pinned_readers(pinned).succeeded());
     failures += expect_eq(pinned.size(), std::size_t {0});
+    return failures;
+}
+
+/** A warm batched select of keys in level zero, in the value cache and in a memory run makes no
+ *  call of @c operator new, rewinding one scratch between calls as <tt>src/</tt> does. */
+template <typename mount_type_>
+std::size_t warm_batched_select_allocates_nothing(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+    expected<collection_id_t> const created = create_named(store, "warm", test_config(0, value_max_size_k));
+    failures += expect(created.has_value());
+    if (!created) return failures;
+    any_collection_id_t const warm {*created};
+
+    constexpr std::size_t keys_k = 64;
+    std::array<stored_key_t, keys_k> keys {};
+    std::array<byte_t, value_max_size_k> value {};
+    std::size_t expected_bytes = 0;
+    for (std::size_t index = 0; index != keys_k; ++index) {
+        keys[index] = stored_key_t {index};
+        std::size_t const width = blob_bytes_of(index);
+        for (std::size_t position = 0; position != width; ++position) value[position] = painted(index, position);
+        failures += expect(store.insert(warm, keys[index], stored_value_view_t {value.data(), width}).succeeded());
+        expected_bytes += width;
+    }
+    failures += expect(store.flush().succeeded());
+    // A single select files its value in the cache; a write after the flush stays in memory.
+    std::array<byte_t, value_max_size_k> into {};
+    stored_value_size_t size = 0;
+    failures += expect(store.select(warm, keys[0], std::span<byte_t> {into}, size).succeeded());
+    failures += expect(store.insert(warm, keys[1], stored_value_view_t {value.data(), blob_bytes_of(1)}).succeeded());
+
+    auto [read, read_status] = store.read_collection(warm, head_stamp_k);
+    failures += expect(read_status.succeeded());
+    if (read_status.failed()) return failures;
+    std::array<lookup_result_t, keys_k> results {};
+    std::size_t carried = 0;
+    auto sink = [&](std::size_t, std::uint64_t, std::span<byte_t const> bytes) noexcept { carried += bytes.size(); };
+    ustore_arena_handle_t scratch {};
+    auto select_once = [&]() noexcept {
+        carried = 0;
+        arena_rewind(&scratch);
+        return store.select(read, &scratch, std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results},
+                            sink);
+    };
+    failures += expect(select_once().succeeded());
+    std::size_t const before = operator_new_calls;
+    failures += expect(select_once().succeeded());
+    std::size_t const allocated = operator_new_calls - before;
+    fmt::println("    warm batched select: {} calls of operator new", allocated);
+    failures += expect_eq(allocated, std::size_t {0});
+    failures += expect_eq(carried, expected_bytes);
+    arena_free_blocks(scratch);
     return failures;
 }
 
@@ -2764,6 +2863,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
         report(totals, mount, "runs_scan_one_at_a_time", runs_scan_one_at_a_time);
         report(totals, mount, "head_reading_pins_nothing", head_reading_pins_nothing);
+        report(totals, mount, "warm_batched_select_allocates_nothing", warm_batched_select_allocates_nothing);
         report(totals, mount, "drop_proceeds_beside_the_snapshot", drop_proceeds_beside_the_snapshot);
         report(totals, mount, "threads_commit_serializably", threads_commit_serializably);
         report(totals, mount, "head_writes_wait_for_records", head_writes_wait_for_records);

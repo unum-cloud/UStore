@@ -256,6 +256,9 @@ class nvme_store {
     /** The tree the flushed writes of this collection live in. */
     using tree_t = typename published_runs_t::tree_t;
 
+    /** What one slice of a merge of that tree writes into, lent by the database. */
+    using merge_buffers_t = typename tree_t::merge_buffers_t;
+
     /** One immutable run of that tree, which an ingest writes before it publishes. */
     using sorted_run_t = typename tree_t::sorted_run_t;
 
@@ -500,32 +503,33 @@ class nvme_store {
                     std::span<lookup_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
                     std::size_t thread_index = outside_executor_k) const noexcept {
         reader_t const inside = runs_.enter(thread_index);
-        return select(channel, runs_.reading(stamp), stored_keys, results, sink);
+        utilities::local_arena_t scratch;
+        return select(channel, runs_.reading(stamp), scratch.allocator().arena, stored_keys, results, sink);
     }
 
     /** As the batched @c select above, through @p read, which a caller inside the ledger's epochs
-     *  took for every read of a call. */
+     *  took for every read of a call, carving what it tracks from @p scratch, which the caller
+     *  rewinds once per call. */
     template <typename sink_type_>
-    status_t select(io_channel_t& channel, reading_t const& read, std::span<stored_key_t const> stored_keys,
-                    std::span<lookup_result_t> results, sink_type_&& sink) const noexcept {
+    status_t select(io_channel_t& channel, reading_t const& read, ustore_arena_t scratch,
+                    std::span<stored_key_t const> stored_keys, std::span<lookup_result_t> results,
+                    sink_type_&& sink) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched select answers one result per key"};
         level_set_t const& levels = *read.view->levels;
 
-        // The tree takes its keys contiguous, so the request each deferred key came from travels beside it.
-        deferred_keys_t deferred_keys {constrained_allocator<stored_key_t, atomic_reference_> {runs_.constraint()}};
-        deferred_requests_t deferred_requests {
-            constrained_allocator<std::size_t, atomic_reference_> {runs_.constraint()}};
-        if (deferred_keys.reserve(stored_keys.size()) != st::status_t::success_k ||
-            deferred_requests.reserve(stored_keys.size()) != st::status_t::success_k)
+        // The tree takes its keys contiguous, so the request each deferred key came from travels
+        // beside it, and a key whose newest version is a change folds once the reads retired.
+        auto [deferred_keys, keys_status] = utilities::arena_allocate<stored_key_t>(scratch, stored_keys.size());
+        auto [deferred_requests, requests_status] = utilities::arena_allocate<std::size_t>(scratch, stored_keys.size());
+        auto [folded_requests, folded_status] = utilities::arena_allocate<std::size_t>(scratch, stored_keys.size());
+        if (keys_status.failed() || requests_status.failed() || folded_status.failed())
             return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
+        std::size_t deferred = 0;
+        std::size_t folded = 0;
 
-        // A cached value is copied out of its slot before the sink sees it, into one buffer the whole batch reuses.
-        constrained_buffer<atomic_reference_> cached_value {
-            constrained_allocator<byte_t, atomic_reference_> {runs_.constraint()}};
-        // A key whose newest version is a fold's change is folded on its own once the batch's reads have retired.
-        deferred_requests_t folded_requests {
-            constrained_allocator<std::size_t, atomic_reference_> {runs_.constraint()}};
+        // A cached value is copied out before the sink sees it, into one room grown to the widest.
+        std::span<byte_t> cached_value;
         bool const tombstoned = tombstoned_(read);
         for (std::size_t request = 0; request != stored_keys.size(); ++request) {
             delta_view_t found;
@@ -535,8 +539,7 @@ class nvme_store {
                     results[request] = lookup_result_t::removed_k;
                 else if (found.kind == delta_kind_t::change_k) {
                     results[request] = lookup_result_t::missing_k;
-                    if (folded_requests.push_back(std::size_t {request}) != st::status_t::success_k)
-                        return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
+                    folded_requests[folded++] = request;
                 }
                 else if (found.kind == delta_kind_t::remove_k) results[request] = lookup_result_t::removed_k;
                 else {
@@ -559,32 +562,34 @@ class nvme_store {
                     stored_value_size_t wanted = 0;
                     stored_value_size_t copied = 0;
                     transaction_stamp_t version = unwritten_stamp_k;
-                    bool const cached =
-                        find_in_levels_(read, stored_keys[request], wanted, version) == lookup_result_t::written_k &&
-                        cached_value.resize(wanted) == st::status_t::success_k &&
-                        cache_.copy(stored_keys[request], version, std::span<byte_t> {cached_value}, copied);
-                    if (cached) {
+                    bool cached = find_in_levels_(read, stored_keys[request], wanted, version) ==
+                                  lookup_result_t::written_k;
+                    if (cached && cached_value.size() < wanted) {
+                        auto [grown, grown_status] = utilities::arena_allocate<byte_t>(scratch, wanted);
+                        cached = grown_status.succeeded();
+                        if (cached) cached_value = grown;
+                    }
+                    if (cached && cache_.copy(stored_keys[request], version, cached_value, copied)) {
                         results[request] = lookup_result_t::written_k;
                         sink(request, std::uint64_t {0}, std::span<byte_t const> {cached_value}.first(copied));
                         continue;
                     }
                 }
             results[request] = lookup_result_t::missing_k;
-            [[maybe_unused]] st::status_t const named = deferred_keys.push_back(stored_key_t {stored_keys[request]});
-            [[maybe_unused]] st::status_t const tracked = deferred_requests.push_back(std::size_t {request});
+            deferred_keys[deferred] = stored_keys[request];
+            deferred_requests[deferred++] = request;
         }
-        if (deferred_keys.empty())
-            return select_folded_(channel, read, stored_keys, std::span<std::size_t const> {folded_requests}, results,
-                                  sink);
+        if (deferred == 0)
+            return select_folded_(channel, read, scratch, stored_keys,
+                                  std::span<std::size_t const> {folded_requests.first(folded)}, results, sink);
 
         // The tree answers in its own vocabulary and the sink is told nothing about sizes, so the bytes every key
         // owed are counted here and compared once the read has run.
-        deferred_answers_t answers {constrained_allocator<lookup_result_t, atomic_reference_> {runs_.constraint()}};
-        deferred_delivered_t delivered {constrained_allocator<std::uint64_t, atomic_reference_> {runs_.constraint()}};
-        if (answers.resize(deferred_keys.size()) != st::status_t::success_k ||
-            delivered.resize(deferred_keys.size()) != st::status_t::success_k)
+        auto [answers, answers_status] = utilities::arena_allocate<lookup_result_t>(scratch, deferred);
+        auto [delivered, delivered_status] = utilities::arena_allocate<std::uint64_t>(scratch, deferred);
+        if (answers_status.failed() || delivered_status.failed())
             return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
-        for (std::size_t index = 0; index != deferred_keys.size(); ++index) {
+        for (std::size_t index = 0; index != deferred; ++index) {
             answers[index] = lookup_result_t::missing_k;
             delivered[index] = 0;
         }
@@ -593,12 +598,11 @@ class nvme_store {
             delivered[index] += bytes.size();
             sink(deferred_requests[index], offset, bytes);
         };
-        status_t const read_status = runs_.tree().read_values(channel, levels,
-                                                              std::span<stored_key_t const> {deferred_keys},
-                                                              std::span<lookup_result_t> {answers}, relay, read.stamp);
+        status_t const read_status = runs_.tree().read_values(
+            channel, levels, std::span<stored_key_t const> {deferred_keys.first(deferred)}, answers, relay, read.stamp);
 
         std::size_t truncated = 0;
-        for (std::size_t index = 0; index != deferred_keys.size(); ++index) {
+        for (std::size_t index = 0; index != deferred; ++index) {
             lookup_result_t& result = results[deferred_requests[index]];
             if (answers[index] == lookup_result_t::missing_k) continue;
             if (answers[index] == lookup_result_t::removed_k) {
@@ -606,8 +610,7 @@ class nvme_store {
                 continue;
             }
             if (answers[index] == lookup_result_t::changed_k) {
-                if (folded_requests.push_back(std::size_t {deferred_requests[index]}) != st::status_t::success_k)
-                    return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
+                folded_requests[folded++] = deferred_requests[index];
                 continue;
             }
             stored_value_size_t wanted = 0;
@@ -623,8 +626,8 @@ class nvme_store {
 
         // A block short of what it asked for fails its own key; a cancelled or refused one fails the batch.
         if (read_status.failed() && (truncated == 0 || !(read_status == status_code_t::io_k))) return read_status;
-        return select_folded_(channel, read, stored_keys, std::span<std::size_t const> {folded_requests}, results,
-                              sink);
+        return select_folded_(channel, read, scratch, stored_keys,
+                              std::span<std::size_t const> {folded_requests.first(folded)}, results, sink);
     }
 
     /** The runs a reader at @p stamp walks, counted for an unordered scan that walks them one at a time. */
@@ -833,13 +836,16 @@ class nvme_store {
             }
             ranges[joined++] = ranges[index];
         }
+        // Each range's walk carves its run cursors here.
+        utilities::local_arena_t walks;
         for (std::size_t index = 0; index != joined; ++index) {
             stamped_range_t const& removed = ranges[index];
             if (removed.stamp > read.stamp) continue;
             stored_key_t const from = removed.stamp == after.stamp && removed.range.start < after.stored_key
                                           ? after.stored_key
                                           : removed.range.start;
-            auto [walk, walk_status] = cursor_t::over(*this, from, removed.stamp - 1, thread_index);
+            auto [walk, walk_status] = cursor_t::over(*this, walks.allocator().arena, from, removed.stamp - 1,
+                                                      thread_index);
             if (walk_status.failed()) return walk_status;
             for (std::uint64_t expanded = 0;
                  expanded != bound && !walk.reached_end() && walk.stored_key() < removed.range.end;) {
@@ -1277,6 +1283,7 @@ class nvme_store {
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
+     *  @param[in,out] buffers What each slice writes into, at least one per slice of @p fan_out.
      *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device
      *      compactor.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
@@ -1284,17 +1291,19 @@ class nvme_store {
      *      the calling thread.
      */
     expected<compaction_outcome_t> compact(
-        io_channel_t& reading_channel, io_channel_t& writing_channel, compactor_ref_t const& compactor,
-        lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
+        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<merge_buffers_t> buffers,
+        compactor_ref_t const& compactor, lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
         compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
-        return runs_.compact(reading_channel, writing_channel, compactor, fold_, device_fold_, published, fan_out);
+        return runs_.compact(reading_channel, writing_channel, buffers, compactor, fold_, device_fold_, published,
+                             fan_out);
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a collection holding no memory run
-     *  takes. */
-    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel, transaction_stamp_t ceiling,
+     *  takes, merging into the lent @p buffers. */
+    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
+                            std::span<merge_buffers_t> buffers, transaction_stamp_t ceiling,
                             lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        return runs_.truncate_above(reading_channel, writing_channel, ceiling, fold_, published);
+        return runs_.truncate_above(reading_channel, writing_channel, buffers, ceiling, fold_, published);
     }
 
 #pragma endregion Maintenance
@@ -1423,9 +1432,6 @@ class nvme_store {
     /** The deltas one commit of its own hands over. */
     using deltas_t = st::vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
 
-    /** The keys of a batch that neither a memory run nor the cache answered. */
-    using deferred_keys_t = st::vector<stored_key_t, constrained_allocator<stored_key_t, atomic_reference_>>;
-
   public:
     struct ingest_runs_t {
 
@@ -1440,9 +1446,6 @@ class nvme_store {
     };
 
   private:
-
-    /** The caller's request every deferred key came from. */
-    using deferred_requests_t = st::vector<std::size_t, constrained_allocator<std::size_t, atomic_reference_>>;
 
     /** One change a feed pull selected, and where the view it read holds it. */
     struct located_change_t {
@@ -1476,12 +1479,6 @@ class nvme_store {
     /** The walk a feed pull expands a range tombstone with. */
     using cursor_t =
         nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_, fold_t, device_fold_t, row_kit_t>;
-
-    /** What the tree answered for every deferred key. */
-    using deferred_answers_t = st::vector<lookup_result_t, constrained_allocator<lookup_result_t, atomic_reference_>>;
-
-    /** Bytes the tree delivered for every deferred key. */
-    using deferred_delivered_t = st::vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>>;
 
 #pragma endregion Private Types
 
@@ -1801,14 +1798,13 @@ class nvme_store {
     }
 
     /** Folds the keys of @p stored_keys that @p requests names, whose newest versions are changes, once a batched
-     *  select's reads retired, and hands each value to @p sink whole. */
+     *  select's reads retired, in @p scratch, and hands each value to @p sink whole. */
     template <typename sink_type_>
-    status_t select_folded_(io_channel_t& channel, reading_t const& read, std::span<stored_key_t const> stored_keys,
-                            std::span<std::size_t const> requests, std::span<lookup_result_t> results,
-                            sink_type_& sink) const noexcept {
+    status_t select_folded_(io_channel_t& channel, reading_t const& read, ustore_arena_t scratch,
+                            std::span<stored_key_t const> stored_keys, std::span<std::size_t const> requests,
+                            std::span<lookup_result_t> results, sink_type_& sink) const noexcept {
+        utilities::arena_allocator<byte_t> arena {scratch};
         for (std::size_t const request : requests) {
-            utilities::local_arena_t scratch;
-            utilities::arena_allocator<byte_t> arena = scratch.allocator();
             std::span<byte_t const> value;
             auto bytes_of = [&](auto const& run, std::uint64_t position, std::span<byte_t const>& bytes) noexcept {
                 return read_bytes_(channel, run, position, arena, bytes);

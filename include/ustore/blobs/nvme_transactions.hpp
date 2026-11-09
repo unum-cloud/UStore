@@ -1175,14 +1175,15 @@ concept nvme_store_concept = requires(
     st::vector<lsm_tree_run_record_t>& listed, typename store_type_::run_pool_t& run_pool,
     typename store_type_::ingest_runs_t& ingest_runs, typename store_type_::stored_key_t stored_key,
     std::span<byte_t> into, stored_value_size_t& size, typename store_type_::sealed_commit_t& sealed,
-    memory_run_claim_t& claimed, transaction_stamp_t stamp, std::size_t thread_index) {
+    memory_run_claim_t& claimed, std::span<typename store_type_::merge_buffers_t> buffers, transaction_stamp_t stamp,
+    std::size_t thread_index) {
     typename store_type_::key_slot_t;
     typename store_type_::fold_t;
     {
         store_type_::mount(volume, config, constraint, ledger, run_pool)
     } noexcept -> std::same_as<expected<store_type_>>;
     { store.restore(channel, runs) } noexcept -> std::same_as<status_t>;
-    { store.truncate_above(channel, channel, stamp, published) } noexcept -> std::same_as<status_t>;
+    { store.truncate_above(channel, channel, buffers, stamp, published) } noexcept -> std::same_as<status_t>;
     { store.destroy() } noexcept;
     { record_lsm_tree_runs(viewed.tree(), listed) } noexcept -> std::same_as<status_t>;
     { viewed.population_count() } noexcept -> std::same_as<std::uint64_t>;
@@ -1205,7 +1206,9 @@ concept nvme_store_concept = requires(
     { viewed.flush_due() } noexcept -> std::same_as<bool>;
     { store.flush(channel) } noexcept -> std::same_as<status_t>;
     { viewed.needs_compaction() } noexcept -> std::same_as<bool>;
-    { store.compact(channel, channel, compactor, published) } noexcept -> std::same_as<expected<compaction_outcome_t>>;
+    {
+        store.compact(channel, channel, buffers, compactor, published)
+    } noexcept -> std::same_as<expected<compaction_outcome_t>>;
     { store.begin_ingest() } noexcept -> std::same_as<typename store_type_::ingest_runs_t>;
     { store.publish_ingest(channel, ingest_runs) } noexcept -> std::same_as<expected<transaction_stamp_t>>;
     { store.drop_ingest(ingest_runs) } noexcept;

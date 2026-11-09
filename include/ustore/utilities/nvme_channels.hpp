@@ -491,6 +491,29 @@ class io_channel_t {
         return std::span<completion_t> {completions_};
     }
 
+    /** One block of one value's read in flight, which the caller holding the queue pair files
+     *  under its tag. */
+    struct read_piece_t {
+
+        /** Which of the caller's requests the block belongs to. */
+        std::uint32_t request = 0;
+
+        /** Bytes of the block before the value's own bytes. */
+        std::uint32_t skipped = 0;
+
+        /** Bytes of the value the block carries. */
+        std::uint32_t carried = 0;
+
+        /** Bytes of the value the blocks before this one carried. */
+        std::uint32_t offset = 0;
+    };
+
+    static_assert(sizeof(read_piece_t) == 16, "A read piece fills a quarter of a cache line");
+
+    /** Room for the piece of every read in flight, indexed by tag modulo the queue pair's depth,
+     *  which no pipeline's window reaches. */
+    [[nodiscard]] std::span<read_piece_t> read_pieces() noexcept { return std::span<read_piece_t> {read_pieces_}; }
+
     /** The next token of this channel, whose tag is unique among its in-flight requests. */
     [[nodiscard]] request_token_t next_token() noexcept { return queue_pair_.token(next_tag_++); }
 
@@ -549,6 +572,9 @@ class io_channel_t {
 
     /** The requests of those reads, the newest of which the ring may not have taken yet. */
     st::vector<request_t> read_requests_;
+
+    /** What every read in flight carries for its caller, a ring of the depth indexed by tag. */
+    st::vector<read_piece_t> read_pieces_;
 
     /** The tag the next request of this channel carries, wrapping harmlessly past the depth. */
     request_tag_t next_tag_ = 0;
@@ -708,7 +734,8 @@ class basic_io_channel_pool {
                 return status_t {status_code_t::out_of_memory_k, "A channel could not size its polling room"};
             if (channel.read_entries_.resize(config.depth) != st::status_t::success_k ||
                 channel.read_blocks_.resize(config.depth) != st::status_t::success_k ||
-                channel.read_requests_.resize(config.depth) != st::status_t::success_k)
+                channel.read_requests_.resize(config.depth) != st::status_t::success_k ||
+                channel.read_pieces_.resize(config.depth) != st::status_t::success_k)
                 return status_t {status_code_t::out_of_memory_k, "A channel could not size its read ring"};
 
             std::uint64_t const base = per_channel * index;

@@ -761,9 +761,10 @@ std::size_t compaction_drops_remove_deltas_at_the_bottom(mount_type_ const& moun
     }
 
     failures += expect(tree->needs_compaction(tree->levels()));
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
-                                                                 compaction_placement_t::host_k, {}, nullptr,
-                                                                 last_write_fold_t {}, no_device_fold_t {});
+    std::array<typename tree_t::merge_buffers_t, 1> buffers {};
+    expected<compaction_outcome_t> const outcome = tree->compact(
+        reading->channel(), writing->channel(), std::span<typename tree_t::merge_buffers_t> {buffers},
+        compaction_placement_t::host_k, {}, nullptr, last_write_fold_t {}, no_device_fold_t {});
     failures += expect(outcome.has_value());
     if (!outcome) return failures;
     failures += expect(*outcome == compaction_outcome_t::published_k);
@@ -1007,9 +1008,10 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
 
     compaction_cancellation<atomic_reference> cancellation;
     cancellation.raise();
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
-                                                                 compaction_placement_t::host_k, {}, &cancellation,
-                                                                 last_write_fold_t {}, no_device_fold_t {});
+    std::array<typename tree_t::merge_buffers_t, 1> buffers {};
+    expected<compaction_outcome_t> const outcome = tree->compact(
+        reading->channel(), writing->channel(), std::span<typename tree_t::merge_buffers_t> {buffers},
+        compaction_placement_t::host_k, {}, &cancellation, last_write_fold_t {}, no_device_fold_t {});
     failures += expect(!outcome.has_value());
     failures += expect_status(outcome, status_code_t::uninitialized_k);
 
@@ -1030,9 +1032,9 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
 
     // The same tree still compacts once nobody is cancelling it.
-    expected<compaction_outcome_t> const again = tree->compact(reading->channel(), writing->channel(),
-                                                               compaction_placement_t::host_k, {}, nullptr,
-                                                               last_write_fold_t {}, no_device_fold_t {});
+    expected<compaction_outcome_t> const again = tree->compact(
+        reading->channel(), writing->channel(), std::span<typename tree_t::merge_buffers_t> {buffers},
+        compaction_placement_t::host_k, {}, nullptr, last_write_fold_t {}, no_device_fold_t {});
     failures += expect(again.has_value());
     if (again) failures += expect(*again == compaction_outcome_t::published_k);
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
@@ -1101,9 +1103,10 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
         for (std::size_t spins = 0; spins != 64; ++spins) fu::preferred_yield_t {}(&spins, spins, std::size_t {0});
         cancellation.raise();
     }};
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
-                                                                 compaction_placement_t::host_k, {}, &cancellation,
-                                                                 last_write_fold_t {}, no_device_fold_t {});
+    std::array<typename tree_t::merge_buffers_t, 1> buffers {};
+    expected<compaction_outcome_t> const outcome = tree->compact(
+        reading->channel(), writing->channel(), std::span<typename tree_t::merge_buffers_t> {buffers},
+        compaction_placement_t::host_k, {}, &cancellation, last_write_fold_t {}, no_device_fold_t {});
     raiser.join();
 
     failures += expect_eq(writing->channel().streams().available_buffers(), lsm_config_k.stream_buffers);
@@ -1203,9 +1206,10 @@ std::size_t trivial_move_writes_nothing(mount_type_ const& mount) {
     uuid_t const content_id = flushed->content_id();
     failures += expect(flushed->size_bytes() >= slot_bytes_k);
     failures += expect(tree->needs_compaction(tree->levels()));
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
-                                                                 compaction_placement_t::host_k, {}, nullptr,
-                                                                 last_write_fold_t {}, no_device_fold_t {});
+    std::array<typename tree_t::merge_buffers_t, 1> buffers {};
+    expected<compaction_outcome_t> const outcome = tree->compact(
+        reading->channel(), writing->channel(), std::span<typename tree_t::merge_buffers_t> {buffers},
+        compaction_placement_t::host_k, {}, nullptr, last_write_fold_t {}, no_device_fold_t {});
     failures += expect(outcome.has_value());
     if (!outcome) return failures;
     failures += expect(*outcome == compaction_outcome_t::published_k);
@@ -1345,9 +1349,10 @@ std::size_t compaction_history_matches_reference(mount_type_ const& mount) {
                 for (std::size_t index = 0; index != source.level(number).size(); ++index)
                     failures += expect(before.push_back(source.level(number).run(index).content_id()) ==
                                        st::status_t::success_k);
-            expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
-                                                                         compaction_placement_t::host_k, {}, nullptr,
-                                                                         last_write_fold_t {}, no_device_fold_t {});
+            std::array<typename tree_t::merge_buffers_t, 1> buffers {};
+            expected<compaction_outcome_t> const outcome = tree->compact(
+                reading->channel(), writing->channel(), std::span<typename tree_t::merge_buffers_t> {buffers},
+                compaction_placement_t::host_k, {}, nullptr, last_write_fold_t {}, no_device_fold_t {});
             failures += expect(outcome.has_value() && *outcome == compaction_outcome_t::published_k);
             if (!outcome) break;
             ++steps;

@@ -45,7 +45,7 @@
 #include "ustore/strings/string_keys.hpp"       // `head_of`, `head_length_of`, `tail_of`, `head_prefix_bytes_k`
 #include "ustore/strings/nvme_memory_run.hpp"   // `memory_run`, `sealed_deltas`, `kept_versions`
 #include "ustore/utilities/folds.hpp"           // `last_write_fold_t`, `delta_view_t`
-#include "ustore/utilities/ram_buffers.hpp"     // `local_arena_t`, `strings_kit_concept`
+#include "ustore/utilities/ram_buffers.hpp"     // `local_arena_t`, `arena_allocator`, `strings_kit_concept`
 #include "ustore/utilities/types.hpp"           // `status_t`, `expected`, `byte_t`
 
 namespace unum::ustore::strings {
@@ -129,28 +129,6 @@ struct listed_string_t {
     ustore_key_t value {};
 };
 
-/** The strings one page of a walk read, in order, copied out of the runs, so they outlive the epoch they were read in;
- *  reused from page to page. */
-struct strings_page_t {
-
-    /** The strings back to back. */
-    st::vector<char> texts;
-
-    /** Where each string sits in @c texts, in order. */
-    st::vector<listed_string_t> listed;
-
-    /** A string put back together from a head and a tail before it lands in @c texts. */
-    st::vector<char> whole;
-
-    /** Strings the page lists. */
-    [[nodiscard]] std::size_t size() const noexcept { return listed.size(); }
-
-    /** The string at @p index. */
-    [[nodiscard]] std::string_view text(std::size_t index) const noexcept {
-        return std::string_view {texts.data() + listed[index].offset, listed[index].length};
-    }
-};
-
 #pragma endregion Pages
 
 #pragma region Store
@@ -218,6 +196,9 @@ class nvme_store {
     /** The tree the flushed strings live in. */
     using tree_t = typename published_runs_t::tree_t;
 
+    /** What one slice of a merge of that tree writes into, lent by the database. */
+    using merge_buffers_t = typename tree_t::merge_buffers_t;
+
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
 
@@ -257,6 +238,9 @@ class nvme_store {
 
     /** The view a read walks and the stamp it answers at, which every read of a call may share. */
     using reading_t = typename published_runs_t::reading_t;
+
+    /** The strings one page of a walk read, defined beside the cursors it holds. */
+    struct page_t;
 
 #pragma endregion Types
 
@@ -399,7 +383,7 @@ class nvme_store {
      *  at a time, so a commit waits for one page at most, and starts the next past the last string of the page.
      */
     status_t read_page(std::string_view prefix, std::string_view from, transaction_stamp_t stamp,
-                       std::size_t thread_index, strings_page_t& page) const noexcept {
+                       std::size_t thread_index, page_t& page) const noexcept {
         reader_t const inside = runs_.enter(thread_index);
         return read_page(reading_t {runs_.view(), stamp}, prefix, from, page);
     }
@@ -407,7 +391,7 @@ class nvme_store {
     /** As @c read_page above, through @p read, which a caller inside the ledger's epochs took for
      *  every read of a call. */
     status_t read_page(reading_t const& read, std::string_view prefix, std::string_view from,
-                       strings_page_t& page) const noexcept {
+                       page_t& page) const noexcept {
         page.texts.clear();
         page.listed.clear();
         view_t const& view = *read.view;
@@ -415,7 +399,8 @@ class nvme_store {
         level_set_t const& levels = *view.levels;
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
-        st::vector<cursor_t> cursors;
+        st::vector<cursor_t, utilities::arena_allocator<cursor_t>>& cursors = page.cursors;
+        cursors.clear();
         if (cursors.reserve(runs) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A walk could not hold a cursor per run"};
         for (memory_run_t const* run : view.memory_runs.runs()) {
@@ -473,7 +458,7 @@ class nvme_store {
      *  page's last string as the next one's @p below.
      */
     status_t read_page_down(std::string_view prefix, std::string_view below, transaction_stamp_t stamp,
-                            std::size_t thread_index, strings_page_t& page) const noexcept {
+                            std::size_t thread_index, page_t& page) const noexcept {
         reader_t const inside = runs_.enter(thread_index);
         return read_page_down(reading_t {runs_.view(), stamp}, prefix, below, page);
     }
@@ -481,7 +466,7 @@ class nvme_store {
     /** As @c read_page_down above, through @p read, which a caller inside the ledger's epochs took
      *  for every read of a call. */
     status_t read_page_down(reading_t const& read, std::string_view prefix, std::string_view below,
-                            strings_page_t& page) const noexcept {
+                            page_t& page) const noexcept {
         page.texts.clear();
         page.listed.clear();
         view_t const& view = *read.view;
@@ -489,9 +474,11 @@ class nvme_store {
         level_set_t const& levels = *view.levels;
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
-        st::vector<cursor_t> cursors;
-        st::vector<std::uint64_t> starts;
-        if (cursors.reserve(runs) != st::status_t::success_k || starts.resize(runs) != st::status_t::success_k)
+        st::vector<cursor_t, utilities::arena_allocator<cursor_t>>& cursors = page.cursors;
+        st::vector<std::uint64_t, utilities::arena_allocator<std::uint64_t>>& starts = page.starts;
+        cursors.clear();
+        if (cursors.reserve(runs) != st::status_t::success_k ||
+            starts.resize(st::assume_uninitialized, runs) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A walk could not hold a cursor per run"};
         for (memory_run_t const* run : view.memory_runs.runs()) {
             cursor_t cursor;
@@ -871,17 +858,20 @@ class nvme_store {
      *      runs as one.
      */
     expected<compaction_outcome_t> compact(
-        io_channel_t& reading_channel, io_channel_t& writing_channel, blobs::compactor_ref_t const& compactor,
+        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<merge_buffers_t> buffers,
+        blobs::compactor_ref_t const& compactor,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
         blobs::compaction_fan_out_t const& fan_out = blobs::compaction_fan_out_t {}) noexcept {
-        return runs_.compact(reading_channel, writing_channel, compactor, fold_, blobs::no_device_fold_t {}, published,
-                             fan_out);
+        return runs_.compact(reading_channel, writing_channel, buffers, compactor, fold_, blobs::no_device_fold_t {},
+                             published, fan_out);
     }
 
-    /** Drops every version a mount found stamped above @p ceiling, which only a store holding no memory run takes. */
-    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel, transaction_stamp_t ceiling,
+    /** Drops every version a mount found stamped above @p ceiling, which only a store holding no
+     *  memory run takes, merging into the lent @p buffers. */
+    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
+                            std::span<merge_buffers_t> buffers, transaction_stamp_t ceiling,
                             lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        return runs_.truncate_above(reading_channel, writing_channel, ceiling, fold_, published);
+        return runs_.truncate_above(reading_channel, writing_channel, buffers, ceiling, fold_, published);
     }
 
 #pragma endregion Maintenance
@@ -976,6 +966,38 @@ class nvme_store {
 
         /** The last string laid out, which the next one must ascend past. */
         st::vector<char> last;
+    };
+
+    /** The strings one page of a walk read, in order, copied out of the runs so they outlive the
+     *  epoch they were read in, and a cursor per run the page merges, all carved from the walk's
+     *  scratch and reused by every page of the walk. */
+    struct page_t {
+
+        explicit page_t(ustore_arena_t scratch) noexcept
+            : texts {{scratch}}, listed {{scratch}}, whole {{scratch}}, cursors {{scratch}}, starts {{scratch}} {}
+
+        /** The strings back to back. */
+        st::vector<char, utilities::arena_allocator<char>> texts;
+
+        /** Where each string sits in @c texts, in order. */
+        st::vector<listed_string_t, utilities::arena_allocator<listed_string_t>> listed;
+
+        /** A string put back together from a head and a tail before it lands in @c texts. */
+        st::vector<char, utilities::arena_allocator<char>> whole;
+
+        /** One cursor per run the page merges. */
+        st::vector<cursor_t, utilities::arena_allocator<cursor_t>> cursors;
+
+        /** Where each cursor of a descending page starts on the string it lists. */
+        st::vector<std::uint64_t, utilities::arena_allocator<std::uint64_t>> starts;
+
+        /** Strings the page lists. */
+        [[nodiscard]] std::size_t size() const noexcept { return listed.size(); }
+
+        /** The string at @p index. */
+        [[nodiscard]] std::string_view text(std::size_t index) const noexcept {
+            return std::string_view {texts.data() + listed[index].offset, listed[index].length};
+        }
     };
 
   private:
@@ -1145,7 +1167,7 @@ class nvme_store {
      *  the newest; a range tombstone hiding it lists a removal.
      */
     static status_t list_key_(std::span<cursor_t> cursors, st::key128_t const& head, std::string_view tail,
-                              transaction_stamp_t stamp, view_t const& view, strings_page_t& page) noexcept {
+                              transaction_stamp_t stamp, view_t const& view, page_t& page) noexcept {
         listed_string_t listed;
         found_t version_found;
         bool taken = false;

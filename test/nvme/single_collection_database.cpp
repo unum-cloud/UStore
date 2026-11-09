@@ -1080,7 +1080,8 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     }
     failures += expect((*store)->memory_deltas_count() != 0);
 
-    expected<variable_cursor_t> scan = variable_cursor_t::over((*store)->records());
+    utilities::local_arena_t walk;
+    expected<variable_cursor_t> scan = variable_cursor_t::over((*store)->records(), walk.allocator().arena);
     failures += expect(scan.has_value());
     if (!scan) return failures;
 

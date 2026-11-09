@@ -39,7 +39,7 @@
 #include "ustore/graph/nvme_store.hpp"                 // `graph::nvme_store`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
 #include "ustore/pages/nvme_store.hpp"                 // `pages::nvme_store`
-#include "ustore/strings/nvme_store.hpp"               // `strings::nvme_store`, `nvme_transaction`, `strings_page_t`
+#include "ustore/strings/nvme_store.hpp"               // `strings::nvme_store`, `nvme_transaction`, `strings_page_k`
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`, `join_path`, `path_max_bytes_k`, `remove_file`
 #include "ustore/utilities/nvme_mounts.hpp" // `resources_config_t`, `open_resources`, `mounted_storage`, `addresses_of`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_copy`, `growing_strings`, `growth_status`
@@ -862,7 +862,7 @@ status_t walk(call_access<cpu_class_> const& access, collection_id_t collection,
         return with_reading(access, collection, access.thread_index,
                             [&](collection_reading_of<cpu_class_> const& reading) noexcept {
                                 return store.scan(
-                                    reading, from,
+                                    reading, access.scratch, from,
                                     [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
                                         return state != lookup_result_t::written_k || visitor(key, size);
                                     },
@@ -911,7 +911,7 @@ status_t walk(call_access<cpu_class_> const& access, collection_id_t collection,
     };
     // The store's side is what the transaction started at, which its reads of single keys answer too
     status_t const walked = store.scan(
-        collection, from,
+        collection, access.scratch, from,
         [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
             for (; next != own_writes.size() && before(own_writes[next].key, key); ++next)
                 if (!emit_own(own_writes[next])) return false;
@@ -1285,8 +1285,8 @@ status_t read_string(call_access<cpu_class_> const& access, collection_id_t coll
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t walk_strings(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view prefix,
                       std::string_view start, visitor_type_&& visitor) noexcept {
-    strings_page_t page;
-    st::vector<char> from;
+    typename strings_store_of<cpu_class_>::page_t page {access.scratch};
+    st::vector<char, arena_allocator<char>> from {{access.scratch}};
     std::string_view const first = std::max(start, prefix);
     if (from.resize(first.size()) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "A walk could not hold where it starts"};
@@ -1316,8 +1316,8 @@ status_t walk_strings(call_access<cpu_class_> const& access, collection_id_t col
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t walk_strings_down(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view prefix,
                            std::string_view below, visitor_type_&& visitor) noexcept {
-    strings_page_t page;
-    st::vector<char> until;
+    typename strings_store_of<cpu_class_>::page_t page {access.scratch};
+    st::vector<char, arena_allocator<char>> until {{access.scratch}};
     if (until.resize(below.size()) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "A walk could not hold where it starts"};
     if (!below.empty()) std::memcpy(until.data(), below.data(), below.size());

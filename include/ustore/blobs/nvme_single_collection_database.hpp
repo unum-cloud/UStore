@@ -19,6 +19,7 @@
 #include <cstdint> // `std::uint16_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
+#include <array>       // `std::array`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
@@ -709,7 +710,7 @@ class basic_single_collection_database {
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = this;
-        return collection_.compact(writing_channel_, merging_channel_, compactor_, published);
+        return collection_.compact(writing_channel_, merging_channel_, lent_merge_buffers_(), compactor_, published);
     }
 
     /** How many memory runs the collection holds, and how many commits they hold. */
@@ -725,7 +726,8 @@ class basic_single_collection_database {
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = this;
-        return collection_.truncate_above(writing_channel_, merging_channel_, ceiling, published);
+        return collection_.truncate_above(writing_channel_, merging_channel_, lent_merge_buffers_(), ceiling,
+                                          published);
     }
 
     /** Pins the newest published stamp, at which every read through the snapshot answers, and flushes nothing. */
@@ -944,8 +946,8 @@ class basic_single_collection_database {
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = this;
-        if (status_t const truncated = collection_.truncate_above(writing_channel_, merging_channel_, durable_stamp,
-                                                                  published);
+        if (status_t const truncated = collection_.truncate_above(writing_channel_, merging_channel_,
+                                                                  lent_merge_buffers_(), durable_stamp, published);
             truncated.failed()) {
             published_generation_ = 0;
             return truncated;
@@ -1003,6 +1005,11 @@ class basic_single_collection_database {
         return {};
     }
 
+    /** The buffers lent to the merge the caller claimed. */
+    std::span<typename collection_t::merge_buffers_t> lent_merge_buffers_() noexcept {
+        return std::span<typename collection_t::merge_buffers_t> {merge_buffers_};
+    }
+
     /** Flushes the memory runs, publishes the manifest naming the run, and compacts the tree while
      *  the flush left a level over its bounds, holding the claim. */
     status_t flush_and_compact_() noexcept {
@@ -1012,8 +1019,8 @@ class basic_single_collection_database {
         published.notify = &record_manifest_;
         published.context = this;
         while (collection_.needs_compaction()) {
-            auto [outcome, compact_status] = collection_.compact(writing_channel_, merging_channel_, compactor_,
-                                                                 published);
+            auto [outcome, compact_status] = collection_.compact(writing_channel_, merging_channel_,
+                                                                 lent_merge_buffers_(), compactor_, published);
             if (compact_status.failed()) return compact_status;
             if (outcome == compaction_outcome_t::nothing_to_compact_k) break;
         }
@@ -1226,6 +1233,9 @@ class basic_single_collection_database {
 
     /** What every merge runs on, picked at open: the calling thread, or a device compactor the opener owns. */
     compactor_ref_t compactor_;
+
+    /** The one slice of buffers every merge of the collection writes into, under the claim. */
+    std::array<typename collection_t::merge_buffers_t, 1> merge_buffers_ {};
 
     /** The budget the manifests this database prints are charged to. */
     resources_shared_ptr<atomic_reference_, waiter_type_> resources_;

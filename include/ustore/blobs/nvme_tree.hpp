@@ -241,8 +241,14 @@ class lsm_tree {
     /** The word a caller raises to stop a merge. */
     using cancellation_t = compaction_cancellation<atomic_reference_>;
 
+    /** What one slice of a merge writes into, which the database lends every merge it claims. */
+    using merge_buffers_t = typename merger_t::merge_buffers_t;
+
     /** The pipeline a batched read refills. */
     using read_pipeline_t = basic_read_pipeline<disk_t>;
+
+    /** One block of one value's read in flight, filed in its channel's ring under its tag. */
+    using read_piece_t = io_channel_t::read_piece_t;
 
     /** How the values of this tree are stored. */
     static constexpr value_layout_t value_layout_k = key_slot_t::value_layout_k;
@@ -309,8 +315,7 @@ class lsm_tree {
     lsm_tree(lsm_tree&& other) noexcept
         : volume_(std::exchange(other.volume_, nullptr)), runs_(std::exchange(other.runs_, nullptr)),
           config_(other.config_), slot_bytes_(other.slot_bytes_), level_sets_(std::move(other.level_sets_)),
-          current_level_set_(other.current_level_set_), compacting_(other.compacting_),
-          merge_buffers_(std::move(other.merge_buffers_)) {}
+          current_level_set_(other.current_level_set_), compacting_(other.compacting_) {}
 
     lsm_tree& operator=(lsm_tree&& other) noexcept {
         if (this == &other) return *this;
@@ -322,7 +327,6 @@ class lsm_tree {
         level_sets_ = std::move(other.level_sets_);
         current_level_set_ = other.current_level_set_;
         compacting_ = other.compacting_;
-        merge_buffers_ = std::move(other.merge_buffers_);
         return *this;
     }
 
@@ -437,17 +441,17 @@ class lsm_tree {
             if (block_bytes == 0)
                 return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
-            std::size_t const depth = channel.queue_pair().depth();
-            st::vector<pending_read_t> pending;
-            if (pending.resize(depth) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A tree could not track its reads in flight"};
+            if (stored_keys.size() > std::numeric_limits<std::uint32_t>::max())
+                return {status_code_t::invalid_argument_k, "A batched read takes at most 2^32 keys"};
+            std::span<read_piece_t> const pieces = channel.read_pieces();
+            std::size_t const depth = pieces.size();
 
             auto [reader_channel, reader_channel_status] = channel.acquire();
             if (reader_channel_status.failed()) return reader_channel_status;
             read_pipeline_t reader {volume_->disk(), std::move(reader_channel), medium_reference_t {}};
             status_t first;
             auto adapter = [&](completed_buffer_t const& completed) noexcept {
-                pending_read_t const& piece = pending[completed.tag % depth];
+                read_piece_t const& piece = pieces[completed.tag % depth];
                 if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                     if (first.succeeded()) first = whole;
                     return;
@@ -480,7 +484,7 @@ class lsm_tree {
                     std::uint64_t const at = chunk * block_bytes;
                     std::uint64_t const room = window.extent.length - at;
                     std::uint64_t const length = block_bytes < room ? block_bytes : room;
-                    pending[tag % depth] = piece_of_(window, request, at, length);
+                    pieces[tag % depth] = piece_of_(window, request, at, length);
                     extent_t const piece {window.extent.offset + at, length};
                     if (status_t const queued = reader.enqueue_read(medium, piece, tag); queued.failed()) {
                         if (reader.outstanding() == 0) return queued;
@@ -645,6 +649,8 @@ class lsm_tree {
      *      publishes the result.
      *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
+     *  @param[in,out] buffers What each slice writes into, one per slice of @p fan_out or more,
+     *      lent by the owner that serializes merges.
      *  @param[in] placement Where the compaction runs, which a collection leaves automatic.
      *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device
      *      compactor.
@@ -663,17 +669,17 @@ class lsm_tree {
      */
     template <utilities::fold_concept fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(
-        io_channel_t& reading_channel, io_channel_t& writing_channel, compaction_placement_t placement,
-        compactor_ref_t const& compactor, cancellation_t const* cancellation, fold_type_ const& fold,
-        device_fold_type_ const& device_fold,
+        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<merge_buffers_t> buffers,
+        compaction_placement_t placement, compactor_ref_t const& compactor, cancellation_t const* cancellation,
+        fold_type_ const& fold, device_fold_type_ const& device_fold,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
         compaction_stamps_t const& stamps = compaction_stamps_t {},
         compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
         if (!claim_compaction_()) return compaction_outcome_t::nothing_to_compact_k;
 
         expected<compaction_outcome_t> const outcome = compact_once_(
-            reading_channel, writing_channel, placement, compactor, cancellation, fold, device_fold, published, stamps,
-            fan_out, merge_choice_t::overfull_k);
+            reading_channel, writing_channel, buffers, placement, compactor, cancellation, fold, device_fold, published,
+            stamps, fan_out, merge_choice_t::overfull_k);
         atomic_reference_<std::int32_t> {compacting_}.store(static_cast<std::int32_t>(compaction_state_t::idle_k),
                                                             std::memory_order_release);
         return outcome;
@@ -688,8 +694,8 @@ class lsm_tree {
      *  only commits that landed whole.
      */
     template <utilities::fold_concept fold_type_>
-    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel, std::uint64_t ceiling,
-                            fold_type_ const& fold,
+    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
+                            std::span<merge_buffers_t> buffers, std::uint64_t ceiling, fold_type_ const& fold,
                             lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
         if (!claim_compaction_()) return {status_code_t::invalid_argument_k, "A mount truncates a tree nobody merges"};
         compaction_stamps_t stamps;
@@ -700,7 +706,7 @@ class lsm_tree {
         while (result.succeeded() && above_(levels(), ceiling) != levels().size()) {
             // A mount truncates on the host, so no device composes a change
             expected<compaction_outcome_t> const outcome = compact_once_(
-                reading_channel, writing_channel, compaction_placement_t::host_k, {}, nullptr, fold,
+                reading_channel, writing_channel, buffers, compaction_placement_t::host_k, {}, nullptr, fold,
                 no_device_fold_t {}, published, stamps, compaction_fan_out_t {}, merge_choice_t::above_ceiling_k);
             if (!outcome) result = outcome.status();
         }
@@ -724,22 +730,6 @@ class lsm_tree {
         /** Runs of the shallowest level holding a version above the ceiling of
          *  the pass's stamps. */
         above_ceiling_k,
-    };
-
-    /** One block of one value's read, kept until its completion carries the block back. */
-    struct pending_read_t {
-
-        /** Which of the caller's requests this block belongs to. */
-        std::size_t request = 0;
-
-        /** Bytes of the block before the value's own bytes. */
-        std::uint32_t skipped = 0;
-
-        /** Bytes of the value this block carries. */
-        std::uint32_t carried = 0;
-
-        /** Bytes of the value that the blocks before this one carried. */
-        std::uint64_t offset = 0;
     };
 
     /** The runs one pass consumes: those of the upper level first, then those
@@ -775,17 +765,17 @@ class lsm_tree {
 #pragma region Private Methods
 
     /** The piece of @p window that the block at @p at of @p length carries, for @p request. */
-    [[nodiscard]] static pending_read_t piece_of_(value_window_t const& window, std::size_t request, std::uint64_t at,
-                                                  std::uint64_t length) noexcept {
+    [[nodiscard]] static read_piece_t piece_of_(value_window_t const& window, std::size_t request, std::uint64_t at,
+                                                std::uint64_t length) noexcept {
         std::uint64_t const wanted_first = window.skipped;
         std::uint64_t const wanted_last = window.skipped + window.bytes;
         std::uint64_t const first = at > wanted_first ? at : wanted_first;
         std::uint64_t const last = at + length < wanted_last ? at + length : wanted_last;
-        pending_read_t piece;
-        piece.request = request;
+        read_piece_t piece;
+        piece.request = static_cast<std::uint32_t>(request);
         piece.skipped = static_cast<std::uint32_t>(first - at);
         piece.carried = static_cast<std::uint32_t>(last > first ? last - first : 0);
-        piece.offset = first - wanted_first;
+        piece.offset = static_cast<std::uint32_t>(first - wanted_first);
         return piece;
     }
 
@@ -1079,9 +1069,9 @@ class lsm_tree {
      *  keeps to one thread. */
     template <typename fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact_once_(io_channel_t& reading_channel, io_channel_t& writing_channel,
-                                                 compaction_placement_t placement, compactor_ref_t const& compactor,
-                                                 cancellation_t const* cancellation, fold_type_ const& fold,
-                                                 device_fold_type_ const& device_fold,
+                                                 std::span<merge_buffers_t> buffers, compaction_placement_t placement,
+                                                 compactor_ref_t const& compactor, cancellation_t const* cancellation,
+                                                 fold_type_ const& fold, device_fold_type_ const& device_fold,
                                                  lsm_tree_publication_hook_t const& published,
                                                  compaction_stamps_t const& stamps, compaction_fan_out_t const& fan_out,
                                                  merge_choice_t choice) noexcept {
@@ -1121,10 +1111,9 @@ class lsm_tree {
         request.compactor = compactor;
         request.cancellation = cancellation;
         request.stamps = stamps;
-        if (merge_buffers_.size() < fan_out.slices() &&
-            merge_buffers_.resize(fan_out.slices()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A tree could not keep buffers for every slice"};
-        request.buffers = std::span<typename merger_t::merge_buffers_t> {merge_buffers_};
+        if (buffers.size() < fan_out.slices())
+            return status_t {status_code_t::invalid_argument_k, "A merge is lent buffers for every slice"};
+        request.buffers = buffers.first(fan_out.slices());
         request.fan_out = fan_out;
 
         auto [merged, merge_status] = merger_t::merge(*volume_, *runs_, reading_channel, writing_channel, request, fold,
@@ -1167,10 +1156,6 @@ class lsm_tree {
 
     /** A @c compaction_state_t, moved by @c claim_compaction_ alone. */
     std::int32_t compacting_ = 0;
-
-    /** What one merge leaves for the next, one per slice, which the compaction claim keeps to one
-     *  merge at a time. */
-    st::vector<typename merger_t::merge_buffers_t> merge_buffers_;
 
 #pragma endregion Private Members
 };
