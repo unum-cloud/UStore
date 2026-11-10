@@ -202,7 +202,7 @@ A transaction watches the keys it reads and writes, and a commit fails when anot
 
 A snapshot is an opaque handle pinning a consistent view of the whole database for reads, and `db.snapshot()` returns an `expected<snapshot_t>` that reads through it and frees it when it goes.
 `snapshot.save(path)` writes exactly what the snapshot sees out as a new database of the same engine.
-Spin models in [`verification/`](https://github.com/unum-cloud/UStore/tree/main/verification) check the ring's completion credit, the one-issuer rule that moves a queue pair between threads, and the write, flush, record and sync order behind durability; model-checking the commit protocol under GenMC is a v1 target.
+Spin models in [`verification/`](https://github.com/unum-cloud/UStore/tree/main/verification) check the ring's completion credit, the one-issuer rule that moves a queue pair between threads, and the write, flush, record and sync order behind durability.
 
 ### Durability
 
@@ -228,7 +228,7 @@ Every engine implements the same C ABI of `c/ustore/db.h`, `c/ustore/blobs.h` an
 | Engine    | Role                  | Storage                        | Transactions | Snapshots | Collections |
 | :-------- | :-------------------- | :----------------------------- | :----------- | :-------- | :---------- |
 | `ram`     | reference, in memory  | memory, with an optional image | yes          | yes       | yes         |
-| `nvme`    | hyper-converged, v1   | LSM trees on NVMe or files     | yes          | yes       | yes         |
+| `nvme`    | hyper-converged       | LSM trees on NVMe or files     | yes          | yes       | yes         |
 | `rocksdb` | baseline, third-party | LSM tree on a filesystem       | yes          | yes       | yes         |
 | `leveldb` | baseline, third-party | LSM tree on a filesystem       | no           | yes       | yes         |
 
@@ -245,12 +245,13 @@ The C++ `database_t` exposes the capability bits as `supports_transactions`, `su
 `ustore_database_clear` empties every collection at once, and `ustore_database_compact` reclaims the space overwritten and removed data still takes.
 NVMe builds behind `USTORE_WITH_NVME`, which is off by default and on in the presets that test it.
 It runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_CUDA_ARCH`; [`src/nvme/README.md`](https://github.com/unum-cloud/UStore/blob/main/src/nvme/README.md) describes its layers.
+Each io_uring ring registers its buffers where `RLIMIT_MEMLOCK` allows and addresses them by pointer otherwise, staying on io_uring either way.
 A database on NVMe is a `<database>.ustore.json` manifest and one `.ustore` file per sorted run, on filesystems or in 1 GB slots of raw drives, as [`docs/format.md`](https://github.com/unum-cloud/UStore/blob/main/docs/format.md) describes.
 
 ## Compatibility
 
-Builds target the baseline instruction set of each architecture, so one artifact runs on any CPU of it, and v1 picks the fastest SIMD kit the CPU supports once, when a database or structure opens.
-The C headers are C11, checked by `c/test.c` under every platform's compiler against both libraries, while the C++ headers and the engines need C++20, and the CPython core is C11.
+Builds target the baseline instruction set of each architecture, so one artifact runs on any CPU of it.
+The C headers are C11, checked by `c/test.c` under every platform's compiler against both libraries, while the C++ headers and the engines need C++20, and the CPython core is C11, with Pandas and NetworkX adapters on top.
 
 | Platform       | C ABI and `ram` | RocksDB | LevelDB | NVMe     | Python | Rust |
 | :------------- | :-------------: | :-----: | :-----: | :------- | :----: | :--: |
@@ -260,8 +261,8 @@ The C headers are C11, checked by `c/test.c` under every platform's compiler aga
 | Windows x86-64 |       ✅        |   ✅    |   ✅    | untested |   ✅   |  ✅  |
 
 Every column but NVMe is exercised by CI on all four platforms: `.github/workflows/prerelease.yml` builds and tests the C ABI and each engine, the Python extension and the Rust crate.
-The NVMe column records the suites in [`test/`](https://github.com/unum-cloud/UStore/tree/main/test) on two Linux x86-64 machines rather than CI, which does not build NVMe yet; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP and is mounted by the engine.
-GPU compaction targets NVIDIA Hopper and Blackwell alike, and its output must match CPU compaction on the same runs.
+The NVMe column records the suites in [`test/`](https://github.com/unum-cloud/UStore/tree/main/test) on two Linux x86-64 machines rather than CI, which does not build NVMe; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP and is mounted by the engine.
+GPU compaction targets NVIDIA Hopper and Blackwell alike, launches three kernels per merge through the CUDA driver API without linking the CUDA runtime, and its output must match CPU compaction on the same runs.
 The engines and the layout of `src/` are described in [`src/README.md`](https://github.com/unum-cloud/UStore/blob/main/src/README.md).
 
 ### Why Not RocksDB
@@ -283,18 +284,6 @@ Map strings onto keys once, at the edge of the application, and address document
 
 Value lengths are `ustore_length_t`, a 64-bit unsigned integer, and a batch of values is one `ustore_strings_view_t`: an Apache Arrow tape of 32-bit offsets as in `binary`, of 64-bit offsets as in `large_binary`, or an accessor callback over any other layout.
 A call writes its tapes with 32-bit offsets while the bytes fit in 4 GB and 64-bit beyond, so neither one value nor one batch stops at 4 GB.
-
-## Roadmap to v1
-
-- __Keys__ — today 128-bit UUID keys and UUIDv7 collection identifiers on every engine, NVMe included; v1 adds time-ordered UUIDv7 keys for local inserts.
-- __The `ram` engine__ — today `strict_serializable` or `snapshot` at open, with binary image persistence; v1 targets the conformance suite passing at both levels, every level proven by anomaly tests.
-- __RocksDB, LevelDB__ — today built against their current headers; v1 targets the same conformance suite, each reporting the isolation it delivers.
-- __NVMe__ — today on the current C ABI over blocking and io_uring transports with GPU compaction wired in, each database a manifest and its run files, on filesystems or raw slots; v1 targets the graph as two collections of one database, backup and export by syncing the run files, and CI on every platform.
-- __Kernel bypass__ — today io_uring on files and block devices, with registered buffers where the memlock cap allows and plain pointers otherwise, and an SPDK transport passing the shared ring cases over NVMe/TCP; v1 targets NVMe passthrough.
-- __SIMD point lookups__ — today the sorted-run index is searched on SmashTable's kits; v1 targets one kit chosen per artifact at open.
-- __GPU__ — today LSM compaction in three kernels per merge, launched through the driver with no CUDA runtime, reached from the engine when built with CUDA, with the host and device merges checked to agree byte for byte on every transport; GPUDirect Storage reads runs from drives into GPU memory for compaction.
-- __Bindings__ — today a raw CPython core in C11 with Pandas and NetworkX adapters, and a Rust crate over the same C ABI; v1 adds an executor for the NVMe engine to both.
-- __Platforms__ — today CI builds and tests the C ABI, `ram`, RocksDB, LevelDB, the Python extension and the Rust crate on Linux x86-64, Linux AArch64, macOS arm64 and Windows x86-64; v1 adds NVMe to that matrix once it builds.
 
 ## Repository Layout
 

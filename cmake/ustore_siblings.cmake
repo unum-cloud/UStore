@@ -45,13 +45,13 @@ endforeach ()
 # ForkUnion's C ABI, linked statically into every engine and suite
 ustore_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
-    9a69946aa5e9a8cbe56b51dab1dfae7f2281537d
+    ce67be6511ce8cfc4b139b3e7266ec0e5edc372c
 )
 
 # SmashTable's containers, header-only
 ustore_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable.git
-    788a94f7baef9eae8923009a444fb6b3dae5f8c4
+    30e349dcd1e582896386d959d4a36badce061787
 )
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
@@ -59,5 +59,5 @@ ustore_sibling(
 # numkong::header link, once something includes its headers.
 ustore_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla.git
-    8b16eea7891d5df9f44706972112d739917b5bf3
+    ff22abca2e1f271f37bd8cb10174bc9dd37ed4e7
 )

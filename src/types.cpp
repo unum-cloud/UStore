@@ -10,13 +10,12 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::find`, `std::reverse`
-#include <array>       // `std::array`
-#include <new>         // `std::nothrow`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
-#include <utility>     // `std::move`
-#include <variant>     // `std::variant`, `std::get_if`, `std::visit`
+#include <algorithm> // `std::find`, `std::reverse`
+#include <array>     // `std::array`
+#include <new>       // `std::nothrow`
+#include <span>      // `std::span`
+#include <utility>   // `std::move`
+#include <variant>   // `std::variant`, `std::get_if`, `std::visit`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
