@@ -130,49 +130,116 @@
 
 #include <stdint.h> // `uint8_t`, `uint32_t`, `uint64_t`
 
-/** Whether the target is Windows, as 1 or 0; no other file reads the compiler's macro. */
-#if defined(_WIN32)
-#define USTORE_OS_WINDOWS_ 1
-#else
-#define USTORE_OS_WINDOWS_ 0
+#pragma region Platform Identity
+
+/*  Derived once from the OS predefines, which no other file reads and no build sets. */
+#if defined(USTORE_OS_LINUX_) || defined(USTORE_OS_APPLE_) || defined(USTORE_OS_WINDOWS_) || \
+    defined(USTORE_OS_FREEBSD_) || defined(USTORE_OS_POSIX_)
+#error "USTORE_OS_*_ are identity, derived from the compiler; set a USTORE_WITH_* facility instead"
 #endif
 
-/** Whether the target is Linux, as 1 or 0; no other file reads the compiler's macro. */
+/** Whether the kernel is Linux, Android included, as 1 or 0. */
 #if defined(__linux__)
 #define USTORE_OS_LINUX_ 1
 #else
 #define USTORE_OS_LINUX_ 0
 #endif
 
-/** Whether the target is an Apple platform, as 1 or 0; no other file reads the compiler's macro. */
+/** Whether the kernel is Darwin: macOS, iOS, tvOS, watchOS or visionOS, as 1 or 0. */
 #if defined(__APPLE__)
 #define USTORE_OS_APPLE_ 1
 #else
 #define USTORE_OS_APPLE_ 0
 #endif
 
+/** Whether the target is Windows, MinGW included and Cygwin not, as 1 or 0. */
+#if defined(_WIN32)
+#define USTORE_OS_WINDOWS_ 1
+#else
+#define USTORE_OS_WINDOWS_ 0
+#endif
+
+/** Whether the kernel is FreeBSD, as 1 or 0. */
+#if defined(__FreeBSD__)
+#define USTORE_OS_FREEBSD_ 1
+#else
+#define USTORE_OS_FREEBSD_ 0
+#endif
+
+/** Whether the POSIX interfaces exist: Linux, Darwin, FreeBSD or Cygwin, as 1 or 0. */
+#if USTORE_OS_LINUX_ || USTORE_OS_APPLE_ || USTORE_OS_FREEBSD_ || defined(__CYGWIN__)
+#define USTORE_OS_POSIX_ 1
+#else
+#define USTORE_OS_POSIX_ 0
+#endif
+
+#if USTORE_OS_LINUX_ + USTORE_OS_APPLE_ + USTORE_OS_WINDOWS_ + USTORE_OS_FREEBSD_ > 1
+#error "Two operating-system identities hold at once"
+#endif
+#if USTORE_OS_POSIX_ && USTORE_OS_WINDOWS_
+#error "POSIX and Windows identities hold at once"
+#endif
+
+#pragma endregion Platform Identity
+
+#pragma region Facilities
+
+/** Whether the in-tree NVMe engine is linked, as 1 or 0, which the library target passes on. */
+#if !defined(USTORE_WITH_NVME)
+#define USTORE_WITH_NVME 0
+#endif
+
+/** Whether the RocksDB engine is linked, as 1 or 0, which the library target passes on. */
+#if !defined(USTORE_WITH_ROCKSDB)
+#define USTORE_WITH_ROCKSDB 0
+#endif
+
+/** Whether the LevelDB engine is linked, as 1 or 0, which the library target passes on. */
+#if !defined(USTORE_WITH_LEVELDB)
+#define USTORE_WITH_LEVELDB 0
+#endif
+
+/** Whether SPDK's user-space NVMe driver is linked, as 1 or 0; its interface target passes it. */
+#if !defined(USTORE_WITH_LINUX_SPDK)
+#define USTORE_WITH_LINUX_SPDK 0
+#endif
+#if USTORE_WITH_LINUX_SPDK && !USTORE_OS_LINUX_
+#error "USTORE_WITH_LINUX_SPDK needs Linux"
+#endif
+
+/** Whether this unit builds the shared library, as 1 or 0. */
+#if !defined(USTORE_EXPORTING)
+#define USTORE_EXPORTING 0
+#endif
+
+/** Whether this unit links the shared library rather than the archive, as 1 or 0. */
+#if !defined(USTORE_SHARED)
+#define USTORE_SHARED 0
+#endif
+
 /**
  *  @brief Marks every function the library exports, and nothing else.
  *
- *  On Windows it exports from the shared library, which builds with @c USTORE_EXPORTING, imports where a consumer of
- *  that library defines @c USTORE_SHARED, as linking @c ustore::shared does, and expands to nothing for the static
- *  library. GCC and Clang give the function default visibility, so it survives @c -fvisibility=hidden.
+ *  On Windows it exports from the shared library, which builds with @c USTORE_EXPORTING, imports
+ *  where a consumer of that library sets @c USTORE_SHARED, as linking @c ustore::shared does, and
+ *  expands to nothing for the static library. GCC and Clang give the function default visibility,
+ *  so it survives @c -fvisibility=hidden.
  */
 #if !defined(USTORE_EXPORT)
-#if USTORE_OS_WINDOWS_ || defined(__CYGWIN__)
-#if defined(USTORE_EXPORTING)
+#if USTORE_OS_WINDOWS_ && USTORE_EXPORTING
 #define USTORE_EXPORT __declspec(dllexport)
-#elif defined(USTORE_SHARED)
+#elif USTORE_OS_WINDOWS_ && USTORE_SHARED
 #define USTORE_EXPORT __declspec(dllimport)
-#else
+#elif USTORE_OS_WINDOWS_
 #define USTORE_EXPORT
-#endif
 #elif defined(__GNUC__) || defined(__clang__)
 #define USTORE_EXPORT __attribute__((visibility("default")))
 #else
 #define USTORE_EXPORT
 #endif
 #endif
+
+#pragma endregion Facilities
 
 /** The major version of UStore, which changes when the C ABI breaks. */
 #define USTORE_VERSION_MAJOR 1

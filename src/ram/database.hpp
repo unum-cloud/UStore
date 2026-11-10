@@ -8,28 +8,18 @@
 
 #pragma once
 
-#include <cerrno>  // `errno`, `ENOENT`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
-#include <cstdio>  // `std::FILE`, `std::fopen`, `std::fread`, `std::fwrite`, `std::rename`
-#include <cstring> // `std::memcmp`
+#include <cstring> // `std::memcmp`, `std::memcpy`
 
 #include <algorithm>   // `std::partition_point`
 #include <array>       // `std::array`
 #include <new>         // `std::nothrow`
+#include <span>        // `std::span`, `std::as_bytes`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`, `std::remove_cvref_t`
 #include <utility>     // `std::exchange`, `std::move`
 #include <variant>     // `std::in_place_type`, `std::variant`, `std::visit`
-
-#include "ustore/types.h" // `USTORE_OS_WINDOWS_`
-
-#if USTORE_OS_WINDOWS_
-#include <io.h>      // `_commit`, `_fileno`
-#include <windows.h> // `MoveFileExA`
-#else
-#include <unistd.h> // `fsync`
-#endif
 
 #include <smashtable/basic_avl_tree.hpp>
 #include <smashtable/basic_vector.hpp>
@@ -47,7 +37,7 @@
 #include "ustore/pages/ram_store.hpp"          // `pages::page_pair_t`, `pages_by_key_store`
 #include "ustore/strings/ram_store.hpp"        // `string_pair_t`, `keys_by_string_store`, `string_key_from`
 #include "ustore/strings/string_keys.hpp"      // `string_key_t`, `blob_t`
-#include "ustore/utilities/blocking_files.hpp" // `directory_exists`
+#include "ustore/utilities/blocking_files.hpp" // `directory_exists`, `replace_file_durably`, `file_appender_t`, `mapped_file_t`
 
 #include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `state_of`, `view_t`, `strings_kit_of`
 #include "lib.hpp"                // `cpu_class_t`, `atomic_ref_for_cpu_class`, `atomic_ref_of`, `waiter_of`
@@ -1487,74 +1477,41 @@ inline constexpr char image_signature_k[8] = {'U', 'S', 'T', 'S', 'M', 'T', 'B',
 /** Name of the image inside the database directory. */
 inline constexpr std::string_view image_name_k = "/ram.image";
 
-/** Name of the image while it is being written, renamed over the image once whole. */
-inline constexpr std::string_view partial_image_name_k = "/ram.image.partial";
-
-#if USTORE_OS_WINDOWS_
-
-/** Flushes the file behind @p file to the drive. */
-inline bool sync_file(std::FILE* file) noexcept { return ::_commit(::_fileno(file)) == 0; }
-
-/** Replaces @p target with @p source in one step, overwriting an existing target. */
-inline bool replace_file(char const* source, char const* target) noexcept {
-    return ::MoveFileExA(source, target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-}
-#else
-
-/** Flushes the file behind @p file to the drive. */
-inline bool sync_file(std::FILE* file) noexcept { return ::fsync(::fileno(file)) == 0; }
-
-/** Replaces @p target with @p source in one step, overwriting an existing target. */
-inline bool replace_file(char const* source, char const* target) noexcept { return std::rename(source, target) == 0; }
-#endif
-
-/** Closes a C stream when it leaves scope, unless it was closed explicitly. */
-class stream_t {
-    std::FILE* handle_ = nullptr;
-
-  public:
-    explicit stream_t(std::FILE* handle) noexcept : handle_(handle) {}
-    stream_t(stream_t const&) = delete;
-    stream_t& operator=(stream_t const&) = delete;
-
-    ~stream_t() noexcept {
-        if (handle_) { [[maybe_unused]] int const closed = std::fclose(handle_); }
-    }
-
-    /** The stream, or null once closed. */
-    std::FILE* get() const noexcept { return handle_; }
-
-    /** Closes the stream now, answering whether everything buffered reached the file. */
-    bool close() noexcept { return std::fclose(std::exchange(handle_, nullptr)) == 0; }
-};
-
 /** Joins @p directory and @p name into @p path, answering whether it fit in memory. */
 inline bool join_path(sz::string_t& path, char const* directory, std::string_view name) noexcept {
     return path.assign(sz::string_view_t {directory}) == sz::status_t::success_k &&
            path.append(name.data(), name.size()) == sz::status_t::success_k;
 }
 
-/** Writes @p blob as its length and its bytes, answering whether all of it reached @p file. */
-inline bool write_blob(std::FILE* file, blob_t const& blob) noexcept {
-    auto const length = static_cast<std::uint64_t>(blob.size());
-    return std::fwrite(&length, sizeof(length), 1, file) == 1 &&
-           (length == 0 || std::fwrite(blob.data(), 1, length, file) == length);
+/** Appends the bytes of @p value as they sit in memory. */
+template <typename value_type_>
+status_t write_value(file_appender_t& file, value_type_ const& value) noexcept {
+    return file.append(std::as_bytes(std::span {&value, 1}));
 }
 
-/** Writes one entry of a collection of blobs, documents or pages, answering whether all of it reached @p file. */
+/** Writes @p blob as its length and its bytes. */
+inline status_t write_blob(file_appender_t& file, blob_t const& blob) noexcept {
+    if (status_t const written = write_value(file, static_cast<std::uint64_t>(blob.size())); written.failed())
+        return written;
+    return file.append(std::as_bytes(std::span {blob}));
+}
+
+/** Writes one entry of a collection of blobs, documents or pages. */
 template <typename mapped_type_>
-bool write_entry(std::FILE* file, st::mapping<ustore_key_t, mapped_type_> const& pair) noexcept {
-    return std::fwrite(&pair.key, sizeof(ustore_key_t), 1, file) == 1 && write_blob(file, blob_of(pair.mapped));
+status_t write_entry(file_appender_t& file, st::mapping<ustore_key_t, mapped_type_> const& pair) noexcept {
+    if (status_t const written = write_value(file, pair.key); written.failed()) return written;
+    return write_blob(file, blob_of(pair.mapped));
 }
 
-/** Writes one entry of a collection of strings, answering whether all of it reached @p file. */
-inline bool write_entry(std::FILE* file, string_pair_t const& pair) noexcept {
-    return write_blob(file, pair.key.text) && std::fwrite(&pair.mapped, sizeof(ustore_key_t), 1, file) == 1;
+/** Writes one entry of a collection of strings. */
+inline status_t write_entry(file_appender_t& file, string_pair_t const& pair) noexcept {
+    if (status_t const written = write_blob(file, pair.key.text); written.failed()) return written;
+    return write_value(file, pair.mapped);
 }
 
-/** Writes one entry of a graph, answering whether all of it reached @p file. */
-inline bool write_entry(std::FILE* file, half_edge_t const& entry) noexcept {
-    return std::fwrite(&entry, sizeof(half_edge_t), 1, file) == 1;
+/** Writes one entry of a graph. */
+inline status_t write_entry(file_appender_t& file, half_edge_t const& entry) noexcept {
+    return write_value(file, entry);
 }
 
 /** The first entry a store of @p entry_type_ can hold, where a walk of the whole store starts. */
@@ -1587,32 +1544,31 @@ store_status_t tally_entries(store_type_ const& store, generation_t read_stamp, 
 }
 
 /** Writes how many entries @p store holds at @p read_stamp, then every one of them, adding the
- *  bytes of their keys and values to @p bytes, and clearing @p written when any of it misses
- *  @p file. */
+ *  bytes of their keys and values to @p bytes, and storing in @p written the first failure to
+ *  reach @p file. */
 template <typename store_type_>
-store_status_t write_entries(std::FILE* file, store_type_ const& store, generation_t read_stamp, std::size_t& bytes,
-                             bool& written) noexcept {
+store_status_t write_entries(file_appender_t& file, store_type_ const& store, generation_t read_stamp,
+                             std::size_t& bytes, status_t& written) noexcept {
     using entry_t = entry_of<store_type_>;
     std::uint64_t count = 0;
     store_status_t const counted = tally_entries(store, read_stamp, count, bytes);
     if (st::failed(counted)) return counted;
-    written = written && std::fwrite(&count, sizeof(count), 1, file) == 1;
+    if (written.succeeded()) written = write_value(file, count);
     return store.reader_at(read_stamp)
         .range_from(first_entry<entry_t>(), [&](entry_t const& entry) noexcept -> walk_control_t {
-            written = written && write_entry(file, entry);
-            return written ? walk_control_t::resume_k : walk_control_t::halt_k;
+            if (written.succeeded()) written = write_entry(file, entry);
+            return written.succeeded() ? walk_control_t::resume_k : walk_control_t::halt_k;
         });
 }
 
 /** Writes the image of every collection of @p state at @p read_stamp into @p directory, reporting
- *  the bytes of the keys and values written to @p progress after each collection, removing the
- *  partial image when the save fails or is cancelled. */
+ *  the bytes of the keys and values written to @p progress after each collection; a save that
+ *  fails or is cancelled leaves the previous image whole. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t write_image(database_state<cpu_class_, isolation_>& state, generation_t read_stamp, char const* directory,
                      ustore_progress_callback_t progress = nullptr, void* progress_state = nullptr) noexcept {
-    sz::string_t partial_path;
     sz::string_t final_path;
-    if (!join_path(partial_path, directory, partial_image_name_k) || !join_path(final_path, directory, image_name_k))
+    if (!join_path(final_path, directory, image_name_k))
         return {status_code_t::out_of_memory_k, "Failed to build the image path"};
     listed_collections<cpu_class_, isolation_> listed;
     reader_source<cpu_class_, isolation_> source {state, read_stamp};
@@ -1631,37 +1587,23 @@ status_t write_image(database_state<cpu_class_, isolation_>& state, generation_t
         if (st::failed(tallied)) return translate(tallied);
     }
     progress_t reporter {progress, progress_state, total};
-    stream_t stream {std::fopen(partial_path.c_str(), "wb")};
-    if (!stream.get()) return {status_code_t::io_k, "Failed to open the image for writing"};
-    auto abandon = [&](status_t status) noexcept {
-        if (stream.get()) { [[maybe_unused]] bool const closed = stream.close(); }
-        [[maybe_unused]] int const removed = std::remove(partial_path.c_str());
-        return status;
-    };
-
-    bool written = std::fwrite(image_signature_k, sizeof(image_signature_k), 1, stream.get()) == 1;
-    for (std::size_t index = 0; index != listed.size() && written; ++index) {
-        listed_collection<cpu_class_, isolation_> const& collection = listed[index];
-        auto const modality = static_cast<std::uint8_t>(modality_of(*collection.store));
-        written = std::fwrite(&collection.id, sizeof(ustore_collection_id_t), 1, stream.get()) == 1 &&
-                  std::fwrite(&modality, sizeof(modality), 1, stream.get()) == 1 &&
-                  write_blob(stream.get(), collection.name);
-        std::size_t bytes = 0;
-        store_status_t const walked = std::visit(
-            [&](auto const& entries) noexcept {
-                return write_entries(stream.get(), entries, read_stamp, bytes, written);
-            },
-            collection.store->entries);
-        if (st::failed(walked)) return abandon(translate(walked));
-        if (written && !reporter.advance(bytes)) return abandon(progress_cancelled_k);
-    }
-
-    bool const synced = written && std::fflush(stream.get()) == 0 && sync_file(stream.get());
-    bool const closed = stream.close();
-    if (!synced || !closed) return abandon({status_code_t::io_k, "Failed to write the image"});
-    if (!replace_file(partial_path.c_str(), final_path.c_str()))
-        return abandon({status_code_t::io_k, "Failed to replace the image"});
-    return {};
+    return replace_file_durably(final_path.c_str(), [&](file_appender_t& file) noexcept -> status_t {
+        status_t written = file.append(std::as_bytes(std::span {image_signature_k}));
+        for (std::size_t index = 0; index != listed.size() && written.succeeded(); ++index) {
+            listed_collection<cpu_class_, isolation_> const& collection = listed[index];
+            auto const modality = static_cast<std::uint8_t>(modality_of(*collection.store));
+            written = write_value(file, collection.id);
+            if (written.succeeded()) written = write_value(file, modality);
+            if (written.succeeded()) written = write_blob(file, collection.name);
+            std::size_t bytes = 0;
+            store_status_t const walked = std::visit(
+                [&](auto const& entries) noexcept { return write_entries(file, entries, read_stamp, bytes, written); },
+                collection.store->entries);
+            if (st::failed(walked)) return translate(walked);
+            if (written.succeeded() && !reporter.advance(bytes)) return progress_cancelled_k;
+        }
+        return written;
+    });
 }
 
 /** What loading one part of an image came to. */
@@ -1677,55 +1619,64 @@ inline constexpr std::array<status_t, 6> image_step_statuses_k {{
     {status_code_t::internal_k, "The store refused an entry of the image"},
 }};
 
-/** Reads a length and that many bytes of @p file into @p blob. */
-inline image_step_t load_blob(std::FILE* file, blob_t& blob) noexcept {
+/** Moves the first @p bytes of @p image into @p into, answering false where the image ends. */
+inline bool take_bytes(std::string_view& image, void* into, std::size_t bytes) noexcept {
+    if (image.size() < bytes) return false;
+    if (bytes != 0) std::memcpy(into, image.data(), bytes);
+    image.remove_prefix(bytes);
+    return true;
+}
+
+/** Reads a length and that many bytes of @p image into @p blob. */
+inline image_step_t load_blob(std::string_view& image, blob_t& blob) noexcept {
     std::uint64_t length = 0;
-    if (std::fread(&length, sizeof(length), 1, file) != 1) return image_step_t::truncated_k;
+    if (!take_bytes(image, &length, sizeof(length))) return image_step_t::truncated_k;
+    if (length > image.size()) return image_step_t::truncated_k;
     if (st::failed(blob.resize(length))) return image_step_t::out_of_memory_k;
-    if (length != 0 && std::fread(blob.data(), 1, length, file) != length) return image_step_t::truncated_k;
+    if (!take_bytes(image, blob.data(), static_cast<std::size_t>(length))) return image_step_t::truncated_k;
     return image_step_t::loaded_k;
 }
 
-/** Loads the next entry of @p file into @p store. */
+/** Loads the next entry of @p image into @p store. */
 template <typename store_type_>
-image_step_t load_entry(std::FILE* file, store_type_& store) noexcept {
+image_step_t load_entry(std::string_view& image, store_type_& store) noexcept {
     using entry_t = entry_of<store_type_>;
     if constexpr (std::is_same_v<entry_t, half_edge_t>) {
         half_edge_t entry;
-        if (std::fread(&entry, sizeof(half_edge_t), 1, file) != 1) return image_step_t::truncated_k;
+        if (!take_bytes(image, &entry, sizeof(half_edge_t))) return image_step_t::truncated_k;
         return st::failed(store.upsert(std::move(entry))) ? image_step_t::refused_k : image_step_t::loaded_k;
     }
     else if constexpr (std::is_same_v<entry_t, string_pair_t>) {
         string_key_t text;
         ustore_key_t value;
-        if (image_step_t const loaded = load_blob(file, text.text); loaded != image_step_t::loaded_k) return loaded;
-        if (std::fread(&value, sizeof(ustore_key_t), 1, file) != 1) return image_step_t::truncated_k;
+        if (image_step_t const loaded = load_blob(image, text.text); loaded != image_step_t::loaded_k) return loaded;
+        if (!take_bytes(image, &value, sizeof(ustore_key_t))) return image_step_t::truncated_k;
         return st::failed(store.upsert(string_pair_t {std::move(text), value})) ? image_step_t::refused_k
                                                                                 : image_step_t::loaded_k;
     }
     else {
         ustore_key_t key;
         blob_t value;
-        if (std::fread(&key, sizeof(ustore_key_t), 1, file) != 1) return image_step_t::truncated_k;
-        if (image_step_t const loaded = load_blob(file, value); loaded != image_step_t::loaded_k) return loaded;
+        if (!take_bytes(image, &key, sizeof(ustore_key_t))) return image_step_t::truncated_k;
+        if (image_step_t const loaded = load_blob(image, value); loaded != image_step_t::loaded_k) return loaded;
         using mapped_t = typename entry_t::mapped_type;
         return st::failed(store.upsert(entry_t {key, mapped_t {std::move(value)}})) ? image_step_t::refused_k
                                                                                     : image_step_t::loaded_k;
     }
 }
 
-/** Loads the next collection of @p file into @p state. */
+/** Loads the next collection of @p image into @p state. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-image_step_t load_collection(std::FILE* file, database_state<cpu_class_, isolation_>& state) noexcept {
+image_step_t load_collection(std::string_view& image, database_state<cpu_class_, isolation_>& state) noexcept {
     ustore_collection_id_t id;
-    if (std::fread(&id, sizeof(id), 1, file) != 1) return image_step_t::finished_k;
+    if (!take_bytes(image, &id, sizeof(id))) return image_step_t::finished_k;
     std::uint8_t modality = 0;
     blob_t name;
     std::uint64_t count = 0;
-    if (std::fread(&modality, sizeof(modality), 1, file) != 1) return image_step_t::truncated_k;
+    if (!take_bytes(image, &modality, sizeof(modality))) return image_step_t::truncated_k;
     if (modality < ustore_modality_blobs_k || modality > ustore_modality_pages_k) return image_step_t::malformed_k;
-    if (image_step_t const loaded = load_blob(file, name); loaded != image_step_t::loaded_k) return loaded;
-    if (std::fread(&count, sizeof(count), 1, file) != 1) return image_step_t::truncated_k;
+    if (image_step_t const loaded = load_blob(image, name); loaded != image_step_t::loaded_k) return loaded;
+    if (!take_bytes(image, &count, sizeof(count))) return image_step_t::truncated_k;
 
     if (name.size() != 0) {
         auto [key, key_status] = string_key_from(view_of(name));
@@ -1743,7 +1694,7 @@ image_step_t load_collection(std::FILE* file, database_state<cpu_class_, isolati
         return image_step_t::refused_k;
     }
     for (std::uint64_t index = 0; index != count; ++index) {
-        image_step_t const loaded = std::visit([&](auto& entries) noexcept { return load_entry(file, entries); },
+        image_step_t const loaded = std::visit([&](auto& entries) noexcept { return load_entry(image, entries); },
                                                store->entries);
         if (loaded != image_step_t::loaded_k) return loaded;
     }
@@ -1756,15 +1707,16 @@ status_t read_image(database_state<cpu_class_, isolation_>& state) noexcept {
     sz::string_t path;
     if (!join_path(path, state.directory.c_str(), image_name_k))
         return {status_code_t::out_of_memory_k, "Failed to build the image path"};
-    stream_t stream {std::fopen(path.c_str(), "rb")};
-    if (!stream.get())
-        return errno == ENOENT ? status_t {} : status_t {status_code_t::io_k, "Failed to open the image"};
+    auto [mapping, map_status] = mapped_file_t::map(path.c_str());
+    if (map_status == status_code_t::not_found_k) return {};
+    if (map_status.failed()) return {status_code_t::io_k, "Failed to open the image"};
+    std::string_view image = mapping.view();
     char signature[sizeof(image_signature_k)];
-    if (std::fread(signature, sizeof(signature), 1, stream.get()) != 1 ||
+    if (!take_bytes(image, signature, sizeof(signature)) ||
         std::memcmp(signature, image_signature_k, sizeof(signature)) != 0)
         return {status_code_t::malformed_k, "The image has an unknown format"};
     image_step_t step = image_step_t::loaded_k;
-    while (step == image_step_t::loaded_k) step = load_collection(stream.get(), state);
+    while (step == image_step_t::loaded_k) step = load_collection(image, state);
     return image_step_statuses_k[static_cast<std::size_t>(step)];
 }
 

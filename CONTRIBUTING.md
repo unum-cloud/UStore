@@ -107,6 +107,22 @@ class lsm_tree;
 A macro survives only as an object-like configuration flag or include guard.
 `#if` brackets whole declarations or include blocks, never a fragment of an `if`/`else`.
 
+Every all-caps name starts with the full project name, `USTORE_`.
+A trailing `_` marks a name as internal: it may change in any release, and nothing outside this repository may define or test it.
+A name without it is a public contract, either a switch you may set or a value you may read.
+
+| Family                    | Form                            | Example                       |
+| :------------------------ | :------------------------------ | :---------------------------- |
+| CPU class                 | `USTORE_TARGET_<CLASS>`         | `USTORE_TARGET_INTEL_HASWELL` |
+| Optional facility         | `USTORE_WITH_[<OS>_]<FACILITY>` | `USTORE_WITH_LINUX_SPDK`      |
+| Operating-system identity | `USTORE_OS_<OS>_`               | `USTORE_OS_POSIX_`            |
+
+Every name in these families is always defined, as 0 or 1, and tested with `#if`.
+`defined(...)` appears only in a `!defined` default and in a guard that an `#error` follows.
+A dependency facility, like `USTORE_WITH_ROCKSDB`, defaults to 0, and the target that links the dependency sets it.
+Only the Platform Identity region of `c/ustore/types.h` reads operating-system predefines like `__linux__`.
+Compiler predefines like `__clang__`, `__GNUC__` and `_MSC_VER` are read raw where they matter.
+
 ### Errors and Memory
 
 Nothing throws.

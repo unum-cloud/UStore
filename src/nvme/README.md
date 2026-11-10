@@ -172,7 +172,7 @@ The ring is exposed rather than hidden behind a blocking read because a blocking
   It registers nothing, so the kernel pins each request's pages, and it links nothing, so a chained request waits in its seat until the poll that sees its predecessor transfer in full submits it.
   A flush is `IOCB_CMD_FDSYNC`, or `fdatasync` where a kernel older than 4.18 refuses that.
   One thread at depth 256 reads about 500 K random 4 KB blocks a second on a 6.8 kernel, where `pread` reads 14 K.
-- __`linux_spdk_k`__ — `linux_spdk_disk_t`, the user-space NVMe driver behind `USTORE_WITH_SPDK`.
+- __`linux_spdk_k`__ — `linux_spdk_disk_t`, the user-space NVMe driver behind `USTORE_WITH_LINUX_SPDK`.
   Its probe reads `/proc/meminfo` and the driver binding first, because `rte_eal_init` can otherwise call `exit` on the whole process.
   The environment comes up once per process and is never torn down, and a forked child must not touch it, since DPDK is not fork-safe.
   Multi-process DPDK, with a primary and secondaries, is out of scope.
@@ -185,7 +185,7 @@ Above the transport, `nvme_volume.hpp` places runs across every data directory o
 A database is the manifest `<database>.ustore.json` plus one self-describing sorted run per `.ustore` file, which a mount takes back level by level; a run the manifest in force does not name is a crash leftover, freed at mount.
 Every publication costs two flushes, however many runs it writes and consumes: the new runs and the manifest copy are flushed first, and the commit second.
 
-- __Directories.__ `basic_directory_volume` keeps each run as `<database>-<run id>.ustore`, its own registered medium, and commits by writing `<database>.ustore.json.tmp`, `fdatasync`, `renameat` over the manifest and an `fsync` of the directory. Consumed runs are unlinked once the manifest that stopped naming them is durable. The manifest's directory is data directory 0, and the manifest lists files by `path` and `medium`.
+- __Directories.__ `basic_directory_volume` keeps each run as `<database>-<run id>.ustore`, its own registered medium, and commits through `replace_file_durably`: it writes `<database>.ustore.json.tmp`, flushes it with `fdatasync`, or `F_FULLFSYNC` on macOS and `FlushFileBuffers` on Windows, renames it over the manifest, and syncs the directory. Consumed runs are unlinked once the manifest that stopped naming them is durable. The manifest's directory is data directory 0, and the manifest lists files by `path` and `medium`.
 - __Raw media.__ `basic_slotted_volume` cuts block devices and SPDK namespaces into 1 GiB slots from a base address, as in `/dev/nvme0n1@64GiB`, and the manifest lists runs by `medium` and `offset`. Runs under 512 MiB are packed into a shared slot, and longer ones take a slot of their own.
 
 On raw media every slot a database holds opens with a `slot_owner_block_t` in its first logical block:

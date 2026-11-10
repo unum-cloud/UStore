@@ -34,7 +34,7 @@ One library serves both isolation levels: the `isolation` field of `ustore_datab
 
 Snapshots map onto the versions the store already keeps.
 `ustore_database_init_ram` starts a database in memory alone, while one `ustore_database_open_ram` serves persists in its directory as one binary image, rewritten whole on a flushed commit and on close.
-A compaction vacuums one collection at a time, reporting one unit per collection, then frees the retired stores and rewrites the image, and a save writes the snapshot's collections as an image into the directory it names, removing `ram.image.partial` when cancelled.
+A compaction vacuums one collection at a time, reporting one unit per collection, then frees the retired stores and rewrites the image, and a save writes the snapshot's collections as an image into the directory it names, removing `ram.image.tmp` when cancelled.
 
 ## RocksDB
 

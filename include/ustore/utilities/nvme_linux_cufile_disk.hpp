@@ -33,8 +33,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/blocking_files.hpp" // `shared_library_t`
-#include "ustore/utilities/nvme_disks.hpp"     // `flush_native_file`, `deallocate_native_file`, `direct_alignment_of`
+#include "ustore/utilities/blocking_files.hpp" // `shared_library_t`, `open_native_file`, `flush_native_file`
+#include "ustore/utilities/nvme_disks.hpp" // `file_access_of`, `medium_bytes_of`, `deallocate_native_file`, `direct_alignment_of`
 #include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -504,11 +504,11 @@ class linux_cufile_files_disk {
             if (!claim_(slot.registered)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
-            auto [file, open_native_file_status] = open_native_file(request.name, request.access,
-                                                                    file_buffering_t::unbuffered_k);
-            if (open_native_file_status.failed()) {
+            auto [file, open_status] = open_native_file(request.name, file_access_of(request.access),
+                                                        file_buffering_t::unbuffered_k);
+            if (open_status.failed()) {
                 claim_(slot.registered).store(0, std::memory_order_release);
-                return open_native_file_status;
+                return open_status;
             }
             status_t opened;
             if (request.access == medium_access_t::create_read_write_k && request.length != 0)
@@ -519,13 +519,13 @@ class linux_cufile_files_disk {
             if (opened.succeeded() && api_->handle_register(&slot.handle, &descriptor).error != cufile_success_k)
                 opened = {status_code_t::device_k, "cuFile would not register the file"};
             if (opened.failed()) {
-                close_native_file(file);
+                [[maybe_unused]] status_t const closed = close_native_file(file);
                 claim_(slot.registered).store(0, std::memory_order_release);
                 return opened;
             }
             direct_alignment_t const alignment = direct_alignment_of(file);
             slot.file = file;
-            slot.capacity = native_file_capacity(file);
+            slot.capacity = medium_bytes_of(file);
             slot.memory_alignment = alignment.memory > portable_alignment_k ? alignment.memory : portable_alignment_k;
             slot.offset_alignment = alignment.offset;
             return registered_medium_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation},
@@ -544,7 +544,7 @@ class linux_cufile_files_disk {
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
             return {status_code_t::invalid_argument_k, "The medium is still named by requests in flight"};
         api_->handle_deregister(slot->handle);
-        close_native_file(slot->file);
+        [[maybe_unused]] status_t const closed = close_native_file(slot->file);
         ++slot->generation;
         slot->handle = nullptr;
         slot->file = invalid_native_file_k;
@@ -835,7 +835,8 @@ class linux_cufile_files_disk {
             }
         for (std::size_t index = 0; index != media_.size(); ++index) {
             if (media_[index].handle) api_->handle_deregister(media_[index].handle);
-            if (media_[index].file != invalid_native_file_k) close_native_file(media_[index].file);
+            if (media_[index].file != invalid_native_file_k) [[maybe_unused]]
+                status_t const closed = close_native_file(media_[index].file);
         }
         queue_pairs_.clear();
         registered_memories_.clear();

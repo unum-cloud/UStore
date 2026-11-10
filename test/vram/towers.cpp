@@ -17,7 +17,6 @@
 #include <cstring> // `std::memcmp`
 
 #include <dlfcn.h> // `dlopen`, `dlsym`
-#include <sched.h> // `sched_getaffinity`, `CPU_COUNT`
 
 #include <array>       // `std::array`
 #include <span>        // `std::span`, `std::as_bytes`, `std::as_writable_bytes`
@@ -28,6 +27,8 @@
 #include <vector>      // `std::vector`
 
 #include <fmt/format.h>
+
+#include <forkunion/topology.hpp> // `fu::allowed_cores_count`
 
 #include "ustore/ustore.h"
 #include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `spawn_gpu_executor`, `kernel_tables`, `assemble_tape`
@@ -342,22 +343,15 @@ std::size_t vram_listing(ustore_gpu_device_t listed) {
     return failures;
 }
 
-/** How many CPUs the calling thread may run on, or -1 when the kernel refuses to say. */
-int callable_cpus() noexcept {
-    cpu_set_t allowed;
-    CPU_ZERO(&allowed);
-    return sched_getaffinity(0, sizeof(allowed), &allowed) == 0 ? CPU_COUNT(&allowed) : -1;
-}
-
 std::size_t vram_arenas(std::size_t ordinal, config_t config) {
     // A VRAM executor runs on its creator, so neither making nor freeing it pins that thread
-    int const cpus = callable_cpus();
+    std::size_t const cpus = fu::allowed_cores_count();
     std::size_t failures = 0;
     {
         device_call_t const made {ordinal};
-        failures += expect(made.status.succeeded() && callable_cpus() == cpus);
+        failures += expect(made.status.succeeded() && fu::allowed_cores_count() == cpus);
     }
-    failures += expect(callable_cpus() == cpus);
+    failures += expect(fu::allowed_cores_count() == cpus);
     device_call_t call {ordinal};
     if (expect(call.status.succeeded())) return failures + 1;
     fixture_t fixture {config, "arenas"};

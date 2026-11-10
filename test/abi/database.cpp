@@ -1679,7 +1679,7 @@ bool nothing_saved(config_t const& config, char const* path) noexcept {
     std::error_code error;
     if (config.engine() == "ram")
         return !std::filesystem::exists(path_t {path, "ram.image"}.c_str(), error) &&
-               !std::filesystem::exists(path_t {path, "ram.image.partial"}.c_str(), error);
+               !std::filesystem::exists(path_t {path, "ram.image.tmp"}.c_str(), error);
     return !std::filesystem::exists(path, error) || std::filesystem::is_empty(path, error);
 }
 
@@ -1803,7 +1803,7 @@ case_result_t progress_cancel_save(config_t const& config) {
         ustore_snapshot_save(&save);
         failures += expect_status(status_t {outcome}, status_code_t::io_k);
         std::error_code error;
-        failures += expect(!std::filesystem::exists(path_t {saved.c_str(), "ram.image.partial"}.c_str(), error));
+        failures += expect(!std::filesystem::exists(path_t {saved.c_str(), "ram.image.tmp"}.c_str(), error));
         std::filesystem::remove_all(blocker.c_str(), error);
     }
     ustore_snapshot_save(&save);

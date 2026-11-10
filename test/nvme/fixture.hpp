@@ -36,14 +36,14 @@
 #include <forkunion/types.hpp>         // `fu::standard_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk`, `file_buffering_t`
+#include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk`
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
 
 #include "ustore/utilities/nvme_channels.hpp"  // `registered_memory_arena`, `memory_arena_config_t`
 #include "ustore/blobs/nvme_store.hpp"         // `lookup_result_t`, `commit_ledger`, `stamp_pin`
 #include "ustore/utilities/nvme_mounts.hpp"    // `shared_resources`, `resources_shared_ptr`
-#include "ustore/utilities/blocking_files.hpp" // `read_file`
+#include "ustore/utilities/blocking_files.hpp" // `read_file`, `file_buffering_t`
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_volume.hpp"    // `basic_directory_volume`, `volume_config_t`, `data_address_t`
 

@@ -340,7 +340,7 @@ class linux_spdk_rig_t {
 
 #pragma endregion Rig
 
-#if USTORE_WITH_SPDK
+#if USTORE_WITH_LINUX_SPDK
 
 #pragma region Cases
 
@@ -533,7 +533,7 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, linux_sp
 /** Checks the refusals, and reports that the transport itself needs a build that carries the driver. */
 void spdk_suite(suite_totals_t& totals, suite_options_t const&, linux_spdk_suite_flags_t const&) {
     report(totals, "linux-spdk.refuses_without_the_option", spdk_refuses_without_the_option);
-    report(totals, "linux-spdk", case_result_t::skipped("needs a build with USTORE_WITH_SPDK"));
+    report(totals, "linux-spdk", case_result_t::skipped("needs a build with USTORE_WITH_LINUX_SPDK"));
 }
 
 #pragma endregion Refusals

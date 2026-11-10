@@ -45,7 +45,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_disks.hpp" // `open_native_file`, `direct_alignment_of`, `deallocate_native_file`
+#include "ustore/utilities/nvme_disks.hpp" // `file_access_of`, `medium_bytes_of`, `direct_alignment_of`, `deallocate_native_file`
 #include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -523,14 +523,14 @@ class linux_uring_files_disk {
             if (!claim_(slot.registered)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
-            auto [file, open_native_file_status] = open_native_file(request.name, request.access, buffering_);
-            if (open_native_file_status.failed()) {
+            auto [file, open_status] = open_native_file(request.name, file_access_of(request.access), buffering_);
+            if (open_status.failed()) {
                 claim_(slot.registered).store(0, std::memory_order_release);
-                return open_native_file_status;
+                return open_status;
             }
             if (request.access == medium_access_t::create_read_write_k && request.length != 0)
                 if (status_t const sized = truncate_native_file(file, request.length); sized.failed()) {
-                    close_native_file(file);
+                    [[maybe_unused]] status_t const closed = close_native_file(file);
                     claim_(slot.registered).store(0, std::memory_order_release);
                     return sized;
                 }
@@ -539,7 +539,7 @@ class linux_uring_files_disk {
                                                      ? direct
                                                      : direct_alignment_t {1, 1};
             atomic_reference_<native_file_t> {slot.file}.store(file, std::memory_order_release);
-            slot.capacity = native_file_capacity(file);
+            slot.capacity = medium_bytes_of(file);
             slot.memory_alignment = alignment.memory;
             slot.offset_alignment = alignment.offset;
             epoch_(media_epoch_).add(1, std::memory_order_release);
@@ -571,7 +571,7 @@ class linux_uring_files_disk {
         for (ring_t const& ring : rings_)
             if (ring.file >= 0) [[maybe_unused]]
                 long const updated = register_(ring, files_update, &update, 1);
-        close_native_file(file);
+        [[maybe_unused]] status_t const closed = close_native_file(file);
         ++slot->generation;
         slot->capacity = 0;
         claim_(slot->registered).store(0, std::memory_order_release);
@@ -1206,7 +1206,8 @@ class linux_uring_files_disk {
     void close_all_() noexcept {
         for (std::size_t index = 0; index != rings_.size(); ++index) teardown_ring_(rings_[index]);
         for (std::size_t index = 0; index != media_.size(); ++index)
-            if (media_[index].file != invalid_native_file_k) close_native_file(media_[index].file);
+            if (media_[index].file != invalid_native_file_k) [[maybe_unused]]
+                status_t const closed = close_native_file(media_[index].file);
         rings_.clear();
         media_.clear();
     }

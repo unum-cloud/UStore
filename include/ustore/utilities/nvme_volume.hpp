@@ -40,7 +40,7 @@
 #include <smashtable/basic_vector.hpp>       // `st::vector`
 
 #include "ustore/utilities/algorithm.hpp"      // `radix_sort`
-#include "ustore/utilities/blocking_files.hpp" // `replace_file_durably`, `read_file`, `list_directory`, `join_path`
+#include "ustore/utilities/blocking_files.hpp" // `replace_file_durably`, `read_file`, `list_directory`, `temporary_path_of`
 #include "ustore/utilities/nvme_channels.hpp"  // `io_channel_t`, `basic_read_pipeline`, `basic_write_pipeline`
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `ring_concept`, `registered_medium_t`
@@ -786,12 +786,10 @@ class basic_directory_volume {
                     named_path.failed() || remove_file(path).failed())
                     return {status_code_t::io_k, "A leftover run file would not be removed"};
         }
-        char path[path_max_bytes_k];
+        char path[path_max_bytes_k], temporary[path_max_bytes_k];
         if (status_t const named_path = manifest_path_(path); named_path.failed()) return named_path;
-        std::size_t const length = std::strlen(path);
-        if (length + 5 > sizeof(path)) return {};
-        std::memcpy(path + length, ".tmp", 5);
-        return remove_file(path);
+        if (temporary_path_of(path, temporary).failed()) return {};
+        return remove_file(temporary);
     }
 
     disk_type_* disk_ = nullptr;

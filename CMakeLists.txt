@@ -30,7 +30,7 @@ option(USTORE_INSTALL "Install CMake targets" OFF)
 
 option(USTORE_WITH_ROCKSDB "Use RocksDB for a persistent engine" OFF)
 option(USTORE_WITH_LEVELDB "Use LevelDB for a persistent engine" OFF)
-option(USTORE_WITH_SPDK "Use SPDK for user-space NVMe access in NVMe" OFF)
+option(USTORE_WITH_LINUX_SPDK "Use SPDK for user-space NVMe access in NVMe" OFF)
 option(USTORE_WITH_NVME "Compile the in-tree NVMe engine" OFF)
 
 option(USTORE_BUILD_TEST "Compile the C++ suites in test/" OFF)
@@ -126,7 +126,7 @@ if (${USTORE_WITH_ROCKSDB})
 endif ()
 
 # The user-space NVMe transport, an `ustore_spdk` interface target over the archives of an SPDK build
-if (${USTORE_WITH_SPDK})
+if (${USTORE_WITH_LINUX_SPDK})
     include(cmake/spdk.cmake)
 endif ()
 
@@ -305,7 +305,11 @@ set(ustore_sources_
 set(ustore_sibling_archives_ forkunion_static stringzilla_static)
 set(ustore_dependencies_ ${ustore_sibling_archives_} yyjson fmt)
 set(ustore_engine_archives_)
-set(ustore_engine_definitions_)
+# Every engine switch reaches the units and their consumers as 0 or 1, so a header never reads an undefined name
+set(ustore_engine_definitions_
+    "USTORE_WITH_NVME=$<BOOL:${USTORE_WITH_NVME}>" "USTORE_WITH_ROCKSDB=$<BOOL:${USTORE_WITH_ROCKSDB}>"
+    "USTORE_WITH_LEVELDB=$<BOOL:${USTORE_WITH_LEVELDB}>"
+)
 set(ustore_compiled_objects_)
 
 foreach (class_ IN LISTS ustore_cpu_classes_)
@@ -329,14 +333,13 @@ if (${USTORE_WITH_NVME})
     # Both libraries link one copy of every CPU class's engine, compiled position-independent once
     add_library(ustore_nvme_variants OBJECT ${ustore_library_exclusion_} ${ustore_nvme_variants_})
     set_target_properties(ustore_nvme_variants PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    # SPDK's archives exist only in a build configured with `USTORE_WITH_SPDK`
+    # SPDK's archives exist only in a build configured with `USTORE_WITH_LINUX_SPDK`
     target_link_libraries(
         ustore_nvme_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_}
                                      $<TARGET_NAME_IF_EXISTS:ustore_spdk>
     )
     list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_nvme_variants>)
     list(APPEND ustore_compiled_objects_ ustore_nvme_variants)
-    list(APPEND ustore_engine_definitions_ USTORE_WITH_NVME=1)
     list(APPEND ustore_engine_names_ "nvme")
 
     # The engine's compaction on the device, whose objects both libraries take: host C++ launching the bundles' kernels
@@ -360,14 +363,12 @@ if (${USTORE_WITH_ROCKSDB})
     if (TARGET uring)
         list(APPEND ustore_engine_archives_ uring)
     endif ()
-    list(APPEND ustore_engine_definitions_ USTORE_WITH_ROCKSDB=1)
     list(APPEND ustore_engine_names_ "rocksdb")
 endif ()
 
 if (${USTORE_WITH_LEVELDB})
     list(APPEND ustore_sources_ src_oracles/leveldb/engine.cpp)
     list(APPEND ustore_engine_archives_ leveldb)
-    list(APPEND ustore_engine_definitions_ USTORE_WITH_LEVELDB=1)
     if (NOT MSVC)
         set_source_files_properties(src_oracles/leveldb/engine.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
     endif ()
@@ -444,8 +445,8 @@ set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
 set_target_properties(ustore_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 target_compile_definitions(
     ustore_shared
-    PRIVATE USTORE_EXPORTING
-    INTERFACE USTORE_SHARED
+    PRIVATE USTORE_EXPORTING=1
+    INTERFACE USTORE_SHARED=1
 )
 target_link_libraries(
     ustore_static PUBLIC Threads::Threads $<BUILD_INTERFACE:smashtable::header> ${ustore_dependency_links_}
@@ -584,7 +585,7 @@ if (${USTORE_BUILD_TEST})
                 target_compile_definitions(
                     ${storage_exe_} PRIVATE USTORE_SPDK_RIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/rigs/spdk_target.sh"
                 )
-                if (${USTORE_WITH_SPDK})
+                if (${USTORE_WITH_LINUX_SPDK})
                     target_link_libraries(${storage_exe_} PRIVATE ustore_spdk)
                     list(APPEND storage_arguments_ --spdk-root ${USTORE_SPDK_ROOT})
                 endif ()

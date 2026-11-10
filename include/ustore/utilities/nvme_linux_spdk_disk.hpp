@@ -52,8 +52,8 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::exchange`
 
-#if USTORE_WITH_SPDK
-#include <spdk/env.h>      // `spdk_env_init`, `spdk_mem_register`, `spdk_vtophys`, `spdk_dma_zmalloc`, `spdk_dma_free`
+#if USTORE_WITH_LINUX_SPDK
+#include <spdk/env.h> // `spdk_env_init`, `spdk_mem_register`, `spdk_vtophys`, `spdk_dma_malloc_socket`, `spdk_dma_free`
 #include <spdk/env_dpdk.h> // `spdk_env_dpdk_external_init`
 #include <spdk/nvme.h>     // `spdk_nvme_connect`, `spdk_nvme_ns_cmd_read`, `spdk_nvme_qpair`
 #endif
@@ -486,7 +486,7 @@ linux_spdk_probe_t linux_spdk_environment<atomic_reference_, waiter_type_>::prob
 
 #endif
 
-#if USTORE_WITH_SPDK
+#if USTORE_WITH_LINUX_SPDK
 
 #pragma region Process
 
@@ -603,24 +603,30 @@ linux_spdk_environment<atomic_reference_, waiter_type_>::acquire(linux_spdk_envi
 
 #pragma region DMA Memory
 
-/** Allocates DMA-able memory from the SPDK environment, which PCIe controllers write into
- *  directly, as the arena of a disk that translates addresses must be; a build without SPDK
- *  answers @c nullptr. */
+/** Allocates DMA-able memory from the SPDK environment on one NUMA socket, which PCIe controllers
+ *  write into directly, as the arena of a disk that translates addresses must be; a build without
+ *  SPDK answers @c nullptr. The bytes come unzeroed, since their first writer is the device. */
 template <typename value_type_ = byte_t>
 struct linux_spdk_dma_allocator {
     using value_type = value_type_;
     using propagate_on_container_move_assignment = std::true_type;
-    using is_always_equal = std::true_type;
+    using is_always_equal = std::false_type;
+
+    /** The NUMA socket the bytes are placed on, or -1 for whichever the environment picks. */
+    int socket = -1;
 
     constexpr linux_spdk_dma_allocator() noexcept = default;
+    constexpr explicit linux_spdk_dma_allocator(int on_socket) noexcept : socket(on_socket) {}
 
     /** The rebinding conversion @c std::allocator_traits performs. */
     template <typename other_type_>
-    constexpr linux_spdk_dma_allocator(linux_spdk_dma_allocator<other_type_> const&) noexcept {}
+    constexpr linux_spdk_dma_allocator(linux_spdk_dma_allocator<other_type_> const& other) noexcept
+        : socket(other.socket) {}
 
-#if USTORE_WITH_SPDK
+#if USTORE_WITH_LINUX_SPDK
     value_type_* allocate(std::size_t count) noexcept {
-        return static_cast<value_type_*>(spdk_dma_zmalloc(count * sizeof(value_type_), portable_alignment_k, nullptr));
+        return static_cast<value_type_*>(
+            spdk_dma_malloc_socket(count * sizeof(value_type_), portable_alignment_k, nullptr, socket));
     }
     void deallocate(value_type_* pointer, std::size_t) noexcept { spdk_dma_free(pointer); }
 #else
@@ -628,12 +634,12 @@ struct linux_spdk_dma_allocator {
     void deallocate(value_type_*, std::size_t) noexcept {}
 #endif
 
-    bool operator==(linux_spdk_dma_allocator const&) const noexcept { return true; }
+    bool operator==(linux_spdk_dma_allocator const& other) const noexcept { return socket == other.socket; }
 };
 
 #pragma endregion DMA Memory
 
-#if USTORE_WITH_SPDK
+#if USTORE_WITH_LINUX_SPDK
 
 #pragma region Attachments
 
@@ -875,6 +881,13 @@ class linux_spdk_disk {
     /** Whether the arena this disk registers must come from @c linux_spdk_dma_allocator: a PCIe
      *  controller DMAs to translated addresses, while a socket transport copies from any memory. */
     [[nodiscard]] bool needs_dma_memory() const noexcept { return reach_ == reach_t::translated_k; }
+
+    /** The NUMA node of the controller's PCI device, which the mount places its arena on, or -1
+     *  over a fabric. */
+    [[nodiscard]] int memory_domain() const noexcept {
+        spdk_pci_device* const device = controller_ ? spdk_nvme_ctrlr_get_pci_device(controller_) : nullptr;
+        return device ? spdk_pci_device_get_socket_id(device) : -1;
+    }
 
     /** What this disk accepts, which the namespace's sector size and the controller's limits fix. */
     [[nodiscard]] ring_capabilities_t capabilities() const noexcept {
@@ -1687,8 +1700,10 @@ class linux_spdk_disk {
             slot.mapping = mapping_t::mapped_k;
             return {};
         }
-        if (chunk.size() % portable_alignment_k != 0)
-            return {status_code_t::invalid_argument_k, "A DMA range the driver maps spans whole pages"};
+        // The driver maps whole 2 MiB pages and refuses a range that starts or ends inside one
+        constexpr std::uint64_t mapped_page_bytes = 2ull * 1024ull * 1024ull;
+        if (chunk.size() % mapped_page_bytes != 0 || !is_address_aligned(chunk.data(), mapped_page_bytes))
+            return {status_code_t::invalid_argument_k, "A DMA range the driver maps spans whole 2 MiB pages"};
         if (spdk_mem_register(chunk.data(), chunk.size()) != 0)
             return {status_code_t::out_of_memory_k, "The driver would not map this range"};
         if (status_t const reachable = inspect_translation_(chunk); reachable.failed()) {
@@ -1986,6 +2001,9 @@ class linux_spdk_disk {
     /** Whether the arena must come from DMA memory, which a disk that never
      *  connected never asks. */
     [[nodiscard]] bool needs_dma_memory() const noexcept { return false; }
+
+    /** No memory domain, since no controller was ever connected. */
+    [[nodiscard]] int memory_domain() const noexcept { return -1; }
 
     /** What this disk would accept, which is nothing at all. */
     [[nodiscard]] ring_capabilities_t capabilities() const noexcept { return {}; }

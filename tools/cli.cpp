@@ -41,8 +41,8 @@
 #include "ustore/db.h"                         // `ustore_database_t`, `ustore_outcome_t`
 #include "ustore/ranges.hpp"                   // `u64_tape`, `tape_string`
 #include "ustore/types.hpp"                    // `uuid_to_text`, `uuid_text_length_k`, `bytes_of`
-#include "ustore/utilities/blocking_files.hpp" // `read_file`, `replace_file_durably`, `list_directory`, `join_path`
-#include "ustore/utilities/nvme_disks.hpp"     // `open_native_file`, `read_native_file`, `write_native_file`
+#include "ustore/utilities/blocking_files.hpp" // `read_file`, `replace_file_durably`, `open_native_file`, `read_native_file`
+#include "ustore/utilities/nvme_disks.hpp"     // `medium_bytes_of`
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `default_reserved_record`, `collections_record_t`
 #include "ustore/utilities/nvme_slots.hpp"     // `slot_owner_block_t`, `slot_bytes_k`, `slot_payload_offset_k`
 #include "ustore/utilities/nvme_volume.hpp"    // `parse_data_address`, `manifest_suffix_k`, `basic_slotted_volume`
@@ -654,7 +654,9 @@ status_t terminated(std::string_view text, std::span<char> into) noexcept {
 /** Reads exactly @p into's bytes of @p file from @p offset, refusing a medium that
  *  ends before them. */
 status_t read_exactly(native_file_t file, std::uint64_t offset, std::span<byte_t> into) noexcept {
-    auto [moved, read_status] = read_native_file(file, offset, into);
+    auto [event, event_status] = native_file_event_t::make();
+    if (event_status.failed()) return event_status;
+    auto [moved, read_status] = read_native_file(file, offset, into, event);
     if (read_status.failed()) return read_status;
     if (moved != into.size()) return {status_code_t::io_k, "The medium ended before the bytes asked for"};
     return {};
@@ -662,7 +664,9 @@ status_t read_exactly(native_file_t file, std::uint64_t offset, std::span<byte_t
 
 /** Writes all of @p from into @p file at @p offset, refusing a medium that took fewer bytes. */
 status_t write_exactly(native_file_t file, std::uint64_t offset, std::span<byte_t const> from) noexcept {
-    auto [moved, write_status] = write_native_file(file, offset, from);
+    auto [event, event_status] = native_file_event_t::make();
+    if (event_status.failed()) return event_status;
+    auto [moved, write_status] = write_native_file(file, offset, from, event);
     if (write_status.failed()) return write_status;
     if (moved != from.size()) return {status_code_t::capacity_exhausted_k, "The medium took fewer bytes than given"};
     return {};
@@ -691,7 +695,7 @@ inline constexpr std::uint64_t manifest_region_bytes_k =
 status_t read_raw_manifest(data_address_t const& address, st::vector<char>& json) noexcept {
     char path[path_max_bytes_k];
     if (status_t const copied = terminated(address.location, path); copied.failed()) return copied;
-    auto [file, open_status] = open_native_file(path, medium_access_t::read_only_k, file_buffering_t::buffered_k);
+    auto [file, open_status] = open_native_file(path, file_access_t::read_only_k, file_buffering_t::buffered_k);
     if (open_status.failed()) return open_status;
     status_t result;
     auto [owner, owner_status] = read_owner_block(file, address.byte_base);
@@ -704,7 +708,7 @@ status_t read_raw_manifest(data_address_t const& address, st::vector<char>& json
     else if (json.resize(static_cast<std::size_t>(owner.manifest_bytes)) != st::status_t::success_k)
         result = {status_code_t::out_of_memory_k, "No room to read the manifest"};
     else result = read_exactly(file, owner.manifest_offset, std::as_writable_bytes(std::span<char> {json}));
-    close_native_file(file);
+    [[maybe_unused]] status_t const closed = close_native_file(file);
     return result;
 }
 
@@ -838,7 +842,7 @@ status_t recover_directory(recovery_t& recovery, std::string_view location, std:
             first = joined;
             return;
         }
-        auto [file, open_status] = open_native_file(path, medium_access_t::read_only_k, file_buffering_t::buffered_k);
+        auto [file, open_status] = open_native_file(path, file_access_t::read_only_k, file_buffering_t::buffered_k);
         if (open_status.failed()) {
             first = open_status;
             return;
@@ -846,7 +850,7 @@ status_t recover_directory(recovery_t& recovery, std::string_view location, std:
         blobs::sorted_run_header_t header {};
         auto [opens, read_status] = read_run_header(file, 0, header);
         std::uint64_t const bytes = native_file_capacity(file);
-        close_native_file(file);
+        [[maybe_unused]] status_t const closed = close_native_file(file);
         if (read_status.failed()) first = read_status;
         else if (!opens || header.content_id != run)
             fmt::println(stderr, style_of(tone_t::failure_k, stderr), "Skipping {}, which holds no run of its name",
@@ -867,9 +871,9 @@ status_t recover_directory(recovery_t& recovery, std::string_view location, std:
 status_t recover_raw(recovery_t& recovery, data_address_t const& address, std::uint16_t medium) noexcept {
     char path[path_max_bytes_k];
     if (status_t const copied = terminated(address.location, path); copied.failed()) return copied;
-    auto [file, open_status] = open_native_file(path, medium_access_t::read_only_k, file_buffering_t::buffered_k);
+    auto [file, open_status] = open_native_file(path, file_access_t::read_only_k, file_buffering_t::buffered_k);
     if (open_status.failed()) return open_status;
-    std::uint64_t const capacity = native_file_capacity(file);
+    std::uint64_t const capacity = medium_bytes_of(file);
     std::uint64_t usable = capacity > address.byte_base ? capacity - address.byte_base : 0;
     if (address.byte_limit != 0 && address.byte_limit < usable) usable = address.byte_limit;
     status_t result;
@@ -913,7 +917,7 @@ status_t recover_raw(recovery_t& recovery, data_address_t const& address, std::u
             offset += round_up_to_multiple(bytes, portable_alignment_k);
         }
     }
-    close_native_file(file);
+    [[maybe_unused]] status_t const closed = close_native_file(file);
     return result;
 }
 
@@ -1112,7 +1116,7 @@ status_t publish_raw_manifest(data_address_t const& address, std::span<char cons
         return {status_code_t::capacity_exhausted_k, "The manifest outgrew its region of the manifest slot"};
     char path[path_max_bytes_k];
     if (status_t const copied = terminated(address.location, path); copied.failed()) return copied;
-    auto [file, open_status] = open_native_file(path, medium_access_t::read_write_k, file_buffering_t::buffered_k);
+    auto [file, open_status] = open_native_file(path, file_access_t::read_write_k, file_buffering_t::buffered_k);
     if (open_status.failed()) return open_status;
     status_t result;
     auto [owner, owner_status] = read_owner_block(file, address.byte_base);
@@ -1132,7 +1136,7 @@ status_t publish_raw_manifest(data_address_t const& address, std::span<char cons
         result = write_exactly(file, address.byte_base, std::as_bytes(std::span {&owner, 1}));
     }
     if (result.succeeded()) result = flush_native_file(file);
-    close_native_file(file);
+    [[maybe_unused]] status_t const closed = close_native_file(file);
     return result;
 }
 

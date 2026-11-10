@@ -39,14 +39,14 @@
 #include <limits>  // `std::numeric_limits`
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`
-#include <variant> // `std::variant`, `std::visit`
+#include <variant> // `std::variant`, `std::visit`, `std::get_if`
 
 #include <smashtable/basic_fixed_pool.hpp> // `st::basic_fixed_pool`
 #include <smashtable/basic_vector.hpp>     // `st::vector`
 
 #include "ustore/utilities/nvme_linux_spdk_disk.hpp" // `linux_spdk_dma_allocator`
 #include "ustore/utilities/nvme_ring.hpp"   // `ring_concept`, `read_request`, `write_request`, `deallocate_request`
-#include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`, `resource_constraint`
+#include "ustore/utilities/ram_buffers.hpp" // `allocate_domain_block`, `domain_block_t`, `resource_constraint`
 #include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
@@ -60,6 +60,10 @@ struct memory_arena_config_t {
 
     /** Bytes the arena holds on host pages, rounded up to @c portable_alignment_k when it is made. */
     std::uint64_t bytes = 0;
+
+    /** The memory domain the bytes are placed on: the controller's node where the mount knows it,
+     *  or -1. */
+    fu_memory_domain_id_t memory_domain = -1;
 };
 
 /**
@@ -117,10 +121,17 @@ class registered_memory_arena {
         arena.constraint_ = &constraint;
         arena.charged_ = bytes;
         if constexpr (requires { disk.needs_dma_memory(); })
-            if (disk.needs_dma_memory()) arena.storage_.template emplace<dma_storage_t>();
-        if (std::visit([&](auto& storage) noexcept { return storage.resize(bytes); }, arena.storage_) !=
-            st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "An arena of that size does not fit"};
+            if (disk.needs_dma_memory())
+                arena.storage_.template emplace<dma_storage_t>(dma_allocator_t {config.memory_domain});
+        if (dma_storage_t* const dma = std::get_if<dma_storage_t>(&arena.storage_)) {
+            if (dma->resize(st::assume_uninitialized, bytes) != st::status_t::success_k)
+                return status_t {status_code_t::out_of_memory_k, "An arena of that size does not fit"};
+        }
+        else {
+            auto [block, allocate_status] = allocate_domain_block(config.memory_domain, bytes);
+            if (allocate_status.failed()) return allocate_status;
+            arena.storage_ = std::move(block);
+        }
 
         auto [pinned, register_memory_status] = disk.register_memory(arena.bytes(), memory_space_t::host_k);
         if (register_memory_status.failed()) return register_memory_status;
@@ -149,6 +160,13 @@ class registered_memory_arena {
     /** Whether the arena is still pinned. */
     [[nodiscard]] bool registered() const noexcept { return registered_memory_.held(); }
 
+    /** The page the host bytes were granted on, or zero for DMA memory, whose pages the driver's
+     *  environment picks. */
+    [[nodiscard]] std::size_t page_bytes() const noexcept {
+        domain_block_t const* const block = std::get_if<domain_block_t>(&storage_);
+        return block ? block->page_bytes() : 0;
+    }
+
     /** The place @p offset bytes into the arena, which a request carries instead of a pointer. */
     [[nodiscard]] memory_reference_t reference(std::uint64_t offset) const noexcept {
         return registered_memory_.reference(offset);
@@ -159,15 +177,16 @@ class registered_memory_arena {
 
   private:
 
-    /** The bytes, aligned so a mount demanding the portable alignment can address offset zero. */
-    using heap_storage_t = st::vector<byte_t, aligned_allocator<byte_t, portable_alignment_k>>;
+    /** The allocator of DMA bytes, placed on the arena's memory domain. */
+    using dma_allocator_t = linux_spdk_dma_allocator<byte_t>;
 
     /** The bytes of a disk whose controller DMAs to translated addresses, from
      *  the SPDK environment. */
-    using dma_storage_t = st::vector<byte_t, linux_spdk_dma_allocator<byte_t>>;
+    using dma_storage_t = st::vector<byte_t, dma_allocator_t>;
 
-    /** Heap bytes, or DMA bytes for a disk that needs them, chosen when the arena is made. */
-    using storage_t = std::variant<heap_storage_t, dma_storage_t>;
+    /** Host bytes on the arena's memory domain, or DMA bytes for a disk that needs them, chosen
+     *  when the arena is made. */
+    using storage_t = std::variant<domain_block_t, dma_storage_t>;
 
     /** Returns the charge to the budget, which both the destructor and a move assignment need. */
     void refund_() noexcept {

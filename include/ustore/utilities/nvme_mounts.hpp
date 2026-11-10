@@ -51,7 +51,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `resource_constraint`, `constrained_allocator`, `unlimited_resource_k`
 #include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`, `string_t`, `uuid_t`
 
-#if !USTORE_OS_WINDOWS_
+#if USTORE_OS_POSIX_
 #include <sys/resource.h> // `getrlimit`, `setrlimit`, `RLIMIT_NOFILE`
 #endif
 
@@ -279,6 +279,12 @@ class any_files_disk {
         return linux_spdk && linux_spdk->needs_dma_memory();
     }
 
+    /** The memory domain of the held controller's PCI node, or -1 for a transport without one. */
+    [[nodiscard]] int memory_domain() const noexcept {
+        linux_spdk_disk_t const* const linux_spdk = std::get_if<linux_spdk_disk_t>(&held_);
+        return linux_spdk ? linux_spdk->memory_domain() : -1;
+    }
+
 #pragma region Queue Pairs
 
     /** Takes a queue pair on @p depth requests of the held ring for the calling thread. */
@@ -496,6 +502,7 @@ class basic_storage_mount {
 
         memory_arena_config_t arena;
         arena.bytes = channels.arena_bytes() * (threads + config.shared_io_channels);
+        if constexpr (requires { disk_.memory_domain(); }) arena.memory_domain = disk_.memory_domain();
         auto [pinned, make_arena_status] = arena_t::make(disk_, constraint, arena);
         if (make_arena_status.failed()) return make_arena_status;
         arena_ = std::move(pinned);

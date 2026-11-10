@@ -156,7 +156,7 @@ engine_t const engine_k {
 using namespace unum::ustore;
 using namespace unum::ustore::oracles::rocksdb;
 
-#if defined(__linux__)
+#if USTORE_OS_LINUX_
 
 /** Lets RocksDB's POSIX file system open io_uring rings, which it leaves off unless this weak symbol is defined. A
  *  thread whose ring the kernel or a seccomp profile refuses reads through `pread` instead. */

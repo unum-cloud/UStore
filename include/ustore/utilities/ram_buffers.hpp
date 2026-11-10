@@ -663,6 +663,84 @@ template <template <typename> typename atomic_reference_>
 using constrained_aligned_buffer =
     st::vector<std::byte, constrained_allocator<std::byte, atomic_reference_, direct_io_allocator<std::byte>>>;
 
+/** Host bytes unbuffered I/O accepts, placed on one memory domain, and freed with the size and
+ *  the page they were granted on. */
+class domain_block_t {
+  public:
+    domain_block_t() noexcept = default;
+    domain_block_t(domain_block_t&& other) noexcept
+        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)),
+          granted_bytes_(std::exchange(other.granted_bytes_, 0)), page_bytes_(std::exchange(other.page_bytes_, 0)),
+          memory_domain_(std::exchange(other.memory_domain_, -1)) {}
+    domain_block_t& operator=(domain_block_t&& other) noexcept {
+        std::swap(data_, other.data_);
+        std::swap(size_, other.size_);
+        std::swap(granted_bytes_, other.granted_bytes_);
+        std::swap(page_bytes_, other.page_bytes_);
+        std::swap(memory_domain_, other.memory_domain_);
+        return *this;
+    }
+    domain_block_t(domain_block_t const&) = delete;
+    domain_block_t& operator=(domain_block_t const&) = delete;
+    ~domain_block_t() noexcept { release_(); }
+
+    /** First byte, aligned to @c buffer_alignment_k, or null when empty. */
+    [[nodiscard]] byte_t* data() const noexcept { return data_; }
+
+    /** Bytes asked for, which the granted run may exceed. */
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+    [[nodiscard]] byte_t* begin() const noexcept { return data_; }
+    [[nodiscard]] byte_t* end() const noexcept { return data_ + size_; }
+
+    /** The page the system backed the bytes with, a huge one where the domain had one free. */
+    [[nodiscard]] std::size_t page_bytes() const noexcept { return page_bytes_; }
+
+  private:
+    friend expected<domain_block_t> allocate_domain_block(fu_memory_domain_id_t, std::size_t) noexcept;
+
+    void release_() noexcept {
+        if (!data_) return;
+        if (memory_domain_ < 0) direct_io_allocator<byte_t> {}.deallocate(data_, granted_bytes_);
+        else fu_free_on_domain_id(memory_domain_, data_, granted_bytes_);
+        data_ = nullptr;
+    }
+
+    byte_t* data_ = nullptr;
+    std::size_t size_ = 0;
+    std::size_t granted_bytes_ = 0;
+    std::size_t page_bytes_ = 0;
+    fu_memory_domain_id_t memory_domain_ = -1;
+};
+
+/** Allocates at least @p bytes on @p memory_domain, through ForkUnion so a free huge page backs
+ *  them, or on @c buffer_alignment_k heap pages where the domain is -1 or nothing is placed. */
+inline expected<domain_block_t> allocate_domain_block(fu_memory_domain_id_t memory_domain, std::size_t bytes) noexcept {
+    domain_block_t block;
+    block.size_ = bytes;
+    if (memory_domain >= 0) {
+        void* memory = nullptr;
+        std::size_t granted = 0, page = 0;
+        if (fu_allocate_at_least_on_domain_id(memory_domain, bytes, &granted, &page, &memory) != fu_success_k ||
+            !memory)
+            return status_t {status_code_t::out_of_memory_k, "The memory domain refused the bytes"};
+        block.data_ = static_cast<byte_t*>(memory);
+        block.granted_bytes_ = granted;
+        block.page_bytes_ = page;
+        block.memory_domain_ = memory_domain;
+        // Without placement the platform answers cache-line-aligned heap, which O_DIRECT refuses
+        if (reinterpret_cast<std::uintptr_t>(memory) % buffer_alignment_k == 0) return block;
+        block.release_();
+        block.memory_domain_ = -1;
+    }
+    std::size_t const granted = round_up_to_multiple(bytes, buffer_alignment_k);
+    block.data_ = direct_io_allocator<byte_t> {}.allocate(granted);
+    if (!block.data_) return status_t {status_code_t::out_of_memory_k, "No room for the bytes"};
+    block.granted_bytes_ = granted;
+    block.page_bytes_ = buffer_alignment_k;
+    return block;
+}
+
 #pragma endregion Buffers
 
 /** An arena one call keeps on its own stack, on the calling thread's memory, freeing every block it grew when it

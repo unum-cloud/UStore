@@ -295,7 +295,7 @@ std::size_t uring_reports_the_alignment_statx_reports(linux_uring_files_disk_t& 
     struct statx description {};
     int const described = static_cast<int>(
         ::syscall(__NR_statx, file, "", AT_EMPTY_PATH, STATX_DIOALIGN, &description));
-    close_native_file(file);
+    [[maybe_unused]] status_t const closed = close_native_file(file);
     failures += expect_eq(described, 0);
     if (described != 0) return failures;
 
