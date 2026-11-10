@@ -56,7 +56,7 @@
 #include "ustore/utilities/algorithm.hpp"       // `radix_sort`
 #include "ustore/utilities/nvme_volume.hpp"     // `medium_extent_t`, `volume_config_t`
 #include "ustore/utilities/ram_buffers.hpp"     // `constrained_allocator`
-#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_t`, `bytes_span_t`, `save_fields`, `load_fields`
+#include "ustore/utilities/types.hpp"           // `status_t`, `expected`, `uuid128_t`, `bytes_span_t`
 
 namespace unum::ustore::blobs {
 
@@ -673,7 +673,7 @@ class basic_database {
 
     /** Runs one store's pool may grow to hold, the most a pool indexed by
      *  @c std::uint16_t admits. */
-    static constexpr std::size_t run_pool_capacity_k = std::numeric_limits<std::uint16_t>::max() - 1;
+    static constexpr std::size_t run_pool_capacity_k = (std::numeric_limits<std::uint16_t>::max)() - 1;
 
     /** One collection of the database: what a collection is called, how it is shaped, and
      *  the collection itself. */
@@ -1170,7 +1170,7 @@ class basic_database {
         std::uint64_t measured = 0;
         lookup_result_t folded = lookup_result_t::missing_k;
         auto const count = [&](std::size_t, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
-            measured = std::max<std::uint64_t>(measured, offset + bytes.size());
+            measured = fu::max_of<std::uint64_t>(measured, offset + bytes.size());
         };
         utilities::local_arena_t scratch;
         if (status_t const selected = select(read, scratch.allocator().arena,
@@ -1919,7 +1919,7 @@ class basic_database {
         if (bytes.empty()) return clear_user_data();
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        uuid_t const run = uuid_generator();
+        uuid128_t const run = uuid_generator();
         auto [written, allocate_status] = volume_->allocate(run, bytes.size());
         if (allocate_status.failed()) return allocate_status;
         if (status_t const filled = write_extent<disk_t, waiter_type_>(volume_->disk(), claimed->channel(), written,
@@ -1948,7 +1948,7 @@ class basic_database {
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         if (user_data_bytes_ == 0) return {status_code_t::not_found_k, "The database holds no user data"};
-        return replace_user_data_(claimed->channel(), uuid_t {}, medium_extent_t {}, 0);
+        return replace_user_data_(claimed->channel(), uuid128_t {}, medium_extent_t {}, 0);
     }
 
 #pragma endregion User Data
@@ -2015,7 +2015,7 @@ class basic_database {
         for (manifest_file_t const& file : held.files) [[maybe_unused]]
             st::status_t const indexed = held_by_run.push_back(st::assume_reserved, &file);
         utilities::radix_sort(
-            std::span<manifest_file_t const*> {held_by_run}, uuid_t::size_bytes_k,
+            std::span<manifest_file_t const*> {held_by_run}, uuid128_t::size_bytes_k,
             [](manifest_file_t const* file, std::size_t digit) noexcept -> std::size_t {
                 return file->run.bytes[digit];
             },
@@ -2623,9 +2623,9 @@ class basic_database {
     /** Publishes @p written of @p bytes as the caller's own data; whichever extent the durable
      *  manifest stops naming, the replaced one or a refused new one, goes back after the next
      *  publication that succeeds. */
-    status_t replace_user_data_(io_channel_t& channel, uuid_t const& run, medium_extent_t const& written,
+    status_t replace_user_data_(io_channel_t& channel, uuid128_t const& run, medium_extent_t const& written,
                                 std::uint64_t bytes) noexcept {
-        uuid_t const replaced_run = std::exchange(user_data_run_, run);
+        uuid128_t const replaced_run = std::exchange(user_data_run_, run);
         medium_extent_t const replaced = std::exchange(user_data_, written);
         std::uint64_t const replaced_bytes = std::exchange(user_data_bytes_, bytes);
         if (status_t const published = publish_manifest_(channel); published.failed()) {
@@ -2668,7 +2668,7 @@ class basic_database {
                                          digester_type_ const& digester, sha256_t& digest) noexcept {
         manifest_file_t const* const* const found = std::lower_bound(
             held_by_run.begin(), held_by_run.end(), source.file.run,
-            [](manifest_file_t const* file, uuid_t const& run) noexcept { return file->run < run; });
+            [](manifest_file_t const* file, uuid128_t const& run) noexcept { return file->run < run; });
         if (found != held_by_run.end() && (*found)->run == source.file.run && (*found)->bytes == source.file.bytes) {
             ++report.kept;
             auto [extent, open_status] = into.open(**found);
@@ -2897,8 +2897,8 @@ class basic_database {
 
     /** The manifest entry of @p extent, run @p run of @p bytes, owned by
      *  collection @p collection. */
-    [[nodiscard]] static manifest_file_t file_of_(medium_extent_t const& extent, uuid_t const& run, std::uint64_t bytes,
-                                                  std::uint32_t collection, std::uint32_t level,
+    [[nodiscard]] static manifest_file_t file_of_(medium_extent_t const& extent, uuid128_t const& run,
+                                                  std::uint64_t bytes, std::uint32_t collection, std::uint32_t level,
                                                   std::uint64_t stamp) noexcept {
         manifest_file_t file;
         file.run = run;
@@ -3073,7 +3073,7 @@ class basic_database {
     volume_t* volume_ = nullptr;
 
     /** The ID a directory volume names the file of the caller's own data by. */
-    uuid_t user_data_run_ {};
+    uuid128_t user_data_run_ {};
 
     /** Where the caller's own data lies, meaningful while @c user_data_bytes_ is not zero. */
     medium_extent_t user_data_ {};

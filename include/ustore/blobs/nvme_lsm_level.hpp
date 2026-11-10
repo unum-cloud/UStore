@@ -318,8 +318,8 @@ class lsm_level {
         : runs_(std::move(other.runs_)), run_pool_(other.run_pool_), number_(other.number_), order_(other.order_),
           size_bytes_(std::exchange(other.size_bytes_, 0)),
           population_count_(std::exchange(other.population_count_, 0)),
-          lower_(std::exchange(other.lower_, limit<stored_key_t>::max())),
-          upper_(std::exchange(other.upper_, limit<stored_key_t>::min())),
+          lower_(std::exchange(other.lower_, limit<stored_key_t>::max_k)),
+          upper_(std::exchange(other.upper_, limit<stored_key_t>::min_k)),
           range_tombstones_count_(std::exchange(other.range_tombstones_count_, 0)) {}
 
     lsm_level& operator=(lsm_level&& other) noexcept {
@@ -330,8 +330,8 @@ class lsm_level {
         order_ = other.order_;
         size_bytes_ = std::exchange(other.size_bytes_, 0);
         population_count_ = std::exchange(other.population_count_, 0);
-        lower_ = std::exchange(other.lower_, limit<stored_key_t>::max());
-        upper_ = std::exchange(other.upper_, limit<stored_key_t>::min());
+        lower_ = std::exchange(other.lower_, limit<stored_key_t>::max_k);
+        upper_ = std::exchange(other.upper_, limit<stored_key_t>::min_k);
         range_tombstones_count_ = std::exchange(other.range_tombstones_count_, 0);
         return *this;
     }
@@ -398,8 +398,8 @@ class lsm_level {
         runs_.clear();
         size_bytes_ = 0;
         population_count_ = 0;
-        lower_ = limit<stored_key_t>::max();
-        upper_ = limit<stored_key_t>::min();
+        lower_ = limit<stored_key_t>::max_k;
+        upper_ = limit<stored_key_t>::min_k;
         range_tombstones_count_ = 0;
     }
 
@@ -455,7 +455,7 @@ class lsm_level {
      *      is @c missing_k.
      */
     [[nodiscard]] lookup_result_t find(stored_key_t stored_key, lsm_level_position_t& position) const noexcept {
-        return find(stored_key, limit<std::uint64_t>::max(), position);
+        return find(stored_key, limit<std::uint64_t>::max_k, position);
     }
 
     /** As @c find, answering the newest version stamped at or below @p stamp, which a reader
@@ -534,7 +534,7 @@ class lsm_level {
 
         for (;;) {
             std::size_t chosen = runs_.size();
-            stored_key_t smallest = limit<stored_key_t>::max();
+            stored_key_t smallest = limit<stored_key_t>::max_k;
             for (std::size_t index = 0; index != runs_.size(); ++index) {
                 if (cursors[index] == run_at_(index).population_count()) continue;
                 stored_key_t const key = run_at_(index).key_slot(cursors[index]).stored_key;
@@ -594,10 +594,10 @@ class lsm_level {
     std::uint64_t population_count_ = 0;
 
     /** The least key any run holds. */
-    stored_key_t lower_ = limit<stored_key_t>::max();
+    stored_key_t lower_ = limit<stored_key_t>::max_k;
 
     /** The greatest key any run holds. */
-    stored_key_t upper_ = limit<stored_key_t>::min();
+    stored_key_t upper_ = limit<stored_key_t>::min_k;
 
     /** Range tombstones every run carries, kept as runs are named rather than recounted. */
     std::uint64_t range_tombstones_count_ = 0;

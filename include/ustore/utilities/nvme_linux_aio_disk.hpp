@@ -757,17 +757,17 @@ class linux_aio_files_disk {
     /** Marks the range and the medium of @p request as live, so neither can be taken back under it. */
     void borrow_(request_t const& request) noexcept {
         if (registered_memory_slot_t* const slot = resolve_(request.buffer); slot)
-            in_flight_(*slot).add(1, std::memory_order_acquire);
+            in_flight_(*slot).store_add(1, std::memory_order_acquire);
         if (registered_medium_slot_t* const slot = resolve_(request.medium); slot)
-            in_flight_(*slot).add(1, std::memory_order_acquire);
+            in_flight_(*slot).store_add(1, std::memory_order_acquire);
     }
 
     /** Releases both once the kernel is done with the bytes of @p request. */
     void restore_(request_t const& request) noexcept {
         if (registered_memory_slot_t* const slot = resolve_(request.buffer); slot)
-            in_flight_(*slot).sub(1, std::memory_order_release);
+            in_flight_(*slot).store_sub(1, std::memory_order_release);
         if (registered_medium_slot_t* const slot = resolve_(request.medium); slot)
-            in_flight_(*slot).sub(1, std::memory_order_release);
+            in_flight_(*slot).store_sub(1, std::memory_order_release);
     }
 
     /** Pops a free seat of @p slot's window, which its credit guarantees there is. */

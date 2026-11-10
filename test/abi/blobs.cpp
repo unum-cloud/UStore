@@ -327,9 +327,10 @@ case_result_t database_named_collections_race(config_t const& config) {
     std::size_t refused = 0;
     auto task = [&](std::size_t) noexcept {
         auto [collection, create_status] = database.create("contested");
-        if (create_status.succeeded()) fu::standard_atomic_ref<std::size_t> {created}.add(1, std::memory_order_relaxed);
+        if (create_status.succeeded())
+            fu::standard_atomic_ref<std::size_t> {created}.store_add(1, std::memory_order_relaxed);
         else if (create_status == status_code_t::already_exists_k)
-            fu::standard_atomic_ref<std::size_t> {refused}.add(1, std::memory_order_relaxed);
+            fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
     };
     auto maybe_executor = executor_t::make(threads_count, caller_exclusivity_t::caller_inclusive_k);
     failures += expect(maybe_executor);
@@ -1029,7 +1030,7 @@ case_result_t database_snapshot_with_threads(config_t const& config) {
             fu::standard_atomic_ref<bool> {snapshot_locked}.store(false, std::memory_order_release);
         }
         else { ++local_failures; }
-        fu::standard_atomic_ref<std::size_t> {thread_failures}.add(local_failures, std::memory_order_relaxed);
+        fu::standard_atomic_ref<std::size_t> {thread_failures}.store_add(local_failures, std::memory_order_relaxed);
     };
 
     auto maybe_executor = executor_t::make(2, caller_exclusivity_t::caller_inclusive_k);

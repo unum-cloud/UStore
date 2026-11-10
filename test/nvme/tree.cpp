@@ -255,7 +255,7 @@ template <typename level_type_, typename volume_type_>
     failures += build_batch(wanted, batch);
     if (failures != 0) return failures;
     expected<sorted_run_t> written = sorted_run_t::write(
-        volume, channel, uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {batch.key_slots},
+        volume, channel, uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {batch.key_slots},
         std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())},
         std::span<std::uint8_t const> {batch.kinds}, 0, std::span<byte_t const> {batch.values},
         std::span<stored_value_offset_t const> {batch.offsets}, value_max_size_k);
@@ -493,9 +493,9 @@ std::size_t restore_assigns_ingested_stamps(mount_type_ const& mount) {
     batch_t batch;
     failures += build_batch(std::span<expectation_t const> {model}, batch);
     if (failures != 0) return failures;
-    uuid_t const content_id = uuid_generator();
+    uuid128_t const content_id = uuid_generator();
     expected<sorted_run_t> const written = sorted_run_t::write(
-        *volume, guard->channel(), uuid_t {}, content_id, std::span<variable_slot_t const> {batch.key_slots},
+        *volume, guard->channel(), uuid128_t {}, content_id, std::span<variable_slot_t const> {batch.key_slots},
         std::span<std::uint64_t const> {zeros}, std::span<std::uint8_t const> {batch.kinds}, 0,
         std::span<byte_t const> {batch.values}, std::span<stored_value_offset_t const> {batch.offsets},
         value_max_size_k);
@@ -1108,7 +1108,7 @@ std::size_t trivial_move_writes_nothing(mount_type_ const& mount) {
     if (failures != 0) return failures;
 
     sorted_run_t const* const flushed = &tree->levels().level(0).run(0);
-    uuid_t const content_id = flushed->content_id();
+    uuid128_t const content_id = flushed->content_id();
     failures += expect(flushed->size_bytes() >= slot_bytes_k);
     failures += expect(tree->needs_compaction(tree->levels()));
     std::array<typename tree_t::merge_buffers_t, 1> buffers {};
@@ -1230,7 +1230,7 @@ std::size_t compaction_history_matches_reference(mount_type_ const& mount) {
     std::size_t overspent = 0;
     std::size_t mislengthed = 0;
     std::size_t underfilled = 0;
-    st::vector<uuid_t> before;
+    st::vector<uuid128_t> before;
     for (std::size_t flush = 0; flush != flushes_k && failures == 0; ++flush) {
         st::vector<expectation_t> batch;
         for (std::uint64_t key = 0; key != keys_k; ++key) {
@@ -1268,7 +1268,7 @@ std::size_t compaction_history_matches_reference(mount_type_ const& mount) {
                 for (std::size_t index = 0; index != merged.level(number).size(); ++index) {
                     sorted_run_t const& run = merged.level(number).run(index);
                     bool known = false;
-                    for (uuid_t const& id : before) known |= id == run.content_id();
+                    for (uuid128_t const& id : before) known |= id == run.content_id();
                     if (!known) failures += expect(written.push_back(&run) == st::status_t::success_k);
                 }
             std::uint64_t written_bytes = 0;
@@ -1742,7 +1742,7 @@ template <typename types_type_>
     }
     tail_offsets[count] = tails_bytes;
     expected<sorted_run_t> run = sorted_run_t::write(
-        volume, channel, uuid_t {}, uuid_generator(), std::span<key_slot_t const> {key_slots},
+        volume, channel, uuid128_t {}, uuid_generator(), std::span<key_slot_t const> {key_slots},
         std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, {}, {}, key_slot_t::size,
         key_tails_column_t {std::span<std::uint32_t const> {tail_offsets}, std::span<byte_t const> {tails}});
     failures += expect(run.has_value());

@@ -11,8 +11,7 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::max`, `std::min`
-#include <span>      // `std::span`
+#include <span> // `std::span`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -159,9 +158,9 @@ status_t read_values_batched(call_access<cpu_class_> const& access, view_t const
                 auto sink = [&, first](std::size_t request, std::uint64_t offset,
                                        std::span<byte_t const> bytes) noexcept {
                     task_window_t const window = windows[first + request];
-                    std::uint64_t const window_begin = std::max<std::uint64_t>(offset, window.offset);
-                    std::uint64_t const window_end = std::min<std::uint64_t>(offset + bytes.size(),
-                                                                             window.offset + window.length);
+                    std::uint64_t const window_begin = fu::max_of<std::uint64_t>(offset, window.offset);
+                    std::uint64_t const window_end = fu::min_of<std::uint64_t>(offset + bytes.size(),
+                                                                               window.offset + window.length);
                     if (window_begin < window_end)
                         std::memcpy(rooms[first + request] + (window_begin - window.offset),
                                     bytes.data() + (window_begin - offset),
@@ -331,7 +330,7 @@ status_t sample_values(ustore_blobs_sample_t const& arguments, view_t const& vie
         std::size_t seen = 0;
         status_t room;
         if (sample.limit != 0)
-            if (status_t const walked = walk(access, sample.collection, limit<stored_key_t>::min(),
+            if (status_t const walked = walk(access, sample.collection, limit<stored_key_t>::min_k,
                                              [&](stored_key_t key, stored_value_size_t) noexcept {
                                                  std::size_t const slot = seen < sample.limit
                                                                               ? seen

@@ -615,7 +615,7 @@ struct repeating_accessor_t {
 /** Writes the one value of @p handle, a @c repeating_accessor_t, for each of @p count indices. */
 void get_repeated(void const* handle, ustore_size_t const*, ustore_size_t count, ustore_bytes_view_t* views) noexcept {
     repeating_accessor_t const& accessor = *static_cast<repeating_accessor_t const*>(handle);
-    *accessor.largest_block = std::max<std::size_t>(*accessor.largest_block, count);
+    *accessor.largest_block = fu::max_of<std::size_t>(*accessor.largest_block, count);
     for (ustore_size_t index = 0; index != count; ++index) views[index] = bytes_of(accessor.value);
 }
 
@@ -1086,7 +1086,7 @@ case_result_t database_stamps(config_t const& config) {
     ustore_transaction_t const transaction = maybe_transaction->transaction();
     failures += write_text(database, blobs, {&key, 1}, "staged", transaction);
 
-    ustore_stamp_t read_stamp = std::numeric_limits<ustore_stamp_t>::max();
+    ustore_stamp_t read_stamp = (std::numeric_limits<ustore_stamp_t>::max)();
     ustore_stamp_t commit_stamp = 0;
     ustore_stamp_t snapshot_stamp = 0;
     ustore_outcome_t outcome {};

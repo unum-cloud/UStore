@@ -10,7 +10,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::find`, `std::max`, `std::reverse`
+#include <algorithm>   // `std::find`, `std::reverse`
 #include <array>       // `std::array`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -312,7 +312,7 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
         if (threads > 1) return finish(outcome, {status_code_t::unsupported_k, "This build spawns no threads"});
         threads = 1;
     }
-    else if (!threads) threads = std::max<std::size_t>(cores_near(*topology, domains) * 7 / 8, 1);
+    else if (!threads) threads = fu::max_of<std::size_t>(cores_near(*topology, domains) * 7 / 8, 1);
     // ForkUnion spawns near one memory domain or across every one, so naming several but not all takes the machine
     bool const near_one = domains.size() == 1 && topology->memory_domains_count() > 1;
     st::expected<executor_t> pool = near_one ? executor_t::make_near(*topology, domains[0], threads,
@@ -371,7 +371,7 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
         if (st::expected<std::size_t> const cores = executor_t::logical_cores_count(); cores)
             threads = std::clamp<std::size_t>(*cores / 2, 1, 8);
     ustore_executor_t made = nullptr;
-    if (status_t const status = spawn_across_machine(std::max<std::size_t>(threads, 1), spawned_exclusivity(),
+    if (status_t const status = spawn_across_machine(fu::max_of<std::size_t>(threads, 1), spawned_exclusivity(),
                                                      forkunion_allowed_of(ceiling), made);
         status.failed())
         return finish(outcome, status);
@@ -412,7 +412,7 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
 
 void ustore_gpu_devices(ustore_gpu_devices_t* arguments) {
     std::span<gpu_device_t const> const devices = gpu_devices();
-    std::size_t const copied = arguments->devices ? std::min<std::size_t>(devices.size(), arguments->devices_capacity)
+    std::size_t const copied = arguments->devices ? fu::min_of<std::size_t>(devices.size(), arguments->devices_capacity)
                                                   : 0;
     for (std::size_t position = 0; position != copied; ++position) {
         gpu_device_t const& device = devices[position];

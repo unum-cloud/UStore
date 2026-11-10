@@ -90,7 +90,7 @@ class pool_view_t {
     template <thread_callback_concept callback_type_>
     [[nodiscard]] st::status_t for_threads(callback_type_&& callback) const noexcept {
         fu_for_threads_t const trampoline = [](fu_lambda_context_t context, std::size_t thread,
-                                               std::size_t compute_domain) noexcept {
+                                               [[maybe_unused]] std::size_t compute_domain) noexcept {
             auto& target = *static_cast<std::remove_reference_t<callback_type_>*>(context);
             if constexpr (std::is_nothrow_invocable_v<callback_type_&, std::size_t, std::size_t>)
                 target(thread, compute_domain);

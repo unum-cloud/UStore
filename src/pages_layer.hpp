@@ -33,7 +33,6 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::max`
 #include <bit>         // `std::bit_cast`
 #include <chrono>      // `std::chrono::system_clock`
 #include <limits>      // `std::numeric_limits`
@@ -154,7 +153,7 @@ inline std::uint64_t newest_placement(page_tree_t const& tree) noexcept {
     std::uint64_t newest = 0;
     pages::element_index_t const root = tree.root();
     for (pages::element_index_t at = root; at != pages::no_element_k; at = tree.next_in_preorder(at, root))
-        newest = std::max(newest, tree[at].placement.stamp);
+        newest = fu::max_of(newest, tree[at].placement.stamp);
     return newest;
 }
 
@@ -373,7 +372,7 @@ status_t edit_pages(arguments_type_ const& arguments, view_t const& view, make_e
     if (status_t const status = validate_remove(arguments.transaction, places, arguments.durability, arguments.watch);
         status.failed())
         return status;
-    if (arguments.count > std::numeric_limits<std::uint32_t>::max())
+    if (arguments.count > (std::numeric_limits<std::uint32_t>::max)())
         return {status_code_t::invalid_argument_k, "One call edits at most 4 Gi tasks"};
 
     view_t reading = view;
@@ -382,8 +381,8 @@ status_t edit_pages(arguments_type_ const& arguments, view_t const& view, make_e
     if (touched_status.failed()) return touched_status;
 
     std::uint64_t newest = 0;
-    for (touched_page_t const& page : touched.pages) newest = std::max(newest, newest_placement(page.state.tree));
-    std::uint64_t const stamp = std::max(clock_stamp(), newest + 1);
+    for (touched_page_t const& page : touched.pages) newest = fu::max_of(newest, newest_placement(page.state.tree));
+    std::uint64_t const stamp = fu::max_of(clock_stamp(), newest + 1);
 
     for (std::size_t task = 0; task != arguments.count; ++task) {
         touched_page_t& page = touched.pages[touched.pages_of_tasks[task]];

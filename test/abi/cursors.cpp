@@ -11,7 +11,7 @@
 #include <cstdint> // `std::uint32_t`
 #include <cstdio>  // `stderr`
 
-#include <algorithm>        // `std::copy`, `std::equal`, `std::min`, `std::sort`
+#include <algorithm>        // `std::copy`, `std::equal`, `std::sort`
 #include <array>            // `std::array`
 #include <chrono>           // `std::chrono::milliseconds`
 #include <initializer_list> // `std::initializer_list`
@@ -63,7 +63,7 @@ case_result_t cursor_whole_walk(config_t const& config) {
         ustore_blobs_cursor_next_t next = pull_of(database, cursor, pulled, arena, 4, outcome);
         ustore_blobs_cursor_next(&next);
         failures += expect_success(outcome);
-        std::span<ustore_key_t const> const wanted {keys.data() + first, std::min<std::size_t>(4, 10 - first)};
+        std::span<ustore_key_t const> const wanted {keys.data() + first, fu::min_of<std::size_t>(4, 10 - first)};
         failures += expect_page(pulled, wanted, "walked");
     }
     ustore_blobs_cursor_free(cursor);
@@ -104,7 +104,7 @@ case_result_t cursor_whole_walk(config_t const& config) {
                                            .wanted = 2};
         ustore_strings_cursor_next(&next);
         failures += expect_success(outcome);
-        failures += expect_eq(written, std::min<std::size_t>(2, 3 - first));
+        failures += expect_eq(written, fu::min_of<std::size_t>(2, 3 - first));
         for (std::size_t index = 0; index != written && first + index != prefixed.size(); ++index) {
             failures += expect_eq(string_of(tape_string(found, index)), prefixed[first + index]);
             failures += expect_eq(values[index], prefixed_keys[first + index]);

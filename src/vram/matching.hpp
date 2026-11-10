@@ -27,11 +27,10 @@
 #include <cstdint> // `std::uint64_t`, `std::uintptr_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::max`, `std::min`
-#include <array>     // `std::array`
-#include <span>      // `std::span`
-#include <utility>   // `std::index_sequence`, `std::make_index_sequence`
-#include <variant>   // `std::get_if`
+#include <array>   // `std::array`
+#include <span>    // `std::span`
+#include <utility> // `std::index_sequence`, `std::make_index_sequence`
+#include <variant> // `std::get_if`
 
 #include "ustore/utilities/ram_buffers.hpp"   // `arena_allocate`, `arena_copy`, `stringzilla_allocator`
 #include "ustore/utilities/vram_device.hpp"   // `carve`, `rewind`, `device_blocks_of`, `launch`
@@ -365,8 +364,8 @@ class device_match {
                                               markup ? walk_split_t::per_thread_k : walk_split_t::by_length_k, work);
         if (shape_status.failed()) return shape_status;
         std::uint64_t const chunk_bytes = substrings
-                                              ? std::max<std::uint64_t>(matching_chunk_bytes_k,
-                                                                        sz_substrings_chunk_bytes_simt_(*substrings))
+                                              ? fu::max_of<std::uint64_t>(matching_chunk_bytes_k,
+                                                                          sz_substrings_chunk_bytes_simt_(*substrings))
                                               : matching_chunk_bytes_k;
         auto [chunks, chunks_status] = !paths ? chunks_of(offsets, shape.per_chunk, chunk_bytes, work)
                                               : expected<std::span<matching_chunk_t>> {std::span<matching_chunk_t> {}};
@@ -426,7 +425,7 @@ class device_match {
         if (substrings) {
             sz_substrings_engine_t const& engine = std::get<sz_substrings_engine_t>(match_.on_device);
             std::size_t const head = sz_substrings_staged_bytes_simt_(&engine, 0);
-            std::uint32_t const staged = static_cast<std::uint32_t>(std::min<std::size_t>(
+            std::uint32_t const staged = static_cast<std::uint32_t>(fu::min_of<std::size_t>(
                 engine.hot_count,
                 (matching_shared_bytes_k - head) / (sz_substrings_staged_bytes_simt_(&engine, 1) - head)));
             unsigned const shared = static_cast<unsigned>(sz_substrings_staged_bytes_simt_(&engine, staged));
@@ -444,7 +443,7 @@ class device_match {
         else if (regex) {
             sz_regex_engine_t const& engine = std::get<sz_regex_engine_t>(match_.on_device);
             std::size_t const head = sz_regex_staged_bytes_simt_(&engine, 0);
-            std::uint32_t const cells = static_cast<std::uint32_t>(std::min<std::size_t>(
+            std::uint32_t const cells = static_cast<std::uint32_t>(fu::min_of<std::size_t>(
                 engine.reverse_states_count * sz_regex_stride_(engine.classes_count, engine.lookarounds_count),
                 (matching_shared_bytes_k - head) / (sz_regex_staged_bytes_simt_(&engine, 1) - head)));
             unsigned const shared = static_cast<unsigned>(sz_regex_staged_bytes_simt_(&engine, cells));

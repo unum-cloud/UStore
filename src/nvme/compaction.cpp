@@ -25,12 +25,13 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
                                              std::uint32_t upper_runs, compaction_stamps_t const& stamps,
                                              st::vector<strings_version_t>& survivors) noexcept {
     using st::status_t;
-    if (!executor_->kernels() || views.size() > std::numeric_limits<std::uint32_t>::max() || upper_runs > views.size())
+    if (!executor_->kernels() || views.size() > (std::numeric_limits<std::uint32_t>::max)() ||
+        upper_runs > views.size())
         return status_t::invalid_argument_k;
     std::size_t const runs_count = views.size();
     std::size_t records = 0, keys_bytes = 0, saved_count = 0;
     for (strings_run_view const& view : views) {
-        if (view.heads->size() > std::numeric_limits<std::uint32_t>::max()) return status_t::invalid_argument_k;
+        if (view.heads->size() > (std::numeric_limits<std::uint32_t>::max)()) return status_t::invalid_argument_k;
         records += view.heads->size();
         keys_bytes += view.keys.size();
         saved_count += (view.stamps->saved_bytes() + view.kinds->saved_bytes()) / sizeof(std::uint64_t);

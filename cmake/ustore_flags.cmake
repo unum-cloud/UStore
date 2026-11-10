@@ -3,9 +3,13 @@
 # Warnings apply to UStore's own targets only, so fetched dependencies build with their own flags.
 add_library(ustore_warnings INTERFACE)
 if (MSVC)
-    target_compile_options(ustore_warnings INTERFACE /W4 /permissive- /Zc:__cplusplus)
+    # The conformance switches MSVC leaves off by default, which every other supported compiler behaves as.
+    target_compile_options(
+        ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:/W4;/Zc:preprocessor;/utf-8;/bigobj>"
+                                  "$<$<COMPILE_LANGUAGE:CXX>:/permissive-;/Zc:__cplusplus>"
+    )
     if (USTORE_WERROR)
-        target_compile_options(ustore_warnings INTERFACE /WX)
+        target_compile_options(ustore_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:/WX>")
     endif ()
 else ()
     # The C ABI takes named arguments as partially designated structs, leaving the rest zeroed. CUDA sources take the

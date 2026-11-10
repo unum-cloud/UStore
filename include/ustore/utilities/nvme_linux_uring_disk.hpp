@@ -480,7 +480,7 @@ class linux_uring_files_disk {
             slot.base = memory.data();
             slot.length = memory.size();
             slot.space = space;
-            epoch_(registered_memories_epoch_).add(1, std::memory_order_release);
+            epoch_(registered_memories_epoch_).store_add(1, std::memory_order_release);
             return registered_memory_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, memory,
                                         space};
         }
@@ -505,7 +505,7 @@ class linux_uring_files_disk {
         slot->base = nullptr;
         slot->length = 0;
         claim_(slot->registered).store(0, std::memory_order_release);
-        epoch_(registered_memories_epoch_).add(1, std::memory_order_release);
+        epoch_(registered_memories_epoch_).store_add(1, std::memory_order_release);
         registered_memory.surrender();
         return {};
     }
@@ -542,7 +542,7 @@ class linux_uring_files_disk {
             slot.capacity = medium_bytes_of(file);
             slot.memory_alignment = alignment.memory;
             slot.offset_alignment = alignment.offset;
-            epoch_(media_epoch_).add(1, std::memory_order_release);
+            epoch_(media_epoch_).store_add(1, std::memory_order_release);
             return registered_medium_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation},
                                         slot.capacity, direct.offset};
         }
@@ -575,7 +575,7 @@ class linux_uring_files_disk {
         ++slot->generation;
         slot->capacity = 0;
         claim_(slot->registered).store(0, std::memory_order_release);
-        epoch_(media_epoch_).add(1, std::memory_order_release);
+        epoch_(media_epoch_).store_add(1, std::memory_order_release);
         registered_medium.surrender();
         return {};
     }
@@ -1265,17 +1265,17 @@ class linux_uring_files_disk {
     /** Marks the range and the medium of @p request as live, so neither can be taken back under it. */
     void borrow_(request_t const& request) noexcept {
         if (registered_memory_slot_t* const slot = resolve_(request.buffer); slot)
-            in_flight_(*slot).add(1, std::memory_order_acquire);
+            in_flight_(*slot).store_add(1, std::memory_order_acquire);
         if (registered_medium_slot_t* const slot = resolve_(request.medium); slot)
-            in_flight_(*slot).add(1, std::memory_order_acquire);
+            in_flight_(*slot).store_add(1, std::memory_order_acquire);
     }
 
     /** Releases both once the kernel is done with the bytes of the request @p flight remembers. */
     void restore_(flight_t const& flight) noexcept {
         if (registered_memory_slot_t* const slot = resolve_(flight.buffer); slot)
-            in_flight_(*slot).sub(1, std::memory_order_release);
+            in_flight_(*slot).store_sub(1, std::memory_order_release);
         if (registered_medium_slot_t* const slot = resolve_(flight.medium); slot)
-            in_flight_(*slot).sub(1, std::memory_order_release);
+            in_flight_(*slot).store_sub(1, std::memory_order_release);
     }
 
     /** Remembers what @p request will need when only its token and result come back. */
@@ -1400,7 +1400,7 @@ class linux_uring_files_disk {
         // A request across a gibibyte boundary spans two table slots, which no fixed transfer names
         range_pinning_t const addressed = across ? range_pinning_t::unpinned_k : pinning;
         if (addressed != pinning)
-            atomic_reference_<std::uint64_t> {crossing_requests_}.add(1, std::memory_order_relaxed);
+            atomic_reference_<std::uint64_t> {crossing_requests_}.store_add(1, std::memory_order_relaxed);
         switch (addressed) {
         case range_pinning_t::pinned_k:
             entry.opcode = request.kind == request_kind_t::read_k ? read_pinned : write_pinned;

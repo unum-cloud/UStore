@@ -709,7 +709,7 @@ status_t publish_naming(volume_type_& volume, fixture_type_& fixture, io_channel
 }
 
 /** The manifest entry of @p extent, written for @p run, as user data of no collection. */
-[[nodiscard]] inline manifest_file_t file_of(medium_extent_t const& extent, uuid_t const& run) noexcept {
+[[nodiscard]] inline manifest_file_t file_of(medium_extent_t const& extent, uuid128_t const& run) noexcept {
     manifest_file_t file;
     file.run = run;
     file.offset = extent.extent.offset;

@@ -2390,7 +2390,7 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
     constexpr std::size_t readers_k = 4;
     constexpr std::uint64_t rounds_k = 1500;
     constexpr std::uint64_t keys_k = 64;
-    constexpr std::uint64_t no_round_k = std::numeric_limits<std::uint64_t>::max();
+    constexpr std::uint64_t no_round_k = (std::numeric_limits<std::uint64_t>::max)();
 
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
     failures += expect_status(stack, status_code_t::success_k);
@@ -2719,7 +2719,7 @@ std::size_t feed_reads_across_flushes_and_merges(mount_type_ const& mount) {
     // Three at a time resumes inside the last commit, and a second pass rereads the same history.
     for (std::size_t wanted : {std::size_t {3}, std::size_t {1000}}) {
         st::vector<fed_change_t> fed;
-        stored_change<stored_key_t> handed {since, std::numeric_limits<stored_key_t>::max()};
+        stored_change<stored_key_t> handed {since, (std::numeric_limits<stored_key_t>::max)()};
         failures += pull_changes(store, id, handed, wanted, fed);
         failures += expect_fed(fed, logged);
     }
@@ -2770,7 +2770,7 @@ std::size_t freed_feed_lets_merges_fold(mount_type_ const& mount) {
     failures += expect(store.flush().succeeded());
     failures += expect_eq(store.population_count(), pinned_population + 1);
     st::vector<fed_change_t> fed;
-    stored_change<stored_key_t> handed {since, std::numeric_limits<stored_key_t>::max()};
+    stored_change<stored_key_t> handed {since, (std::numeric_limits<stored_key_t>::max)()};
     failures += pull_changes(store, id, handed, 2, fed);
     failures += expect_eq(fed.size(), std::size_t {rewrites_k});
 

@@ -81,7 +81,7 @@ struct settings_t : shared_settings_t {
     count_t outer_degree {.value = 1, .minimum = 0};
 
     /** Edges kept from the dataset, counted before repeats collapse. */
-    count_t max_edges {std::numeric_limits<std::size_t>::max()};
+    count_t max_edges {(std::numeric_limits<std::size_t>::max)()};
 
     /** Edges every upsert batch carries into the graph collection. */
     count_t batch_size_upsert {.value = 1024, .minimum = 1};
@@ -702,7 +702,7 @@ int main(int argc, char** argv) {
             [&](loop_t& loop, std::size_t) noexcept {
                 for (std::size_t call : loop) {
                     std::span<edge_t const> const batch = batches.subspan(
-                        call * batch_size, std::min(batch_size, batches.size() - call * batch_size));
+                        call * batch_size, fu::min_of(batch_size, batches.size() - call * batch_size));
                     if (graph.write_edges(edges_view_t {batch.data(), batch.data() + batch.size()}).failed())
                         return loop.skip("failed to upsert a batch of edges");
                     loop.count(batch.size(), batch.size() * sizeof(edge_t));

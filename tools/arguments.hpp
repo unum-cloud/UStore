@@ -99,7 +99,7 @@ struct bytes_t {
 struct count_t {
     std::size_t value = 0;
     std::size_t minimum = 1;
-    std::size_t maximum = std::numeric_limits<std::size_t>::max();
+    std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
 };
 
 /** Comma-separated counts like @c 16,256,4096, each within @b [minimum,maximum].
@@ -109,7 +109,7 @@ struct counts_t {
     std::array<std::size_t, capacity_k> values {};
     std::size_t size = 0;
     std::size_t minimum = 1;
-    std::size_t maximum = std::numeric_limits<std::size_t>::max();
+    std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
     std::size_t min_size = 1;
     std::size_t max_size = capacity_k;
 
@@ -208,7 +208,7 @@ inline constexpr std::array<unit_t, 2> duration_units_k {{
     std::string_view const suffix = text.substr(digits_length);
     for (unit_t const& unit : units) {
         if (unit.suffix != suffix) continue;
-        if (number != 0 && unit.multiplier > std::numeric_limits<std::uint64_t>::max() / number)
+        if (number != 0 && unit.multiplier > (std::numeric_limits<std::uint64_t>::max)() / number)
             return argument_status_t::out_of_range_k;
         value = number * unit.multiplier;
         return argument_status_t::parsed_k;
@@ -237,7 +237,7 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
     };
     for (std::string_view const known : std::array<std::string_view, 5> {"", "kb", "mb", "gb", "tb"}) {
         if (std::equal(unit.begin(), unit.end(), known.begin(), known.end(), same_letter)) return bytes;
-        if (bytes > std::numeric_limits<std::size_t>::max() / 1024) return std::nullopt;
+        if (bytes > (std::numeric_limits<std::size_t>::max)() / 1024) return std::nullopt;
         bytes *= 1024;
     }
     return std::nullopt;
@@ -257,7 +257,7 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
     std::uint64_t value = 0;
     argument_status_t const status = parse_with_units_(text, duration_units_k, value);
     if (status != argument_status_t::parsed_k) return status;
-    if (value == 0 || value > static_cast<std::uint64_t>(std::numeric_limits<std::chrono::nanoseconds::rep>::max()))
+    if (value == 0 || value > static_cast<std::uint64_t>((std::numeric_limits<std::chrono::nanoseconds::rep>::max)()))
         return argument_status_t::out_of_range_k;
     duration = std::chrono::nanoseconds {static_cast<std::chrono::nanoseconds::rep>(value)};
     return argument_status_t::parsed_k;
@@ -475,7 +475,7 @@ inline std::string spell_size(std::size_t bytes) {
 [[nodiscard]] inline std::string expected_(flag_t const& flag) {
     if (auto const* count = std::get_if<count_t*>(&flag.destination)) {
         std::size_t const minimum = (*count)->minimum, maximum = (*count)->maximum;
-        if (maximum != std::numeric_limits<std::size_t>::max())
+        if (maximum != (std::numeric_limits<std::size_t>::max)())
             return fmt::format("a count from {} to {}", minimum, maximum);
         return minimum == 1 ? "a positive count" : fmt::format("a count of at least {}", minimum);
     }

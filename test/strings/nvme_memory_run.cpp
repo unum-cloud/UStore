@@ -17,7 +17,6 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcmp`
 
-#include <algorithm>       // `std::max`, `std::min`
 #include <array>           // `std::array`
 #include <map>             // `std::map`
 #include <memory>          // `std::unique_ptr`, `std::addressof`
@@ -105,7 +104,7 @@ static std::size_t cursor_agrees(view_t const& view, model_t const& model, std::
     if (check(cursor.has_value())) return 1;
     std::size_t failures = 0;
     std::size_t listed = 0;
-    for (model_t::const_iterator entry = model.lower_bound(std::max(prefix, start));
+    for (model_t::const_iterator entry = model.lower_bound(fu::max_of(prefix, start));
          entry != model.end() && entry->first.starts_with(prefix) && listed != wanted && failures == 0; ++entry) {
         model_version_t const* const version = model_find(model, entry->first, at);
         if (!version) continue;
@@ -165,7 +164,7 @@ static std::string prefix_pick(std::vector<std::string> const& pool, std::mt1993
     switch (shape_pick(generator)) {
     case 0: return {};
     case 1: return text;
-    default: return text.substr(0, std::min(text.size(), length_pick(generator)));
+    default: return text.substr(0, fu::min_of(text.size(), length_pick(generator)));
     }
 }
 
@@ -176,7 +175,7 @@ static std::string start_pick(std::vector<std::string> const& pool, std::mt19937
     switch (shape_pick(generator)) {
     case 0: return {};
     case 1: return text;
-    case 2: return text.substr(0, std::min(text.size(), length_pick(generator)));
+    case 2: return text.substr(0, fu::min_of(text.size(), length_pick(generator)));
     default: return text + std::string(1, '\xFF');
     }
 }
@@ -423,8 +422,8 @@ static std::size_t random_streams_match_model() {
                 failures += check(view.written_since(text, from) == (model_newest(model, text) > from));
 
                 std::string const& other = pool[string_pick(generator)];
-                std::string const& lower = std::min(text, other);
-                std::string const& upper = std::max(text, other);
+                std::string const& lower = fu::min_of(text, other);
+                std::string const& upper = fu::max_of(text, other);
                 bool range_written = false;
                 for (model_t::const_iterator entry = model.lower_bound(lower);
                      entry != model.end() && entry->first <= upper && !range_written; ++entry)

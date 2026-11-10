@@ -25,11 +25,10 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 
-#include <algorithm> // `std::max`, `std::min`
-#include <atomic>    // `std::atomic_thread_fence`, `std::memory_order_acquire`, `std::memory_order_release`
-#include <memory>    // `std::construct_at`, `std::destroy_at`
-#include <span>      // `std::span`
-#include <utility>   // `std::exchange`, `std::move`
+#include <atomic>  // `std::atomic_thread_fence`, `std::memory_order_acquire`, `std::memory_order_release`
+#include <memory>  // `std::construct_at`, `std::destroy_at`
+#include <span>    // `std::span`
+#include <utility> // `std::exchange`, `std::move`
 
 #include <forkunion/types.hpp> // `fu::default_alignment_k`
 
@@ -449,7 +448,7 @@ class commit_ledger {
     [[nodiscard]] transaction_stamp_t fold_horizon(transaction_stamp_t horizon, transaction_stamp_t& folded) noexcept {
         guard_t const held {claim_};
         for (pin_t const* pin = feeds_.next_; pin != &feeds_; pin = pin->next_)
-            if (pin->folded_ == &folded) horizon = std::min(horizon, pin->stamp_);
+            if (pin->folded_ == &folded) horizon = fu::min_of(horizon, pin->stamp_);
         if (folded < horizon) folded = horizon;
         return horizon;
     }
@@ -467,12 +466,12 @@ class commit_ledger {
     [[nodiscard]] transaction_stamp_t durable_stamp() noexcept { return horizon_besides(views_); }
 
     /** The stamp below which no reader and no mount can tell two stamps apart, which a run's column counts from. */
-    [[nodiscard]] transaction_stamp_t floor() noexcept { return std::min(low_water_mark(), durable_stamp()); }
+    [[nodiscard]] transaction_stamp_t floor() noexcept { return fu::min_of(low_water_mark(), durable_stamp()); }
 
     /** As @c floor, ignoring the memory runs of the view @p own_pin registers, which a flush is
      *  about to write out. */
     [[nodiscard]] transaction_stamp_t floor_besides(pin_t const& own_pin) noexcept {
-        return std::min(low_water_mark(), horizon_besides(own_pin));
+        return fu::min_of(low_water_mark(), horizon_besides(own_pin));
     }
 
     /**
@@ -485,7 +484,7 @@ class commit_ledger {
         transaction_stamp_t horizon = published();
         guard_t const held {claim_};
         for (pin_t const* pin = views_.next_; pin != &views_; pin = pin->next_)
-            if (pin != &own_pin) horizon = std::min(horizon, load_(pin->stamp_));
+            if (pin != &own_pin) horizon = fu::min_of(horizon, load_(pin->stamp_));
         return horizon;
     }
 
@@ -831,12 +830,12 @@ class maintenance_claim {
         if (epoch.fetch_or(1, std::memory_order_acquire) % 2 == 0) return;
         // Counted across retries: a holder that reads none parked after its release is seen by
         // the next `fetch_or`.
-        parked.add(1, std::memory_order_seq_cst);
+        parked.store_add(1, std::memory_order_seq_cst);
         while (epoch.fetch_or(1, std::memory_order_acquire) % 2 != 0) {
             std::uint32_t const seen = epoch.load(std::memory_order_relaxed);
             if (seen % 2 != 0) waiting_policy_t {}.wait_until_changed(&epoch_, seen);
         }
-        parked.sub(1, std::memory_order_relaxed);
+        parked.store_sub(1, std::memory_order_relaxed);
     }
 
     /** Whether a blocking @c take is parked on the claim, which a holder about to retake
@@ -868,7 +867,7 @@ class maintenance_claim {
     /** Hands the claim back, which only its holder does, and wakes every caller parked on it; the
      *  holder looks at the views again only after this. */
     void release() noexcept {
-        atomic_reference_<std::uint32_t> {epoch_}.add(1, std::memory_order_release);
+        atomic_reference_<std::uint32_t> {epoch_}.store_add(1, std::memory_order_release);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         waiting_policy_t {}.notify_waiters(&epoch_);
     }
@@ -1424,7 +1423,7 @@ class published_runs {
         survival.pinned = readers.data();
         survival.pinned_count = readers.size();
         survival.horizon = ledger_->fold_horizon(ledger_->horizon_besides(view_pin_), folded_floor_);
-        survival.floor = std::min(ledger_->floor_besides(view_pin_), survival.horizon);
+        survival.floor = fu::min_of(ledger_->floor_besides(view_pin_), survival.horizon);
         publication.oldest_readable = survival.horizon;
         return drain(tree_, std::span<memory_run_t const* const> {publication.flushed}, survival, publication.hook());
     }
@@ -1455,7 +1454,7 @@ class published_runs {
         stamps.pinned = readers.data();
         stamps.pinned_count = readers.size();
         stamps.horizon = ledger_->fold_horizon(ledger_->durable_stamp(), folded_floor_);
-        stamps.floor = std::min(ledger_->floor(), stamps.horizon);
+        stamps.floor = fu::min_of(ledger_->floor(), stamps.horizon);
         publication_t publication;
         publication.owner = this;
         publication.oldest_readable = stamps.horizon;
@@ -1508,7 +1507,7 @@ class published_runs {
                             std::span<merge_buffers_t> buffers, transaction_stamp_t ceiling, fold_type_ const& fold,
                             lsm_tree_publication_hook_t const& published) noexcept {
         // Merges before the mount may have folded anything at or below the stamp it resumes from.
-        folded_floor_ = std::max(folded_floor_, ceiling);
+        folded_floor_ = fu::max_of(folded_floor_, ceiling);
         {
             reader_t const inside = enter();
             view_t const& taken = *view_.load();
@@ -1834,7 +1833,7 @@ class published_runs {
             return {status_code_t::out_of_memory_k, "A flush could not take its memory runs over"};
         }
         auto [next, next_status] = owner.next_view_(
-            runs.first(kept), std::max(owner.current_->oldest_readable, publication.oldest_readable),
+            runs.first(kept), fu::max_of(owner.current_->oldest_readable, publication.oldest_readable),
             owner.current_->layout_generation + 1);
         if (next_status.failed()) {
             owner.ledger_->stop_leading();
@@ -1898,7 +1897,7 @@ class published_runs {
         for (std::size_t index = first + group.size(); index != runs.size(); ++index)
             laid_out[index - group.size() + 1] = runs[index];
         auto [next, next_status] = make_view_(view_t {memory_view_t::of(std::move(laid_out)), current_->levels,
-                                                      std::max(current_->oldest_readable, horizon)});
+                                                      fu::max_of(current_->oldest_readable, horizon)});
         if (next_status.failed()) {
             ledger_->stop_leading();
             return next_status;

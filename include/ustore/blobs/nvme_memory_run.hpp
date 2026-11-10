@@ -21,10 +21,9 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::max`, `std::min`
-#include <memory>    // `std::allocator_traits`
-#include <span>      // `std::span`
-#include <utility>   // `std::move`
+#include <memory>  // `std::allocator_traits`
+#include <span>    // `std::span`
+#include <utility> // `std::move`
 
 #include <smashtable/basic_vector.hpp>           // `st::vector`
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
@@ -158,8 +157,8 @@ class sealed_deltas {
                  delta.bytes.data() + delta.bytes.size() > lent.data() + lent.size()))
                 return status_t {status_code_t::invalid_argument_k, "A lent buffer holds the bytes of every delta"};
             total_bytes += delta.bytes.size();
-            least_kind = std::min(least_kind, static_cast<std::uint8_t>(delta.kind));
-            greatest_kind = std::max(greatest_kind, static_cast<std::uint8_t>(delta.kind));
+            least_kind = fu::min_of(least_kind, static_cast<std::uint8_t>(delta.kind));
+            greatest_kind = fu::max_of(greatest_kind, static_cast<std::uint8_t>(delta.kind));
         }
         // A memory run flushes into one sorted run file, whose length bounds every offset either holds.
         if (total_bytes > storage_limits_t::sorted_run_file_max_size_k)
@@ -248,8 +247,8 @@ class sealed_deltas {
         std::uint8_t greatest_kind = least_kind;
         for (stamped_delta<stored_key_t> const& version : versions) {
             if (!version.delta.bytes.empty() && !in_place(version)) folded_bytes += version.delta.bytes.size();
-            least_kind = std::min(least_kind, static_cast<std::uint8_t>(version.delta.kind));
-            greatest_kind = std::max(greatest_kind, static_cast<std::uint8_t>(version.delta.kind));
+            least_kind = fu::min_of(least_kind, static_cast<std::uint8_t>(version.delta.kind));
+            greatest_kind = fu::max_of(greatest_kind, static_cast<std::uint8_t>(version.delta.kind));
         }
         buffer_t folded {typename buffer_t::allocator_t(allocator)};
         if (folded.resize(st::assume_uninitialized, static_cast<std::size_t>(folded_bytes)) != st::status_t::success_k)
@@ -465,9 +464,9 @@ class memory_run {
                                        std::span<stamped_delta<stored_key_t> const> versions,
                                        range_tombstones_t&& tombstones, transaction_stamp_t oldest_stamp,
                                        std::uint32_t tier, allocator_t allocator = {}) noexcept {
-        transaction_stamp_t newest_stamp = std::max(oldest_stamp, tombstones.newest_stamp());
+        transaction_stamp_t newest_stamp = fu::max_of(oldest_stamp, tombstones.newest_stamp());
         for (stamped_delta<stored_key_t> const& version : versions)
-            newest_stamp = std::max(newest_stamp, version.stamp);
+            newest_stamp = fu::max_of(newest_stamp, version.stamp);
         auto [deltas, merged_status] = sealed_deltas_t::merged(group, versions, std::move(tombstones), allocator);
         if (merged_status.failed()) return merged_status;
         transaction_stamp_t pulled = unwritten_stamp_k;

@@ -13,7 +13,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memmove`
 
-#include <algorithm>   // `std::ranges::lower_bound`, `std::min`
+#include <algorithm>   // `std::ranges::lower_bound`
 #include <array>       // `std::array`
 #include <chrono>      // `std::chrono::steady_clock`
 #include <concepts>    // `std::same_as`, `std::convertible_to`
@@ -153,7 +153,7 @@ class sorted_128_cursor_t {
             step *= 2;
             above = offset_ + step;
         }
-        above = std::min(above, keys_.size());
+        above = fu::min_of(above, keys_.size());
         while (above - below > 1) {
             std::size_t const middle = below + (above - below) / 2;
             if (compare_128(keys_[middle], wanted) < 0) below = middle;
@@ -375,7 +375,7 @@ void merge_sort(std::span<value_type_> values, std::span<value_type_> scratch, o
     value_type_* target = scratch.data();
     for (std::size_t first = 0; first < count; first += run_k) {
         value_type_* const begin = source + first;
-        value_type_* const end = source + std::min(first + run_k, count);
+        value_type_* const end = source + fu::min_of(first + run_k, count);
         for (value_type_* next = begin + 1; next < end; ++next) {
             value_type_ moved = std::move(*next);
             value_type_* hole = next;
@@ -386,9 +386,9 @@ void merge_sort(std::span<value_type_> values, std::span<value_type_> scratch, o
     for (std::size_t width = run_k; width < count; width *= 2) {
         for (std::size_t first = 0; first < count; first += 2 * width) {
             value_type_* left = source + first;
-            value_type_* const middle = source + std::min(first + width, count);
+            value_type_* const middle = source + fu::min_of(first + width, count);
             value_type_* right = middle;
-            value_type_* const end = source + std::min(first + 2 * width, count);
+            value_type_* const end = source + fu::min_of(first + 2 * width, count);
             value_type_* written = target + first;
             // The right value goes first only when it strictly precedes, which keeps
             // the merge stable.

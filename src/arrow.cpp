@@ -170,7 +170,7 @@ ustore_status_t convert_on_host(ustore_arena_t arena, ustore_strings_view_t cons
     // many of them
     std::uint64_t const first = wide ? strings.data.u64_tape.offsets[0] : 0;
     std::uint64_t const end = wide ? strings.data.u64_tape.offsets[rows] : 0;
-    if (end >= first && end - first > std::numeric_limits<std::uint32_t>::max())
+    if (end >= first && end - first > (std::numeric_limits<std::uint32_t>::max)())
         return ustore_status_capacity_exhausted_k;
     if (!arena_holds_tape(arena, strings, rows)) return ustore_status_invalid_argument_k;
     if (wide) {
@@ -207,7 +207,7 @@ ustore_status_t convert_through(executor_type_& executor, device_blocks_t& block
     first = sizeof(converted_type_) < sizeof(source_type_) ? static_cast<std::uint64_t>(source[0]) : 0;
     std::uint64_t const end = source[rows];
     if (end < first) return ustore_status_invalid_argument_k;
-    if (end - first > std::numeric_limits<std::uint32_t>::max()) return ustore_status_capacity_exhausted_k;
+    if (end - first > (std::numeric_limits<std::uint32_t>::max)()) return ustore_status_capacity_exhausted_k;
     convert_offsets(source.data(), target, first);
     auto [carved, carved_status] = carve<converted_type_>(blocks, executor, rows + 1);
     if (carved_status.failed()) return static_cast<ustore_status_t>(carved_status.code);

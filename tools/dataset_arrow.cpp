@@ -26,7 +26,6 @@
 #include <unistd.h>  // `read`, `close`
 #endif
 
-#include <algorithm>   // `std::min`
 #include <array>       // `std::array`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -161,7 +160,7 @@ struct output_piece_t {
         if (written < 0 && errno == EINTR) continue;
         if (written <= 0) return false;
         for (std::size_t left = static_cast<std::size_t>(written); left != 0;) {
-            std::size_t const step = std::min(left, pieces[index].size - done);
+            std::size_t const step = fu::min_of(left, pieces[index].size - done);
             left -= step, done += step;
             if (done == pieces[index].size) ++index, done = 0;
         }
@@ -264,7 +263,7 @@ class input_bytes_t {
 
     /** Views the first @p count bytes, at most 8, without taking them, fewer only at the end. */
     [[nodiscard]] std::span<std::byte const> peek(std::size_t count, ustore_outcome_t* outcome) noexcept {
-        if (descriptor_ < 0) return whole_.first(std::min(count, whole_.size()));
+        if (descriptor_ < 0) return whole_.first(fu::min_of(count, whole_.size()));
         while (peeked_size_ < count) {
             std::ptrdiff_t const bytes_read = read_some(descriptor_, peeked_.data() + peeked_size_,
                                                         count - peeked_size_);
@@ -280,7 +279,8 @@ class input_bytes_t {
     [[nodiscard]] std::span<std::byte const> take(std::size_t count, st::vector<std::byte>& storage,
                                                   ustore_outcome_t* outcome) noexcept {
         if (descriptor_ < 0) {
-            std::span<std::byte const> const taken = whole_.subspan(cursor_, std::min(count, whole_.size() - cursor_));
+            std::span<std::byte const> const taken = whole_.subspan(cursor_,
+                                                                    fu::min_of(count, whole_.size() - cursor_));
             cursor_ += taken.size();
             return taken;
         }
@@ -811,7 +811,7 @@ void write_rows(ustore_database_t database, ustore_collection_id_t collection, u
                 batch_views_t const& rows, ustore_durability_t durability, ustore_outcome_t* outcome) noexcept {
     std::size_t chunk = import_chunk_rows_k;
     for (std::size_t first = 0; first != rows.count;) {
-        std::size_t const count = std::min<std::size_t>(chunk, rows.count - first);
+        std::size_t const count = fu::min_of<std::size_t>(chunk, rows.count - first);
         bool const last = first + count == rows.count;
         write_chunk(database, collection, modality, rows, first, count,
                     last ? durability : ustore_durability_buffered_k, outcome);

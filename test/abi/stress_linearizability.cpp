@@ -12,7 +12,7 @@
 #include <cstdio>  // `stderr`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::fill`, `std::max`, `std::ranges::max`
+#include <algorithm> // `std::fill`, `std::ranges::max`
 #include <array>     // `std::array`
 #include <chrono>    // `std::chrono::steady_clock`
 #include <limits>    // `std::numeric_limits`
@@ -103,7 +103,7 @@ struct operation_t {
     payload_t value = 0;
 
     /** Stamp the transaction committed under, or the maximum when it failed. */
-    commit_stamp_t stamp {std::numeric_limits<ustore_stamp_t>::max()};
+    commit_stamp_t stamp {(std::numeric_limits<ustore_stamp_t>::max)()};
 
     /** Whether the write inserts or removes. */
     operation_code_t code = operation_code_t::insert_k;
@@ -197,10 +197,10 @@ struct linearizability_run_t {
 [[nodiscard]] std::size_t prepare_run(linearizability_run_t& run, linearizability_options_t const& options,
                                       random_t random) {
     std::size_t parts = 0;
-    for (operations_mix_t const mix : mixes_k) parts = std::max(parts, mix.parts());
-    std::size_t const threads_count = std::ranges::max(options.threads.view());
-    std::size_t const operations_count = threads_count * std::ranges::max(options.transactions.view()) * parts;
-    std::size_t const keys_count = std::max<std::size_t>(operations_count / options.writes_per_key.value, 1) + 1;
+    for (operations_mix_t const mix : mixes_k) parts = fu::max_of(parts, mix.parts());
+    std::size_t const threads_count = (std::ranges::max)(options.threads.view());
+    std::size_t const operations_count = threads_count * (std::ranges::max)(options.transactions.view()) * parts;
+    std::size_t const keys_count = fu::max_of<std::size_t>(operations_count / options.writes_per_key.value, 1) + 1;
 
     auto [arena, arena_status] = arena_t::make();
     run.arena = std::move(arena);
@@ -259,7 +259,8 @@ std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collec
 
     auto maybe_stamp = slot.transaction.commit();
     bool const committed = maybe_stamp.has_value();
-    commit_stamp_t const stamp = committed ? *maybe_stamp : commit_stamp_t {std::numeric_limits<ustore_stamp_t>::max()};
+    commit_stamp_t const stamp = committed ? *maybe_stamp
+                                           : commit_stamp_t {(std::numeric_limits<ustore_stamp_t>::max)()};
     for (operation_t& operation : batch) {
         operation.committed = committed;
         operation.stamp = stamp;
@@ -380,7 +381,7 @@ std::size_t linear_writes_mixes(linearizability_run_t& run, executor_t& executor
     std::size_t failures = 0;
     for (operations_mix_t const mix : mixes_k) {
         std::size_t const writes = mix.parts() * transactions * threads;
-        std::uint64_t const max_key = std::max<std::uint64_t>(writes / options.writes_per_key.value, 1);
+        std::uint64_t const max_key = fu::max_of<std::uint64_t>(writes / options.writes_per_key.value, 1);
         workload_t const workload {mix, threads, transactions, max_key};
         failures += linear_writes(run, executor, workload, options.checkpoints.value, slice);
     }

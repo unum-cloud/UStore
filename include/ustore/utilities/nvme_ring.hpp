@@ -74,7 +74,9 @@ class countdown {
     }
 
     /** Adds @p parts to what the counter is owed, for a fan-out that grows while it runs. */
-    void increment(std::int32_t parts = 1) noexcept { remaining_reference_().add(parts, std::memory_order_relaxed); }
+    void increment(std::int32_t parts = 1) noexcept {
+        remaining_reference_().store_add(parts, std::memory_order_relaxed);
+    }
 
     /** Whether every part has reported, or one of them has failed. */
     bool has_finished() const noexcept {
@@ -157,7 +159,7 @@ class notifier {
     countdown_t& counter() const noexcept { return countdown_; }
 
     /** Reports one part done. */
-    void did_one() const noexcept { countdown_.remaining_reference_().sub(1, std::memory_order_release); }
+    void did_one() const noexcept { countdown_.remaining_reference_().store_sub(1, std::memory_order_release); }
 
     /** Reports every remaining part done, for a fan-out that finished early. */
     void did_all() const noexcept { countdown_.remaining_reference_().store(0, std::memory_order_release); }

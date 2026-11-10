@@ -290,7 +290,7 @@ constexpr bool read_magnitude(std::string_view text, std::uint64_t& magnitude, b
     for (; position != text.size(); ++position) {
         if (!is_digit(text[position])) return false;
         std::uint64_t const digit = static_cast<std::uint64_t>(text[position] - '0');
-        if (magnitude > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) return false;
+        if (magnitude > ((std::numeric_limits<std::uint64_t>::max)() - digit) / 10) return false;
         magnitude = magnitude * 10 + digit;
     }
     return true;
@@ -514,8 +514,8 @@ template <typename scalar_type_>
 constexpr bool real_fits_cell(double real) noexcept {
     if constexpr (std::is_same_v<scalar_type_, bool>) return true;
     else if constexpr (std::is_floating_point_v<scalar_type_>) {
-        constexpr double max = static_cast<double>(std::numeric_limits<scalar_type_>::max());
-        return real <= max && real >= -max;
+        constexpr double greatest = static_cast<double>((std::numeric_limits<scalar_type_>::max)());
+        return real <= greatest && real >= -greatest;
     }
     else if constexpr (std::is_signed_v<scalar_type_>)
         return real >= -real_bound<scalar_type_>() && real < real_bound<scalar_type_>();
@@ -553,7 +553,7 @@ constexpr bool read_text_scalar(std::string_view text, scalar_type_& scalar, std
             scalar = static_cast<scalar_type_>(magnitude);
             return true;
         }
-        constexpr std::uint64_t magnitude_max = static_cast<std::uint64_t>(std::numeric_limits<scalar_type_>::max()) +
+        constexpr std::uint64_t magnitude_max = static_cast<std::uint64_t>((std::numeric_limits<scalar_type_>::max)()) +
                                                 1;
         if (magnitude > magnitude_max) return false;
         scalar = static_cast<scalar_type_>(static_cast<std::int64_t>(~magnitude + 1));

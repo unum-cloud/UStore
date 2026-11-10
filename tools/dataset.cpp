@@ -708,7 +708,7 @@ void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text)
     std::size_t const target_column = column_index(names, columns, string_of(task.target_id_field));
     std::size_t const edge_column = task.edge_id_field.length
                                         ? column_index(names, columns, string_of(task.edge_id_field))
-                                        : std::numeric_limits<std::size_t>::max();
+                                        : (std::numeric_limits<std::size_t>::max)();
     if (source_column == columns.size() || target_column == columns.size() || edge_column == columns.size()) {
         *task.outcome = {ustore_status_malformed_k, "The CSV header lacks a vertex or edge column"};
         return;

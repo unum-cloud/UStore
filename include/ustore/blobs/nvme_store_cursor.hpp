@@ -87,7 +87,7 @@ class nvme_store_cursor {
      *  reads a page, the first of which it reads before returning, its run cursors carved from
      *  @p scratch, which outlives it. */
     static expected<nvme_store_cursor> over(nvme_store_t const& source, ustore_arena_t scratch,
-                                            stored_key_t from = limit<stored_key_t>::min(),
+                                            stored_key_t from = limit<stored_key_t>::min_k,
                                             transaction_stamp_t stamp = head_stamp_k,
                                             std::size_t thread_index = outside_executor_k,
                                             scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
@@ -103,7 +103,7 @@ class nvme_store_cursor {
     /** A walk over @p source as @c over above, every page of which reads through @p read, which a
      *  caller inside the ledger's epochs took and keeps walkable while the cursor lives. */
     static expected<nvme_store_cursor> over(nvme_store_t const& source, typename nvme_store_t::reading_t const& read,
-                                            ustore_arena_t scratch, stored_key_t from = limit<stored_key_t>::min(),
+                                            ustore_arena_t scratch, stored_key_t from = limit<stored_key_t>::min_k,
                                             scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
         nvme_store_cursor cursor {scratch};
         cursor.source_ = &source;
@@ -136,7 +136,7 @@ class nvme_store_cursor {
     /** The keys of the page the scan sits on, every one of which comes before the keys of
      *  the next page. */
     [[nodiscard]] std::span<entry_t const> page() const noexcept {
-        return std::span<entry_t const> {page_.data(), std::min(filled_, page_keys_k)};
+        return std::span<entry_t const> {page_.data(), fu::min_of(filled_, page_keys_k)};
     }
 
     /** Whether a page follows the one the scan sits on, and in @p from the key it starts at. */
@@ -261,7 +261,7 @@ class nvme_store_cursor {
     bool next_(entry_t& entry) noexcept {
         std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
         for (;;) {
-            stored_key_t smallest = limit<stored_key_t>::max();
+            stored_key_t smallest = limit<stored_key_t>::max_k;
             bool any = false;
             for (std::size_t index = 0; index != memory_runs.size(); ++index) {
                 if (memory_positions_[index] == memory_runs[index]->size()) continue;
@@ -308,7 +308,7 @@ class nvme_store_cursor {
     bool next_down_(entry_t& entry) noexcept {
         std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
         for (;;) {
-            stored_key_t largest = limit<stored_key_t>::min();
+            stored_key_t largest = limit<stored_key_t>::min_k;
             bool any = false;
             for (std::size_t index = 0; index != memory_runs.size(); ++index) {
                 if (memory_ends_[index] == 0) continue;

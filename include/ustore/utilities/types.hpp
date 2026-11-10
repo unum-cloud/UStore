@@ -20,6 +20,10 @@
 #include "ustore/types.h" // `USTORE_OS_WINDOWS_`
 
 #if USTORE_OS_WINDOWS_
+/*  Winsock 2 first keeps Winsock 1.1 out, unless a user's earlier `<windows.h>` brought it in. */
+#if !defined(_WINSOCKAPI_)
+#include <winsock2.h>
+#endif
 #include <windows.h> // NTSTATUS, which <bcrypt.h> needs
 #include <bcrypt.h>  // `BCryptGenRandom`
 #else
@@ -39,6 +43,7 @@
 #include <type_traits> // `std::is_nothrow_move_constructible_v`, `std::is_trivially_copyable_v`, `std::remove_cvref_t`, `std::type_identity`
 #include <utility> // `std::cmp_equal`, `std::move`
 
+#include <forkunion/types.hpp>         // `ashvardanian::forkunion`, which `fu` names
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <smashtable/shared.hpp>       // `st::hash`, `st::status_t`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`, `sz::failed`
@@ -503,7 +508,7 @@ struct sha256_t {
  *  what @c is_valid reports; every minted identifier is version 4, so all but six of its
  *  bits are random.
  */
-struct uuid_t {
+struct uuid128_t {
 
     /** Bytes the identifier occupies in memory and on disk. */
     static constexpr std::size_t size_bytes_k = 16;
@@ -514,10 +519,10 @@ struct uuid_t {
     /** The sixteen bytes, in the order they are printed and stored. */
     std::uint8_t bytes[size_bytes_k] = {};
 
-    uuid_t() = default;
+    uuid128_t() = default;
 
     /** Reads an identifier from the sixteen bytes at @p source. */
-    explicit uuid_t(std::span<std::uint8_t const, size_bytes_k> source) noexcept {
+    explicit uuid128_t(std::span<std::uint8_t const, size_bytes_k> source) noexcept {
         std::memcpy(bytes, source.data(), size_bytes_k);
     }
 
@@ -542,9 +547,9 @@ struct uuid_t {
     /** The last eight bytes read as a big-endian word. */
     constexpr std::uint64_t low_word() const noexcept { return word_(8); }
 
-    friend constexpr bool operator==(uuid_t const&, uuid_t const&) = default;
+    friend constexpr bool operator==(uuid128_t const&, uuid128_t const&) = default;
 
-    friend constexpr std::strong_ordering operator<=>(uuid_t const& first, uuid_t const& second) noexcept {
+    friend constexpr std::strong_ordering operator<=>(uuid128_t const& first, uuid128_t const& second) noexcept {
         if (std::strong_ordering const high = first.high_word() <=> second.high_word(); high != 0) return high;
         return first.low_word() <=> second.low_word();
     }
@@ -572,8 +577,8 @@ struct uuid_t {
     }
 
     /** Reads the canonical form out of @p text, which @c parses has already accepted. */
-    static constexpr uuid_t parse(std::span<char const, printed_length_k> text) noexcept {
-        uuid_t identifier;
+    static constexpr uuid128_t parse(std::span<char const, printed_length_k> text) noexcept {
+        uuid128_t identifier;
         std::size_t read = 0;
         for (std::size_t index = 0; index != size_bytes_k; ++index) {
             if (index == 4 || index == 6 || index == 8 || index == 10) ++read;
@@ -608,7 +613,7 @@ struct uuid_t {
     }
 };
 
-static_assert(sizeof(uuid_t) == uuid_t::size_bytes_k, "An identifier is its sixteen bytes and nothing else");
+static_assert(sizeof(uuid128_t) == uuid128_t::size_bytes_k, "An identifier is its sixteen bytes and nothing else");
 
 /** Fills @p destination with bytes from the operating system, answering whether it could. */
 inline bool fill_with_entropy(std::span<std::uint8_t> destination) noexcept {
@@ -627,8 +632,8 @@ inline bool fill_with_entropy(std::span<std::uint8_t> destination) noexcept {
  *  caller learns of that through the identifier rather than through a status, since every source
  *  of a fresh identifier already validates it before recording it.
  */
-inline uuid_t uuid_generator() noexcept {
-    uuid_t identifier;
+inline uuid128_t uuid_generator() noexcept {
+    uuid128_t identifier;
     if (!fill_with_entropy(identifier.bytes)) return {};
     identifier.bytes[6] = static_cast<std::uint8_t>((identifier.bytes[6] & 0x0F) | 0x40);
     identifier.bytes[8] = static_cast<std::uint8_t>((identifier.bytes[8] & 0x3F) | 0x80);
@@ -636,7 +641,7 @@ inline uuid_t uuid_generator() noexcept {
 }
 
 /** The identifier folded onto one word, for a table keyed by a number rather than by the bytes. */
-constexpr std::uint64_t uuid_to_u64(uuid_t const& identifier) noexcept {
+constexpr std::uint64_t uuid_to_u64(uuid128_t const& identifier) noexcept {
     std::uint64_t mixed = identifier.high_word() ^ (identifier.low_word() * 0x9E3779B97F4A7C15ull);
     mixed ^= mixed >> 30;
     mixed *= 0xBF58476D1CE4E5B9ull;
@@ -717,7 +722,7 @@ inline ustore_vertex_role_t invert(ustore_vertex_role_t role) noexcept {
 #pragma region Variable Length Views
 
 /** The length a missing value carries, which no stored value reaches, so a view tells it apart from an empty one. */
-inline constexpr ustore_length_t missing_length_k = std::numeric_limits<ustore_length_t>::max();
+inline constexpr ustore_length_t missing_length_k = (std::numeric_limits<ustore_length_t>::max)();
 
 /** A view of a stored value that tells a missing value apart from an empty one. */
 class value_view_t {
@@ -965,7 +970,7 @@ inline std::size_t storage_requirements(string_t const& text) noexcept { return 
 
 /** Saves the 16-bit length of @p text, then its characters. */
 inline status_t save(string_t const& text, bytes_span_t destination) noexcept {
-    if (text.size() > std::numeric_limits<std::uint16_t>::max())
+    if (text.size() > (std::numeric_limits<std::uint16_t>::max)())
         return status_t {status_code_t::capacity_exhausted_k, "Data is too big"};
     if (destination.size() < storage_requirements(text))
         return status_t {status_code_t::invalid_argument_k, "Buffer is too small"};
@@ -1071,7 +1076,7 @@ template <std::unsigned_integral integer_type_>
 constexpr integer_type_ round_up_to_multiple(integer_type_ value,
                                              std::type_identity_t<integer_type_> multiple) noexcept {
     integer_type_ const below = round_down_to_multiple(value, multiple);
-    if (below == value || below > std::numeric_limits<integer_type_>::max() - multiple) return below;
+    if (below == value || below > (std::numeric_limits<integer_type_>::max)() - multiple) return below;
     return static_cast<integer_type_>(below + multiple);
 }
 

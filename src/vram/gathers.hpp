@@ -21,7 +21,6 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 
-#include <algorithm>   // `std::max`
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`, `std::as_bytes`
 #include <string_view> // `std::string_view`
@@ -150,8 +149,8 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
     std::uint64_t const frame_words = sz_subdocuments_frame_words_simt_(engine_slot.data());
     std::uint64_t const key_bytes = round_up_to_multiple<std::uint64_t>(sz_subdocuments_key_bytes_(engine_slot.data()),
                                                                         arena_alignment_k);
-    std::size_t const walkers_count = std::max(
-        {shape.per_thread.size(), shape.per_group.size(), shape.per_chunk.size()});
+    std::size_t const walkers_count = fu::max_of(fu::max_of(shape.per_thread.size(), shape.per_group.size()),
+                                                 shape.per_chunk.size());
     auto [lists, lists_status] = carve<std::uint32_t>(blocks, executor, 3 * count);
     auto [stacks, stacks_status] = carve<std::uint64_t>(blocks, executor,
                                                         walkers_count * matching_frames_k * frame_words);
@@ -239,7 +238,7 @@ expected<ustore_strings_view_t> write_texts(walked_documents_t const& walked, me
                           blocks_for(walked.page.rows, gather_block_threads_k), gather_block_threads_k, 0u, walked.page,
                           measured.texts);
     if (launched.failed()) return launched;
-    if (total > std::numeric_limits<std::uint32_t>::max()) return u64_tape(bytes.data(), measured.offsets.data());
+    if (total > (std::numeric_limits<std::uint32_t>::max)()) return u64_tape(bytes.data(), measured.offsets.data());
     std::size_t const rows = walked.page.rows;
     auto [narrow, narrow_status] = carve<std::uint32_t>(blocks, executor, rows + 1);
     if (narrow_status.failed()) return narrow_status;

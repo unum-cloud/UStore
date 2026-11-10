@@ -12,7 +12,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::max`, `std::min`, `std::sort`
+#include <algorithm>   // `std::sort`
 #include <array>       // `std::array`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
@@ -183,9 +183,9 @@ template <cpu_class_t cpu_class_>
 using collection_reading_of = typename basic_database_of<cpu_class_>::collection_reading_t;
 
 /** @p uuid as the collection ID the C ABI addresses a collection by. */
-constexpr ustore_collection_id_t collection_id_of(uuid_t const& uuid) noexcept {
+constexpr ustore_collection_id_t collection_id_of(uuid128_t const& uuid) noexcept {
     ustore_collection_id_t collection {};
-    for (std::size_t index = 0; index != uuid_t::size_bytes_k; ++index)
+    for (std::size_t index = 0; index != uuid128_t::size_bytes_k; ++index)
         collection.uuid.bytes[index] = uuid.bytes[index];
     return collection;
 }
@@ -989,7 +989,7 @@ status_t collect_keys_unordered(call_access<cpu_class_> const& access, collectio
 
 /** The key after @p key, or answers false for the largest key, which has none. */
 inline bool advance_key(stored_key_t& key) noexcept {
-    if (key == limit<stored_key_t>::max()) return false;
+    if (key == limit<stored_key_t>::max_k) return false;
     key = stored_of(key_after(key_of(key)).uuid);
     return true;
 }
@@ -1026,8 +1026,8 @@ template <cpu_class_t cpu_class_, typename writes_type_>
 status_t commit_alone(database_state<cpu_class_>& state, ustore_arena_t scratch, std::size_t count, std::size_t bytes,
                       watch_schedule_t schedule, writes_type_&& writes) noexcept {
     transaction_config_t shape;
-    shape.max_deltas = std::max<std::size_t>(count, 1);
-    shape.max_bytes = std::max<std::size_t>(bytes, 1);
+    shape.max_deltas = fu::max_of<std::size_t>(count, 1);
+    shape.max_bytes = fu::max_of<std::size_t>(bytes, 1);
     for (std::size_t attempt = 0; attempt != commit_attempts_k; ++attempt) {
         // Declared first, so the transaction it joins dies before it does.
         strings_transaction_of<cpu_class_> strings {*state.store};
@@ -1040,7 +1040,7 @@ status_t commit_alone(database_state<cpu_class_>& state, ustore_arena_t scratch,
         if (written == status_code_t::capacity_exhausted_k &&
             shape.max_bytes < storage_limits_t::transaction_max_bytes_k) {
             shape.max_bytes *= 2;
-            shape.max_deltas = std::min(shape.max_deltas * 2, storage_limits_t::transaction_max_deltas_k);
+            shape.max_deltas = fu::min_of(shape.max_deltas * 2, storage_limits_t::transaction_max_deltas_k);
             continue;
         }
         if (written.failed()) return written;
@@ -1287,7 +1287,7 @@ status_t walk_strings(call_access<cpu_class_> const& access, collection_id_t col
                       std::string_view start, visitor_type_&& visitor) noexcept {
     typename strings_store_of<cpu_class_>::page_t page {access.scratch};
     st::vector<char, arena_allocator<char>> from {{access.scratch}};
-    std::string_view const first = std::max(start, prefix);
+    std::string_view const first = fu::max_of(start, prefix);
     if (from.resize(first.size()) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "A walk could not hold where it starts"};
     if (!first.empty()) std::memcpy(from.data(), first.data(), first.size());
@@ -1602,11 +1602,11 @@ status_t empty_collection(database_state<cpu_class_>& state, ustore_arena_t scra
     if (modality == ustore_modality_graph_k && mode == ustore_drop_values_k) return {};
     call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch};
     st::vector<stored_key_t, arena_allocator<stored_key_t>> keys {{scratch}};
-    stored_key_t from = limit<stored_key_t>::min();
+    stored_key_t from = limit<stored_key_t>::min_k;
     value_view_t const emptied = mode == ustore_drop_values_k ? value_view_t::make_empty() : value_view_t {};
     for (;;) {
         keys.clear();
-        if (status_t const collected = collect_keys(head, collection, from, limit<stored_key_t>::max(),
+        if (status_t const collected = collect_keys(head, collection, from, limit<stored_key_t>::max_k,
                                                     clear_window_keys_k, keys);
             collected.failed())
             return collected;
@@ -1639,8 +1639,8 @@ status_t list_collections(database_state<cpu_class_>& state, ustore_arena_t scra
                           transaction_stamp_t stamp = head_stamp_k) noexcept {
     call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch, stamp};
     st::vector<stored_key_t, arena_allocator<stored_key_t>> keys {{scratch}};
-    if (status_t const collected = collect_keys(head, collections_collection_k, limit<stored_key_t>::min(),
-                                                limit<stored_key_t>::max(), std::numeric_limits<std::size_t>::max(),
+    if (status_t const collected = collect_keys(head, collections_collection_k, limit<stored_key_t>::min_k,
+                                                limit<stored_key_t>::max_k, (std::numeric_limits<std::size_t>::max)(),
                                                 keys);
         collected.failed())
         return collected;
@@ -1887,8 +1887,8 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
     if (mint_status.failed()) return mint_status;
 
     // The engine's own name of a collection is its UUID's text, which never leaves the engine
-    char text[uuid_t::printed_length_k] = {};
-    uuid_t {std::span<std::uint8_t const, uuid_t::size_bytes_k> {created.uuid.bytes}}.print(text);
+    char text[uuid128_t::printed_length_k] = {};
+    uuid128_t {std::span<std::uint8_t const, uuid128_t::size_bytes_k> {created.uuid.bytes}}.print(text);
     collection_config_t const shape = entry_layout_of(arguments.modality) == entry_layout_t::strings_to_uuids_k
                                           ? strings_shape_of(state.collection_shape)
                                           : state.collection_shape;
@@ -2411,10 +2411,10 @@ status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t
         return save_strings(access, collection.id, target, window, progress);
     st::vector<stored_key_t> keys;
     st::vector<byte_t> value;
-    stored_key_t from = limit<stored_key_t>::min();
+    stored_key_t from = limit<stored_key_t>::min_k;
     for (;;) {
         keys.clear();
-        if (status_t const collected = collect_keys(access, collection.id, from, limit<stored_key_t>::max(), window,
+        if (status_t const collected = collect_keys(access, collection.id, from, limit<stored_key_t>::max_k, window,
                                                     keys);
             collected.failed())
             return collected;
@@ -2571,7 +2571,7 @@ status_t changes_cursor_init(ustore_changes_cursor_init_t const& arguments, usto
     auto* const feed = new (std::nothrow) changes_state<cpu_class_> {};
     if (!feed) return {status_code_t::out_of_memory_k, "Failed to allocate the change feed"};
     feed->handed.stamp = static_cast<transaction_stamp_t>(arguments.since_stamp);
-    feed->handed.stored_key = limit<stored_key_t>::max();
+    feed->handed.stored_key = limit<stored_key_t>::max_k;
     status_t const pinned = state.store->pin_feed(arguments.collection, feed->pin, feed->handed.stamp);
     if (pinned.failed()) {
         delete feed;

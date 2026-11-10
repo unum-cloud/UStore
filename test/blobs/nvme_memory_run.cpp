@@ -322,8 +322,8 @@ static std::size_t random_streams_match_model() {
                 failures += check(view.written_since(stored_key, from) == (model_newest(model, stored_key) > from));
 
                 stored_key_t const other = probe_pick(generator);
-                stored_key_t const lower = std::min(stored_key, other);
-                stored_key_t const upper = std::max(stored_key, other);
+                stored_key_t const lower = fu::min_of(stored_key, other);
+                stored_key_t const upper = fu::max_of(stored_key, other);
                 bool range_written = false;
                 for (stored_key_t key = lower; key <= upper; ++key) range_written |= model_newest(model, key) > from;
                 failures += check(view.range_written_since(lower, upper, from) == range_written);

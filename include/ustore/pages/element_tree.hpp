@@ -28,7 +28,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::sort`, `std::min`
+#include <algorithm>   // `std::sort`
 #include <compare>     // `std::strong_ordering`
 #include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`
@@ -616,8 +616,9 @@ class element_tree {
     /** Replaces @p length bytes of the text of @p index from @p start with @p bytes, both clamped to the text. */
     status_t splice(element_index_t index, std::uint64_t start, std::uint64_t length, std::string_view bytes) noexcept {
         string_span_t const old = elements_[index].text;
-        std::uint32_t const clamped_start = std::uint32_t(std::min<std::uint64_t>(start, old.length));
-        std::uint32_t const clamped_length = std::uint32_t(std::min<std::uint64_t>(length, old.length - clamped_start));
+        std::uint32_t const clamped_start = std::uint32_t(fu::min_of<std::uint64_t>(start, old.length));
+        std::uint32_t const clamped_length = std::uint32_t(
+            fu::min_of<std::uint64_t>(length, old.length - clamped_start));
         std::uint64_t const new_length = std::uint64_t(old.length) - clamped_length + bytes.size();
         if (new_length > ~std::uint32_t(0) - strings_.size())
             return {status_code_t::invalid_argument_k, "A page outgrew 4 GiB of strings"};

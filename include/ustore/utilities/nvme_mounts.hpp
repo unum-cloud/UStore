@@ -30,7 +30,6 @@
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::min`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::shared_ptr`, `std::make_shared`
 #include <new>         // placement `new`
@@ -49,7 +48,7 @@
 #include "ustore/utilities/nvme_ring.hpp"             // `queue_pair_t`, `request_t`, `completion_t`, `ring_concept`
 #include "ustore/utilities/nvme_volume.hpp"           // `any_volume`, `data_address_t`, `parse_data_address`
 #include "ustore/utilities/ram_buffers.hpp" // `resource_constraint`, `constrained_allocator`, `unlimited_resource_k`
-#include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`, `string_t`, `uuid_t`
+#include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`, `string_t`
 
 #if USTORE_OS_POSIX_
 #include <sys/resource.h> // `getrlimit`, `setrlimit`, `RLIMIT_NOFILE`
@@ -172,7 +171,7 @@ inline expected<volume_addresses_t> addresses_of(resources_config_t const& confi
 #if USTORE_OS_WINDOWS_
 
 /** Leaves the descriptor limit alone, which Windows does not impose on handles. */
-inline std::size_t raise_open_files_limit() noexcept { return std::numeric_limits<std::size_t>::max(); }
+inline std::size_t raise_open_files_limit() noexcept { return (std::numeric_limits<std::size_t>::max)(); }
 
 #else
 
@@ -180,14 +179,14 @@ inline std::size_t raise_open_files_limit() noexcept { return std::numeric_limit
  *  open per run, and answers the descriptors the process may now hold. */
 inline std::size_t raise_open_files_limit() noexcept {
     struct rlimit limit {};
-    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) return std::numeric_limits<std::size_t>::max();
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) return (std::numeric_limits<std::size_t>::max)();
     if (limit.rlim_cur != limit.rlim_max) {
         rlim_t const soft = limit.rlim_cur;
         limit.rlim_cur = limit.rlim_max;
         if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) limit.rlim_cur = soft;
     }
-    return limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > std::numeric_limits<std::size_t>::max()
-               ? std::numeric_limits<std::size_t>::max()
+    return limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > (std::numeric_limits<std::size_t>::max)()
+               ? (std::numeric_limits<std::size_t>::max)()
                : static_cast<std::size_t>(limit.rlim_cur);
 }
 
@@ -496,8 +495,8 @@ class basic_storage_mount {
         // SPDK's controllers bound
         io_channel_config_t channels = config.channels;
         if (std::uint64_t const transfer = disk_.capabilities().max_transfer_bytes; transfer != 0) {
-            channels.request_buffer_bytes = std::min(channels.request_buffer_bytes, transfer);
-            channels.stream_buffer_bytes = std::min(channels.stream_buffer_bytes, transfer);
+            channels.request_buffer_bytes = fu::min_of(channels.request_buffer_bytes, transfer);
+            channels.stream_buffer_bytes = fu::min_of(channels.stream_buffer_bytes, transfer);
         }
 
         memory_arena_config_t arena;
@@ -662,7 +661,7 @@ class mounted_storage {
         if (descriptors <= reserved)
             return {status_code_t::capacity_exhausted_k, "The descriptor limit leaves no room for a run file"};
         std::uint16_t const targets = static_cast<std::uint16_t>(
-            std::min<std::size_t>(descriptors - reserved, std::numeric_limits<std::uint16_t>::max() - 1));
+            fu::min_of<std::size_t>(descriptors - reserved, (std::numeric_limits<std::uint16_t>::max)() - 1));
 
         switch (report_.transport) {
         case io_transport_t::memory_k: {

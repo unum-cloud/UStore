@@ -207,7 +207,7 @@ case_result_t run_reads_back_every_value(mount_type_ const& mount) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
 
-    uuid_t const content_id = uuid_generator();
+    uuid128_t const content_id = uuid_generator();
     variable_data_t data;
     failures += build_variable(
         count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index * 37 % 4096); }, data);
@@ -219,7 +219,7 @@ case_result_t run_reads_back_every_value(mount_type_ const& mount) {
         if (!mounted) return failures;
 
         expected<variable_run_t> written = variable_run_t::write(
-            *mounted, guard->channel(), uuid_t {}, content_id, std::span<variable_slot_t const> {data.key_slots},
+            *mounted, guard->channel(), uuid128_t {}, content_id, std::span<variable_slot_t const> {data.key_slots},
             std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
             std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
             std::span<stored_value_offset_t const> {data.offsets}, 4096);
@@ -292,7 +292,7 @@ std::size_t fixed_width_run_reads_back(mount_type_ const& mount) {
     }
 
     expected<fixed_run_t> written = fixed_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<fixed_slot_t const> {key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<fixed_slot_t const> {key_slots},
         std::span<std::uint64_t const> {ascending_stamps(key_slots.size())}, std::span<std::uint8_t const> {kinds}, 0,
         std::span<byte_t const> {values}, {}, value_size_k);
     failures += expect(written.has_value());
@@ -300,7 +300,7 @@ std::size_t fixed_width_run_reads_back(mount_type_ const& mount) {
 
     // A fixed-width run takes exactly one stride per key slot, and finds each value by stride from its position.
     expected<fixed_run_t> short_values = fixed_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<fixed_slot_t const> {key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<fixed_slot_t const> {key_slots},
         std::span<std::uint64_t const> {ascending_stamps(key_slots.size())}, std::span<std::uint8_t const> {kinds}, 0,
         std::span<byte_t const> {values}.first(values.size() - 1), {}, value_size_k);
     failures += expect_status(short_values, status_code_t::invalid_argument_k);
@@ -371,7 +371,7 @@ std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
     }
 
     expected<inline_run_t> written = inline_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<inline_slot_t const> {key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<inline_slot_t const> {key_slots},
         std::span<std::uint64_t const> {ascending_stamps(key_slots.size())},
         std::span<std::uint8_t const> {written_kinds(key_slots.size())}, 0, std::span<byte_t const> {}, {}, 8);
     failures += expect(written.has_value());
@@ -475,9 +475,10 @@ std::size_t sections_sit_on_page_boundaries(mount_type_ const& mount) {
             data);
         if (failures != 0) return failures;
         expected<variable_run_t> run = variable_run_t::write(
-            *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
-            std::span<std::uint64_t const> {ascending_stamps(count)}, std::span<std::uint8_t const> {data.kinds}, 0,
-            std::span<byte_t const> {data.values}, std::span<stored_value_offset_t const> {data.offsets}, 4096);
+            *volume, guard->channel(), uuid128_t {}, uuid_generator(),
+            std::span<variable_slot_t const> {data.key_slots}, std::span<std::uint64_t const> {ascending_stamps(count)},
+            std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
+            std::span<stored_value_offset_t const> {data.offsets}, 4096);
         failures += expect(run.has_value());
         if (!run) return failures;
 
@@ -589,13 +590,13 @@ std::size_t split_write_matches_write(mount_type_ const& mount) {
     std::span<variable_slot_t const> const key_slots {data.key_slots};
     std::span<byte_t const> const values {data.values};
     std::span<stored_value_offset_t const> const offsets {data.offsets};
-    uuid_t const content_id = uuid_generator();
+    uuid128_t const content_id = uuid_generator();
 
     st::vector<byte_t> whole_bytes;
     medium_extent_t whole_extent;
     {
         expected<variable_run_t> whole = variable_run_t::write(
-            *volume, guard->channel(), uuid_t {}, content_id, key_slots, std::span<std::uint64_t const> {stamps},
+            *volume, guard->channel(), uuid128_t {}, content_id, key_slots, std::span<std::uint64_t const> {stamps},
             std::span<std::uint8_t const> {data.kinds}, 0, values, offsets, 4096);
         failures += expect(whole.has_value());
         if (!whole) return failures;
@@ -607,7 +608,7 @@ std::size_t split_write_matches_write(mount_type_ const& mount) {
     volume->deallocate(whole_extent);
 
     expected<sorted_run_reservation_t> reservation = variable_run_t::reserve(
-        *volume, guard->channel(), uuid_t {}, content_id, key_slots, std::span<std::uint64_t const> {stamps},
+        *volume, guard->channel(), uuid128_t {}, content_id, key_slots, std::span<std::uint64_t const> {stamps},
         std::span<std::uint8_t const> {data.kinds}, 0, values, offsets, 4096);
     failures += expect(reservation.has_value());
     if (!reservation) return failures;
@@ -736,7 +737,8 @@ std::size_t deallocated_run_opens_nothing(mount_type_ const& mount) {
     medium_extent_t extent;
     {
         expected<variable_run_t> written = variable_run_t::write(
-            *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
+            *volume, guard->channel(), uuid128_t {}, uuid_generator(),
+            std::span<variable_slot_t const> {data.key_slots},
             std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
             std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
             std::span<stored_value_offset_t const> {data.offsets}, 4096);
@@ -783,7 +785,7 @@ std::size_t point_lookup_finds_and_misses(mount_type_ const& mount) {
         count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index % 97); }, data);
     if (failures != 0) return failures;
     expected<variable_run_t> run = variable_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
         std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
         std::span<stored_value_offset_t const> {data.offsets}, 4096);
@@ -848,7 +850,7 @@ std::size_t lookups_descend_the_saved_tree(mount_type_ const& mount) {
     failures += build_variable(count_k, [](std::size_t index) { return static_cast<std::int64_t>(index % 5); }, data);
     if (failures != 0) return failures;
     expected<variable_run_t> written = variable_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(count_k)}, std::span<std::uint8_t const> {data.kinds}, 0,
         std::span<byte_t const> {data.values}, std::span<stored_value_offset_t const> {data.offsets}, 4096);
     failures += expect(written.has_value());
@@ -872,7 +874,7 @@ std::size_t lookups_descend_the_saved_tree(mount_type_ const& mount) {
     std::size_t misranked = 0;
     std::size_t misfound = 0;
     for (stored_key_t probe = 0; probe <= key_of(count_k); ++probe) {
-        std::uint64_t const below = std::min<std::uint64_t>(probe / 2, count_k);
+        std::uint64_t const below = fu::min_of<std::uint64_t>(probe / 2, count_k);
         std::uint64_t const ranked = run->lower_bound(probe);
         misranked += ranked != saved->rank(probe) || ranked != below;
         std::uint64_t position = 0;
@@ -910,7 +912,7 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
     failures += build_variable(1, [](std::size_t) { return std::int64_t {7}; }, alone);
     if (failures != 0) return failures;
     expected<variable_run_t> alone_run = variable_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {alone.key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {alone.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(alone.key_slots.size())},
         std::span<std::uint8_t const> {alone.kinds}, 0, std::span<byte_t const> {alone.values},
         std::span<stored_value_offset_t const> {alone.offsets}, 4096);
@@ -928,7 +930,7 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
     variable_data_t none;
     failures += build_variable(0, [](std::size_t) { return std::int64_t {0}; }, none);
     expected<variable_run_t> empty = variable_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {none.key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {none.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(none.key_slots.size())},
         std::span<std::uint8_t const> {none.kinds}, 0, std::span<byte_t const> {none.values},
         std::span<stored_value_offset_t const> {none.offsets}, 4096);
@@ -940,8 +942,8 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
     failures += expect_eq(empty->size_bytes(), variable_layout_t::header_bytes() + 2 * portable_alignment_k +
                                                    variable_layout_t::trailer_bytes(empty->stamps().saved_bytes(),
                                                                                     empty->kinds().saved_bytes()));
-    failures += expect(empty->lower_stored_key() == limit<stored_key_t>::max());
-    failures += expect(empty->upper_stored_key() == limit<stored_key_t>::min());
+    failures += expect(empty->lower_stored_key() == limit<stored_key_t>::max_k);
+    failures += expect(empty->upper_stored_key() == limit<stored_key_t>::min_k);
     failures += expect(empty->find(key_of(0), position) == lookup_result_t::missing_k);
     failures += expect_eq(position, std::uint64_t {0});
     failures += check_variable_values(*empty, guard->channel(), none);
@@ -991,7 +993,7 @@ std::size_t values_section_the_size_extremes(mount_type_ const& mount) {
     if (failures != 0) return failures;
 
     expected<variable_run_t> run = variable_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
         std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
         std::span<stored_value_offset_t const> {data.offsets}, largest_k);
@@ -1046,7 +1048,8 @@ std::size_t remove_deltas_read_back_as_removals(mount_type_ const& mount) {
     medium_extent_t extent;
     {
         expected<variable_run_t> written = variable_run_t::write(
-            *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
+            *volume, guard->channel(), uuid128_t {}, uuid_generator(),
+            std::span<variable_slot_t const> {data.key_slots},
             std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
             std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
             std::span<stored_value_offset_t const> {data.offsets}, 4096);
@@ -1114,7 +1117,7 @@ std::size_t range_tombstones_read_back(mount_type_ const& mount) {
     for (std::size_t shape = 0; shape != extents.size(); ++shape) {
         std::size_t const slots = shape == 0 ? count_k : 0;
         expected<variable_run_t> written = variable_run_t::write(
-            *volume, guard->channel(), uuid_t {}, uuid_generator(),
+            *volume, guard->channel(), uuid128_t {}, uuid_generator(),
             std::span<variable_slot_t const> {data.key_slots}.first(slots),
             std::span<std::uint64_t const> {ascending_stamps(count_k)}.first(slots),
             std::span<std::uint8_t const> {data.kinds}.first(slots), 0,
@@ -1181,7 +1184,7 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
         count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index % 1024); }, data);
     if (failures != 0) return failures;
     expected<variable_run_t> run = variable_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
         std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
         std::span<stored_value_offset_t const> {data.offsets}, 4096);
@@ -1309,13 +1312,13 @@ case_result_t tails_read_back(mount_type_ const& mount) {
     };
     key_tails_column_t const run_tails {std::span<std::uint32_t const> {tail_offsets}, bytes_of(tails)};
 
-    uuid_t const content_id = uuid_generator();
+    uuid128_t const content_id = uuid_generator();
     {
         expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
         failures += expect(volume.has_value());
         if (!volume) return failures;
         expected<tailed_run_t> written = tailed_run_t::write(
-            *volume, guard->channel(), uuid_t {}, content_id, std::span<tailed_slot_t const> {key_slots},
+            *volume, guard->channel(), uuid128_t {}, content_id, std::span<tailed_slot_t const> {key_slots},
             std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, {}, {},
             tailed_slot_t::size, run_tails);
         failures += expect(written.has_value());
@@ -1335,7 +1338,7 @@ case_result_t tails_read_back(mount_type_ const& mount) {
         std::array<std::uint64_t, 2> const swapped_stamps {1, 2};
         std::array<std::uint8_t, 2> const swapped_kinds {0, 0};
         expected<tailed_run_t> misordered = tailed_run_t::write(
-            *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<tailed_slot_t const> {swapped_slots},
+            *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<tailed_slot_t const> {swapped_slots},
             std::span<std::uint64_t const> {swapped_stamps}, std::span<std::uint8_t const> {swapped_kinds}, 0, {}, {},
             tailed_slot_t::size,
             key_tails_column_t {std::span<std::uint32_t const> {swapped_offsets}, bytes_of(swapped_tails)});
@@ -1344,7 +1347,7 @@ case_result_t tails_read_back(mount_type_ const& mount) {
         // Strings their heads hold whole save no tails and no offsets
         std::array<tailed_slot_t, 3> const short_slots {key_slots[0], key_slots[1], key_slots[2]};
         expected<tailed_run_t> whole = tailed_run_t::write(
-            *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<tailed_slot_t const> {short_slots},
+            *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<tailed_slot_t const> {short_slots},
             std::span<std::uint64_t const> {stamps}.first(3), std::span<std::uint8_t const> {kinds}.first(3), 0, {}, {},
             tailed_slot_t::size);
         failures += expect(whole.has_value());
@@ -1499,7 +1502,7 @@ std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
     tail_offsets[count] = tails_bytes;
 
     expected<tailed_run_t> run = tailed_run_t::write(
-        *volume, guard->channel(), uuid_t {}, uuid_generator(), std::span<tailed_slot_t const> {key_slots},
+        *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<tailed_slot_t const> {key_slots},
         std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, {}, {}, tailed_slot_t::size,
         key_tails_column_t {std::span<std::uint32_t const> {tail_offsets}, std::span<byte_t const> {tails}});
     failures += expect(run.has_value());
@@ -1507,7 +1510,7 @@ std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
 
     // The URLs tie on "https://example", on ".org/catalog/se", and on each section's "ction-000/item-".
     std::uint32_t deepest = 0;
-    for (head_layer_t const& layer : run->layers()) deepest = std::max(deepest, layer.depth);
+    for (head_layer_t const& layer : run->layers()) deepest = fu::max_of(deepest, layer.depth);
     failures += expect_eq(deepest, std::uint32_t {3});
     failures += expect(run->header().layers_bytes > sizeof(head_layers_header_t));
     failures += expect_eq(run->size_bytes(), strings_run_layout<tailed_slot_t>::blob_bytes(run->header()));

@@ -125,7 +125,7 @@ void fill_value(std::uint32_t seed, std::size_t index, std::span<std::byte> valu
     std::uint64_t const origin = stream_key(seed, "values", index);
     for (std::size_t offset = 0; offset < value.size(); offset += sizeof(std::uint64_t)) {
         std::uint64_t const word = mix(origin + offset);
-        std::memcpy(value.data() + offset, &word, std::min(sizeof(word), value.size() - offset));
+        std::memcpy(value.data() + offset, &word, fu::min_of(sizeof(word), value.size() - offset));
     }
 }
 
@@ -283,7 +283,7 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
     time_point_t const start = steady_clock_t::now();
     ustore_outcome_t outcome {};
     for (std::size_t first = 0; first < records; first += batch) {
-        std::size_t const count = std::min(batch, records - first);
+        std::size_t const count = fu::min_of(batch, records - first);
         for (std::size_t row = 0; row != count; ++row) {
             keys[row] = key_of(settings.shared.seed.value, first + row);
             fill_value(settings.shared.seed.value, first + row, {tape.data() + row * value_size, value_size});

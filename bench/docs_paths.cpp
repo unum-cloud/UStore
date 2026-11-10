@@ -265,7 +265,7 @@ enum class resolver_t { yyjson_k, subdocuments_k };
  *  fills @p columns. */
 row_t run_row(executor_t& executor, settings_t const& settings, corpus_t const& corpus, std::string_view name,
               std::span<column_t const> columns, resolver_t resolver) noexcept {
-    std::size_t const batch_size = std::min(settings.batch_size.value, settings.documents.value);
+    std::size_t const batch_size = fu::min_of(settings.batch_size.value, settings.documents.value);
     std::array<std::string_view, columns_k.size()> fields;
     for (std::size_t column = 0; column != columns.size(); ++column) fields[column] = columns[column].field;
     std::span<std::string_view const> const used_fields {fields.data(), columns.size()};

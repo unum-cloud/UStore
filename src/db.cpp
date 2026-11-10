@@ -12,8 +12,9 @@
 #include "ustore/types.h" // `USTORE_OS_WINDOWS_`
 
 #if USTORE_OS_WINDOWS_
-#include <windows.h> // NTSTATUS, which <bcrypt.h> needs
-#include <bcrypt.h>  // `BCryptGenRandom`
+#include <winsock2.h> // ahead of `<windows.h>`, which would pull in Winsock 1.1
+#include <windows.h>  // NTSTATUS, which <bcrypt.h> needs
+#include <bcrypt.h>   // `BCryptGenRandom`
 #else
 #include <sys/random.h> // `getentropy`
 #endif

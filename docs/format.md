@@ -26,7 +26,7 @@ struct sorted_run {                       // every section starts on a 4096-byte
 struct strings_run {                      // every section starts on a 4096-byte boundary
     sorted_run_header_t header;           // 120 bytes
     splus_tree heads;                     // saved immutable_splus_tree<key128_t> over the n heads
-    uuid_t values[n];                     // Arrow fixed_size_binary(16), in sorted order
+    uuid128_t values[n];                  // Arrow fixed_size_binary(16), in sorted order
     u32 key_offsets[n + 1];               // Arrow string column of the whole keys
     char keys[key_tape_bytes];
     byte_t stamps[stamps_bytes];          // trailer: the saved stamps column
@@ -127,7 +127,7 @@ struct slot_owner_block_t {      // first logical block of every slot a database
     char   magic[8];             //  0 "USTORESL"
     u32    format_version;       //  8 1
     u32    medium;               // 12 the slot's data directory, so reordered drives are refused
-    uuid_t database;             // 16 the database's `id`
+    uuid128_t database;          // 16 the database's `id`
     u64    manifest_generation;  // 32 manifest slot only: the copy in force
     u64    manifest_offset;      // 40 manifest slot only: where that copy begins
     u64    manifest_bytes;       // 48 manifest slot only: its length, also ending at its first zero byte

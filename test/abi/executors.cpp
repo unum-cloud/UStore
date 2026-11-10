@@ -1126,7 +1126,7 @@ struct lender_hold_t {
 
 /** Holds one thread of the lender's pool until @p hold is released. */
 void hold_lender_thread(lender_hold_t& hold) noexcept {
-    fu::standard_atomic_ref<std::size_t> {hold.entered}.add(1, std::memory_order_acq_rel);
+    fu::standard_atomic_ref<std::size_t> {hold.entered}.store_add(1, std::memory_order_acq_rel);
     fu::standard_atomic_ref<std::uint32_t> const released {hold.released};
     while (released.load(std::memory_order_acquire) == 0) std::this_thread::yield();
 }
@@ -1152,7 +1152,7 @@ void lend_until_finished(lender_loop_t& lending) noexcept {
     fu::standard_atomic_ref<std::size_t> const finished {lending.writes_finished};
     do {
         st::status_t const status = lending.pool.for_n(lender_tasks_k, [&lending](std::size_t, std::size_t) noexcept {
-            fu::standard_atomic_ref<std::size_t> {lending.tasks}.add(1, std::memory_order_relaxed);
+            fu::standard_atomic_ref<std::size_t> {lending.tasks}.store_add(1, std::memory_order_relaxed);
         });
         if (status == st::status_t::operation_would_block_k) ++lending.refused;
         else if (st::failed(status)) ++lending.failed;
@@ -1222,7 +1222,7 @@ std::size_t executor_on_pool(config_t const& config) {
             status = ustore_outcome_wait(&written);
         }
         failures += expect(status == ustore_status_success_k);
-        fu::standard_atomic_ref<std::size_t> {lending.writes_finished}.add(1, std::memory_order_release);
+        fu::standard_atomic_ref<std::size_t> {lending.writes_finished}.store_add(1, std::memory_order_release);
     }
     lending_thread->join(*looping);
     failures += expect(lending.failed == 0);

@@ -1029,8 +1029,8 @@ struct arrow_read_t {
         ipc_batch_t batch {};
         std::size_t const body = static_cast<std::size_t>(message.body_bytes);
         read.body_offsets.push_back(cursor);
-        failures += expect(ipc_read_batch(message, bytes.subspan(cursor, std::min(body, bytes.size() - cursor)), schema,
-                                          nodes, buffers, batch) == ipc_status_t::success_k);
+        failures += expect(ipc_read_batch(message, bytes.subspan(cursor, fu::min_of(body, bytes.size() - cursor)),
+                                          schema, nodes, buffers, batch) == ipc_status_t::success_k);
         failures += expect(ipc_validate_batch(schema, batch) == ipc_status_t::success_k);
         cursor += body;
         if (failures) return failures;
@@ -1173,7 +1173,7 @@ struct arrow_read_t {
     arrow_read_t read;
     failures += read_arrow(bytes, read);
     failures += expect_eq(blocks_count, read.batches);
-    for (std::size_t index = 0; index != std::min(blocks_count, read.body_offsets.size()); ++index) {
+    for (std::size_t index = 0; index != fu::min_of(blocks_count, read.body_offsets.size()); ++index) {
         failures += expect_eq(std::size_t(blocks[index].offset + blocks[index].metadata_bytes),
                               read.body_offsets[index]);
         failures += expect_eq(read.body_offsets[index] % ipc_alignment_direct_k, 0u);

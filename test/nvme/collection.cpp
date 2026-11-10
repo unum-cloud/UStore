@@ -16,15 +16,14 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcmp`
 
-#include <algorithm> // `std::min`
-#include <array>     // `std::array`
-#include <map>       // `std::map`
-#include <memory>    // `std::unique_ptr`
-#include <new>       // `std::nothrow`
-#include <optional>  // `std::optional`
-#include <span>      // `std::span`
-#include <thread>    // `std::thread`
-#include <utility>   // `std::move`
+#include <array>    // `std::array`
+#include <map>      // `std::map`
+#include <memory>   // `std::unique_ptr`
+#include <new>      // `std::nothrow`
+#include <optional> // `std::optional`
+#include <span>     // `std::span`
+#include <thread>   // `std::thread`
+#include <utility>  // `std::move`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -518,7 +517,7 @@ std::size_t burst_past_records_lands_every_commit(mount_type_ const& mount) {
         paint_into(entry, std::span<byte_t> {value});
         failures += expect(
             store->insert((*stack)->channel(), entry.stored_key, std::span<byte_t const> {value}).succeeded());
-        widest_shape = std::max(widest_shape, store->memory_shape().runs);
+        widest_shape = fu::max_of(widest_shape, store->memory_shape().runs);
     }
     failures += expect(widest_shape <= merged_runs_max);
     failures += expect_eq(store->memory_deltas_count(), count_k);
@@ -1147,7 +1146,7 @@ template <typename cursor_type_, typename store_type_>
         bool const descending = direction == scan_direction_t::descending_k;
         utilities::local_arena_t walk;
         expected<cursor_type_> scan = cursor_type_::over(
-            store, walk.allocator().arena, descending ? limit<stored_key_t>::max() : limit<stored_key_t>::min(),
+            store, walk.allocator().arena, descending ? limit<stored_key_t>::max_k : limit<stored_key_t>::min_k,
             head_stamp_k, outside_executor_k, direction);
         failures += expect(scan.has_value());
         if (!scan) return failures;
@@ -1412,7 +1411,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
 struct counter_fold {
     static std::uint64_t count_of(std::span<byte_t const> bytes) noexcept {
         std::uint64_t count = 0;
-        if (!bytes.empty()) std::memcpy(&count, bytes.data(), std::min(bytes.size(), sizeof(count)));
+        if (!bytes.empty()) std::memcpy(&count, bytes.data(), fu::min_of(bytes.size(), sizeof(count)));
         return count;
     }
     static expected<std::span<byte_t const>> counted(std::uint64_t count, arena_allocator<byte_t>& arena) noexcept {

@@ -26,7 +26,7 @@
 #include <cstdint> // `std::int64_t`, `std::uint64_t`
 #include <cstdio>  // `stderr`
 
-#include <algorithm>    // `std::min`, `std::sort`, `std::unique`
+#include <algorithm>    // `std::sort`, `std::unique`
 #include <array>        // `std::array`
 #include <charconv>     // `std::to_chars`
 #include <filesystem>   // `std::filesystem::directory_iterator`
@@ -245,8 +245,8 @@ constexpr std::string_view
         std::int64_t const tweet_id = static_cast<std::int64_t>(random.next() >> 1);
         std::int64_t const user_id = static_cast<std::int64_t>(random.next() >> 1);
         std::size_t const text_length = 1 + random.below(280);
-        std::size_t const mentions_count = std::min<std::size_t>(random.below(2 * settings.connectivity.value + 1),
-                                                                 user_ids.size());
+        std::size_t const mentions_count = fu::min_of<std::size_t>(random.below(2 * settings.connectivity.value + 1),
+                                                                   user_ids.size());
 
         mentioned_user_ids.clear();
         for (std::size_t mention = 0; mention != mentions_count; ++mention)
@@ -298,7 +298,7 @@ constexpr std::string_view
     std::size_t failed_files = 0;
     st::status_t const dispatched = executor.for_n(twitter.files.size(), [&](std::size_t file, std::size_t) noexcept {
         if (!index_tweets(twitter.files[file].view(), twitter.documents[file], twitter.edges[file]))
-            fu::standard_atomic_ref<std::size_t> {failed_files}.add(1, std::memory_order_relaxed);
+            fu::standard_atomic_ref<std::size_t> {failed_files}.store_add(1, std::memory_order_relaxed);
     });
     return st::succeeded(dispatched) && failed_files == 0;
 }

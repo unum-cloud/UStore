@@ -391,7 +391,7 @@ int main(int argc, char const* argv[]) {
         ustore_outcome_t outcome {};
         for (std::size_t call : loop) {
             std::size_t const first = call * batch;
-            std::size_t const count = std::min(batch, rows - first);
+            std::size_t const count = fu::min_of(batch, rows - first);
             if (st::failed(offsets.resize(count + 1)) || st::failed(smiles_offsets.resize(count + 1))) {
                 loop.fail();
                 continue;
@@ -478,7 +478,7 @@ int main(int argc, char const* argv[]) {
         std::thread depths([&] {
             while (reading.load(std::memory_order_relaxed)) {
                 std::uint64_t const depth = in_flight(settings.devices);
-                depth_sum += depth, ++depth_samples, depth_peak = std::max(depth_peak, depth);
+                depth_sum += depth, ++depth_samples, depth_peak = fu::max_of(depth_peak, depth);
                 std::this_thread::sleep_for(std::chrono::milliseconds {1});
             }
         });

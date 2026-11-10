@@ -18,7 +18,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 
 #include "ustore/utilities/nvme_ring.hpp" // `portable_alignment_k`
-#include "ustore/utilities/types.hpp"     // `uuid_t`
+#include "ustore/utilities/types.hpp"     // `uuid128_t`
 
 namespace unum::ustore::utilities {
 
@@ -75,7 +75,7 @@ struct slot_owner_block_t {
     std::uint32_t medium = 0;
 
     /** The database holding the slot, minted when the database was first opened. */
-    uuid_t database;
+    uuid128_t database;
 
     /** The generation of the manifest copy in force, on the manifest slot alone. */
     std::uint64_t manifest_generation = 0;

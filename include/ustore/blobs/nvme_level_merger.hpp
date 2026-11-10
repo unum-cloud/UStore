@@ -12,7 +12,6 @@
 #include <cstdint> // `std::uint8_t`, `std::int32_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm>   // `std::max`, `std::min`
 #include <array>       // `std::array`
 #include <atomic>      // `std::memory_order_acquire`, `std::memory_order_release`
 #include <concepts>    // `std::same_as`
@@ -33,7 +32,7 @@
 #include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
 #include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`
 #include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
-#include "ustore/utilities/types.hpp"              // `status_t`, `byte_t`, `uuid_t`, `uuid_generator`
+#include "ustore/utilities/types.hpp"              // `status_t`, `byte_t`, `uuid128_t`, `uuid_generator`
 
 namespace unum::ustore::blobs {
 
@@ -455,7 +454,7 @@ class lsm_level_merger {
         lsm_level_depth_t depth = lsm_level_depth_t::intermediate_k;
 
         /** The collection every new run's header names. */
-        uuid_t collection {};
+        uuid128_t collection {};
 
         /** The largest value the collection admits, which every new run's header carries. */
         stored_value_size_t value_max_size = 0;
@@ -678,7 +677,7 @@ class lsm_level_merger {
                              string_side_t& side) noexcept {
         std::uint64_t versions = 0;
         for (std::uint32_t source = first; source != last; ++source) versions += sources[source]->population_count();
-        if (versions > limit<std::uint32_t>::max())
+        if (versions > limit<std::uint32_t>::max_k)
             return {status_code_t::capacity_exhausted_k, "A merge of strings holds more versions than it counts"};
         if (side.versions.reserve(static_cast<std::size_t>(versions)) != st::status_t::success_k ||
             side.keys.reserve(static_cast<std::size_t>(versions)) != st::status_t::success_k)
@@ -961,7 +960,7 @@ class lsm_level_merger {
         std::uint64_t tails_bytes = 0;
         for (strings_version_t const version : versions)
             tails_bytes += strings::tail_of(key_of_(sources, version)).size();
-        if (tails_bytes > limit<std::uint32_t>::max())
+        if (tails_bytes > limit<std::uint32_t>::max_k)
             return status_t {status_code_t::capacity_exhausted_k, "A merged run's keys outgrow their offsets"};
         st::vector<key_slot_t> key_slots;
         st::vector<std::uint64_t> stamps;
@@ -982,7 +981,7 @@ class lsm_level_merger {
             slot.stored_key = source.head(position);
             std::memcpy(slot.data, source.value(position).data(), key_slot_t::size);
             key_slots[index] = slot;
-            stamps[index] = std::max(source.stamp(position), request.stamps.floor);
+            stamps[index] = fu::max_of(source.stamp(position), request.stamps.floor);
             kinds[index] = static_cast<std::uint8_t>(source.kind(position));
             tail_offsets[index] = written;
             if (!tail.empty()) std::memcpy(tails.data() + written, tail.data(), tail.size());
@@ -1267,8 +1266,8 @@ class lsm_level_merger {
             choose_compactor(request.placement, devices, merged) == compactor_choice_t::device_k)
             return 1;
         std::uint64_t largest = 0;
-        for (sorted_run_index_view<key_slot_t> const& view : upper) largest = std::max(largest, view.key_slots_count);
-        for (sorted_run_index_view<key_slot_t> const& view : lower) largest = std::max(largest, view.key_slots_count);
+        for (sorted_run_index_view<key_slot_t> const& view : upper) largest = fu::max_of(largest, view.key_slots_count);
+        for (sorted_run_index_view<key_slot_t> const& view : lower) largest = fu::max_of(largest, view.key_slots_count);
         return largest < offered ? 1 : offered;
     }
 
@@ -1305,7 +1304,7 @@ class lsm_level_merger {
                 std::uint64_t end = views[source].key_slots_count;
                 if (slice + 1 != buffers.size()) {
                     std::uint64_t const cut = (slice + 1) * largest_count / buffers.size();
-                    end = std::max(begin, lower_bound_(views[source], key_slot_of(views[largest], cut).stored_key));
+                    end = fu::max_of(begin, lower_bound_(views[source], key_slot_of(views[largest], cut).stored_key));
                 }
                 sorted_run_index_view<key_slot_t>& share = buffers[slice].slice_views[source];
                 share = views[source];
@@ -1414,7 +1413,7 @@ class lsm_level_merger {
     static status_t place_runs_(volume_t& volume, std::span<merge_buffers_t> buffers, std::span<range_t const> ranges,
                                 std::span<std::uint64_t const> stamps) noexcept {
         laid_out_run_t* previous = nullptr;
-        stored_key_t previous_lower = limit<stored_key_t>::min();
+        stored_key_t previous_lower = limit<stored_key_t>::min_k;
         for (merge_buffers_t& sliced : buffers)
             for (laid_out_run_t& laid : sliced.laid_out_runs) {
                 if (previous != nullptr) {
@@ -1431,7 +1430,7 @@ class lsm_level_merger {
             }
         if (previous == nullptr) return {};
         status_t const placed = place_run_(volume, *previous, ranges, stamps, previous_lower,
-                                           limit<stored_key_t>::max());
+                                           limit<stored_key_t>::max_k);
         if (placed.failed()) abandon_runs_(volume, buffers);
         return placed;
     }
@@ -1440,7 +1439,7 @@ class lsm_level_merger {
      *  allocates its extent. */
     static status_t place_run_(volume_t& volume, laid_out_run_t& laid, std::span<range_t const> ranges,
                                std::span<std::uint64_t const> stamps, stored_key_t lower, stored_key_t upper) noexcept {
-        uuid_t const content_id = uuid_generator();
+        uuid128_t const content_id = uuid_generator();
         if (!content_id.is_valid()) return {status_code_t::internal_k, "A merge could not name the run it writes"};
         auto [pieces, pieces_status] = clipped_range_tombstones_(ranges, stamps, lower, upper);
         if (pieces_status.failed()) return pieces_status;
@@ -1531,8 +1530,8 @@ class lsm_level_merger {
         std::size_t const sources_count = windows.size();
         utilities::buffer_pool_t& streams = reading_channel.streams();
         std::size_t const free_blocks = streams.available_buffers();
-        std::size_t const per_block = divide_round_up(std::max<std::size_t>(sources_count, 1),
-                                                      std::max<std::size_t>(free_blocks, 1));
+        std::size_t const per_block = divide_round_up(fu::max_of<std::size_t>(sources_count, 1),
+                                                      fu::max_of<std::size_t>(free_blocks, 1));
         std::uint64_t const share_bytes = round_down_to_multiple(streams.buffer_bytes() / per_block,
                                                                  portable_alignment_k);
         if (free_blocks != 0 && share_bytes >= read_block) {
@@ -1558,8 +1557,8 @@ class lsm_level_merger {
         // The windows split the streaming budget on the heap instead, filled through
         // the request blocks
         std::uint64_t const stream_budget = streams.buffer_bytes() * streams.total_buffers();
-        std::uint64_t const window_bytes = std::max(
-            read_block, round_down_to_multiple(stream_budget / std::max<std::size_t>(sources_count, 1), read_block));
+        std::uint64_t const window_bytes = fu::max_of(
+            read_block, round_down_to_multiple(stream_budget / fu::max_of<std::size_t>(sources_count, 1), read_block));
         st::vector<byte_t>& heap = buffers.heap_windows;
         heap.clear();
         if (heap.resize(st::assume_uninitialized, static_cast<std::size_t>(window_bytes * sources_count)) !=
@@ -1685,7 +1684,7 @@ class lsm_level_merger {
                         if (status_t const made = make_room(); made.failed()) return made;
                         continue;
                     }
-                    std::uint64_t const length = std::min(step, span.length - offset);
+                    std::uint64_t const length = fu::min_of(step, span.length - offset);
                     extent_t const piece {span.offset + offset, length};
                     pending[tag % depth] = pending_piece_t {static_cast<std::uint32_t>(half_offset + offset), 0,
                                                             static_cast<std::uint32_t>(shared ? 0 : length), run};
@@ -1712,7 +1711,7 @@ class lsm_level_merger {
                 if (leading.begin <= at && at < leading.end) {
                     if (window.halves[1 - ahead].begin < leading.begin && leading.end != section_end)
                         if (status_t const refilled = refill(run, 1 - ahead, leading.end,
-                                                             std::min(leading.end + half_bytes, section_end));
+                                                             fu::min_of(leading.end + half_bytes, section_end));
                             refilled.failed())
                             return refilled;
                     return ahead;
@@ -1720,9 +1719,9 @@ class lsm_level_merger {
                 window_half_t const& trailing = window.halves[1 - ahead];
                 if (trailing.begin <= at && at < trailing.end) return 1 - ahead;
                 std::uint64_t const begin = round_down_to_multiple(at, portable_alignment_k);
-                std::uint64_t const middle = std::min(begin + half_bytes, section_end);
+                std::uint64_t const middle = fu::min_of(begin + half_bytes, section_end);
                 if (status_t const refilled = refill(run, 0, begin, middle); refilled.failed()) return refilled;
-                if (status_t const refilled = refill(run, 1, middle, std::min(middle + half_bytes, section_end));
+                if (status_t const refilled = refill(run, 1, middle, fu::min_of(middle + half_bytes, section_end));
                     refilled.failed())
                     return refilled;
                 return std::size_t {0};
@@ -1746,8 +1745,8 @@ class lsm_level_merger {
                 std::uint64_t gathered = 0;
                 while (gathered != chunk && range != ranges_end) {
                     value_copy_range_t const& copied = output.value_copy_ranges[range];
-                    std::uint64_t const taken = std::min<std::uint64_t>(chunk - gathered,
-                                                                        copied.bytes - range_gathered);
+                    std::uint64_t const taken = fu::min_of<std::uint64_t>(chunk - gathered,
+                                                                          copied.bytes - range_gathered);
                     // Values a fold wrote are copied out of the compaction's own bytes.
                     if (copied.source_run == sources.size())
                         std::memcpy(room.data() + gathered, output.folded.data() + copied.source_begin + range_gathered,
@@ -1770,7 +1769,7 @@ class lsm_level_merger {
                                 if (half_status.failed()) return half_status;
                                 window_half_t const& half = window.halves[index];
                                 if (status_t const settled = settle(half); settled.failed()) return settled;
-                                std::uint64_t const bytes = std::min(taken - carried, half.end - at);
+                                std::uint64_t const bytes = fu::min_of(taken - carried, half.end - at);
                                 std::memcpy(room.data() + gathered + carried,
                                             window.bytes.data() + index * half_bytes + (at - half.begin),
                                             static_cast<std::size_t>(bytes));
@@ -1789,7 +1788,7 @@ class lsm_level_merger {
                                 std::uint64_t const aligned = round_down_to_multiple(from + carried,
                                                                                      portable_alignment_k);
                                 std::uint64_t const skipped = from + carried - aligned;
-                                std::uint64_t const bytes = std::min(taken - carried, read_block - skipped);
+                                std::uint64_t const bytes = fu::min_of(taken - carried, read_block - skipped);
                                 std::uint64_t const length = round_up_to_multiple(skipped + bytes,
                                                                                   portable_alignment_k);
                                 extent_t const piece = source.extent().slice(aligned, length);

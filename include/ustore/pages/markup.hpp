@@ -604,8 +604,12 @@ status_t render_xml_with(element_tree<tree_allocator_type_> const& tree, element
                          st::vector<char, output_allocator_type_>& output, open_type_&& open,
                          close_type_&& close) noexcept {
     if (from == no_element_k) return {status_code_t::not_found_k, "No element to render"};
+    // Empty text runs render nothing, so an element holding only those self-closes like its import
     auto content_of = [&](element_index_t index) noexcept {
-        return tree[index].first_child != no_element_k || !tree.text(index).empty();
+        if (!tree.text(index).empty()) return true;
+        for (element_index_t child = tree[index].first_child; child != no_element_k; child = tree[child].next_sibling)
+            if (tree[child].kind != element_kind_t::text_k || !tree.text(child).empty()) return true;
+        return false;
     };
     element_index_t at = from;
     for (;;) {

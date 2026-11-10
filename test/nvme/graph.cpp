@@ -189,7 +189,7 @@ std::size_t expect_model(graph_collection_t& graph, graph_model_t const& model, 
         if (found_status.failed()) continue;
         std::vector<edge_t> const wanted = model.outgoing(vertex);
         failures += expect_eq(found.size(), wanted.size());
-        for (std::size_t index = 0; index != std::min(found.size(), wanted.size()); ++index)
+        for (std::size_t index = 0; index != fu::min_of(found.size(), wanted.size()); ++index)
             failures += expect(found[index] == wanted[index]);
     }
     return failures;
@@ -302,7 +302,7 @@ case_result_t concurrent_adds_commit(char const* directory) {
             for (std::size_t round = 0; round != transactions_per_thread_k; ++round) {
                 auto [transaction, begin_status] = database.transaction();
                 if (begin_status.failed()) {
-                    fu::standard_atomic_ref<std::size_t> {refused}.add(1, std::memory_order_relaxed);
+                    fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 auto [adding, adding_status] = transaction.find<graph_collection_t>("adds");
@@ -310,7 +310,7 @@ case_result_t concurrent_adds_commit(char const* directory) {
                 bool const committed = adding_status.succeeded() &&
                                        adding.write_edge(edge_of(0, leaf, leaf)).succeeded() &&
                                        transaction.commit().has_value();
-                if (!committed) fu::standard_atomic_ref<std::size_t> {refused}.add(1, std::memory_order_relaxed);
+                if (!committed) fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
             }
         });
     for (std::thread& thread : threads) thread.join();

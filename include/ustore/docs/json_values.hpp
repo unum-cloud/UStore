@@ -224,7 +224,8 @@ template <typename scalar_type_>
 bool real_fits(double real) noexcept {
     if constexpr (std::is_same_v<scalar_type_, bool>) return true;
     else if constexpr (std::is_floating_point_v<scalar_type_>)
-        return !std::isfinite(real) || std::abs(real) <= static_cast<double>(std::numeric_limits<scalar_type_>::max());
+        return !std::isfinite(real) ||
+               std::abs(real) <= static_cast<double>((std::numeric_limits<scalar_type_>::max)());
     else if constexpr (std::is_signed_v<scalar_type_>) {
         double const bound = std::ldexp(1.0, std::numeric_limits<scalar_type_>::digits);
         return real >= -bound && real < bound;

@@ -146,7 +146,7 @@ struct batches_t {
     run.arena = std::move(arena);
     std::size_t failures = expect(arena_status.succeeded());
     failures += expect(st::succeeded(run.keys.resize(options.keys.value)));
-    failures += expect(st::succeeded(run.slots.resize(std::ranges::max(options.threads.view()))));
+    failures += expect(st::succeeded(run.slots.resize((std::ranges::max)(options.threads.view()))));
     for (std::size_t index = 0; index != run.keys.size(); ++index) run.keys[index] = key_from_integer(index);
     for (std::size_t index = 0; index != run.slots.size(); ++index)
         run.slots[index].random_generator.seed(static_cast<std::uint32_t>(random.fork(index).next()));

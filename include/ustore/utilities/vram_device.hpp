@@ -20,7 +20,6 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uintptr_t`
 
-#include <algorithm>   // `std::min`
 #include <concepts>    // `std::same_as`, `std::convertible_to`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -415,7 +414,7 @@ expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, executor_
             std::size_t const left = held < limit ? limit - held : 0;
             if (left < padded)
                 return status_t {status_code_t::out_of_memory_k, "The carve passes the executor's scratch limit"};
-            capacity = std::min(capacity, left);
+            capacity = fu::min_of(capacity, left);
         }
         expected<std::uintptr_t> opened = allocate(capacity);
         if (!opened) return opened.status();

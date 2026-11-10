@@ -512,7 +512,7 @@ class basic_single_collection_database {
     using run_pool_t = typename collection_t::run_pool_t;
 
     /** Runs the collection's pool may grow to hold, the most a @c std::uint16_t index admits. */
-    static constexpr std::size_t run_pool_capacity_k = std::numeric_limits<std::uint16_t>::max() - 1;
+    static constexpr std::size_t run_pool_capacity_k = (std::numeric_limits<std::uint16_t>::max)() - 1;
 
 #pragma endregion Types
 
@@ -773,7 +773,7 @@ class basic_single_collection_database {
         if (bytes.empty()) return clear_user_data();
         claim_guard_t const held {*this};
         if (status_t const adopted = adopt_channels_(); adopted.failed()) return adopted;
-        uuid_t const run = uuid_generator();
+        uuid128_t const run = uuid_generator();
         auto [written, allocate_status] = volume_.allocate(run, bytes.size());
         if (allocate_status.failed()) return allocate_status;
         if (status_t const filled = write_extent<disk_t, waiter_type_>(volume_.disk(), writing_channel_, written,
@@ -799,7 +799,7 @@ class basic_single_collection_database {
         claim_guard_t const held {*this};
         if (status_t const adopted = adopt_channels_(); adopted.failed()) return adopted;
         if (user_data_bytes_ == 0) return {status_code_t::not_found_k, "The database holds no user data"};
-        return replace_user_data_(uuid_t {}, medium_extent_t {}, 0);
+        return replace_user_data_(uuid128_t {}, medium_extent_t {}, 0);
     }
 
 #pragma endregion User Data
@@ -1098,8 +1098,8 @@ class basic_single_collection_database {
     /** Publishes @p written of @p bytes as the owner's data; whichever extent the durable
      *  manifest stops naming, the replaced one or a refused new one, goes back after the next
      *  publication that succeeds. */
-    status_t replace_user_data_(uuid_t const& run, medium_extent_t const& written, std::uint64_t bytes) noexcept {
-        uuid_t const replaced_run = std::exchange(user_data_run_, run);
+    status_t replace_user_data_(uuid128_t const& run, medium_extent_t const& written, std::uint64_t bytes) noexcept {
+        uuid128_t const replaced_run = std::exchange(user_data_run_, run);
         medium_extent_t const replaced = std::exchange(user_data_, written);
         std::uint64_t const replaced_bytes = std::exchange(user_data_bytes_, bytes);
         if (status_t const published = publish_manifest_(); published.failed()) {
@@ -1177,8 +1177,8 @@ class basic_single_collection_database {
     }
 
     /** The manifest entry of @p extent, run @p run of @p bytes, of collection @p collection. */
-    [[nodiscard]] static manifest_file_t file_of_(medium_extent_t const& extent, uuid_t const& run, std::uint64_t bytes,
-                                                  std::uint32_t collection, std::uint32_t level,
+    [[nodiscard]] static manifest_file_t file_of_(medium_extent_t const& extent, uuid128_t const& run,
+                                                  std::uint64_t bytes, std::uint32_t collection, std::uint32_t level,
                                                   std::uint64_t stamp) noexcept {
         manifest_file_t file;
         file.run = run;
@@ -1222,7 +1222,7 @@ class basic_single_collection_database {
     collection_t collection_;
 
     /** The ID a directory volume names the file of the owner's data by. */
-    uuid_t user_data_run_ {};
+    uuid128_t user_data_run_ {};
 
     /** Where the owner's data lies, meaningful while @c user_data_bytes_ is not zero. */
     medium_extent_t user_data_ {};

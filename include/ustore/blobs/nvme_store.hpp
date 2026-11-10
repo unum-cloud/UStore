@@ -39,7 +39,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm> // `std::max`, `std::min`, `std::upper_bound`
+#include <algorithm> // `std::upper_bound`
 #include <array>     // `std::array`
 #include <atomic>    // `std::memory_order_acquire`
 #include <bit>       // `std::bit_floor`
@@ -771,7 +771,7 @@ class nvme_store {
                 versions += run.population_count();
                 tombstones += run.range_tombstones().size();
             }
-        std::uint64_t const bound = std::min<std::uint64_t>(wanted, versions + (tombstones != 0 ? held_versions : 0));
+        std::uint64_t const bound = fu::min_of<std::uint64_t>(wanted, versions + (tombstones != 0 ? held_versions : 0));
         if (bound == 0) return {};
         located_changes_t selected {constrained_allocator<located_change_t, atomic_reference_> {runs_.constraint()}};
         stamped_ranges_t ranges {constrained_allocator<stamped_range_t, atomic_reference_> {runs_.constraint()}};
@@ -1205,8 +1205,8 @@ class nvme_store {
                 drained.clear();
                 if (status_t const laid = lay_out_versions_(run_versions, drained); laid.failed()) return laid;
                 auto [pieces, pieces_status] = tombstones.clipped(
-                    begin == 0 ? limit<stored_key_t>::min() : versions[begin].stored_key,
-                    end == versions.size() ? limit<stored_key_t>::max() : versions[end].stored_key);
+                    begin == 0 ? limit<stored_key_t>::min_k : versions[begin].stored_key,
+                    end == versions.size() ? limit<stored_key_t>::max_k : versions[end].stored_key);
                 if (pieces_status.failed()) return pieces_status;
                 if (written.reserve(written.size() + 1) != st::status_t::success_k)
                     return {status_code_t::out_of_memory_k, "A flush could not hold another run"};
@@ -1466,9 +1466,9 @@ class nvme_store {
                                                                    : value_offsets[index + 1] - value_offsets.front();
                 std::span<byte_t const> const bytes = versions[index].delta.bytes;
                 std::size_t const within = static_cast<std::size_t>(from - begin);
-                std::size_t const taken = static_cast<std::size_t>(std::min<std::uint64_t>(into.size(), end - from));
+                std::size_t const taken = static_cast<std::size_t>(fu::min_of<std::uint64_t>(into.size(), end - from));
                 std::size_t const left = within < bytes.size() ? bytes.size() - within : 0;
-                std::size_t const carried = std::min(taken, left);
+                std::size_t const carried = fu::min_of(taken, left);
                 if (carried != 0) std::memcpy(into.data(), bytes.data() + within, carried);
                 if (carried != taken) std::memset(into.data() + carried, 0, taken - carried);
                 into = into.subspan(taken);
@@ -2036,7 +2036,7 @@ class nvme_store {
         if constexpr (is_fixed(value_layout_k)) added = std::uint64_t {versions.size()} * value_size_;
         std::uint64_t written = holds_values_inline_k ? 0 : drained.stored_values.size();
         if constexpr (sorted_run_layout_t::carries_value_offsets_k) {
-            if (written + added > std::numeric_limits<stored_value_offset_t>::max())
+            if (written + added > (std::numeric_limits<stored_value_offset_t>::max)())
                 return {status_code_t::capacity_exhausted_k, "A run's values outgrow its value offsets"};
             if (drained.value_offsets.resize(first + versions.size() + 1) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A run could not hold its value offsets"};

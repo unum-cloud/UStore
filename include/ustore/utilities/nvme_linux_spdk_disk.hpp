@@ -1609,17 +1609,17 @@ class linux_spdk_disk {
     /** Marks the range and the target of @p request as live, so neither can be taken back under it. */
     void borrow_(request_t const& request) noexcept {
         if (registered_memory_slot_t* const slot = resolve_(request.buffer); slot)
-            in_flight_(*slot).add(1, std::memory_order_acquire);
+            in_flight_(*slot).store_add(1, std::memory_order_acquire);
         if (registered_medium_slot_t* const slot = resolve_(request.medium); slot)
-            in_flight_(*slot).add(1, std::memory_order_acquire);
+            in_flight_(*slot).store_add(1, std::memory_order_acquire);
     }
 
     /** Releases both once the device is done with the bytes the request @p flight remembers. */
     void restore_(flight_t const& flight) noexcept {
         if (registered_memory_slot_t* const slot = resolve_(flight.buffer); slot)
-            in_flight_(*slot).sub(1, std::memory_order_release);
+            in_flight_(*slot).store_sub(1, std::memory_order_release);
         if (registered_medium_slot_t* const slot = resolve_(flight.medium); slot)
-            in_flight_(*slot).sub(1, std::memory_order_release);
+            in_flight_(*slot).store_sub(1, std::memory_order_release);
     }
 
     /** Takes one flight slot off @p slot's free list, or @c no_entry_k when every one is taken. */
@@ -1751,7 +1751,7 @@ class linux_spdk_disk {
         if (request.kind == request_kind_t::flush_k) return {};
         if (request.kind == request_kind_t::deallocate_k) {
             if (!request.extent.aligned_to(sector_bytes_) ||
-                request.extent.length / sector_bytes_ > std::numeric_limits<std::uint32_t>::max())
+                request.extent.length / sector_bytes_ > (std::numeric_limits<std::uint32_t>::max)())
                 return {status_code_t::invalid_argument_k, "A deallocation covers whole sectors, at most one range"};
             if (!request.extent.fits_within(target->capacity))
                 return {status_code_t::invalid_argument_k, "The request runs past the namespace"};

@@ -78,7 +78,7 @@ inline void paint(std::span<byte_t> bytes, std::uint64_t seed) noexcept {
  *  where they lie. */
 template <typename fixture_type_, typename volume_type_>
 expected<medium_extent_t> write_painted(fixture_type_& fixture, volume_type_& volume, io_channel_t& channel,
-                                        uuid_t const& run, std::uint64_t bytes, std::uint64_t seed) noexcept {
+                                        uuid128_t const& run, std::uint64_t bytes, std::uint64_t seed) noexcept {
     auto [extent, allocate_status] = volume.allocate(run, bytes);
     if (allocate_status.failed()) return allocate_status;
     st::vector<byte_t> painted_bytes;
@@ -160,7 +160,7 @@ case_result_t directory_keeps_named_and_reclaims_leftovers(fixture_type_& fixtur
     if (!guard) return failures;
     io_channel_t& channel = guard->channel();
 
-    uuid_t const kept = uuid_generator(), leftover = uuid_generator();
+    uuid128_t const kept = uuid_generator(), leftover = uuid_generator();
     path_t leftover_path {"", ""};
     {
         auto [volume, mount_status] = fixture.mount_volume(channel);
@@ -342,13 +342,13 @@ std::size_t slotted_keeps_named_and_reclaims_leftovers(fixture_type_& fixture) {
         if (mount_status.failed()) return failures;
         // The manifest slot is held, and every other slot is free.
         failures += expect_eq(volume.free_bytes(), (stand_in_slots_k - 1) * sorted_run_bytes_max_k);
-        auto [small, small_status] = write_painted(fixture, volume, channel, uuid_t {}, small_run_bytes_k, 11);
-        auto [whole, whole_status] = volume.allocate(uuid_t {}, packed_run_bytes_max_k);
-        failures += expect(small_status.succeeded() && whole_status.succeeded());
-        if (small_status.failed() || whole_status.failed()) return failures;
-        failures += expect(small.extent.offset / slot_bytes_k != whole.extent.offset / slot_bytes_k);
-        kept = small;
-        manifest_file_t const files[] {file_of(small, uuid_t {})};
+        auto [packed, packed_status] = write_painted(fixture, volume, channel, uuid128_t {}, small_run_bytes_k, 11);
+        auto [whole, whole_status] = volume.allocate(uuid128_t {}, packed_run_bytes_max_k);
+        failures += expect(packed_status.succeeded() && whole_status.succeeded());
+        if (packed_status.failed() || whole_status.failed()) return failures;
+        failures += expect(packed.extent.offset / slot_bytes_k != whole.extent.offset / slot_bytes_k);
+        kept = packed;
+        manifest_file_t const files[] {file_of(packed, uuid128_t {})};
         failures += expect(publish_naming(volume, fixture, channel, files).succeeded());
     }
 
@@ -370,7 +370,7 @@ std::size_t slotted_keeps_named_and_reclaims_leftovers(fixture_type_& fixture) {
         failures += expect(reads_painted(fixture, channel, opened, small_run_bytes_k, 11));
     }
     // A small run after the mount packs behind the kept one rather than claiming a fresh slot.
-    auto [next, next_status] = volume.allocate(uuid_t {}, small_run_bytes_k);
+    auto [next, next_status] = volume.allocate(uuid128_t {}, small_run_bytes_k);
     failures += expect(next_status.succeeded());
     if (next_status.succeeded()) failures += expect_eq(next.extent.offset, kept.extent.offset + kept.extent.length);
     return failures;
@@ -397,11 +397,11 @@ std::size_t slotted_zeroes_a_dropped_run(fixture_type_& fixture) {
     failures += expect(dropped_status.succeeded() && kept_status.succeeded());
     if (dropped_status.failed() || kept_status.failed()) return failures;
     failures += expect_eq(dropped.extent.offset / slot_bytes_k, kept.extent.offset / slot_bytes_k);
-    manifest_file_t const both[] {file_of(dropped, uuid_t {}), file_of(kept, uuid_t {})};
+    manifest_file_t const both[] {file_of(dropped, uuid128_t {}), file_of(kept, uuid128_t {})};
     failures += expect(publish_naming(volume, fixture, channel, both).succeeded());
 
     // The manifest stops naming the run, and only once it is durable is the run given back.
-    manifest_file_t const one[] {file_of(kept, uuid_t {})};
+    manifest_file_t const one[] {file_of(kept, uuid128_t {})};
     failures += expect(publish_naming(volume, fixture, channel, one).succeeded());
     volume.deallocate(dropped);
     failures += expect(publish_naming(volume, fixture, channel, one).succeeded());
@@ -481,11 +481,11 @@ std::size_t slotted_shares_a_medium(fixture_type_& fixture) {
         auto [volume, mount_status] = mount_slotted(fixture, channel, second);
         failures += expect(mount_status.succeeded());
         if (mount_status.failed()) return failures;
-        auto [run, run_status] = write_painted(fixture, volume, channel, uuid_t {}, small_run_bytes_k, 21);
+        auto [run, run_status] = write_painted(fixture, volume, channel, uuid128_t {}, small_run_bytes_k, 21);
         failures += expect(run_status.succeeded());
         if (run_status.failed()) return failures;
         failures += expect_eq(run.extent.offset / slot_bytes_k, std::uint64_t {2});
-        manifest_file_t const files[] {file_of(run, uuid_t {})};
+        manifest_file_t const files[] {file_of(run, uuid128_t {})};
         failures += expect(publish_naming(volume, fixture, channel, files).succeeded());
     }
     {
@@ -493,7 +493,7 @@ std::size_t slotted_shares_a_medium(fixture_type_& fixture) {
         failures += expect(mount_status.succeeded());
         if (mount_status.failed()) return failures;
         failures += expect_eq(volume.free_bytes(), std::uint64_t {1} * sorted_run_bytes_max_k);
-        auto [run, run_status] = volume.allocate(uuid_t {}, small_run_bytes_k);
+        auto [run, run_status] = volume.allocate(uuid128_t {}, small_run_bytes_k);
         failures += expect(run_status.succeeded());
         if (run_status.succeeded()) failures += expect_eq(run.extent.offset / slot_bytes_k, std::uint64_t {3});
     }
@@ -517,19 +517,19 @@ std::size_t slotted_refuses_reordered_media(fixture_type_& fixture) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
     io_channel_t& channel = guard->channel();
-    path_t const small = stand_in_device(fixture, "first.raw", 2), large = stand_in_device(fixture, "second.raw", 3);
-    raw_address_t const small_raw {small, 0}, large_raw {large, 0};
-    data_address_t const ordered[] {small_raw.address(), large_raw.address()};
-    data_address_t const reordered[] {large_raw.address(), small_raw.address()};
+    path_t const smaller = stand_in_device(fixture, "first.raw", 2), larger = stand_in_device(fixture, "second.raw", 3);
+    raw_address_t const smaller_raw {smaller, 0}, larger_raw {larger, 0};
+    data_address_t const ordered[] {smaller_raw.address(), larger_raw.address()};
+    data_address_t const reordered[] {larger_raw.address(), smaller_raw.address()};
     {
         auto [volume, mount_status] = mount_slotted(fixture, channel, ordered);
         failures += expect(mount_status.succeeded());
         if (mount_status.failed()) return failures;
-        auto [run, run_status] = write_painted(fixture, volume, channel, uuid_t {}, small_run_bytes_k, 31);
+        auto [run, run_status] = write_painted(fixture, volume, channel, uuid128_t {}, small_run_bytes_k, 31);
         failures += expect(run_status.succeeded());
         if (run_status.failed()) return failures;
         failures += expect_eq(run.data_directory, std::uint16_t {1});
-        manifest_file_t const files[] {file_of(run, uuid_t {})};
+        manifest_file_t const files[] {file_of(run, uuid128_t {})};
         failures += expect(publish_naming(volume, fixture, channel, files).succeeded());
     }
     failures += expect_status(mount_slotted(fixture, channel, reordered), status_code_t::malformed_k);

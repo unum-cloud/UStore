@@ -25,13 +25,12 @@
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::min`
-#include <concepts>  // `std::same_as`
-#include <limits>    // `std::numeric_limits`
-#include <memory>    // `std::unique_ptr`
-#include <new>       // `std::nothrow`, placement `new`
-#include <span>      // `std::span`
-#include <utility>   // `std::move`, `std::swap`
+#include <concepts> // `std::same_as`
+#include <limits>   // `std::numeric_limits`
+#include <memory>   // `std::unique_ptr`
+#include <new>      // `std::nothrow`, placement `new`
+#include <span>     // `std::span`
+#include <utility>  // `std::move`, `std::swap`
 
 #include <smashtable/basic_hash_table.hpp> // `st::basic_hash_table`, `st::mapping`, `st::assume_reserved`
 #include <smashtable/basic_vector.hpp>     // `st::vector`
@@ -559,7 +558,7 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     auto update = [&](auto& equal_slot) noexcept {
         stored_value_place_t& held = equal_slot.value_ref();
         collection->elements_size_bytes -= held.size;
-        transaction_stamp_t const earlier = std::min(held.watch_stamp, watch_stamp);
+        transaction_stamp_t const earlier = fu::min_of(held.watch_stamp, watch_stamp);
         held = place;
         held.watch_stamp = earlier;
         collection->elements_size_bytes += stored_value.size();
@@ -595,7 +594,7 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     auto update = [&](auto& equal_slot) noexcept {
         stored_value_place_t& held = equal_slot.value_ref();
         collection->elements_size_bytes -= held.size;
-        transaction_stamp_t const earlier = std::min(held.watch_stamp, watch_stamp);
+        transaction_stamp_t const earlier = fu::min_of(held.watch_stamp, watch_stamp);
         held = place;
         held.watch_stamp = earlier;
     };
@@ -662,7 +661,7 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     collection_deltas_t* collection = nullptr;
     auto status = reach_collection_(id, widths, collection);
     if (status.failed()) return status;
-    if (stored_key == limit<stored_key_t>::max()) return status_t {status_code_t::malformed_k, "Invalid stored key"};
+    if (stored_key == limit<stored_key_t>::max_k) return status_t {status_code_t::malformed_k, "Invalid stored key"};
     if (collection->stored_values.reserve_more(1) == collection_deltas_t::stored_values_t::reserve_result_t::failed_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another key"};
 
@@ -829,7 +828,7 @@ inline status_t
 transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::check_stored_value(
     value_widths_t const& widths, stored_key_t stored_key, stored_value_size_t stored_value_size) const noexcept {
 
-    bool valid_key = stored_key != limit<stored_key_t>::max();
+    bool valid_key = stored_key != limit<stored_key_t>::max_k;
     bool valid_fixed_width_stored_value = (widths.value_size > 0) & (stored_value_size == widths.value_size);
     bool valid_variable_width_stored_value = stored_value_size <= widths.value_max_size;
     bool valid = valid_key & (valid_fixed_width_stored_value ^ valid_variable_width_stored_value);
@@ -845,7 +844,8 @@ inline bool transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
     bool has_element_place = elements_count_ + stored_values_count <= elements_max_count_;
     // A place names its offset in 32 bits, which every value of the buffer stays within.
     bool has_enough_space = (used_memory + stored_values_sum_size <= capacity_bytes_) &
-                            (used_memory + stored_values_sum_size <= std::numeric_limits<stored_value_offset_t>::max());
+                            (used_memory + stored_values_sum_size <=
+                             (std::numeric_limits<stored_value_offset_t>::max)());
     return has_element_place & has_enough_space;
 }
 
@@ -971,7 +971,7 @@ class read_set {
         };
         auto update = [&](auto& equal_slot) noexcept {
             watch_t& watch = equal_slot.value_ref();
-            watch.watch_stamp = std::min(watch_stamp, watch.watch_stamp);
+            watch.watch_stamp = fu::min_of(watch_stamp, watch.watch_stamp);
             watch.purpose = watch.purpose | purpose;
         };
         [[maybe_unused]] auto const stored = stored_keys.probe_to_upsert(stored_key, insert, update,

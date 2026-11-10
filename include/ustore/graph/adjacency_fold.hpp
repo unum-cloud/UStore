@@ -38,11 +38,10 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::int32_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm> // `std::min`, `std::max`
-#include <limits>    // `std::numeric_limits`
-#include <memory>    // `std::allocator_traits`
-#include <new>       // placement `new`
-#include <span>      // `std::span`
+#include <limits> // `std::numeric_limits`
+#include <memory> // `std::allocator_traits`
+#include <new>    // placement `new`
+#include <span>   // `std::span`
 
 #include <smashtable/shared.hpp> // `st::status_t`
 
@@ -99,7 +98,7 @@ inline constexpr role_t dedge_source_k {1 << 1};
 inline constexpr role_t dedge_target_k {1 << 2};
 inline constexpr role_t hedge_leaf_k {1 << 3};
 inline constexpr role_t hedge_parent_k {1 << 4};
-inline constexpr role_t any_role_k {std::numeric_limits<std::uint8_t>::max()};
+inline constexpr role_t any_role_k {(std::numeric_limits<std::uint8_t>::max)()};
 
 /** Whether an edge leads from its first vertex to its second one, or joins them both ways. */
 enum class direction_t : bool { undirected_k, directed_k };
@@ -194,8 +193,8 @@ struct labeled_half_edge_t {
 
         default:
             edge.direction = direction_t::undirected_k;
-            edge.first = std::min(vertex, neighbor_id);
-            edge.second = std::max(vertex, neighbor_id);
+            edge.first = fu::min_of(vertex, neighbor_id);
+            edge.second = fu::max_of(vertex, neighbor_id);
             break;
         }
         return edge;
@@ -655,7 +654,7 @@ struct adjacency_fold_t {
         }
         if (!total) return std::span<byte_t const> {};
         // Every record carries its place in the chain as a 32-bit sequence
-        if (total > std::numeric_limits<std::uint32_t>::max())
+        if (total > (std::numeric_limits<std::uint32_t>::max)())
             return status_t {status_code_t::capacity_exhausted_k, "Too many half-edge deltas to compose"};
 
         using entries_allocator_t =

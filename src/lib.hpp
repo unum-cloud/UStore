@@ -49,7 +49,6 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 
-#include <algorithm>   // `std::min`, `std::max`
 #include <array>       // `std::array`
 #include <bit>         // `std::bit_cast`
 #include <memory>      // `std::addressof`
@@ -597,7 +596,7 @@ inline status_t gather_strings(ragged_input_t const& input, ustore_arena_t scrat
     if (status.failed()) return status;
     std::array<ustore_size_t, accessor_block_k> indices;
     for (std::size_t first = 0; first < input.count; first += indices.size()) {
-        std::size_t const block = std::min(indices.size(), input.count - first);
+        std::size_t const block = fu::min_of(indices.size(), input.count - first);
         std::iota(indices.begin(), indices.begin() + block, static_cast<ustore_size_t>(first));
         view.data.accessor.get(view.data.accessor.handle, indices.data(), block, views.data() + first);
     }
@@ -621,7 +620,7 @@ struct strings_window_t {
     /** The least string of the window, or of the prefix where the window names none. */
     [[nodiscard]] std::string_view lower() const noexcept {
         std::string_view const bound = direction == ustore_scan_descending_k ? end : start;
-        return std::max(bound, prefix);
+        return fu::max_of(bound, prefix);
     }
 
     /** The string the window stops at, exclusive for an ascending window and inclusive for a

@@ -241,7 +241,7 @@ inline sz_strings_view_t stringzilla_strings(ustore_strings_view_t const& view, 
     std::array<ustore_size_t, 64> indices;
     std::array<ustore_bytes_view_t, 64> gathered;
     for (std::size_t first = 0; first < count; first += indices.size()) {
-        std::size_t const block = std::min(indices.size(), count - first);
+        std::size_t const block = fu::min_of(indices.size(), count - first);
         for (std::size_t index = 0; index != block; ++index) indices[index] = first + index;
         view.data.accessor.get(view.data.accessor.handle, indices.data(), block, gathered.data());
         for (std::size_t index = 0; index != block; ++index) {

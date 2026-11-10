@@ -16,7 +16,7 @@
 #include <climits> // `CHAR_BIT`
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 
-#include <algorithm>   // `std::min`, `std::ranges::sort`, `std::ranges::unique`
+#include <algorithm>   // `std::ranges::sort`, `std::ranges::unique`
 #include <array>       // `std::array`
 #include <compare>     // `std::strong_ordering`
 #include <concepts>    // `std::same_as`
@@ -419,7 +419,7 @@ struct edges_span {
         ids = tuples.members(&edge_t::id);
     }
 
-    std::size_t size() const noexcept { return std::min(sources.count(), targets.count()); }
+    std::size_t size() const noexcept { return fu::min_of(sources.count(), targets.count()); }
 
     edge_t operator[](std::size_t index) const noexcept {
         edge_t result;

@@ -74,7 +74,7 @@ __device__ inline int compare_record_half_edges(half_edge_record_t const& record
  *  which orders last. */
 __device__ inline bool chained_before(half_edge_record_t const* records, std::uint32_t first,
                                       std::uint32_t second) noexcept {
-    constexpr std::uint32_t padding = std::numeric_limits<std::uint32_t>::max();
+    constexpr std::uint32_t padding = (std::numeric_limits<std::uint32_t>::max)();
     if (first == padding || second == padding) return second == padding && first != padding;
     bool const first_clears = record_operation(records[first]) == half_edge_operation_t::remove_vertex_k;
     bool const second_clears = record_operation(records[second]) == half_edge_operation_t::remove_vertex_k;
@@ -92,7 +92,7 @@ __device__ inline bool chained_before(half_edge_record_t const* records, std::ui
 template <unsigned block_threads_>
 __device__ void fold_chains(half_edge_record_t const* records, std::uint32_t const* starts, std::uint32_t chains_count,
                             std::uint32_t* sorted, std::uint32_t* kept, std::uint32_t* kept_counts) noexcept {
-    constexpr std::uint32_t padding = std::numeric_limits<std::uint32_t>::max();
+    constexpr std::uint32_t padding = (std::numeric_limits<std::uint32_t>::max)();
     unsigned const thread = threadIdx.x;
     for (std::uint32_t chain = blockIdx.x; chain < chains_count; chain += gridDim.x) {
         std::uint32_t const start = starts[chain];
@@ -221,7 +221,7 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blo
     }
     // A record's index is its place in its chain, so every index fits 32 bits, and a chain sorts in
     // one block's memory
-    if (total > std::numeric_limits<std::uint32_t>::max()) return status_t::invalid_argument_k;
+    if (total > (std::numeric_limits<std::uint32_t>::max)()) return status_t::invalid_argument_k;
     if (longest > fold_chain_records_max_k) return status_t::out_of_memory_heap_k;
     if (total == 0) return status_t::success_k;
     if (!executor.kernels()) return status_t::invalid_argument_k;
@@ -284,7 +284,7 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blo
     if (status != status_t::success_k) return status;
     half_edge_record_t removal;
     save_delta(half_edge_delta_t::remove_vertex(), removal.bytes);
-    std::uint64_t const tickets = std::min(
+    std::uint64_t const tickets = fu::min_of(
         utilities::divide_round_up(std::uint64_t {chains_count}, std::uint64_t {fold_block_threads_k}),
         utilities::chain_blocks_max_k);
     status = device_status(

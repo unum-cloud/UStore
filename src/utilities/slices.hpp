@@ -9,8 +9,6 @@
 
 #include <cstddef> // `std::size_t`
 
-#include <algorithm> // `std::min`
-
 #include "ustore/status.hpp"                // `status_t`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 #include "ustore/utilities/types.hpp"       // `divide_round_up`
@@ -52,7 +50,7 @@ status_t for_task_slices(view_t const& call, std::size_t count, slice_type_&& sl
     for (status_t& status : statuses) status = {};
     auto run_slice = [&](std::size_t thread) noexcept {
         std::size_t const first = thread * words / threads * tasks_per_word_k;
-        std::size_t const end = std::min((thread + 1) * words / threads * tasks_per_word_k, count);
+        std::size_t const end = fu::min_of((thread + 1) * words / threads * tasks_per_word_k, count);
         if (first >= end) return;
         view_t sliced = call;
         sliced.scratch = &executor->scratches[thread];

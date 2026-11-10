@@ -23,7 +23,6 @@
 #include <malloc.h> // `_aligned_malloc`, `_aligned_free`
 #endif
 
-#include <algorithm>   // `std::max`
 #include <array>       // `std::array`
 #include <concepts>    // `std::convertible_to`
 #include <limits>      // `std::numeric_limits`
@@ -180,7 +179,7 @@ expected<std::span<element_type_>> carve(host_blocks_t& blocks, std::size_t coun
     void* bytes = newest ? arena_bump(*newest, length, alignment) : nullptr;
     if (!bytes) {
         std::size_t const grown = newest ? newest->capacity * arena_growth_factor_k : 0;
-        std::size_t const capacity = round_up_to_multiple(std::max(grown, length + alignment + sizeof(arena_block_t)),
+        std::size_t const capacity = round_up_to_multiple(fu::max_of(grown, length + alignment + sizeof(arena_block_t)),
                                                           arena_page_bytes_k);
         void* memory = nullptr;
         if (fu_allocate_on_domain_id(blocks.memory_domain, capacity, &memory) != fu_success_k || !memory)
@@ -212,7 +211,7 @@ inline std::uintptr_t bump(device_blocks_t& blocks, std::size_t padded) noexcept
  *  page, and at least double the newest run. */
 inline std::size_t grown_capacity(device_blocks_t const& blocks, std::size_t padded) noexcept {
     std::size_t const grown = blocks.count ? blocks.blocks[blocks.count - 1].capacity * arena_growth_factor_k : 0;
-    return round_up_to_multiple(std::max(grown, padded), arena_page_bytes_k);
+    return round_up_to_multiple(fu::max_of(grown, padded), arena_page_bytes_k);
 }
 
 /** The host blocks of @p arena, or null for an arena on a device. */
@@ -479,7 +478,7 @@ class aligned_allocator {
   private:
 
     /** The largest count whose aligned byte size still fits a @c std::size_t. */
-    static constexpr std::size_t max_count_k = (std::numeric_limits<std::size_t>::max() - alignment_k) /
+    static constexpr std::size_t max_count_k = ((std::numeric_limits<std::size_t>::max)() - alignment_k) /
                                                sizeof(value_type_);
 };
 
@@ -595,7 +594,7 @@ class constrained_allocator {
     [[nodiscard]] value_type_* allocate(std::size_t count) noexcept {
         // A count whose byte size wraps would charge the budget for a small block that
         // reads as valid.
-        if (count > std::numeric_limits<std::size_t>::max() / sizeof(value_type_)) return nullptr;
+        if (count > (std::numeric_limits<std::size_t>::max)() / sizeof(value_type_)) return nullptr;
         std::size_t const bytes = count * sizeof(value_type_);
         if (!constraint_ || !constraint_->acquire(bytes)) return nullptr;
         value_type_* const memory = base_.allocate(count);
@@ -795,7 +794,7 @@ status_t export_strings(ustore_arena_t arena, std::size_t count, std::size_t tot
         else tape = u64_tape(bytes.data(), offsets.data());
         return status_t {};
     };
-    if (total <= std::numeric_limits<std::uint32_t>::max()) return export_as(std::type_identity<std::uint32_t> {});
+    if (total <= (std::numeric_limits<std::uint32_t>::max)()) return export_as(std::type_identity<std::uint32_t> {});
     return export_as(std::type_identity<std::uint64_t> {});
 }
 

@@ -12,7 +12,6 @@
 #include <cstdint> // `std::uint8_t`, `std::int32_t`, `std::int64_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcmp`
 
-#include <algorithm>   // `std::max`
 #include <chrono>      // `std::chrono::system_clock`
 #include <concepts>    // `std::convertible_to`, `std::invocable`, `std::same_as`, `std::unsigned_integral`
 #include <limits>      // `std::numeric_limits`
@@ -27,7 +26,7 @@
 
 #include "ustore/blobs/nvme_key_slot.hpp"   // `storage_limits_t`, `stored_value_size_t`, `value_layout_t`
 #include "ustore/utilities/nvme_mounts.hpp" // `resources_config_t`
-#include "ustore/utilities/types.hpp"       // `status_t`, `uuid_t`, `save_fields`
+#include "ustore/utilities/types.hpp"       // `status_t`, `uuid128_t`, `save_fields`
 
 namespace unum::ustore::blobs {
 
@@ -101,7 +100,7 @@ struct lsm_level_config_t {
 struct lsm_tree_config_t {
     lsm_level_config_t lsm_level_0;
     std::size_t level_enlarge_factor = 0;
-    uuid_t collection {};
+    uuid128_t collection {};
 };
 
 /** Configuration of one collection. */
@@ -214,7 +213,7 @@ struct single_collection_database_schema_t {
     struct snapshot_t {
         collection_snapshot_schema_t collection;
         snapshot_id_t id = invalid_snapshot_id_k;
-        time_point_t time_stamp = time_point_t::max();
+        time_point_t time_stamp = (time_point_t::max)();
     };
     using snapshots_t = st::vector<snapshot_t>;
 
@@ -251,7 +250,7 @@ struct database_schema_t {
         using collection_snapshots_schema_t = st::vector<collection_t>;
 
         snapshot_id_t id = invalid_snapshot_id_k;
-        time_point_t time_stamp = time_point_t::max();
+        time_point_t time_stamp = (time_point_t::max)();
         collection_snapshots_schema_t collections;
     };
 
@@ -328,7 +327,7 @@ inline std::string_view json_string_view(yyjson_val* value) noexcept {
 /** Reads an unsigned number that fits @p value_type_. */
 template <std::unsigned_integral value_type_>
 [[nodiscard]] bool read_json(yyjson_val* value, value_type_& number) noexcept {
-    if (!yyjson_is_uint(value) || yyjson_get_uint(value) > std::numeric_limits<value_type_>::max()) return false;
+    if (!yyjson_is_uint(value) || yyjson_get_uint(value) > (std::numeric_limits<value_type_>::max)()) return false;
     number = static_cast<value_type_>(yyjson_get_uint(value));
     return true;
 }
@@ -340,12 +339,12 @@ template <std::unsigned_integral value_type_>
 }
 
 /** Reads a UUID from its printed form. */
-[[nodiscard]] inline bool read_json(yyjson_val* value, uuid_t& id) noexcept {
+[[nodiscard]] inline bool read_json(yyjson_val* value, uuid128_t& id) noexcept {
     std::string_view const text = json_string_view(value);
-    if (text.size() != uuid_t::printed_length_k) return false;
-    std::span<char const, uuid_t::printed_length_k> const printed {text.data(), uuid_t::printed_length_k};
-    if (!uuid_t::parses(printed)) return false;
-    id = uuid_t::parse(printed);
+    if (text.size() != uuid128_t::printed_length_k) return false;
+    std::span<char const, uuid128_t::printed_length_k> const printed {text.data(), uuid128_t::printed_length_k};
+    if (!uuid128_t::parses(printed)) return false;
+    id = uuid128_t::parse(printed);
     return true;
 }
 
@@ -360,7 +359,8 @@ template <std::unsigned_integral value_type_>
 [[nodiscard]] inline bool read_json(yyjson_val* value, time_point_t& time) noexcept {
     std::int64_t ticks = 0;
     if (yyjson_is_sint(value)) ticks = yyjson_get_sint(value);
-    else if (yyjson_is_uint(value) && yyjson_get_uint(value) <= std::uint64_t(std::numeric_limits<std::int64_t>::max()))
+    else if (yyjson_is_uint(value) &&
+             yyjson_get_uint(value) <= std::uint64_t((std::numeric_limits<std::int64_t>::max)()))
         ticks = static_cast<std::int64_t>(yyjson_get_uint(value));
     else return false;
     time = time_point_t(typename time_point_t::duration(ticks));
@@ -552,10 +552,10 @@ template <std::unsigned_integral value_type_>
     return yyjson_mut_str(document, text.c_str());
 }
 
-[[nodiscard]] inline yyjson_mut_val* write_json(yyjson_mut_doc* document, uuid_t const& id) noexcept {
-    char text[uuid_t::printed_length_k] = {};
+[[nodiscard]] inline yyjson_mut_val* write_json(yyjson_mut_doc* document, uuid128_t const& id) noexcept {
+    char text[uuid128_t::printed_length_k] = {};
     id.print(text);
-    return yyjson_mut_strncpy(document, text, uuid_t::printed_length_k);
+    return yyjson_mut_strncpy(document, text, uuid128_t::printed_length_k);
 }
 
 [[nodiscard]] inline yyjson_mut_val* write_json(yyjson_mut_doc* document, collection_id_t const& id) noexcept {
@@ -837,12 +837,12 @@ template <issue_sink_concept sink_type_>
         return report_issue(sink, issue_kind_t::error_k, "Variable value size must be within [{}, {}]",
                             storage_limits_t::variable_value_min_size_k, storage_limits_t::variable_value_max_size_k);
 
-    std::size_t const value_max_size = std::max(config.value_size, config.value_max_size);
+    std::size_t const value_max_size = fu::max_of(config.value_size, config.value_max_size);
     if (!is_inline(value_layout)) {
         if (config.cache_limit > storage_limits_t::cache_limit_max_size_k)
             return report_issue(sink, issue_kind_t::error_k, "Value cache must not exceed {} bytes",
                                 storage_limits_t::cache_limit_max_size_k);
-        if (config.cache_limit / value_max_size > std::numeric_limits<std::uint32_t>::max())
+        if (config.cache_limit / value_max_size > (std::numeric_limits<std::uint32_t>::max)())
             report_issue(sink, issue_kind_t::warning_k, "Value cache holds more values than it can index");
     }
 

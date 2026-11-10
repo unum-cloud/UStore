@@ -92,14 +92,7 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
-# Windows headers define `min`, `max` and, through the RPC headers, `small` as macros unless told not to
-if (WIN32)
-    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
-endif ()
-
 include(cmake/ustore_flags.cmake)
-
-include(cmake/ustore_platform.cmake)
 
 find_package(Threads REQUIRED)
 include(GNUInstallDirs)
@@ -137,6 +130,7 @@ set(YYJSON_INSTALL OFF)
 include(cmake/yyjson.cmake)
 
 include(cmake/ustore_siblings.cmake)
+include(cmake/ustore_platform.cmake)
 
 # The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
 # headers they reach into. The package installs UStore's own headers alone, so a consumer brings each sibling's.
@@ -677,6 +671,13 @@ if (${USTORE_BUILD_TEST})
         )
         set_tests_properties(ustore_test_links_no_gpu_runtime PROPERTIES REQUIRED_FILES $<TARGET_FILE:ustore_shared>)
     endif ()
+    add_test(
+        NAME ustore_duplicate_symbols
+        COMMAND
+            ${CMAKE_COMMAND}
+            "-DOBJECTS=$<TARGET_OBJECTS:ustore_static>;$<FILTER:$<TARGET_PROPERTY:ustore_static,SOURCES>,INCLUDE,[.]o(bj)?$>"
+            -P "${forkunion_SOURCE_DIR}/cmake/forkunion_duplicate_symbols.cmake"
+    )
 
     # Every read verb on each listed GPU against the host, once per engine on the one GPU the device suites share
     add_executable(ustore_test_vram test/vram/towers.cpp)

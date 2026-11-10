@@ -43,7 +43,6 @@
 #include <cstdint> // `std::uint8_t`, `std::int32_t`, `std::int64_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`, `std::memmove`, `std::memset`
 
-#include <algorithm>   // `std::max`, `std::min`
 #include <chrono>      // `std::chrono::system_clock`
 #include <concepts>    // `std::invocable`, `std::same_as`, `std::unsigned_integral`
 #include <limits>      // `std::numeric_limits`
@@ -71,7 +70,7 @@
 #include "ustore/utilities/nvme_slots.hpp"         // `slot_bytes_k`, `slot_payload_offset_k`
 #include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
 #include "ustore/utilities/ram_buffers.hpp"        // `constrained_allocator`, `resource_constraint`
-#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `byte_t`, `uuid_t`, `uuid_generator`, `save_fields`, `load_fields`
+#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `byte_t`, `uuid128_t`, `uuid_generator`, `save_fields`, `load_fields`
 
 namespace unum::ustore::blobs {
 
@@ -111,11 +110,11 @@ struct collection_ids_t {
 };
 
 /** The canonical text of @p identifier, as a schema document carries it. */
-inline expected<string_t> uuid_to_string(uuid_t const& identifier) noexcept {
-    char text[uuid_t::printed_length_k] = {};
+inline expected<string_t> uuid_to_string(uuid128_t const& identifier) noexcept {
+    char text[uuid128_t::printed_length_k] = {};
     identifier.print(text);
     string_t printed;
-    if (sz::failed(printed.assign(string_view_t {text, uuid_t::printed_length_k})))
+    if (sz::failed(printed.assign(string_view_t {text, uuid128_t::printed_length_k})))
         return status_t {status_code_t::out_of_memory_k, "No room for the text of an identifier"};
     return printed;
 }
@@ -155,7 +154,7 @@ struct lsm_tree_run_record_t {
 
     /** The run's own identifier, which its header also carries and which a manifest
      *  may leave zero. */
-    uuid_t content_id {};
+    uuid128_t content_id {};
 
     /** Where the run sits on its volume. */
     medium_extent_t extent {};
@@ -389,7 +388,7 @@ class lsm_tree {
      *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
      */
     [[nodiscard]] lookup_result_t find(level_set_t const& taken, stored_key_t stored_key, lsm_tree_position_t& position,
-                                       std::uint64_t stamp = limit<std::uint64_t>::max()) const noexcept {
+                                       std::uint64_t stamp = limit<std::uint64_t>::max_k) const noexcept {
         position = lsm_tree_position_t {};
         for (std::size_t number = 0; number != taken.size(); ++number) {
             lsm_level_position_t inside;
@@ -421,7 +420,7 @@ class lsm_tree {
     template <typename sink_type_>
     status_t read_values(io_channel_t& channel, level_set_t const& taken, std::span<stored_key_t const> stored_keys,
                          std::span<lookup_result_t> results, sink_type_&& sink,
-                         std::uint64_t stamp = limit<std::uint64_t>::max()) const noexcept {
+                         std::uint64_t stamp = limit<std::uint64_t>::max_k) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched read answers one result per key"};
 
@@ -441,7 +440,7 @@ class lsm_tree {
             if (block_bytes == 0)
                 return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
-            if (stored_keys.size() > std::numeric_limits<std::uint32_t>::max())
+            if (stored_keys.size() > (std::numeric_limits<std::uint32_t>::max)())
                 return {status_code_t::invalid_argument_k, "A batched read takes at most 2^32 keys"};
             std::span<read_piece_t> const pieces = channel.read_pieces();
             std::size_t const depth = pieces.size();
@@ -760,10 +759,10 @@ class lsm_tree {
         std::size_t upper_count = 0;
 
         /** The least key any picked run holds. */
-        stored_key_t lower_stored_key = limit<stored_key_t>::max();
+        stored_key_t lower_stored_key = limit<stored_key_t>::max_k;
 
         /** The greatest key any picked run holds. */
-        stored_key_t upper_stored_key = limit<stored_key_t>::min();
+        stored_key_t upper_stored_key = limit<stored_key_t>::min_k;
 
         /** The upper level's picked runs. */
         [[nodiscard]] std::span<sorted_run_t const* const> upper() const noexcept {
@@ -946,7 +945,7 @@ class lsm_tree {
         std::uint64_t const factor = config_.level_enlarge_factor;
         std::uint64_t ceiling = slot_bytes_;
         for (std::size_t step = 0; step != number; ++step) {
-            if (ceiling > limit<std::uint64_t>::max() / factor) return limit<std::uint64_t>::max();
+            if (ceiling > limit<std::uint64_t>::max_k / factor) return limit<std::uint64_t>::max_k;
             ceiling *= factor;
         }
         std::size_t const deepest = levels.size() - 1;
@@ -976,7 +975,7 @@ class lsm_tree {
             if (overlapping != levels.size() && number + 1 == overlapping) return number;
             std::uint64_t const held = number < levels.size() ? levels.level(number).size_bytes() : 0;
             std::uint64_t const admitted = level_bytes_(levels, number);
-            if (held + bytes <= admitted || admitted == limit<std::uint64_t>::max()) return number;
+            if (held + bytes <= admitted || admitted == limit<std::uint64_t>::max_k) return number;
         }
     }
 
@@ -1025,7 +1024,7 @@ class lsm_tree {
                 st::status_t const placed = picked.runs.push_back(&from.run(index));
         else {
             std::size_t chosen = 0;
-            std::uint64_t cheapest = limit<std::uint64_t>::max();
+            std::uint64_t cheapest = limit<std::uint64_t>::max_k;
             std::size_t first_overlapping = 0;
             for (std::size_t index = 0; index != from.size(); ++index) {
                 sorted_run_t const& run = from.run(index);
@@ -1049,8 +1048,8 @@ class lsm_tree {
         }
         picked.upper_count = picked.runs.size();
 
-        stored_key_t range_lower = limit<stored_key_t>::max();
-        stored_key_t range_upper = limit<stored_key_t>::min();
+        stored_key_t range_lower = limit<stored_key_t>::max_k;
+        stored_key_t range_upper = limit<stored_key_t>::min_k;
         for (sorted_run_t const* run : picked.upper()) {
             if (!run->holds_keys()) continue;
             if (run->lower_stored_key() < range_lower) range_lower = run->lower_stored_key();

@@ -434,7 +434,7 @@ status_t export_texts(ustore_arena_t arena, std::size_t count, std::size_t total
         else tape = u64_tape(bytes.data(), offsets.data());
         return status_t {};
     };
-    if (total <= std::numeric_limits<std::uint32_t>::max()) return export_as(std::type_identity<std::uint32_t> {});
+    if (total <= (std::numeric_limits<std::uint32_t>::max)()) return export_as(std::type_identity<std::uint32_t> {});
     return export_as(std::type_identity<std::uint64_t> {});
 }
 

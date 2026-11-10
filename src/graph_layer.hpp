@@ -376,7 +376,7 @@ inline expected<ustore_graph_remove_vertices_t> vertices_of_ranges(blobs_verbs<h
     scan.offsets = &offsets;
     scan.keys = &listed;
     scan.arena = view.scratch;
-    scan.wanted = std::numeric_limits<ustore_size_t>::max();
+    scan.wanted = (std::numeric_limits<ustore_size_t>::max)();
     if (status_t const status = values_verbs.scan(scan, view); status.failed()) return status;
 
     std::size_t const listed_count = offsets[requested.count];

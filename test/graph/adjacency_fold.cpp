@@ -635,7 +635,7 @@ std::size_t random_streams() {
             if (generator() % 12 == 0) {
                 failures += fold_vertex(vertex, model);
                 ++folds;
-                largest = std::max(largest, model.size());
+                largest = fu::max_of(largest, model.size());
             }
             std::size_t const other = generator() % store.size();
             failures += check_reads(vertex, model, store[other], models[other], pools, generator);

@@ -18,6 +18,10 @@
 #include "ustore/types.h" // `USTORE_OS_WINDOWS_`, `USTORE_OS_APPLE_`
 
 #if USTORE_OS_WINDOWS_
+/*  Winsock 2 first keeps Winsock 1.1 out, unless a user's earlier `<windows.h>` brought it in. */
+#if !defined(_WINSOCKAPI_)
+#include <winsock2.h>
+#endif
 #include <windows.h> // `CreateFileW`, `ReadFile`, `WriteFile`, `MapViewOfFile`, `MoveFileExW`, `CreateHardLinkW`
 #else
 #include <dlfcn.h>       // `dlopen`, `dlsym`

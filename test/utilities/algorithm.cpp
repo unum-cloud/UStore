@@ -120,7 +120,7 @@ std::size_t cursor_seeks() {
             failures += check(seeker.seek(wanted).succeeded());
             std::size_t bound = std::size_t(std::lower_bound(keys.begin(), keys.end(), wanted, key_less) -
                                             keys.begin());
-            bound = std::max(bound, lowest);
+            bound = fu::max_of(bound, lowest);
             failures += check(seeker.valid() == (bound < keys.size()));
             if (bound < keys.size() && seeker.valid()) failures += check(key_equal(seeker.key(), keys[bound]));
             lowest = seeker.valid() ? std::size_t(std::lower_bound(keys.begin(), keys.end(), seeker.key(), key_less) -
@@ -144,10 +144,10 @@ std::size_t intersections_match() {
         std::set_intersection(unique_first.begin(), unique_first.end(), unique_second.begin(), unique_second.end(),
                               std::back_inserter(wanted), key_less);
 
-        std::vector<ustore_key_t> output(std::min(first.size(), second.size()) + 1);
+        std::vector<ustore_key_t> output(fu::min_of(first.size(), second.size()) + 1);
         std::size_t const count = intersect_sorted_128(first, second, output.data());
         failures += check(count == wanted.size());
-        for (std::size_t index = 0; index != std::min(count, wanted.size()); ++index)
+        for (std::size_t index = 0; index != fu::min_of(count, wanted.size()); ++index)
             failures += check(key_equal(output[index], wanted[index]));
 
         sorted_128_cursor_t first_cursor(first), second_cursor(second);

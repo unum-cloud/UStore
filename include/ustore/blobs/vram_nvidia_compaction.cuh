@@ -523,7 +523,8 @@ st::status_t download(cuda_executor_t& executor, element_type_* target, element_
 template <typename... argument_types_>
 st::status_t launch_over(cuda_executor_t& executor, char const* name, std::uint64_t items, std::uint64_t blocks_limit,
                          argument_types_... arguments) noexcept {
-    std::uint64_t const blocks = std::min(divide_round_up(items, std::uint64_t {merge_block_threads_k}), blocks_limit);
+    std::uint64_t const blocks = fu::min_of(divide_round_up(items, std::uint64_t {merge_block_threads_k}),
+                                            blocks_limit);
     return executor_status(utilities::launch(executor, executor.kernels()->function(name),
                                              static_cast<unsigned>(blocks), merge_block_threads_k, 0u, arguments...));
 }
@@ -674,7 +675,7 @@ st::status_t fold_survivors(cuda_executor_t& executor, utilities::device_blocks_
         std::uint64_t merged = 0;
         delta_kind_t kind = delta_kind_t::change_k;
         std::span<byte_t const> bytes;
-        std::uint64_t chain = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t chain = (std::numeric_limits<std::uint64_t>::max)();
     };
     vector<folded_t> folds;
     vector<delta_view_t> changes;
@@ -727,7 +728,7 @@ st::status_t fold_survivors(cuda_executor_t& executor, utilities::device_blocks_
     for (std::size_t index = 0; index != folds.size(); ++index) {
         folded_t const& folded = folds[index];
         std::span<byte_t const> const bytes =
-            folded.chain == std::numeric_limits<std::uint64_t>::max()
+            folded.chain == (std::numeric_limits<std::uint64_t>::max)()
                 ? folded.bytes
                 : std::span<byte_t const> {composed.data() + composed_offsets[folded.chain],
                                            composed_offsets[folded.chain + 1] - composed_offsets[folded.chain]};
@@ -767,7 +768,7 @@ st::status_t cuda_compactor_t::compact(
         if (!executor_->kernels()) return status_t::invalid_argument_k;
         if (!admits_sorted_runs(bounds)) return status_t::invalid_argument_k;
         std::uint64_t const sorted_runs_count = upper.size() + lower.size();
-        if (sorted_runs_count > std::numeric_limits<std::uint32_t>::max() || extents.size() != sorted_runs_count)
+        if (sorted_runs_count > (std::numeric_limits<std::uint32_t>::max)() || extents.size() != sorted_runs_count)
             return status_t::invalid_argument_k;
         if (!views_locate_values(upper, bounds) || !views_locate_values(lower, bounds))
             return status_t::invalid_argument_k;
@@ -969,8 +970,8 @@ st::status_t cuda_compactor_t::compact(
             if ((status = executor_status(executor_->fill_async(reinterpret_cast<std::uintptr_t>(chains), byte_t {0},
                                                                 2 * sizeof(std::uint64_t)))) != status_t::success_k)
                 return status;
-            std::uint64_t const tickets = std::min(divide_round_up(merged_count, std::uint64_t {merge_block_threads_k}),
-                                                   utilities::chain_blocks_max_k);
+            std::uint64_t const tickets = fu::min_of(
+                divide_round_up(merged_count, std::uint64_t {merge_block_threads_k}), utilities::chain_blocks_max_k);
             status = launch_over(*executor_, names_t::pack_k, tickets * merge_block_threads_k, tickets,
                                  static_cast<record_t const*>(merged), static_cast<std::uint8_t const*>(flags),
                                  merged_count, static_cast<std::uint64_t const*>(replaced),

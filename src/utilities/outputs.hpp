@@ -68,7 +68,7 @@ class read_outputs_t {
             else tape = u64_tape(adopted_.data(), offsets.data());
             return status_t {};
         };
-        if (length_ <= std::numeric_limits<std::uint32_t>::max())
+        if (length_ <= (std::numeric_limits<std::uint32_t>::max)())
             return export_as(std::type_identity<std::uint32_t> {});
         return export_as(std::type_identity<std::uint64_t> {});
     }
@@ -448,7 +448,7 @@ struct measure_outputs_t {
         min_value_bytes[task] = value_bytes;
         max_value_bytes[task] = value_bytes;
         min_space_usages[task] = space_bytes;
-        max_space_usages[task] = std::numeric_limits<ustore_size_t>::max();
+        max_space_usages[task] = (std::numeric_limits<ustore_size_t>::max)();
     }
 
     /** Exports every column @p arguments ask for. */

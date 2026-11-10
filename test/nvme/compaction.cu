@@ -120,7 +120,7 @@ sorted_run_bounds_t shaped_bounds(sorted_run_bounds_t bounds) noexcept {
 template <typename key_slot_type_>
 key_slot_type_ poison_key_slot() noexcept {
     key_slot_type_ poison {};
-    poison.stored_key = limit<typename key_slot_type_::stored_key_t>::min();
+    poison.stored_key = limit<typename key_slot_type_::stored_key_t>::min_k;
     if constexpr (sizes_stored_values_concept<key_slot_type_>) poison.size = 7;
     return poison;
 }
@@ -497,12 +497,15 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
         for (std::size_t index = 0; index != lsm_level->counts.size(); ++index, ++sorted_run) {
             for (std::uint64_t position = 0; position != lsm_level->counts[index]; ++position) {
                 std::uint64_t const stamp = lsm_level->stamps.empty() ? 0 : lsm_level->stamps[first + position];
-                delta_kind_t const kind = lsm_level->kinds.empty()
-                                              ? delta_kind_t::write_k
-                                              : static_cast<delta_kind_t>(lsm_level->kinds[first + position]);
-                records[written++] = record_t {
-                    lsm_level->sorted[first + position], sorted_run, kind, stamp, static_cast<std::uint32_t>(position),
-                    lsm_level->sizes[first + position]};
+                delta_kind_t const delta_kind = lsm_level->kinds.empty()
+                                                    ? delta_kind_t::write_k
+                                                    : static_cast<delta_kind_t>(lsm_level->kinds[first + position]);
+                records[written++] = record_t {lsm_level->sorted[first + position],
+                                               sorted_run,
+                                               delta_kind,
+                                               stamp,
+                                               static_cast<std::uint32_t>(position),
+                                               lsm_level->sizes[first + position]};
             }
             first += lsm_level->counts[index];
         }
@@ -604,7 +607,7 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
     std::size_t wrong_stamps = 0;
     std::size_t wrong_kinds = 0;
     for (std::size_t index = 0; index != wanted_survivors.size(); ++index) {
-        wrong_stamps += output.stamps[index] != std::max(wanted_survivors[index].stamp, stamps.floor);
+        wrong_stamps += output.stamps[index] != fu::max_of(wanted_survivors[index].stamp, stamps.floor);
         wrong_kinds += output.kinds[index] != static_cast<std::uint8_t>(wanted_survivors[index].kind);
     }
     failures += expect_eq(wrong_stamps, std::size_t {0});
@@ -637,7 +640,7 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
     // alignment of four sections of its aim.
     std::uint64_t largest_value = 0;
     for (std::size_t index = 0; index != wanted_survivors.size(); ++index)
-        largest_value = std::max<std::uint64_t>(largest_value, wanted_survivors[index].size);
+        largest_value = fu::max_of<std::uint64_t>(largest_value, wanted_survivors[index].size);
     std::uint64_t const cut_slack_bytes = bounds.header_bytes + 4 * bounds.alignment_bytes + sizeof(key_slot_type_) +
                                           st::default_row_bytes_k + largest_value;
 
@@ -803,8 +806,8 @@ std::size_t survivor_first_orders_the_survivor_first() {
     failures += expect(!order(checked_record(7, 4), checked_record(7, 3)));
 
     // Keys at both ends of the type still order by value, whichever sorted runs they came from
-    constexpr std::uint64_t least = limit<std::uint64_t>::min();
-    constexpr std::uint64_t greatest = limit<std::uint64_t>::max();
+    constexpr std::uint64_t least = limit<std::uint64_t>::min_k;
+    constexpr std::uint64_t greatest = limit<std::uint64_t>::max_k;
     failures += expect(order(checked_record(least, 4), checked_record(greatest, 0)));
     failures += expect(!order(checked_record(greatest, 0), checked_record(least, 4)));
     failures += expect(!order(checked_record(greatest, 2), checked_record(greatest, 2)));
@@ -870,8 +873,8 @@ std::size_t survives_follows_the_kind() {
     failures += expect_eq(wrong, std::size_t {0});
 
     // Keys at both ends of the type shadow their own repeats and nothing else
-    located_key_slot<checked_key_slot_t> const least = checked_record(limit<std::uint64_t>::min(), 0);
-    located_key_slot<checked_key_slot_t> const greatest = checked_record(limit<std::uint64_t>::max(), 1);
+    located_key_slot<checked_key_slot_t> const least = checked_record(limit<std::uint64_t>::min_k, 0);
+    located_key_slot<checked_key_slot_t> const greatest = checked_record(limit<std::uint64_t>::max_k, 1);
     failures += expect(survives(&least, greatest, compaction_kind_t::sorted_into_bottom_k, compaction_stamps_t {}));
     failures += expect(!survives(&greatest, greatest, compaction_kind_t::sorted_into_bottom_k, compaction_stamps_t {}));
     return failures;
@@ -1265,7 +1268,7 @@ std::size_t uuid_orders_like_memcmp(options_t const& options) {
         mismatches += std::memcmp(round_trip, first_bytes, sizeof(first_bytes)) != 0;
     }
     std::byte ones[16];
-    limit<st::key128_t>::max().to_bytes(ones);
+    limit<st::key128_t>::max_k.to_bytes(ones);
     for (std::byte const byte : ones) mismatches += byte != std::byte {0xFF};
     failures += expect_eq(mismatches, std::size_t {0});
     return failures;

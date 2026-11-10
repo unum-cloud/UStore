@@ -627,13 +627,13 @@ std::size_t arrow_exports_read_in_place(config_t const& config) {
     sliced_array.array.release(&sliced_array.array);
     sliced_schema.release(&sliced_schema);
     std::uint64_t const far_offsets[] {5ull << 30, (5ull << 30) + (std::uint64_t {1} << 32)};
-    ustore_strings_view_t far {};
-    far.layout = ustore_strings_u64_tape_k;
-    far.data.u64_tape.data = widened.data.u64_tape.data, far.data.u64_tape.offsets = far_offsets;
+    ustore_strings_view_t far_view {};
+    far_view.layout = ustore_strings_u64_tape_k;
+    far_view.data.u64_tape.data = widened.data.u64_tape.data, far_view.data.u64_tape.offsets = far_offsets;
     ArrowSchema far_schema {};
     ArrowDeviceArray far_array {};
     failures += expect_eq(
-        ustore_strings_view_to_arrow(far, 1, ustore_strings_u32_tape_k, arena, &far_schema, &far_array),
+        ustore_strings_view_to_arrow(far_view, 1, ustore_strings_u32_tape_k, arena, &far_schema, &far_array),
         ustore_status_capacity_exhausted_k);
     wide_array.array.release(&wide_array.array);
     wide_schema.release(&wide_schema);

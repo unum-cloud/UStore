@@ -33,7 +33,7 @@
 #include "ustore/utilities/nvme_ring.hpp"   // `disk_id_t`, `file_id_t`
 #include "ustore/utilities/nvme_slots.hpp"  // `slot_bytes_k`, `sorted_run_bytes_max_k`
 #include "ustore/utilities/ram_buffers.hpp" // `heap_allocator`, `buffer_alignment_k`
-#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_t`, `bytes_span_t`, `bytes_view_t`, `to_status`
+#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid128_t`, `bytes_span_t`, `bytes_view_t`, `to_status`
 
 namespace unum::ustore::blobs {
 
@@ -54,7 +54,7 @@ using utilities::status_t;
 using utilities::to_status;
 using utilities::u32_t;
 using utilities::u64_t;
-using utilities::uuid_t;
+using utilities::uuid128_t;
 
 #pragma region Identifiers and Layouts
 
@@ -64,10 +64,10 @@ using utilities::uuid_t;
 using collection_id_t = ustore_collection_id_t;
 
 /** The ID of one single-collection database, which its schema records. */
-using single_collection_database_id_t = uuid_t;
+using single_collection_database_id_t = uuid128_t;
 
 /** The ID of one database, which its schema records. */
-using database_id_t = uuid_t;
+using database_id_t = uuid128_t;
 
 /** The identifier of one snapshot inside its database. */
 using snapshot_id_t = std::uint64_t;
@@ -84,10 +84,10 @@ using transaction_stamp_t = std::uint64_t;
 inline constexpr transaction_stamp_t unwritten_stamp_k = 0;
 
 /** The stamp of a transaction that has not started, or of a watch that was never taken. */
-inline constexpr transaction_stamp_t invalid_transaction_stamp_k = std::numeric_limits<transaction_stamp_t>::max();
+inline constexpr transaction_stamp_t invalid_transaction_stamp_k = (std::numeric_limits<transaction_stamp_t>::max)();
 
 /** The stamp a read at the head answers at, which orders after every stamp a commit draws. */
-inline constexpr transaction_stamp_t head_stamp_k = std::numeric_limits<transaction_stamp_t>::max();
+inline constexpr transaction_stamp_t head_stamp_k = (std::numeric_limits<transaction_stamp_t>::max)();
 
 /** The identifier of one backup inside its database. */
 using backup_id_t = std::uint64_t;
@@ -105,7 +105,7 @@ inline constexpr collection_id_t collection_invalid_id_k {
 inline constexpr snapshot_id_t invalid_snapshot_id_k = 0;
 
 /** The identifier of no backup. */
-inline constexpr backup_id_t invalid_backup_id_k = std::numeric_limits<backup_id_t>::max();
+inline constexpr backup_id_t invalid_backup_id_k = (std::numeric_limits<backup_id_t>::max)();
 
 #pragma endregion Identifiers
 
@@ -244,14 +244,10 @@ template <typename value_type_>
 struct limit<value_type_> {
 
     /** The least value. */
-    static constexpr value_type_ min() noexcept { return min_k; }
+    static constexpr value_type_ min_k = std::numeric_limits<value_type_>::lowest();
 
     /** The greatest value. */
-    static constexpr value_type_ max() noexcept { return max_k; }
-
-  private:
-    static constexpr value_type_ min_k = std::numeric_limits<value_type_>::lowest();
-    static constexpr value_type_ max_k = std::numeric_limits<value_type_>::max();
+    static constexpr value_type_ max_k = (std::numeric_limits<value_type_>::max)();
 };
 
 /** Bounds of a 16-byte key, whose two words order as @c memcmp orders its bytes: all bytes zero and all bytes one. */
@@ -259,25 +255,25 @@ template <>
 struct limit<st::key128_t> {
 
     /** The key of 16 zero bytes. */
-    static constexpr st::key128_t min() noexcept { return {0, 0}; }
+    static constexpr st::key128_t min_k {0, 0};
 
     /** The key of 16 bytes with every bit set. */
-    static constexpr st::key128_t max() noexcept { return {~std::uint64_t {0}, ~std::uint64_t {0}}; }
+    static constexpr st::key128_t max_k {~std::uint64_t {0}, ~std::uint64_t {0}};
 };
 
-/** Bounds of a composite key that names its own, through static @c min and @c max members. */
+/** Bounds of a composite key that names its own, through static @c min_k and @c max_k members. */
 template <typename value_type_>
     requires requires {
-        { value_type_::min() } -> std::same_as<value_type_>;
-        { value_type_::max() } -> std::same_as<value_type_>;
+        { value_type_::min_k } -> std::convertible_to<value_type_>;
+        { value_type_::max_k } -> std::convertible_to<value_type_>;
     }
 struct limit<value_type_> {
 
     /** The least value. */
-    static constexpr value_type_ min() noexcept { return value_type_::min(); }
+    static constexpr value_type_ min_k = value_type_::min_k;
 
     /** The greatest value. */
-    static constexpr value_type_ max() noexcept { return value_type_::max(); }
+    static constexpr value_type_ max_k = value_type_::max_k;
 };
 
 /** The key right before @p key of an unsigned type, which must not be the least: the inclusive
@@ -307,7 +303,7 @@ concept stored_key_concept = std::is_trivially_copyable_v<stored_key_type_> &&
                              requires(stored_key_type_ const& first, stored_key_type_ const& second) {
                                  { first < second } -> std::convertible_to<bool>;
                                  { first == second } -> std::convertible_to<bool>;
-                                 { limit<stored_key_type_>::max() } -> std::same_as<stored_key_type_>;
+                                 { limit<stored_key_type_>::max_k } -> std::convertible_to<stored_key_type_>;
                              };
 
 #pragma endregion Stored Key
@@ -327,7 +323,7 @@ using stored_value_span_t = bytes_span_t;
 using stored_value_view_t = bytes_view_t;
 
 /** The level or run number of a location that names none. */
-inline constexpr u32_t unknown_run_number_k = std::numeric_limits<u32_t>::max();
+inline constexpr u32_t unknown_run_number_k = (std::numeric_limits<u32_t>::max)();
 
 /** Whether a span of locations may be written through, or only read. */
 enum class locations_mutability_t : bool {
@@ -817,7 +813,7 @@ struct storage_limits_t {
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
     static constexpr std::size_t sorted_run_file_max_size_k = utilities::sorted_run_bytes_max_k;
     static constexpr std::size_t cuda_compaction_threshold_k = 900'000;
-    static constexpr std::size_t value_max_size_k = std::max(fixed_value_max_size_k, variable_value_max_size_k);
+    static constexpr std::size_t value_max_size_k = fu::max_of(fixed_value_max_size_k, variable_value_max_size_k);
     static constexpr std::size_t user_data_max_size_k = 4 * 1024 * 1024;
 };
 
@@ -830,7 +826,7 @@ struct key_slot {
     using stored_key_t = stored_key_type_;
     static constexpr value_layout_t value_layout_k = value_layout_;
 
-    stored_key_t stored_key = limit<stored_key_t>::max();
+    stored_key_t stored_key = limit<stored_key_t>::max_k;
     stored_value_size_t size = 0;
     byte_t data[static_cast<std::uint16_t>(value_layout_k)] = {byte_t(0)};
 
@@ -850,7 +846,7 @@ struct key_slot<stored_key_type_, value_layout_t::fixed_width_k> {
     using stored_key_t = stored_key_type_;
     static constexpr value_layout_t value_layout_k = value_layout_t::fixed_width_k;
 
-    stored_key_t stored_key = limit<stored_key_t>::max();
+    stored_key_t stored_key = limit<stored_key_t>::max_k;
 
     constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
     constexpr bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
@@ -865,7 +861,7 @@ struct key_slot<stored_key_type_, value_layout_t::variable_width_k, key_tails_> 
     static constexpr value_layout_t value_layout_k = value_layout_t::variable_width_k;
     static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
 
-    stored_key_t stored_key = limit<stored_key_t>::max();
+    stored_key_t stored_key = limit<stored_key_t>::max_k;
 
     constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
     constexpr bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
@@ -881,7 +877,7 @@ struct key_slot<stored_key_type_, value_layout_t::uuid_k, key_tails_> {
     static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
     static constexpr stored_value_size_t size = 16;
 
-    stored_key_t stored_key = limit<stored_key_t>::max();
+    stored_key_t stored_key = limit<stored_key_t>::max_k;
     byte_t data[size] {};
 
     constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }

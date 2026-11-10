@@ -24,7 +24,6 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::min`
 #include <array>       // `std::array`
 #include <concepts>    // `std::convertible_to`
 #include <limits>      // `std::numeric_limits`
@@ -46,7 +45,7 @@
 #include "ustore/utilities/folds.hpp"          // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
 #include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
 #include "ustore/utilities/ram_buffers.hpp"    // `local_arena_t`, `arena_allocator`
-#include "ustore/utilities/types.hpp"          // `round_up_to_multiple`, `expected`, `uuid_t`
+#include "ustore/utilities/types.hpp"          // `round_up_to_multiple`, `expected`, `uuid128_t`
 
 namespace unum::ustore::blobs {
 
@@ -156,7 +155,7 @@ struct sorted_run_extents_t {
     std::uint64_t leaves_begin = 0;
 
     /** The run's ID, which names its file on a directory volume. */
-    utilities::uuid_t run {};
+    utilities::uuid128_t run {};
 };
 
 /** The keys from @c start up to @c end, exclusive, which one range removal hides. */
@@ -312,12 +311,12 @@ class range_tombstones {
 
     /** The least key a tombstone hides, or the greatest key of the type for none. */
     [[nodiscard]] stored_key_t lower_stored_key() const noexcept {
-        return ranges_.empty() ? limit<stored_key_t>::max() : ranges_[0].start;
+        return ranges_.empty() ? limit<stored_key_t>::max_k : ranges_[0].start;
     }
 
     /** The greatest key a tombstone hides, or the least key of the type for none. */
     [[nodiscard]] stored_key_t upper_stored_key() const noexcept {
-        stored_key_t upper = limit<stored_key_t>::min();
+        stored_key_t upper = limit<stored_key_t>::min_k;
         for (range_t const& range : ranges_)
             if (upper < stored_key_before(range.end)) upper = stored_key_before(range.end);
         return upper;
@@ -601,10 +600,10 @@ struct compaction_stamps_t {
     std::uint64_t pinned_count = 0;
 
     /** The newest stamp a schema can promise durable: every version above it survives, as a mount may drop it. */
-    std::uint64_t horizon = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t horizon = (std::numeric_limits<std::uint64_t>::max)();
 
     /** The newest stamp a merge keeps at all, which a mount sets to drop what no durable schema covers. */
-    std::uint64_t ceiling = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t ceiling = (std::numeric_limits<std::uint64_t>::max)();
 
     /** The stamp every surviving stamp is raised to at least, which no reader and no mount can tell apart. */
     std::uint64_t floor = 0;
@@ -1079,7 +1078,7 @@ st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t val
             size = static_cast<std::size_t>(value_stride);
         }
         std::size_t const location = folded.size();
-        if (location + size > std::numeric_limits<std::uint32_t>::max()) return status_t::capacity_exhausted_k;
+        if (location + size > (std::numeric_limits<std::uint32_t>::max)()) return status_t::capacity_exhausted_k;
         if (status_t const grown = folded.resize(location + size); grown != status_t::success_k) return grown;
         if (!bytes.empty()) std::memcpy(folded.data() + location, bytes.data(), bytes.size());
         if (bytes.size() != size) std::memset(folded.data() + location + bytes.size(), 0, size - bytes.size());
@@ -1125,7 +1124,7 @@ st::status_t append_value_copy(located_key_slot<key_slot_type_> const& survivor,
         source_begin = !view.value_offsets.empty() ? view.value_offsets[survivor.position]
                                                    : survivor.position * value_stride;
     }
-    if (source_begin > std::numeric_limits<std::uint32_t>::max()) return st::status_t::capacity_exhausted_k;
+    if (source_begin > (std::numeric_limits<std::uint32_t>::max)()) return st::status_t::capacity_exhausted_k;
     return ranges.push_back(
         value_copy_range_t {survivor.sorted_run, static_cast<std::uint32_t>(source_begin), survivor.size, 0});
 }
@@ -1152,13 +1151,13 @@ st::status_t coalesce_value_copies(sorted_runs_type_& sorted_runs, ranges_type_&
                 std::uint64_t const extended = std::uint64_t {last.bytes} + piece.bytes;
                 if (last.source_run == piece.source_run &&
                     last.source_begin + std::uint64_t {last.bytes} == piece.source_begin &&
-                    extended <= std::numeric_limits<std::uint32_t>::max()) {
+                    extended <= (std::numeric_limits<std::uint32_t>::max)()) {
                     last.bytes = static_cast<std::uint32_t>(extended);
                     target += piece.bytes;
                     continue;
                 }
             }
-            if (target > std::numeric_limits<std::uint32_t>::max()) return st::status_t::capacity_exhausted_k;
+            if (target > (std::numeric_limits<std::uint32_t>::max)()) return st::status_t::capacity_exhausted_k;
             ranges[placed++] = value_copy_range_t {piece.source_run, piece.source_begin, piece.bytes,
                                                    static_cast<std::uint32_t>(target)};
             target += piece.bytes;
@@ -1236,9 +1235,10 @@ st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t
         // must not split.
         std::uint64_t const run_overhead = sorted_run_file_bytes<key_slot_type_>(bounds, 1, 0);
         std::uint64_t const target_bytes =
-            runs_needed > 1 ? std::min(divide_round_up(remaining_bytes + (runs_needed - 1) * run_overhead, runs_needed),
-                                       bounds.file_bytes_limit)
-                            : bounds.file_bytes_limit;
+            runs_needed > 1
+                ? fu::min_of(divide_round_up(remaining_bytes + (runs_needed - 1) * run_overhead, runs_needed),
+                             bounds.file_bytes_limit)
+                : bounds.file_bytes_limit;
 
         std::uint64_t taken = remaining;
         std::uint64_t taken_bytes = all_bytes;
@@ -1310,7 +1310,7 @@ constexpr bool views_locate_values(std::span<sorted_run_index_view<key_slot_type
 }
 
 /** The position a row of @c union_sorted_keys names in a side that lacks its key. */
-inline constexpr std::size_t absent_position_k = std::numeric_limits<std::size_t>::max();
+inline constexpr std::size_t absent_position_k = (std::numeric_limits<std::size_t>::max)();
 
 /**
  *  @brief Merges two ascending sequences of distinct keys into their union, writing for each row,
@@ -1343,12 +1343,12 @@ std::size_t union_sorted_keys(first_reader_type_&& read_first, std::size_t first
     };
     while (first_index != first_count && second_index != second_count) {
         if (first_index == first_block_end) {
-            std::size_t const filled = std::min(block_k, first_count - first_index);
+            std::size_t const filled = fu::min_of(block_k, first_count - first_index);
             read_first(first_index, std::span<std::string_view> {first_views}.first(filled));
             first_block_start = first_index, first_block_end = first_index + filled;
         }
         if (second_index == second_block_end) {
-            std::size_t const filled = std::min(block_k, second_count - second_index);
+            std::size_t const filled = fu::min_of(block_k, second_count - second_index);
             read_second(second_index, std::span<std::string_view> {second_views}.first(filled));
             second_block_start = second_index, second_block_end = second_index + filled;
         }
@@ -1486,7 +1486,7 @@ struct host_compactor_t {
 
         if (!admits_sorted_runs(bounds)) return status_t::invalid_argument_k;
         std::uint64_t const sorted_runs_count = upper.size() + lower.size();
-        if (sorted_runs_count > std::numeric_limits<std::uint32_t>::max()) return status_t::invalid_argument_k;
+        if (sorted_runs_count > (std::numeric_limits<std::uint32_t>::max)()) return status_t::invalid_argument_k;
         if (!views_locate_values(upper, bounds) || !views_locate_values(lower, bounds))
             return status_t::invalid_argument_k;
 
@@ -1650,7 +1650,7 @@ struct host_compactor_t {
             return status_t::out_of_memory_heap_k;
 
         // Tails take room in a run file beside the values, so the plan bounds both together.
-        auto const read_prefix = [&](std::uint64_t index, std::uint64_t& bytes) noexcept {
+        auto const read_prefix = [&]([[maybe_unused]] std::uint64_t index, std::uint64_t& bytes) noexcept {
             bytes = 0;
             if constexpr (locates_k) bytes += output.value_offsets[index];
             if constexpr (tailed_k) bytes += output.tail_offsets[index];
@@ -1747,7 +1747,7 @@ struct device_section_read_t {
     std::uint64_t into = 0;
 
     /** The run's ID, which names its file on a directory volume. */
-    utilities::uuid_t run {};
+    utilities::uuid128_t run {};
 };
 
 /** A borrowed transport moving run sections from their volumes into a device compactor's scratch, so one compaction
@@ -1937,7 +1937,7 @@ class ring_sections_reader {
 
     /** One run file a merge reads, registered at its first section. */
     struct run_medium_t {
-        utilities::uuid_t run {};
+        utilities::uuid128_t run {};
         utilities::registered_medium_t medium;
     };
 

@@ -21,7 +21,6 @@
 #include <cstdint> // `std::uint64_t`, `std::int64_t`
 #include <cstring> // `std::strlen`
 
-#include <algorithm>   // `std::min`
 #include <map>         // `std::map`
 #include <optional>    // `std::optional`
 #include <span>        // `std::span`
@@ -742,7 +741,7 @@ std::size_t json_fold_compose(std::uint64_t seed) {
         // The chain lands in records of random lengths, as flushes of memory runs write them
         std::vector<pending_t> pending;
         for (std::size_t index = 0; index != deltas.size();) {
-            std::size_t const length = std::min<std::size_t>(1 + random.below(4), deltas.size() - index);
+            std::size_t const length = fu::min_of<std::size_t>(1 + random.below(4), deltas.size() - index);
             std::span<json_delta_t const> const run(deltas.data() + index, length);
             if (length == 1) pending.push_back(pending_of(run.front(), arena, failures));
             else pending.push_back(change_of(run, arena, failures));

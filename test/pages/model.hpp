@@ -15,7 +15,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
-#include <algorithm> // `std::find`, `std::min`
+#include <algorithm> // `std::find`
 #include <map>       // `std::map`
 #include <string>    // `std::string`
 #include <utility>   // `std::pair`
@@ -158,8 +158,8 @@ struct model_page_t {
         case modification_t::splice_k: {
             if (!exists || !live(edit.element)) return;
             std::string& text = elements[edit.element].text;
-            std::size_t const start = std::size_t(std::min<std::uint64_t>(edit.text_start, text.size()));
-            std::size_t const length = std::size_t(std::min<std::uint64_t>(edit.text_length, text.size() - start));
+            std::size_t const start = std::size_t(fu::min_of<std::uint64_t>(edit.text_start, text.size()));
+            std::size_t const length = std::size_t(fu::min_of<std::uint64_t>(edit.text_length, text.size() - start));
             text.replace(start, length, edit.value);
             return;
         }

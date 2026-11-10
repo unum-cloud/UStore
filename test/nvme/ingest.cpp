@@ -11,12 +11,11 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::min`
-#include <array>     // `std::array`
-#include <memory>    // `std::unique_ptr`
-#include <new>       // `std::nothrow`
-#include <span>      // `std::span`
-#include <utility>   // `std::move`
+#include <array>   // `std::array`
+#include <memory>  // `std::unique_ptr`
+#include <new>     // `std::nothrow`
+#include <span>    // `std::span`
+#include <utility> // `std::move`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -222,7 +221,7 @@ expected<transaction_stamp_t> ingest_rows(database_type_& store, collection_id_t
     std::span<row_t const> const rows_view {rows.rows};
     for (std::size_t first = 0; first < rows_view.size(); first += batch) {
         status_t const written = store.write_ingest(
-            ingest, rows_view.subspan(first, std::min(batch, rows_view.size() - first)));
+            ingest, rows_view.subspan(first, fu::min_of(batch, rows_view.size() - first)));
         if (written.failed()) {
             store.drop_ingest(ingest);
             return written;

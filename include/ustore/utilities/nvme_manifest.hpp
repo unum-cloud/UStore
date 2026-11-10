@@ -37,7 +37,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `uuid_t`, `string_t`, `byte_t`
+#include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `uuid128_t`, `string_t`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -100,7 +100,7 @@ class json_allocator {
 
 /** What @c manifest_file_t::collection holds for the caller's user data, which belongs
  *  to no collection. */
-inline constexpr std::uint32_t manifest_no_collection_k = std::numeric_limits<std::uint32_t>::max();
+inline constexpr std::uint32_t manifest_no_collection_k = (std::numeric_limits<std::uint32_t>::max)();
 
 /** How a manifest names its files: by path on a filesystem, by offset on raw media. */
 enum class manifest_placement_t : std::uint8_t {
@@ -112,7 +112,7 @@ enum class manifest_placement_t : std::uint8_t {
 struct manifest_collection_t {
 
     /** The UUID every commit and the C ABI address the collection by. */
-    uuid_t id;
+    uuid128_t id;
 
     /** The name a caller reaches the collection by. */
     string_t name;
@@ -184,19 +184,19 @@ static_assert(sizeof(collections_record_t) == 48, "A collections record is 48 pa
 
 /** The UUID of the reserved collection numbered @p last, all ones but its last byte, which no
  *  minted UUIDv7 spells. */
-[[nodiscard]] constexpr uuid_t reserved_collection_uuid(std::uint8_t last) noexcept {
-    uuid_t identifier;
+[[nodiscard]] constexpr uuid128_t reserved_collection_uuid(std::uint8_t last) noexcept {
+    uuid128_t identifier;
     for (std::uint8_t& byte : identifier.bytes) byte = 0xFF;
-    identifier.bytes[uuid_t::size_bytes_k - 1] = last;
+    identifier.bytes[uuid128_t::size_bytes_k - 1] = last;
     return identifier;
 }
 
 /** The collections system collection, keeping a @c collections_record_t per collection. */
-inline constexpr uuid_t collections_collection_uuid_k = reserved_collection_uuid(0xFD);
+inline constexpr uuid128_t collections_collection_uuid_k = reserved_collection_uuid(0xFD);
 
 /** The names system collection, a strings collection mapping every collection's name
  *  onto its UUID. */
-inline constexpr uuid_t names_collection_uuid_k = reserved_collection_uuid(0xFE);
+inline constexpr uuid128_t names_collection_uuid_k = reserved_collection_uuid(0xFE);
 
 /** Bytes the largest value of a collection takes, unless the open of its database
  *  names another bound. */
@@ -221,14 +221,14 @@ inline constexpr std::uint64_t engine_level_enlarge_factor_k = 4;
  *  the bound. The store tag is left to the caller, which derives it from the modality or reads it
  *  from a run's value layout.
  */
-[[nodiscard]] inline manifest_collection_t default_reserved_record(uuid_t const& id,
+[[nodiscard]] inline manifest_collection_t default_reserved_record(uuid128_t const& id,
                                                                    std::uint32_t value_max_size) noexcept {
     manifest_collection_t record;
     record.id = id;
     bool const names = id == names_collection_uuid_k;
     [[maybe_unused]] sz::status_t const named = record.name.assign(names ? string_view_t {"_names"}
                                                                          : string_view_t {"_collections"});
-    record.value_size = names ? static_cast<std::uint32_t>(sizeof(uuid_t)) : 0;
+    record.value_size = names ? static_cast<std::uint32_t>(sizeof(uuid128_t)) : 0;
     record.value_max_size = names ? 0 : value_max_size;
     record.level_enlarge_factor = engine_level_enlarge_factor_k;
     record.cache_limit = engine_collection_bytes_k;
@@ -242,7 +242,7 @@ struct manifest_file_t {
 
     /** The run ID a directory volume names the file by, and an archive recognizes a run it
      *  already holds by. */
-    uuid_t run;
+    uuid128_t run;
 
     /** First byte of the file inside its medium, on raw media alone. */
     std::uint64_t offset = 0;
@@ -280,7 +280,7 @@ struct manifest_t {
     string_t database;
 
     /** The database's own ID, minted at its first open, which every slot it holds carries. */
-    uuid_t id;
+    uuid128_t id;
 
     /** How many manifests the database has published, this one included. */
     std::uint64_t generation = 0;
@@ -298,19 +298,19 @@ struct manifest_t {
     /** Characters the file name of @p run takes, which is the database name, a dash, the ID
      *  and the suffix. */
     [[nodiscard]] std::size_t file_name_length() const noexcept {
-        return database.size() + 1 + uuid_t::printed_length_k + run_suffix_k.size();
+        return database.size() + 1 + uuid128_t::printed_length_k + run_suffix_k.size();
     }
 
     /** Writes @c <database>-<run>.ustore and a terminator into @p into, refusing a
      *  buffer too short. */
-    status_t file_name(uuid_t const& run, std::span<char> into) const noexcept {
+    status_t file_name(uuid128_t const& run, std::span<char> into) const noexcept {
         if (into.size() <= file_name_length())
             return {status_code_t::invalid_argument_k, "A run file name outgrew the platform's limit"};
         std::size_t written = database.size();
         std::memcpy(into.data(), database.data(), written);
         into[written++] = '-';
-        run.print(std::span<char, uuid_t::printed_length_k> {into.data() + written, uuid_t::printed_length_k});
-        written += uuid_t::printed_length_k;
+        run.print(std::span<char, uuid128_t::printed_length_k> {into.data() + written, uuid128_t::printed_length_k});
+        written += uuid128_t::printed_length_k;
         std::memcpy(into.data() + written, run_suffix_k.data(), run_suffix_k.size());
         written += run_suffix_k.size();
         into[written] = '\0';
@@ -319,14 +319,14 @@ struct manifest_t {
 
     /** The run ID @p name carries when it is a run file of this database, or a
      *  zero ID otherwise. */
-    [[nodiscard]] uuid_t run_of(std::string_view name) const noexcept {
-        if (name.size() != file_name_length()) return uuid_t {};
-        if (name.substr(0, database.size()) != std::string_view {database}) return uuid_t {};
-        if (name[database.size()] != '-' || !name.ends_with(run_suffix_k)) return uuid_t {};
-        std::span<char const, uuid_t::printed_length_k> const printed {name.data() + database.size() + 1,
-                                                                       uuid_t::printed_length_k};
-        if (!uuid_t::parses(printed)) return uuid_t {};
-        return uuid_t::parse(printed);
+    [[nodiscard]] uuid128_t run_of(std::string_view name) const noexcept {
+        if (name.size() != file_name_length()) return uuid128_t {};
+        if (name.substr(0, database.size()) != std::string_view {database}) return uuid128_t {};
+        if (name[database.size()] != '-' || !name.ends_with(run_suffix_k)) return uuid128_t {};
+        std::span<char const, uuid128_t::printed_length_k> const printed {name.data() + database.size() + 1,
+                                                                          uuid128_t::printed_length_k};
+        if (!uuid128_t::parses(printed)) return uuid128_t {};
+        return uuid128_t::parse(printed);
     }
 
     /**
@@ -377,7 +377,7 @@ struct manifest_t {
         if (!root || !metadata || !collections_array || !files_array)
             return {status_code_t::out_of_memory_k, "No room to print the manifest"};
         yyjson_mut_doc_set_root(document, root);
-        char printed_id[uuid_t::printed_length_k];
+        char printed_id[uuid128_t::printed_length_k];
         id.print(printed_id);
         bool laid = yyjson_mut_obj_add_str(document, metadata, "format", "ustore") &&
                     yyjson_mut_obj_add_str(document, metadata, "version", "1") &&
@@ -532,7 +532,7 @@ struct manifest_t {
 
     template <std::unsigned_integral value_type_>
     static bool read_(yyjson_val* value, value_type_& number) noexcept {
-        if (!yyjson_is_uint(value) || yyjson_get_uint(value) > std::numeric_limits<value_type_>::max()) return false;
+        if (!yyjson_is_uint(value) || yyjson_get_uint(value) > (std::numeric_limits<value_type_>::max)()) return false;
         number = static_cast<value_type_>(yyjson_get_uint(value));
         return true;
     }
@@ -542,12 +542,12 @@ struct manifest_t {
         return sz::succeeded(text.assign(string_view_t {yyjson_get_str(value), yyjson_get_len(value)}));
     }
 
-    static bool read_(yyjson_val* value, uuid_t& identifier) noexcept {
+    static bool read_(yyjson_val* value, uuid128_t& identifier) noexcept {
         std::string_view const text = text_of_(value);
-        if (text.size() != uuid_t::printed_length_k) return false;
-        std::span<char const, uuid_t::printed_length_k> const printed {text.data(), uuid_t::printed_length_k};
-        if (!uuid_t::parses(printed)) return false;
-        identifier = uuid_t::parse(printed);
+        if (text.size() != uuid128_t::printed_length_k) return false;
+        std::span<char const, uuid128_t::printed_length_k> const printed {text.data(), uuid128_t::printed_length_k};
+        if (!uuid128_t::parses(printed)) return false;
+        identifier = uuid128_t::parse(printed);
         return true;
     }
 

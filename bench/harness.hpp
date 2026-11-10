@@ -23,7 +23,6 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstdlib> // `std::exit`
 
-#include <algorithm>   // `std::max`
 #include <array>       // `std::array`
 #include <bit>         // `std::bit_width`
 #include <chrono>      // `std::chrono::steady_clock`
@@ -164,7 +163,7 @@ class latency_histogram_t {
         std::uint64_t total = 0;
         for (std::uint64_t const count : bins_) total += count;
         if (total == 0) return {};
-        std::uint64_t const rank = std::max<std::uint64_t>(
+        std::uint64_t const rank = fu::max_of<std::uint64_t>(
             1, static_cast<std::uint64_t>(std::ceil(fraction * static_cast<double>(total))));
         std::uint64_t cumulative = 0;
         std::size_t bin = 0;
@@ -213,10 +212,10 @@ struct row_t {
  *  histogram, and the body reports what a call did through @c count, @c fail and @c skip.
  */
 class loop_t {
-    time_point_t warmup_until_ = time_point_t::min();
-    time_point_t deadline_ = time_point_t::max();
+    time_point_t warmup_until_ = (time_point_t::min)();
+    time_point_t deadline_ = (time_point_t::max)();
     time_point_t started_ {}, previous_ {};
-    std::size_t index_ = 0, end_ = std::numeric_limits<std::size_t>::max();
+    std::size_t index_ = 0, end_ = (std::numeric_limits<std::size_t>::max)();
     std::uint64_t calls_ = 0, items_ = 0, bytes_ = 0, failures_ = 0;
     steady_clock_t::duration elapsed_ {};
     bool warming_up_ = false;
@@ -270,7 +269,7 @@ class loop_t {
     /** Adds this loop's counts and latencies to @p row and @p latencies. */
     void fold_into(row_t& row, latency_histogram_t& latencies) const noexcept {
         row.calls += calls_, row.items += items_, row.bytes += bytes_, row.failures += failures_;
-        row.seconds = std::max(row.seconds, std::chrono::duration<double>(elapsed_).count());
+        row.seconds = fu::max_of(row.seconds, std::chrono::duration<double>(elapsed_).count());
         if (skipped_) row.skipped = skipped_;
         latencies.merge(latencies_);
     }

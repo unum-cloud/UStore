@@ -831,7 +831,7 @@ status_t recover_directory(recovery_t& recovery, std::string_view location, std:
     if (status_t const copied = terminated(location, directory); copied.failed()) return copied;
     status_t first;
     status_t const listed = list_directory(directory, [&](std::string_view name) noexcept {
-        uuid_t const run = recovery.manifest.run_of(name);
+        uuid128_t const run = recovery.manifest.run_of(name);
         if (!run.is_valid() || first.failed()) return;
         char file_name[path_max_bytes_k], path[path_max_bytes_k];
         if (status_t const copied = terminated(name, file_name); copied.failed()) {
@@ -1056,7 +1056,7 @@ status_t assign_collections(recovery_t& recovery, std::span<data_address_t const
     if (status_t const read = read_collections_records(recovery, addresses, newest); read.failed()) return read;
     manifest_t& manifest = recovery.manifest;
     for (found_run_t const& found : recovery.runs) {
-        uuid_t const& id = found.header.collection;
+        uuid128_t const& id = found.header.collection;
         if (id != collections_collection_uuid_k && id != names_collection_uuid_k) continue;
         std::size_t index = 0;
         while (index != manifest.collections.size() && manifest.collections[index].id != id) ++index;
@@ -1071,10 +1071,11 @@ status_t assign_collections(recovery_t& recovery, std::span<data_address_t const
         collections_record_t fields;
         std::memcpy(&fields, version.value.data(), sizeof(fields));
         manifest_collection_t record;
-        version.key.to_bytes(std::as_writable_bytes(std::span<std::uint8_t, uuid_t::size_bytes_k> {record.id.bytes}));
+        version.key.to_bytes(
+            std::as_writable_bytes(std::span<std::uint8_t, uuid128_t::size_bytes_k> {record.id.bytes}));
         // The engine names a collection in the manifest by its printed UUID, its own name living in
         // the record alone
-        char printed[uuid_t::printed_length_k];
+        char printed[uuid128_t::printed_length_k];
         record.id.print(printed);
         if (sz::failed(record.name.assign(string_view_t {printed, sizeof(printed)})))
             return {status_code_t::out_of_memory_k, "No room to name a recovered collection"};
@@ -1095,7 +1096,7 @@ status_t assign_collections(recovery_t& recovery, std::span<data_address_t const
         while (index != manifest.collections.size() && manifest.collections[index].id != found.header.collection)
             ++index;
         if (index == manifest.collections.size()) {
-            char printed[uuid_t::printed_length_k];
+            char printed[uuid128_t::printed_length_k];
             found.file.run.print(printed);
             fmt::println(stderr, style_of(tone_t::failure_k, stderr),
                          "Leaving out run {}, whose collection the records list as dropped or never named",
@@ -1147,7 +1148,7 @@ status_t publish_raw_manifest(data_address_t const& address, std::span<char cons
     manifest_t& manifest = recovery.manifest;
     st::vector<data_address_t> addresses;
     status_t status;
-    if (line.addresses.size() > std::numeric_limits<std::uint16_t>::max())
+    if (line.addresses.size() > (std::numeric_limits<std::uint16_t>::max)())
         status = {status_code_t::invalid_argument_k, "A database spans at most 65,535 data directories"};
     else if (sz::failed(manifest.database.assign(string_view_t {line.database})) ||
              addresses.reserve(line.addresses.size()) != st::status_t::success_k)

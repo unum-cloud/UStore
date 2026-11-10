@@ -31,7 +31,6 @@
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::max`, `std::min`
 #include <compare>     // `std::strong_ordering`
 #include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`, `std::as_bytes`
@@ -140,7 +139,7 @@ expected<std::size_t> sort_unique_strings(std::span<delta_type_> deltas, sz_kern
             continue;
         }
         sz_size_t& survivor = order[kept - 1];
-        survivor = keep == keep_t::first_k ? std::min(survivor, given) : std::max(survivor, given);
+        survivor = keep == keep_t::first_k ? fu::min_of(survivor, given) : fu::max_of(survivor, given);
     }
     st::vector<delta_type_, deltas_allocator_t> survivors {deltas_allocator_t {allocator}};
     if (survivors.resize(kept) != st::status_t::success_k)
@@ -291,7 +290,7 @@ class sealed_deltas {
     [[nodiscard]] std::size_t prefix_end(std::string_view prefix) const noexcept {
         // A head's padding zeros never sort above a prefix's bytes, so a string shorter than the prefix that ties
         // with it in the head is one of its prefixes and sorts below it, as every string below the window does.
-        std::string_view const leading = prefix.substr(0, std::min(prefix.size(), head_prefix_bytes_k));
+        std::string_view const leading = prefix.substr(0, fu::min_of(prefix.size(), head_prefix_bytes_k));
         std::string_view const trailing = tail_of(prefix);
         std::size_t low = 0;
         std::size_t high = heads_.size();
@@ -340,8 +339,8 @@ class sealed_deltas {
         std::uint8_t greatest_kind = least_kind;
         for (delta_type_ const& each : deltas) {
             keys_bytes += each.stored_key.size();
-            least_kind = std::min(least_kind, static_cast<std::uint8_t>(each.delta.kind));
-            greatest_kind = std::max(greatest_kind, static_cast<std::uint8_t>(each.delta.kind));
+            least_kind = fu::min_of(least_kind, static_cast<std::uint8_t>(each.delta.kind));
+            greatest_kind = fu::max_of(greatest_kind, static_cast<std::uint8_t>(each.delta.kind));
         }
         // A run flushes into one sorted run file, whose length bounds every offset of the key tape.
         if (keys_bytes + deltas.size() * value_bytes_k > storage_limits_t::sorted_run_file_max_size_k)
@@ -458,8 +457,8 @@ class memory_run {
     static expected<memory_run> merged(std::span<memory_run const* const>, std::span<stamped_delta_t const> versions,
                                        range_tombstones_t&& tombstones, transaction_stamp_t oldest_stamp,
                                        std::uint32_t tier, allocator_t allocator = {}) noexcept {
-        transaction_stamp_t newest_stamp = std::max(oldest_stamp, tombstones.newest_stamp());
-        for (stamped_delta_t const& version : versions) newest_stamp = std::max(newest_stamp, version.stamp);
+        transaction_stamp_t newest_stamp = fu::max_of(oldest_stamp, tombstones.newest_stamp());
+        for (stamped_delta_t const& version : versions) newest_stamp = fu::max_of(newest_stamp, version.stamp);
         auto [deltas, merged_status] = sealed_deltas_t::merged(versions, std::move(tombstones), allocator);
         if (merged_status.failed()) return merged_status;
         transaction_stamp_t pulled = unwritten_stamp_k;
@@ -590,10 +589,10 @@ class memory_run_cursor {
         if (cursor.positions_.resize(runs.size()) != st::status_t::success_k ||
             cursor.ends_.resize(runs.size()) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "A cursor could not hold a position per run"};
-        std::string_view const from = std::max(start, prefix);
+        std::string_view const from = fu::max_of(start, prefix);
         for (std::size_t index = 0; index != runs.size(); ++index) {
             cursor.ends_[index] = runs[index]->prefix_end(prefix);
-            cursor.positions_[index] = std::min(runs[index]->lower_bound(from), cursor.ends_[index]);
+            cursor.positions_[index] = fu::min_of(runs[index]->lower_bound(from), cursor.ends_[index]);
         }
         return cursor;
     }

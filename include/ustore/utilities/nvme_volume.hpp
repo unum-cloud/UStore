@@ -45,7 +45,7 @@
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `ring_concept`, `registered_medium_t`
 #include "ustore/utilities/nvme_slots.hpp"     // `slot_t`, `slot_owner_block_t`, `slot_bytes_k`
-#include "ustore/utilities/types.hpp"          // `status_t`, `status_code_t`, `expected`, `uuid_t`
+#include "ustore/utilities/types.hpp"          // `status_t`, `status_code_t`, `expected`, `uuid128_t`
 
 namespace unum::ustore::utilities {
 
@@ -546,7 +546,7 @@ class basic_directory_volume {
 
     /** Creates @c <database>-<run>.ustore of @p bytes, rounded to a page, in the directory with the
      *  most free bytes; the file is durable only once a manifest naming it is published. */
-    expected<medium_extent_t> allocate(uuid_t const& run, std::uint64_t bytes) noexcept {
+    expected<medium_extent_t> allocate(uuid128_t const& run, std::uint64_t bytes) noexcept {
         std::uint64_t const rounded = round_up_to_multiple(bytes, portable_alignment_k);
         if (rounded == 0 || rounded > sorted_run_bytes_max_k)
             return status_t {status_code_t::invalid_argument_k, "A run fits one slot"};
@@ -623,7 +623,7 @@ class basic_directory_volume {
 
     /** Writes the path of the file of @p run in data directory @p medium into @p into, which
      *  an archive links. */
-    status_t file_path(std::uint16_t medium, uuid_t const& run, std::span<char> into) const noexcept {
+    status_t file_path(std::uint16_t medium, uuid128_t const& run, std::span<char> into) const noexcept {
         if (medium >= directories_.size())
             return {status_code_t::invalid_argument_k, "The volume holds no data directory of that index"};
         return run_path_(medium, run, into);
@@ -661,7 +661,7 @@ class basic_directory_volume {
     /** One run file, registered while it is live. */
     struct run_file_t {
         registered_medium_t medium;
-        uuid_t run;
+        uuid128_t run;
         std::uint64_t bytes = 0;
         std::uint32_t generation = 0;
         std::uint16_t data_directory = 0;
@@ -678,7 +678,7 @@ class basic_directory_volume {
 
     template <typename integer_type_>
     static constexpr std::size_t limit_of_() noexcept {
-        return std::numeric_limits<integer_type_>::max();
+        return (std::numeric_limits<integer_type_>::max)();
     }
 
     static typename run_files_t::handle_t handle_of_(placement_handle_t handle) noexcept {
@@ -715,13 +715,13 @@ class basic_directory_volume {
         return join_path(directories_[0].path.c_str(), name, into);
     }
 
-    status_t run_path_(std::uint16_t directory, uuid_t const& run, std::span<char> into) const noexcept {
+    status_t run_path_(std::uint16_t directory, uuid128_t const& run, std::span<char> into) const noexcept {
         char name[path_max_bytes_k];
         if (status_t const named = manifest_.file_name(run, name); named.failed()) return named;
         return join_path(directories_[directory].path.c_str(), name, into);
     }
 
-    expected<medium_extent_t> register_run_(std::uint16_t directory, uuid_t const& run, std::uint64_t length,
+    expected<medium_extent_t> register_run_(std::uint16_t directory, uuid128_t const& run, std::uint64_t length,
                                             medium_access_t access, std::uint64_t bytes) noexcept {
         std::uint32_t const index = run_files_.take();
         if (index == run_files_t::absent_k)
@@ -758,30 +758,30 @@ class basic_directory_volume {
     /** Unlinks every run file of this database no manifest entry names, and a manifest copy
      *  a crash left. */
     status_t sweep_leftovers_() noexcept {
-        st::vector<uuid_t> named;
+        st::vector<uuid128_t> named;
         if (named.reserve(manifest_.files.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to list the runs the manifest names"};
         for (manifest_file_t const& file : manifest_.files) [[maybe_unused]]
-            st::status_t const placed = named.push_back(st::assume_reserved, uuid_t {file.run});
+            st::status_t const placed = named.push_back(st::assume_reserved, uuid128_t {file.run});
         utilities::radix_sort(
-            std::span<uuid_t> {named}, uuid_t::size_bytes_k,
-            [](uuid_t const& run, std::size_t digit) noexcept -> std::size_t { return run.bytes[digit]; },
-            [](uuid_t const& first, uuid_t const& second) noexcept { return first < second; });
+            std::span<uuid128_t> {named}, uuid128_t::size_bytes_k,
+            [](uuid128_t const& run, std::size_t digit) noexcept -> std::size_t { return run.bytes[digit]; },
+            [](uuid128_t const& first, uuid128_t const& second) noexcept { return first < second; });
 
-        st::vector<uuid_t> leftovers;
+        st::vector<uuid128_t> leftovers;
         for (std::size_t directory = 0; directory != directories_.size(); ++directory) {
             leftovers.clear();
             status_t listed;
             status_t const walked = list_directory(directories_[directory].path.c_str(), [&](std::string_view name) {
-                uuid_t const run = manifest_.run_of(name);
+                uuid128_t const run = manifest_.run_of(name);
                 if (!run.is_valid() || std::binary_search(named.begin(), named.end(), run)) return;
-                if (leftovers.push_back(uuid_t {run}) != st::status_t::success_k)
+                if (leftovers.push_back(uuid128_t {run}) != st::status_t::success_k)
                     listed = {status_code_t::out_of_memory_k, "No room to list the leftover run files"};
             });
             if (walked.failed()) return walked;
             if (listed.failed()) return listed;
             char path[path_max_bytes_k];
-            for (uuid_t const& run : leftovers)
+            for (uuid128_t const& run : leftovers)
                 if (status_t const named_path = run_path_(static_cast<std::uint16_t>(directory), run, path);
                     named_path.failed() || remove_file(path).failed())
                     return {status_code_t::io_k, "A leftover run file would not be removed"};
@@ -876,7 +876,7 @@ class basic_slotted_volume {
     static expected<basic_slotted_volume> mount(disk_type_& disk, io_channel_t& channel, volume_config_t const& config,
                                                 allocator_type_ allocator) noexcept {
         if (config.data_directories.empty() ||
-            config.data_directories.size() > std::numeric_limits<std::uint16_t>::max())
+            config.data_directories.size() > (std::numeric_limits<std::uint16_t>::max)())
             return status_t {status_code_t::invalid_argument_k, "A volume spans one to 65,535 data directories"};
         basic_slotted_volume volume {disk, allocator};
         if (volume.media_.reserve(config.data_directories.size()) != st::status_t::success_k)
@@ -921,7 +921,7 @@ class basic_slotted_volume {
 
     /** Places @p bytes on the medium with the most free bytes, packing a short run into the
      *  open packed slot. */
-    expected<medium_extent_t> allocate([[maybe_unused]] uuid_t const& run, std::uint64_t bytes) noexcept {
+    expected<medium_extent_t> allocate([[maybe_unused]] uuid128_t const& run, std::uint64_t bytes) noexcept {
         std::uint64_t const rounded = round_up_to_multiple(bytes, portable_alignment_k);
         std::size_t chosen = media_.size();
         std::uint64_t chosen_free = 0;
@@ -996,12 +996,12 @@ class basic_slotted_volume {
     }
 
     /** Answers @c unsupported_k, as a run on raw media is no file an archive could link. */
-    status_t file_path(std::uint16_t, uuid_t const&, std::span<char>) const noexcept {
+    status_t file_path(std::uint16_t, uuid128_t const&, std::span<char>) const noexcept {
         return {status_code_t::unsupported_k, "A run on raw media is no file"};
     }
 
     /** Runs a database on raw media may hold, which the run pools above it are sized by. */
-    [[nodiscard]] std::size_t runs_capacity() const noexcept { return std::numeric_limits<std::uint16_t>::max() - 1; }
+    [[nodiscard]] std::size_t runs_capacity() const noexcept { return (std::numeric_limits<std::uint16_t>::max)() - 1; }
 
     /** Bytes every raw medium still offers. */
     [[nodiscard]] std::uint64_t free_bytes() const noexcept {
@@ -1464,7 +1464,7 @@ class any_volume {
         return visit_(*this, [&](auto& held) noexcept { return held.open(file); });
     }
 
-    expected<medium_extent_t> allocate(uuid_t const& run, std::uint64_t bytes) noexcept {
+    expected<medium_extent_t> allocate(uuid128_t const& run, std::uint64_t bytes) noexcept {
         return visit_(*this, [&](auto& held) noexcept { return held.allocate(run, bytes); });
     }
 
@@ -1484,7 +1484,7 @@ class any_volume {
         return visit_(*this, [](auto const& held) noexcept { return held.runs_capacity(); });
     }
 
-    status_t file_path(std::uint16_t medium, uuid_t const& run, std::span<char> into) const noexcept {
+    status_t file_path(std::uint16_t medium, uuid128_t const& run, std::span<char> into) const noexcept {
         return visit_(*this, [&](auto const& held) noexcept { return held.file_path(medium, run, into); });
     }
 

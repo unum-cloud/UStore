@@ -1059,7 +1059,7 @@ class basic_read_pipeline {
      *  @p block until its completion. */
     status_t offer_(medium_reference_t medium, extent_t extent, memory_reference_t into, std::span<byte_t> landing,
                     pooled_buffer_t&& block, request_tag_t tag) noexcept {
-        if (extent.length > std::numeric_limits<std::uint32_t>::max())
+        if (extent.length > (std::numeric_limits<std::uint32_t>::max)())
             return {status_code_t::invalid_argument_k, "A read asks for more bytes than one request carries"};
         std::size_t const position = position_(next_slot_);
         channel_.read_requests_[position] = read_request(medium, extent, into, channel_.token(next_slot_));

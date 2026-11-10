@@ -161,7 +161,7 @@ scan_batch_t measures_of(arguments_type_ const& arguments) noexcept {
             strided(arguments.start_keys),
             strided(arguments.end_keys),
             arguments.direction,
-            std::numeric_limits<ustore_size_t>::max(),
+            (std::numeric_limits<ustore_size_t>::max)(),
             arguments.count};
 }
 
@@ -185,8 +185,8 @@ struct sample_generator_t {
     /** The state every draw advances. */
     std::uint64_t state;
 
-    static constexpr result_type min() noexcept { return 0; }
-    static constexpr result_type max() noexcept { return std::numeric_limits<result_type>::max(); }
+    static constexpr result_type(min)() noexcept { return 0; }
+    static constexpr result_type(max)() noexcept { return (std::numeric_limits<result_type>::max)(); }
 
     /** A generator seeded by the clock and the address @p salt, so two samples of one
      *  moment still differ. */

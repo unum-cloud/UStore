@@ -26,7 +26,6 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::max`, `std::min`
 #include <compare>     // `std::strong_ordering`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
@@ -407,7 +406,7 @@ class nvme_store {
             cursor_t cursor;
             cursor.memory = run;
             cursor.end = run->prefix_end(prefix);
-            cursor.position = std::min<std::uint64_t>(run->lower_bound(from), cursor.end);
+            cursor.position = fu::min_of<std::uint64_t>(run->lower_bound(from), cursor.end);
             [[maybe_unused]] st::status_t const placed = cursors.push_back(std::move(cursor));
         }
         for (std::size_t number = 0; number != levels.size(); ++number) {
@@ -421,7 +420,7 @@ class nvme_store {
                 auto [end, end_status] = prefix_end_in_(run, prefix);
                 if (end_status.failed()) return end_status;
                 cursor.end = end;
-                cursor.position = std::min(run.lower_bound(from), cursor.end);
+                cursor.position = fu::min_of(run.lower_bound(from), cursor.end);
                 [[maybe_unused]] st::status_t const placed = cursors.push_back(std::move(cursor));
             }
         }
@@ -485,7 +484,7 @@ class nvme_store {
             cursor.memory = run;
             cursor.begin = run->lower_bound(prefix);
             cursor.end = run->prefix_end(prefix);
-            if (!below.empty()) cursor.end = std::min<std::uint64_t>(cursor.end, run->lower_bound(below));
+            if (!below.empty()) cursor.end = fu::min_of<std::uint64_t>(cursor.end, run->lower_bound(below));
             [[maybe_unused]] st::status_t const placed = cursors.push_back(std::move(cursor));
         }
         for (std::size_t number = 0; number != levels.size(); ++number) {
@@ -499,7 +498,7 @@ class nvme_store {
                 auto [end, end_status] = prefix_end_in_(run, prefix);
                 if (end_status.failed()) return end_status;
                 cursor.begin = run.lower_bound(prefix);
-                cursor.end = below.empty() ? end : std::min(end, run.lower_bound(below));
+                cursor.end = below.empty() ? end : fu::min_of(end, run.lower_bound(below));
                 [[maybe_unused]] st::status_t const placed = cursors.push_back(std::move(cursor));
             }
         }
@@ -688,7 +687,7 @@ class nvme_store {
      *  walk to the end of the prefix watches. */
     [[nodiscard]] bool prefix_written_since(std::string_view prefix, std::string_view lower,
                                             transaction_stamp_t from) const noexcept {
-        std::string_view const first = std::max(lower, prefix);
+        std::string_view const first = fu::max_of(lower, prefix);
         reader_t const inside = runs_.enter();
         view_t const& view = *runs_.view();
         for (memory_run_t const* run : view.memory_runs.runs()) {
@@ -1418,7 +1417,7 @@ class nvme_transaction {
         bool updated = false;
         writes_.probe_to_find(probe_t {collection, text}, [&](auto& slot) noexcept {
             write_t& held = slot.value_ref();
-            transaction_stamp_t const earlier = std::min(held.watch_stamp, watch_stamp);
+            transaction_stamp_t const earlier = fu::min_of(held.watch_stamp, watch_stamp);
             held = written;
             held.watch_stamp = earlier;
             updated = true;

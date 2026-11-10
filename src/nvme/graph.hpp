@@ -558,7 +558,7 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
                 else if (vertices[task] < end_vertices[task])
                     listed = collect_keys(access, collections[task], stored_of(vertices[task].uuid),
                                           stored_of(key_before(end_vertices[task]).uuid),
-                                          std::numeric_limits<std::size_t>::max(), keys);
+                                          (std::numeric_limits<std::size_t>::max)(), keys);
                 if (listed.failed()) return listed;
             }
             firsts[count] = keys.size();

@@ -12,11 +12,10 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm> // `std::min`
-#include <atomic>    // `std::atomic_thread_fence`, `std::memory_order_acquire`
-#include <bit>       // `std::bit_floor`
-#include <span>      // `std::span`
-#include <utility>   // `std::swap`
+#include <atomic>  // `std::atomic_thread_fence`, `std::memory_order_acquire`
+#include <bit>     // `std::bit_floor`
+#include <span>    // `std::span`
+#include <utility> // `std::swap`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <smashtable/shared.hpp>       // `st::status_t`
@@ -226,7 +225,7 @@ class value_cache {
     static void store_bytes_(std::uint64_t* words, std::span<byte_t const> bytes) noexcept {
         for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(std::uint64_t)) {
             std::uint64_t word = 0;
-            std::memcpy(&word, bytes.data() + offset, std::min(sizeof(word), bytes.size() - offset));
+            std::memcpy(&word, bytes.data() + offset, fu::min_of(sizeof(word), bytes.size() - offset));
             store_(words[offset / sizeof(word)], word);
         }
     }
@@ -235,7 +234,7 @@ class value_cache {
     static void load_bytes_(std::uint64_t const* words, std::span<byte_t> bytes) noexcept {
         for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(std::uint64_t)) {
             std::uint64_t const word = load_(words[offset / sizeof(word)]);
-            std::memcpy(bytes.data() + offset, &word, std::min(sizeof(word), bytes.size() - offset));
+            std::memcpy(bytes.data() + offset, &word, fu::min_of(sizeof(word), bytes.size() - offset));
         }
     }
 

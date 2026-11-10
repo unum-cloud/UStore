@@ -51,7 +51,7 @@
  *  struct strings_run {                      // every section starts on a 4096-byte boundary
  *      sorted_run_header_t header;           // 120 bytes, key_tape_bytes and layers_bytes size the rest
  *      splus_tree heads;                     // saved immutable_splus_tree<key128_t> over n heads
- *      uuid_t values[n];                     // Arrow fixed_size_binary(16), in sorted order
+ *      uuid128_t values[n];                  // Arrow fixed_size_binary(16), in sorted order
  *      u32 key_offsets[n + 1];               // Arrow string column of the whole keys
  *      char keys[key_tape_bytes];
  *      byte_t stamps[stamps_bytes];          // trailer: the saved stamps column
@@ -76,7 +76,6 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm>   // `std::min`, `std::max`
 #include <array>       // `std::array`
 #include <concepts>    // `std::convertible_to`
 #include <limits>      // `std::numeric_limits`
@@ -95,7 +94,7 @@
 #include "ustore/utilities/nvme_ring.hpp" // `read_request`, `request_t`, `completion_t`, `extent_t`, `portable_alignment_k`
 #include "ustore/utilities/nvme_slots.hpp"  // `magic_of`
 #include "ustore/utilities/nvme_volume.hpp" // `medium_extent_t`
-#include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`, `uuid_t`
+#include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`, `uuid128_t`
 
 namespace unum::ustore::blobs {
 
@@ -149,7 +148,7 @@ struct sorted_run_header_t {
     value_layout_t value_layout = value_layout_t::unknown_k;
 
     /** The identifier this run is named by, which a directory volume also names its file by. */
-    uuid_t content_id;
+    uuid128_t content_id;
 
     /** Bytes the saved stamps column takes in the trailer, before its alignment padding. */
     std::uint64_t stamps_bytes = 0;
@@ -172,7 +171,7 @@ struct sorted_run_header_t {
     std::uint32_t layers_bytes = 0;
 
     /** The collection that wrote the run, so a run found without a manifest goes back to it. */
-    uuid_t collection;
+    uuid128_t collection;
 
     /** Range tombstones the section at the end of the run holds. */
     std::uint32_t range_tombstones_count = 0;
@@ -571,8 +570,9 @@ inline expected<stamps_column_t> pack_stamps(std::span<std::uint64_t const> stam
         if (stamp > newest) newest = stamp;
     std::array<std::uint64_t, 64> raised {};
     auto fill = [&](std::size_t position) noexcept {
-        std::size_t const count = std::min(raised.size(), stamps.size() - position);
-        for (std::size_t index = 0; index != count; ++index) raised[index] = std::max(stamps[position + index], floor);
+        std::size_t const count = fu::min_of(raised.size(), stamps.size() - position);
+        for (std::size_t index = 0; index != count; ++index)
+            raised[index] = fu::max_of(stamps[position + index], floor);
         return st::expected<std::span<std::uint64_t const>>(std::span<std::uint64_t const> {raised.data(), count},
                                                             st::status_t::success_k);
     };
@@ -738,10 +738,10 @@ class lsm_sorted_run {
     std::uint16_t level_sets_naming = 0;
 
     /** The identifier this run was written under. */
-    [[nodiscard]] uuid_t content_id() const noexcept { return header_.content_id; }
+    [[nodiscard]] uuid128_t content_id() const noexcept { return header_.content_id; }
 
     /** The collection that wrote this run. */
-    [[nodiscard]] uuid_t collection() const noexcept { return header_.collection; }
+    [[nodiscard]] uuid128_t collection() const noexcept { return header_.collection; }
 
 #pragma endregion Pool Fields
 
@@ -774,8 +774,8 @@ class lsm_sorted_run {
      *      extent given back.
      */
     template <typename values_type_ = std::span<byte_t const>>
-    static expected<lsm_sorted_run> write(volume_type_& volume, io_channel_t& channel, uuid_t const& collection,
-                                          uuid_t const& content_id, std::span<key_slot_t const> key_slots,
+    static expected<lsm_sorted_run> write(volume_type_& volume, io_channel_t& channel, uuid128_t const& collection,
+                                          uuid128_t const& content_id, std::span<key_slot_t const> key_slots,
                                           std::span<std::uint64_t const> stamps, std::span<std::uint8_t const> kinds,
                                           std::uint64_t floor, values_type_ const& stored_values,
                                           std::span<stored_value_offset_t const> value_offsets,
@@ -800,7 +800,7 @@ class lsm_sorted_run {
      */
     template <typename values_type_ = std::span<byte_t const>>
     static expected<sorted_run_reservation_t> reserve(
-        volume_type_& volume, io_channel_t& channel, uuid_t const& collection, uuid_t const& content_id,
+        volume_type_& volume, io_channel_t& channel, uuid128_t const& collection, uuid128_t const& content_id,
         std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
         std::span<std::uint8_t const> kinds, std::uint64_t floor, values_type_ const& stored_values,
         std::span<stored_value_offset_t const> value_offsets, stored_value_size_t value_max_size,
@@ -850,7 +850,7 @@ class lsm_sorted_run {
         header.collection = collection;
         if (status_t const laid = lay_out_range_tombstones(tombstones, reservation.range_tombstones); laid.failed())
             return laid;
-        if (reservation.range_tombstones.size() > std::numeric_limits<std::uint32_t>::max())
+        if (reservation.range_tombstones.size() > (std::numeric_limits<std::uint32_t>::max)())
             return status_t {status_code_t::capacity_exhausted_k, "A run's range tombstones outgrow its header"};
         header.range_tombstones_count = static_cast<std::uint32_t>(tombstones.size());
         header.range_tombstones_bytes = static_cast<std::uint32_t>(reservation.range_tombstones.size());
@@ -861,8 +861,8 @@ class lsm_sorted_run {
                 return laid;
             header.branching = static_cast<std::uint16_t>(strings_layout_t::keys_per_row_k);
             std::uint64_t const layers_bytes = reservation.strings.layers.size() * sizeof(std::uint64_t);
-            if (reservation.strings.keys.size() > std::numeric_limits<std::uint32_t>::max() ||
-                layers_bytes > std::numeric_limits<std::uint32_t>::max())
+            if (reservation.strings.keys.size() > (std::numeric_limits<std::uint32_t>::max)() ||
+                layers_bytes > (std::numeric_limits<std::uint32_t>::max)())
                 return status_t {status_code_t::capacity_exhausted_k,
                                  "A run of strings outgrows what its header counts"};
             header.key_tape_bytes = static_cast<std::uint32_t>(reservation.strings.keys.size());
@@ -1082,7 +1082,7 @@ class lsm_sorted_run {
     /** The newest stamp any key slot or range tombstone of the run carries, which a check of what
      *  changed since a stamp skips by. */
     [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
-        return std::max(header_.newest_stamp, range_tombstones_.newest_stamp());
+        return fu::max_of(header_.newest_stamp, range_tombstones_.newest_stamp());
     }
 
     /** The range tombstones the run carries, ascending by start. */
@@ -1106,7 +1106,7 @@ class lsm_sorted_run {
     /** The least key the run holds or a range tombstone of it hides, by head for a run of strings,
      *  or the greatest key of the type for an empty run. */
     [[nodiscard]] stored_key_t lower_stored_key() const noexcept {
-        stored_key_t hidden = limit<stored_key_t>::max();
+        stored_key_t hidden = limit<stored_key_t>::max_k;
         if constexpr (tailed_k) {
             if (!range_tombstones_.empty()) hidden = strings::head_of(range_tombstones_.range(0).start);
         }
@@ -1122,10 +1122,10 @@ class lsm_sorted_run {
      *  strings, the head of an exclusive end standing for every string below it, or the least key
      *  of the type for an empty run. */
     [[nodiscard]] stored_key_t upper_stored_key() const noexcept {
-        stored_key_t hidden = limit<stored_key_t>::min();
+        stored_key_t hidden = limit<stored_key_t>::min_k;
         if constexpr (tailed_k) {
             for (auto const& range : range_tombstones_.ranges()) {
-                stored_key_t const reach = range.end.empty() ? limit<stored_key_t>::max() : strings::head_of(range.end);
+                stored_key_t const reach = range.end.empty() ? limit<stored_key_t>::max_k : strings::head_of(range.end);
                 if (hidden < reach) hidden = reach;
             }
         }
@@ -1527,7 +1527,7 @@ class lsm_sorted_run {
         if (block_bytes == 0)
             return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
-        if (count > std::numeric_limits<std::uint32_t>::max())
+        if (count > (std::numeric_limits<std::uint32_t>::max)())
             return {status_code_t::invalid_argument_k, "A batched read takes at most 2^32 values"};
         std::span<read_piece_t> const pieces = channel.read_pieces();
         std::size_t const depth = pieces.size();
@@ -1696,8 +1696,8 @@ class lsm_sorted_run {
 
     /** How many heads of @p heads are not above @p head. */
     [[nodiscard]] static std::uint64_t rank_above_(heads_view_t const& heads, st::key128_t head) noexcept {
-        if (head == limit<st::key128_t>::max()) return heads.size();
-        st::key128_t const next = head.low != limit<std::uint64_t>::max() ? st::key128_t {head.high, head.low + 1}
+        if (head == limit<st::key128_t>::max_k) return heads.size();
+        st::key128_t const next = head.low != limit<std::uint64_t>::max_k ? st::key128_t {head.high, head.low + 1}
                                                                           : st::key128_t {head.high + 1, 0};
         return heads.rank(next);
     }
@@ -1718,7 +1718,7 @@ class lsm_sorted_run {
         std::uint64_t keys_bytes = 0;
         for (std::size_t index = 0; index != count; ++index)
             keys_bytes += lead_bytes_(key_slots[index].stored_key) + tails.at(index).size();
-        if (keys_bytes > std::numeric_limits<std::uint32_t>::max())
+        if (keys_bytes > (std::numeric_limits<std::uint32_t>::max)())
             return {status_code_t::capacity_exhausted_k, "A run's keys outgrow what its offsets reach"};
         st::vector<st::key128_t> heads;
         if (heads.resize(count) != st::status_t::success_k ||
@@ -2030,7 +2030,7 @@ class lsm_sorted_run {
             return {status_code_t::malformed_k, "The run's tree rows match no tree of this build"};
         if (tailed_k != (header.layers_bytes >= sizeof(head_layers_header_t)))
             return {status_code_t::malformed_k, "The run's layers do not match its key slots"};
-        if (carries_value_offsets_k && header.stored_values_bytes > std::numeric_limits<stored_value_offset_t>::max())
+        if (carries_value_offsets_k && header.stored_values_bytes > (std::numeric_limits<stored_value_offset_t>::max)())
             return {status_code_t::malformed_k, "The run claims more values than its offsets reach"};
         if (is_fixed(value_layout_k) && header.stored_values_bytes != header.key_slots_count * header.value_max_size)
             return {status_code_t::malformed_k, "The run's values are not one width per key slot"};
@@ -2292,7 +2292,7 @@ class lsm_sorted_run {
             return {status_code_t::malformed_k, "A run's stamps disagree with its header"};
         std::array<std::uint64_t, 64> unpacked {};
         auto fill = [&](std::size_t position) noexcept {
-            std::size_t const count = std::min(unpacked.size(), view->size() - position);
+            std::size_t const count = fu::min_of(unpacked.size(), view->size() - position);
             for (std::size_t index = 0; index != count; ++index) unpacked[index] = (*view)[position + index];
             return st::expected<std::span<std::uint64_t const>>(std::span<std::uint64_t const> {unpacked.data(), count},
                                                                 st::status_t::success_k);
@@ -2312,7 +2312,7 @@ class lsm_sorted_run {
             return {status_code_t::malformed_k, "A run's kinds disagree with its header"};
         std::array<std::uint8_t, 64> unpacked_kinds {};
         auto fill_kinds = [&](std::size_t position) noexcept {
-            std::size_t const count = std::min(unpacked_kinds.size(), kinds->size() - position);
+            std::size_t const count = fu::min_of(unpacked_kinds.size(), kinds->size() - position);
             for (std::size_t index = 0; index != count; ++index) {
                 unpacked_kinds[index] = (*kinds)[position + index];
                 if (unpacked_kinds[index] > static_cast<std::uint8_t>(delta_kind_t::change_k))

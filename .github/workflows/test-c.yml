@@ -195,8 +195,8 @@ jobs:
         run: ctest --preset msvc2026_x64
 
   test_windows_arm:
-    name: Test on Windows ARM64 with Visual Studio 2022
-    runs-on: windows-11-arm
+    name: Test on Windows ARM64 with Visual Studio 2026
+    runs-on: windows-11-vs2026-arm
     timeout-minutes: 120
     steps:
       - name: Checkout Repository

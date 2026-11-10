@@ -16,21 +16,20 @@
 #include <cstdint> // `std::uint32_t`, `std::uintptr_t`
 #include <cstring> // `std::memcmp`
 
-#include <dlfcn.h> // `dlopen`, `dlsym`
-
-#include <array>       // `std::array`
-#include <span>        // `std::span`, `std::as_bytes`, `std::as_writable_bytes`
-#include <string>      // `std::string`, `std::to_string`
-#include <string_view> // `std::string_view`
-#include <variant>     // `std::variant`, `std::visit`
+#include <array>           // `std::array`
+#include <span>            // `std::span`, `std::as_bytes`, `std::as_writable_bytes`
+#include <string>          // `std::string`, `std::to_string`
+#include <string_view>     // `std::string_view`
+#include <variant>         // `std::variant`, `std::visit`
 #include <source_location> // `std::source_location`
-#include <vector>      // `std::vector`
+#include <vector>          // `std::vector`
 
 #include <fmt/format.h>
 
 #include <forkunion/topology.hpp> // `fu::allowed_cores_count`
 
 #include "ustore/ustore.h"
+#include "ustore/utilities/blocking_files.hpp" // `shared_library_t`
 #include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `spawn_gpu_executor`, `kernel_tables`, `assemble_tape`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_success`, `report`
@@ -65,8 +64,9 @@ struct fake_hip_counters_t {
 
 /** The stand-in's counters, or null when the real runtime or none is loaded. */
 fake_hip_counters_t const* fake_hip_counters() noexcept {
-    void* const library = dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD);
-    return library ? static_cast<fake_hip_counters_t const*>(dlsym(library, "fake_hip_counters")) : nullptr;
+    fake_hip_counters_t const* counters = nullptr;
+    shared_library_t::open("libamdhip64.so").resolve("fake_hip_counters", counters);
+    return counters;
 }
 
 /** Hands @p body the executor a mover holds, of either vendor, and nothing for none. */
@@ -802,8 +802,8 @@ case_result_t vram_frees_everything(std::size_t ordinal, ustore_gpu_device_t lis
     if (listed.vendor != ustore_gpu_vendor_amd_k || !fake_hip_counters())
         return case_result_t::skipped("counting live ranges needs the HIP stand-in");
     using live_ranges_t = std::size_t (*)();
-    live_ranges_t const live = reinterpret_cast<live_ranges_t>(
-        dlsym(dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD), "fake_hip_live_ranges"));
+    live_ranges_t live = nullptr;
+    shared_library_t::open("libamdhip64.so").resolve("fake_hip_live_ranges", live);
     std::size_t const before = live();
     {
         device_call_t call {ordinal};

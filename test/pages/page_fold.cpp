@@ -16,7 +16,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcmp`
 
-#include <algorithm>       // `std::find`, `std::min`, `std::next_permutation`
+#include <algorithm>       // `std::find`, `std::next_permutation`
 #include <memory>          // `std::unique_ptr`, `std::align`
 #include <new>             // `std::nothrow`
 #include <random>          // `std::mt19937_64`
@@ -463,7 +463,7 @@ std::size_t compose_is_sound() {
             test_arena_t arena;
             bytes_allocator_t allocator(&arena);
             std::size_t const first = random() % commits.size();
-            std::size_t const last = first + 1 + random() % std::min<std::size_t>(12, commits.size() - first);
+            std::size_t const last = first + 1 + random() % fu::min_of<std::size_t>(12, commits.size() - first);
             auto const head = deltas_of(commits, 0, first);
             auto base = fold.apply({}, head, allocator);
             std::span<byte_t const> base_bytes;

@@ -33,6 +33,10 @@
 #include "ustore/types.h" // `USTORE_OS_APPLE_`, `USTORE_OS_LINUX_`, `USTORE_OS_WINDOWS_`
 
 #if USTORE_OS_WINDOWS_
+/*  Winsock 2 first keeps Winsock 1.1 out, unless a user's earlier `<windows.h>` brought it in. */
+#if !defined(_WINSOCKAPI_)
+#include <winsock2.h>
+#endif
 #include <windows.h> // `DeviceIoControl`
 #include <winioctl.h> // `FSCTL_SET_ZERO_DATA`, `FILE_ZERO_DATA_INFORMATION`
 #else
@@ -97,7 +101,7 @@ concept block_device_concept = requires(device_type_& device, device_type_ const
 
 /** The thread index a caller outside every executor reads with, past any executor's threads, so it shares the
  *  channels and the epoch slots threads of no executor take. */
-inline constexpr std::size_t outside_executor_k = std::numeric_limits<std::size_t>::max();
+inline constexpr std::size_t outside_executor_k = (std::numeric_limits<std::size_t>::max)();
 
 #pragma endregion Devices
 
@@ -554,17 +558,17 @@ class basic_disk {
     /** Marks the range and the medium of @p request as live, so neither can be taken back under it. */
     void borrow_(request_t const& request) noexcept {
         if (registered_memory_record_t* const record = resolve_(request.buffer); record)
-            in_flight_(*record).add(1, std::memory_order_acquire);
+            in_flight_(*record).store_add(1, std::memory_order_acquire);
         if (registered_medium_record_t* const record = resolve_(request.medium); record)
-            in_flight_(*record).add(1, std::memory_order_acquire);
+            in_flight_(*record).store_add(1, std::memory_order_acquire);
     }
 
     /** Releases both once the device is done with the bytes of @p request. */
     void restore_(request_t const& request) noexcept {
         if (registered_memory_record_t* const record = resolve_(request.buffer); record)
-            in_flight_(*record).sub(1, std::memory_order_release);
+            in_flight_(*record).store_sub(1, std::memory_order_release);
         if (registered_medium_record_t* const record = resolve_(request.medium); record)
-            in_flight_(*record).sub(1, std::memory_order_release);
+            in_flight_(*record).store_sub(1, std::memory_order_release);
     }
 
     /** Where inside the shared completion window the @p index -th fresh completion of a queue pair goes. */
