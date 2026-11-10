@@ -116,7 +116,7 @@ bool device_blocks_hold(device_blocks_t const& blocks, std::uintptr_t first, std
     for (std::uint32_t block = 0; block != blocks.count; ++block) {
         device_block_t const& run = blocks.blocks[block];
         std::size_t const used = block + 1 == blocks.count ? blocks.used : run.capacity;
-        if (first >= run.address && first - run.address + bytes <= used) return true;
+        if (first >= run.address && first - run.address <= used && bytes <= used - (first - run.address)) return true;
     }
     return false;
 }
@@ -131,7 +131,7 @@ bool arena_holds(ustore_arena_t arena, void const* data, std::size_t bytes) noex
     std::uintptr_t const first = reinterpret_cast<std::uintptr_t>(data);
     for (arena_block_t const* block = blocks->newest; block; block = block->previous) {
         std::uintptr_t const begin = reinterpret_cast<std::uintptr_t>(block);
-        if (first >= begin && first - begin + bytes <= block->used) return true;
+        if (first >= begin && first - begin <= block->used && bytes <= block->used - (first - begin)) return true;
     }
     return false;
 }
@@ -145,12 +145,11 @@ bool arena_holds_tape(ustore_arena_t arena, ustore_strings_view_t const& strings
     std::size_t const width = wide ? sizeof(std::uint64_t) : sizeof(std::uint32_t);
     // The host reads no device offsets, so a device tape is held where its offsets and its
     // first byte are
-    if (device_arena_of(arena).blocks)
-        return arena_holds(arena, offsets, (count + 1) * width) && (!data || arena_holds(arena, data, 1));
+    if (wraps_on_multiply(count + 1, width) || !arena_holds(arena, offsets, (count + 1) * width)) return false;
+    if (device_arena_of(arena).blocks) return !data || arena_holds(arena, data, 1);
     std::uint64_t const first = wide ? strings.data.u64_tape.offsets[0] : strings.data.u32_tape.offsets[0];
     std::uint64_t const end = wide ? strings.data.u64_tape.offsets[count] : strings.data.u32_tape.offsets[count];
-    return arena_holds(arena, offsets, (count + 1) * width) && end >= first &&
-           arena_holds(arena, data + first, end - first);
+    return end >= first && arena_holds(arena, data + first, end - first);
 }
 
 /** Copies the @p converted.size() offsets at @p source into @p converted, less @p first, in the other width. */
@@ -166,6 +165,9 @@ void convert_offsets(source_type_ const* source, std::span<converted_type_> conv
 ustore_status_t convert_on_host(ustore_arena_t arena, ustore_strings_view_t const& strings, std::size_t rows,
                                 void const*& converted, ustore_byte_t const*& data) noexcept {
     bool const wide = strings.layout == ustore_strings_u64_tape_k;
+    if (wide && (wraps_on_multiply(rows + 1, sizeof(std::uint64_t)) ||
+                 !arena_holds(arena, strings.data.u64_tape.offsets, (rows + 1) * sizeof(std::uint64_t))))
+        return ustore_status_invalid_argument_k;
     // A span past 32 bits is refused before its bytes are looked for, as no arena holds that
     // many of them
     std::uint64_t const first = wide ? strings.data.u64_tape.offsets[0] : 0;
@@ -387,6 +389,7 @@ ustore_status_t pack_on_host(ustore_arena_t arena, ustore_byte_t const* bools, s
 template <typename offset_type_>
 ustore_status_t drop_on_host(ustore_arena_t arena, offset_type_ const* offsets, ustore_byte_t const* bytes,
                              std::size_t rows, column_buffers_t& buffers) noexcept {
+    if (static_cast<std::uint64_t>(offsets[rows] - offsets[0]) < rows) return ustore_status_invalid_argument_k;
     auto [bare_offsets, offsets_status] = arena_allocate<offset_type_>(arena, rows + 1);
     if (offsets_status.failed()) return static_cast<ustore_status_t>(offsets_status.code);
     auto [bare_bytes, bytes_status] = arena_allocate<ustore_byte_t>(

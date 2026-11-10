@@ -824,7 +824,7 @@ status_t snapshot_init(ustore_snapshot_init_t const& arguments, view_t const&) {
     snapshot.native = database.native->GetSnapshot();
     if (!snapshot.native) return {status_code_t::internal_k, "Failed to take a snapshot"};
     snapshot.database = &database;
-    count_snapshot_opened<cpu_ladder_floor_k>(database.open_snapshots);
+    count_reader_opened<cpu_ladder_floor_k>(database.open_snapshots);
     if (arguments.read_stamp) *arguments.read_stamp = snapshot.native->GetSequenceNumber();
     *arguments.snapshot = made.release();
     return {};
@@ -1336,7 +1336,7 @@ void snapshot_free(ustore_snapshot_t handle) noexcept {
     database.native->ReleaseSnapshot(snapshot->native);
     delete snapshot;
     std::lock_guard retired_lock {database.retired_mutex};
-    if (!count_snapshot_closed<cpu_ladder_floor_k>(database.open_snapshots)) return;
+    if (!count_reader_closed<cpu_ladder_floor_k>(database.open_snapshots)) return;
     for (column_t* const column : database.retired) database.native->DestroyColumnFamilyHandle(column);
     database.retired.clear();
 }

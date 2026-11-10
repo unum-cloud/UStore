@@ -490,6 +490,8 @@ ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
     if constexpr (requires { arguments.database; }) return arguments.database;
     else if constexpr (requires { arguments.cursor->cursor.database; })
         return arguments.cursor ? arguments.cursor->cursor.database : nullptr;
+    else if constexpr (requires { arguments.ingest->database; })
+        return arguments.ingest ? arguments.ingest->database : nullptr;
     else return arguments.snapshot ? arguments.snapshot->database : nullptr;
 }
 
@@ -1292,13 +1294,18 @@ struct ustore_transaction_handle_t {
     std::uint32_t holds = 1;
 };
 
-/** What @c ustore_ingest_t points to: its engine and state, null once finished, the database it keeps open, and the
- *  scratch every call on it runs in, as the @c view_t the router hands its engine names it. */
+/** What @c ustore_ingest_t points to: its engine and state, null once finished, the database it
+ *  keeps open, the scratch every call on it runs in, as the @c view_t the router hands its engine
+ *  names it, and the claim that refuses a second call on it as contended. */
 struct ustore_ingest_handle_t {
     engine_t const* engine = nullptr;
     void* state = nullptr;
     ustore_database_t database = nullptr;
     ustore_arena_handle_t scratch {};
+    claim_t claim = claim_t::free_k;
+
+    /** Appends and finishes on the ingest that have not ended. */
+    std::uint32_t named_calls = 0;
 };
 
 /** What @c ustore_snapshot_t points to: its engine and state, and the database it keeps open. */

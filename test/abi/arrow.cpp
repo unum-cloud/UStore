@@ -16,6 +16,7 @@
 
 #include <algorithm>   // `std::reverse`
 #include <array>       // `std::array`
+#include <limits>      // `std::numeric_limits`
 #include <optional>    // `std::optional`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -531,6 +532,70 @@ std::size_t arrow_docs_columns_export(config_t const& config) {
     return failures;
 }
 
+/** A text column whose entry lacks the null byte ending it is refused before its copy is carved. */
+std::size_t arrow_export_refuses_an_entry_without_terminator(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t fixture {config};
+    if (!fixture.database) return failures + 1;
+    ustore_collection_id_t const collection = fixture.create("unterminated", ustore_modality_blobs_k);
+    tape_t empty;
+    empty.push("");
+    ustore_key_t const key = key_from_integer(1);
+    ustore_outcome_t outcome {};
+    ustore_blobs_write_t write {.database = fixture.database,
+                                .outcome = &outcome,
+                                .count = 1,
+                                .collections = {&collection, 0},
+                                .keys = {&key, 0},
+                                .values = empty.view()};
+    ustore_blobs_write(&write);
+    if ((failures += expect_success(outcome))) return failures;
+
+    // The empty value read back gives offsets inside the arena with no byte between them
+    arena_t const arena;
+    ustore_octet_t const* presences = nullptr;
+    ustore_strings_view_t values {};
+    ustore_blobs_read_t read {.database = fixture.database,
+                              .outcome = &outcome,
+                              .count = 1,
+                              .collections = {&collection, 0},
+                              .keys = {&key, 0},
+                              .presences = &presences,
+                              .values = &values,
+                              .arena = arena.arena};
+    ustore_blobs_read(&read);
+    if ((failures += expect_success(outcome))) return failures;
+    ustore_docs_column_view_t const column {.validities = presences, .strings = values};
+    ArrowSchema schema {};
+    ArrowDeviceArray array {};
+    failures += expect_eq(
+        ustore_docs_column_view_to_arrow(&column, 1, ustore_docs_field_type_string_k, arena.arena, &schema, &array),
+        ustore_status_invalid_argument_k);
+    return failures;
+}
+
+/** A tape whose offsets lie outside the arena is refused, as is one whose count wraps the bytes
+ *  of its offsets to the empty run an arena holds anywhere. */
+std::size_t arrow_export_refuses_offsets_outside_the_arena(config_t const&) {
+    std::size_t failures = 0;
+    arena_t const arena;
+    tape_t outside;
+    outside.push("outside");
+    ArrowSchema schema {};
+    ArrowDeviceArray array {};
+    failures += expect_eq(
+        ustore_strings_view_to_arrow(outside.view(), 1, ustore_strings_u32_tape_k, arena.arena, &schema, &array),
+        ustore_status_invalid_argument_k);
+    std::size_t const wrapping = (std::numeric_limits<std::size_t>::max)() / sizeof(std::uint32_t);
+    failures += expect_eq(
+        ustore_strings_view_to_arrow(outside.view(), wrapping, ustore_strings_u32_tape_k, arena.arena, &schema, &array),
+        ustore_status_invalid_argument_k);
+    failures += expect_eq(
+        ustore_strings_view_to_arrow(outside.view(), wrapping, ustore_strings_u64_tape_k, arena.arena, &schema, &array),
+        ustore_status_invalid_argument_k);
+    return failures;
+}
+
 /** A cursor's keys and values export in place and read back through the converters until the
  *  arena's next call. */
 std::size_t arrow_exports_read_in_place(config_t const& config) {
@@ -626,14 +691,45 @@ std::size_t arrow_exports_read_in_place(config_t const& config) {
     failures += expect(narrowed_count == written - 1 && cell_of(narrowed, 38) == cell_of(values, 39));
     sliced_array.array.release(&sliced_array.array);
     sliced_schema.release(&sliced_schema);
-    std::uint64_t const far_offsets[] {5ull << 30, (5ull << 30) + (std::uint64_t {1} << 32)};
+    // The far offsets are gathered as a column of their own arena, as an export reads only offsets
+    // an arena holds
+    ustore_collection_id_t const far_collection = fixture.create("far", ustore_modality_docs_k);
+    std::array<ustore_key_t, 2> const far_keys {key_from_integer(1), key_from_integer(2)};
+    std::array<std::string_view, 2> const far_documents {R"({"offset": 5368709120})", R"({"offset": 9663676416})"};
+    strided_strings<std::string_view> const far_values {strided(far_documents).begin()};
+    ustore_docs_write_t far_write {.database = fixture.database,
+                                   .outcome = &outcome,
+                                   .count = far_keys.size(),
+                                   .collections = {&far_collection, 0},
+                                   .keys = {far_keys.data(), sizeof(ustore_key_t)},
+                                   .values = far_values.view()};
+    ustore_docs_write(&far_write);
+    failures += expect_success(outcome);
+    std::array<std::string_view, 1> const far_fields {"offset"};
+    strided_strings<std::string_view> const far_fields_strings {strided(far_fields).begin()};
+    ustore_docs_field_type_t const far_type = ustore_docs_field_type_u64_k;
+    arena_t const far_arena;
+    ustore_docs_column_view_t const* far_columns = nullptr;
+    ustore_docs_gather_t far_gather {.database = fixture.database,
+                                     .outcome = &outcome,
+                                     .count = far_keys.size(),
+                                     .collections = {&far_collection, 0},
+                                     .keys = {far_keys.data(), sizeof(ustore_key_t)},
+                                     .fields_count = far_fields.size(),
+                                     .fields = far_fields_strings.view(),
+                                     .columns = &far_columns,
+                                     .arena = far_arena.arena,
+                                     .outputs_types = &far_type};
+    ustore_docs_gather(&far_gather);
+    failures += expect_success(outcome);
     ustore_strings_view_t far_view {};
     far_view.layout = ustore_strings_u64_tape_k;
-    far_view.data.u64_tape.data = widened.data.u64_tape.data, far_view.data.u64_tape.offsets = far_offsets;
+    far_view.data.u64_tape.data = widened.data.u64_tape.data;
+    if (far_columns) far_view.data.u64_tape.offsets = reinterpret_cast<std::uint64_t const*>(far_columns[0].scalars);
     ArrowSchema far_schema {};
     ArrowDeviceArray far_array {};
     failures += expect_eq(
-        ustore_strings_view_to_arrow(far_view, 1, ustore_strings_u32_tape_k, arena, &far_schema, &far_array),
+        ustore_strings_view_to_arrow(far_view, 1, ustore_strings_u32_tape_k, far_arena.arena, &far_schema, &far_array),
         ustore_status_capacity_exhausted_k);
     wide_array.array.release(&wide_array.array);
     wide_schema.release(&wide_schema);
@@ -836,6 +932,48 @@ case_result_t arrow_ingest_refuses_a_descending_key(config_t const& config) {
     return failures;
 }
 
+/** What an accessor appending to its own ingest reads: the ingest, the value it views, and the
+ *  outcome of the append it makes from inside the one reading it. */
+struct reentering_values_t {
+    ustore_ingest_t ingest = nullptr;
+    std::string_view value;
+    ustore_outcome_t* nested = nullptr;
+};
+
+/** Appends nothing to the ingest of @p handle, then views its one value for every index. */
+void append_from_accessor(void const* handle, ustore_size_t const*, ustore_size_t count,
+                          ustore_bytes_view_t* views) noexcept {
+    reentering_values_t const& values = *static_cast<reentering_values_t const*>(handle);
+    ustore_ingest_append_t nested {.ingest = values.ingest, .outcome = values.nested};
+    ustore_ingest_append(&nested);
+    for (ustore_size_t index = 0; index != count; ++index)
+        views[index] = {reinterpret_cast<ustore_byte_t const*>(values.value.data()), values.value.size()};
+}
+
+/** An ingest serves one call at a time, so an append made while another reads its values is
+ *  contended, and the outer append lands as if alone. */
+case_result_t arrow_ingest_contends_a_second_append(config_t const& config) {
+    if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
+    std::size_t failures = 0;
+    fixture_t fixture {config};
+    if (!fixture.database) return failures + 1;
+    ustore_collection_id_t const collection = fixture.create("reentered", ustore_modality_blobs_k);
+    ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
+    ustore_outcome_t nested {};
+    reentering_values_t const values {.ingest = ingest.ingest, .value = "outer", .nested = &nested};
+    ustore_key_t const key = key_from_integer(1);
+    ustore_outcome_t appended {};
+    ustore_ingest_append_t append {.ingest = ingest.ingest, .outcome = &appended, .count = 1, .keys = {&key, 0}};
+    append.values.layout = ustore_strings_accessor_k;
+    append.values.data.accessor = {.get = &append_from_accessor, .handle = &values};
+    ustore_ingest_append(&append);
+    failures += expect_succeeded(appended);
+    failures += expect_status(status_t {nested}, status_code_t::contended_k);
+    failures += expect_succeeded(ingest.finish());
+    failures += expect(stored_value(fixture.database, collection, key) == std::optional<std::string> {"outer"});
+    return failures;
+}
+
 /** A freed ingest that never finished lands nothing. */
 case_result_t arrow_ingest_freed_lands_nothing(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
@@ -941,10 +1079,15 @@ int main(int argc, char** argv) {
     report(totals, "arrow.converters", arrow_converters, config);
     report(totals, "arrow.exports_read_in_place", arrow_exports_read_in_place, config);
     report(totals, "arrow.docs_columns_export", arrow_docs_columns_export, config);
+    report(totals, "arrow.export_refuses_an_entry_without_terminator", arrow_export_refuses_an_entry_without_terminator,
+           config);
+    report(totals, "arrow.export_refuses_offsets_outside_the_arena", arrow_export_refuses_offsets_outside_the_arena,
+           config);
     report(totals, "arrow.ingest_per_engine", arrow_ingest_per_engine, config);
     report(totals, "arrow.ingest_equals_writes", arrow_ingest_equals_writes, config);
     report(totals, "arrow.ingest_last_repeat_wins", arrow_ingest_last_repeat_wins, config);
     report(totals, "arrow.ingest_refuses_a_descending_key", arrow_ingest_refuses_a_descending_key, config);
+    report(totals, "arrow.ingest_contends_a_second_append", arrow_ingest_contends_a_second_append, config);
     report(totals, "arrow.ingest_freed_lands_nothing", arrow_ingest_freed_lands_nothing, config);
     report(totals, "arrow.ingest_spares_older_snapshots", arrow_ingest_spares_older_snapshots, config);
     report(totals, "arrow.ingest_conflicts_older_transactions", arrow_ingest_conflicts_older_transactions, config);

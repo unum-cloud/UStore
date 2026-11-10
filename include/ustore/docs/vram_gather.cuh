@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <cassert> // `assert`
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint32_t`, `std::uint64_t`
 
 #include <array>       // `std::array`
@@ -260,6 +261,7 @@ template <typename offset_type_>
 constexpr void drop_terminator(terminated_texts<offset_type_> const& texts, std::uint64_t row) noexcept {
     offset_type_ const first = texts.offsets[0];
     offset_type_ const begin = texts.offsets[row], end = texts.offsets[row + 1];
+    assert(end > begin && "Every exported entry holds its terminator");
     offset_type_ const bare_begin = static_cast<offset_type_>(begin - first - row);
     texts.bare_offsets[row] = bare_begin;
     if (row + 1 == texts.rows) texts.bare_offsets[texts.rows] = static_cast<offset_type_>(end - first - texts.rows);

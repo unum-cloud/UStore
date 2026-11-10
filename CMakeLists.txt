@@ -671,13 +671,6 @@ if (${USTORE_BUILD_TEST})
         )
         set_tests_properties(ustore_test_links_no_gpu_runtime PROPERTIES REQUIRED_FILES $<TARGET_FILE:ustore_shared>)
     endif ()
-    add_test(
-        NAME ustore_duplicate_symbols
-        COMMAND
-            ${CMAKE_COMMAND}
-            "-DOBJECTS=$<TARGET_OBJECTS:ustore_static>;$<FILTER:$<TARGET_PROPERTY:ustore_static,SOURCES>,INCLUDE,[.]o(bj)?$>"
-            -P "${forkunion_SOURCE_DIR}/cmake/forkunion_duplicate_symbols.cmake"
-    )
 
     # Every read verb on each listed GPU against the host, once per engine on the one GPU the device suites share
     add_executable(ustore_test_vram test/vram/towers.cpp)

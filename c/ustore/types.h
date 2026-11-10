@@ -24,8 +24,8 @@
  *
  *  Structures carry no size or version field, so they grow source-compatibly only: initialize them
  *  by designator, which zeroes every field left out, and expect the major version to change whenever
- *  one does. A @c NULL pointer only ever means its pointee's own default, and choices between
- *  behaviours are enums named for what they choose.
+ *  one does. A @c NULL pointer only ever means its pointee's own default, apart from the outcome,
+ *  and choices between behaviours are enums named for what they choose.
  *
  *  @section types_asynchrony Asynchrony
  *
@@ -389,8 +389,10 @@ typedef enum ustore_status_t {
     /** The engine or build does not implement what the call asks for, like io_uring on a kernel without it. */
     ustore_status_unsupported_k = 16,
 
-    /** An argument is null, contradicts another one, or carries a choice the call does not accept, like a collection
-     *  of another modality, a name reserved for a system collection, or a batch of strings in an unknown layout. */
+    /** An argument is null, contradicts another one, or carries a choice the call does not
+     *  accept, like a collection of another modality, a name reserved for a system collection,
+     *  or a batch of strings in an unknown layout. The outcome itself is never @c NULL: it is
+     *  where this status lands. */
     ustore_status_invalid_argument_k = 17,
 
     /** A collection, a directory, or a document a modification needs does not exist, while a read marks a missing
@@ -1170,6 +1172,9 @@ USTORE_EXPORT void ustore_arena_describe(ustore_arena_describe_t* arguments);
 /**
  *  @brief Reports the version of the library the program runs against, which may differ from the macros it
  *      compiled against.
+ *
+ *  None of the three outputs may be @c NULL.
+ *
  *  @param[out] major Output for the major version.
  *  @param[out] minor Output for the minor version.
  *  @param[out] patch Output for the patch version.

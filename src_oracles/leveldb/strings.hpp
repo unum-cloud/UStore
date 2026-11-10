@@ -140,7 +140,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
         native_status_t const status = database.native->Get(
             options, string_key(collections[index], string_of(texts[index]), key), &value);
         if (status.IsNotFound()) {
-            outputs.push_missing();
+            outputs.assign_missing(index);
             continue;
         }
         if (!status.ok()) return status_of(status);
@@ -148,7 +148,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
             return {status_code_t::malformed_k, "The key a string maps onto is malformed"};
         ustore_key_t found;
         std::memcpy(found.uuid.bytes, value.data(), sizeof(found.uuid.bytes));
-        outputs.push_present(found);
+        outputs.assign_present(index, found);
     }
     outputs.finish(arguments);
     return {};

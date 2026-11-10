@@ -573,6 +573,13 @@ inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_measure_t cons
 /** Strings an accessor writes per block, so the indices it reads fit on the stack of the thread running the call. */
 constexpr std::size_t accessor_block_k = 64;
 
+/** Refuses a tape of @p count strings spanning bytes it has no pointer to. */
+template <typename tape_type_>
+status_t tape_holds(tape_type_ const& tape, std::size_t count) noexcept {
+    if (!count || tape.data || tape.offsets[count] == tape.offsets[0]) return {};
+    return {status_code_t::invalid_argument_k, "A tape of strings needs its bytes"};
+}
+
 /** Reads @p input for its engine into @p strings, refusing a layout no constant names and gathering
  *  into @p scratch the views an accessor writes, so the accessor runs on the thread running the
  *  call and never after it is final. */
@@ -581,11 +588,13 @@ inline status_t gather_strings(ragged_input_t const& input, ustore_arena_t scrat
     strings.view = view;
     // A C caller may pass any integer, which C++ may not load as the enum, so its bits are read instead
     switch (std::bit_cast<std::underlying_type_t<ustore_strings_layout_t>>(view.layout)) {
-    case ustore_strings_u32_tape_k: return {};
+    case ustore_strings_u32_tape_k:
+        if (!view.data.u32_tape.offsets) return {};
+        return tape_holds(view.data.u32_tape, input.count);
     case ustore_strings_u64_tape_k:
         if (input.count && !view.data.u64_tape.offsets)
             return {status_code_t::invalid_argument_k, "A tape of strings needs its offsets"};
-        return {};
+        return tape_holds(view.data.u64_tape, input.count);
     case ustore_strings_accessor_k: break;
     default: return {status_code_t::invalid_argument_k, "The strings come in an unknown layout"};
     }
@@ -831,6 +840,7 @@ std::array<std::uint32_t*, 3> named_calls_of(arguments_type_ const& arguments) n
     ustore_database_t const database = database_of(arguments);
     std::uint32_t* viewed = nullptr;
     if constexpr (requires { arguments.cursor->cursor; }) viewed = &arguments.cursor->cursor.named_calls;
+    else if constexpr (requires { arguments.ingest->named_calls; }) viewed = &arguments.ingest->named_calls;
     else {
         view_t view;
         decode_call(arguments, view);
@@ -949,7 +959,7 @@ void refuse(arguments_type_& arguments, status_t status) noexcept {
     finish(*arguments.outcome, status);
 }
 
-/** Waits until no executor call counted in @p calls is left, so their handle may be freed. */
+/** Waits until no call counted in @p calls is left, so their handle may be freed. */
 inline void wait_named_calls(std::uint32_t& calls) noexcept {
     floor_atomic_ref<std::uint32_t const> const counted {calls};
     for (std::uint32_t seen = counted.load(std::memory_order_acquire); seen != 0;
@@ -1426,7 +1436,9 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
     if constexpr (std::is_same_v<arguments_type_, ustore_collection_create_t>) {
         if (arguments.modality < ustore_modality_blobs_k || arguments.modality > ustore_modality_pages_k)
             return {status_code_t::invalid_argument_k, "Unknown modality"};
-        if (arguments.name.length && arguments.name.data && arguments.name.data[0] == '_')
+        if (arguments.name.length && !arguments.name.data)
+            return {status_code_t::invalid_argument_k, "A name with a length needs its bytes"};
+        if (arguments.name.length && arguments.name.data[0] == '_')
             return {status_code_t::invalid_argument_k, "Names starting with _ are reserved for system collections"};
     }
 
@@ -1589,7 +1601,9 @@ void run_alone(call_type_* call) noexcept {
     alignas(arena_alignment_k) byte_t page[arena_page_bytes_k];
     arena_block_t* const first = new (page) arena_block_t {nullptr, sizeof(page), sizeof(arena_block_t)};
     ustore_arena_handle_t scratch {.memory = host_blocks_t {.newest = first}};
+    std::array<std::uint32_t*, 3> const named_calls = raise_named_calls(*call);
     run<call_type_, serve_>(call, view_t {.scratch = &scratch});
+    lower_named_calls(named_calls);
     arena_free_blocks(scratch, first);
 }
 
@@ -1653,6 +1667,10 @@ void route_init(arguments_type_* arguments) noexcept {
     if (arguments->database) *arguments->database = nullptr;
     if (home_of(arguments->executor) != home_t::host_k)
         return finish(*arguments->outcome, {status_code_t::device_k, "Databases open on host executors"});
+    if constexpr (requires { arguments->directory.length; })
+        if (arguments->directory.length && !arguments->directory.data)
+            return finish(*arguments->outcome,
+                          {status_code_t::invalid_argument_k, "A directory with a length needs its bytes"});
     dispatch<arguments_type_, &serve_open<arguments_type_, open_>>(arguments);
 }
 

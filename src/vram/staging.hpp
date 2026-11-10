@@ -139,6 +139,7 @@ status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor, ar
     if constexpr (requires { arguments.strings.layout; }) stager.stage(arguments.strings, count);
     if constexpr (requires { arguments.prefixes.layout; }) stager.stage(arguments.prefixes, count);
     if constexpr (requires { arguments.start_strings.layout; }) stager.stage(arguments.start_strings, count);
+    if constexpr (requires { arguments.end_strings.layout; }) stager.stage(arguments.end_strings, count);
     if constexpr (requires { arguments.fields_count; }) {
         std::size_t const fields_count = static_cast<std::size_t>(arguments.fields_count);
         stager.stage(arguments.fields, fields_count);

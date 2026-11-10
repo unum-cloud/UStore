@@ -686,6 +686,59 @@ std::size_t database_unknown_layout(config_t const& config) {
     return failures;
 }
 
+/** A name or a directory with a length but no bytes is refused, never read through @c NULL. */
+std::size_t database_lengths_without_bytes(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+
+    ustore_collection_id_t collection {};
+    ustore_outcome_t outcome {};
+    ustore_collection_create_t create {.database = database,
+                                       .outcome = &outcome,
+                                       .name = {nullptr, 4},
+                                       .modality = ustore_modality_blobs_k,
+                                       .collection = &collection};
+    ustore_collection_create(&create);
+    failures += expect_status(outcome, status_code_t::invalid_argument_k);
+
+    ustore_database_t opened = nullptr;
+    ustore_database_open_ram_t open {.database = &opened, .outcome = &outcome, .directory = {nullptr, 4}};
+    ustore_database_open_ram(&open);
+    failures += expect_status(outcome, status_code_t::invalid_argument_k);
+    failures += expect(opened == nullptr);
+    return failures;
+}
+
+/** A tape whose strings span bytes it has no pointer to is refused, while a tape of empty
+ *  strings needs none. */
+std::size_t database_tape_without_bytes(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_tape_without_bytes.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
+
+    ustore_key_t const key = key_from_integer(1800);
+    std::array<std::uint32_t, 2> const spanning_offsets {0, 8}, empty_offsets {0, 0};
+    ustore_outcome_t outcome {};
+    ustore_blobs_write_t write {.database = database,
+                                .outcome = &outcome,
+                                .count = 1,
+                                .collections = {&blobs, 0},
+                                .keys = {&key, 0},
+                                .values = u32_tape(nullptr, spanning_offsets.data())};
+    ustore_blobs_write(&write);
+    failures += expect_status(outcome, status_code_t::invalid_argument_k);
+    write.values = u32_tape(nullptr, empty_offsets.data());
+    ustore_blobs_write(&write);
+    failures += expect_success(outcome);
+    return failures;
+}
+
 /** A zeroed view of fields keeps its default, the whole document, on a write and on a read. */
 std::size_t database_zeroed_fields(config_t const& config) {
     std::size_t failures = 0;
@@ -2265,6 +2318,8 @@ int main(int argc, char** argv) {
     report(totals, "database.write_layouts", database_write_layouts, config);
     report(totals, "database.write_broadcast", database_write_broadcast, config);
     report(totals, "database.unknown_layout", database_unknown_layout, config);
+    report(totals, "database.lengths_without_bytes", database_lengths_without_bytes, config);
+    report(totals, "database.tape_without_bytes", database_tape_without_bytes, config);
     report(totals, "database.zeroed_fields", database_zeroed_fields, config);
     report(totals, "database.modality_refusals", database_modality_refusals, config);
     report(totals, "database.modality_keys", database_modality_keys, config);

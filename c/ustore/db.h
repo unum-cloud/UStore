@@ -1624,6 +1624,7 @@ typedef struct ustore_ingest_append_t {
  *    key before it under @c ustore_ingest_sorted_k.
  *  - @c ustore_status_malformed_k A value is past what the collection admits, a document no JSON, or a page no XML.
  *  - @c ustore_status_capacity_exhausted_k The volume is full.
+ *  - @c ustore_status_contended_k Another append or the finish runs on the same @c ingest.
  */
 USTORE_EXPORT void ustore_ingest_append(ustore_ingest_append_t* arguments);
 
@@ -1651,7 +1652,8 @@ typedef struct ustore_ingest_finish_t {
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c ingest is @c NULL or finished, or the @c durability is unknown.
  *  - @c ustore_status_not_found_k The collection was dropped meanwhile.
- *  - @c ustore_status_contended_k Memory runs kept refilling while the ingest waited them out.
+ *  - @c ustore_status_contended_k An append runs on the same @c ingest, or memory runs kept
+ *    refilling while the ingest waited them out.
  *  - @c ustore_status_capacity_exhausted_k The volume is full.
  */
 USTORE_EXPORT void ustore_ingest_finish(ustore_ingest_finish_t* arguments);

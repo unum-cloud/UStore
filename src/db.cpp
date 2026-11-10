@@ -189,6 +189,19 @@ status_t finish_ingest(ustore_ingest_finish_t const& arguments) noexcept {
     return landed;
 }
 
+/** Serves @p arguments holding the ingest's claim and counting the call, so a second call is
+ *  contended and a free waits. */
+template <auto serve_, typename arguments_type_>
+status_t on_ingest(arguments_type_ const& arguments) noexcept {
+    if (!arguments.ingest) return {status_code_t::invalid_argument_k, "The ingest is missing"};
+    if (!take(arguments.ingest->claim)) return {status_code_t::contended_k, "The ingest serves another call"};
+    std::array<std::uint32_t*, 3> const named_calls = raise_named_calls(arguments);
+    status_t const status = serve_(arguments);
+    release(arguments.ingest->claim);
+    lower_named_calls(named_calls);
+    return status;
+}
+
 void ustore_database_describe(ustore_database_describe_t* arguments) { route(arguments); }
 void ustore_database_clear(ustore_database_clear_t* arguments) { route(arguments); }
 void ustore_database_compact(ustore_database_compact_t* arguments) { route(arguments); }
@@ -204,8 +217,12 @@ void ustore_transaction_stage(ustore_transaction_stage_t* arguments) { route(arg
 void ustore_transaction_commit(ustore_transaction_commit_t* arguments) { route(arguments); }
 void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments) { route(arguments); }
 void ustore_ingest_init(ustore_ingest_init_t* arguments) { finish(*arguments->outcome, open_ingest(*arguments)); }
-void ustore_ingest_append(ustore_ingest_append_t* arguments) { finish(*arguments->outcome, append_ingest(*arguments)); }
-void ustore_ingest_finish(ustore_ingest_finish_t* arguments) { finish(*arguments->outcome, finish_ingest(*arguments)); }
+void ustore_ingest_append(ustore_ingest_append_t* arguments) {
+    finish(*arguments->outcome, on_ingest<&append_ingest>(*arguments));
+}
+void ustore_ingest_finish(ustore_ingest_finish_t* arguments) {
+    finish(*arguments->outcome, on_ingest<&finish_ingest>(*arguments));
+}
 
 ustore_view_t ustore_transaction_view(ustore_transaction_t transaction, ustore_watch_t watch) {
     return tagged_view(transaction, watch == ustore_watch_none_k ? view_tag_t::blind_k : view_tag_t::watching_k);
@@ -267,6 +284,7 @@ void ustore_transaction_free(ustore_transaction_t transaction) {
 
 void ustore_ingest_free(ustore_ingest_t ingest) {
     if (!ingest) return;
+    wait_named_calls(ingest->named_calls);
     if (ingest->state) ingest->engine->database->ingest_free(ingest);
     ustore_database_t const database = ingest->database;
     arena_free_blocks(ingest->scratch);

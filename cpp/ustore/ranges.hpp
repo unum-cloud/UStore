@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <cassert> // `assert`
 #include <climits> // `CHAR_BIT`
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 
@@ -641,9 +642,11 @@ inline sz::strings_view_t strings_of(ustore_strings_view_t const& tape, std::siz
 inline ustore_bytes_view_t tape_string(ustore_strings_view_t const& tape, std::size_t index) noexcept {
     if (tape.layout == ustore_strings_u64_tape_k) {
         std::uint64_t const* const offsets = tape.data.u64_tape.offsets;
+        assert(offsets[index + 1] >= offsets[index] && "A tape's offsets must not decrease");
         return {tape.data.u64_tape.data + offsets[index], offsets[index + 1] - offsets[index]};
     }
     std::uint32_t const* const offsets = tape.data.u32_tape.offsets;
+    assert(offsets[index + 1] >= offsets[index] && "A tape's offsets must not decrease");
     return {tape.data.u32_tape.data + offsets[index], offsets[index + 1] - offsets[index]};
 }
 

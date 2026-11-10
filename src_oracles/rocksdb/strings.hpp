@@ -210,7 +210,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
                                                          database.native.get(), read_options, column, key, &value)
                                                    : database.native->Get(read_options, column, key, &value);
         if (status.IsNotFound()) {
-            outputs.push_missing();
+            outputs.assign_missing(index);
             continue;
         }
         if (!status.ok()) return status_of(status);
@@ -218,7 +218,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
             return {status_code_t::malformed_k, "The database holds a malformed strings entry"};
         ustore_key_t found;
         std::memcpy(&found, value.data(), sizeof(ustore_key_t));
-        outputs.push_present(found);
+        outputs.assign_present(index, found);
     }
     outputs.finish(arguments);
     return {};

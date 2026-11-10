@@ -1063,6 +1063,12 @@ constexpr integer_type_ divide_round_up(integer_type_ value, std::type_identity_
     return static_cast<integer_type_>(value / divisor + (value % divisor != 0));
 }
 
+/** Whether @p a times @p b exceeds what @p integer_type_ holds. */
+template <std::unsigned_integral integer_type_>
+constexpr bool wraps_on_multiply(integer_type_ a, std::type_identity_t<integer_type_> b) noexcept {
+    return b != 0 && a > (std::numeric_limits<integer_type_>::max)() / b;
+}
+
 /** The greatest multiple of @p multiple at or below @p value. */
 template <std::unsigned_integral integer_type_>
 constexpr integer_type_ round_down_to_multiple(integer_type_ value,

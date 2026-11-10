@@ -1322,6 +1322,32 @@ std::size_t database_free_waits(config_t const&) {
     return failures;
 }
 
+/** Freeing a database waits for a call naming it on no executor, held inside its callback on
+ *  another thread, as such a call counts on its handles as an executor call does. */
+std::size_t database_free_waits_without_executor(config_t const&) {
+    std::size_t failures = 0;
+    st::expected<executor_t> holding_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
+    failures += expect(holding_thread.has_value());
+    if (failures != 0) return failures;
+
+    held_scan_t held;
+    failures += arm_held(held, nullptr, nullptr, ustore_completion_blocking_k);
+    st::expected<fu_generation_t> const generation = holding_thread->start<&scan_blocking>(held);
+    failures += expect(generation.has_value());
+    if (failures != 0) return failures;
+    failures += wait_held(held);
+    fu::standard_atomic_ref<hold_stage_t> const stage {held.stage};
+    stage.store(hold_stage_t::released_k, std::memory_order_release);
+    // A second hold keeps the router from deleting the case's own handle once the
+    // free stops waiting
+    held.database.holds = 2;
+    ustore_database_free(&held.database);
+    failures += expect(stage.load(std::memory_order_acquire) == hold_stage_t::returned_k);
+    holding_thread->join(*generation);
+    failures += expect_success(held.outcome);
+    return failures;
+}
+
 /** An init runs on an executor as every call does: a blocking one returns with the database open,
  *  and a deferred one runs from its copy, whose original died with the frame that built it, and
  *  writes the database before its outcome is final. */
@@ -2098,6 +2124,7 @@ int main(int argc, char** argv) {
     report(totals, "executor.arena_on_device", executor_arena_on_device, config);
     report(totals, "outcome.wait_blocks", outcome_wait_blocks, config);
     report(totals, "database.free_waits", database_free_waits, config);
+    report(totals, "database.free_waits_without_executor", database_free_waits_without_executor, config);
     report(totals, "database.init_on_executor", database_init_on_executor, config);
     report(totals, "executor.sliced_read", executor_sliced_read, config);
     report(totals, "executor.sliced_docs", executor_sliced_docs, config);

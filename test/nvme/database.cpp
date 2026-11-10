@@ -2028,6 +2028,9 @@ std::size_t warm_batched_select_allocates_nothing(mount_type_ const& mount) {
         return store.select(read, &scratch, std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results},
                             sink);
     };
+    // The first call can spill into a second arena block, and a rewind keeps only the newest block,
+    // so the arena settles on the second call.
+    failures += expect(select_once().succeeded());
     failures += expect(select_once().succeeded());
     std::size_t const before = allocation_watch_g.calls;
     failures += expect(select_once().succeeded());
