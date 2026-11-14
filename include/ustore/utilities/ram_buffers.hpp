@@ -1000,6 +1000,27 @@ struct rvv_strings_kit_t {
 };
 #endif
 
+#if STRINGZILLA_TARGET_POWERVSX
+struct powervsx_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto sort_order = sz_sort_order_serial;
+    static constexpr auto utf8_count_strings = sz_utf8_count_strings_serial;
+    static constexpr auto find_byteset = sz_find_byteset_powervsx;
+    static constexpr auto strings_unescape = sz_strings_unescape_powervsx;
+    static constexpr auto strings_escape = sz_strings_escape_powervsx;
+    static constexpr auto hash = sz_hash_powervsx;
+    static constexpr auto sha256_state_init = sz_sha256_state_init_powervsx;
+    static constexpr auto sha256_state_update = sz_sha256_state_update_powervsx;
+    static constexpr auto sha256_state_digest = sz_sha256_state_digest_powervsx;
+};
+#else
+struct powervsx_strings_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = false;
+};
+#endif
+
 /** Names the six slots every strings kit carries. */
 template <typename strings_kit_type_>
 concept strings_kit_concept = requires {
@@ -1039,9 +1060,9 @@ struct strings_kit_sha256 {
 template <sz_capability_t capabilities_>
     requires((capabilities_ & sz_cap_cpus_k) != 0)
 struct strings_ladder {
-    using strings_kit_t =
-        typename highest_strings_kit<capabilities_, serial_strings_kit_t, icelake_strings_kit_t, skylake_strings_kit_t,
-                                     haswell_strings_kit_t, neon_strings_kit_t, rvv_strings_kit_t>::type;
+    using strings_kit_t = typename highest_strings_kit<capabilities_, serial_strings_kit_t, icelake_strings_kit_t,
+                                                       skylake_strings_kit_t, haswell_strings_kit_t, neon_strings_kit_t,
+                                                       rvv_strings_kit_t, powervsx_strings_kit_t>::type;
     static constexpr sz_capability_t picked_k = strings_kit_t::capability_k;
 };
 
