@@ -703,8 +703,10 @@ status_t read_raw_manifest(data_address_t const& address, st::vector<char>& json
     else if (owner.magic != slot_owner_magic_k || owner.format_version != slot_format_version_k)
         result = {status_code_t::not_found_k, "The address holds no database of this layout"};
     else if (owner.manifest_bytes == 0) result = {status_code_t::not_found_k, "The database has published no manifest"};
-    else if (owner.manifest_bytes > manifest_region_bytes_k)
-        result = {status_code_t::malformed_k, "The manifest slot names a copy longer than its region"};
+    else if (owner.manifest_bytes > manifest_region_bytes_k ||
+             (owner.manifest_offset != address.byte_base + slot_payload_offset_k &&
+              owner.manifest_offset != address.byte_base + slot_payload_offset_k + manifest_region_bytes_k))
+        result = {status_code_t::malformed_k, "The manifest slot points outside its regions"};
     else if (json.resize(static_cast<std::size_t>(owner.manifest_bytes)) != st::status_t::success_k)
         result = {status_code_t::out_of_memory_k, "No room to read the manifest"};
     else result = read_exactly(file, owner.manifest_offset, std::as_writable_bytes(std::span<char> {json}));
@@ -907,6 +909,11 @@ status_t recover_raw(recovery_t& recovery, data_address_t const& address, std::u
             auto [bytes, bytes_status] = run_bytes_of(header);
             if (bytes_status.failed()) {
                 result = bytes_status;
+                break;
+            }
+            // A run of no bytes recurs at the same offset, and one past the slot is another's
+            if (bytes == 0 || bytes > base + slot_bytes_k - offset) {
+                result = {status_code_t::malformed_k, "A run's header claims bytes its slot does not hold"};
                 break;
             }
             manifest_file_t found;

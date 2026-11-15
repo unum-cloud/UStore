@@ -40,9 +40,9 @@
 #include <random>       // `std::random_device`
 #include <regex>        // `std::regex`, `std::regex_search`
 #include <span>         // `std::span`
-#include <string>       // `std::string`, `std::to_string`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
+#include <utility>      // `std::forward`
 #include <variant>      // `std::variant`
 
 #include <fmt/format.h>
@@ -457,38 +457,53 @@ inline void print_usage(std::string_view synopsis, std::span<flag_t const> flags
     fmt::println("  --help{:{}}print this message", "", column_k - 6);
 }
 
+/** A flag value or grammar spelled into a buffer of its own, so a whole line prints in one call. */
+struct spelling_t {
+    std::array<char, 256> text {};
+    std::size_t size = 0;
+
+    template <typename... arguments_types_>
+    spelling_t(fmt::format_string<arguments_types_...> format, arguments_types_&&... arguments) noexcept {
+        size = fmt::format_to_n(text.data(), text.size(), format, std::forward<arguments_types_>(arguments)...).size;
+        if (size > text.size()) size = text.size();
+    }
+
+    [[nodiscard]] std::string_view view() const noexcept { return {text.data(), size}; }
+};
+
 /** Spells @p duration as a user types it: whole seconds as "10s", anything else as "1500ms". */
-inline std::string spell_duration(std::chrono::milliseconds duration) {
+inline spelling_t spell_duration_(std::chrono::milliseconds duration) noexcept {
     auto const count = duration.count();
-    return count % 1000 ? std::to_string(count) + "ms" : std::to_string(count / 1000) + "s";
+    return count % 1000 ? spelling_t {"{}ms", count} : spelling_t {"{}s", count / 1000};
 }
 
 /** Spells @p bytes as a user types it, in the largest binary unit dividing it, like "256MB". */
-inline std::string spell_size(std::size_t bytes) {
+inline spelling_t spell_size_(std::size_t bytes) noexcept {
     constexpr std::array<char const*, 5> units {"", "KB", "MB", "GB", "TB"};
     std::size_t power = 0;
     while (power + 1 != units.size() && bytes && bytes % 1024 == 0) bytes /= 1024, ++power;
-    return std::to_string(bytes) + units[power];
+    return {"{}{}", bytes, units[power]};
 }
 
-/** The grammar the value of @p flag takes, which a failure line ends with. */
-[[nodiscard]] inline std::string expected_(flag_t const& flag) {
+/** Spells the grammar the value of @p flag takes, which a failure line ends with. */
+inline spelling_t spell_expected_(flag_t const& flag) noexcept {
     if (auto const* count = std::get_if<count_t*>(&flag.destination)) {
         std::size_t const minimum = (*count)->minimum, maximum = (*count)->maximum;
-        if (maximum != (std::numeric_limits<std::size_t>::max)())
-            return fmt::format("a count from {} to {}", minimum, maximum);
-        return minimum == 1 ? "a positive count" : fmt::format("a count of at least {}", minimum);
+        if (maximum != (std::numeric_limits<std::size_t>::max)()) return {"a count from {} to {}", minimum, maximum};
+        if (minimum == 1) return {"a positive count"};
+        return {"a count of at least {}", minimum};
     }
-    if (auto const* counts = std::get_if<counts_t*>(&flag.destination))
-        return (*counts)->min_size == (*counts)->max_size
-                   ? fmt::format("{} positive counts like 32,64,128", (*counts)->min_size)
-                   : "positive counts like 64,128";
-    if (std::holds_alternative<bytes_t*>(flag.destination)) return "a size like 4096, 64KB or 1GB";
-    if (std::holds_alternative<std::chrono::nanoseconds*>(flag.destination)) return "a duration like 200ms or 10s";
-    if (std::holds_alternative<seed_t*>(flag.destination)) return "an unsigned integer or random";
+    if (auto const* counts = std::get_if<counts_t*>(&flag.destination)) {
+        if ((*counts)->min_size == (*counts)->max_size)
+            return {"{} positive counts like 32,64,128", (*counts)->min_size};
+        return {"positive counts like 64,128"};
+    }
+    if (std::holds_alternative<bytes_t*>(flag.destination)) return {"a size like 4096, 64KB or 1GB"};
+    if (std::holds_alternative<std::chrono::nanoseconds*>(flag.destination)) return {"a duration like 200ms or 10s"};
+    if (std::holds_alternative<seed_t*>(flag.destination)) return {"an unsigned integer or random"};
     if (auto const* choice = std::get_if<choice_t*>(&flag.destination))
-        return fmt::format("one of {}", fmt::join((*choice)->names, ", "));
-    return "names separated by commas";
+        return {"one of {}", fmt::join((*choice)->names, ", ")};
+    return {"names separated by commas"};
 }
 
 /** Prints why @p parsed failed as one line, like @c --threads="0" @c does @c not @c parse, @c expected @c a @c positive
@@ -496,28 +511,30 @@ inline std::string spell_size(std::size_t bytes) {
 inline void print_error(arguments_t const& parsed) {
     if (!parsed.flag) return fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
     fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", parsed.flag->name, parsed.value,
-                 expected_(*parsed.flag));
+                 spell_expected_(*parsed.flag).view());
 }
 
-/** The value of @p flag, spelled as a user types it, or "none" for empty text. */
-[[nodiscard]] inline std::string spell_value_(flag_t const& flag) {
+/** Spells the value of @p flag as a user types it, or "none" for empty text. */
+inline spelling_t spell_value_(flag_t const& flag) noexcept {
     if (auto const* text = std::get_if<std::string_view*>(&flag.destination))
-        return (*text)->empty() ? "none" : std::string(**text);
-    if (auto const* count = std::get_if<count_t*>(&flag.destination)) return std::to_string((*count)->value);
+        return {"{}", (*text)->empty() ? std::string_view {"none"} : **text};
+    if (auto const* count = std::get_if<count_t*>(&flag.destination)) return {"{}", (*count)->value};
     if (auto const* counts = std::get_if<counts_t*>(&flag.destination))
-        return fmt::format("{}", fmt::join((*counts)->view(), ","));
-    if (auto const* bytes = std::get_if<bytes_t*>(&flag.destination)) return spell_size((*bytes)->value);
+        return {"{}", fmt::join((*counts)->view(), ",")};
+    if (auto const* bytes = std::get_if<bytes_t*>(&flag.destination)) return spell_size_((*bytes)->value);
     if (auto const* duration = std::get_if<std::chrono::nanoseconds*>(&flag.destination))
-        return spell_duration(std::chrono::duration_cast<std::chrono::milliseconds>(**duration));
-    if (auto const* texts = std::get_if<texts_t*>(&flag.destination))
-        return (*texts)->size ? fmt::format("{}", fmt::join((*texts)->view(), ",")) : "none";
+        return spell_duration_(std::chrono::duration_cast<std::chrono::milliseconds>(**duration));
+    if (auto const* texts = std::get_if<texts_t*>(&flag.destination)) {
+        if ((*texts)->size) return {"{}", fmt::join((*texts)->view(), ",")};
+        return {"none"};
+    }
     if (auto const* choice = std::get_if<choice_t*>(&flag.destination))
-        return std::string((*choice)->names[(*choice)->selected]);
+        return {"{}", (*choice)->names[(*choice)->selected]};
     if (auto const* toggle = std::get_if<switch_t*>(&flag.destination))
-        return **toggle == switch_t::present_k ? "true" : "false";
-    if (auto const* seed = std::get_if<seed_t*>(&flag.destination)) return std::to_string((*seed)->value);
+        return {"{}", **toggle == switch_t::present_k ? "true" : "false"};
+    if (auto const* seed = std::get_if<seed_t*>(&flag.destination)) return {"{}", (*seed)->value};
     filter_t const& filter = **std::get_if<filter_t*>(&flag.destination);
-    return filter.text.empty() ? "none" : std::string(filter.text);
+    return {"{}", filter.text.empty() ? std::string_view {"none"} : std::string_view {filter.text}};
 }
 
 /** Prints every flag as "- Label: value" in the grammar it parses from, labelled like "--time-limit" as "Time limit",
@@ -527,11 +544,11 @@ inline void print_flags(std::span<flag_t const> flags) {
         flag_t const& flag = flags[index];
         auto const shadows = [&](flag_t const& later) noexcept { return later.name == flag.name; };
         if (std::any_of(flags.begin() + index + 1, flags.end(), shadows)) continue;
-        std::string label {flag.label.empty() ? flag.name.substr(2) : flag.label};
-        for (char& character : label)
+        spelling_t label {"{}", flag.label.empty() ? flag.name.substr(2) : flag.label};
+        for (char& character : label.text)
             if (character == '-' && flag.label.empty()) character = ' ';
-        label.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(label.front())));
-        fmt::println("- {}: {}", label, spell_value_(flag));
+        label.text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(label.text[0])));
+        fmt::println("- {}: {}", label.view(), spell_value_(flag).view());
     }
 }
 
