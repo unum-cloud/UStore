@@ -2275,8 +2275,8 @@ impl FromStr for Engine {
 /// A directory the data files may occupy, with the bytes they may take there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub struct DataDirectory<'path> {
-    /// The directory, which must exist; on NVMe also a raw device from a base, like
-    /// `/dev/nvme0n1@64GiB`.
+    /// The directory, which must exist; on NVMe also an extent of a raw device, like
+    /// `/dev/nvme0n1@64GiB+16GiB`.
     pub path: &'path str,
     /// Bytes the files may take there: zero is unlimited on RocksDB and the whole medium on NVMe.
     pub max_bytes: u64,

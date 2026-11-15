@@ -691,17 +691,14 @@ typedef struct keys_call_t {
     /** Output slot for the BM25 scores of the keys, inside the arena, when the patterns carry weights. */
     float const* scores;
 
-    /** The bytes of the patterns, borrowed until the call finishes. */
-    ustore_py_contents_t patterns;
-
-    /** The patterns as bytes, `str` ones encoded to UTF-8, held until the call finishes, or NULL. */
-    PyObject* encoded;
+    /** The patterns, borrowed until the call finishes. */
+    ustore_py_texts_t patterns;
 
     /** One weight per pattern, copied, or NULL. */
     float* weights;
 
-    /** The filter as bytes, held until the call finishes, or NULL. */
-    PyObject* filter;
+    /** The JSONPath or XPath filter, borrowed until the call finishes. */
+    ustore_py_texts_t filter;
 } keys_call_t;
 
 static PyObject* keys_answer(void* erased) {
@@ -713,20 +710,11 @@ static void keys_release(void* erased) {
     keys_call_t* const call = (keys_call_t*)erased;
     ustore_py_keys_release(&call->starts);
     ustore_py_keys_release(&call->ends);
-    ustore_py_contents_release(&call->patterns);
-    Py_CLEAR(call->encoded);
-    Py_CLEAR(call->filter);
+    ustore_py_texts_release(&call->patterns);
+    ustore_py_texts_release(&call->filter);
     PyMem_Free(call->weights);
     call->weights = NULL;
     ustore_py_call_release(&call->call);
-}
-
-/** The bytes of @p object, a `str` encoded to UTF-8 or a bytes-like object as it is, as a new reference. */
-static PyObject* match_bytes(PyObject* object, char const* field) {
-    if (PyUnicode_Check(object)) return PyUnicode_AsUTF8String(object);
-    if (PyObject_CheckBuffer(object)) return Py_NewRef(object);
-    PyErr_Format(PyExc_TypeError, "The '%s' option takes str or bytes-like items, got %S", field, Py_TYPE(object));
-    return NULL;
 }
 
 /** Gathers into @p call what @p match names, borrowing its patterns, copying its weights and holding its filter until
@@ -735,22 +723,9 @@ static int match_fill(keys_call_t* call, scan_match_t const* match, ustore_patte
                       ustore_bytes_view_t* filter) {
     call->call.predicate.callable = Py_XNewRef(match->predicate);
     if (match->patterns) {
-        PyObject* const listed = PySequence_Tuple(match->patterns);
-        if (!listed) return -1;
-        Py_ssize_t const count = PyTuple_GET_SIZE(listed);
-        call->encoded = PyTuple_New(count);
-        for (Py_ssize_t index = 0; call->encoded && index != count; ++index) {
-            PyObject* const encoded = match_bytes(PyTuple_GET_ITEM(listed, index), "patterns");
-            if (!encoded) Py_CLEAR(call->encoded);
-            else PyTuple_SET_ITEM(call->encoded, index, encoded);
-        }
-        Py_DECREF(listed);
-        if (!call->encoded ||
-            ustore_py_contents_reserve(&call->patterns, (size_t)count, ustore_py_contents_per_task_k) != 0)
-            return -1;
-        for (Py_ssize_t index = 0; index != count; ++index)
-            if (ustore_py_contents_borrow(PyTuple_GET_ITEM(call->encoded, index), &call->patterns) != 0) return -1;
-        patterns->patterns = call->patterns.view;
+        if (ustore_py_texts_from_object(match->patterns, "patterns", NULL, NULL, &call->patterns) != 0) return -1;
+        Py_ssize_t const count = (Py_ssize_t)call->patterns.contents.count;
+        patterns->patterns = call->patterns.contents.view;
         patterns->count = (ustore_size_t)count;
         patterns->kind = (ustore_pattern_kind_t)match->kind;
         patterns->sensitivity = (ustore_case_sensitivity_t)match->sensitivity;
@@ -775,14 +750,10 @@ static int match_fill(keys_call_t* call, scan_match_t const* match, ustore_patte
         }
     }
     if (match->filter) {
-        call->filter = match_bytes(match->filter, "filter");
-        if (!call->filter) return -1;
-        Py_buffer view;
-        if (PyObject_GetBuffer(call->filter, &view, PyBUF_SIMPLE) != 0) return -1;
-        // The held object keeps the bytes in place, so the view outlives the released export
-        filter->data = (uint8_t const*)view.buf;
-        filter->length = (ustore_size_t)view.len;
-        PyBuffer_Release(&view);
+        if (ustore_py_texts_from_object(match->filter, "filter", NULL, NULL, &call->filter) != 0) return -1;
+        if (call->filter.contents.spread != ustore_py_contents_broadcast_k)
+            return ustore_py_raise(ustore_status_invalid_argument_k, "A scan takes one filter, not a sequence of them");
+        *filter = call->filter.contents.views[0];
     }
     return 0;
 }

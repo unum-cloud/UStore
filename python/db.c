@@ -438,7 +438,7 @@ static char const doc_Database_open_nvme[] =                                    
     "\n"                                                                                         //
     "Args:\n"                                                                                    //
     "  manifest (str | bytes | PathLike): The manifest, <database>.ustore.json in an existing\n" //
-    "    directory, or the raw address of the database's first slot, like /dev/nvme0n1@64GiB.\n" //
+    "    directory, or the raw extent its first slot opens, like /dev/nvme0n1@64GiB+16GiB.\n"    //
     "  executor (Executor, optional): The executor the open blocks on, or None to open on\n"     //
     "    the calling thread.\n"                                                                  //
     "  data_directories (Sequence): Further data directories runs land on, each a path or a\n"   //
