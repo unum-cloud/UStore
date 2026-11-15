@@ -464,12 +464,12 @@ std::size_t database_failed_reports_zeroed(config_t const& config) {
     failures += expect_failure(outcome);
     failures += expect(collection == ustore_collection_id_t {});
 
-    // An executor pinned to a CPU class no build names is never made
+    // An executor pinned to a CPU class UStore lacks, here amd-genoa's id, is never made
     ustore_executor_t executor = reinterpret_cast<ustore_executor_t>(stale_handle);
     ustore_executor_for_ram_t spawn {.executor = &executor,
                                      .outcome = &outcome,
                                      .threads = 1,
-                                     .cpu_class = static_cast<ustore_cpu_class_t>(1 << 20)};
+                                     .cpu_class = static_cast<ustore_cpu_class_t>(7)};
     ustore_executor_for_ram(&spawn);
     failures += expect_status(outcome, status_code_t::invalid_argument_k);
     failures += expect(executor == nullptr);
@@ -1345,7 +1345,7 @@ case_result_t database_find_at_snapshot(config_t const& config) {
     return failures;
 }
 
-/** Fails unless exactly @p count values below 64 have a spelling, each reading back as its value,
+/** Fails unless exactly @p count values of a byte have a spelling, each reading back as its value,
  *  while a name no enumerator carries is refused and leaves the output as it was. */
 template <typename enum_type_>
 std::size_t expect_spellings(char const* (*name_of)(enum_type_),
@@ -1355,7 +1355,7 @@ std::size_t expect_spellings(char const* (*name_of)(enum_type_),
     enum_type_ read {};
     // Values no enumerator carries reach the library as a C caller passes them, never loaded as
     // the enum here
-    for (int value = 0; value != 64; ++value) {
+    for (int value = 0; value != 256; ++value) {
         std::string_view const name = name_of(static_cast<enum_type_>(value));
         if (name == "unrecognized") continue;
         ++spelled;
@@ -1383,7 +1383,7 @@ std::size_t status_names(config_t const&) {
  *  rest. */
 std::size_t closed_set_names(config_t const&) {
     std::size_t failures = 0;
-    failures += expect_spellings(ustore_cpu_class_name, ustore_cpu_class_from_name, 11);
+    failures += expect_spellings(ustore_cpu_class_name, ustore_cpu_class_from_name, 12);
     failures += expect_spellings(ustore_gpu_vendor_name, ustore_gpu_vendor_from_name, 2);
     failures += expect_spellings(ustore_gpu_class_name, ustore_gpu_class_from_name, 8);
     failures += expect_spellings(ustore_mood_name, ustore_mood_from_name, 2);

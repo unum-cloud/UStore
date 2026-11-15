@@ -102,17 +102,12 @@ constexpr enumerator_spelling<ustore_predicate_cost_t> predicate_cost_names_k[] 
 
 /** The canonical spelling of every CPU class, as UCall spells its classes. */
 constexpr enumerator_spelling<ustore_cpu_class_t> cpu_class_names_k[] {
-    {ustore_cpu_class_unknown_k, "automatic"},
-    {ustore_cpu_class_serial_k, "serial"},
-    {ustore_cpu_class_intel_haswell_k, "intel-haswell"},
-    {ustore_cpu_class_intel_sierra_k, "intel-sierra"},
-    {ustore_cpu_class_intel_skylake_k, "intel-skylake"},
-    {ustore_cpu_class_intel_icelake_k, "intel-icelake"},
-    {ustore_cpu_class_aws_g2_k, "aws-g2"},
-    {ustore_cpu_class_apple_m2_k, "apple-m2"},
-    {ustore_cpu_class_aws_g5_k, "aws-g5"},
-    {ustore_cpu_class_alibaba_c930_k, "alibaba-c930"},
-    {ustore_cpu_class_monoversioned_k, "monoversioned"},
+    {ustore_cpu_class_unknown_k, "automatic"},           {ustore_cpu_class_serial_k, "serial"},
+    {ustore_cpu_class_monoversioned_k, "monoversioned"}, {ustore_cpu_class_intel_haswell_k, "intel-haswell"},
+    {ustore_cpu_class_intel_sierra_k, "intel-sierra"},   {ustore_cpu_class_intel_skylake_k, "intel-skylake"},
+    {ustore_cpu_class_intel_icelake_k, "intel-icelake"}, {ustore_cpu_class_aws_g2_k, "aws-g2"},
+    {ustore_cpu_class_apple_m2_k, "apple-m2"},           {ustore_cpu_class_aws_g5_k, "aws-g5"},
+    {ustore_cpu_class_alibaba_c930_k, "alibaba-c930"},   {ustore_cpu_class_ibm_power10_k, "ibm-power10"},
 };
 
 /** The canonical spelling of every transport. */

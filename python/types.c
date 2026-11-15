@@ -1857,8 +1857,8 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
     [ustore_py_enum_change_kind_k] = "ChangeKind",
 };
 
-/** Every enumerator of every closed set lies below this, as the C suite checks, so a walk up to it finds them all. */
-enum { enum_values_limit_k = 64 };
+/** Every enumerator of every closed set fits a byte, as the C suite checks, so walks find all. */
+enum { enum_values_limit_k = 256 };
 
 /** What the C `_name` functions answer for a value no enumerator carries. */
 static char const enum_unrecognized_k[] = "unrecognized";

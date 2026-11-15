@@ -19,6 +19,7 @@
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::bad_alloc`, `std::nothrow`
+#include <string_view> // `std::string_view` - a pinned class checked against its spelling
 #include <thread>      // `std::thread::id`
 #include <type_traits> // `std::is_same_v`, `std::conditional_t`
 #include <utility>     // `std::forward`
@@ -757,46 +758,53 @@ struct cpu_ceiling_t {
 enum class cpu_class_t : std::uint32_t {
 
     /** The zero value, which names no class. */
-    unknown_k = 0,
+    unknown_k = ustore_cpu_class_unknown_k,
 
     /** The portable floor: standard atomics, spinning on the hint every core of its architecture
      *  carries, @c PAUSE or @c YIELD, and yielding to the scheduler elsewhere. */
-    serial_k,
-
-    /** Haswell-class x86: the @c serial_k waits and atomics, and AVX2 string kernels. */
-    intel_haswell_k,
-
-    /** Sierra Forest-class x86 - the E-core Xeons, and Diamond Rapids after them: @c TPAUSE waits
-     *  and @c CMPCCXADD conditional adds. */
-    intel_sierra_k,
-
-    /** Skylake-class x86 servers: AVX-512 string kernels over the @c intel_haswell_k
-     *  waits and atomics. */
-    intel_skylake_k,
-
-    /** Ice Lake-class x86 servers: the @c intel_skylake_k kernels widened by VBMI2 and SHA-NI. */
-    intel_icelake_k,
-
-    /** Graviton2-class Arm - Neoverse N1: the @c serial_k waits and atomics, and
-     *  NEON string kernels. */
-    aws_g2_k,
-
-    /** Armv8.3+ Arm, named for Apple M2: single-instruction LSE read-modify-writes under
-     *  RCpc acquiring loads. */
-    apple_m2_k,
-
-    /** Graviton3-class Arm and newer: the @c apple_m2_k atomics with @c WFE waits. */
-    aws_g5_k,
-
-    /** RVA23-class RISC-V, named for Alibaba's C930: @c WRS waits, Zacas compare-and-swaps and
-     *  RVV string kernels. */
-    alibaba_c930_k,
+    serial_k = ustore_cpu_class_serial_k,
 
     /** The one class of a monoversioned build: the waiter, atomic reference and
      *  string kernels @c USTORE_MARCH implies or a preset vouches for, as the
      *  libraries compiled them. */
-    monoversioned_k,
+    monoversioned_k = ustore_cpu_class_monoversioned_k,
+
+    /** Haswell-class x86: the @c serial_k waits and atomics, and AVX2 string kernels. */
+    intel_haswell_k = ustore_cpu_class_intel_haswell_k,
+
+    /** Sierra Forest-class x86 - the E-core Xeons, and Diamond Rapids after them: @c TPAUSE waits
+     *  and @c CMPCCXADD conditional adds. */
+    intel_sierra_k = ustore_cpu_class_intel_sierra_k,
+
+    /** Skylake-class x86 servers: AVX-512 string kernels over the @c intel_haswell_k
+     *  waits and atomics. */
+    intel_skylake_k = ustore_cpu_class_intel_skylake_k,
+
+    /** Ice Lake-class x86 servers: the @c intel_skylake_k kernels widened by VBMI2 and SHA-NI. */
+    intel_icelake_k = ustore_cpu_class_intel_icelake_k,
+
+    /** Graviton2-class Arm - Neoverse N1: the @c serial_k waits and atomics, and
+     *  NEON string kernels. */
+    aws_g2_k = ustore_cpu_class_aws_g2_k,
+
+    /** Armv8.3+ Arm, named for Apple M2: single-instruction LSE read-modify-writes under
+     *  RCpc acquiring loads. */
+    apple_m2_k = ustore_cpu_class_apple_m2_k,
+
+    /** Graviton3-class Arm and newer: the @c apple_m2_k atomics with @c WFE waits. */
+    aws_g5_k = ustore_cpu_class_aws_g5_k,
+
+    /** RVA23-class RISC-V, named for Alibaba's C930: @c WRS waits, Zacas compare-and-swaps and
+     *  RVV string kernels. */
+    alibaba_c930_k = ustore_cpu_class_alibaba_c930_k,
+
+    /** POWER10-class Power, ISA 3.1: @c pause_short waits, ISA 3.0 store atomics and Power VSX
+     *  string kernels. */
+    ibm_power10_k = ustore_cpu_class_ibm_power10_k,
 };
+
+static_assert(ustore_cpu_class_serial_k == 1 && ustore_cpu_class_monoversioned_k == 2 &&
+              ustore_cpu_class_ibm_power10_k == 18);
 
 /** The class a refused rung degrades to - the next one down its own lineage, which is the class a
  *  variant must be distinct from to earn instantiation. */
@@ -869,6 +877,12 @@ struct waiter_for_cpu_class<cpu_class_t::alibaba_c930_k> {
     using type = fu::riscv64_wrs_t;
 };
 #endif
+#if FORKUNION_TARGET_PPC64_PAUSE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::ibm_power10_k> {
+    using type = fu::ppc64_pause_t;
+};
+#endif
 #if USTORE_TARGET_MONOVERSIONED
 template <>
 struct waiter_for_cpu_class<cpu_class_t::monoversioned_k> {
@@ -926,6 +940,13 @@ struct atomic_ref_for_cpu_class<cpu_class_t::alibaba_c930_k> {
     using type = fu::riscv64_zacas_atomic_ref<value_type_>;
 };
 #endif
+#if FORKUNION_TARGET_PPC64_AMO
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::ibm_power10_k> {
+    template <typename value_type_>
+    using type = fu::ppc64_amo_atomic_ref<value_type_>;
+};
+#endif
 #if USTORE_TARGET_MONOVERSIONED
 template <>
 struct atomic_ref_for_cpu_class<cpu_class_t::monoversioned_k> {
@@ -939,10 +960,10 @@ struct atomic_ref_for_cpu_class<cpu_class_t::monoversioned_k> {
 template <cpu_class_t cpu_class_, typename value_type_>
 using atomic_ref_of = typename atomic_ref_for_cpu_class<cpu_class_>::template type<value_type_>;
 
-/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause: the runtime
- *  confirms nothing about them. */
+/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause and Power's
+ *  priority nops: the runtime confirms nothing about them. */
 inline constexpr fu::capabilities_t baseline_hints_k = fu::capability_x86_pause_k | fu::capability_arm64_yield_k |
-                                                       fu::capability_riscv64_pause_k;
+                                                       fu::capability_riscv64_pause_k | fu::capability_ppc64_yield_k;
 
 /** Lowers one CPU class onto ForkUnion's mask - the bits the runtime must confirm before the
  *  class's waiter and atomic reference are trusted, read off the two types themselves. */
@@ -984,6 +1005,9 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
 #if USTORE_TARGET_ALIBABA_C930
     case cpu_class_t::alibaba_c930_k: return true;
 #endif
+#if USTORE_TARGET_IBM_POWER10
+    case cpu_class_t::ibm_power10_k: return true;
+#endif
 #if USTORE_TARGET_MONOVERSIONED
     case cpu_class_t::monoversioned_k: return true;
 #endif
@@ -1003,6 +1027,7 @@ constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu_class) no
     case cpu_class_t::apple_m2_k: return forkunion_capabilities_of<cpu_class_t::apple_m2_k>();
     case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
     case cpu_class_t::alibaba_c930_k: return forkunion_capabilities_of<cpu_class_t::alibaba_c930_k>();
+    case cpu_class_t::ibm_power10_k: return forkunion_capabilities_of<cpu_class_t::ibm_power10_k>();
     case cpu_class_t::monoversioned_k: return forkunion_capabilities_of<cpu_class_t::monoversioned_k>();
     default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
     }
@@ -1023,6 +1048,7 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu_class) noe
     case cpu_class_t::apple_m2_k:
     case cpu_class_t::aws_g5_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
     case cpu_class_t::alibaba_c930_k: return sz_cap_serial_k | sz_cap_rvv_k;
+    case cpu_class_t::ibm_power10_k: return sz_cap_serial_k | sz_cap_powervsx_k;
     case cpu_class_t::monoversioned_k: return sz_capabilities_compiled_cpu_mask();
     default: return sz_cap_serial_k;
     }
@@ -1044,6 +1070,7 @@ constexpr st::row_kit_t row_kit_kind_of(cpu_class_t cpu_class) noexcept {
     case cpu_class_t::apple_m2_k:
     case cpu_class_t::aws_g5_k: return st::row_kit_t::neon_k;
     case cpu_class_t::alibaba_c930_k: return st::row_kit_t::rvv_k;
+    case cpu_class_t::ibm_power10_k: return st::row_kit_t::powervsx_k;
     case cpu_class_t::monoversioned_k: return st::native_row_kit_t::kit_k;
     default: return st::row_kit_t::serial_k;
     }
@@ -1067,7 +1094,7 @@ struct compiled_row_kit<kit_, floor_type_, head_type_, tail_types_...> {
 template <cpu_class_t cpu_class_>
 using row_kit_of = typename compiled_row_kit<row_kit_kind_of(cpu_class_), st::serial_row_kit_t, st::icelake_row_kit_t,
                                              st::skylake_row_kit_t, st::haswell_row_kit_t, st::neon_row_kit_t,
-                                             st::rvv_row_kit_t, st::native_row_kit_t>::type;
+                                             st::rvv_row_kit_t, st::powervsx_row_kit_t, st::native_row_kit_t>::type;
 
 /** Whether one compiled class is distinct from the class it degrades to: another strings kit,
  *  waiter or atomic reference, the one fact justifying its variant. */
@@ -1079,16 +1106,6 @@ consteval bool rung_advances() noexcept {
             !std::is_same_v<waiter_of<cpu_class_>, waiter_of<parent_k>> ||
             !std::is_same_v<atomic_ref_of<cpu_class_, std::uint32_t>, atomic_ref_of<parent_k, std::uint32_t>>);
 }
-
-/** The C enum's class as the engines name it; @c ustore_cpu_class_unknown_k derives nothing, so it
- *  names the serial floor. */
-constexpr cpu_class_t cpu_class_of(ustore_cpu_class_t cpu_class) noexcept {
-    if (cpu_class == ustore_cpu_class_unknown_k || cpu_class > ustore_cpu_class_monoversioned_k)
-        return cpu_class_t::serial_k;
-    return static_cast<cpu_class_t>(cpu_class);
-}
-
-static_assert(static_cast<std::uint32_t>(cpu_class_t::monoversioned_k) == ustore_cpu_class_monoversioned_k);
 
 /** Whether @p rung fits under @p ceiling: its waiter, atomics and string kernels need nothing
  *  the ceiling lacks. */
@@ -1115,9 +1132,10 @@ struct cpu_ladder {};
 using cpu_ladder_t = cpu_ladder<cpu_class_t::monoversioned_k>;
 inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::monoversioned_k;
 #else
-using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_sierra_k,
-                                cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::apple_m2_k,
-                                cpu_class_t::aws_g2_k, cpu_class_t::alibaba_c930_k, cpu_class_t::serial_k>;
+using cpu_ladder_t =
+    cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_sierra_k,
+               cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::apple_m2_k, cpu_class_t::aws_g2_k,
+               cpu_class_t::alibaba_c930_k, cpu_class_t::ibm_power10_k, cpu_class_t::serial_k>;
 inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::serial_k;
 #endif
 
@@ -1129,10 +1147,10 @@ inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t pinned) noexc
     cpu_ceiling_t ceiling;
     if (sz_capabilities_detected_cpu(&ceiling.strings) != sz_success_k) ceiling.strings = sz_cap_serial_k;
     ceiling.sync = fu::cpu_capabilities();
-    if (pinned > ustore_cpu_class_monoversioned_k)
+    if (std::string_view {ustore_cpu_class_name(pinned)} == "unrecognized")
         return status_t {status_code_t::invalid_argument_k, "Unknown CPU class"};
     if (pinned != ustore_cpu_class_unknown_k) {
-        cpu_class_t const pinned_class = cpu_class_of(pinned);
+        cpu_class_t const pinned_class = static_cast<cpu_class_t>(pinned);
         cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
         if ((ceiling.strings & wanted.strings) != wanted.strings || (ceiling.sync & wanted.sync) != wanted.sync)
             return status_t {status_code_t::unsupported_k, "The CPU does not run the pinned class"};

@@ -233,6 +233,15 @@ ustore_cpu_class(
     riscv64_zacas
     rvv
 )
+ustore_cpu_class(
+    ibm_power10
+    IBM_POWER10
+    OVER
+    serial
+    ppc64_pause
+    ppc64_amo
+    powervsx
+)
 
 # A monoversioned build compiles one class: every capability StringZilla and ForkUnion enabled, which is what
 # `USTORE_MARCH` implies plus what a preset vouches for.

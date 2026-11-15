@@ -163,15 +163,16 @@ class CPUClass(IntEnum):
 
     AUTOMATIC = 0
     SERIAL = 1
-    INTEL_HASWELL = 2
-    INTEL_SIERRA = 3
-    INTEL_SKYLAKE = 4
-    INTEL_ICELAKE = 5
-    AWS_G2 = 6
-    APPLE_M2 = 7
-    AWS_G5 = 8
-    ALIBABA_C930 = 9
-    MONOVERSIONED = 10
+    MONOVERSIONED = 2
+    INTEL_HASWELL = 3
+    INTEL_SIERRA = 4
+    INTEL_SKYLAKE = 5
+    INTEL_ICELAKE = 6
+    AWS_G2 = 12
+    APPLE_M2 = 13
+    AWS_G5 = 15
+    ALIBABA_C930 = 17
+    IBM_POWER10 = 18
 
 class Transport(IntEnum):
     """How the NVMe engine moves bytes between its files and memory, valued as `ustore_transport_t`."""
@@ -224,9 +225,9 @@ class GPUClass(IntEnum):
     NVIDIA_HOPPER = 3
     NVIDIA_BLACKWELL = 4
     NVIDIA_BLACKWELLRTX = 5
-    AMD_CDNA3 = 6
-    AMD_CDNA4 = 7
-    AMD_CDNA5 = 8
+    AMD_CDNA3 = 7
+    AMD_CDNA4 = 8
+    AMD_CDNA5 = 9
 
 class Engine(IntEnum):
     """The engine serving a database, as `describe()` reports it, valued as `ustore_engine_t`."""

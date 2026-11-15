@@ -40,6 +40,9 @@ extern template struct nvme_variant<cpu_class_t::aws_g2_k>;
 #if USTORE_TARGET_ALIBABA_C930
 extern template struct nvme_variant<cpu_class_t::alibaba_c930_k>;
 #endif // USTORE_TARGET_ALIBABA_C930
+#if USTORE_TARGET_IBM_POWER10
+extern template struct nvme_variant<cpu_class_t::ibm_power10_k>;
+#endif // USTORE_TARGET_IBM_POWER10
 #if USTORE_TARGET_SERIAL
 extern template struct nvme_variant<cpu_class_t::serial_k>;
 #endif // USTORE_TARGET_SERIAL

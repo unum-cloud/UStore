@@ -340,6 +340,65 @@ jobs:
       - name: Test
         run: ctest --preset tsan
 
+  # StringZilla's RVV kernels need Clang 21 or newer, and apt.llvm.org publishes Clang 23 for Trixie. The toolchain's
+  # `max` core runs both the C930 class and serial.
+  test_qemu_riscv:
+    name: Test RISC-V under QEMU
+    runs-on: ubuntu-26.04
+    container: debian:trixie
+    timeout-minutes: 120
+    steps:
+      # `git` must precede `actions/checkout`, or it falls back to the tarball API.
+      - name: Install Dependencies
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
+            cmake ninja-build qemu-user gcc-riscv64-linux-gnu g++-riscv64-linux-gnu libc6-dev-riscv64-cross
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main" \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update
+          apt-get install -y clang-23 lld-23 llvm-23
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --recursive
+      - name: Configure
+        run: cmake --preset linux_riscv64
+      - name: Build
+        run: cmake --build --preset linux_riscv64
+      - name: Test
+        run: ctest --preset linux_riscv64
+
+  # POWER9 Power VSX kernels scope per function only from GCC 15 on, which Ubuntu 26.04 ships as a cross compiler. The
+  # toolchain's `power10` core runs both the POWER10 class and serial.
+  test_qemu_power:
+    name: Test POWER10 under QEMU
+    runs-on: ubuntu-26.04
+    container: ubuntu:26.04
+    timeout-minutes: 120
+    steps:
+      - name: Install Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates cmake ninja-build qemu-user \
+            gcc-15-powerpc64le-linux-gnu g++-15-powerpc64le-linux-gnu
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull Git Submodules
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --recursive
+      - name: Configure
+        run: cmake --preset linux_ppc64le
+      - name: Build
+        run: cmake --build --preset linux_ppc64le
+      - name: Test
+        run: ctest --preset linux_ppc64le
+
   # Each machine profile builds the libraries for one CPU and one GPU code; the Arm ones build natively on Arm runners,
   # where the CUDA image also exists. Clang 22 compiles the host units, as Ubuntu 24.04's GCC predates Olympus, and the
   # family codes like `100f` need CMake 3.31, where Ubuntu 24.04 ships 3.28. The siblings come from their pins.

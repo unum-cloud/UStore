@@ -250,6 +250,29 @@
       }
     },
     {
+      "name": "cross",
+      "hidden": true,
+      "inherits": ["base", "linux"],
+      "description": "The suites over the RAM and NVMe engines, cross-compiled and statically linked; their tests run under the QEMU user-mode emulator the toolchain file names.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_WITH_NVME": "ON"
+      }
+    },
+    {
+      "name": "linux_riscv64",
+      "inherits": "cross",
+      "displayName": "Linux RISC-V under QEMU",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-riscv64-llvm.cmake"
+    },
+    {
+      "name": "linux_ppc64le",
+      "inherits": "cross",
+      "displayName": "Linux POWER under QEMU",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-ppc64le-gnu.cmake"
+    },
+    {
       "name": "machine",
       "hidden": true,
       "inherits": ["llvm", "linux"],
@@ -415,6 +438,8 @@
     { "name": "android_arm64", "configurePreset": "android_arm64", "jobs": 0 },
     { "name": "wasm32_emscripten", "configurePreset": "wasm32_emscripten", "jobs": 0 },
     { "name": "wasm64_emscripten", "configurePreset": "wasm64_emscripten", "jobs": 0 },
+    { "name": "linux_riscv64", "configurePreset": "linux_riscv64", "jobs": 0 },
+    { "name": "linux_ppc64le", "configurePreset": "linux_ppc64le", "jobs": 0 },
     { "name": "xeon4_hopper", "configurePreset": "xeon4_hopper", "jobs": 0 },
     { "name": "xeon6_blackwell", "configurePreset": "xeon6_blackwell", "jobs": 0 },
     { "name": "grace_hopper", "configurePreset": "grace_hopper", "jobs": 0 },
@@ -469,6 +494,8 @@
       "inherits": "base",
       "configurePreset": "cuda"
     },
+    { "name": "linux_riscv64", "inherits": "base", "configurePreset": "linux_riscv64" },
+    { "name": "linux_ppc64le", "inherits": "base", "configurePreset": "linux_ppc64le" },
     { "name": "msvc2026_x64", "inherits": "base", "configurePreset": "msvc2026_x64", "configuration": "Release" },
     { "name": "msvc2026_arm64", "inherits": "base", "configurePreset": "msvc2026_arm64", "configuration": "Release" }
   ],

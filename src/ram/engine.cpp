@@ -66,6 +66,10 @@ extern template struct ram_variant<cpu_class_t::aws_g2_k, isolation_t::strict_se
 extern template struct ram_variant<cpu_class_t::alibaba_c930_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::alibaba_c930_k, isolation_t::strict_serializable_k>;
 #endif // USTORE_TARGET_ALIBABA_C930
+#if USTORE_TARGET_IBM_POWER10
+extern template struct ram_variant<cpu_class_t::ibm_power10_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::ibm_power10_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_IBM_POWER10
 #if USTORE_TARGET_SERIAL
 extern template struct ram_variant<cpu_class_t::serial_k, isolation_t::snapshot_k>;
 extern template struct ram_variant<cpu_class_t::serial_k, isolation_t::strict_serializable_k>;

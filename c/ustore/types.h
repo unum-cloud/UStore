@@ -615,35 +615,48 @@ typedef enum ustore_cpu_class_t {
     /** Whatever the running CPU offers. */
     ustore_cpu_class_unknown_k = 0,
 
+    // Portable
+
     /** The portable floor every CPU runs. */
-    ustore_cpu_class_serial_k,
+    ustore_cpu_class_serial_k = 1,
+
+    /** The one class of a monoversioned build, whatever its floor implies or its preset says. */
+    ustore_cpu_class_monoversioned_k = 2,
+
+    // x86
 
     /** x86 cores from Intel Haswell on. */
-    ustore_cpu_class_intel_haswell_k,
+    ustore_cpu_class_intel_haswell_k = 3,
 
     /** x86 efficiency cores from Intel Sierra Forest on. */
-    ustore_cpu_class_intel_sierra_k,
+    ustore_cpu_class_intel_sierra_k = 4,
 
     /** x86 server cores from Intel Skylake on. */
-    ustore_cpu_class_intel_skylake_k,
+    ustore_cpu_class_intel_skylake_k = 5,
 
     /** x86 server cores from Intel Ice Lake on. */
-    ustore_cpu_class_intel_icelake_k,
+    ustore_cpu_class_intel_icelake_k = 6,
+
+    // Arm
 
     /** Arm cores from AWS Graviton 2 on. */
-    ustore_cpu_class_aws_g2_k,
+    ustore_cpu_class_aws_g2_k = 12,
 
     /** Arm cores from Apple M2 on. */
-    ustore_cpu_class_apple_m2_k,
+    ustore_cpu_class_apple_m2_k = 13,
 
     /** Arm server cores from AWS Graviton 5 on. */
-    ustore_cpu_class_aws_g5_k,
+    ustore_cpu_class_aws_g5_k = 15,
+
+    // RISC-V
 
     /** RISC-V cores with RVV, Zawrs and Zacas, from Alibaba's C930 on. */
-    ustore_cpu_class_alibaba_c930_k,
+    ustore_cpu_class_alibaba_c930_k = 17,
 
-    /** The one class of a monoversioned build, whatever its floor implies or its preset vouches for. */
-    ustore_cpu_class_monoversioned_k,
+    // Power
+
+    /** Power cores with VSX, ISA 3.0 store atomics and @c pause_short waits, from POWER10 on. */
+    ustore_cpu_class_ibm_power10_k = 18,
 
 } ustore_cpu_class_t;
 
@@ -896,6 +909,8 @@ typedef enum ustore_gpu_class_t {
     /** No class, which no listed device carries. */
     ustore_gpu_class_unknown_k = 0,
 
+    // NVIDIA
+
     /** Ampere-class NVIDIA and every NVIDIA GPU without a class of its own - A100, A10 & RTX 30. */
     ustore_gpu_class_nvidia_ampere_k = 1,
 
@@ -911,14 +926,16 @@ typedef enum ustore_gpu_class_t {
     /** Consumer Blackwell NVIDIA - RTX 50, RTX PRO 6000 & DGX Spark. */
     ustore_gpu_class_nvidia_blackwellrtx_k = 5,
 
+    // AMD
+
     /** CDNA3 AMD - MI300X & MI325X, gfx942. */
-    ustore_gpu_class_amd_cdna3_k = 6,
+    ustore_gpu_class_amd_cdna3_k = 7,
 
     /** CDNA4 AMD - MI350X & MI355X, gfx950. */
-    ustore_gpu_class_amd_cdna4_k = 7,
+    ustore_gpu_class_amd_cdna4_k = 8,
 
     /** CDNA5 AMD - MI400, gfx1250. */
-    ustore_gpu_class_amd_cdna5_k = 8,
+    ustore_gpu_class_amd_cdna5_k = 9,
 
 } ustore_gpu_class_t;
 

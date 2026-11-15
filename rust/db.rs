@@ -2001,34 +2001,34 @@ impl FromStr for GPUVendor {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum GPUClass {
     /// Ampere-class NVIDIA and every NVIDIA GPU without a class of its own - A100, A10 & RTX 30.
-    NvidiaAmpere = 1,
+    NVIDIAAmpere = 1,
     /// Ada-class NVIDIA - L4, L40S & RTX 40.
-    NvidiaAda = 2,
+    NVIDIAAda = 2,
     /// Hopper-class NVIDIA - H100 & H200.
-    NvidiaHopper = 3,
+    NVIDIAHopper = 3,
     /// Blackwell-class NVIDIA - B200, B300 & GB300.
-    NvidiaBlackwell = 4,
+    NVIDIABlackwell = 4,
     /// Consumer Blackwell NVIDIA - RTX 50, RTX PRO 6000 & DGX Spark.
-    NvidiaBlackwellRTX = 5,
+    NVIDIABlackwellRTX = 5,
     /// CDNA3 AMD - MI300X & MI325X.
-    AmdCDNA3 = 6,
+    AMDCDNA3 = 7,
     /// CDNA4 AMD - MI350X & MI355X.
-    AmdCDNA4 = 7,
+    AMDCDNA4 = 8,
     /// CDNA5 AMD - MI400.
-    AmdCDNA5 = 8,
+    AMDCDNA5 = 9,
 }
 
 impl GPUClass {
     fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
         match raw {
-            1 => Some(GPUClass::NvidiaAmpere),
-            2 => Some(GPUClass::NvidiaAda),
-            3 => Some(GPUClass::NvidiaHopper),
-            4 => Some(GPUClass::NvidiaBlackwell),
-            5 => Some(GPUClass::NvidiaBlackwellRTX),
-            6 => Some(GPUClass::AmdCDNA3),
-            7 => Some(GPUClass::AmdCDNA4),
-            8 => Some(GPUClass::AmdCDNA5),
+            1 => Some(GPUClass::NVIDIAAmpere),
+            2 => Some(GPUClass::NVIDIAAda),
+            3 => Some(GPUClass::NVIDIAHopper),
+            4 => Some(GPUClass::NVIDIABlackwell),
+            5 => Some(GPUClass::NVIDIABlackwellRTX),
+            7 => Some(GPUClass::AMDCDNA3),
+            8 => Some(GPUClass::AMDCDNA4),
+            9 => Some(GPUClass::AMDCDNA5),
             _ => None,
         }
     }
@@ -2124,39 +2124,42 @@ pub fn gpu_devices() -> Result<Vec<GPUDevice>> {
 pub enum CPUClass {
     /// Portable kernels that run on any CPU.
     Serial = 1,
-    /// x86 cores from Intel Haswell on.
-    IntelHaswell = 2,
-    /// x86 efficiency cores from Intel Sierra Forest on.
-    IntelSierra = 3,
-    /// x86 server cores from Intel Skylake on.
-    IntelSkylake = 4,
-    /// x86 server cores from Intel Ice Lake on.
-    IntelIcelake = 5,
-    /// Arm cores from AWS Graviton 2 on.
-    AWSG2 = 6,
-    /// Arm cores from Apple M2 on.
-    AppleM2 = 7,
-    /// Arm server cores from AWS Graviton 5 on.
-    AWSG5 = 8,
-    /// RISC-V cores with RVV, Zawrs and Zacas, from Alibaba's C930 on.
-    AlibabaC930 = 9,
     /// The one class of a monoversioned build.
-    Monoversioned = 10,
+    Monoversioned = 2,
+    /// x86 cores from Intel Haswell on.
+    IntelHaswell = 3,
+    /// x86 efficiency cores from Intel Sierra Forest on.
+    IntelSierra = 4,
+    /// x86 server cores from Intel Skylake on.
+    IntelSkylake = 5,
+    /// x86 server cores from Intel Ice Lake on.
+    IntelIcelake = 6,
+    /// Arm cores from AWS Graviton 2 on.
+    AWSG2 = 12,
+    /// Arm cores from Apple M2 on.
+    AppleM2 = 13,
+    /// Arm server cores from AWS Graviton 5 on.
+    AWSG5 = 15,
+    /// RISC-V cores with RVV, Zawrs and Zacas, from Alibaba's C930 on.
+    AlibabaC930 = 17,
+    /// Power cores with VSX, ISA 3.0 store atomics and `pause_short` waits, from IBM's POWER10 on.
+    IBMPower10 = 18,
 }
 
 impl CPUClass {
     fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
         match raw {
             1 => Some(CPUClass::Serial),
-            2 => Some(CPUClass::IntelHaswell),
-            3 => Some(CPUClass::IntelSierra),
-            4 => Some(CPUClass::IntelSkylake),
-            5 => Some(CPUClass::IntelIcelake),
-            6 => Some(CPUClass::AWSG2),
-            7 => Some(CPUClass::AppleM2),
-            8 => Some(CPUClass::AWSG5),
-            9 => Some(CPUClass::AlibabaC930),
-            10 => Some(CPUClass::Monoversioned),
+            2 => Some(CPUClass::Monoversioned),
+            3 => Some(CPUClass::IntelHaswell),
+            4 => Some(CPUClass::IntelSierra),
+            5 => Some(CPUClass::IntelSkylake),
+            6 => Some(CPUClass::IntelIcelake),
+            12 => Some(CPUClass::AWSG2),
+            13 => Some(CPUClass::AppleM2),
+            15 => Some(CPUClass::AWSG5),
+            17 => Some(CPUClass::AlibabaC930),
+            18 => Some(CPUClass::IBMPower10),
             _ => None,
         }
     }

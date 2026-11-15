@@ -244,24 +244,26 @@ struct CPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """Whatever the running CPU offers."""
     comptime SERIAL = Self(1)
     """The portable floor every CPU runs."""
-    comptime INTEL_HASWELL = Self(2)
-    """Intel and AMD x86 cores from Haswell on."""
-    comptime INTEL_SIERRA = Self(3)
-    """Intel x86 efficiency cores from Sierra Forest on."""
-    comptime INTEL_SKYLAKE = Self(4)
-    """Intel x86 server cores from Skylake on."""
-    comptime INTEL_ICELAKE = Self(5)
-    """Intel x86 server cores from Ice Lake on."""
-    comptime AWS_G2 = Self(6)
-    """Arm cores from AWS Graviton 2 on."""
-    comptime APPLE_M2 = Self(7)
-    """Arm cores from Apple M2 on."""
-    comptime AWS_G5 = Self(8)
-    """Arm server cores from AWS Graviton 5 on."""
-    comptime ALIBABA_C930 = Self(9)
-    """RISC-V cores with RVV, Zawrs and Zacas, from Alibaba's C930 on."""
-    comptime MONOVERSIONED = Self(10)
+    comptime MONOVERSIONED = Self(2)
     """The one class of a monoversioned build."""
+    comptime INTEL_HASWELL = Self(3)
+    """Intel and AMD x86 cores from Haswell on."""
+    comptime INTEL_SIERRA = Self(4)
+    """Intel x86 efficiency cores from Sierra Forest on."""
+    comptime INTEL_SKYLAKE = Self(5)
+    """Intel x86 server cores from Skylake on."""
+    comptime INTEL_ICELAKE = Self(6)
+    """Intel x86 server cores from Ice Lake on."""
+    comptime AWS_G2 = Self(12)
+    """Arm cores from AWS Graviton 2 on."""
+    comptime APPLE_M2 = Self(13)
+    """Arm cores from Apple M2 on."""
+    comptime AWS_G5 = Self(15)
+    """Arm server cores from AWS Graviton 5 on."""
+    comptime ALIBABA_C930 = Self(17)
+    """RISC-V cores with RVV, Zawrs and Zacas, from Alibaba's C930 on."""
+    comptime IBM_POWER10 = Self(18)
+    """Power cores with VSX, ISA 3.0 store atomics and `pause_short` waits, from IBM's POWER10 on."""
 
 
 @fieldwise_init
@@ -328,11 +330,11 @@ struct GPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """Blackwell-class NVIDIA datacenter parts."""
     comptime NVIDIA_BLACKWELLRTX = Self(5)
     """Consumer Blackwell NVIDIA."""
-    comptime AMD_CDNA3 = Self(6)
+    comptime AMD_CDNA3 = Self(7)
     """CDNA3 AMD, gfx942."""
-    comptime AMD_CDNA4 = Self(7)
+    comptime AMD_CDNA4 = Self(8)
     """CDNA4 AMD, gfx950."""
-    comptime AMD_CDNA5 = Self(8)
+    comptime AMD_CDNA5 = Self(9)
     """CDNA5 AMD, gfx1250."""
 
 
