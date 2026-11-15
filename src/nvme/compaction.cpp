@@ -75,13 +75,12 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
         described = strings_merge_run {heads + first, offsets + offsets_at, keys + keys_at, nullptr, nullptr, first,
                                        count};
         std::size_t const stamps_bytes = view.stamps->saved_bytes();
-        if (view.stamps->save({reinterpret_cast<std::byte*>(host_saved + saved_at), stamps_bytes}) !=
-            status_t::success_k)
+        if (view.stamps->save({reinterpret_cast<byte_t*>(host_saved + saved_at), stamps_bytes}) != status_t::success_k)
             return status_t::invalid_argument_k;
         described.saved_stamps = saved + saved_at;
         saved_at += stamps_bytes / sizeof(std::uint64_t);
         std::size_t const kinds_bytes = view.kinds->saved_bytes();
-        if (view.kinds->save({reinterpret_cast<std::byte*>(host_saved + saved_at), kinds_bytes}) != status_t::success_k)
+        if (view.kinds->save({reinterpret_cast<byte_t*>(host_saved + saved_at), kinds_bytes}) != status_t::success_k)
             return status_t::invalid_argument_k;
         described.saved_kinds = saved + saved_at;
         saved_at += kinds_bytes / sizeof(std::uint64_t);

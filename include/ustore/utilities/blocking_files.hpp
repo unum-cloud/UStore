@@ -240,7 +240,8 @@ inline int native_open_flags_of(file_access_t access) noexcept {
     case file_access_t::read_only_k: return O_RDONLY | O_CLOEXEC;
     case file_access_t::read_write_k: return O_RDWR | O_CLOEXEC;
     case file_access_t::create_read_write_k: return O_RDWR | O_CREAT | O_CLOEXEC;
-    case file_access_t::truncate_read_write_k: return O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC;
+    // Only temporaries are truncated, and a link planted in their place must empty no file
+    case file_access_t::truncate_read_write_k: return O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC;
     }
     return O_RDONLY | O_CLOEXEC;
 }
@@ -961,7 +962,7 @@ inline expected<std::uint64_t> free_bytes_of(char const* directory) noexcept {
 #endif
 
 /** What @c link_or_copy_file did to land a file at its target. */
-enum class file_landing_t : unsigned char {
+enum class file_landing_t : std::uint8_t {
     linked_k,
     copied_k,
 };

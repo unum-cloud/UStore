@@ -606,7 +606,7 @@ bool remove_partial_export(std::string const& path, ::rocksdb::Options const& op
 template <typename arguments_type_>
 status_t open_database(arguments_type_ const& arguments, access_t access) {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
-    if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
+    if (!names_path(arguments.directory)) return {status_code_t::invalid_argument_k, "A database needs a directory"};
     if (arguments.data_directories_count && !arguments.data_directories)
         return {status_code_t::invalid_argument_k, "Counted data directories are null"};
 
@@ -643,7 +643,7 @@ status_t open_database(arguments_type_ const& arguments, access_t access) {
     options.manual_wal_flush = false;
     for (ustore_data_directory_t const& directory :
          std::span {arguments.data_directories, static_cast<std::size_t>(arguments.data_directories_count)}) {
-        if (!directory.path.length) return {status_code_t::invalid_argument_k, "A data directory needs a path"};
+        if (!names_path(directory.path)) return {status_code_t::invalid_argument_k, "A data directory needs a path"};
         options.db_paths.push_back(
             {std::string(string_of(directory.path)), directory.max_bytes ? directory.max_bytes : UINT64_MAX});
     }

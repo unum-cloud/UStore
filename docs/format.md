@@ -119,7 +119,8 @@ On raw media the order is the one under Manifest Slot.
 ## Raw Slots
 
 A raw block device or SPDK namespace holds no filesystem, so a database claims it slot by slot.
-Slot `i` of a data directory spans the 1 GiB from `base + i × 1 GiB`, where the base is the address's `@` offset, as in `/dev/nvme0n1@64GiB`.
+Slot `i` of a data directory spans the 1 GiB from `base + i × 1 GiB`, where the base is the address's `@` offset and the length after its `+` bounds the slots, as in `/dev/nvme0n1@64GiB+16GiB`.
+A raw address without a length is refused: a database takes slots only inside the extent it was given, and never looks for free ones past it.
 The first logical block of every slot is its owner block, and runs start 4 KiB into the slot, past it on either block size.
 
 ```c
@@ -136,7 +137,8 @@ struct slot_owner_block_t {      // first logical block of every slot a database
 
 An owner block of all zeros means the slot is free.
 A block holding `USTORESL` with this database's ID means the slot is held.
-Anything else is foreign, and a mount skips it without trying to identify it, so two databases and other software can share a drive.
+Anything else is foreign, and a mount skips it without trying to identify it.
+Two databases and other software share a drive through disjoint extents, since a file of another format marks only the first slot it spans, and the slots after it may open with zeros.
 A mount reads one block per slot, frees every held slot the manifest does not name, and refuses a drive whose blocks name another position among the data directories.
 
 Runs of 512 MiB and above take a slot of their own.
@@ -145,7 +147,7 @@ A released slot's owner block is zeroed, and the slot is then handed back to the
 
 ## Manifest Slot
 
-The slot at data directory 0's base holds the manifest, so an address like `/dev/nvme0n1@64GiB` names the database and finding its manifest takes one read.
+The slot at data directory 0's base holds the manifest, so an address like `/dev/nvme0n1@64GiB+16GiB` names the database and finding its manifest takes one read.
 Past the owner block it keeps two JSON regions of equal size, and the owner block points at the one in force.
 
 A publication runs in two steps:

@@ -273,12 +273,12 @@ typedef enum ustore_engine_t {
 /** A directory the data files may occupy, with the bytes they may take there. */
 typedef struct ustore_data_directory_t {
 
-    /** The directory, which must exist; on NVMe also a raw device from a base, as in
-     *  @c /dev/nvme0n1@64GiB. */
+    /** The directory, which must exist; on NVMe also an extent of a raw device, as in
+     *  @c /dev/nvme0n1@64GiB+16GiB, whose length may come from @c max_bytes instead. */
     ustore_bytes_view_t path;
 
     /** Bytes the files may take there, zero being unlimited on RocksDB and the whole
-     *  medium on NVMe. */
+     *  directory on NVMe; a raw device is refused without a length here or in its path. */
     ustore_size_t max_bytes;
 
 } ustore_data_directory_t;
@@ -502,7 +502,8 @@ typedef struct ustore_database_open_nvme_t {
     ustore_completion_t completion;
 
     /** The manifest, <tt>\<database\>.ustore.json</tt>, whose directory must exist and holds the database's
-     *  first data directory, or the raw address of its first slot, as in @c /dev/nvme0n1@64GiB. */
+     *  first data directory, or the raw extent its first slot opens, like
+     *  @c /dev/nvme0n1@64GiB+16GiB. */
     ustore_bytes_view_t directory;
 
     /** Further data directories every run may land on, the one with the most free bytes taking

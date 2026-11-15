@@ -99,7 +99,7 @@ struct key_tails_column_t {
         if (offsets.empty()) return {};
         std::size_t const begin = offsets[static_cast<std::size_t>(position)];
         std::size_t const end = offsets[static_cast<std::size_t>(position) + 1];
-        return std::string_view {reinterpret_cast<char const*>(bytes.data()) + begin, end - begin};
+        return utilities::string_of(bytes.subspan(begin, end - begin));
     }
 };
 

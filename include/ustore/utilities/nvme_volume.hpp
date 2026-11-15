@@ -1092,8 +1092,11 @@ class basic_slotted_volume {
             refused = {status_code_t::unsupported_k, "A raw medium's logical block does not hold an owner block"};
         else if (medium.base % medium.block_bytes != 0 || medium.base > capacity)
             refused = {status_code_t::invalid_argument_k, "A raw medium's base is not a block inside it"};
-        std::uint64_t usable = capacity - (refused.failed() ? 0 : medium.base);
-        if (address.byte_limit != 0 && address.byte_limit < usable) usable = address.byte_limit;
+        // Another tool's file marks only the first slot it spans, so slots come from a named length
+        else if (address.byte_limit == 0 || address.byte_limit > capacity - medium.base)
+            refused = {status_code_t::invalid_argument_k,
+                       "A raw medium needs a length that fits it, as in @64GiB+16GiB"};
+        std::uint64_t const usable = refused.failed() ? 0 : address.byte_limit;
         if (refused.succeeded()) {
             auto [slots, make_status] = slot_allocator_t::make(index, static_cast<std::size_t>(usable / slot_bytes_k),
                                                                allocator_);

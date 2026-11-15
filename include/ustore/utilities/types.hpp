@@ -797,6 +797,16 @@ inline std::string_view string_of(ustore_bytes_view_t bytes) noexcept {
     return {reinterpret_cast<char const*>(bytes.data), static_cast<std::size_t>(bytes.length)};
 }
 
+/** The text @p bytes spell. */
+inline std::string_view string_of(std::span<byte_t const> bytes) noexcept {
+    return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+}
+
+/** Whether @p bytes spell a path: some text with no NUL, where every system call would cut it. */
+inline bool names_path(ustore_bytes_view_t bytes) noexcept {
+    return bytes.length != 0 && string_of(bytes).find('\0') == std::string_view::npos;
+}
+
 /** A tape of 32-bit offsets, where string @c i spans @b [offsets[i],offsets[i+1]) of @p data. */
 inline ustore_strings_view_t u32_tape(void const* data, std::uint32_t const* offsets) noexcept {
     ustore_strings_view_t tape {};
@@ -818,17 +828,17 @@ inline ustore_strings_view_t u64_tape(void const* data, std::uint64_t const* off
 #pragma region Byte Views
 
 /** Bytes a caller may write into. */
-using bytes_span_t = std::span<std::byte>;
+using bytes_span_t = std::span<byte_t>;
 
 /** Bytes a caller may only read. */
-using bytes_view_t = std::span<std::byte const>;
+using bytes_view_t = std::span<byte_t const>;
 
 /** A value, or the bytes of a string, owned so it outlives the call that wrote it. */
 using blob_t = st::vector<ustore_byte_t>;
 
 /** The bytes of @p buffer, which a caller may only read. */
 template <typename allocator_type_>
-inline bytes_view_t as_bytes_view(st::vector<std::byte, allocator_type_> const& buffer) noexcept {
+inline bytes_view_t as_bytes_view(st::vector<byte_t, allocator_type_> const& buffer) noexcept {
     return bytes_view_t {buffer};
 }
 

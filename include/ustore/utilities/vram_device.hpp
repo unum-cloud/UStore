@@ -331,7 +331,7 @@ status_t launch(hip_executor_t& executor, hip_function_handle_t function, unsign
  */
 template <typename offset_type_, gpu_executor_concept executor_type_>
 status_t assemble_tape(executor_type_& executor, std::span<tape_source_t const> sources,
-                       std::span<offset_type_> offsets, std::span<std::byte> bytes) noexcept {
+                       std::span<offset_type_> offsets, std::span<byte_t> bytes) noexcept {
     static_assert(std::is_same_v<offset_type_, std::uint32_t> || std::is_same_v<offset_type_, std::uint64_t>,
                   "A tape's offsets take 32 or 64 bits");
     if (offsets.size() != sources.size() + 1)

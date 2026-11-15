@@ -897,16 +897,14 @@ st::status_t cuda_compactor_t::compact(
             if (view.key_slots_count == 0) continue;
             if (view.stamps != nullptr) {
                 std::size_t const bytes = view.stamps->saved_bytes();
-                if (view.stamps->save({reinterpret_cast<std::byte*>(saved + saved_offset), bytes}) !=
-                    status_t::success_k)
+                if (view.stamps->save({reinterpret_cast<byte_t*>(saved + saved_offset), bytes}) != status_t::success_k)
                     return status_t::invalid_argument_k;
                 described.saved_stamps = saved_columns + saved_offset;
                 saved_offset += bytes / sizeof(std::uint64_t);
             }
             if (view.kinds != nullptr) {
                 std::size_t const bytes = view.kinds->saved_bytes();
-                if (view.kinds->save({reinterpret_cast<std::byte*>(saved + saved_offset), bytes}) !=
-                    status_t::success_k)
+                if (view.kinds->save({reinterpret_cast<byte_t*>(saved + saved_offset), bytes}) != status_t::success_k)
                     return status_t::invalid_argument_k;
                 described.saved_kinds = saved_columns + saved_offset;
                 saved_offset += bytes / sizeof(std::uint64_t);

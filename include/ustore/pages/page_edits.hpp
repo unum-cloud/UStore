@@ -29,6 +29,8 @@
 
 namespace unum::ustore::pages {
 
+using utilities::string_of;
+
 /** The kind of an edit, named after the call that makes it and numbered as its serialized form spells it. */
 enum class modification_t : std::uint8_t {
 
@@ -105,11 +107,6 @@ constexpr bool carries_value(modification_t modification) noexcept {
 constexpr bool closes(edit_t const& edit) noexcept {
     return edit.modification == modification_t::import_k ||
            (edit.modification == modification_t::remove_k && edit.element.is_nil());
-}
-
-/** The view of a bytes run as characters. */
-inline std::string_view as_chars(std::span<byte_t const> bytes) noexcept {
-    return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
 }
 
 /** The view of characters as a bytes run. */

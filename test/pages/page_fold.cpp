@@ -376,7 +376,7 @@ std::size_t edit_codec() {
                 failures += check(edit.text_start == wanted.text_start && edit.text_length == wanted.text_length);
             if (carries_field(edit.modification)) failures += check(edit.field == wanted.field);
             if (edit.modification == modification_t::splice_k || edit.modification == modification_t::set_attributes_k)
-                failures += check(as_chars(edit.value) == wanted.value);
+                failures += check(string_of(edit.value) == wanted.value);
             if (edit.modification == modification_t::insert_k || edit.modification == modification_t::import_k) {
                 std::size_t minted = 0;
                 failures += check(for_each_minted_key(edit, [&](element_key_t const& key) {
@@ -535,7 +535,7 @@ std::size_t compose_shapes() {
     failures += check(count_of(attributes) == 2);
     std::vector<std::string> values;
     (void)for_each_edit(attributes, [&](edit_t const& edit) noexcept -> status_t {
-        values.push_back(std::string(edit.field) + "=" + std::string(as_chars(edit.value)));
+        values.push_back(std::string(edit.field) + "=" + std::string(string_of(edit.value)));
         return {};
     });
     failures += check(values == std::vector<std::string> {"id=c", "x=1"});
@@ -551,7 +551,7 @@ std::size_t compose_shapes() {
                           splice_edit({4, 0}, paragraph, 1, 1, "a")});
     failures += check(count_of(typed) == 1);
     (void)for_each_edit(typed, [&](edit_t const& edit) noexcept -> status_t {
-        failures += check(as_chars(edit.value) == "Hay!" && edit.text_start == 0 && edit.text_length == 2);
+        failures += check(string_of(edit.value) == "Hay!" && edit.text_start == 0 && edit.text_length == 2);
         failures += check(edit.placement == placement_t {4, 0});
         return {};
     });

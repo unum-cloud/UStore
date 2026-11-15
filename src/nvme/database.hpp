@@ -2070,7 +2070,7 @@ inline status_t read_directories(ustore_database_open_nvme_t const& arguments, r
         return {status_code_t::invalid_argument_k, "Counted data directories are null"};
     for (std::size_t index = 0; index != arguments.data_directories_count; ++index) {
         ustore_data_directory_t const& given = arguments.data_directories[index];
-        if (!given.path.length) return {status_code_t::invalid_argument_k, "A data directory needs a path"};
+        if (!names_path(given.path)) return {status_code_t::invalid_argument_k, "A data directory needs a path"};
         data_directory_config_t directory;
         if (sz::failed(directory.path.assign(string_view_t {string_of(given.path)})))
             return {status_code_t::out_of_memory_k, "Failed to copy a data directory"};
@@ -2265,7 +2265,7 @@ status_t open_state(database_state<cpu_class_>& state, resources_config_t const&
 template <cpu_class_t cpu_class_>
 status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& arguments, view_t const& view) noexcept {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
-    if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a manifest"};
+    if (!names_path(arguments.directory)) return {status_code_t::invalid_argument_k, "A database needs a manifest"};
 
     resources_config_t resources;
     database_config_t transactions;
@@ -2458,7 +2458,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
 
     ustore_database_open_nvme_t saving {};
     saving.directory = arguments.path;
-    if (!saving.directory.length) return {status_code_t::invalid_argument_k, "A save needs a manifest path"};
+    if (!names_path(saving.directory)) return {status_code_t::invalid_argument_k, "A save needs a manifest path"};
     resources_config_t resources;
     database_config_t transactions;
     transactions.default_transaction = source.transaction_shape;

@@ -1185,7 +1185,7 @@ class lsm_sorted_run {
     {
         std::size_t const begin = key_offsets_[static_cast<std::size_t>(position)];
         std::size_t const end = key_offsets_[static_cast<std::size_t>(position) + 1];
-        return std::string_view {reinterpret_cast<char const*>(keys_.data()) + begin, end - begin};
+        return utilities::string_of(std::span<byte_t const> {keys_}.subspan(begin, end - begin));
     }
 
     /** One offset per string of a run of strings into @c key_tape and one past the last: an
@@ -1264,7 +1264,7 @@ class lsm_sorted_run {
 
     /** The saved tree of the keys, or of a run of strings' heads, which a merge views in place with
      *  its own kit. */
-    [[nodiscard]] std::span<std::byte const> keys_bytes() const noexcept {
+    [[nodiscard]] std::span<byte_t const> keys_bytes() const noexcept {
         return std::as_bytes(std::span<std::uint64_t const> {tree_words_});
     }
 
@@ -1669,7 +1669,7 @@ class lsm_sorted_run {
     }
 
     /** The saved bytes of the heads of @p layer, which must be one of this run's. */
-    [[nodiscard]] std::span<std::byte const> layer_bytes_(head_layer_t const& layer) const noexcept {
+    [[nodiscard]] std::span<byte_t const> layer_bytes_(head_layer_t const& layer) const noexcept {
         return std::as_bytes(std::span<std::uint64_t const> {layer_words_})
             .subspan(static_cast<std::size_t>(layer.heads_offset), static_cast<std::size_t>(layer.heads_bytes));
     }
@@ -1730,7 +1730,7 @@ class lsm_sorted_run {
         std::uint32_t written = 0;
         for (std::size_t index = 0; index != count; ++index) {
             key_slot_t const& slot = key_slots[index];
-            std::byte head_bytes[sizeof(st::key128_t)];
+            byte_t head_bytes[sizeof(st::key128_t)];
             slot.stored_key.to_bytes(head_bytes);
             std::size_t const lead = lead_bytes_(slot.stored_key);
             std::string_view const tail = tails.at(index);
@@ -1832,7 +1832,7 @@ class lsm_sorted_run {
     [[nodiscard]] static std::string_view key_of_(strings_sections_t const& sections, std::uint64_t position) noexcept {
         std::size_t const begin = sections.key_offsets[static_cast<std::size_t>(position)];
         std::size_t const end = sections.key_offsets[static_cast<std::size_t>(position) + 1];
-        return std::string_view {reinterpret_cast<char const*>(sections.keys.data()) + begin, end - begin};
+        return utilities::string_of(std::span<byte_t const> {sections.keys}.subspan(begin, end - begin));
     }
 
     /** Stages the heads, the values, the key offsets, the key tape and the layers of a
@@ -1864,7 +1864,7 @@ class lsm_sorted_run {
                 std::span<byte_t const> {sections.keys});
             keys.failed())
             return keys;
-        std::span<std::byte const> const layers = std::as_bytes(std::span<std::uint64_t const> {sections.layers});
+        std::span<byte_t const> const layers = std::as_bytes(std::span<std::uint64_t const> {sections.layers});
         return write_bytes_(
             writer, extent,
             strings_layout_t::layers_offset(count, header.key_tape_bytes, header.stamps_bytes, header.kinds_bytes),
@@ -2034,7 +2034,13 @@ class lsm_sorted_run {
             return {status_code_t::malformed_k, "The run claims more values than its offsets reach"};
         if (is_fixed(value_layout_k) && header.stored_values_bytes != header.key_slots_count * header.value_max_size)
             return {status_code_t::malformed_k, "The run's values are not one width per key slot"};
-        if (sections_end_(header) > extent_.extent.length)
+        // Each length is held to the extent alone first, so no sum of them below can wrap past it
+        std::uint64_t const room = extent_.extent.length;
+        if (header.key_slots_count > room || header.stored_values_bytes > room || header.stamps_bytes > room ||
+            header.kinds_bytes > room || header.key_tape_bytes > room || header.layers_bytes > room ||
+            header.range_tombstones_count > room || header.range_tombstones_bytes > room)
+            return {status_code_t::malformed_k, "A section of the run is longer than its extent"};
+        if (sections_end_(header) > room)
             return {status_code_t::malformed_k, "The run claims more bytes than its extent holds"};
         if (header.newest_stamp < header.stamps_floor)
             return {status_code_t::malformed_k, "The run's newest stamp is below its floor"};

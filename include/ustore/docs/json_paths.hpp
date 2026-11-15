@@ -219,8 +219,8 @@ inline expected<field_paths_t> compile_field_paths(std::span<std::string_view co
     if (map_status.failed()) return map_status;
     std::size_t paths_count = 0;
     using known_paths_t =
-        st::hash_map<std::string_view, std::size_t, st::default_hash_t, st::equal_to_t, arena_allocator<std::byte>>;
-    known_paths_t known_paths {{}, {}, arena_allocator<std::byte> {scratch}};
+        st::hash_map<std::string_view, std::size_t, st::default_hash_t, st::equal_to_t, arena_allocator<byte_t>>;
+    known_paths_t known_paths {{}, {}, arena_allocator<byte_t> {scratch}};
     st::vector<char, arena_allocator<char>> path {{scratch}};
     for (std::size_t field_index = 0; field_index != fields.size(); ++field_index) {
         auto [valid, path_status] = json_path_of(fields[field_index], path);

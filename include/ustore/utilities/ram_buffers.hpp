@@ -648,19 +648,19 @@ template <typename value_type_>
 using direct_io_allocator = aligned_allocator<value_type_, buffer_alignment_k>;
 
 /** Bytes charged to no budget, with no alignment beyond the heap's own. */
-using buffer_t = st::vector<std::byte>;
+using buffer_t = st::vector<byte_t>;
 
 /** Bytes of a buffer unbuffered I/O accepts, charged to no budget. */
-using aligned_buffer_t = st::vector<std::byte, direct_io_allocator<std::byte>>;
+using aligned_buffer_t = st::vector<byte_t, direct_io_allocator<byte_t>>;
 
 /** Bytes charged to a named budget. */
 template <template <typename> typename atomic_reference_>
-using constrained_buffer = st::vector<std::byte, constrained_allocator<std::byte, atomic_reference_>>;
+using constrained_buffer = st::vector<byte_t, constrained_allocator<byte_t, atomic_reference_>>;
 
 /** Bytes of a buffer unbuffered I/O accepts, charged to a named budget. */
 template <template <typename> typename atomic_reference_>
 using constrained_aligned_buffer =
-    st::vector<std::byte, constrained_allocator<std::byte, atomic_reference_, direct_io_allocator<std::byte>>>;
+    st::vector<byte_t, constrained_allocator<byte_t, atomic_reference_, direct_io_allocator<byte_t>>>;
 
 /** Host bytes unbuffered I/O accepts, placed on one memory domain, and freed with the size and
  *  the page they were granted on. */

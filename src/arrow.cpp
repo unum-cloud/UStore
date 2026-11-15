@@ -275,7 +275,7 @@ ustore_status_t convert_on_device(ustore_arena_t arena, ustore_strings_view_t co
 ustore_status_t densify_on_host(ustore_arena_t arena, strided_rows_t& rows) noexcept {
     auto [dense, carve_status] = arena_allocate<ustore_key_t>(arena, static_cast<std::size_t>(rows.rows));
     if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
-    rows.dense = reinterpret_cast<std::byte*>(dense.data());
+    rows.dense = reinterpret_cast<byte_t*>(dense.data());
     for (std::uint64_t row = 0; row != rows.rows; ++row) densify_row(rows, row);
     return ustore_status_success_k;
 }
@@ -290,7 +290,7 @@ ustore_status_t densify_on_device(ustore_arena_t arena, strided_rows_t& rows) no
         if (!executor.kernels()) return ustore_status_device_k;
         auto [dense, carve_status] = carve<ustore_key_t>(blocks, executor, static_cast<std::size_t>(rows.rows));
         if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
-        rows.dense = reinterpret_cast<std::byte*>(dense.data());
+        rows.dense = reinterpret_cast<byte_t*>(dense.data());
         status_t status = launch(executor, executor.kernels()->function("ustore_tape_densify"),
                                  static_cast<unsigned>(divide_round_up<std::size_t>(rows.rows, tape_block_threads_k)),
                                  tape_block_threads_k, 0u, rows);
@@ -527,7 +527,7 @@ ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys, ustore_size_t
         // Strided keys, like the triples of edges, are carved dense behind the call's outputs under the claim
         if (!take(arena->claim)) return ustore_status_contended_k;
         std::size_t const rows = static_cast<std::size_t>(count);
-        strided_rows_t strided_keys {reinterpret_cast<std::byte const*>(keys.data), keys.stride, sizeof(ustore_key_t),
+        strided_rows_t strided_keys {reinterpret_cast<byte_t const*>(keys.data), keys.stride, sizeof(ustore_key_t),
                                      rows, nullptr};
         ustore_status_t const status = device_arena_of(arena).blocks ? densify_on_device(arena, strided_keys)
                                                                      : densify_on_host(arena, strided_keys);

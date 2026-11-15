@@ -97,7 +97,7 @@ status_t string_of_key(st::key128_t const& head, std::string_view tail, buffer_t
     std::size_t const leading = length <= head_prefix_bytes_k ? length : head_prefix_bytes_k;
     if (whole.resize(leading + tail.size()) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "No room to put a string back together"};
-    std::byte head_bytes[sizeof(st::key128_t)];
+    byte_t head_bytes[sizeof(st::key128_t)];
     head.to_bytes(head_bytes);
     if (leading != 0) std::memcpy(whole.data(), head_bytes, leading);
     if (!tail.empty()) std::memcpy(whole.data() + leading, tail.data(), tail.size());

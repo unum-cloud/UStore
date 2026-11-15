@@ -54,6 +54,7 @@ using utilities::arena_allocator;
 using utilities::delta_kind_t;
 using utilities::delta_view_t;
 using utilities::growth_status;
+using utilities::string_of;
 
 #pragma region Deltas
 
@@ -91,11 +92,6 @@ constexpr std::size_t delta_header_bytes_k = sizeof(std::uint64_t) + 1 + 2 * siz
 /** The bytes @p text spells. */
 inline std::span<byte_t const> bytes_of_text(std::string_view text) noexcept {
     return {reinterpret_cast<byte_t const*>(text.data()), text.size()};
-}
-
-/** The text @p bytes spell. */
-inline std::string_view text_of_bytes(std::span<byte_t const> bytes) noexcept {
-    return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
 }
 
 /** Whether @p delta makes the base and every older delta irrelevant: a write, a removal or a whole upsert. */
@@ -219,7 +215,7 @@ inline status_t apply_delta(document_state_t& document, json_delta_t const& delt
     if (document.exists() && whole && modification == modification_t::insert_k)
         return {status_code_t::already_exists_k, "Inserted document already exists"};
 
-    value_view_t const base = document.exists() ? value_view_t(text_of_bytes(document.bytes)) : value_view_t();
+    value_view_t const base = document.exists() ? value_view_t(string_of(document.bytes)) : value_view_t();
     auto [parsed, status] = json_parse(base, arena);
     if (status.failed()) return status;
     auto [modifier, modifier_status] = any_parse(value_view_t(delta.value), ustore_docs_field_type_json_k, arena);
@@ -257,7 +253,7 @@ status_t for_each_delta(std::span<delta_view_t const> deltas, callback_type_&& c
         status_t status;
         switch (delta.kind) {
         case delta_kind_t::write_k:
-            status = callback(json_delta_t {0, delta_modification_t::write_k, {}, text_of_bytes(delta.bytes)});
+            status = callback(json_delta_t {0, delta_modification_t::write_k, {}, string_of(delta.bytes)});
             break;
         case delta_kind_t::remove_k:
         case delta_kind_t::remove_range_k:
@@ -599,8 +595,7 @@ struct json_fold_t {
             if (replay.failure.failed()) return encode_deltas(rest, arena);
             json_delta_t folded {chain[chain.size() - 1].stamp, delta_modification_t::remove_k, {}, {}};
             if (replay.document.exists())
-                folded.modification = delta_modification_t::write_k,
-                folded.value = text_of_bytes(replay.document.bytes);
+                folded.modification = delta_modification_t::write_k, folded.value = string_of(replay.document.bytes);
             return encode_deltas(std::span<json_delta_t const>(&folded, 1), arena);
         }
 

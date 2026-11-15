@@ -287,7 +287,7 @@ inline status_t replay_deltas(document_state_t& document, std::span<json_delta_t
         if (document.exists() && whole && modification == modification_t::insert_k)
             return {status_code_t::already_exists_k, "Inserted document already exists"};
         if (!tree.mutable_handle) {
-            value_view_t const base = document.exists() ? value_view_t(text_of_bytes(document.bytes)) : value_view_t();
+            value_view_t const base = document.exists() ? value_view_t(string_of(document.bytes)) : value_view_t();
             auto [parsed, parse_status] = json_parse(base, arena);
             if (parse_status.failed()) return parse_status;
             tree = parsed;

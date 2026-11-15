@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include <cstddef> // `std::byte`, `std::size_t`
+#include <cstddef> // `std::size_t`
 
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
@@ -22,11 +22,12 @@
 #include <stringzilla/stringzilla.hpp> // `sz::string_view_t`
 
 #include "ustore/utilities/ram_buffers.hpp" // `strings_kit_concept`
-#include "ustore/utilities/types.hpp"       // `blob_t`
+#include "ustore/utilities/types.hpp"       // `blob_t`, `byte_t`
 
 namespace unum::ustore::strings {
 
 using utilities::blob_t;
+using utilities::byte_t;
 
 /** A string of a strings collection, or the name of a collection, owning its bytes. */
 struct string_key_t {
@@ -72,7 +73,7 @@ struct string_key_hash {
 inline constexpr std::size_t head_prefix_bytes_k = sizeof(st::key128_t) - 1;
 
 /** The length byte of the head every string longer than @c head_prefix_bytes_k shares with its neighbors. */
-inline constexpr unsigned char long_head_length_k = static_cast<unsigned char>(head_prefix_bytes_k + 1);
+inline constexpr std::uint8_t long_head_length_k = static_cast<std::uint8_t>(head_prefix_bytes_k + 1);
 
 /**
  *  @brief The 16-byte head of @p text: its leading bytes padded with zeros, then its length, capped one past them.
@@ -81,17 +82,17 @@ inline constexpr unsigned char long_head_length_k = static_cast<unsigned char>(h
  *  compares heads first and the bytes past them, the @c tail_of, only between equal heads.
  */
 constexpr st::key128_t head_of(std::string_view text) noexcept {
-    std::byte bytes[sizeof(st::key128_t)] {};
+    byte_t bytes[sizeof(st::key128_t)] {};
     for (std::size_t index = 0; index != head_prefix_bytes_k && index != text.size(); ++index)
-        bytes[index] = static_cast<std::byte>(text[index]);
-    bytes[head_prefix_bytes_k] = static_cast<std::byte>(text.size() <= head_prefix_bytes_k ? text.size()
-                                                                                           : long_head_length_k);
+        bytes[index] = static_cast<byte_t>(text[index]);
+    bytes[head_prefix_bytes_k] = static_cast<byte_t>(text.size() <= head_prefix_bytes_k ? text.size()
+                                                                                        : long_head_length_k);
     return st::key128_t::from_bytes(bytes);
 }
 
 /** The length byte of @p head, its last byte, which the low word holds lowest since words read big-endian. */
-constexpr unsigned char head_length_of(st::key128_t const& head) noexcept {
-    return static_cast<unsigned char>(head.low & 0xFF);
+constexpr std::uint8_t head_length_of(st::key128_t const& head) noexcept {
+    return static_cast<std::uint8_t>(head.low & 0xFF);
 }
 
 /** The bytes of @p text past the leading ones its head holds, empty for a string its head holds whole. */

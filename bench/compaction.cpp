@@ -18,7 +18,7 @@
  *  --engine          nvme      Engine to open: nvme or rocksdb
  *  --compactor       cpu       Where NVMe merges: cpu or gpu
  *  --directory       Required  An empty directory the database fills, unless --open names a raw address
- *  --open            None      A raw slot or spdk:// address NVMe opens instead, like spdk://0000:6e:00.0/1@256GiB
+ *  --open            None      A raw or spdk:// extent NVMe opens instead, like spdk://0000:6e:00.0/1@256GiB+64GiB
  *  --rocksdb-subcompactions 1 Threads a RocksDB manual compaction splits across
  *  --threads         0         Threads of the executor NVMe opens and compacts on, blocking, or 0 for none
  *  --runs            16        Level-0 runs the merge takes, and the NVMe level enlarge factor

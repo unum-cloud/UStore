@@ -17,6 +17,7 @@
 #include <cstring> // `std::memcpy`, `std::memset`
 
 #include <array>   // `std::array`
+#include <limits>  // `std::numeric_limits`
 #include <memory>  // `std::unique_ptr`
 #include <span>    // `std::span`
 #include <string>  // `std::string`
@@ -630,16 +631,20 @@ std::size_t split_write_matches_write(mount_type_ const& mount) {
 
 #pragma region Truncation Cases
 
-/** Writes the header of a run claiming @p key_slots_count key slots at the front of @p medium. */
+/** Writes the header of a run claiming @p key_slots_count key slots and a trailer of
+ *  @p stamps_bytes and @p kinds_bytes at the front of @p medium. */
 template <typename disk_type_>
 status_t paint_stub_header(disk_type_& disk, io_channel_t& channel, medium_reference_t medium,
-                           std::uint64_t key_slots_count) noexcept {
+                           std::uint64_t key_slots_count, std::uint64_t stamps_bytes = 0,
+                           std::uint64_t kinds_bytes = 0) noexcept {
     sorted_run_header_t header {};
     header.magic = sorted_run_magic_k;
     header.format_version = sorted_run_format_version_k;
     header.key_slot_bytes = static_cast<std::uint32_t>(sizeof(variable_slot_t));
     header.key_slots_count = key_slots_count;
     header.stored_values_bytes = 0;
+    header.stamps_bytes = stamps_bytes;
+    header.kinds_bytes = kinds_bytes;
     header.value_max_size = 4096;
     header.branching = static_cast<std::uint16_t>(variable_layout_t::branching_k);
     header.value_layout = value_layout_t::variable_width_k;
@@ -708,6 +713,16 @@ case_result_t truncated_index_is_malformed(mount_type_ const& mount) {
     expected<variable_run_t> unwritten = variable_run_t::open(*volume, guard->channel(), blank);
     failures += expect(!unwritten.has_value());
     failures += expect_status(unwritten, status_code_t::malformed_k);
+
+    // Trailer lengths whose sum wraps to nothing fit no extent either.
+    failures += expect(
+        paint_stub_header((*fixture)->disk, guard->channel(), stub, 1, (std::numeric_limits<std::uint64_t>::max)(), 1)
+            .succeeded());
+    medium_extent_t wrapped = handed;
+    wrapped.extent = extent_t {0, stub_bytes_k};
+    expected<variable_run_t> forged = variable_run_t::open(*volume, guard->channel(), wrapped);
+    failures += expect(!forged.has_value());
+    failures += expect_status(forged, status_code_t::malformed_k);
     return failures;
 }
 

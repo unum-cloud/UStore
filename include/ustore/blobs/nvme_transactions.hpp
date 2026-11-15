@@ -125,7 +125,7 @@ class transaction_deltas {
     struct collection_deltas_t {
         using stored_values_t =
             st::basic_hash_table<st::mapping<stored_key_t, stored_value_place_t>, stored_key_hash_t, st::equal_to_t,
-                                 constrained_allocator<std::byte, atomic_reference_>, row_kit_type_>;
+                                 constrained_allocator<byte_t, atomic_reference_>, row_kit_type_>;
 
         /** The value widths the collection admits, which every write is checked against. */
         value_widths_t widths;
@@ -142,7 +142,7 @@ class transaction_deltas {
 
     using collections_t =
         st::basic_hash_table<st::mapping<collection_id_t, collection_deltas_t>, collection_id_hash_t, st::equal_to_t,
-                             constrained_allocator<std::byte, atomic_reference_>, row_kit_type_>;
+                             constrained_allocator<byte_t, atomic_reference_>, row_kit_type_>;
 
 #pragma endregion Types
 
@@ -153,7 +153,7 @@ class transaction_deltas {
 
     /** The bytes every written value of every collection sits in, sized by the first write that
      *  lands bytes, as a landed commit of one collection takes it over. */
-    st::vector<std::byte, constrained_allocator<std::byte, atomic_reference_>> insertions_buffer;
+    st::vector<byte_t, constrained_allocator<byte_t, atomic_reference_>> insertions_buffer;
 
     /** The first free byte of @c insertions_buffer. */
     stored_value_offset_in_buffer_t next_inserted_offset = 0;
@@ -179,10 +179,10 @@ class transaction_deltas {
     /** The bytes a landed commit takes over with the buffer: every written byte when one collection
      *  holds them and they fill half the buffer or more, so a run holds at most twice the bytes its
      *  memory bounds count, or none, which the seal copies. */
-    [[nodiscard]] std::span<std::byte const> lendable_bytes() const noexcept {
+    [[nodiscard]] std::span<byte_t const> lendable_bytes() const noexcept {
         bool const lends = collections_by_id.size() == 1 && 2 * next_inserted_offset >= insertions_buffer.size();
-        return lends ? std::span<std::byte const> {insertions_buffer}.first(next_inserted_offset)
-                     : std::span<std::byte const> {};
+        return lends ? std::span<byte_t const> {insertions_buffer}.first(next_inserted_offset)
+                     : std::span<byte_t const> {};
     }
     inline std::size_t count() const noexcept { return elements_count_; }
 
@@ -309,8 +309,8 @@ template <typename stored_key_type_, template <typename> typename atomic_referen
 inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::transaction_deltas(
     std::size_t capacity_bytes, std::size_t elements_max_count,
     resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-    : collections_by_id({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}),
-      insertions_buffer(constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}),
+    : collections_by_id({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources->memory_constraint}),
+      insertions_buffer(constrained_allocator<byte_t, atomic_reference_> {resources->memory_constraint}),
       next_inserted_offset(0), resources_(resources), capacity_bytes_(capacity_bytes),
       elements_max_count_(elements_max_count), elements_count_(0) {}
 
@@ -502,7 +502,7 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
 
         collection_deltas_t fresh {
             widths,
-            {{}, {}, constrained_allocator<std::byte, atomic_reference_> {resources_->memory_constraint}},
+            {{}, {}, constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint}},
             0,
             ranges_t {constrained_allocator<range_t, atomic_reference_> {resources_->memory_constraint}}};
         if (collections_by_id.reserve_more(1) == collections_t::reserve_result_t::failed_k)
@@ -931,11 +931,11 @@ class read_set {
     };
 
     using stored_keys_t = st::basic_hash_table<st::mapping<stored_key_t, watch_t>, stored_key_hash_t, st::equal_to_t,
-                                               constrained_allocator<std::byte, atomic_reference_>, row_kit_type_>;
+                                               constrained_allocator<byte_t, atomic_reference_>, row_kit_type_>;
 
     /** A set charging @p resources for the keys it holds. */
     explicit read_set(resources_shared_ptr<atomic_reference_, waiter_type_> const& resources) noexcept
-        : stored_keys({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}) {}
+        : stored_keys({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources->memory_constraint}) {}
 
     /** Whether the transaction watches nothing. */
     bool empty() const noexcept { return stored_keys.empty(); }
@@ -994,12 +994,12 @@ class grouped_read_set {
     using read_set_t = read_set<stored_key_t, atomic_reference_, waiter_type_, row_kit_type_>;
     using groups_t =
         st::basic_hash_table<st::mapping<collection_id_t, read_set_t>, collection_id_hash_t, st::equal_to_t,
-                             constrained_allocator<std::byte, atomic_reference_>, row_kit_type_>;
+                             constrained_allocator<byte_t, atomic_reference_>, row_kit_type_>;
 
     /** A set charging @p resources for the keys of every collection it watches. */
     explicit grouped_read_set(resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
         : resources(resources),
-          groups({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}) {}
+          groups({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources->memory_constraint}) {}
 
     /** Whether the transaction watches nothing anywhere. */
     bool empty() const noexcept { return count() == 0; }

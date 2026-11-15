@@ -212,6 +212,9 @@ inline constexpr std::uint64_t engine_memory_runs_deltas_k = 64ull * 1024ull;
 /** How fast the bytes a level admits grow with its number. */
 inline constexpr std::uint64_t engine_level_enlarge_factor_k = 4;
 
+/** Levels a manifest may name, more than any medium holds at the least enlarge factor of two. */
+inline constexpr std::uint32_t manifest_levels_max_k = 64;
+
 /**
  *  @brief The record a database keeps for the reserved collection @p id, which the open creating it
  *      and a recovery rebuilding it without a manifest both take from here.
@@ -508,7 +511,7 @@ struct manifest_t {
                 return malformed_();
             if (collection) {
                 if (!read_(collection, file.collection) || file.collection >= collections.size() ||
-                    !read_(yyjson_obj_get(object, "level"), file.level) ||
+                    !read_(yyjson_obj_get(object, "level"), file.level) || file.level >= manifest_levels_max_k ||
                     !read_(yyjson_obj_get(object, "stamp"), file.stamp))
                     return malformed_();
             }

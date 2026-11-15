@@ -103,7 +103,7 @@ class lsm_record_pool {
 
     /** The records and the stack of the free ones, in chunks charged to the budget, which a reader
      *  resolves without the claim while a take grows them. */
-    using records_t = st::basic_growing_pool<record_t, index_t, constrained_allocator<std::byte, atomic_reference_>>;
+    using records_t = st::basic_growing_pool<record_t, index_t, constrained_allocator<byte_t, atomic_reference_>>;
 
     /** A record's index and the generation it was taken at. */
     using handle_t = typename records_t::handle_t;
@@ -123,7 +123,7 @@ class lsm_record_pool {
 
     /** A pool of @p capacity free records charged to @p constraint, which must outlive it. */
     static expected<lsm_record_pool> make(std::size_t capacity, constraint_t& constraint) noexcept {
-        using allocator_t = constrained_allocator<std::byte, atomic_reference_>;
+        using allocator_t = constrained_allocator<byte_t, atomic_reference_>;
         return adopt_(records_t::make(capacity, capacity, allocator_t {constraint}));
     }
 
@@ -131,7 +131,7 @@ class lsm_record_pool {
      *  @c take finds none, charged to @p constraint, which must outlive it. */
     static expected<lsm_record_pool> make(std::size_t capacity, std::size_t capacity_limit,
                                           constraint_t& constraint) noexcept {
-        using allocator_t = constrained_allocator<std::byte, atomic_reference_>;
+        using allocator_t = constrained_allocator<byte_t, atomic_reference_>;
         return adopt_(records_t::make(capacity, capacity_limit, allocator_t {constraint}));
     }
 

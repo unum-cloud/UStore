@@ -347,7 +347,7 @@ std::span<byte_t const> base_of(std::optional<std::string> const& base) noexcept
 pending_t change_of(std::span<json_delta_t const> deltas, ustore_arena_t arena, std::size_t& failures) {
     auto [chain, status] = encode_deltas(deltas, arena);
     failures += expect(status.succeeded());
-    return {delta_kind_t::change_k, std::string(text_of_bytes(chain))};
+    return {delta_kind_t::change_k, std::string(string_of(chain))};
 }
 
 /** The store delta @p delta becomes, as the glue logs it: writes and removals as deltas of their own. */
@@ -378,7 +378,7 @@ struct outcome_t {
 
 outcome_t outcome_of(expected<std::span<byte_t const>> const& result) {
     if (!result) return {result.status().code, {}};
-    return {status_code_t::success_k, std::string(text_of_bytes(*result))};
+    return {status_code_t::success_k, std::string(string_of(*result))};
 }
 
 /** Counts a failure when @p actual differs from @p wanted, printing both and the @p context. */
@@ -421,7 +421,7 @@ std::size_t json_fold_codec() {
                                                   [](json_delta_t const&) noexcept { return status_t {}; });
         failures += expect(truncated.succeeded() == (boundaries == 1));
     }
-    std::string unknown(text_of_bytes(chain.first(encoded_size(deltas[0]))));
+    std::string unknown(string_of(chain.first(encoded_size(deltas[0]))));
     unknown[sizeof(std::uint64_t)] = 9;
     failures += expect_status(
         for_each_delta(bytes_of_text(unknown), [](json_delta_t const&) noexcept { return status_t {}; }),
@@ -655,7 +655,7 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
                                           ? 1
                                           : count_records(bytes_of_text(delta.bytes), failures);
                 records_after += count_records(chain, failures);
-                pending.assign(1, {delta_kind_t::change_k, std::string(text_of_bytes(chain))});
+                pending.assign(1, {delta_kind_t::change_k, std::string(string_of(chain))});
                 ++compositions;
             }
             if (random.below(25) == 0) base = stored, pending.clear();

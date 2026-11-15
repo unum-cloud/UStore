@@ -1437,7 +1437,7 @@ struct arrow_read_t {
     path_t const input {paths.files.c_str(), "recovered.strings.arrows"};
     path_t const printed {paths.files.c_str(), "recovered.raw.printed.json"};
     path_t const original {paths.files.c_str(), "recovered.raw.original.json"};
-    std::string const address = std::string(device.c_str()) + "@0";
+    std::string const address = std::string(device.c_str()) + "@0+8GiB";
     std::string const database {nvme_database_name_k};
     std::error_code error;
     std::filesystem::remove(device.c_str(), error);

@@ -1341,8 +1341,8 @@ case_result_t archive_saves_incrementally_both_ways(mount_type_ const& mount) {
         std::filesystem::resize_file(device.c_str(), 4 * slot_bytes_k, error);
         failures += expect(!error);
     }
-    std::array<char, path_capacity_k + 8> raw {};
-    *fmt::format_to_n(raw.data(), raw.size() - 1, "{}@0", device.c_str()).out = '\0';
+    std::array<char, path_capacity_k + 16> raw {};
+    *fmt::format_to_n(raw.data(), raw.size() - 1, "{}@0+4GiB", device.c_str()).out = '\0';
 
     collection_id_t collection;
     typename database_t::archive_report_t first, second;

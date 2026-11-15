@@ -87,7 +87,7 @@ struct element_span_t {
 template <typename allocator_type_>
 class stringzilla_allocator {
     struct alignas(16) chunk_t {
-        std::byte bytes[16];
+        byte_t bytes[16];
     };
     using chunks_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<chunk_t>;
     chunks_allocator_t allocator_;

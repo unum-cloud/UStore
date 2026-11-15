@@ -125,11 +125,21 @@ inline bool overwrite_page(path_t const& path, std::uint64_t offset, std::span<b
     return std::fclose(file) == 0 && written;
 }
 
-/** The address of @p path from @p base on, as a data directory names a raw medium. */
+/** Reads the page at @p offset of the stand-in device @p path into @p block. */
+inline bool read_page(path_t const& path, std::uint64_t offset, std::span<byte_t> block) noexcept {
+    std::FILE* const file = std::fopen(path.c_str(), "rb");
+    if (!file) return false;
+    bool const read = std::fseek(file, static_cast<long>(offset), SEEK_SET) == 0 &&
+                      std::fread(block.data(), 1, block.size(), file) == block.size();
+    return std::fclose(file) == 0 && read;
+}
+
+/** The address of @p slots slots of @p path from @p base on. */
 struct raw_address_t {
-    char text[path_capacity_k + 32] {};
-    raw_address_t(path_t const& path, std::uint64_t base) noexcept {
-        auto const written = fmt::format_to_n(text, sizeof(text) - 1, "{}@{}", path.c_str(), base);
+    char text[path_capacity_k + 64] {};
+    raw_address_t(path_t const& path, std::uint64_t base, std::uint64_t slots) noexcept {
+        auto const written = fmt::format_to_n(text, sizeof(text) - 1, "{}@{}+{}", path.c_str(), base,
+                                              slots * slot_bytes_k);
         *written.out = '\0';
     }
     [[nodiscard]] data_address_t address() const noexcept { return *parse_data_address(text); }
@@ -332,7 +342,7 @@ std::size_t slotted_keeps_named_and_reclaims_leftovers(fixture_type_& fixture) {
     if (!guard) return failures;
     io_channel_t& channel = guard->channel();
     path_t const device = stand_in_device(fixture, "leftovers.raw", stand_in_slots_k);
-    raw_address_t const raw {device, 0};
+    raw_address_t const raw {device, 0, stand_in_slots_k};
     data_address_t const addresses[] {raw.address()};
 
     medium_extent_t kept {};
@@ -386,7 +396,7 @@ std::size_t slotted_zeroes_a_dropped_run(fixture_type_& fixture) {
     if (!guard) return failures;
     io_channel_t& channel = guard->channel();
     path_t const device = stand_in_device(fixture, "dropped.raw", stand_in_slots_k);
-    raw_address_t const raw {device, 0};
+    raw_address_t const raw {device, 0, stand_in_slots_k};
     data_address_t const addresses[] {raw.address()};
 
     auto [volume, mount_status] = mount_slotted(fixture, channel, addresses);
@@ -428,7 +438,7 @@ std::size_t slotted_ignores_an_uncommitted_copy(fixture_type_& fixture) {
     if (!guard) return failures;
     io_channel_t& channel = guard->channel();
     path_t const device = stand_in_device(fixture, "uncommitted.raw", stand_in_slots_k);
-    raw_address_t const raw {device, 0};
+    raw_address_t const raw {device, 0, stand_in_slots_k};
     data_address_t const addresses[] {raw.address()};
     {
         auto [volume, mount_status] = mount_slotted(fixture, channel, addresses);
@@ -448,8 +458,8 @@ std::size_t slotted_ignores_an_uncommitted_copy(fixture_type_& fixture) {
     return failures;
 }
 
-/** Two databases share one medium from two bases, each skipping the other's slots as foreign; a
- *  foreign magic in a slot is skipped, and one in the base slot refuses the mount. */
+/** Two databases share one medium through disjoint extents, neither taking a slot past its own;
+ *  another tool's file keeps every slot it spans, and its magic in a base slot refuses a mount. */
 template <typename fixture_type_>
 std::size_t slotted_shares_a_medium(fixture_type_& fixture) {
     std::size_t failures = 0;
@@ -457,56 +467,72 @@ std::size_t slotted_shares_a_medium(fixture_type_& fixture) {
     failures += expect(guard.has_value());
     if (!guard) return failures;
     io_channel_t& channel = guard->channel();
-    path_t const device = stand_in_device(fixture, "shared.raw", stand_in_slots_k + 1);
-    raw_address_t const first_raw {device, 0}, second_raw {device, slot_bytes_k};
+    path_t const device = stand_in_device(fixture, "shared.raw", stand_in_slots_k + 2);
+    raw_address_t const first_raw {device, 0, 2}, second_raw {device, 2 * slot_bytes_k, 2};
     data_address_t const first[] {first_raw.address()}, second[] {second_raw.address()};
 
-    // Slot 4 of the first database holds a SafeGraphs index, which neither database may take.
-    std::array<byte_t, portable_alignment_k> foreign {};
+    // Slots 4 and 5 hold one SafeGraphs index, whose second slot opens with zeros like a free one.
+    std::array<byte_t, portable_alignment_k> foreign {}, interior {};
     std::uint64_t const safegraphs_magic = magic_of("SAFEGRPH");
     std::memcpy(foreign.data(), &safegraphs_magic, sizeof(safegraphs_magic));
+    paint(interior, 77);
+    std::uint64_t const interior_offset = (stand_in_slots_k + 1) * slot_bytes_k + slot_payload_offset_k;
     failures += expect(overwrite_page(device, stand_in_slots_k * slot_bytes_k, foreign));
+    failures += expect(overwrite_page(device, interior_offset, interior));
     {
         auto [volume, mount_status] = mount_slotted(fixture, channel, first);
         failures += expect(mount_status.succeeded());
         if (mount_status.failed()) return failures;
-        failures += expect_eq(volume.free_bytes(), (stand_in_slots_k - 1) * sorted_run_bytes_max_k);
+        failures += expect_eq(volume.free_bytes(), std::uint64_t {1} * sorted_run_bytes_max_k);
         failures += expect(publish_naming(volume, fixture, channel, {}).succeeded());
         // Another mount of the same medium waits for this one, as another process claiming
         // its slots would.
         failures += expect_status(mount_slotted(fixture, channel, second), status_code_t::contended_k);
     }
     {
-        // The second database's base slot is the first's slot 1, free until now.
         auto [volume, mount_status] = mount_slotted(fixture, channel, second);
         failures += expect(mount_status.succeeded());
         if (mount_status.failed()) return failures;
+        failures += expect_eq(volume.free_bytes(), std::uint64_t {1} * sorted_run_bytes_max_k);
         auto [run, run_status] = write_painted(fixture, volume, channel, uuid128_t {}, small_run_bytes_k, 21);
         failures += expect(run_status.succeeded());
         if (run_status.failed()) return failures;
-        failures += expect_eq(run.extent.offset / slot_bytes_k, std::uint64_t {2});
+        failures += expect_eq(run.extent.offset / slot_bytes_k, std::uint64_t {3});
         manifest_file_t const files[] {file_of(run, uuid128_t {})};
         failures += expect(publish_naming(volume, fixture, channel, files).succeeded());
+        // Its extent is full, and the zeros opening slot 5 are not its to take.
+        failures += expect_status(volume.allocate(uuid128_t {}, sorted_run_bytes_max_k),
+                                  status_code_t::capacity_exhausted_k);
     }
     {
         auto [volume, mount_status] = mount_slotted(fixture, channel, first);
         failures += expect(mount_status.succeeded());
         if (mount_status.failed()) return failures;
-        failures += expect_eq(volume.free_bytes(), std::uint64_t {1} * sorted_run_bytes_max_k);
         auto [run, run_status] = volume.allocate(uuid128_t {}, small_run_bytes_k);
         failures += expect(run_status.succeeded());
-        if (run_status.succeeded()) failures += expect_eq(run.extent.offset / slot_bytes_k, std::uint64_t {3});
+        if (run_status.succeeded()) failures += expect_eq(run.extent.offset / slot_bytes_k, std::uint64_t {1});
     }
     {
         auto [volume, mount_status] = mount_slotted(fixture, channel, second);
         failures += expect(mount_status.succeeded());
         if (mount_status.succeeded()) failures += expect_eq(volume.manifest().files.size(), std::size_t {1});
     }
-    raw_address_t const foreign_raw {device, stand_in_slots_k * slot_bytes_k};
+    std::array<byte_t, portable_alignment_k> read_back {};
+    failures += expect(read_page(device, interior_offset - slot_payload_offset_k, read_back) &&
+                       read_back == std::array<byte_t, portable_alignment_k> {});
+    failures += expect(read_page(device, interior_offset, read_back) && holds_paint(read_back, 77));
+
+    raw_address_t const foreign_raw {device, stand_in_slots_k * slot_bytes_k, 2};
     data_address_t const foreign_base[] {foreign_raw.address()};
-    std::size_t const refused = expect_status(mount_slotted(fixture, channel, foreign_base),
-                                              status_code_t::already_exists_k);
-    return failures + refused;
+    failures += expect_status(mount_slotted(fixture, channel, foreign_base), status_code_t::already_exists_k);
+    // A raw medium is mounted by a length that fits it, never from a base to wherever it ends.
+    raw_address_t const past_raw {device, 0, stand_in_slots_k + 3};
+    data_address_t unbounded[] {first_raw.address()};
+    unbounded[0].byte_limit = 0;
+    data_address_t const past[] {past_raw.address()};
+    failures += expect_status(mount_slotted(fixture, channel, past), status_code_t::invalid_argument_k);
+    failures += expect_status(mount_slotted(fixture, channel, unbounded), status_code_t::invalid_argument_k);
+    return failures;
 }
 
 /** Data directories listed in another order than the database was created with are refused. */
@@ -518,7 +544,7 @@ std::size_t slotted_refuses_reordered_media(fixture_type_& fixture) {
     if (!guard) return failures;
     io_channel_t& channel = guard->channel();
     path_t const smaller = stand_in_device(fixture, "first.raw", 2), larger = stand_in_device(fixture, "second.raw", 3);
-    raw_address_t const smaller_raw {smaller, 0}, larger_raw {larger, 0};
+    raw_address_t const smaller_raw {smaller, 0, 2}, larger_raw {larger, 0, 3};
     data_address_t const ordered[] {smaller_raw.address(), larger_raw.address()};
     data_address_t const reordered[] {larger_raw.address(), smaller_raw.address()};
     {

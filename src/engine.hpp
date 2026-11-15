@@ -107,7 +107,7 @@ struct call_pin_t {
     void (*release)(call_pin_t&) noexcept = nullptr;
 
     /** Where the engine keeps its pin. */
-    alignas(std::max_align_t) std::byte room[call_pin_bytes_k];
+    alignas(std::max_align_t) byte_t room[call_pin_bytes_k];
 
     call_pin_t() noexcept = default;
     call_pin_t(call_pin_t const&) = delete;

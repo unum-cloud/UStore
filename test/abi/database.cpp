@@ -708,11 +708,18 @@ std::size_t database_lengths_without_bytes(config_t const& config) {
     ustore_database_open_ram(&open);
     failures += expect_status(outcome, status_code_t::invalid_argument_k);
     failures += expect(opened == nullptr);
+
+    // A NUL inside a path would cut every file name made from it short
+    std::string_view const cut_short {"store\0.ustore.json", 18};
+    open.directory = bytes_of(cut_short);
+    ustore_database_open_ram(&open);
+    failures += expect_status(outcome, status_code_t::invalid_argument_k);
+    failures += expect(opened == nullptr);
     return failures;
 }
 
-/** A tape whose strings span bytes it has no pointer to is refused, while a tape of empty
- *  strings needs none. */
+/** A tape whose strings span bytes it has no pointer to, or whose offsets step back, is refused,
+ *  while a tape of empty strings needs none. */
 std::size_t database_tape_without_bytes(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -736,6 +743,15 @@ std::size_t database_tape_without_bytes(config_t const& config) {
     write.values = u32_tape(nullptr, empty_offsets.data());
     ustore_blobs_write(&write);
     failures += expect_success(outcome);
+
+    ustore_key_t const keys[] {key_from_integer(1801), key_from_integer(1802)};
+    std::array<std::uint32_t, 3> const backward_offsets {0, 8, 4};
+    char const bytes[8] {};
+    write.count = 2;
+    write.keys = {keys, sizeof(ustore_key_t)};
+    write.values = u32_tape(reinterpret_cast<ustore_byte_t const*>(bytes), backward_offsets.data());
+    ustore_blobs_write(&write);
+    failures += expect_status(outcome, status_code_t::invalid_argument_k);
     return failures;
 }
 

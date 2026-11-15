@@ -297,7 +297,7 @@ class sealed_deltas {
         while (low != high) {
             std::size_t const middle = low + (high - low) / 2;
             st::key128_t const& head = heads_[middle];
-            std::byte head_bytes[sizeof(st::key128_t)];
+            byte_t head_bytes[sizeof(st::key128_t)];
             head.to_bytes(head_bytes);
             std::string_view const head_leading(reinterpret_cast<char const*>(head_bytes), leading.size());
             std::strong_ordering const order = leading.empty()

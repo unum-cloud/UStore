@@ -573,9 +573,12 @@ inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_measure_t cons
 /** Strings an accessor writes per block, so the indices it reads fit on the stack of the thread running the call. */
 constexpr std::size_t accessor_block_k = 64;
 
-/** Refuses a tape of @p count strings spanning bytes it has no pointer to. */
+/** Refuses a tape of @p count strings whose offsets step back or outrun its bytes. */
 template <typename tape_type_>
 status_t tape_holds(tape_type_ const& tape, std::size_t count) noexcept {
+    for (std::size_t index = 0; index != count; ++index)
+        if (tape.offsets[index + 1] < tape.offsets[index])
+            return {status_code_t::invalid_argument_k, "A tape of strings needs ascending offsets"};
     if (!count || tape.data || tape.offsets[count] == tape.offsets[0]) return {};
     return {status_code_t::invalid_argument_k, "A tape of strings needs its bytes"};
 }
