@@ -137,6 +137,10 @@ include(cmake/ustore_platform.cmake)
 add_library(ustore_header INTERFACE)
 add_library(ustore::header ALIAS ustore_header)
 set_target_properties(ustore_header PROPERTIES EXPORT_NAME header)
+# MSVC reads BOM-less UTF-8 in the system code page, so consumers of these Unicode-commented headers need `/utf-8`.
+target_compile_options(
+    ustore_header INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
+)
 target_compile_features(ustore_header INTERFACE cxx_std_20)
 target_include_directories(
     ustore_header
@@ -442,6 +446,12 @@ add_library(
                          ${ustore_vram_amd_objects_}
 )
 add_library(ustore::shared ALIAS ustore_shared)
+target_compile_options(
+    ustore_static INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
+)
+target_compile_options(
+    ustore_shared INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
+)
 set_target_properties(ustore_static PROPERTIES EXPORT_NAME static)
 set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
 # `SOVERSION` carries the major alone, the only break the C ABI admits
