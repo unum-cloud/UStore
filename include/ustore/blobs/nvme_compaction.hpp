@@ -1067,32 +1067,37 @@ constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, st
  *  @param[out] folded The bytes of the merge's folded values, or the inline key slot when the value fits it.
  */
 template <typename key_slot_type_, typename folded_type_>
+    requires locates_stored_values_concept<key_slot_type_>
 st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t value_stride, std::uint32_t folded_run,
                                 located_key_slot<key_slot_type_>& record, folded_type_& folded) noexcept {
     using st::status_t;
+    std::size_t size = bytes.size();
+    if constexpr (is_fixed(key_slot_type_::value_layout_k)) {
+        if (!bytes.empty() && bytes.size() != value_stride) return status_t::invalid_argument_k;
+        size = static_cast<std::size_t>(value_stride);
+    }
+    std::size_t const location = folded.size();
+    if (location + size > (std::numeric_limits<std::uint32_t>::max)()) return status_t::capacity_exhausted_k;
+    if (status_t const grown = folded.resize(location + size); grown != status_t::success_k) return grown;
+    if (!bytes.empty()) std::memcpy(folded.data() + location, bytes.data(), bytes.size());
+    if (bytes.size() != size) std::memset(folded.data() + location + bytes.size(), 0, size - bytes.size());
+    record.sorted_run = folded_run;
+    record.position = 0;
+    record.size = static_cast<std::uint32_t>(size);
+    return status_t::success_k;
+}
+
+/** As @c place_folded_value above, for a key slot holding its value inline. */
+template <typename key_slot_type_, typename folded_type_>
+st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t, std::uint32_t,
+                                located_key_slot<key_slot_type_>& record, folded_type_&) noexcept {
+    using st::status_t;
     key_slot_type_& key_slot = record.key_slot;
-    if constexpr (locates_stored_values_concept<key_slot_type_>) {
-        std::size_t size = bytes.size();
-        if constexpr (is_fixed(key_slot_type_::value_layout_k)) {
-            if (!bytes.empty() && bytes.size() != value_stride) return status_t::invalid_argument_k;
-            size = static_cast<std::size_t>(value_stride);
-        }
-        std::size_t const location = folded.size();
-        if (location + size > (std::numeric_limits<std::uint32_t>::max)()) return status_t::capacity_exhausted_k;
-        if (status_t const grown = folded.resize(location + size); grown != status_t::success_k) return grown;
-        if (!bytes.empty()) std::memcpy(folded.data() + location, bytes.data(), bytes.size());
-        if (bytes.size() != size) std::memset(folded.data() + location + bytes.size(), 0, size - bytes.size());
-        record.sorted_run = folded_run;
-        record.position = 0;
-        record.size = static_cast<std::uint32_t>(size);
-    }
-    else {
-        if (bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
-        if (!bytes.empty()) std::memcpy(key_slot.data, bytes.data(), bytes.size());
-        if constexpr (sizes_stored_values_concept<key_slot_type_>)
-            key_slot.size = static_cast<stored_value_size_t>(bytes.size());
-        else if (bytes.size() != key_slot_type_::size) return status_t::invalid_argument_k;
-    }
+    if (bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
+    if (!bytes.empty()) std::memcpy(key_slot.data, bytes.data(), bytes.size());
+    if constexpr (sizes_stored_values_concept<key_slot_type_>)
+        key_slot.size = static_cast<stored_value_size_t>(bytes.size());
+    else if (bytes.size() != key_slot_type_::size) return status_t::invalid_argument_k;
     return status_t::success_k;
 }
 
@@ -1482,6 +1487,7 @@ struct host_compactor_t {
         using view_t = sorted_run_index_view<key_slot_type_>;
         constexpr bool tailed_k = tailed_key_slot_concept<key_slot_type_>;
         constexpr bool locates_k = locates_stored_values_concept<key_slot_type_>;
+        constexpr bool drops_value_offsets_k = locates_k && !is_variable_width(key_slot_type_::value_layout_k);
         constexpr st::assume_uninitialized_t uninitialized {};
 
         if (!admits_sorted_runs(bounds)) return status_t::invalid_argument_k;
@@ -1567,6 +1573,18 @@ struct host_compactor_t {
         bool const tombstoned = carries_range_tombstones(upper, lower);
         std::uint64_t survivors = 0;
         std::uint64_t folded_begin = 0;
+        // Folds the change at @p index onto the versions below it, when any composes with it.
+        auto const fold_survivor = [&](record_t* versions, std::uint8_t const* kept, std::size_t count,
+                                       std::size_t index, located_key_slot<key_slot_type_>& placed) noexcept {
+            folded_versions_t const folding = folded_versions(kind, stamps, versions, kept, count, index);
+            if (folding.end == index + 1 && !folding.applies) return status_t::success_k;
+            delta_view_t folded;
+            status_t const read = fold_versions(fold, versions, index, folding, value_of, arena_bytes, folded);
+            if (read != status_t::success_k) return read;
+            placed.kind = folded.kind;
+            return place_folded_value(folded.bytes, bounds.value_stride, static_cast<std::uint32_t>(sorted_runs_count),
+                                      placed, output.folded);
+        };
         auto const settle = [&]() noexcept -> status_t {
             std::size_t const count = output.key_versions.size();
             output.key_versions_kept.clear();
@@ -1591,20 +1609,10 @@ struct host_compactor_t {
                 located_key_slot<key_slot_type_>& placed = located_of(survivor);
                 // A folded value replaces the survivor's own: inline in the key slot, or in
                 // the folded bytes
-                if (placed.kind == delta_kind_t::change_k) {
-                    folded_versions_t const folding = folded_versions(kind, stamps, versions, kept, count, index);
-                    if (folding.end != index + 1 || folding.applies) {
-                        delta_view_t folded;
-                        status_t const read = fold_versions(fold, versions, index, folding, value_of, arena_bytes,
-                                                            folded);
-                        if (read != status_t::success_k) return read;
-                        placed.kind = folded.kind;
-                        status_t const laid = place_folded_value(folded.bytes, bounds.value_stride,
-                                                                 static_cast<std::uint32_t>(sorted_runs_count), placed,
-                                                                 output.folded);
-                        if (laid != status_t::success_k) return laid;
-                    }
-                }
+                if (placed.kind == delta_kind_t::change_k)
+                    if (status_t const folded = fold_survivor(versions, kept, count, index, placed);
+                        folded != status_t::success_k)
+                        return folded;
                 place_key_slot(placed, stamps.floor, output.cells[survivors], output.stamps[survivors],
                                output.kinds[survivors]);
                 if constexpr (locates_k)
@@ -1663,13 +1671,16 @@ struct host_compactor_t {
         };
         status = plan_sorted_runs<key_slot_type_>(survivors, bounds, read_prefix, shares_key, output.sorted_runs);
         if (status != status_t::success_k) return status;
+        [[maybe_unused]] auto const values_bytes_between =
+            [&]([[maybe_unused]] std::uint64_t first, [[maybe_unused]] std::uint64_t end) noexcept -> std::uint64_t {
+            if constexpr (locates_k) return output.value_offsets[end] - output.value_offsets[first];
+            else return 0;
+        };
         if constexpr (tailed_k) {
             std::uint64_t planned_first = 0;
             for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
                 std::uint64_t const end = planned_first + output.sorted_runs[index].key_slots_count;
-                std::uint64_t values_bytes = 0;
-                if constexpr (locates_k) values_bytes = output.value_offsets[end] - output.value_offsets[planned_first];
-                output.sorted_runs[index].stored_values_bytes = values_bytes;
+                output.sorted_runs[index].stored_values_bytes = values_bytes_between(planned_first, end);
                 planned_first = end;
             }
         }
@@ -1677,7 +1688,7 @@ struct host_compactor_t {
         if (status != status_t::success_k) return status;
 
         // The running sizes are the new runs' value offsets, which a variable width alone keeps
-        if constexpr (locates_k && !is_variable_width(key_slot_type_::value_layout_k)) output.value_offsets.clear();
+        if constexpr (drops_value_offsets_k) output.value_offsets.clear();
         return status_t::success_k;
     }
 };
@@ -1941,30 +1952,35 @@ class ring_sections_reader {
         utilities::registered_medium_t medium;
     };
 
+    /** Whether a directory volume names the run files, rather than raw media alone. */
+    static constexpr bool reads_run_files_k = !std::is_void_v<volume_type_>;
+
     /** The medium @p section is read from: its volume's on raw media, else its run's file. */
     expected<utilities::medium_reference_t> medium_of_(device_section_read_t const& section) noexcept {
-        if constexpr (!std::is_void_v<volume_type_>)
-            if (volume_) {
-                // A merge reads a handful of runs, which a scan finds sooner than a table would.
-                for (run_medium_t const& known : runs_)
-                    if (known.run == section.run) return known.medium.reference();
-                char path[utilities::path_max_bytes_k];
-                if (status_t const named = volume_->file_path(static_cast<std::uint16_t>(section.volume), section.run,
-                                                              path);
-                    named.failed())
-                    return named;
-                utilities::medium_options_t request;
-                request.name = path;
-                request.access = utilities::medium_access_t::read_only_k;
-                expected<utilities::registered_medium_t> registered = disk_.register_medium(request);
-                if (!registered) return registered.status();
-                if (runs_.push_back(run_medium_t {section.run, std::move(*registered)}) != st::status_t::success_k)
-                    return status_t {status_code_t::out_of_memory_k, "The reader could not track another run"};
-                return runs_[runs_.size() - 1].medium.reference();
-            }
+        if constexpr (reads_run_files_k)
+            if (volume_) return run_medium_of_(section);
         if (section.volume >= media_.size())
             return status_t {status_code_t::invalid_argument_k, "The section names no volume of this reader"};
         return media_[section.volume].reference();
+    }
+
+    /** The file of the run @p section names, registered at its first section. */
+    expected<utilities::medium_reference_t> run_medium_of_(device_section_read_t const& section) noexcept {
+        // A merge reads a handful of runs, which a scan finds sooner than a table would.
+        for (run_medium_t const& known : runs_)
+            if (known.run == section.run) return known.medium.reference();
+        char path[utilities::path_max_bytes_k];
+        if (status_t const named = volume_->file_path(static_cast<std::uint16_t>(section.volume), section.run, path);
+            named.failed())
+            return named;
+        utilities::medium_options_t request;
+        request.name = path;
+        request.access = utilities::medium_access_t::read_only_k;
+        expected<utilities::registered_medium_t> registered = disk_.register_medium(request);
+        if (!registered) return registered.status();
+        if (runs_.push_back(run_medium_t {section.run, std::move(*registered)}) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "The reader could not track another run"};
+        return runs_[runs_.size() - 1].medium.reference();
     }
 
     /** The ring, owned, and opened for this reader alone. */

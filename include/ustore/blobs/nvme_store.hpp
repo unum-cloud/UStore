@@ -562,24 +562,8 @@ class nvme_store {
                     continue;
                 }
             }
-            if constexpr (!holds_values_inline_k)
-                if (cache_.capacity() != 0) {
-                    stored_value_size_t wanted = 0;
-                    stored_value_size_t copied = 0;
-                    transaction_stamp_t version = unwritten_stamp_k;
-                    bool cached = find_in_levels_(read, stored_keys[request], wanted, version) ==
-                                  lookup_result_t::written_k;
-                    if (cached && cached_value.size() < wanted) {
-                        auto [grown, grown_status] = utilities::arena_allocate<byte_t>(scratch, wanted);
-                        cached = grown_status.succeeded();
-                        if (cached) cached_value = grown;
-                    }
-                    if (cached && cache_.copy(stored_keys[request], version, cached_value, copied)) {
-                        results[request] = lookup_result_t::written_k;
-                        sink(request, std::uint64_t {0}, std::span<byte_t const> {cached_value}.first(copied));
-                        continue;
-                    }
-                }
+            if (select_cached_(read, scratch, stored_keys[request], cached_value, request, results[request], sink))
+                continue;
             results[request] = lookup_result_t::missing_k;
             deferred_keys[deferred] = stored_keys[request];
             deferred_requests[deferred++] = request;
@@ -633,6 +617,37 @@ class nvme_store {
         if (read_status.failed() && (truncated == 0 || !(read_status == status_code_t::io_k))) return read_status;
         return select_folded_(channel, read, scratch, stored_keys,
                               std::span<std::size_t const> {folded_requests.first(folded)}, results, sink);
+    }
+
+    /** Never answers from the cache, which holds no value of a layout holding values inline. */
+    template <typename sink_type_>
+    bool select_cached_(reading_t const&, ustore_arena_t, stored_key_t const&, std::span<byte_t>&, std::size_t,
+                        lookup_result_t&, sink_type_&) const noexcept
+        requires holds_values_inline_k
+    {
+        return false;
+    }
+
+    /** Hands @p sink the value of @p stored_key the cache holds at the version @p read sees, copied
+     *  into @p cached_value, grown from @p scratch to the widest; answers whether one was held. */
+    template <typename sink_type_>
+    bool select_cached_(reading_t const& read, ustore_arena_t scratch, stored_key_t const& stored_key,
+                        std::span<byte_t>& cached_value, std::size_t request, lookup_result_t& result,
+                        sink_type_& sink) const noexcept {
+        if (cache_.capacity() == 0) return false;
+        stored_value_size_t wanted = 0;
+        stored_value_size_t copied = 0;
+        transaction_stamp_t version = unwritten_stamp_k;
+        bool cached = find_in_levels_(read, stored_key, wanted, version) == lookup_result_t::written_k;
+        if (cached && cached_value.size() < wanted) {
+            auto [grown, grown_status] = utilities::arena_allocate<byte_t>(scratch, wanted);
+            cached = grown_status.succeeded();
+            if (cached) cached_value = grown;
+        }
+        if (!cached || !cache_.copy(stored_key, version, cached_value, copied)) return false;
+        result = lookup_result_t::written_k;
+        sink(request, std::uint64_t {0}, std::span<byte_t const> {cached_value}.first(copied));
+        return true;
     }
 
     /** The runs a reader at @p stamp walks, counted for an unordered scan that walks them one at a time. */
@@ -2047,21 +2062,8 @@ class nvme_store {
             std::span<byte_t const> const bytes = version.delta.bytes;
             key_slot_t built {};
             built.stored_key = version.stored_key;
-            if constexpr (holds_values_inline_k) {
-                // A merge may compose changes wider than any one of them, which a key slot cannot hold.
-                if (bytes.size() > sizeof(built.data))
-                    return {status_code_t::capacity_exhausted_k, "A folded change outgrows its key slot"};
-                if (!bytes.empty()) std::memcpy(built.data, bytes.data(), bytes.size());
-                built.size = static_cast<stored_value_size_t>(bytes.size());
-            }
-            else {
-                std::uint64_t const stride = is_fixed(value_layout_k) ? value_size_ : bytes.size();
-                if (bytes.size() > stride)
-                    return {status_code_t::capacity_exhausted_k, "A value outgrows its fixed width"};
-                if constexpr (sorted_run_layout_t::carries_value_offsets_k)
-                    drained.value_offsets[first + index] = static_cast<stored_value_offset_t>(written);
-                written += stride;
-            }
+            if (status_t const laid = lay_out_value_(bytes, built, drained, first + index, written); laid.failed())
+                return laid;
             [[maybe_unused]] st::status_t const placed = drained.key_slots.push_back(std::move(built));
             [[maybe_unused]] st::status_t const stamped = drained.stamps.push_back(std::uint64_t {version.stamp});
             [[maybe_unused]] st::status_t const kinded = drained.kinds.push_back(
@@ -2069,6 +2071,31 @@ class nvme_store {
         }
         if constexpr (sorted_run_layout_t::carries_value_offsets_k)
             drained.value_offsets[first + versions.size()] = static_cast<stored_value_offset_t>(written);
+        return {};
+    }
+
+    /** Copies @p bytes into the key slot @p built, for a layout holding values inline. */
+    status_t lay_out_value_(std::span<byte_t const> bytes, key_slot_t& built, drained_t&, std::size_t,
+                            std::uint64_t&) const noexcept
+        requires holds_values_inline_k
+    {
+        // A merge may compose changes wider than any one of them, which a key slot cannot hold.
+        if (bytes.size() > sizeof(built.data))
+            return {status_code_t::capacity_exhausted_k, "A folded change outgrows its key slot"};
+        if (!bytes.empty()) std::memcpy(built.data, bytes.data(), bytes.size());
+        built.size = static_cast<stored_value_size_t>(bytes.size());
+        return {};
+    }
+
+    /** Locates @p bytes at @p written past the values @p drained holds, as key slot @p slot, and
+     *  moves @p written one stride on. */
+    status_t lay_out_value_(std::span<byte_t const> bytes, key_slot_t&, drained_t& drained,
+                            [[maybe_unused]] std::size_t slot, std::uint64_t& written) const noexcept {
+        std::uint64_t const stride = is_fixed(value_layout_k) ? value_size_ : bytes.size();
+        if (bytes.size() > stride) return {status_code_t::capacity_exhausted_k, "A value outgrows its fixed width"};
+        if constexpr (sorted_run_layout_t::carries_value_offsets_k)
+            drained.value_offsets[slot] = static_cast<stored_value_offset_t>(written);
+        written += stride;
         return {};
     }
 

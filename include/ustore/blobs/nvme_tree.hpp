@@ -418,90 +418,103 @@ class lsm_tree {
      *      before it, and a key whose value is present and empty is reported once with no bytes.
      */
     template <typename sink_type_>
+    status_t read_values([[maybe_unused]] io_channel_t& channel, level_set_t const& taken,
+                         std::span<stored_key_t const> stored_keys, std::span<lookup_result_t> results,
+                         sink_type_&& sink, std::uint64_t stamp = limit<std::uint64_t>::max_k) const noexcept
+        requires holds_values_inline_k
+    {
+        if (results.size() != stored_keys.size())
+            return {status_code_t::invalid_argument_k, "A batched read answers one result per key"};
+        for (std::size_t request = 0; request != stored_keys.size(); ++request) {
+            lsm_tree_position_t position;
+            results[request] = find(taken, stored_keys[request], position, stamp);
+            if (results[request] != lookup_result_t::written_k) continue;
+            key_slot_t const& slot = taken.level(position.level_number).key_slot(position.level_position);
+            sink(request, std::uint64_t {0}, std::span<byte_t const> {slot.data, slot.size});
+        }
+        return {};
+    }
+
+    /** As @c read_values above, for values held in blocks, which the channel reads in turn. */
+    template <typename sink_type_>
     status_t read_values(io_channel_t& channel, level_set_t const& taken, std::span<stored_key_t const> stored_keys,
                          std::span<lookup_result_t> results, sink_type_&& sink,
                          std::uint64_t stamp = limit<std::uint64_t>::max_k) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched read answers one result per key"};
+        std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(),
+                                                                 portable_alignment_k);
+        if (block_bytes == 0)
+            return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
-        if constexpr (holds_values_inline_k) {
-            for (std::size_t request = 0; request != stored_keys.size(); ++request) {
-                lsm_tree_position_t position;
-                results[request] = find(taken, stored_keys[request], position, stamp);
-                if (results[request] != lookup_result_t::written_k) continue;
-                key_slot_t const& slot = taken.level(position.level_number).key_slot(position.level_position);
-                sink(request, std::uint64_t {0}, std::span<byte_t const> {slot.data, slot.size});
+        if (stored_keys.size() > (std::numeric_limits<std::uint32_t>::max)())
+            return {status_code_t::invalid_argument_k, "A batched read takes at most 2^32 keys"};
+        std::span<read_piece_t> const pieces = channel.read_pieces();
+        std::size_t const depth = pieces.size();
+
+        auto [reader_channel, reader_channel_status] = channel.acquire();
+        if (reader_channel_status.failed()) return reader_channel_status;
+        read_pipeline_t reader {volume_->disk(), std::move(reader_channel), medium_reference_t {}};
+        status_t first;
+        auto adapter = [&](completed_buffer_t const& completed) noexcept {
+            read_piece_t const& piece = pieces[completed.tag % depth];
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
+                if (first.succeeded()) first = whole;
+                return;
             }
-            return {};
-        }
-        else {
-            std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(),
-                                                                     portable_alignment_k);
-            if (block_bytes == 0)
-                return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
+            sink(piece.request, piece.offset, completed.bytes.subspan(piece.skipped, piece.carried));
+        };
 
-            if (stored_keys.size() > (std::numeric_limits<std::uint32_t>::max)())
-                return {status_code_t::invalid_argument_k, "A batched read takes at most 2^32 keys"};
-            std::span<read_piece_t> const pieces = channel.read_pieces();
-            std::size_t const depth = pieces.size();
-
-            auto [reader_channel, reader_channel_status] = channel.acquire();
-            if (reader_channel_status.failed()) return reader_channel_status;
-            read_pipeline_t reader {volume_->disk(), std::move(reader_channel), medium_reference_t {}};
-            status_t first;
-            auto adapter = [&](completed_buffer_t const& completed) noexcept {
-                read_piece_t const& piece = pieces[completed.tag % depth];
-                if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
-                    if (first.succeeded()) first = whole;
-                    return;
+        std::size_t request = 0;
+        std::uint64_t chunk = 0;
+        request_tag_t tag = 0;
+        value_window_t window;
+        medium_reference_t medium;
+        while (request != stored_keys.size() || reader.outstanding() != 0) {
+            while (request != stored_keys.size() && reader.can_enqueue()) {
+                if (chunk == 0 && !locate_value_(taken, stored_keys[request], stamp, request, results[request], sink,
+                                                 window, medium)) {
+                    ++request;
+                    continue;
                 }
-                sink(piece.request, piece.offset, completed.bytes.subspan(piece.skipped, piece.carried));
-            };
-
-            std::size_t request = 0;
-            std::uint64_t chunk = 0;
-            request_tag_t tag = 0;
-            value_window_t window;
-            medium_reference_t medium;
-            while (request != stored_keys.size() || reader.outstanding() != 0) {
-                while (request != stored_keys.size() && reader.can_enqueue()) {
-                    if (chunk == 0) {
-                        lsm_tree_position_t position;
-                        lookup_result_t const found = find(taken, stored_keys[request], position, stamp);
-                        results[request] = found;
-                        level_t const& level = taken.level(position.level_number);
-                        window = found == lookup_result_t::written_k ? level.value_window(position.level_position)
-                                                                     : value_window_t {};
-                        if (window.extent.length == 0) {
-                            if (found == lookup_result_t::written_k)
-                                sink(request, std::uint64_t {0}, std::span<byte_t const> {});
-                            ++request;
-                            continue;
-                        }
-                        medium = level.run(position.level_position.run_index).extent().medium;
-                    }
-                    std::uint64_t const at = chunk * block_bytes;
-                    std::uint64_t const room = window.extent.length - at;
-                    std::uint64_t const length = block_bytes < room ? block_bytes : room;
-                    pieces[tag % depth] = piece_of_(window, request, at, length);
-                    extent_t const piece {window.extent.offset + at, length};
-                    if (status_t const queued = reader.enqueue_read(medium, piece, tag); queued.failed()) {
-                        if (reader.outstanding() == 0) return queued;
-                        break;
-                    }
-                    ++tag;
-                    if (at + length == window.extent.length) {
-                        ++request;
-                        chunk = 0;
-                    }
-                    else ++chunk;
+                std::uint64_t const at = chunk * block_bytes;
+                std::uint64_t const room = window.extent.length - at;
+                std::uint64_t const length = block_bytes < room ? block_bytes : room;
+                pieces[tag % depth] = piece_of_(window, request, at, length);
+                extent_t const piece {window.extent.offset + at, length};
+                status_t const queued = reader.enqueue_read(medium, piece, tag);
+                if (queued.failed() && reader.outstanding() == 0) return queued;
+                if (queued.failed()) break;
+                ++tag;
+                if (at + length == window.extent.length) {
+                    ++request;
+                    chunk = 0;
                 }
-                if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
-                auto [polled, wait_completions_status] = reader.wait_completions(adapter);
-                if (wait_completions_status.failed()) return wait_completions_status;
+                else ++chunk;
             }
-            return first;
+            if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
+            auto [polled, wait_completions_status] = reader.wait_completions(adapter);
+            if (wait_completions_status.failed()) return wait_completions_status;
         }
+        return first;
+    }
+
+    /** Looks @p stored_key up in @p taken into @p result, @p window and @p medium, answering
+     *  whether its value has bytes to read; a present empty value reaches @p sink as @p request. */
+    template <typename sink_type_>
+    bool locate_value_(level_set_t const& taken, stored_key_t const& stored_key, std::uint64_t stamp,
+                       std::size_t request, lookup_result_t& result, sink_type_& sink, value_window_t& window,
+                       medium_reference_t& medium) const noexcept {
+        lsm_tree_position_t position;
+        lookup_result_t const found = find(taken, stored_key, position, stamp);
+        result = found;
+        level_t const& level = taken.level(position.level_number);
+        window = found == lookup_result_t::written_k ? level.value_window(position.level_position) : value_window_t {};
+        if (window.extent.length == 0 && found == lookup_result_t::written_k)
+            sink(request, std::uint64_t {0}, std::span<byte_t const> {});
+        if (window.extent.length == 0) return false;
+        medium = level.run(position.level_position.run_index).extent().medium;
+        return true;
     }
 
 #pragma endregion Batched Reads

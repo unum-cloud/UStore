@@ -574,6 +574,41 @@ constexpr bool is_plain_body(std::string_view body) noexcept {
     return is_utf8(body);
 }
 
+/** Whether @p scalar_type_ takes every integer whole, as a boolean and a float do. */
+template <typename scalar_type_>
+constexpr bool takes_any_integer = std::is_same_v<scalar_type_, bool> || std::is_floating_point_v<scalar_type_>;
+
+/** Whether @p integer fits the range of @p scalar_type_. */
+template <typename scalar_type_, typename integer_type_>
+constexpr bool integer_fits_cell(integer_type_ integer) noexcept {
+    if constexpr (takes_any_integer<scalar_type_>) return true;
+    else return std::in_range<scalar_type_>(integer);
+}
+
+/** Converts the cell number @p number into @p scalar as @c cell_scalar does, raising @p refused
+ *  where only the host reads it. */
+template <typename scalar_type_>
+constexpr conversion_t cell_number_scalar(cell_number_t const& number, scalar_type_& scalar,
+                                          std::uint32_t& refused) noexcept {
+    switch (number.kind) {
+    case cell_number_kind_t::real_k:
+        if (!real_fits_cell<scalar_type_>(number.real)) return conversion_t::collides_k;
+        scalar = static_cast<scalar_type_>(number.real);
+        return std::is_floating_point_v<scalar_type_> ? conversion_t::exact_k : conversion_t::converted_k;
+    case cell_number_kind_t::signed_k:
+        if (!integer_fits_cell<scalar_type_>(number.signed_integer)) return conversion_t::collides_k;
+        scalar = static_cast<scalar_type_>(number.signed_integer);
+        return std::is_integral_v<scalar_type_> && std::is_signed_v<scalar_type_> ? conversion_t::exact_k
+                                                                                  : conversion_t::converted_k;
+    case cell_number_kind_t::unsigned_k:
+        if (!integer_fits_cell<scalar_type_>(number.unsigned_integer)) return conversion_t::collides_k;
+        scalar = static_cast<scalar_type_>(number.unsigned_integer);
+        return std::is_unsigned_v<scalar_type_> && !std::is_same_v<scalar_type_, bool> ? conversion_t::exact_k
+                                                                                       : conversion_t::converted_k;
+    default: return refused = 1, conversion_t::missing_k;
+    }
+}
+
 /** Converts the cell @p token into @p scalar as @c gather_scalar does, a missing cell empty,
  *  raising @p refused where only the host converts it; @p scalar is zero wherever the conversion
  *  holds no value. */
@@ -595,28 +630,7 @@ constexpr conversion_t cell_scalar(std::string_view token, scalar_type_& scalar,
         if (read_text_scalar(body, read, refused)) return scalar = read, conversion_t::converted_k;
         return conversion_t::collides_k;
     }
-    case json_token_t::number_k: {
-        cell_number_t const number = read_cell_number(token);
-        switch (number.kind) {
-        case cell_number_kind_t::real_k:
-            if (!real_fits_cell<scalar_type_>(number.real)) return conversion_t::collides_k;
-            scalar = static_cast<scalar_type_>(number.real);
-            return std::is_floating_point_v<scalar_type_> ? conversion_t::exact_k : conversion_t::converted_k;
-        case cell_number_kind_t::signed_k:
-            if constexpr (!std::is_same_v<scalar_type_, bool> && !std::is_floating_point_v<scalar_type_>)
-                if (!std::in_range<scalar_type_>(number.signed_integer)) return conversion_t::collides_k;
-            scalar = static_cast<scalar_type_>(number.signed_integer);
-            return std::is_integral_v<scalar_type_> && std::is_signed_v<scalar_type_> ? conversion_t::exact_k
-                                                                                      : conversion_t::converted_k;
-        case cell_number_kind_t::unsigned_k:
-            if constexpr (!std::is_same_v<scalar_type_, bool> && !std::is_floating_point_v<scalar_type_>)
-                if (!std::in_range<scalar_type_>(number.unsigned_integer)) return conversion_t::collides_k;
-            scalar = static_cast<scalar_type_>(number.unsigned_integer);
-            return std::is_unsigned_v<scalar_type_> && !std::is_same_v<scalar_type_, bool> ? conversion_t::exact_k
-                                                                                           : conversion_t::converted_k;
-        default: return refused = 1, conversion_t::missing_k;
-        }
-    }
+    case json_token_t::number_k: return cell_number_scalar(read_cell_number(token), scalar, refused);
     default: return conversion_t::collides_k;
     }
 }
