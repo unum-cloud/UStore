@@ -14,7 +14,8 @@
 #include <type_traits> // `std::type_identity_t`
 
 #include "ustore/blobs/nvme_compaction.hpp"            // `compaction_output`, `sorted_run_index_view`
-#include "ustore/blobs/vram_nvidia_compaction.hpp"     // `cuda_compactor_t`, `hip_compactor_t`
+#include "ustore/blobs/vram_amd_compaction.hpp"        // `hip_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp"     // `cuda_compactor_t`
 #include "ustore/graph/adjacency_fold.hpp"             // `adjacency_fold_t`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
 #include "ustore/utilities/folds.hpp"                  // `last_write_fold_t`
@@ -30,38 +31,46 @@ using blobs::compaction_kind_t;
 using blobs::compaction_output;
 using blobs::compaction_stamps_t;
 using blobs::cuda_compactor_t;
-using blobs::device_compactor;
 using blobs::hip_compactor_t;
 using blobs::sorted_run_bounds_t;
 using st::key128_t;
 using utilities::last_write_fold_t;
 
-template <typename executor_type_>
-expected<device_compactor<executor_type_>> device_compactor<executor_type_>::make(executor_type_&,
-                                                                                  device_sections_reader_t) noexcept {
+expected<cuda_compactor_t> cuda_compactor_t::make(utilities::cuda_executor_t&, device_sections_reader_t) noexcept {
     return status_t {status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
 }
 
-template <typename executor_type_>
-device_compactor<executor_type_>::~device_compactor() noexcept {}
+cuda_compactor_t::~cuda_compactor_t() noexcept {}
 
-template <typename executor_type_>
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
           typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t device_compactor<executor_type_>::compact(compaction_kind_t,
-                                                       std::span<sorted_run_index_view<key_slot_type_> const>,
-                                                       std::span<sorted_run_index_view<key_slot_type_> const>,
-                                                       std::span<sorted_run_extents_t const>,
-                                                       sorted_run_bounds_t const&, compaction_stamps_t const&,
-                                                       fold_type_ const&, device_fold_type_ const&,
-                                                       std::type_identity_t<located_value_reader<key_slot_type_>>,
-                                                       compaction_output<key_slot_type_, allocator_type_>&) noexcept {
+st::status_t cuda_compactor_t::compact(compaction_kind_t, std::span<sorted_run_index_view<key_slot_type_> const>,
+                                       std::span<sorted_run_index_view<key_slot_type_> const>,
+                                       std::span<sorted_run_extents_t const>, sorted_run_bounds_t const&,
+                                       compaction_stamps_t const&, fold_type_ const&, device_fold_type_ const&,
+                                       std::type_identity_t<located_value_reader<key_slot_type_>>,
+                                       compaction_output<key_slot_type_, allocator_type_>&) noexcept {
     return st::status_t::invalid_argument_k;
 }
 
-template class blobs::device_compactor<utilities::cuda_executor_t>;
-template class blobs::device_compactor<utilities::hip_executor_t>;
+expected<hip_compactor_t> hip_compactor_t::make(utilities::hip_executor_t&, device_sections_reader_t) noexcept {
+    return status_t {status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
+}
+
+hip_compactor_t::~hip_compactor_t() noexcept {}
+
+template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+          typename allocator_type_>
+    requires compactable_key_slot_concept<key_slot_type_>
+st::status_t hip_compactor_t::compact(compaction_kind_t, std::span<sorted_run_index_view<key_slot_type_> const>,
+                                      std::span<sorted_run_index_view<key_slot_type_> const>,
+                                      std::span<sorted_run_extents_t const>, sorted_run_bounds_t const&,
+                                      compaction_stamps_t const&, fold_type_ const&, device_fold_type_ const&,
+                                      std::type_identity_t<located_value_reader<key_slot_type_>>,
+                                      compaction_output<key_slot_type_, allocator_type_>&) noexcept {
+    return st::status_t::invalid_argument_k;
+}
 
 /** The sorted run indexes of one LSM level, as a compaction takes both of its levels. */
 template <typename key_slot_type_>

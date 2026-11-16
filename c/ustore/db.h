@@ -517,9 +517,9 @@ typedef struct ustore_database_open_nvme_t {
     /** Entries of @c data_directories. */
     ustore_size_t data_directories_count;
 
-    /** Executor of @c ustore_executor_for_vram on an NVIDIA or AMD device, whose device, scratch
-     *  budget and, on NVIDIA, GPUDirect Storage mode every merge of the database takes, read once
-     *  here, so it may be freed afterwards; @c NULL merges on host threads. */
+    /** Executor of @c ustore_executor_for_vram on an NVIDIA, AMD or Apple device, whose device,
+     *  scratch budget and, on NVIDIA, GPUDirect Storage mode every merge of the database takes,
+     *  read once here, so it may be freed afterwards; @c NULL merges on host threads. */
     ustore_executor_t compactions;
 
     /** Bytes of host memory the engine may pin and cache. */
@@ -566,8 +566,9 @@ typedef struct ustore_database_open_nvme_t {
  *  @par Statuses:
  *  @c ustore_status_unsupported_k means the library was built without the engine, SPDK is asked
  *  for, the manifest or a slot has another format version, the @c compactions executor drives an
- *  NVIDIA or AMD device that loaded no bundle of the library's kernels, the io_uring transport was
- *  named on a kernel without one, or no compiled class fits under the @c cpu_class_ceiling.
+ *  NVIDIA, AMD or Apple device that loaded no bundle of the library's kernels, the io_uring
+ *  transport was named on a kernel without one, or no compiled class fits under the
+ *  @c cpu_class_ceiling.
  *
  *  - @c ustore_status_device_k The executor computes on a device, or the @c compactions executor is
  *    no VRAM one.

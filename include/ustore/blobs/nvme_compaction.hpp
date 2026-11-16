@@ -11,10 +11,10 @@
  *  compactors share the rules below. The device one composes chains of changes only through a
  *  device fold the caller passes, and folds on the host every chain reaching a write or a base,
  *  so without a device fold a merge of runs holding a change runs on the host. Every compiler
- *  sees the device compactor, which carves, copies and launches through its executor: its kernels
- *  in @c vram_nvidia_compaction.cuh compile into the library's bundles, and @c compaction.cpp
- *  instantiates its compaction for the engine's key slots, so a host TU calls it, and a device
- *  whose bundle carries no kernels makes no device compactor.
+ *  sees the device compactors, one per vendor, which carve, copy and launch through their
+ *  executors: their kernels compile into the library's bundles, and @c compaction.cpp
+ *  instantiates their compaction for the engine's key slots, so a host TU calls them, and a
+ *  device whose bundle carries no kernels makes no device compactor.
  */
 
 #pragma once
@@ -2023,18 +2023,39 @@ class ring_sections_reader {
     utilities::registered_memory_t registered_;
 };
 
-template <typename executor_type_>
-class device_compactor;
+/** The device regions the pack of one merge reads and writes, on every vendor's device. */
+template <typename record_type_>
+struct merge_pack_regions {
+
+    /** The merged records and their survival flags, as the rank kernel wrote them. */
+    record_type_ const* merged = nullptr;
+    std::uint8_t const* flags = nullptr;
+    std::uint64_t records_count = 0;
+
+    /** The merged indices of the folded survivors, ascending, and the records replacing them. */
+    std::uint64_t const* replaced = nullptr;
+    record_type_ const* replacements = nullptr;
+    std::uint64_t replaced_count = 0;
+
+    /** The survivors in order, their value offsets or null, and whether each shares the key before
+     *  it. */
+    record_type_* survivors = nullptr;
+    std::uint64_t* prefix = nullptr;
+    std::uint8_t* shares = nullptr;
+};
 
 /** The device compactor of an NVIDIA device. */
-using cuda_compactor_t = device_compactor<utilities::cuda_executor_t>;
+class cuda_compactor_t;
 
 /** The device compactor of an AMD device. */
-using hip_compactor_t = device_compactor<utilities::hip_executor_t>;
+class hip_compactor_t;
+
+/** The device compactor of an Apple device. */
+class metal_compactor_t;
 
 /** The compactor a database's merges run on, picked once at mount by whoever opens it: the calling thread, or a warm
- *  device compactor of either vendor that opener owns. */
-using compactor_ref_t = std::variant<host_compactor_t, cuda_compactor_t*, hip_compactor_t*>;
+ *  device compactor of any vendor that opener owns. */
+using compactor_ref_t = std::variant<host_compactor_t, cuda_compactor_t*, hip_compactor_t*, metal_compactor_t*>;
 
 #pragma endregion Device
 

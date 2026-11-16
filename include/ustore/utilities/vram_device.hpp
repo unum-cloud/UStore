@@ -154,12 +154,29 @@ inline constexpr char const* vram_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                       "ustore_docs_drop_terminators_u32",
                                                       "ustore_docs_drop_terminators_u64"};
 
-/** The C names every Apple bundle exports its kernels under: every other vendor's but the
- *  compaction's merges and folds, which no Apple device runs. */
+/** The C names every Apple bundle exports its kernels under: every other vendor's, and the select
+ *  and the value offsets an Apple merge packs through, with no 64-bit atomics to chain with. */
 inline constexpr char const* vram_apple_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                             "ustore_tape_offsets_u64",
                                                             "ustore_tape_gather",
                                                             "ustore_tape_densify",
+                                                            "ustore_merge_rank_inline_12",
+                                                            "ustore_merge_pack_inline_12",
+                                                            "ustore_merge_place_inline_12",
+                                                            "ustore_merge_rank_inline_44",
+                                                            "ustore_merge_pack_inline_44",
+                                                            "ustore_merge_place_inline_44",
+                                                            "ustore_merge_rank_fixed_width",
+                                                            "ustore_merge_pack_fixed_width",
+                                                            "ustore_merge_place_fixed_width",
+                                                            "ustore_merge_rank_variable_width",
+                                                            "ustore_merge_pack_variable_width",
+                                                            "ustore_merge_place_variable_width",
+                                                            "ustore_merge_strings_rank",
+                                                            "ustore_merge_gather_fixed_width",
+                                                            "ustore_merge_gather_variable_width",
+                                                            "ustore_fold_chains",
+                                                            "ustore_fold_write",
                                                             "ustore_substrings_contains_per_thread",
                                                             "ustore_substrings_contains_per_group",
                                                             "ustore_substrings_contains_per_chunk",
@@ -176,7 +193,11 @@ inline constexpr char const* vram_apple_kernel_names_k[] = {"ustore_tape_offsets
                                                             "ustore_docs_write_texts",
                                                             "ustore_docs_pack_bools",
                                                             "ustore_docs_drop_terminators_u32",
-                                                            "ustore_docs_drop_terminators_u64"};
+                                                            "ustore_docs_drop_terminators_u64",
+                                                            "ustore_select_count_apple",
+                                                            "ustore_select_scan_apple",
+                                                            "ustore_select_write_apple",
+                                                            "ustore_merge_offsets_apple"};
 
 /** One bundle loaded on one device, its kernels resolved by their C names once. */
 template <typename module_type_>

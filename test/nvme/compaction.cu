@@ -23,7 +23,7 @@
 #include <span>        // `std::span`, `std::as_bytes`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::type_identity`
+#include <type_traits> // `std::type_identity`, `std::conditional_t`, `std::is_same_v`
 
 #include <fmt/format.h>
 
@@ -33,7 +33,8 @@
 #include <smashtable/shared.hpp>
 
 #include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compacted_sorted_run_t`, `compaction_kind_t`
-#include "ustore/blobs/vram_nvidia_compaction.hpp" // `device_compactor`
+#include "ustore/blobs/vram_amd_compaction.hpp"    // `hip_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 #include "ustore/graph/adjacency_fold.hpp"         // `adjacency_fold_t`, `save_delta`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
 #include "ustore/utilities/nvme_linux_cufile_disk.hpp" // `linux_cufile_files_disk`, `linux_cufile_disk_config_t`
@@ -1321,7 +1322,8 @@ template <typename executor_type_, typename key_slot_type_>
 case_result_t gpu_case_on(compaction_kind_t kind, sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                           test_lsm_level<key_slot_type_> const& upper, test_lsm_level<key_slot_type_> const& lower,
                           compaction_output<key_slot_type_> const& host, options_t const& options) {
-    using compactor_t = device_compactor<executor_type_>;
+    using compactor_t =
+        std::conditional_t<std::is_same_v<executor_type_, hip_executor_t>, hip_compactor_t, cuda_compactor_t>;
     if constexpr (!std::is_same_v<typename key_slot_type_::stored_key_t, st::key128_t>)
         return case_result_t::skipped("the bundle carries merge kernels for 16-byte keys alone");
     expected<executor_type_> executor = spawn_device_zero<executor_type_>(options, 0);
@@ -1887,7 +1889,8 @@ double milliseconds_since(std::chrono::steady_clock::time_point start) noexcept 
 template <typename executor_type_>
 case_result_t graph_gpu_case_on(graph_case_t const& graph_case, std::size_t case_index, sequence_order_t order,
                                 options_t const& options) {
-    using compactor_t = device_compactor<executor_type_>;
+    using compactor_t =
+        std::conditional_t<std::is_same_v<executor_type_, hip_executor_t>, hip_compactor_t, cuda_compactor_t>;
     expected<executor_type_> executor = spawn_device_zero<executor_type_>(options, 0);
     if (!executor) return case_result_t::skipped("no GPU device");
     expected<compactor_t> compactor = compactor_t::make(*executor);

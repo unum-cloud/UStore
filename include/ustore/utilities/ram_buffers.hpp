@@ -1076,7 +1076,6 @@ struct strings_ladder {
     using strings_kit_t = typename highest_strings_kit<capabilities_, serial_strings_kit_t, icelake_strings_kit_t,
                                                        skylake_strings_kit_t, haswell_strings_kit_t, neon_strings_kit_t,
                                                        rvv_strings_kit_t, powervsx_strings_kit_t>::type;
-    static constexpr sz_capability_t picked_k = strings_kit_t::capability_k;
 };
 
 } // namespace unum::ustore::utilities

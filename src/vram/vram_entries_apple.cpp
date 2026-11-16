@@ -8,9 +8,9 @@
  *  The Apple twin of a class's device pass over @c vram_kernels_nvidia.cu or
  *  @c vram_kernels_amd.hip, compiled once per class with that class's gate set to 1. MSL cannot
  *  include, so the source is spliced here, in order: the vocabulary the host and the kernels share,
- *  a prelude naming the class's Apple family, the kernels of tapes, gathers and selects, then the
- *  matching kernels. Each part ends in a newline and the whole in a null byte, as Metal reads it as
- *  one C string.
+ *  a prelude naming the class's Apple family, StringZilla's MSL engines, the kernels of tapes,
+ *  gathers and selects, the compactor's kernels, then the matching kernels. Each part ends in a
+ *  newline and the whole in a null byte, as Metal reads it as one C string.
  */
 
 #include <cstddef> // `std::size_t`
@@ -29,9 +29,25 @@ constexpr char metal_shared_source_k[] = {
 #embed "ustore/utilities/vram_apple_shared.h" suffix(, 0) if_empty(0)
 };
 
+/** StringZilla's MSL: its vocabulary, case folding tables and folding, and the substrings, regex
+ *  and subdocuments engines the matching kernels walk, each part followed by a newline. */
+constexpr char metal_stringzilla_source_k[] = {
+#embed "stringzilla/types.metal" suffix(, '\n', )
+#embed "stringzilla/utf8_uncased_fold/tables.h" suffix(, '\n', )
+#embed "stringzilla/utf8_uncased_fold/metal.metal" suffix(, '\n', )
+#embed "stringzilla/substrings/metal.metal" suffix(, '\n', )
+#embed "stringzilla/regex/metal.metal" suffix(, '\n', )
+#embed "stringzilla/subdocuments/metal.metal" suffix(, 0) if_empty(0)
+};
+
 /** The tape, gather and select kernels. */
 constexpr char metal_kernels_source_k[] = {
 #embed "vram/vram_kernels_apple.metal" suffix(, 0) if_empty(0)
+};
+
+/** The compactor's merge and fold kernels. */
+constexpr char metal_compaction_source_k[] = {
+#embed "vram/vram_compaction_apple.metal" suffix(, 0) if_empty(0)
 };
 
 /** The matching kernels, which walk the substrings, regex and subdocuments engines. */
@@ -79,8 +95,8 @@ std::array<unsigned char, spliced_bytes<sizes_...>()> splice(char const (&... pa
 }
 
 /** The source of this class's bundle, the vocabulary first, as every MSL part reads it. */
-auto const metal_bundle_source_k = splice(metal_shared_source_k, metal_prelude_source_k, metal_kernels_source_k,
-                                          metal_matching_source_k);
+auto const metal_bundle_source_k = splice(metal_shared_source_k, metal_prelude_source_k, metal_stringzilla_source_k,
+                                          metal_kernels_source_k, metal_compaction_source_k, metal_matching_source_k);
 
 #if USTORE_TARGET_APPLE_METAL7
 extern "C" unsigned char const* const vram_apple_metal7_bundle_start = metal_bundle_source_k.data();

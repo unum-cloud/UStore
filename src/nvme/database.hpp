@@ -34,7 +34,9 @@
 #include "ustore/blobs/nvme_database.hpp"              // `basic_database`, `lookup_result_t`
 #include "ustore/blobs/nvme_transactions.hpp"          // `watch_schedule_t`
 #include "ustore/blobs/nvme_tree.hpp"                  // `user_collection_config_t`, `validate`
-#include "ustore/blobs/vram_nvidia_compaction.hpp"     // `cuda_compactor_t`, `hip_compactor_t`
+#include "ustore/blobs/vram_amd_compaction.hpp"        // `hip_compactor_t`
+#include "ustore/blobs/vram_apple_compaction.hpp"      // `metal_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp"     // `cuda_compactor_t`
 #include "ustore/docs/nvme_store.hpp"                  // `docs::nvme_store`
 #include "ustore/graph/nvme_store.hpp"                 // `graph::nvme_store`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
@@ -75,8 +77,8 @@ template <cpu_class_t cpu_class_>
 using sections_reader_of = ring_sections_reader<sections_disk_of<cpu_class_>, waiter_of<cpu_class_>,
                                                 typename storage_mount_of<cpu_class_>::volume_t>;
 
-/** What composes the half-edge changes of a graph's merge on a device: the CUDA tower, which a build without a CUDA
- *  compiler never reaches, as it makes no device compactor. */
+/** What composes the half-edge changes of a graph's merge on a device, whichever vendor's compactor
+ *  runs it. */
 using graph_device_fold_t = graph::vram_nvidia_adjacency_fold_t;
 
 /** The store of a blobs collection, and of the collections system collection, whose values follow
@@ -308,8 +310,8 @@ struct nvme_variant {
  *
  *  Sections read by DMA on an NVIDIA device where the executor's GPUDirect Storage mode allows it
  *  and cuFile reaches the device, since compat mode bounces through host pages, slower than
- *  uploading the indexes the runs already hold in memory; an AMD device uploads them from memory
- *  alone. The members die in reverse, the compactor first, so it frees its scratch while the
+ *  uploading the indexes the runs already hold in memory; AMD and Apple devices upload them from
+ *  memory alone. The members die in reverse, the compactor first, so it frees its scratch while the
  *  reader and the executor live.
  */
 template <cpu_class_t cpu_class_>
@@ -326,22 +328,30 @@ class device_compaction {
     /** Spawns the executor on the device @p compactions computes on and binds the compactor over
      *  it, refusing with @c unsupported_k where the device loaded no bundle of the library's
      *  kernels; on an NVIDIA device the compactor reads run sections through the reader over
-     *  @p volume, mounted over the data directories of @p resources, and on an AMD one it uploads
-     *  them from memory. */
+     *  @p volume, mounted over the data directories of @p resources, and on an AMD or an Apple one
+     *  it uploads them from memory. */
     status_t open(ustore_executor_handle_t const& compactions, resources_config_t const& resources,
                   volume_t const& volume) noexcept {
-        hip_executor_t const* const amd = std::get_if<hip_executor_t>(&compactions.device);
-        cuda_executor_t const* const caller = std::get_if<cuda_executor_t>(&compactions.device);
-        if (!caller && !amd)
+        gpu_device_t twin {};
+        std::size_t scratch_limit = 0;
+        bool const on_device = std::visit(
+            [&]<typename device_type_>(device_type_ const& device) noexcept {
+                if constexpr (!gpu_executor_concept<device_type_>) return false;
+                else {
+                    twin.vendor = device_type_::vendor_k;
+                    twin.vendor_ordinal = static_cast<std::uint32_t>(device.device());
+                    scratch_limit = device.scratch_limit();
+                    return true;
+                }
+            },
+            compactions.device);
+        if (!on_device)
             return {status_code_t::device_k, "The compactions need an executor of ustore_executor_for_vram"};
+        cuda_executor_t const* const nvidia = std::get_if<cuda_executor_t>(&compactions.device);
         gpu_runtime_t& runtime = gpu_runtime();
         gpu_drivers_t const& drivers = runtime.drivers;
-        gpu_device_t twin {};
-        twin.vendor = caller ? cuda_executor_t::vendor_k : hip_executor_t::vendor_k;
-        twin.vendor_ordinal = static_cast<std::uint32_t>(caller ? caller->device() : amd->device());
-        if (status_t const spawned = runtime.spawn(twin, compactions.gpu_class, nullptr,
-                                                   caller ? caller->scratch_limit() : amd->scratch_limit(),
-                                                   caller ? caller->gds() : ustore_gds_compatibility_k, executor_);
+        if (status_t const spawned = runtime.spawn(twin, compactions.gpu_class, nullptr, scratch_limit,
+                                                   nvidia ? nvidia->gds() : ustore_gds_compatibility_k, executor_);
             spawned.failed())
             return spawned;
         return std::visit([&](auto& executor) noexcept { return bind_(executor, drivers, resources, volume); },
@@ -366,18 +376,35 @@ class device_compaction {
     }
 
     /** Binds the compactor over @p executor, reading run sections over @p volume where cuFile
-     *  reaches an NVIDIA device, as no AMD device reads them by DMA. */
-    template <typename executor_type_>
-    status_t bind_(executor_type_& executor, gpu_drivers_t const& drivers, resources_config_t const& resources,
+     *  reaches the NVIDIA device. */
+    status_t bind_(cuda_executor_t& executor, gpu_drivers_t const& drivers, resources_config_t const& resources,
                    volume_t const& volume) noexcept {
-        if constexpr (std::is_same_v<executor_type_, cuda_executor_t>) {
-            status_t const opened = open_sections(drivers.cufile, executor.gds(), resources, volume);
-            if (opened.failed()) return opened;
-        }
-        expected<device_compactor<executor_type_>> made = device_compactor<executor_type_>::make(
+        if (status_t const opened = open_sections(drivers.cufile, executor.gds(), resources, volume); opened.failed())
+            return opened;
+        expected<cuda_compactor_t> made = cuda_compactor_t::make(
             executor, sections_ ? device_sections_reader_t {&sections_.value()} : device_sections_reader_t {});
         if (!made) return made.status();
-        compactor_.template emplace<device_compactor<executor_type_>>(std::move(*made));
+        compactor_.template emplace<cuda_compactor_t>(std::move(*made));
+        return {};
+    }
+
+    /** Binds the compactor over @p executor, uploading run sections from memory, as no AMD device
+     *  reads them by DMA. */
+    status_t bind_(hip_executor_t& executor, gpu_drivers_t const&, resources_config_t const&,
+                   volume_t const&) noexcept {
+        expected<hip_compactor_t> made = hip_compactor_t::make(executor);
+        if (!made) return made.status();
+        compactor_.template emplace<hip_compactor_t>(std::move(*made));
+        return {};
+    }
+
+    /** Binds the compactor over @p executor, uploading run sections from memory, as no Apple device
+     *  reads them by DMA. */
+    status_t bind_(metal_executor_t& executor, gpu_drivers_t const&, resources_config_t const&,
+                   volume_t const&) noexcept {
+        expected<metal_compactor_t> made = metal_compactor_t::make(executor);
+        if (!made) return made.status();
+        compactor_.template emplace<metal_compactor_t>(std::move(*made));
         return {};
     }
 
@@ -436,9 +463,9 @@ class device_compaction {
     /** Run files one merge on a directory volume reads at most. */
     static constexpr std::uint16_t merged_run_files_k = 1024;
 
-    std::variant<std::monostate, cuda_executor_t, hip_executor_t> executor_;
+    std::variant<std::monostate, cuda_executor_t, hip_executor_t, metal_executor_t> executor_;
     std::optional<sections_reader_of<cpu_class_>> sections_;
-    std::variant<std::monostate, cuda_compactor_t, hip_compactor_t> compactor_;
+    std::variant<std::monostate, cuda_compactor_t, hip_compactor_t, metal_compactor_t> compactor_;
 };
 
 /** Everything one open database holds, behind its database handle of the C ABI. */

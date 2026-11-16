@@ -310,7 +310,7 @@ The C headers are C11, checked by `c/test.c` under every platform's compiler aga
 
 Every column but NVMe is exercised by CI on all four platforms: `.github/workflows/prerelease.yml` builds and tests the C ABI and each engine, the Python extension and the Rust crate.
 The NVMe column records the suites in [`test/`](https://github.com/unum-cloud/UStore/tree/main/test) on two Linux x86-64 machines rather than CI, which does not build NVMe; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP and is mounted by the engine.
-GPU compaction targets NVIDIA Hopper and Blackwell alike through the CUDA driver API, and AMD CDNA through HIP's module API, untested on hardware; it launches three kernels per merge without linking either runtime, and its output must match CPU compaction on the same runs.
+GPU compaction targets NVIDIA Hopper and Blackwell alike through the CUDA driver API, AMD CDNA through HIP's module API and Apple GPUs through Metal, the last two untested on hardware; it launches three kernels per merge without linking any of those runtimes, and its output must match CPU compaction on the same runs.
 The engines and the layout of `src/` are described in [`src/README.md`](https://github.com/unum-cloud/UStore/blob/main/src/README.md).
 
 ### Why Not RocksDB

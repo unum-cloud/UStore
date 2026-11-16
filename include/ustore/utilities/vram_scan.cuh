@@ -14,11 +14,20 @@
  *  they start, and each waits for the ticket before its own to chain its total, adds its own, and
  *  only then writes; a ticket is only ever held by a running block, so the wait always ends. The
  *  last block leaves the grand total in the slot, which the host downloads.
+ *
+ *  Apple devices have no 64-bit atomics, so there the host runs the select of
+ *  @c vram_kernels_apple.metal instead, whose launches this header names: a count per tile, one
+ *  threadgroup scanning the counts, and a write of every flagged index at its rank, in item order
+ *  as the chain's.
  */
 
 #pragma once
 
 #include <cstdint> // `std::uint64_t`
+
+#if !defined(__CUDACC__) && !defined(__HIP__)
+#include "ustore/utilities/vram_device.hpp" // `launch`, `metal_executor_t`, `status_t`
+#endif
 
 namespace unum::ustore::utilities {
 
@@ -78,6 +87,34 @@ struct block_scanned_t {
     std::uint64_t before = 0;
     std::uint64_t total = 0;
 };
+
+#else
+
+/**
+ *  @brief Queues the select over the @p count byte @p flags on @p executor, listing the index of
+ *      every flagged item into @p selected in item order.
+ *
+ *  @p counts receives the items flagged before every one of the @p tiles tiles of @p tile items,
+ *  a multiple of 256, and the total after the last, so it holds @p tiles + 1 words, and
+ *  @p selected holds @p count, both on the device.
+ *
+ *  @par Statuses:
+ *  - @c status_code_t::device_k The bundle holds no select, or the device refused a launch.
+ */
+inline status_t select_flagged(metal_executor_t& executor, std::uint8_t const* flags, std::uint32_t count,
+                               std::uint32_t tile, std::uint32_t tiles, std::uint32_t* counts,
+                               std::uint32_t* selected) noexcept {
+    constexpr std::uint32_t byte_flags_k = 8;
+    char const* const passes[] = {"ustore_select_count_apple", "ustore_select_scan_apple", "ustore_select_write_apple"};
+    unsigned const groups[] = {tiles, 1u, tiles};
+    // The select's scans assume threadgroups of 256 threads
+    for (std::size_t pass = 0; pass != 3; ++pass)
+        if (status_t const launched = launch(executor, executor.kernels()->function(passes[pass]), groups[pass], 256u,
+                                             0u, flags, count, tile, tiles, byte_flags_k, counts, selected);
+            launched.failed())
+            return launched;
+    return {};
+}
 
 #endif
 

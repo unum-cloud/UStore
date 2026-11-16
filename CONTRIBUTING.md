@@ -205,9 +205,9 @@ A plan owns only what crosses its barriers: scratch belongs to the context, resu
 A report's verdict-like enum starts at `none = 0`, so a zeroed report never reads as progress.
 
 UStore's one long operation is compaction: `ustore_database_compact` takes a `ustore_database_compact_plan_t`, and `ustore_database_compact_plan_finish` frees it.
-Its phases are `flush`, `merge` and `reclaim`, between `none` and `done`, and each engine runs the ones it has: RAM a merge per collection, then one reclaim; NVMe a flush, then merge rounds; RocksDB a flush per column family, then a merge per family; LevelDB a merge per collection's key range.
-An engine's `compact_open` lists its units once, the plan's only allocation, marking which may run at once, and `compact_advance` runs any one unit, in place of `tasks`, `run` and `advance`: RAM merges and RocksDB flushes are tasks the router's driver fans out over the executor, while RocksDB and LevelDB merges and NVMe rounds are steps, one after another.
-The driver reports `ustore_phase_progress_t` as units finish, a cancel lets running units finish and starts no more, and a plan the cancel leaves live continues past every unit that finished.
+Its phases are `flush`, `merge` and `reclaim`, between `none` and `done`, and each engine runs the ones it has: RAM a merge task per collection, then one reclaim task; NVMe a flush task, then merge passes of one task each; RocksDB a flush task per column family, then a merge task per family; LevelDB a merge pass per collection's key range.
+Each engine's `compact_plan_t` carries `task_t`, `tasks()`, `run(task, context)`, `advance()`, `stop()`, `status()`, `phase()`, `ordinal()`, `completed()`, `total()` and `finish()`, its table entry `compact_plan_open` opens one, and `compact_plan` holds the `plan_verbs` the router drives it through.
+The driver fans each phase's tasks out over the executor and ticks the phase's units at its barrier, where a cancel stops, so a plan the cancel leaves live continues at the phase it reached.
 
 A member of a plan, cursor or walk names what it holds and when it holds it, like `picked_this_round_` or `visited_`.
 A pair that trades places shares one stem and differs in one word, like `picked_this_round_` and `picked_next_round_`, and the verb moving between them is named for the barrier it runs at, like `advance_round_`.
@@ -581,6 +581,6 @@ Start with these, in order:
 11. Outputs: every output whose length scales with the call lands in the call's `arena` through `include/ustore/utilities/ram_buffers.hpp`, while the router makes and frees arenas in `ustore_arena_init()` and `ustore_arena_free()`.
 
 Scans and saves report through the `progress_t` of `src/utilities/progress.hpp`, in the units their verbs document, and unwind with `progress_cancelled_k` once `advance` answers false, leaving nothing a caller would read: a cancelled save removes what it wrote.
-A compaction is a plan instead, as [Planned Operations](#planned-operations) describes: the router's driver reports as its units finish and starts no unit after a cancel.
+A compaction is a plan instead, as [Planned Operations](#planned-operations) describes: the driver reports at every barrier and starts no phase after a cancel.
 
 The conformance suite checks every advertised isolation level against behaviour, so report the level the engine delivers, not the one it aims for.

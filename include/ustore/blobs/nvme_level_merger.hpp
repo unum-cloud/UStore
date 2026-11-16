@@ -28,7 +28,9 @@
 #include "ustore/blobs/nvme_lsm_level.hpp"         // `lsm_level`
 #include "ustore/blobs/nvme_schemas.hpp"           // `cancellation_state_t`
 #include "ustore/blobs/nvme_sorted_run.hpp"        // `sorted_run_header_t`, `sorted_run_layout`
-#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`, `hip_compactor_t`
+#include "ustore/blobs/vram_amd_compaction.hpp"    // `hip_compactor_t`
+#include "ustore/blobs/vram_apple_compaction.hpp"  // `metal_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 #include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
 #include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`
 #include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
@@ -66,7 +68,8 @@ enum class compactor_choice_t : std::uint8_t {
     /** @c host_compactor_t, on the calling thread. */
     host_k,
 
-    /** @c cuda_compactor_t or @c hip_compactor_t, on the device of the database's own executor. */
+    /** @c cuda_compactor_t, @c hip_compactor_t or @c metal_compactor_t, on the device of the
+     *  database's own executor. */
     device_k,
 };
 
@@ -192,10 +195,11 @@ class compaction_fan_out_t {
                : compactor_choice_t::host_k;
 }
 
-/** Devices @p compactor merges on: one for an NVIDIA or AMD compactor, none for the host's. */
+/** Devices @p compactor merges on: one for an NVIDIA, AMD or Apple one, none for the host's. */
 [[nodiscard]] inline std::size_t devices_of(compactor_ref_t const& compactor) noexcept {
     bool const device = std::holds_alternative<cuda_compactor_t*>(compactor) ||
-                        std::holds_alternative<hip_compactor_t*>(compactor);
+                        std::holds_alternative<hip_compactor_t*>(compactor) ||
+                        std::holds_alternative<metal_compactor_t*>(compactor);
     return device ? 1 : 0;
 }
 

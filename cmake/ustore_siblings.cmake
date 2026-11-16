@@ -58,13 +58,13 @@ endif ()
 # ForkUnion's C ABI, linked statically into every engine and suite
 ustore_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
-    b9c6f4c4c3b417061c67859517b945716916bd51
+    7fe655aa759804b6c3a5ceef517650a5fceee02e
 )
 
 # SmashTable's containers, header-only
 ustore_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable.git
-    c2a4b7310423d671099ebd3e3f250383959cd413
+    09caec7b2084dd20a6563c8f0e87448eebf90d43
 )
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel

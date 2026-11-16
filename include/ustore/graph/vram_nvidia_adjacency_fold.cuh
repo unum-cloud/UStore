@@ -12,6 +12,10 @@
  *  shared memory, keeps what survives and counts it; the second hands every chain its offset
  *  through one chained scan and writes the composed records. A record's place in its chain is its
  *  index among the gathered records, as the chains are gathered back to back, oldest first.
+ *
+ *  An Apple device has no 64-bit atomics to chain with, so there the first launch also flags the
+ *  places each chain kept, the select lists them in order, and the second writes every kept record
+ *  at its rank; its kernels are the MSL of @c vram_compaction_apple.metal.
  */
 
 #pragma once
@@ -19,15 +23,16 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <limits> // `std::numeric_limits`
-#include <span>   // `std::span`
+#include <limits>      // `std::numeric_limits`
+#include <span>        // `std::span`
+#include <type_traits> // `std::is_same_v`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <smashtable/shared.hpp>       // `st::status_t`
 
 #include "ustore/graph/adjacency_fold.hpp"             // `check_delta`, `save_delta`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
-#include "ustore/utilities/vram_scan.cuh"              // `chain_ticket`, `chain_offset`, `block_scanned_t`
+#include "ustore/utilities/vram_scan.cuh"              // `chain_ticket`, `chain_offset`, `select_flagged`
 
 #if !defined(__CUDACC__) && !defined(__HIP__)
 #include "ustore/utilities/vram_device.hpp" // `launch`, `carve`
@@ -37,10 +42,6 @@ namespace unum::ustore::graph {
 
 /** Threads of every block a fold launches. */
 inline constexpr unsigned fold_block_threads_k = 256;
-
-/** Records one chain holds at most for its block to sort it in shared memory, so a merge with a
- *  longer one folds on the host. */
-inline constexpr std::uint32_t fold_chain_records_max_k = 16384;
 
 /** One record of a chain on the device, aligned so a copy moves it in three 16-byte words. */
 struct alignas(16) half_edge_record_t {
@@ -199,6 +200,104 @@ __device__ void fold_write(half_edge_record_t const* records, std::uint32_t cons
 
 #else
 
+/** What both fold launches of one compose read and write on the device. */
+struct fold_regions_t {
+
+    /** The gathered records, oldest first per chain, and where every chain starts among them. */
+    half_edge_record_t const* records = nullptr;
+    std::uint32_t const* starts = nullptr;
+
+    /** The indices each chain keeps, over its own span, and how many. */
+    std::uint32_t* kept = nullptr;
+    std::uint32_t* kept_counts = nullptr;
+
+    /** The composed records and every chain's first one among them, the records kept after the
+     *  last. */
+    half_edge_record_t* composed = nullptr;
+    std::uint64_t* offsets = nullptr;
+
+    /** A removal of the vertex as the composed records spell it. */
+    half_edge_record_t removal {};
+
+    std::uint32_t chains_count = 0;
+    std::uint32_t records_count = 0;
+
+    /** The next power of two of the longest chain's records, which one block sorts. */
+    std::uint32_t width = 0;
+};
+
+/** Queues both fold launches over @p regions on @p executor, of an NVIDIA or an AMD device, the
+ *  second handing every chain its offset through one chained scan. */
+template <typename executor_type_, typename blocks_type_>
+st::status_t launch_folds(executor_type_& executor, blocks_type_&, fold_regions_t const& regions) noexcept {
+    using st::status_t;
+    // The kept total lands one past the chains' offsets, which the last chain's tile overwrites
+    if (executor
+            .fill_async(reinterpret_cast<std::uintptr_t>(regions.offsets + regions.chains_count), byte_t {0},
+                        sizeof(std::uint64_t))
+            .failed())
+        return status_t::unknown_k;
+    unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
+    if (utilities::launch(executor, executor.kernels()->function("ustore_fold_chains"), blocks_count,
+                          fold_block_threads_k, static_cast<unsigned>(regions.width * sizeof(std::uint32_t)),
+                          regions.records, regions.starts, regions.chains_count, regions.kept, regions.kept_counts)
+            .failed())
+        return status_t::unknown_k;
+    std::uint64_t const tickets = fu::min_of(
+        utilities::divide_round_up(std::uint64_t {regions.chains_count}, std::uint64_t {fold_block_threads_k}),
+        utilities::chain_blocks_max_k);
+    if (utilities::launch(executor, executor.kernels()->function("ustore_fold_write"), static_cast<unsigned>(tickets),
+                          fold_block_threads_k, 0u, regions.records, regions.starts,
+                          static_cast<std::uint32_t const*>(regions.kept),
+                          static_cast<std::uint32_t const*>(regions.kept_counts), regions.chains_count, tickets,
+                          regions.removal, regions.composed, regions.offsets, regions.offsets + regions.chains_count)
+            .failed())
+        return status_t::unknown_k;
+    return status_t::success_k;
+}
+
+/** As the other @c launch_folds, on an Apple device, which has no 64-bit atomics: the first
+ *  launch flags the places every chain kept, the select over @p blocks lists them, and the second
+ *  writes every one. */
+template <typename blocks_type_>
+st::status_t launch_folds(utilities::metal_executor_t& executor, blocks_type_& blocks,
+                          fold_regions_t const& regions) noexcept {
+    using st::status_t;
+    // Few enough tiles that the select's one scanning threadgroup walks them quickly
+    std::uint32_t const tile = static_cast<std::uint32_t>(utilities::round_up_to_multiple(
+        utilities::divide_round_up(std::uint64_t {regions.records_count}, utilities::chain_blocks_max_k),
+        std::uint64_t {256}));
+    std::uint32_t const tiles = static_cast<std::uint32_t>(
+        utilities::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {tile}));
+    auto const flags = utilities::carve<std::uint8_t>(blocks, executor, regions.records_count);
+    auto const counts = utilities::carve<std::uint32_t>(blocks, executor, std::size_t {tiles} + 1);
+    auto const selected = utilities::carve<std::uint32_t>(blocks, executor, regions.records_count);
+    if (!flags || !counts || !selected) return status_t::out_of_memory_heap_k;
+    unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
+    // Metal binds threadgroup memory in multiples of 16 bytes
+    unsigned const sorted_bytes = utilities::round_up_to_multiple(regions.width * 4u, 16u);
+    if (utilities::launch(executor, executor.kernels()->function("ustore_fold_chains"), blocks_count,
+                          fold_block_threads_k, sorted_bytes, regions.records, regions.starts, regions.chains_count,
+                          regions.kept, regions.kept_counts, flags->data())
+            .failed())
+        return status_t::unknown_k;
+    if (utilities::select_flagged(executor, static_cast<std::uint8_t const*>(flags->data()), regions.records_count,
+                                  tile, tiles, counts->data(), selected->data())
+            .failed())
+        return status_t::unknown_k;
+    std::uint64_t const groups = fu::min_of(
+        utilities::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {fold_block_threads_k}),
+        std::uint64_t {65535});
+    if (utilities::launch(executor, executor.kernels()->function("ustore_fold_write"), static_cast<unsigned>(groups),
+                          fold_block_threads_k, 0u, regions.records, regions.starts,
+                          static_cast<std::uint32_t const*>(regions.kept), regions.chains_count, tiles, regions.removal,
+                          regions.composed, regions.offsets, static_cast<std::uint32_t const*>(selected->data()),
+                          static_cast<std::uint32_t const*>(counts->data()))
+            .failed())
+        return status_t::unknown_k;
+    return status_t::success_k;
+}
+
 template <typename executor_type_, typename blocks_type_>
 st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blocks_type_& blocks,
                                                    std::span<delta_view_t const> changes,
@@ -231,8 +330,12 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blo
         total += records;
         longest = records > longest ? records : longest;
     }
-    // A record's index is its place in its chain, so every index fits 32 bits, and a chain sorts in
-    // one block's memory
+    // A record's index is its place in its chain, so every index fits 32 bits, and a chain sorts
+    // in one block's memory, 64 KiB on NVIDIA and AMD devices and 32 KiB on Apple ones, so a merge
+    // with a longer one folds on the host
+    constexpr std::uint32_t fold_chain_records_max_k = std::is_same_v<executor_type_, utilities::metal_executor_t>
+                                                           ? 4096
+                                                           : 16384;
     if (total > (std::numeric_limits<std::uint32_t>::max)()) return status_t::invalid_argument_k;
     if (longest > fold_chain_records_max_k) return status_t::out_of_memory_heap_k;
     if (total == 0) return status_t::success_k;
@@ -279,33 +382,14 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blo
     if ((status = device_status(executor.upload_async(reinterpret_cast<std::uintptr_t>(starts),
                                                       std::as_bytes(gathered_chain_starts)))) != status_t::success_k)
         return status;
-    // The kept total lands one past the chains' offsets, which the last chain's tile
-    // overwrites with it
-    if ((status = device_status(executor.fill_async(reinterpret_cast<std::uintptr_t>(offsets + chains_count),
-                                                    byte_t {0}, sizeof(std::uint64_t)))) != status_t::success_k)
-        return status;
 
-    std::uint32_t width = 1;
-    while (width < longest) width *= 2;
-    std::uint32_t const chains = static_cast<std::uint32_t>(chains_count);
-    unsigned const blocks_count = static_cast<unsigned>(chains_count < 65535 ? chains_count : 65535);
-    status = device_status(utilities::launch(executor, executor.kernels()->function("ustore_fold_chains"), blocks_count,
-                                             fold_block_threads_k, static_cast<unsigned>(width * sizeof(std::uint32_t)),
-                                             static_cast<half_edge_record_t const*>(records),
-                                             static_cast<std::uint32_t const*>(starts), chains, kept, kept_counts));
-    if (status != status_t::success_k) return status;
-    half_edge_record_t removal;
-    save_delta(half_edge_delta_t::remove_vertex(), removal.bytes);
-    std::uint64_t const tickets = fu::min_of(
-        utilities::divide_round_up(std::uint64_t {chains_count}, std::uint64_t {fold_block_threads_k}),
-        utilities::chain_blocks_max_k);
-    status = device_status(
-        utilities::launch(executor, executor.kernels()->function("ustore_fold_write"), static_cast<unsigned>(tickets),
-                          fold_block_threads_k, 0u, static_cast<half_edge_record_t const*>(records),
-                          static_cast<std::uint32_t const*>(starts), static_cast<std::uint32_t const*>(kept),
-                          static_cast<std::uint32_t const*>(kept_counts), chains, tickets, removal, chained, offsets,
-                          offsets + chains_count));
-    if (status != status_t::success_k) return status;
+    fold_regions_t regions {records, starts, kept, kept_counts, chained, offsets};
+    save_delta(half_edge_delta_t::remove_vertex(), regions.removal.bytes);
+    regions.chains_count = static_cast<std::uint32_t>(chains_count);
+    regions.records_count = static_cast<std::uint32_t>(records_count);
+    regions.width = 1;
+    while (regions.width < longest) regions.width *= 2;
+    if ((status = launch_folds(executor, blocks, regions)) != status_t::success_k) return status;
 
     // Every chain keeps at most what it gathered, so the whole span comes back and the offsets say
     // how much is live

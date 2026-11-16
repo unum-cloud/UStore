@@ -41,7 +41,7 @@ Pin a commit, not a version, when building on them.
   - `nvme_key_slot.hpp`: identifiers and value layouts of the LSM trees, stored keys and values, key slots and the sorted run index over them.
   - `nvme_sorted_run.hpp`: one immutable sorted run on a volume.
   - `nvme_compaction.hpp`: the rules of a merge, the host compactor and the sections readers a device compactor reads through.
-  - `vram_nvidia_compaction.hpp` and `vram_nvidia_compaction.cuh`: the host face of the device compactor, and its kernels, which compile into the library's bundles.
+  - `vram_nvidia_compaction.hpp` and `vram_nvidia_compaction.cuh`: `cuda_compactor_t`, the device compactor of an NVIDIA device, and its kernels, which compile into the library's bundles and the AMD ones; `vram_amd_compaction.hpp` and `vram_amd_compaction.hip`: `hip_compactor_t`, its AMD twin; `vram_apple_compaction.hpp`: `metal_compactor_t`, its Apple twin, whose kernels are the MSL of `src/vram/vram_compaction_apple.metal`.
   - `nvme_tree.hpp`: configurations and schemas, the merge of one level into the next, and the level set readers see; `nvme_lsm_level.hpp`: the LSM levels.
   - `nvme_published_runs.hpp`: `commit_ledger`, `stamp_pin` and `pinned_snapshot`, the stamps and the sequencer every NVMe store commits through, `maintenance_claim`, the claim a database's maintenance runs under, and `published_runs`, the tree, memory runs and published view every NVMe store owns, with the commits, merges, flushes, compactions and truncations that move its runs.
   - `nvme_store.hpp`: `nvme_store`, the store of one collection, memory runs in front of a tree, with its snapshots; `nvme_value_cache.hpp`: its value cache; `nvme_store_cursor.hpp`: `nvme_store_cursor`.
@@ -53,7 +53,7 @@ Pin a commit, not a version, when building on them.
   - `ram_store.hpp`: `half_edges_store`, the RAM store of a graph collection, exporting degrees and edges from it, and staging edge and vertex inserts and removals.
   - `vertex_values.hpp`: the dense codec keeping every vertex as one value of its degrees and sorted neighborships.
   - `adjacency_fold.hpp`: labeled edges and their half-edges, the 48-byte half-edge records a vertex value and its change deltas share, `adjacency_fold_t`, and the reads merging both.
-  - `vram_nvidia_adjacency_fold.hpp` and `vram_nvidia_adjacency_fold.cuh`: the host face of the device fold `vram_nvidia_adjacency_fold_t`, and the kernels and device composition behind it, which compile into the library's bundles.
+  - `vram_nvidia_adjacency_fold.hpp` and `vram_nvidia_adjacency_fold.cuh`: the host face of the device fold `vram_nvidia_adjacency_fold_t`, which every vendor's compactor composes through, and the kernels and device composition behind it, which compile into the library's bundles.
   - `nvme_store.hpp`: `nvme_store`, the NVMe store of a graph collection, one store keyed by vertex and folded by `adjacency_fold_t`.
 - `docs/`, in `unum::ustore::docs`:
   - `ram_store.hpp`: `documents_by_key_store`, the RAM store of a documents collection.

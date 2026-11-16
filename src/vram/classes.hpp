@@ -14,8 +14,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 
-#include <span>        // `std::span`
-#include <type_traits> // `std::is_constructible_v`
+#include <span> // `std::span`
 
 #include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `kernel_table`, `cuda_executor_t`, `metal_executor_t`
 
@@ -281,17 +280,12 @@ status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_mod
         return {};
     }
     if (device.vendor == gpu_vendor_t::apple_k) {
-        // The NVMe compactor holds an NVIDIA or an AMD executor alone, as no Apple device compacts
-        if constexpr (!std::is_constructible_v<variant_type_, metal_executor_t>)
-            return {status_code_t::unsupported_k, "No compactor runs on an Apple device"};
-        else {
-            expected<metal_executor_t> spawned = metal_executor_t::spawn(
-                drivers.metal, drivers.metal_devices.device(ordinal), ordinal, stream, scratch_limit,
-                metal_kernels.table_of(ordinal, gpu_class));
-            if (!spawned) return spawned.status();
-            into.template emplace<metal_executor_t>(std::move(*spawned));
-            return {};
-        }
+        expected<metal_executor_t> spawned = metal_executor_t::spawn(
+            drivers.metal, drivers.metal_devices.device(ordinal), ordinal, stream, scratch_limit,
+            metal_kernels.table_of(ordinal, gpu_class));
+        if (!spawned) return spawned.status();
+        into.template emplace<metal_executor_t>(std::move(*spawned));
+        return {};
     }
     return {status_code_t::device_k, "No driver serves the device's vendor"};
 }

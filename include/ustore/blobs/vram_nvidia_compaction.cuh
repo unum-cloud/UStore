@@ -2,8 +2,9 @@
  *  @file include/ustore/blobs/vram_nvidia_compaction.cuh
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief The device compactor: three kernels per merge, ranking, packing and placing, and the host
- *      half queueing them through the driver.
+ *  @brief The NVIDIA device compactor: three kernels per merge, ranking, packing and placing, which
+ *      the AMD bundle compiles too, the host steps every vendor's compactor shares, and the host
+ *      half of @c cuda_compactor_t queueing them through the driver.
  *
  *  A merge of sorted runs into new ones takes three launches. The rank kernel runs one thread per
  *  input record, which reads its record out of its run's cells and saved columns, finds its merged
@@ -14,6 +15,12 @@
  *  stamp and its kind. The host waits three times: once to fold what survives where changes are
  *  pending, once for what plans the new runs, and once they are placed.
  *
+ *  An Apple device has no 64-bit atomics to chain with, so there the pack follows the three passes
+ *  of the select, listing the survivors in order, and a last launch adds the bytes of the tiles
+ *  before each to its value offsets; its kernels are the MSL of @c vram_compaction_apple.metal,
+ *  and @c metal_compactor_t queues them. The AMD bundle compiles these kernels with its own block
+ *  scan, and @c vram_amd_compaction.hip queues them for @c hip_compactor_t.
+ *
  *  Every device region a merge needs is carved off the compactor's own device blocks, rewound per
  *  merge, and every host buffer off the executor's pinned bounce. The kernels compile into the
  *  library's bundles and the host half with the host compiler, so nothing links a CUDA runtime.
@@ -22,7 +29,7 @@
 #pragma once
 
 #include "ustore/blobs/nvme_compaction.hpp"        // `compaction_kind_t`, `compaction_output`
-#include "ustore/blobs/vram_nvidia_compaction.hpp" // `device_compactor`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 
 #include "ustore/utilities/vram_scan.cuh" // `chain_ticket`, `chain_offset`, `block_scanned_t`
 
@@ -613,17 +620,7 @@ constexpr std::size_t saved_words(sorted_run_index_view<key_slot_type_> const& v
 
 #pragma endregion Sections
 
-#pragma region Merge
-
-template <typename executor_type_>
-template <typename element_type_>
-element_type_* device_compactor<executor_type_>::carve_(std::size_t count) noexcept {
-    std::uint32_t const held = blocks_.count;
-    expected<std::span<element_type_>> const carved = utilities::carve_runs<element_type_>(
-        blocks_, *executor_, count, [&](std::size_t bytes) noexcept { return executor_->allocate_async(bytes); });
-    device_allocations_ += blocks_.count - held;
-    return carved ? carved->data() : nullptr;
-}
+#pragma region Folds
 
 /**
  *  @brief Folds what the survivors of a merge fold, as @c host_compactor_t::compact does, writing
@@ -742,27 +739,57 @@ st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t
     return status_t::success_k;
 }
 
-template <typename executor_type_>
+#pragma endregion Folds
+
+#pragma region Merge
+
+template <typename element_type_>
+element_type_* cuda_compactor_t::carve_(std::size_t count) noexcept {
+    std::uint32_t const held = blocks_.count;
+    expected<std::span<element_type_>> const carved = utilities::carve_runs<element_type_>(
+        blocks_, *executor_, count, [&](std::size_t bytes) noexcept { return executor_->allocate_async(bytes); });
+    device_allocations_ += blocks_.count - held;
+    return carved ? carved->data() : nullptr;
+}
+
+template <typename record_type_>
+st::status_t cuda_compactor_t::pack_(char const* name, merge_pack_regions<record_type_> const& regions,
+                                     std::uint64_t*& counted) noexcept {
+    using st::status_t;
+    std::uint64_t* const chains = carve_<std::uint64_t>(2);
+    if (!chains) return status_t::out_of_memory_heap_k;
+    counted = chains;
+    status_t const zeroed = executor_status(
+        executor_->fill_async(reinterpret_cast<std::uintptr_t>(chains), byte_t {0}, 2 * sizeof(std::uint64_t)));
+    if (zeroed != status_t::success_k) return zeroed;
+    std::uint64_t const tickets = fu::min_of(
+        divide_round_up(regions.records_count, std::uint64_t {merge_block_threads_k}), utilities::chain_blocks_max_k);
+    return launch_over(*executor_, name, tickets * merge_block_threads_k, tickets, regions.merged, regions.flags,
+                       regions.records_count, regions.replaced, regions.replacements, regions.replaced_count, tickets,
+                       regions.survivors, regions.prefix, regions.shares, chains);
+}
+
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
           typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t device_compactor<executor_type_>::compact(
-    compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
-    std::span<sorted_run_index_view<key_slot_type_> const> lower, std::span<sorted_run_extents_t const> extents,
-    sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, fold_type_ const& fold,
-    device_fold_type_ const& device_fold, std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
-    compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
+st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
+                                       std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                                       std::span<sorted_run_index_view<key_slot_type_> const> lower,
+                                       std::span<sorted_run_extents_t const> extents, sorted_run_bounds_t const& bounds,
+                                       compaction_stamps_t const& stamps, fold_type_ const& fold,
+                                       device_fold_type_ const& device_fold,
+                                       std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
+                                       compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
     // A key slot the bundles carry no kernels for merges on the host.
     if constexpr (merge_kernel_names<key_slot_type_>::exported_k)
         return compact_on_device_(kind, upper, lower, extents, bounds, stamps, fold, device_fold, read_value, output);
     else return st::status_t::invalid_argument_k;
 }
 
-template <typename executor_type_>
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
           typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t device_compactor<executor_type_>::compact_on_device_(
+st::status_t cuda_compactor_t::compact_on_device_(
     compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
     std::span<sorted_run_index_view<key_slot_type_> const> lower, std::span<sorted_run_extents_t const> extents,
     sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, [[maybe_unused]] fold_type_ const& fold,
@@ -832,11 +859,10 @@ st::status_t device_compactor<executor_type_>::compact_on_device_(
     record_t* const survivors = carve_<record_t>(records_count);
     std::uint64_t* const prefix = locates_k ? carve_<std::uint64_t>(records_count + 1) : nullptr;
     std::uint8_t* const shares = carve_<std::uint8_t>(records_count);
-    std::uint64_t* const chains = carve_<std::uint64_t>(2);
     key_rows_gather<key_slot_type_>* const gathers = carve_<key_rows_gather<key_slot_type_>>(sorted_runs_count);
     if ((sorted_runs_count && (!runs || !gathers)) || (saved_count && !saved_columns) ||
         (stamps.pinned_count && !pinned) ||
-        (records_count && (!merged || !flags || !survivors || !shares || (locates_k && !prefix))) || !chains)
+        (records_count && (!merged || !flags || !survivors || !shares || (locates_k && !prefix))))
         return status_t::out_of_memory_heap_k;
 
     merge_run<key_slot_type_>* const host_runs = carve_bounce<merge_run<key_slot_type_>>(*executor_, sorted_runs_count);
@@ -976,16 +1002,11 @@ st::status_t device_compactor<executor_type_>::compact_on_device_(
             return status;
         if ((status = upload(*executor_, replacing, replacements.data(), replacements.size())) != status_t::success_k)
             return status;
-        if ((status = executor_status(executor_->fill_async(reinterpret_cast<std::uintptr_t>(chains), byte_t {0},
-                                                            2 * sizeof(std::uint64_t)))) != status_t::success_k)
-            return status;
-        std::uint64_t const tickets = fu::min_of(divide_round_up(merged_count, std::uint64_t {merge_block_threads_k}),
-                                                 utilities::chain_blocks_max_k);
-        status = launch_over(*executor_, names_t::pack_k, tickets * merge_block_threads_k, tickets,
-                             static_cast<record_t const*>(merged), static_cast<std::uint8_t const*>(flags),
-                             merged_count, static_cast<std::uint64_t const*>(replaced),
-                             static_cast<record_t const*>(replacing), std::uint64_t {indices.size()}, tickets,
-                             survivors, prefix, shares, chains);
+        std::uint64_t* counted = nullptr;
+        status = pack_(names_t::pack_k,
+                       merge_pack_regions<record_t> {merged, flags, merged_count, replaced, replacing,
+                                                     std::uint64_t {indices.size()}, survivors, prefix, shares},
+                       counted);
         if (status != status_t::success_k) return status;
 
         // What plans the new runs comes back at once, sized by the records, as only the
@@ -995,7 +1016,7 @@ st::status_t device_compactor<executor_type_>::compact_on_device_(
         host_shares = carve_bounce<std::uint8_t>(*executor_, records_count);
         if (!selected || !host_shares || (locates_k && !prefixes) || executor_->pin_bounce().failed())
             return status_t::out_of_memory_heap_k;
-        if ((status = download(*executor_, selected, chains, 1)) != status_t::success_k) return status;
+        if ((status = download(*executor_, selected, counted, 1)) != status_t::success_k) return status;
         if ((status = download(*executor_, prefixes, prefix, locates_k ? records_count + 1 : 0)) != status_t::success_k)
             return status;
         if ((status = download(*executor_, host_shares, shares, records_count)) != status_t::success_k) return status;
