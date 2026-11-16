@@ -2895,6 +2895,7 @@ static PyStructSequence_Field description_fields[] = {
     {"capabilities", "What the engine supports, as a Capabilities."},
     {"engine", "The engine serving the database, an Engine."},
     {"isolation", "How transactions see each other: what the RAM engine was opened with, and SNAPSHOT elsewhere."},
+    {"cpu_class", "The CPUClass the engine's calls run as, picked at open; UNKNOWN for RocksDB and LevelDB."},
     {"keys", "Keys across every collection, as the engine estimates them."},
     {"memory_bytes", "Bytes of memory the engine holds for the data, or zero where it keeps no estimate."},
     {"disk_bytes", "Bytes the files of the database take on disk."},
@@ -2909,7 +2910,7 @@ static PyStructSequence_Desc description_description = {
     "ustore.Description",
     "What an open database reports about itself, as `describe()` answers it, every size the engine's estimate.",
     description_fields,
-    8,
+    9,
 };
 
 PyTypeObject* GPUDeviceType = NULL;

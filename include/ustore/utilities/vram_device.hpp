@@ -2,17 +2,17 @@
  *  @file include/ustore/utilities/vram_device.hpp
  *  @author Ash Vardanian
  *  @date October 29, 2026
- *  @brief The vendor-neutral face of the GPU residency: every vendor's driver, the device listing, and one executor
- *      spawned over any vendor.
+ *  @brief The vendor-neutral face of the GPU residency: every vendor's driver, the device
+ *      listing, and the kernels every vendor's executor launches.
  *
  *  One binary drives NVIDIA and AMD devices at once, each vendor through a runtime its caller loads
  *  once and declared without its SDK, so every unit names both: NVIDIA devices are listed first,
  *  then AMD, and a vendor whose runtime is absent contributes no devices. Every vendor's device
  *  header provides the same surface, which @c gpu_executor_concept names.
  *
- *  The library embeds one bundle of kernels per vendor, which every device loads at its first spawn
- *  into a @c kernel_table the process keeps, and every executor spawned there launches through,
- *  finding each kernel by its C name.
+ *  The library embeds bundles of kernels, which a device loads into a @c kernel_table the process
+ *  keeps, and every executor spawned over that table launches through it, finding each kernel by
+ *  its C name; which bundle a device loads, its class, @c src/ picks.
  */
 
 #pragma once
@@ -27,20 +27,18 @@
 #include <utility>     // `std::move`
 #include <variant>     // `std::get_if`
 
-#include <stringzilla/capabilities.h> // `sz_capability_t`
-
 #include "ustore/utilities/nvme_linux_cufile_disk.hpp" // `cufile_api_t`
 #include "ustore/utilities/ram_buffers.hpp"            // `device_blocks_t`, `managed_blocks_t`, `bump`
 #include "ustore/utilities/tapes.hpp"                  // `tape_source_t`, `tape_segment_t`, `tape_block_threads_k`
-#include "ustore/utilities/types.hpp"                  // `gpu_device_t`, `gpu_class_t`, `status_t`
+#include "ustore/utilities/types.hpp"                  // `gpu_device_t`, `status_t`
 #include "ustore/utilities/vram_amd_device.hpp"        // `hip_api_t`, `hip_executor_t`, `list_amd_gpu_devices`
 #include "ustore/utilities/vram_nvidia_device.hpp"     // `cuda_api_t`, `cuda_executor_t`, `list_nvidia_gpu_devices`
 
 namespace unum::ustore::utilities {
 
-/** What every vendor's executor answers: its vendor and the arena memory it carves, one device, one stream it waits
- *  on, the device's class and the StringZilla capabilities it runs, the ceiling on its scratch, the memory entries
- *  arenas and towers queue on its stream, and its pinned bounce and managed runs. */
+/** What every vendor's executor answers: its vendor and the arena memory it carves, one device,
+ *  one stream it waits on, the ceiling on its scratch, the memory entries arenas and towers queue
+ *  on its stream, and its pinned bounce and managed runs. */
 template <typename executor_type_>
 concept gpu_executor_concept = requires(executor_type_& executor, executor_type_ const& spawned, std::size_t bytes,
                                         std::uintptr_t address, std::span<byte_t> target,
@@ -51,8 +49,6 @@ concept gpu_executor_concept = requires(executor_type_& executor, executor_type_
     { executor.bind() } -> std::same_as<status_t>;
     { spawned.device() } -> std::same_as<int>;
     { spawned.device_of(target.data()) } -> std::same_as<int>;
-    { spawned.gpu_class() } -> std::same_as<gpu_class_t>;
-    { spawned.capabilities() } -> std::same_as<sz_capability_t>;
     { spawned.scratch_limit() } -> std::same_as<std::size_t>;
     { executor.allocate_async(bytes) } -> std::same_as<expected<std::uintptr_t>>;
     { executor.allocate_managed(bytes) } -> std::same_as<expected<std::uintptr_t>>;
@@ -148,12 +144,6 @@ inline constexpr char const* vram_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                       "ustore_docs_drop_terminators_u32",
                                                       "ustore_docs_drop_terminators_u64"};
 
-/** The bundle of NVIDIA kernels the library embeds, empty when its build named no CUDA codes. */
-std::span<byte_t const> vram_nvidia_bundle() noexcept;
-
-/** The bundle of AMD kernels the library embeds, empty when its build named no ROCm processors. */
-std::span<byte_t const> vram_amd_bundle() noexcept;
-
 /** One bundle loaded on one device, its kernels resolved by their C names once. */
 template <typename module_type_>
 struct kernel_table {
@@ -180,87 +170,6 @@ struct kernel_table {
         return nullptr;
     }
 };
-
-/** The bundle every device of one vendor loaded, one table per device by its vendor's ordinal,
- *  found by the bundle's address. The first spawn on a device loads its table alone, and every
- *  later one only reads it. */
-template <typename module_type_>
-class kernel_tables {
-  public:
-
-    /**
-     *  @brief Loads @p bundle onto @p device through @p api and resolves @p names, unless its table
-     *      holds it already.
-     *  @param[in] api The vendor's driver table.
-     *  @param[in] place Where the module loads: an NVIDIA device's primary context, or an
-     *      AMD device's ordinal.
-     *  @param[in] device The vendor's ordinal of the device.
-     *  @param[in] bundle The bundle, which outlives the tables.
-     *  @param[in] names The C names of the kernels to resolve, which outlive the tables.
-     *
-     *  @par Statuses:
-     *  - @c status_code_t::device_k The ordinal passes the devices UStore lists, the device refused
-     *    the bundle, or the bundle exports no kernel of a name.
-     */
-    template <typename api_type_, typename place_type_>
-    status_t load(api_type_ const& api, place_type_ place, int device, std::span<byte_t const> bundle,
-                  std::span<char const* const> names) noexcept {
-        if (device < 0 || device >= static_cast<int>(gpu_devices_capacity_k))
-            return {status_code_t::device_k, "The ordinal passes the devices UStore lists"};
-        if (table_of(bundle, device)) return {};
-        expected<module_type_> loaded = module_type_::load(api, place, bundle);
-        if (!loaded) return loaded.status();
-        kernel_table<module_type_>& table = tables_[device];
-        if (st::failed(table.functions.resize(names.size())))
-            return {status_code_t::out_of_memory_k, "No room for the kernel table of a bundle"};
-        for (std::size_t index = 0; index != names.size(); ++index)
-            if (!(table.functions[index] = loaded->function(names[index])))
-                return {status_code_t::device_k, "The bundle exports no kernel of a name"};
-        table.device = device, table.module = std::move(*loaded), table.names = names;
-        table.bundle = bundle.data();
-        return {};
-    }
-
-    /** The table of @p bundle on @p device, or null where it never loaded. */
-    kernel_table<module_type_> const* table_of(std::span<byte_t const> bundle, int device) const noexcept {
-        if (device < 0 || device >= static_cast<int>(gpu_devices_capacity_k)) return nullptr;
-        kernel_table<module_type_> const& table = tables_[device];
-        return table.bundle && table.bundle == bundle.data() ? &table : nullptr;
-    }
-
-  private:
-    kernel_table<module_type_> tables_[gpu_devices_capacity_k];
-};
-
-/**
- *  @brief Opens @p device through @p drivers: retains an NVIDIA device's primary context, then
- *      loads the library's bundle of its vendor into @p cuda_kernels or @p hip_kernels.
- *
- *  A device the bundle carries no code for keeps moving memory and refuses launches alone. The
- *  first open of a device runs alone.
- *
- *  @par Statuses:
- *  - @c status_code_t::device_k The driver refused an NVIDIA device's primary context, or serves
- *    no such vendor.
- */
-inline status_t open_gpu_device(gpu_drivers_t& drivers, gpu_device_t const& device,
-                                kernel_tables<cuda_module_t>& cuda_kernels,
-                                kernel_tables<hip_module_t>& hip_kernels) noexcept {
-    int const ordinal = static_cast<int>(device.vendor_ordinal);
-    if (device.vendor == gpu_vendor_t::nvidia_k) {
-        cuda_context_handle_t const context = drivers.retain_context(ordinal);
-        if (!context) return {status_code_t::device_k, "The driver refused the device's primary context"};
-        [[maybe_unused]] status_t const loaded = cuda_kernels.load(drivers.cuda, context, ordinal, vram_nvidia_bundle(),
-                                                                   vram_kernel_names_k);
-        return {};
-    }
-    if (device.vendor == gpu_vendor_t::amd_k) {
-        [[maybe_unused]] status_t const loaded = hip_kernels.load(drivers.hip, ordinal, ordinal, vram_amd_bundle(),
-                                                                  vram_kernel_names_k);
-        return {};
-    }
-    return {status_code_t::device_k, "No driver serves the device's vendor"};
-}
 
 /**
  *  @brief Queues @p function on @p executor's stream as @p blocks blocks of @p threads
@@ -358,39 +267,6 @@ status_t assemble_tape(executor_type_& executor, std::span<tape_source_t const> 
 }
 
 #pragma endregion Kernels
-
-/** Spawns into @p into the executor of @p device, which @c open_gpu_device opened, over its
- *  vendor's driver in @p drivers, of class @p gpu_class, queueing on @p stream, the caller's
- *  stream of that vendor or null for one of its own, its scratch capped at @p scratch_limit bytes,
- *  zero for no ceiling, moving bytes between the drives and an NVIDIA device as @p gds asks, and
- *  launching the library's kernels from its device's table in @p cuda_kernels or @p hip_kernels,
- *  if one loaded. */
-template <typename variant_type_>
-status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_module_t> const& cuda_kernels,
-                            kernel_tables<hip_module_t> const& hip_kernels, gpu_device_t const& device,
-                            gpu_class_t gpu_class, void* stream, std::size_t scratch_limit, ustore_gds_t gds,
-                            variant_type_& into) noexcept {
-    int const ordinal = static_cast<int>(device.vendor_ordinal);
-    if (device.vendor == gpu_vendor_t::nvidia_k) {
-        if (device.vendor_ordinal >= gpu_devices_capacity_k)
-            return {status_code_t::device_k, "The CUDA ordinal passes the devices UStore lists"};
-        cuda_context_handle_t const context = drivers.cuda_contexts[device.vendor_ordinal];
-        expected<cuda_executor_t> spawned = cuda_executor_t::spawn(
-            drivers.cuda, context, ordinal, gpu_class, stream, scratch_limit, gds,
-            cuda_kernels.table_of(vram_nvidia_bundle(), ordinal));
-        if (!spawned) return spawned.status();
-        into.template emplace<cuda_executor_t>(std::move(*spawned));
-        return {};
-    }
-    if (device.vendor == gpu_vendor_t::amd_k) {
-        expected<hip_executor_t> spawned = hip_executor_t::spawn(drivers.hip, ordinal, gpu_class, stream, scratch_limit,
-                                                                 hip_kernels.table_of(vram_amd_bundle(), ordinal));
-        if (!spawned) return spawned.status();
-        into.template emplace<hip_executor_t>(std::move(*spawned));
-        return {};
-    }
-    return {status_code_t::device_k, "No driver serves the device's vendor"};
-}
 
 #pragma region Device Arenas
 

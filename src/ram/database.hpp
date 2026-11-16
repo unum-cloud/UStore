@@ -230,19 +230,19 @@ struct ram_variant {
     static database_verbs_t const database_verbs_k;
 
     /** The verbs of this class's blobs collections. */
-    static blobs_verbs<home_t::host_k> const blobs_verbs_k;
+    static blobs_verbs<vendored_residency_t::host_k> const blobs_verbs_k;
 
     /** The verbs of this class's strings collections. */
-    static strings_verbs<home_t::host_k> const strings_verbs_k;
+    static strings_verbs<vendored_residency_t::host_k> const strings_verbs_k;
 
     /** The verbs of this class's documents collections. */
-    static docs_verbs<home_t::host_k> const docs_verbs_k;
+    static docs_verbs<vendored_residency_t::host_k> const docs_verbs_k;
 
     /** The verbs of this class's graph collections. */
-    static graph_verbs<home_t::host_k> const graph_verbs_k;
+    static graph_verbs<vendored_residency_t::host_k> const graph_verbs_k;
 
     /** The verbs of this class's pages collections. */
-    static pages_verbs<home_t::host_k> const pages_verbs_k;
+    static pages_verbs<vendored_residency_t::host_k> const pages_verbs_k;
 
     /** The table every handle of a database of this class and isolation is stamped with, so the
      *  router refuses a handle of another. */
@@ -2065,6 +2065,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_de
             .engine = ustore_engine_ram_k,
             .isolation = isolation_ == isolation_t::snapshot_k ? ustore_isolation_snapshot_k
                                                                : ustore_isolation_strict_serializable_k,
+            .cpu_class = static_cast<ustore_cpu_class_t>(cpu_class_),
             .keys = keys,
             .disk_bytes = image_bytes(state),
         });

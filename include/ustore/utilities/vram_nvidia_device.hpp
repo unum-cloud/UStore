@@ -24,7 +24,7 @@
 
 #include "ustore/utilities/blocking_files.hpp" // `shared_library_t`
 #include "ustore/utilities/ram_buffers.hpp"    // `pinned_bounce`, `managed_blocks_t`, `free_blocks`
-#include "ustore/utilities/types.hpp"          // `gpu_device_t`, `gpu_class_t`, `expected`, `status_t`
+#include "ustore/utilities/types.hpp"          // `gpu_device_t`, `expected`, `status_t`
 
 namespace unum::ustore::utilities {
 
@@ -307,15 +307,14 @@ class cuda_executor_t {
     /** The kernels this executor launches. */
     using function_t = cuda_function_handle_t;
 
-    /** Binds CUDA ordinal @p ordinal through @p context, its retained primary context, as of
-     *  class @p gpu_class, and queues on @p borrowed, a @c cudaStream_t of the caller's on that
-     *  device which outlives the executor, or on one of its own for null; its scratch never grows
-     *  past @p scratch_limit bytes, zero for no limit, bytes move between the drives and the
-     *  device as @p gds asks, and its launches find their kernels in @p kernels, the device's
-     *  table of the library's bundle, or none for null. */
+    /** Binds CUDA ordinal @p ordinal through @p context, its retained primary context, and queues
+     *  on @p borrowed, a @c cudaStream_t of the caller's on that device which outlives the
+     *  executor, or on one of its own for null; its scratch never grows past @p scratch_limit
+     *  bytes, zero for no limit, bytes move between the drives and the device as @p gds asks, and
+     *  its launches find their kernels in @p kernels, the device's table of the library's bundle,
+     *  or none for null. */
     static expected<cuda_executor_t> spawn(cuda_api_t const& api, cuda_context_handle_t context, int ordinal,
-                                           gpu_class_t gpu_class, void* borrowed, std::size_t scratch_limit,
-                                           ustore_gds_t gds,
+                                           void* borrowed, std::size_t scratch_limit, ustore_gds_t gds,
                                            kernel_table<cuda_module_t> const* kernels = nullptr) noexcept {
         if (!api || !context || api.set_current_context(context) != cuda_success_k)
             return status_t {status_code_t::device_k, "The CUDA driver refused the device"};
@@ -323,7 +322,6 @@ class cuda_executor_t {
         executor.api_ = &api;
         executor.context_ = context;
         executor.device_ = ordinal;
-        executor.gpu_class_ = gpu_class;
         executor.scratch_limit_ = scratch_limit;
         executor.gds_ = gds;
         executor.kernels_ = kernels;
@@ -368,22 +366,6 @@ class cuda_executor_t {
 
     /** The CUDA ordinal every call and arena of the executor uses. */
     int device() const noexcept { return device_; }
-
-    /** The class of the device. */
-    gpu_class_t gpu_class() const noexcept { return gpu_class_; }
-
-    /** The StringZilla capabilities the device's class runs: its tiers start at compute capability 9.0 for
-     *  @c hopper and 10.0 for @c blackwell, consumer Blackwell included. */
-    sz_capability_t capabilities() const noexcept {
-        switch (gpu_class_) {
-        case gpu_class_t::nvidia_ampere_k:
-        case gpu_class_t::nvidia_ada_k: return sz_cap_cuda_k;
-        case gpu_class_t::nvidia_hopper_k: return sz_cap_cuda_k | sz_cap_hopper_k;
-        case gpu_class_t::nvidia_blackwell_k:
-        case gpu_class_t::nvidia_blackwellrtx_k: return sz_cap_cuda_k | sz_cap_hopper_k | sz_cap_blackwell_k;
-        default: return 0;
-        }
-    }
 
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
@@ -478,7 +460,7 @@ class cuda_executor_t {
     void swap(cuda_executor_t& other) noexcept {
         std::swap(api_, other.api_), std::swap(context_, other.context_);
         std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);
-        std::swap(event_, other.event_), std::swap(device_, other.device_), std::swap(gpu_class_, other.gpu_class_);
+        std::swap(event_, other.event_), std::swap(device_, other.device_);
         std::swap(scratch_limit_, other.scratch_limit_), std::swap(gds_, other.gds_),
             std::swap(kernels_, other.kernels_);
         std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
@@ -495,7 +477,6 @@ class cuda_executor_t {
     cuda_stream_handle_t stream_ = nullptr;
     cuda_event_t event_;
     int device_ = 0;
-    gpu_class_t gpu_class_ = gpu_class_t::unknown_k;
     std::size_t scratch_limit_ = 0;
     ustore_gds_t gds_ = ustore_gds_automatic_k;
     kernel_table<cuda_module_t> const* kernels_ = nullptr;

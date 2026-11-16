@@ -69,6 +69,7 @@
 #include "engine.hpp"            // `engine_t`, `ustore_*_handle_t`, `view_t`, `host_verbs`, `floor_atomic_ref`
 #include "match.hpp"             // `compiled_match`, `compile_match`, `scan_matched`, `exhausted_t`
 #include "utilities/batches.hpp" // `strings_arg_t`
+#include "vram/classes.hpp"      // `gpu_class_t`, `pick_gpu_class`, `kernel_tables`, `spawn_gpu_executor`
 #include "vram/matching.hpp"     // `compile_match`, `scan_matched_on_device`
 #include "vram/staging.hpp"      // `stage_inputs`
 
@@ -100,18 +101,18 @@ struct cursor_t {
     ustore_scan_direction_t direction = ustore_scan_ascending_k;
 };
 
-/** The verbs a walk lists and reads through at one home, and the match it compiled once at init. */
-template <template <home_t> typename verbs_type_, home_t home_>
+/** The verbs a walk lists and reads through at one residency, and the match it compiled at init. */
+template <template <vendored_residency_t> typename verbs_type_, vendored_residency_t residency_>
 struct cursor_engine {
-    verbs_type_<home_> const* verbs = nullptr;
-    compiled_match<home_> match;
+    verbs_type_<residency_> const* verbs = nullptr;
+    compiled_match<residency_> match;
 };
 
-/** The engine of a walk at whichever home its init's executor serves. */
-template <template <home_t> typename verbs_type_>
-using cursor_engines =
-    std::variant<cursor_engine<verbs_type_, home_t::host_k>, cursor_engine<verbs_type_, home_t::vram_nvidia_k>,
-                 cursor_engine<verbs_type_, home_t::vram_amd_k>>;
+/** The engine of a walk at whichever residency its init's executor serves. */
+template <template <vendored_residency_t> typename verbs_type_>
+using cursor_engines = std::variant<cursor_engine<verbs_type_, vendored_residency_t::host_k>,
+                                    cursor_engine<verbs_type_, vendored_residency_t::vram_nvidia_k>,
+                                    cursor_engine<verbs_type_, vendored_residency_t::vram_amd_k>>;
 
 #pragma region Names
 
@@ -148,28 +149,51 @@ ustore_status_t value_in(enumerator_spelling<enum_type_> const (&names)[count_],
 
 #pragma region GPU Classes
 
-/** The class of @p device, read off the architecture its driver reported: an NVIDIA generation without a class of its
- *  own runs as Ampere, one older than Ampere as none, and an AMD processor without a class as none. */
-constexpr gpu_class_t gpu_class_of(gpu_device_t const& device) noexcept {
-    std::uint32_t const major = device.architecture_major, minor = device.architecture_minor;
-    if (device.vendor == gpu_vendor_t::nvidia_k) {
-        if (major < 8) return gpu_class_t::unknown_k;
-        if (major == 8) return minor >= 9 ? gpu_class_t::nvidia_ada_k : gpu_class_t::nvidia_ampere_k;
-        if (major == 9) return gpu_class_t::nvidia_hopper_k;
-        if (major == 10) return gpu_class_t::nvidia_blackwell_k;
-        if (major == 12) return gpu_class_t::nvidia_blackwellrtx_k;
-        return gpu_class_t::nvidia_ampere_k;
+/** Whether the build compiled the bundle of @p gpu_class, as CMake decided and told every unit
+ *  through @c USTORE_TARGET_<CLASS>. */
+constexpr bool gpu_class_compiled(gpu_class_t gpu_class) noexcept {
+    switch (gpu_class) {
+#if USTORE_TARGET_NVIDIA_AMPERE
+    case gpu_class_t::nvidia_ampere_k: return true;
+#endif
+#if USTORE_TARGET_NVIDIA_ADA
+    case gpu_class_t::nvidia_ada_k: return true;
+#endif
+#if USTORE_TARGET_NVIDIA_HOPPER
+    case gpu_class_t::nvidia_hopper_k: return true;
+#endif
+#if USTORE_TARGET_NVIDIA_BLACKWELL
+    case gpu_class_t::nvidia_blackwell_k: return true;
+#endif
+#if USTORE_TARGET_NVIDIA_BLACKWELLRTX
+    case gpu_class_t::nvidia_blackwellrtx_k: return true;
+#endif
+#if USTORE_TARGET_AMD_CDNA3
+    case gpu_class_t::amd_cdna3_k: return true;
+#endif
+#if USTORE_TARGET_AMD_CDNA4
+    case gpu_class_t::amd_cdna4_k: return true;
+#endif
+#if USTORE_TARGET_AMD_CDNA5
+    case gpu_class_t::amd_cdna5_k: return true;
+#endif
+    default: return false;
     }
-    if (device.vendor == gpu_vendor_t::amd_k) {
-        if (major == 9 && minor == 4) return gpu_class_t::amd_cdna3_k;
-        if (major == 9 && minor == 5) return gpu_class_t::amd_cdna4_k;
-        if (major == 12 && minor == 5) return gpu_class_t::amd_cdna5_k;
-    }
-    return gpu_class_t::unknown_k;
 }
 
-/** The GPU side of the process, built at its first VRAM call: every vendor's driver, and the devices some class runs
- *  on, NVIDIA first, then AMD, each opened by the first executor spawned on it. */
+/** Rungs of a ladder this build compiled; a monoversioned build compiles at most one. */
+template <gpu_class_t... classes_>
+consteval std::size_t compiled_rungs(gpu_ladder<classes_...>) noexcept {
+    return (std::size_t {gpu_class_compiled(classes_)} + ... + 0);
+}
+
+#if USTORE_TARGET_MONOVERSIONED
+static_assert(compiled_rungs(nvidia_ladder_t {}) <= 1);
+static_assert(compiled_rungs(amd_ladder_t {}) <= 1);
+#endif
+
+/** The GPU side of the process, built at its first VRAM call: every vendor's driver, and every
+ *  device, NVIDIA first, then AMD, each with the class picked for it when nothing is pinned. */
 struct gpu_runtime_t {
     gpu_drivers_t drivers;
     kernel_tables<cuda_module_t> cuda_kernels;
@@ -177,27 +201,25 @@ struct gpu_runtime_t {
     gpu_device_t devices[2 * gpu_devices_capacity_k];
     std::size_t devices_count = 0;
 
-    /** Taken by the first spawn on every device, NVIDIA ones by CUDA ordinal, then AMD ones
-     *  by HIP ordinal. */
-    claim_t opening[2 * gpu_devices_capacity_k] = {};
+    /** The class picked for each of @c devices with no pin, @c unknown_k where none runs. */
+    gpu_class_t classes[2 * gpu_devices_capacity_k] = {};
 
-    /** What the open of every device answered, in the order of @c opening, deferred
-     *  until it ends. */
-    ustore_outcome_t opened[2 * gpu_devices_capacity_k];
+    /** Held by the spawn opening a device for its class, NVIDIA devices by CUDA ordinal, then AMD
+     *  ones by HIP ordinal. */
+    claim_t opening[2 * gpu_devices_capacity_k] = {};
 
     gpu_runtime_t() noexcept {
         std::size_t const reported = list_gpu_devices(drivers, devices);
         for (std::size_t position = 0; position != reported; ++position) {
-            gpu_device_t const& device = devices[position];
-            if (gpu_class_of(device) == gpu_class_t::unknown_k || device.vendor_ordinal >= gpu_devices_capacity_k)
-                continue;
+            gpu_device_t const device = devices[position];
+            if (device.vendor_ordinal >= gpu_devices_capacity_k) continue;
+            classes[devices_count] = pick_gpu_class(drivers, device, gpu_class_t::unknown_k);
             devices[devices_count++] = device;
         }
-        for (ustore_outcome_t& outcome : opened) outcome = {ustore_status_deferred_k, nullptr};
     }
 
-    /** Spawns into @p into an executor on @p device as @c spawn_gpu_executor does, the first spawn
-     *  on the device opening it while every other one waits for that open. */
+    /** Spawns into @p into an executor of @p gpu_class on @p device as @c spawn_gpu_executor does,
+     *  first opening the device for the class while no other spawn opens it. */
     template <typename variant_type_>
     status_t spawn(gpu_device_t const& device, gpu_class_t gpu_class, void* stream, std::size_t scratch_limit,
                    ustore_gds_t gds, variant_type_& into) noexcept {
@@ -207,13 +229,10 @@ struct gpu_runtime_t {
         std::size_t const slot = (device.vendor == gpu_vendor_t::amd_k ? gpu_devices_capacity_k : 0) +
                                  device.vendor_ordinal;
         class_verbs_t const& verbs = host_verbs();
-        if (verbs.take(&opening[slot])) {
-            status_t const status = open_gpu_device(drivers, device, cuda_kernels, hip_kernels);
-            opened[slot].message = status.message;
-            verbs.publish(&opened[slot], static_cast<ustore_status_t>(status.code), std::memory_order_release);
-        }
-        if (ustore_status_t const status = verbs.wait(&opened[slot]); status != ustore_status_success_k)
-            return {static_cast<status_code_t>(status), opened[slot].message};
+        while (!verbs.take(&opening[slot])) verbs.wait_while_claimed(&opening[slot]);
+        status_t const opened = open_gpu_device(drivers, device, gpu_class, cuda_kernels, hip_kernels);
+        verbs.release(&opening[slot]);
+        if (opened.failed()) return opened;
         return spawn_gpu_executor(drivers, cuda_kernels, hip_kernels, device, gpu_class, stream, scratch_limit, gds,
                                   into);
     }
@@ -741,17 +760,17 @@ auto host_engine_of(cursor_type_& cursor) noexcept {
 template <typename arguments_type_, typename cursor_type_, gpu_executor_concept executor_type_>
 status_t pull(engine_t const& engine, arguments_type_ const& arguments, cursor_type_& cursor, view_t const& view,
               executor_type_& executor) noexcept {
-    constexpr home_t home_k = home_of_executors<executor_type_>;
-    constexpr std::size_t home_index_k = home_k == home_t::vram_nvidia_k ? 1 : 2;
-    auto const* const walker = std::get_if<home_index_k>(&cursor.engine);
+    constexpr vendored_residency_t residency_k = vendored_residency_of<executor_type_>;
+    constexpr std::size_t residency_index_k = residency_k == vendored_residency_t::vram_nvidia_k ? 1 : 2;
+    auto const* const walker = std::get_if<residency_index_k>(&cursor.engine);
     if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
     device_blocks_t* const blocks = device_blocks_of(arguments.arena, executor);
     if (!blocks) return {status_code_t::device_k, "The arena lives where another executor computes"};
-    compiled_match<home_k> match = walker->match;
+    compiled_match<residency_k> match = walker->match;
     if (match.reads_values() && !executor.kernels())
         return {status_code_t::unsupported_k, "The device loaded no bundle of the library's kernels"};
     if (status_t const status = rebase_on_device(match, executor); status.failed()) return status;
-    device_match<home_k> const matching {match, executor, *blocks};
+    device_match<residency_k> const matching {match, executor, *blocks};
     arguments_type_ hosted = arguments;
     hosted.arena = executor.bounce();
     if (status_t const status = pull_through(engine, hosted, cursor, matching, view); status.failed()) return status;
@@ -885,12 +904,12 @@ claim_t* cursor_claim_of(arguments_type_ const& arguments) noexcept {
     else return nullptr;
 }
 
-/** The home of the calls on @p executor, where a null one runs them on the calling thread over host pages. */
-inline home_t home_of(ustore_executor_handle_t const* executor) noexcept {
-    if (!executor) return home_t::host_k;
-    if (std::holds_alternative<cuda_executor_t>(executor->device)) return home_t::vram_nvidia_k;
-    if (std::holds_alternative<hip_executor_t>(executor->device)) return home_t::vram_amd_k;
-    return home_t::host_k;
+/** The residency of the calls on @p executor; a null one runs them on the caller in host pages. */
+inline vendored_residency_t residency_of(ustore_executor_handle_t const* executor) noexcept {
+    if (!executor) return vendored_residency_t::host_k;
+    if (std::holds_alternative<cuda_executor_t>(executor->device)) return vendored_residency_t::vram_nvidia_k;
+    if (std::holds_alternative<hip_executor_t>(executor->device)) return vendored_residency_t::vram_amd_k;
+    return vendored_residency_t::host_k;
 }
 
 /** Whether @p arena lives where calls on @p executor compute: host pages for host executors, the
@@ -975,11 +994,11 @@ inline void wait_named_calls(std::uint32_t& calls) noexcept {
 #pragma region Verb Slots
 
 /**
- *  @brief Where the verb serving an argument structure sits: @c table names the modality's table at
- *      a home and @c verb the verb in it, each a variable template over the home, or @c database
- *      the verb of the control plane, which serves on host executors alone.
+ *  @brief Where the verb serving an argument structure sits: @c table names the modality's table
+ *      at a residency and @c verb the verb in it, each a variable template over the residency, or
+ *      @c database the verb of the control plane, which serves on host executors alone.
  *
- *  A @c verb whose home lacks the slot fails its constraint, as every change does on a device.
+ *  A @c verb whose residency lacks the slot fails its constraint, as every change does on a device.
  */
 template <typename>
 struct verb_slot;
@@ -1046,315 +1065,315 @@ struct verb_slot<ustore_changes_cursor_init_t> {
 };
 template <>
 struct verb_slot<ustore_blobs_write_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::blobs;
-    template <home_t home_>
-        requires requires { &blobs_verbs<home_>::write; }
-    static constexpr auto verb = &blobs_verbs<home_>::write;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::blobs;
+    template <vendored_residency_t residency_>
+        requires requires { &blobs_verbs<residency_>::write; }
+    static constexpr auto verb = &blobs_verbs<residency_>::write;
 };
 template <>
 struct verb_slot<ustore_blobs_remove_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::blobs;
-    template <home_t home_>
-        requires requires { &blobs_verbs<home_>::remove; }
-    static constexpr auto verb = &blobs_verbs<home_>::remove;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::blobs;
+    template <vendored_residency_t residency_>
+        requires requires { &blobs_verbs<residency_>::remove; }
+    static constexpr auto verb = &blobs_verbs<residency_>::remove;
 };
 template <>
 struct verb_slot<ustore_blobs_read_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::blobs;
-    template <home_t home_>
-        requires requires { &blobs_verbs<home_>::read; }
-    static constexpr auto verb = &blobs_verbs<home_>::read;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::blobs;
+    template <vendored_residency_t residency_>
+        requires requires { &blobs_verbs<residency_>::read; }
+    static constexpr auto verb = &blobs_verbs<residency_>::read;
 };
 template <>
 struct verb_slot<ustore_blobs_scan_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::blobs;
-    template <home_t home_>
-        requires requires { &blobs_verbs<home_>::scan; }
-    static constexpr auto verb = &blobs_verbs<home_>::scan;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::blobs;
+    template <vendored_residency_t residency_>
+        requires requires { &blobs_verbs<residency_>::scan; }
+    static constexpr auto verb = &blobs_verbs<residency_>::scan;
 };
 template <>
 struct verb_slot<ustore_blobs_sample_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::blobs;
-    template <home_t home_>
-        requires requires { &blobs_verbs<home_>::sample; }
-    static constexpr auto verb = &blobs_verbs<home_>::sample;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::blobs;
+    template <vendored_residency_t residency_>
+        requires requires { &blobs_verbs<residency_>::sample; }
+    static constexpr auto verb = &blobs_verbs<residency_>::sample;
 };
 template <>
 struct verb_slot<ustore_blobs_measure_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::blobs;
-    template <home_t home_>
-        requires requires { &blobs_verbs<home_>::measure; }
-    static constexpr auto verb = &blobs_verbs<home_>::measure;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::blobs;
+    template <vendored_residency_t residency_>
+        requires requires { &blobs_verbs<residency_>::measure; }
+    static constexpr auto verb = &blobs_verbs<residency_>::measure;
 };
 template <>
 struct verb_slot<ustore_strings_write_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::strings;
-    template <home_t home_>
-        requires requires { &strings_verbs<home_>::write; }
-    static constexpr auto verb = &strings_verbs<home_>::write;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::strings;
+    template <vendored_residency_t residency_>
+        requires requires { &strings_verbs<residency_>::write; }
+    static constexpr auto verb = &strings_verbs<residency_>::write;
 };
 template <>
 struct verb_slot<ustore_strings_remove_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::strings;
-    template <home_t home_>
-        requires requires { &strings_verbs<home_>::remove; }
-    static constexpr auto verb = &strings_verbs<home_>::remove;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::strings;
+    template <vendored_residency_t residency_>
+        requires requires { &strings_verbs<residency_>::remove; }
+    static constexpr auto verb = &strings_verbs<residency_>::remove;
 };
 template <>
 struct verb_slot<ustore_strings_read_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::strings;
-    template <home_t home_>
-        requires requires { &strings_verbs<home_>::read; }
-    static constexpr auto verb = &strings_verbs<home_>::read;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::strings;
+    template <vendored_residency_t residency_>
+        requires requires { &strings_verbs<residency_>::read; }
+    static constexpr auto verb = &strings_verbs<residency_>::read;
 };
 template <>
 struct verb_slot<ustore_strings_scan_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::strings;
-    template <home_t home_>
-        requires requires { &strings_verbs<home_>::scan; }
-    static constexpr auto verb = &strings_verbs<home_>::scan;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::strings;
+    template <vendored_residency_t residency_>
+        requires requires { &strings_verbs<residency_>::scan; }
+    static constexpr auto verb = &strings_verbs<residency_>::scan;
 };
 template <>
 struct verb_slot<ustore_docs_write_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::docs;
-    template <home_t home_>
-        requires requires { &docs_verbs<home_>::write; }
-    static constexpr auto verb = &docs_verbs<home_>::write;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::docs;
+    template <vendored_residency_t residency_>
+        requires requires { &docs_verbs<residency_>::write; }
+    static constexpr auto verb = &docs_verbs<residency_>::write;
 };
 template <>
 struct verb_slot<ustore_docs_read_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::docs;
-    template <home_t home_>
-        requires requires { &docs_verbs<home_>::read; }
-    static constexpr auto verb = &docs_verbs<home_>::read;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::docs;
+    template <vendored_residency_t residency_>
+        requires requires { &docs_verbs<residency_>::read; }
+    static constexpr auto verb = &docs_verbs<residency_>::read;
 };
 template <>
 struct verb_slot<ustore_docs_gist_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::docs;
-    template <home_t home_>
-        requires requires { &docs_verbs<home_>::gist; }
-    static constexpr auto verb = &docs_verbs<home_>::gist;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::docs;
+    template <vendored_residency_t residency_>
+        requires requires { &docs_verbs<residency_>::gist; }
+    static constexpr auto verb = &docs_verbs<residency_>::gist;
 };
 template <>
 struct verb_slot<ustore_docs_gather_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::docs;
-    template <home_t home_>
-        requires requires { &docs_verbs<home_>::gather; }
-    static constexpr auto verb = &docs_verbs<home_>::gather;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::docs;
+    template <vendored_residency_t residency_>
+        requires requires { &docs_verbs<residency_>::gather; }
+    static constexpr auto verb = &docs_verbs<residency_>::gather;
 };
 template <>
 struct verb_slot<ustore_docs_remove_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::docs;
-    template <home_t home_>
-        requires requires { &docs_verbs<home_>::remove; }
-    static constexpr auto verb = &docs_verbs<home_>::remove;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::docs;
+    template <vendored_residency_t residency_>
+        requires requires { &docs_verbs<residency_>::remove; }
+    static constexpr auto verb = &docs_verbs<residency_>::remove;
 };
 template <>
 struct verb_slot<ustore_docs_scan_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::docs;
-    template <home_t home_>
-        requires requires { &docs_verbs<home_>::scan; }
-    static constexpr auto verb = &docs_verbs<home_>::scan;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::docs;
+    template <vendored_residency_t residency_>
+        requires requires { &docs_verbs<residency_>::scan; }
+    static constexpr auto verb = &docs_verbs<residency_>::scan;
 };
 template <>
 struct verb_slot<ustore_docs_sample_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::docs;
-    template <home_t home_>
-        requires requires { &docs_verbs<home_>::sample; }
-    static constexpr auto verb = &docs_verbs<home_>::sample;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::docs;
+    template <vendored_residency_t residency_>
+        requires requires { &docs_verbs<residency_>::sample; }
+    static constexpr auto verb = &docs_verbs<residency_>::sample;
 };
 template <>
 struct verb_slot<ustore_graph_read_edges_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::graph;
-    template <home_t home_>
-        requires requires { &graph_verbs<home_>::read_edges; }
-    static constexpr auto verb = &graph_verbs<home_>::read_edges;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::graph;
+    template <vendored_residency_t residency_>
+        requires requires { &graph_verbs<residency_>::read_edges; }
+    static constexpr auto verb = &graph_verbs<residency_>::read_edges;
 };
 template <>
 struct verb_slot<ustore_graph_write_edges_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::graph;
-    template <home_t home_>
-        requires requires { &graph_verbs<home_>::write_edges; }
-    static constexpr auto verb = &graph_verbs<home_>::write_edges;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::graph;
+    template <vendored_residency_t residency_>
+        requires requires { &graph_verbs<residency_>::write_edges; }
+    static constexpr auto verb = &graph_verbs<residency_>::write_edges;
 };
 template <>
 struct verb_slot<ustore_graph_remove_edges_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::graph;
-    template <home_t home_>
-        requires requires { &graph_verbs<home_>::remove_edges; }
-    static constexpr auto verb = &graph_verbs<home_>::remove_edges;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::graph;
+    template <vendored_residency_t residency_>
+        requires requires { &graph_verbs<residency_>::remove_edges; }
+    static constexpr auto verb = &graph_verbs<residency_>::remove_edges;
 };
 template <>
 struct verb_slot<ustore_graph_write_vertices_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::graph;
-    template <home_t home_>
-        requires requires { &graph_verbs<home_>::write_vertices; }
-    static constexpr auto verb = &graph_verbs<home_>::write_vertices;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::graph;
+    template <vendored_residency_t residency_>
+        requires requires { &graph_verbs<residency_>::write_vertices; }
+    static constexpr auto verb = &graph_verbs<residency_>::write_vertices;
 };
 template <>
 struct verb_slot<ustore_graph_remove_vertices_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::graph;
-    template <home_t home_>
-        requires requires { &graph_verbs<home_>::remove_vertices; }
-    static constexpr auto verb = &graph_verbs<home_>::remove_vertices;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::graph;
+    template <vendored_residency_t residency_>
+        requires requires { &graph_verbs<residency_>::remove_vertices; }
+    static constexpr auto verb = &graph_verbs<residency_>::remove_vertices;
 };
 template <>
 struct verb_slot<ustore_graph_scan_vertices_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::graph;
-    template <home_t home_>
-        requires requires { &graph_verbs<home_>::scan_vertices; }
-    static constexpr auto verb = &graph_verbs<home_>::scan_vertices;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::graph;
+    template <vendored_residency_t residency_>
+        requires requires { &graph_verbs<residency_>::scan_vertices; }
+    static constexpr auto verb = &graph_verbs<residency_>::scan_vertices;
 };
 template <>
 struct verb_slot<ustore_pages_import_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::import; }
-    static constexpr auto verb = &pages_verbs<home_>::import;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::import; }
+    static constexpr auto verb = &pages_verbs<residency_>::import;
 };
 template <>
 struct verb_slot<ustore_pages_insert_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::insert; }
-    static constexpr auto verb = &pages_verbs<home_>::insert;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::insert; }
+    static constexpr auto verb = &pages_verbs<residency_>::insert;
 };
 template <>
 struct verb_slot<ustore_pages_remove_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::remove; }
-    static constexpr auto verb = &pages_verbs<home_>::remove;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::remove; }
+    static constexpr auto verb = &pages_verbs<residency_>::remove;
 };
 template <>
 struct verb_slot<ustore_pages_move_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::move; }
-    static constexpr auto verb = &pages_verbs<home_>::move;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::move; }
+    static constexpr auto verb = &pages_verbs<residency_>::move;
 };
 template <>
 struct verb_slot<ustore_pages_splice_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::splice; }
-    static constexpr auto verb = &pages_verbs<home_>::splice;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::splice; }
+    static constexpr auto verb = &pages_verbs<residency_>::splice;
 };
 template <>
 struct verb_slot<ustore_pages_set_attributes_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::set_attributes; }
-    static constexpr auto verb = &pages_verbs<home_>::set_attributes;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::set_attributes; }
+    static constexpr auto verb = &pages_verbs<residency_>::set_attributes;
 };
 template <>
 struct verb_slot<ustore_pages_remove_attributes_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::remove_attributes; }
-    static constexpr auto verb = &pages_verbs<home_>::remove_attributes;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::remove_attributes; }
+    static constexpr auto verb = &pages_verbs<residency_>::remove_attributes;
 };
 template <>
 struct verb_slot<ustore_pages_read_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::read; }
-    static constexpr auto verb = &pages_verbs<home_>::read;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::read; }
+    static constexpr auto verb = &pages_verbs<residency_>::read;
 };
 template <>
 struct verb_slot<ustore_pages_scan_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::scan; }
-    static constexpr auto verb = &pages_verbs<home_>::scan;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::scan; }
+    static constexpr auto verb = &pages_verbs<residency_>::scan;
 };
 template <>
 struct verb_slot<ustore_strings_sample_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::strings;
-    template <home_t home_>
-        requires requires { &strings_verbs<home_>::sample; }
-    static constexpr auto verb = &strings_verbs<home_>::sample;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::strings;
+    template <vendored_residency_t residency_>
+        requires requires { &strings_verbs<residency_>::sample; }
+    static constexpr auto verb = &strings_verbs<residency_>::sample;
 };
 template <>
 struct verb_slot<ustore_strings_measure_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::strings;
-    template <home_t home_>
-        requires requires { &strings_verbs<home_>::measure; }
-    static constexpr auto verb = &strings_verbs<home_>::measure;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::strings;
+    template <vendored_residency_t residency_>
+        requires requires { &strings_verbs<residency_>::measure; }
+    static constexpr auto verb = &strings_verbs<residency_>::measure;
 };
 template <>
 struct verb_slot<ustore_docs_measure_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::docs;
-    template <home_t home_>
-        requires requires { &docs_verbs<home_>::measure; }
-    static constexpr auto verb = &docs_verbs<home_>::measure;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::docs;
+    template <vendored_residency_t residency_>
+        requires requires { &docs_verbs<residency_>::measure; }
+    static constexpr auto verb = &docs_verbs<residency_>::measure;
 };
 template <>
 struct verb_slot<ustore_graph_sample_vertices_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::graph;
-    template <home_t home_>
-        requires requires { &graph_verbs<home_>::sample_vertices; }
-    static constexpr auto verb = &graph_verbs<home_>::sample_vertices;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::graph;
+    template <vendored_residency_t residency_>
+        requires requires { &graph_verbs<residency_>::sample_vertices; }
+    static constexpr auto verb = &graph_verbs<residency_>::sample_vertices;
 };
 template <>
 struct verb_slot<ustore_graph_measure_vertices_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::graph;
-    template <home_t home_>
-        requires requires { &graph_verbs<home_>::measure_vertices; }
-    static constexpr auto verb = &graph_verbs<home_>::measure_vertices;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::graph;
+    template <vendored_residency_t residency_>
+        requires requires { &graph_verbs<residency_>::measure_vertices; }
+    static constexpr auto verb = &graph_verbs<residency_>::measure_vertices;
 };
 template <>
 struct verb_slot<ustore_pages_sample_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::sample; }
-    static constexpr auto verb = &pages_verbs<home_>::sample;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::sample; }
+    static constexpr auto verb = &pages_verbs<residency_>::sample;
 };
 template <>
 struct verb_slot<ustore_pages_measure_t> {
-    template <home_t home_>
-    static constexpr auto table = &home_tables<home_>::pages;
-    template <home_t home_>
-        requires requires { &pages_verbs<home_>::measure; }
-    static constexpr auto verb = &pages_verbs<home_>::measure;
+    template <vendored_residency_t residency_>
+    static constexpr auto table = &residency_tables<residency_>::pages;
+    template <vendored_residency_t residency_>
+        requires requires { &pages_verbs<residency_>::measure; }
+    static constexpr auto verb = &pages_verbs<residency_>::measure;
 };
 
 #pragma endregion Verb Slots
@@ -1362,10 +1381,10 @@ struct verb_slot<ustore_pages_measure_t> {
 #pragma region Serving
 
 /** Hands @p visitor the device executor of @p view, as <tt>visitor(device)</tt> for a VRAM executor
- *  and <tt>visitor()</tt> for every host one, so a verb takes its home's executor as its last
+ *  and <tt>visitor()</tt> for every host one, so a verb takes its residency's executor as its last
  *  argument. */
 template <typename visitor_type_>
-status_t visit_home(view_t const& view, visitor_type_&& visitor) noexcept {
+status_t visit_residency(view_t const& view, visitor_type_&& visitor) noexcept {
     ustore_executor_t const executor = view.executor;
     if (cuda_executor_t* const device = executor ? std::get_if<cuda_executor_t>(&executor->device) : nullptr)
         return visitor(*device);
@@ -1375,7 +1394,7 @@ status_t visit_home(view_t const& view, visitor_type_&& visitor) noexcept {
 }
 
 /** Calls @p verb on @p arguments with every ragged input gathered on the host into the scratch
- *  @p view works in, then @p view and the executor of the verb's home. */
+ *  @p view works in, then @p view and the executor of the verb's residency. */
 template <typename verb_type_, typename arguments_type_, typename... executors_types_>
 status_t call_gathered(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
                        executors_types_&... executor) noexcept {
@@ -1419,9 +1438,9 @@ status_t open_device_call(arguments_type_ const& arguments, executor_type_& exec
 }
 
 /** Serves @p arguments on the engine of their database, in the scratch and on the executor thread
- *  @p runner names, through the verb table of its executor's home, refusing what no engine may see,
- *  and handing every ragged input to the engine readable in any layout. A pull serves through its
- *  cursor. */
+ *  @p runner names, through the verb table of its executor's residency, refusing what no engine may
+ *  see, and handing every ragged input to the engine readable in any layout; a pull is served by
+ *  its own cursor. */
 template <typename arguments_type_>
 status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept {
     ustore_database_t const database = database_of(arguments);
@@ -1457,16 +1476,17 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
     if (runner.executor)
         for (ustore_arena_handle_t& scratch : runner.executor->scratches) arena_rewind(&scratch);
     else arena_rewind(runner.scratch);
-    return visit_home(view, [&]<typename... executors_types_>(executors_types_&... executor) noexcept -> status_t {
-        constexpr home_t home_k = home_of_executors<executors_types_...>;
-        if constexpr (home_k != home_t::host_k)
+    return visit_residency(view, [&]<typename... executors_types_>(executors_types_&... executor) noexcept -> status_t {
+        constexpr vendored_residency_t residency_k = vendored_residency_of<executors_types_...>;
+        if constexpr (residency_k != vendored_residency_t::host_k)
             if (status_t const opened = open_device_call(arguments, executor...); opened.failed()) return opened;
         if constexpr (requires { arguments.cursor->cursor; })
             return with_call_stamp(engine, database, &arguments.cursor->cursor.collection, view,
                                    [&](view_t const& pinned) noexcept {
                                        return pull(engine, arguments, *arguments.cursor, pinned, executor...);
                                    });
-        else if constexpr (home_k != home_t::host_k && !requires { verb_slot<arguments_type_>::template verb<home_k>; })
+        else if constexpr (residency_k != vendored_residency_t::host_k &&
+                           !requires { verb_slot<arguments_type_>::template verb<residency_k>; })
             return status_t {status_code_t::unsupported_k, "Changes and the control plane run on host executors"};
         else if constexpr (requires { verb_slot<arguments_type_>::database; }) {
             auto const verb = engine.database->*verb_slot<arguments_type_>::database;
@@ -1489,11 +1509,11 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
             else return call_staged(verb, arguments, view);
         }
         else {
-            auto const* const verbs = engine.template tables<home_k>().*
-                                      verb_slot<arguments_type_>::template table<home_k>;
+            auto const* const verbs = engine.template tables<residency_k>().*
+                                      verb_slot<arguments_type_>::template table<residency_k>;
             if (!verbs)
                 return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
-            auto const verb = verbs->*verb_slot<arguments_type_>::template verb<home_k>;
+            auto const verb = verbs->*verb_slot<arguments_type_>::template verb<residency_k>;
             if (!verb) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
             if constexpr (carries_match<arguments_type_>) {
                 auto [match, match_status] = compile_match(arguments, runner.scratch, database->ceiling.strings,
@@ -1504,7 +1524,7 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
                         engine, database, one_collection(arguments), view, [&](view_t const& pinned) noexcept {
                             return call_staged(
                                 [&](arguments_type_ const& matched, auto&... rest) noexcept {
-                                    if constexpr (home_k == home_t::host_k)
+                                    if constexpr (residency_k == vendored_residency_t::host_k)
                                         return scan_matched(engine.host, match, matched, rest...);
                                     else return scan_matched_on_device(engine.host, match, matched, rest...);
                                 },
@@ -1668,7 +1688,7 @@ void route(arguments_type_* arguments) noexcept {
 template <auto open_, typename arguments_type_>
 void route_init(arguments_type_* arguments) noexcept {
     if (arguments->database) *arguments->database = nullptr;
-    if (home_of(arguments->executor) != home_t::host_k)
+    if (residency_of(arguments->executor) != vendored_residency_t::host_k)
         return finish(*arguments->outcome, {status_code_t::device_k, "Databases open on host executors"});
     if constexpr (requires { arguments->directory.length; })
         if (arguments->directory.length && !arguments->directory.data)
@@ -1681,48 +1701,54 @@ void route_init(arguments_type_* arguments) noexcept {
 
 #pragma region Cursor Lifetimes
 
-/** Opens the engine of a walk over @p scan_type_ at @p home_, compiling what @p arguments match
- *  once into @p compiled. */
-template <home_t home_, template <home_t> typename verbs_type_, typename scan_type_, typename arguments_type_>
-expected<cursor_engines<verbs_type_>> open_cursor_home(engine_t const& engine, arguments_type_ const& arguments,
-                                                       ustore_arena_t compiled) noexcept {
-    verbs_type_<home_> const* const verbs = engine.template tables<home_>().*
-                                            verb_slot<scan_type_>::template table<home_>;
-    if (!verbs || !(verbs->*verb_slot<scan_type_>::template verb<home_>))
+/** Opens the engine of a walk over @p scan_type_ at @p residency_, compiling what @p arguments
+ *  match once into @p compiled. */
+template <vendored_residency_t residency_, template <vendored_residency_t> typename verbs_type_, typename scan_type_,
+          typename arguments_type_>
+expected<cursor_engines<verbs_type_>> open_cursor_residency(engine_t const& engine, arguments_type_ const& arguments,
+                                                            ustore_arena_t compiled) noexcept {
+    verbs_type_<residency_> const* const verbs = engine.template tables<residency_>().*
+                                                 verb_slot<scan_type_>::template table<residency_>;
+    if (!verbs || !(verbs->*verb_slot<scan_type_>::template verb<residency_>))
         return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
     auto [match, match_status] = compile_match(arguments, compiled, arguments.database->ceiling.strings);
     if (match_status.failed()) return match_status;
-    if constexpr (home_ == home_t::host_k)
-        return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, home_> {verbs, match}};
+    if constexpr (residency_ == vendored_residency_t::host_k)
+        return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, residency_> {verbs, match}};
     else {
         // A walk outlives the call opening it, so its engine stays in the cursor's arena, and every
         // pull rebases it onto the managed runs that call rewinds
-        compiled_match<home_> on_device {match.matcher, match};
+        compiled_match<residency_> on_device {match.matcher, match};
         on_device.host.matcher = match_everything_t {};
-        return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, home_> {verbs, on_device}};
+        return cursor_engines<verbs_type_> {cursor_engine<verbs_type_, residency_> {verbs, on_device}};
     }
 }
 
-/** Opens the engine of a walk over @p scan_type_ at the home of @p executor. */
-template <template <home_t> typename verbs_type_, typename scan_type_, typename arguments_type_>
+/** Opens the engine of a walk over @p scan_type_ at the residency of @p executor. */
+template <template <vendored_residency_t> typename verbs_type_, typename scan_type_, typename arguments_type_>
 expected<cursor_engines<verbs_type_>> open_cursor_engine(engine_t const& engine,
                                                          ustore_executor_handle_t const* executor,
                                                          arguments_type_ const& arguments,
                                                          ustore_arena_t compiled) noexcept {
-    switch (home_of(executor)) {
-    case home_t::vram_nvidia_k:
-        return open_cursor_home<home_t::vram_nvidia_k, verbs_type_, scan_type_>(engine, arguments, compiled);
-    case home_t::vram_amd_k:
-        return open_cursor_home<home_t::vram_amd_k, verbs_type_, scan_type_>(engine, arguments, compiled);
-    default: return open_cursor_home<home_t::host_k, verbs_type_, scan_type_>(engine, arguments, compiled);
+    switch (residency_of(executor)) {
+    case vendored_residency_t::vram_nvidia_k:
+        return open_cursor_residency<vendored_residency_t::vram_nvidia_k, verbs_type_, scan_type_>(engine, arguments,
+                                                                                                   compiled);
+    case vendored_residency_t::vram_amd_k:
+        return open_cursor_residency<vendored_residency_t::vram_amd_k, verbs_type_, scan_type_>(engine, arguments,
+                                                                                                compiled);
+    default:
+        return open_cursor_residency<vendored_residency_t::host_k, verbs_type_, scan_type_>(engine, arguments,
+                                                                                            compiled);
     }
 }
 
 /** Opens a cursor of @p cursor_type_ over the walk @p arguments describe, holding their database
- *  and the transaction or snapshot their view reads through, at their executor's home, and refusing
- *  a database whose engine lacks the verb serving @p scan_type_ there, a match that does not
- *  compile, or a view of another database. */
-template <typename cursor_type_, template <home_t> typename verbs_type_, typename scan_type_, typename arguments_type_>
+ *  and the transaction or snapshot their view reads through, at their executor's residency, and
+ *  refusing a database whose engine lacks the verb serving @p scan_type_ there, a match that does
+ *  not compile, or a view of another database. */
+template <typename cursor_type_, template <vendored_residency_t> typename verbs_type_, typename scan_type_,
+          typename arguments_type_>
 expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noexcept {
     if (!arguments.cursor)
         return status_t {status_code_t::invalid_argument_k, "The call needs an output for the cursor"};
@@ -1790,7 +1816,7 @@ struct ustore_blobs_cursor_handle_t {
     /** The key the walk stops before, if any. */
     std::optional<ustore_key_t> end_key;
 
-    /** The verbs and the match of the home the walk computes at. */
+    /** The verbs and the match of the residency the walk computes at. */
     cursor_engines<blobs_verbs> engine;
 };
 
@@ -1805,7 +1831,7 @@ struct ustore_docs_cursor_handle_t {
     /** The key the walk stops before, if any. */
     std::optional<ustore_key_t> end_key;
 
-    /** The verbs and the match of the home the walk computes at. */
+    /** The verbs and the match of the residency the walk computes at. */
     cursor_engines<docs_verbs> engine;
 };
 
@@ -1820,7 +1846,7 @@ struct ustore_pages_cursor_handle_t {
     /** The key the walk stops before, if any. */
     std::optional<ustore_key_t> end_key;
 
-    /** The verbs and the match of the home the walk computes at. */
+    /** The verbs and the match of the residency the walk computes at. */
     cursor_engines<pages_verbs> engine;
 };
 
@@ -1835,7 +1861,7 @@ struct ustore_graph_vertices_cursor_handle_t {
     /** The key the walk stops before, if any. */
     std::optional<ustore_key_t> end_key;
 
-    /** The verbs and the match of the home the walk computes at. */
+    /** The verbs and the match of the residency the walk computes at. */
     cursor_engines<graph_verbs> engine;
 };
 
@@ -1858,7 +1884,7 @@ struct ustore_strings_cursor_handle_t {
     /** The string the walk stops before, where an empty one bounds nothing. */
     sz::string_t end_string;
 
-    /** The verbs and the match of the home the walk computes at. */
+    /** The verbs and the match of the residency the walk computes at. */
     cursor_engines<strings_verbs> engine;
 };
 

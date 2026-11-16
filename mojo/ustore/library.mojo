@@ -621,7 +621,7 @@ struct Library(ImplicitlyCopyable):
         return Mood(self._read_name(self.symbols().mood_from_name, name, "ustore_mood_from_name"))
 
     def cpu_class_name(self, cpu_class: CPUClass) -> String:
-        """The engine's spelling of a CPU class, "automatic" for `UNKNOWN`. Calls `ustore_cpu_class_name`."""
+        """The engine's spelling of a CPU class, "unknown" for `UNKNOWN`. Calls `ustore_cpu_class_name`."""
         return text_at(self.symbols().cpu_class_name(cpu_class.code))
 
     def cpu_class_from_name(self, name: StringSlice) raises Error -> CPUClass:

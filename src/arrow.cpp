@@ -226,16 +226,19 @@ template <typename visitor_type_>
 ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visitor) noexcept {
     device_arena_t const device = device_arena_of(arena);
     gpu_vendor_t const vendor = device.type == ARROW_DEVICE_CUDA ? gpu_vendor_t::nvidia_k : gpu_vendor_t::amd_k;
-    gpu_device_t const* listed = nullptr;
-    for (gpu_device_t const& candidate : gpu_devices())
-        if (candidate.vendor == vendor && candidate.vendor_ordinal == static_cast<std::uint32_t>(device.device))
-            listed = &candidate;
-    if (!listed) return ustore_status_device_k;
     gpu_runtime_t& runtime = gpu_runtime();
+    std::size_t listed = runtime.devices_count;
+    for (std::size_t position = 0; position != runtime.devices_count; ++position)
+        if (runtime.devices[position].vendor == vendor &&
+            runtime.devices[position].vendor_ordinal == static_cast<std::uint32_t>(device.device))
+            listed = position;
+    if (listed == runtime.devices_count) return ustore_status_device_k;
+    gpu_class_t const gpu_class = runtime.classes[listed];
+    if (gpu_class == gpu_class_t::unknown_k) return ustore_status_unsupported_k;
     std::variant<std::monostate, cuda_executor_t, hip_executor_t> spawned;
-    if (status_t const status = spawn_gpu_executor(runtime.drivers, runtime.cuda_kernels, runtime.hip_kernels, *listed,
-                                                   gpu_class_of(*listed), nullptr, 0, ustore_gds_compatibility_k,
-                                                   spawned);
+    if (status_t const status = spawn_gpu_executor(runtime.drivers, runtime.cuda_kernels, runtime.hip_kernels,
+                                                   runtime.devices[listed], gpu_class, nullptr, 0,
+                                                   ustore_gds_compatibility_k, spawned);
         status.failed())
         return static_cast<ustore_status_t>(status.code);
     return std::visit(

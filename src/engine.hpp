@@ -45,6 +45,7 @@
 #include "ustore/utilities/vram_device.hpp" // `cuda_executor_t`, `hip_executor_t`
 
 #include "utilities/batches.hpp" // `strings_arg_t`
+#include "vram/classes.hpp"      // `gpu_class_t`
 
 namespace unum::ustore {
 
@@ -118,7 +119,7 @@ struct call_pin_t {
 };
 
 /** Where a verb runs, which is the kind of executor it takes; the storage engine is fixed at open. */
-enum class home_t : std::uint8_t {
+enum class vendored_residency_t : std::uint8_t {
 
     /** Host threads, as every RAM, NVMe and host-only executor runs. */
     host_k,
@@ -130,33 +131,33 @@ enum class home_t : std::uint8_t {
     vram_amd_k,
 };
 
-/** The executor the verbs of one device home take. */
-template <home_t>
-struct executor_for_home;
+/** The executor the verbs of one device residency take. */
+template <vendored_residency_t>
+struct vendored_residency_executor;
 
 template <>
-struct executor_for_home<home_t::vram_nvidia_k> {
+struct vendored_residency_executor<vendored_residency_t::vram_nvidia_k> {
     using type = cuda_executor_t;
 };
 
 template <>
-struct executor_for_home<home_t::vram_amd_k> {
+struct vendored_residency_executor<vendored_residency_t::vram_amd_k> {
     using type = hip_executor_t;
 };
 
-/** The executor the verbs of device home @p home_ take as their last argument. */
-template <home_t home_>
-using home_executor = typename executor_for_home<home_>::type;
+/** The executor the verbs of device residency @p residency_ take as their last argument. */
+template <vendored_residency_t residency_>
+using residency_executor = typename vendored_residency_executor<residency_>::type;
 
-/** The home whose verbs take @p executors_types_ as their last argument, host threads for none. */
+/** The residency whose verbs take @p executors_types_ last, host threads for none. */
 template <typename... executors_types_>
-inline constexpr home_t home_of_executors = home_t::host_k;
+inline constexpr vendored_residency_t vendored_residency_of = vendored_residency_t::host_k;
 
 template <>
-inline constexpr home_t home_of_executors<cuda_executor_t> = home_t::vram_nvidia_k;
+inline constexpr vendored_residency_t vendored_residency_of<cuda_executor_t> = vendored_residency_t::vram_nvidia_k;
 
 template <>
-inline constexpr home_t home_of_executors<hip_executor_t> = home_t::vram_amd_k;
+inline constexpr vendored_residency_t vendored_residency_of<hip_executor_t> = vendored_residency_t::vram_amd_k;
 
 /** The database, snapshot, collection and transaction verbs every engine serves, on host threads alone. */
 struct database_verbs_t {
@@ -192,13 +193,13 @@ struct database_verbs_t {
                      call_pin_t& pin) noexcept;
 };
 
-/** The verbs of blobs collections served at one home. */
-template <home_t>
+/** The verbs of blobs collections served at one residency. */
+template <vendored_residency_t>
 struct blobs_verbs;
 
 /** The verbs of blobs collections on host threads. */
 template <>
-struct blobs_verbs<home_t::host_k> {
+struct blobs_verbs<vendored_residency_t::host_k> {
     status_t (*write)(ustore_blobs_write_t const&, strings_arg_t const& values, view_t const&) noexcept;
     status_t (*remove)(ustore_blobs_remove_t const&, view_t const&) noexcept;
     status_t (*read)(ustore_blobs_read_t const&, view_t const&) noexcept;
@@ -208,21 +209,21 @@ struct blobs_verbs<home_t::host_k> {
 };
 
 /** The verbs of blobs collections on a device, which has no slot for a change. */
-template <home_t home_>
-    requires(home_ != home_t::host_k)
-struct blobs_verbs<home_> {
-    status_t (*read)(ustore_blobs_read_t const&, view_t const&, home_executor<home_>&) noexcept;
-    status_t (*scan)(ustore_blobs_scan_t const&, view_t const&, home_executor<home_>&) noexcept;
-    status_t (*sample)(ustore_blobs_sample_t const&, view_t const&, home_executor<home_>&) noexcept;
+template <vendored_residency_t residency_>
+    requires(residency_ != vendored_residency_t::host_k)
+struct blobs_verbs<residency_> {
+    status_t (*read)(ustore_blobs_read_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    status_t (*scan)(ustore_blobs_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    status_t (*sample)(ustore_blobs_sample_t const&, view_t const&, residency_executor<residency_>&) noexcept;
 };
 
-/** The verbs of strings collections served at one home. */
-template <home_t>
+/** The verbs of strings collections served at one residency. */
+template <vendored_residency_t>
 struct strings_verbs;
 
 /** The verbs of strings collections on host threads. */
 template <>
-struct strings_verbs<home_t::host_k> {
+struct strings_verbs<vendored_residency_t::host_k> {
     status_t (*write)(ustore_strings_write_t const&, strings_arg_t const& strings, view_t const&) noexcept;
     status_t (*remove)(ustore_strings_remove_t const&, strings_arg_t const& strings, strings_arg_t const& end_strings,
                        view_t const&) noexcept;
@@ -235,22 +236,22 @@ struct strings_verbs<home_t::host_k> {
 };
 
 /** The verbs of strings collections on a device, whose strings a host index resolves. */
-template <home_t home_>
-    requires(home_ != home_t::host_k)
-struct strings_verbs<home_> {
+template <vendored_residency_t residency_>
+    requires(residency_ != vendored_residency_t::host_k)
+struct strings_verbs<residency_> {
     status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&,
-                     home_executor<home_>&) noexcept;
+                     residency_executor<residency_>&) noexcept;
     status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes, strings_arg_t const& start_strings,
-                     strings_arg_t const& end_strings, view_t const&, home_executor<home_>&) noexcept;
+                     strings_arg_t const& end_strings, view_t const&, residency_executor<residency_>&) noexcept;
 };
 
-/** The verbs of documents collections served at one home. */
-template <home_t>
+/** The verbs of documents collections served at one residency. */
+template <vendored_residency_t>
 struct docs_verbs;
 
 /** The verbs of documents collections on host threads. */
 template <>
-struct docs_verbs<home_t::host_k> {
+struct docs_verbs<vendored_residency_t::host_k> {
     status_t (*write)(ustore_docs_write_t const&, strings_arg_t const& fields, strings_arg_t const& values,
                       view_t const&) noexcept;
     status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&) noexcept;
@@ -263,24 +264,24 @@ struct docs_verbs<home_t::host_k> {
 };
 
 /** The verbs of documents collections on a device, whose field paths the host compiles. */
-template <home_t home_>
-    requires(home_ != home_t::host_k)
-struct docs_verbs<home_> {
+template <vendored_residency_t residency_>
+    requires(residency_ != vendored_residency_t::host_k)
+struct docs_verbs<residency_> {
     status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&,
-                     home_executor<home_>&) noexcept;
+                     residency_executor<residency_>&) noexcept;
     status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&,
-                       home_executor<home_>&) noexcept;
-    status_t (*scan)(ustore_docs_scan_t const&, view_t const&, home_executor<home_>&) noexcept;
-    status_t (*sample)(ustore_docs_sample_t const&, view_t const&, home_executor<home_>&) noexcept;
+                       residency_executor<residency_>&) noexcept;
+    status_t (*scan)(ustore_docs_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    status_t (*sample)(ustore_docs_sample_t const&, view_t const&, residency_executor<residency_>&) noexcept;
 };
 
-/** The verbs of graph collections served at one home. */
-template <home_t>
+/** The verbs of graph collections served at one residency. */
+template <vendored_residency_t>
 struct graph_verbs;
 
 /** The verbs of graph collections on host threads. */
 template <>
-struct graph_verbs<home_t::host_k> {
+struct graph_verbs<vendored_residency_t::host_k> {
     status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&) noexcept;
     status_t (*write_edges)(ustore_graph_write_edges_t const&, view_t const&) noexcept;
     status_t (*remove_edges)(ustore_graph_remove_edges_t const&, view_t const&) noexcept;
@@ -292,20 +293,21 @@ struct graph_verbs<home_t::host_k> {
 };
 
 /** The verbs of graph collections on a device. */
-template <home_t home_>
-    requires(home_ != home_t::host_k)
-struct graph_verbs<home_> {
-    status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&, home_executor<home_>&) noexcept;
-    status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&, home_executor<home_>&) noexcept;
+template <vendored_residency_t residency_>
+    requires(residency_ != vendored_residency_t::host_k)
+struct graph_verbs<residency_> {
+    status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&,
+                              residency_executor<residency_>&) noexcept;
 };
 
-/** The verbs of pages collections served at one home. */
-template <home_t>
+/** The verbs of pages collections served at one residency. */
+template <vendored_residency_t>
 struct pages_verbs;
 
 /** The verbs of pages collections on host threads. */
 template <>
-struct pages_verbs<home_t::host_k> {
+struct pages_verbs<vendored_residency_t::host_k> {
     status_t (*import)(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&) noexcept;
     status_t (*insert)(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&) noexcept;
     status_t (*remove)(ustore_pages_remove_t const&, view_t const&) noexcept;
@@ -322,22 +324,22 @@ struct pages_verbs<home_t::host_k> {
 };
 
 /** The verbs of pages collections on a device. */
-template <home_t home_>
-    requires(home_ != home_t::host_k)
-struct pages_verbs<home_> {
-    status_t (*read)(ustore_pages_read_t const&, view_t const&, home_executor<home_>&) noexcept;
-    status_t (*scan)(ustore_pages_scan_t const&, view_t const&, home_executor<home_>&) noexcept;
+template <vendored_residency_t residency_>
+    requires(residency_ != vendored_residency_t::host_k)
+struct pages_verbs<residency_> {
+    status_t (*read)(ustore_pages_read_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    status_t (*scan)(ustore_pages_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
 };
 
-/** The verbs of every modality an engine serves at one home; a null host table or verb answers
+/** The verbs of every modality an engine serves at one residency; a null host table or verb answers
  *  @c ustore_status_unsupported_k, while every device table is filled. */
-template <home_t home_>
-struct home_tables {
-    blobs_verbs<home_> const* blobs = nullptr;
-    strings_verbs<home_> const* strings = nullptr;
-    docs_verbs<home_> const* docs = nullptr;
-    graph_verbs<home_> const* graph = nullptr;
-    pages_verbs<home_> const* pages = nullptr;
+template <vendored_residency_t residency_>
+struct residency_tables {
+    blobs_verbs<residency_> const* blobs = nullptr;
+    strings_verbs<residency_> const* strings = nullptr;
+    docs_verbs<residency_> const* docs = nullptr;
+    graph_verbs<residency_> const* graph = nullptr;
+    pages_verbs<residency_> const* pages = nullptr;
 };
 
 /** Answers a device verb whose stage has not landed yet, which fills every entry of the device tables. */
@@ -346,52 +348,52 @@ status_t unsupported_on_vram(parameters_types_...) noexcept {
     return {status_code_t::unsupported_k, "No engine serves this call on devices yet"};
 }
 
-template <home_t home_>
-inline constexpr blobs_verbs<home_> unsupported_vram_blobs {
+template <vendored_residency_t residency_>
+inline constexpr blobs_verbs<residency_> unsupported_vram_blobs {
     .read = &unsupported_on_vram,
     .scan = &unsupported_on_vram,
     .sample = &unsupported_on_vram,
 };
 
-template <home_t home_>
-inline constexpr strings_verbs<home_> unsupported_vram_strings {
+template <vendored_residency_t residency_>
+inline constexpr strings_verbs<residency_> unsupported_vram_strings {
     .read = &unsupported_on_vram,
     .scan = &unsupported_on_vram,
 };
 
-template <home_t home_>
-inline constexpr docs_verbs<home_> unsupported_vram_docs {
+template <vendored_residency_t residency_>
+inline constexpr docs_verbs<residency_> unsupported_vram_docs {
     .read = &unsupported_on_vram,
     .gather = &unsupported_on_vram,
     .scan = &unsupported_on_vram,
     .sample = &unsupported_on_vram,
 };
 
-template <home_t home_>
-inline constexpr graph_verbs<home_> unsupported_vram_graph {
+template <vendored_residency_t residency_>
+inline constexpr graph_verbs<residency_> unsupported_vram_graph {
     .read_edges = &unsupported_on_vram,
     .scan_vertices = &unsupported_on_vram,
 };
 
-template <home_t home_>
-inline constexpr pages_verbs<home_> unsupported_vram_pages {
+template <vendored_residency_t residency_>
+inline constexpr pages_verbs<residency_> unsupported_vram_pages {
     .read = &unsupported_on_vram,
     .scan = &unsupported_on_vram,
 };
 
-/** The device tables of an engine with no device tower yet at @p home_, every entry answering
+/** The device tables of an engine with no device tower yet at @p residency_, every entry answering
  *  @c unsupported_on_vram. */
-template <home_t home_>
-inline constexpr home_tables<home_> unsupported_vram_tables {
-    .blobs = &unsupported_vram_blobs<home_>,
-    .strings = &unsupported_vram_strings<home_>,
-    .docs = &unsupported_vram_docs<home_>,
-    .graph = &unsupported_vram_graph<home_>,
-    .pages = &unsupported_vram_pages<home_>,
+template <vendored_residency_t residency_>
+inline constexpr residency_tables<residency_> unsupported_vram_tables {
+    .blobs = &unsupported_vram_blobs<residency_>,
+    .strings = &unsupported_vram_strings<residency_>,
+    .docs = &unsupported_vram_docs<residency_>,
+    .graph = &unsupported_vram_graph<residency_>,
+    .pages = &unsupported_vram_pages<residency_>,
 };
 
 /**
- *  @brief One engine: its database verbs, and one table of modality verbs per home.
+ *  @brief One engine: its database verbs, and one table of modality verbs per residency.
  *
  *  Every verb is @c noexcept and answers a status, which the router publishes into the caller's outcome: the in-house
  *  engines never throw, and an oracle wraps each call of its library in @c guarded. Every ragged input arrives
@@ -404,19 +406,21 @@ struct engine_t {
     database_verbs_t const* database = nullptr;
 
     /** The modality verbs on host threads. */
-    home_tables<home_t::host_k> host;
+    residency_tables<vendored_residency_t::host_k> host;
 
     /** The modality verbs on one NVIDIA device. */
-    home_tables<home_t::vram_nvidia_k> vram_nvidia = unsupported_vram_tables<home_t::vram_nvidia_k>;
+    residency_tables<vendored_residency_t::vram_nvidia_k> vram_nvidia =
+        unsupported_vram_tables<vendored_residency_t::vram_nvidia_k>;
 
     /** The modality verbs on one AMD device, which no engine serves yet. */
-    home_tables<home_t::vram_amd_k> vram_amd = unsupported_vram_tables<home_t::vram_amd_k>;
+    residency_tables<vendored_residency_t::vram_amd_k> vram_amd =
+        unsupported_vram_tables<vendored_residency_t::vram_amd_k>;
 
-    /** The tables of the verbs served at @p home_. */
-    template <home_t home_>
-    home_tables<home_> const& tables() const noexcept {
-        if constexpr (home_ == home_t::host_k) return host;
-        else if constexpr (home_ == home_t::vram_nvidia_k) return vram_nvidia;
+    /** The tables of the verbs served at @p residency_. */
+    template <vendored_residency_t residency_>
+    residency_tables<residency_> const& tables() const noexcept {
+        if constexpr (residency_ == vendored_residency_t::host_k) return host;
+        else if constexpr (residency_ == vendored_residency_t::vram_nvidia_k) return vram_nvidia;
         else return vram_amd;
     }
 };
@@ -529,7 +533,7 @@ status_t guarded_by(arguments_type_ const& arguments, strings_arg_t const& value
 
 /** Removes the whole values a removal of collections holding @p modality_ names through @p values_verbs_, after
  *  @p resolve_ refuses every collection holding another modality: the documents of @c ustore_docs_remove. */
-template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
+template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
 status_t remove_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
@@ -552,7 +556,7 @@ status_t remove_over_blobs(arguments_type_ const& arguments, view_t const& view)
 
 /** Scans the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_ refuses every
  *  collection holding another modality: the documents, vertices and pages of the scans of those modalities. */
-template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
+template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
 status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
@@ -582,7 +586,7 @@ status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) n
 /** Samples the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_
  *  refuses every collection holding another modality: the documents, vertices and pages of the
  *  samples of those modalities. */
-template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
+template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
 status_t sample_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
@@ -606,7 +610,7 @@ status_t sample_over_blobs(arguments_type_ const& arguments, view_t const& view)
 /** Measures the key ranges of collections holding @p modality_ through @p values_verbs_, after
  *  @p resolve_ refuses every collection holding another modality: the documents, vertices and pages
  *  of the measures of those modalities. */
-template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
+template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
 status_t measure_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
@@ -757,7 +761,7 @@ struct cpu_ceiling_t {
  *  its parent's carries a variant. */
 enum class cpu_class_t : std::uint32_t {
 
-    /** The zero value, which names no class. */
+    /** The zero value, which picks the newest class this machine runs. */
     unknown_k = ustore_cpu_class_unknown_k,
 
     /** The portable floor: standard atomics, spinning on the hint every core of its architecture
@@ -1099,7 +1103,7 @@ using row_kit_of = typename compiled_row_kit<row_kit_kind_of(cpu_class_), st::se
 /** Whether one compiled class is distinct from the class it degrades to: another strings kit,
  *  waiter or atomic reference, the one fact justifying its variant. */
 template <cpu_class_t cpu_class_>
-consteval bool rung_advances() noexcept {
+consteval bool class_advances() noexcept {
     constexpr cpu_class_t parent_k = parent_class_of(cpu_class_);
     return cpu_class_compiled(cpu_class_) &&
            (!std::is_same_v<strings_kit_of<cpu_class_>, strings_kit_of<parent_k>> ||
@@ -1139,16 +1143,26 @@ using cpu_ladder_t =
 inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::serial_k;
 #endif
 
+/** Rungs of a ladder this build compiled; a monoversioned build compiles at most one. */
+template <cpu_class_t... classes_>
+consteval std::size_t compiled_rungs(cpu_ladder<classes_...>) noexcept {
+    return (std::size_t {cpu_class_compiled(classes_)} + ... + 0);
+}
+
+#if USTORE_TARGET_MONOVERSIONED
+static_assert(compiled_rungs(cpu_ladder_t {}) <= 1);
+#endif
+
 /** What a handle may use: the masks this machine runs when nothing is pinned, the pinned class's
  *  masks when it runs them, refusing an unknown class, one this machine does not run, or a ceiling
  *  the build compiled no class under, as a monoversioned build on an older CPU or under a pin below
  *  its one class. The one caller of StringZilla's and ForkUnion's detection. */
 inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t pinned) noexcept {
+    if (std::string_view {ustore_cpu_class_name(pinned)} == "unrecognized")
+        return status_t {status_code_t::invalid_argument_k, "Unknown CPU class"};
     cpu_ceiling_t ceiling;
     if (sz_capabilities_detected_cpu(&ceiling.strings) != sz_success_k) ceiling.strings = sz_cap_serial_k;
     ceiling.sync = fu::cpu_capabilities();
-    if (std::string_view {ustore_cpu_class_name(pinned)} == "unrecognized")
-        return status_t {status_code_t::invalid_argument_k, "Unknown CPU class"};
     if (pinned != ustore_cpu_class_unknown_k) {
         cpu_class_t const pinned_class = static_cast<cpu_class_t>(pinned);
         cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
@@ -1172,7 +1186,7 @@ status_t open_fitting_rung(cpu_ladder<classes_...>, cpu_ceiling_t ceiling, open_
     bool picked = false;
     auto rung = [&]<cpu_class_t class_>() noexcept {
         constexpr bool floor_k = class_ == cpu_class_t::serial_k || class_ == cpu_class_t::monoversioned_k;
-        if constexpr ((floor_k && cpu_class_compiled(class_)) || rung_advances<class_>()) {
+        if constexpr ((floor_k && cpu_class_compiled(class_)) || class_advances<class_>()) {
             if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, opened = open.template operator()<class_>();
         }
         else static_assert(!cpu_class_compiled(class_), "A compiled class no longer advances past the one below");
@@ -1359,4 +1373,8 @@ struct ustore_executor_handle_t {
     /** Nothing beyond the pool on RAM, the rings' options on NVMe, the device's stream on VRAM of either vendor; the
      *  variant is the kind tag, so no second word can disagree. */
     std::variant<std::monostate, ustore_nvme_options_t, cuda_executor_t, hip_executor_t> device;
+
+    /** The class a VRAM executor's device was opened for, which every executor an engine spawns
+     *  there takes too; @c unknown_k on RAM and NVMe. */
+    gpu_class_t gpu_class = gpu_class_t::unknown_k;
 };

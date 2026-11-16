@@ -63,8 +63,8 @@ engine_t const ram_variant<cpu_class_, isolation_>::engine_k {
              .docs = &docs_verbs_k,
              .graph = &graph_verbs_k,
              .pages = &pages_verbs_k},
-    .vram_nvidia = uploading_vram_tables<home_t::vram_nvidia_k>,
-    .vram_amd = uploading_vram_tables<home_t::vram_amd_k>,
+    .vram_nvidia = uploading_vram_tables<vendored_residency_t::vram_nvidia_k>,
+    .vram_amd = uploading_vram_tables<vendored_residency_t::vram_amd_k>,
 };
 
 #pragma endregion Table

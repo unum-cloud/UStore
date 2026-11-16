@@ -179,7 +179,7 @@ function (ustore_cpu_class class_ target_macro_)
     cmake_parse_arguments(PARSE_ARGV 2 arg "" "OVER" "")
     set(exists_ ${ustore_class_${arg_OVER}_exists_})
     foreach (capability_ IN LISTS arg_UNPARSED_ARGUMENTS)
-        if (NOT forkunion_target_${capability_}_enabled AND NOT stringzilla_target_${capability_}_enabled)
+        if (NOT forkunion_target_${capability_}_compiled AND NOT stringzilla_target_${capability_}_compiled)
             set(exists_ FALSE)
         endif ()
     endforeach ()
@@ -253,7 +253,7 @@ set(ustore_class_monoversioned_macro_ MONOVERSIONED)
 set(ustore_monoversioned_capabilities_)
 if (NOT USTORE_MULTIVERSIONED)
     foreach (library_ IN ITEMS stringzilla forkunion)
-        get_property(enabled_ GLOBAL PROPERTY ${library_}_capabilities_enabled)
+        get_property(enabled_ GLOBAL PROPERTY ${library_}_capabilities_compiled)
         foreach (capability_ IN LISTS enabled_)
             if (NOT DEFINED ${library_}_target_${capability_}_architectures
                 AND NOT "${ustore_monoversioned_capabilities_} " MATCHES " ${capability_} "
@@ -393,58 +393,45 @@ foreach (dependency_ IN LISTS ustore_dependencies_)
     endif ()
     list(APPEND ustore_dependency_links_ $<BUILD_INTERFACE:${dependency_}>)
 endforeach ()
-# The kernels a device loads at its first executor's spawn, embedded in both libraries as one device-only bundle per
-# vendor the build names codes for, so neither links a GPU runtime. Each vendor's bundle is a target of its own, since a
-# device pass reads its includes from its target and only the NVIDIA one may see the CUDA toolkit's headers. Both take
-# the siblings' include directories without their definitions, so device code shares the host's layouts, and
-# `src/vram/bundles.cpp` reads `USTORE_BUNDLE_VRAM_<VENDOR>` set to 0 or 1 for whether the bundle links in
-set(ustore_bundle_vram_nvidia_ 0)
-set(ustore_bundle_vram_amd_ 0)
-if (ustore_cuda_codes_)
-    add_library(ustore_vram_nvidia OBJECT ${ustore_library_exclusion_})
+# The kernels a device loads at its first executor's spawn of its class, embedded in both libraries as one device-only
+# bundle per kept GPU class, so neither links a GPU runtime. Each class's bundle is a target of its own, since a device
+# pass reads its includes and definitions from its target and only the NVIDIA ones may see the CUDA toolkit's headers.
+# All take the siblings' include directories without their definitions, so device code shares the host's layouts. Every
+# unit reads the kept classes as `USTORE_TARGET_<CLASS>` set to 0 or 1, collected in `ustore_gpu_gates_`. A class unit
+# learns its class from its vendor's gates, 1 for itself and 0 for the others, and writes StringZilla's GPU floor off,
+# so its bundle holds UStore's kernels alone over the building blocks StringZilla opens wherever the vendor compiles
+set(ustore_gpu_gates_)
+set(ustore_vram_objects_)
+foreach (class_ IN LISTS ustore_nvidia_classes_ ustore_amd_classes_)
+    set(macro_ ${ustore_class_${class_}_macro_})
+    list(APPEND ustore_gpu_gates_ "USTORE_TARGET_${macro_}=$<BOOL:${ustore_class_${class_}_kept_}>")
+    if (NOT ustore_class_${class_}_kept_)
+        continue()
+    endif ()
+    add_library(ustore_vram_${class_} OBJECT ${ustore_library_exclusion_})
     target_include_directories(
-        ustore_vram_nvidia SYSTEM
+        ustore_vram_${class_} SYSTEM
         PRIVATE $<TARGET_PROPERTY:smashtable::header,INTERFACE_INCLUDE_DIRECTORIES>
                 $<TARGET_PROPERTY:forkunion::header,INTERFACE_INCLUDE_DIRECTORIES>
                 $<TARGET_PROPERTY:stringzilla::header,INTERFACE_INCLUDE_DIRECTORIES>
     )
-    ustore_gpu_bundle(
-        ustore_vram_nvidia nvidia vram_nvidia "${CMAKE_CURRENT_SOURCE_DIR}/src/vram/vram_kernels_nvidia.cu"
-        ${ustore_cuda_codes_}
-    )
-    set(ustore_vram_nvidia_objects_ $<TARGET_OBJECTS:ustore_vram_nvidia>)
-    set(ustore_bundle_vram_nvidia_ 1)
-endif ()
-if (ustore_rocm_codes_)
-    add_library(ustore_vram_amd OBJECT ${ustore_library_exclusion_})
-    target_include_directories(
-        ustore_vram_amd SYSTEM
-        PRIVATE $<TARGET_PROPERTY:smashtable::header,INTERFACE_INCLUDE_DIRECTORIES>
-                $<TARGET_PROPERTY:forkunion::header,INTERFACE_INCLUDE_DIRECTORIES>
-                $<TARGET_PROPERTY:stringzilla::header,INTERFACE_INCLUDE_DIRECTORIES>
+    target_compile_definitions(
+        ustore_vram_${class_} PRIVATE ${ustore_class_${class_}_gates_} ${ustore_class_${class_}_floor_off_}
     )
     ustore_gpu_bundle(
-        ustore_vram_amd amd vram_amd "${CMAKE_CURRENT_SOURCE_DIR}/src/vram/vram_kernels_amd.hip" ${ustore_rocm_codes_}
+        ustore_vram_${class_} ${ustore_class_${class_}_vendor_} vram_${class_}
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/vram/${ustore_class_${class_}_source_}" ${ustore_class_${class_}_flags_}
     )
-    set(ustore_vram_amd_objects_ $<TARGET_OBJECTS:ustore_vram_amd>)
-    set(ustore_bundle_vram_amd_ 1)
-endif ()
-set_source_files_properties(
-    src/vram/bundles.cpp
-    PROPERTIES
-        COMPILE_DEFINITIONS
-        "USTORE_BUNDLE_VRAM_NVIDIA=${ustore_bundle_vram_nvidia_};USTORE_BUNDLE_VRAM_AMD=${ustore_bundle_vram_amd_}"
-)
+    list(APPEND ustore_vram_objects_ $<TARGET_OBJECTS:ustore_vram_${class_}>)
+endforeach ()
+set_source_files_properties(src/vram/bundles.cpp PROPERTIES COMPILE_DEFINITIONS "${ustore_gpu_gates_}")
 add_library(
-    ustore_static STATIC ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_vram_nvidia_objects_}
-                         ${ustore_vram_amd_objects_} ${ustore_dependency_objects_}
+    ustore_static STATIC ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_vram_objects_}
+                         ${ustore_dependency_objects_}
 )
 add_library(ustore::static ALIAS ustore_static)
 add_library(ustore::ustore ALIAS ustore_static)
-add_library(
-    ustore_shared SHARED ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_vram_nvidia_objects_}
-                         ${ustore_vram_amd_objects_}
-)
+add_library(ustore_shared SHARED ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_vram_objects_})
 add_library(ustore::shared ALIAS ustore_shared)
 target_compile_options(
     ustore_static INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
@@ -491,9 +478,9 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
     )
     # Collection identifiers draw their entropy from `BCryptGenRandom` on Windows
     target_link_libraries(${library_} PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt> $<BUILD_INTERFACE:ustore_warnings>)
-    # Every unit reads which CPU classes compiled and which ForkUnion and StringZilla capabilities the toolchain builds,
-    # so the units instantiating a class and the open picking one name the same rungs and strings kits
-    target_compile_definitions(${library_} PRIVATE ${ustore_cpu_gates_})
+    # Every unit reads which CPU and GPU classes compiled and which ForkUnion and StringZilla capabilities the toolchain
+    # builds, so the units instantiating a class and the open picking one name the same rungs and strings kits
+    target_compile_definitions(${library_} PRIVATE ${ustore_cpu_gates_} ${ustore_gpu_gates_})
     target_link_libraries(
         ${library_} PRIVATE $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>
                             $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
@@ -586,10 +573,7 @@ if (${USTORE_BUILD_TEST})
             # so it links the bundles, and on the transports that need no hardware option its device case may no longer
             # skip
             if (storage_name_ STREQUAL "tree")
-                target_sources(${storage_exe_} PRIVATE src/vram/bundles.cpp)
-                if (TARGET ustore_vram_nvidia)
-                    target_sources(${storage_exe_} PRIVATE $<TARGET_OBJECTS:ustore_vram_nvidia>)
-                endif ()
+                target_sources(${storage_exe_} PRIVATE src/vram/bundles.cpp ${ustore_vram_objects_})
             endif ()
             if (storage_name_ STREQUAL "tree" AND ustore_device_compaction_)
                 list(APPEND storage_arguments_ --no-skips --transports memory,blocking,linux-uring)
@@ -702,21 +686,46 @@ if (${USTORE_BUILD_TEST})
         list(APPEND ustore_gpu_tests_ ustore_test_vram_${engine_name_})
     endforeach ()
 
-    # A stand-in HIP runtime reporting one gfx942 device drives the AMD routing on machines without AMD hardware
+    # A stand-in HIP runtime reporting one gfx942 device drives the AMD routing on machines without AMD hardware,
+    # through a copy of the suite whose bundles unit gives the CDNA3 class a bundle the stand-in loads
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_library(ustore_fake_amdhip64 SHARED test/vram/fake_amdhip64.cpp)
         set_target_properties(
             ustore_fake_amdhip64 PROPERTIES OUTPUT_NAME amdhip64 LIBRARY_OUTPUT_DIRECTORY
                                                                  ${CMAKE_BINARY_DIR}/fake_amdhip64
         )
-        add_dependencies(ustore_test_vram ustore_fake_amdhip64)
-        add_test(NAME ustore_test_vram_fake_amd COMMAND ustore_test_vram --engine ram --no-skips --filter "^vram\\.amd")
+        add_executable(ustore_test_vram_fake_amd test/vram/towers.cpp test/vram/fake_amd_bundles.cpp)
+        set_source_files_properties(
+            test/vram/fake_amd_bundles.cpp PROPERTIES COMPILE_DEFINITIONS "${ustore_gpu_gates_}"
+        )
+        target_include_directories(ustore_test_vram_fake_amd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_link_libraries(ustore_test_vram_fake_amd PRIVATE ustore::static fmt::fmt ustore_warnings)
+        add_dependencies(ustore_test_vram_fake_amd ustore_fake_amdhip64)
+        add_test(NAME ustore_test_vram_fake_amd COMMAND ustore_test_vram_fake_amd --engine ram --no-skips --filter
+                                                        "^vram\\.amd"
+        )
         set_tests_properties(
             ustore_test_vram_fake_amd PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/fake_amdhip64"
         )
         list(APPEND ustore_gpu_tests_ ustore_test_vram_fake_amd)
     endif ()
     set_tests_properties(${ustore_gpu_tests_} PROPERTIES RESOURCE_LOCK gpu0)
+
+    # The class bundles hold UStore's kernels alone: no StringZilla kernel or device table rides along.
+    if ((USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER) OR USTORE_ROCM_ARCH)
+        if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
+            find_program(ustore_test_cuobjdump_ cuobjdump HINTS ${CUDAToolkit_BIN_DIR} REQUIRED)
+        endif ()
+        if (USTORE_ROCM_ARCH)
+            find_program(ustore_test_offload_bundler_ clang-offload-bundler HINTS /opt/rocm/llvm/bin REQUIRED)
+            find_program(ustore_test_readelf_ llvm-readelf HINTS /opt/rocm/llvm/bin REQUIRED)
+        endif ()
+        add_test(
+            NAME ustore_test_gpu_bundles
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/bundles.sh ${CMAKE_BINARY_DIR}/bundles "${ustore_test_cuobjdump_}"
+                    "${ustore_test_offload_bundler_}" "${ustore_test_readelf_}" ${ustore_amd_unit_codes_}
+        )
+    endif ()
 
     set(ustore_stress_names_ "atomicity" "linearizability")
 

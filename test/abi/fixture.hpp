@@ -156,7 +156,7 @@ inline void leave_database(ustore_database_t) noexcept {}
 database_verbs_t const progress_database_verbs_k {.database_free = &leave_database};
 
 /** The stand-in engine's only blobs verb, a scan reporting its progress once. */
-blobs_verbs<home_t::host_k> const progress_blobs_verbs_k {.scan = &scan_reporting_progress};
+blobs_verbs<vendored_residency_t::host_k> const progress_blobs_verbs_k {.scan = &scan_reporting_progress};
 
 /** An engine serving only scans, each reporting its progress once, so a call stays unfinished while
  *  a case needs. */

@@ -92,7 +92,7 @@ database_verbs_t const nvme_variant<cpu_class_>::database_verbs_k {
 };
 
 template <cpu_class_t cpu_class_>
-blobs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::values_verbs_k {
+blobs_verbs<vendored_residency_t::host_k> const nvme_variant<cpu_class_>::values_verbs_k {
     .remove = &remove_values<cpu_class_>,
     .read = &read_values<cpu_class_>,
     .scan = &scan_values<cpu_class_>,
@@ -101,7 +101,7 @@ blobs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::values_verbs_k {
 };
 
 template <cpu_class_t cpu_class_>
-blobs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::blobs_verbs_k {
+blobs_verbs<vendored_residency_t::host_k> const nvme_variant<cpu_class_>::blobs_verbs_k {
     .write = &blobs_write<cpu_class_>,
     .remove = &blobs_remove<cpu_class_>,
     .read = &blobs_read<cpu_class_>,
@@ -111,7 +111,7 @@ blobs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::blobs_verbs_k {
 };
 
 template <cpu_class_t cpu_class_>
-strings_verbs<home_t::host_k> const nvme_variant<cpu_class_>::strings_verbs_k {
+strings_verbs<vendored_residency_t::host_k> const nvme_variant<cpu_class_>::strings_verbs_k {
     .write = &strings_write<cpu_class_>,
     .remove = &strings_remove<cpu_class_>,
     .read = &strings_read<cpu_class_>,
@@ -121,7 +121,7 @@ strings_verbs<home_t::host_k> const nvme_variant<cpu_class_>::strings_verbs_k {
 };
 
 template <cpu_class_t cpu_class_>
-docs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::docs_verbs_k {
+docs_verbs<vendored_residency_t::host_k> const nvme_variant<cpu_class_>::docs_verbs_k {
     .write = &docs_write<cpu_class_>,
     .read = &docs_read_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality<cpu_class_>>,
     .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
@@ -133,7 +133,7 @@ docs_verbs<home_t::host_k> const nvme_variant<cpu_class_>::docs_verbs_k {
 };
 
 template <cpu_class_t cpu_class_>
-graph_verbs<home_t::host_k> const nvme_variant<cpu_class_>::graph_verbs_k {
+graph_verbs<vendored_residency_t::host_k> const nvme_variant<cpu_class_>::graph_verbs_k {
     .read_edges = &graph_read_edges<cpu_class_>,
     .write_edges = &graph_write_edges<cpu_class_>,
     .remove_edges = &graph_remove_edges<cpu_class_>,
@@ -145,7 +145,7 @@ graph_verbs<home_t::host_k> const nvme_variant<cpu_class_>::graph_verbs_k {
 };
 
 template <cpu_class_t cpu_class_>
-pages_verbs<home_t::host_k> const nvme_variant<cpu_class_>::pages_verbs_k {
+pages_verbs<vendored_residency_t::host_k> const nvme_variant<cpu_class_>::pages_verbs_k {
     .import = &pages_import<cpu_class_>,
     .insert = &pages_insert<cpu_class_>,
     .remove = &pages_remove<cpu_class_>,
@@ -167,8 +167,8 @@ engine_t const nvme_variant<cpu_class_>::engine_k {
              .docs = &docs_verbs_k,
              .graph = &graph_verbs_k,
              .pages = &pages_verbs_k},
-    .vram_nvidia = uploading_vram_tables<home_t::vram_nvidia_k>,
-    .vram_amd = uploading_vram_tables<home_t::vram_amd_k>,
+    .vram_nvidia = uploading_vram_tables<vendored_residency_t::vram_nvidia_k>,
+    .vram_amd = uploading_vram_tables<vendored_residency_t::vram_amd_k>,
 };
 
 #pragma endregion Table

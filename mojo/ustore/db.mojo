@@ -552,7 +552,7 @@ struct DatabaseNvmeOptions(Defaultable, ImplicitlyCopyable):
     var collection_value_max_size: c_size_t
     """Bytes of the largest value of a collection whose values vary in size."""
     var cpu_class: CPUClass
-    """The class the database confines its waits, atomics and string kernels to; `UNKNOWN` derives."""
+    """The class the database confines its waits, atomics and string kernels to; `UNKNOWN` picks the newest this machine runs."""
 
     def __init__(out self):
         """Every engine default."""
@@ -660,6 +660,8 @@ struct DatabaseDescription(Answer, Defaultable, ImplicitlyCopyable):
     """The engine serving the database."""
     var isolation: Isolation
     """How transactions see each other."""
+    var cpu_class: CPUClass
+    """The CPU class the engine's calls run as, picked at open; `UNKNOWN` for RocksDB and LevelDB."""
     var keys: c_size_t
     """Keys across every collection, the engine's estimate."""
     var memory_bytes: c_size_t
@@ -673,7 +675,7 @@ struct DatabaseDescription(Answer, Defaultable, ImplicitlyCopyable):
 
     def __init__(out self):
         """Zeroes every field, which is what a failed report leaves."""
-        self = Self(Capabilities(0), Engine.RAM, Isolation.STRICT_SERIALIZABLE, 0, 0, 0, 0, 0)
+        self = Self(Capabilities(0), Engine.RAM, Isolation.STRICT_SERIALIZABLE, CPUClass.UNKNOWN, 0, 0, 0, 0, 0)
 
     def __init__(out self, arena: Address, generation: Int, written: DatabaseDescription, count: Int):
         """Adopts the description a call wrote."""
@@ -1409,7 +1411,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         Args:
             executor: The executor the open runs on; it also lends its engine.
             isolation: How transactions see each other.
-            cpu_class: The class the database confines its kernels to; `UNKNOWN` derives.
+            cpu_class: The class the database confines its kernels to; `UNKNOWN` picks the newest this machine runs.
 
         Raises:
             `Error` if the class is not one the CPU runs.

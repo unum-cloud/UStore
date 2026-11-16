@@ -27,7 +27,7 @@
 
 #include "ustore/graph/adjacency_fold.hpp"             // `check_delta`, `save_delta`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
-#include "ustore/utilities/vram_scan.cuh"              // `chain_ticket`, `chain_offset`, `block_exclusive_scan`
+#include "ustore/utilities/vram_scan.cuh"              // `chain_ticket`, `chain_offset`, `block_scanned_t`
 
 #if !defined(__CUDACC__) && !defined(__HIP__)
 #include "ustore/utilities/vram_device.hpp" // `launch`, `carve`
@@ -89,7 +89,7 @@ __device__ inline bool chained_before(half_edge_record_t const* records, std::ui
  *  records, keeps its newest removal of the vertex and the newest record of every half-edge newer
  *  than that removal, unless it removes the half-edge behind such a removal, and writes the kept
  *  indices over the chain's span of @p kept and their count into @p kept_counts. */
-template <unsigned block_threads_>
+template <unsigned block_threads_, typename scan_type_>
 __device__ void fold_chains(half_edge_record_t const* records, std::uint32_t const* starts, std::uint32_t chains_count,
                             std::uint32_t* sorted, std::uint32_t* kept, std::uint32_t* kept_counts) noexcept {
     constexpr std::uint32_t padding = (std::numeric_limits<std::uint32_t>::max)();
@@ -141,7 +141,7 @@ __device__ void fold_chains(half_edge_record_t const* records, std::uint32_t con
                     keeps = leads && !hidden;
                 }
             }
-            utilities::block_scanned_t const scan = utilities::block_exclusive_scan<block_threads_>(keeps ? 1 : 0);
+            utilities::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(keeps ? 1 : 0);
             if (keeps) kept[start + written + scan.before] = sorted[position];
             written += scan.total;
         }
@@ -153,7 +153,7 @@ __device__ void fold_chains(half_edge_record_t const* records, std::uint32_t con
 /** Writes the kept records of every chain back to back into @p composed, a removal of the vertex as
  *  @p removal spells it, and every chain's first record into @p offsets, the chains' tiles handing
  *  their totals through @p chain, which answers the records kept. */
-template <unsigned block_threads_>
+template <unsigned block_threads_, typename scan_type_>
 __device__ void fold_write(half_edge_record_t const* records, std::uint32_t const* starts, std::uint32_t const* kept,
                            std::uint32_t const* kept_counts, std::uint32_t chains_count, std::uint64_t tickets,
                            half_edge_record_t removal, half_edge_record_t* composed, std::uint64_t* offsets,
@@ -165,11 +165,11 @@ __device__ void fold_write(half_edge_record_t const* records, std::uint32_t cons
     std::uint64_t count = 0;
     for (std::uint64_t index = first + threadIdx.x; index < end; index += block_threads_) count += kept_counts[index];
     std::uint64_t before = utilities::chain_offset(chain, ticket, tickets,
-                                                   utilities::block_exclusive_scan<block_threads_>(count).total);
+                                                   scan_type_::template block_exclusive<block_threads_>(count).total);
     for (std::uint64_t base = first; base < end; base += block_threads_) {
         std::uint64_t const index = base + threadIdx.x;
         std::uint64_t const thread_kept_count = index < end ? kept_counts[index] : 0;
-        utilities::block_scanned_t const scan = utilities::block_exclusive_scan<block_threads_>(thread_kept_count);
+        utilities::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(thread_kept_count);
         if (index < end) {
             std::uint64_t const offset = before + scan.before;
             offsets[index] = offset;

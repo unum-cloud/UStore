@@ -17,11 +17,12 @@ Pin a commit, not a version, when building on them.
     `cpp/ustore/status.hpp` and `cpp/ustore/types.hpp` re-export it all into `unum::ustore`.
   - `ram_buffers.hpp`: the growing arena behind `ustore_arena_t` and every call's scratch, the `arena_allocator` SmashTable's containers take, the aligned and budgeted allocators of unbuffered I/O with the buffers they grow, and `growing_strings`, a column of strings exported as a tape.
   - `ram_device.hpp`: `topology_t`, `executor_t`, `lent_pool_t` and `pool_view_t` over ForkUnion's C ABI.
-  - `vram_device.hpp`: the vendor-neutral face of the GPU residency, every vendor's driver, the device listing, and one executor spawned over any vendor.
+  - `vram_device.hpp`: the vendor-neutral face of the GPU residency, every vendor's driver, the device listing, and the kernels every vendor's executor launches.
   - `vram_nvidia_device.hpp`: CUDA devices, streams, events and buffers from the host.
   - `vram_amd_device.hpp`: AMD devices from the host, the HIP runtime opened at first use, the device listing, modules, events and the executor.
   - `vram_matching.hpp` and `vram_matching.cuh`: the device matching kernels of the library's bundles as one executor's device resolved them, and the kernels themselves.
-  - `vram_scan.cuh`: the device scan steps every kernel compacts with, a block-wide scan and a chain of blocks.
+  - `vram_scan.cuh`: the device scan steps every kernel compacts with, what a block scan kit answers and a chain of blocks.
+  - `vram_nvidia_scan.cuh` and `vram_amd_scan.hip`: the block scan kits of each GPU generation, `ampere_scan_t`, `cdna3_scan_t` and `cdna5_scan_t`, which a class unit names.
   - `tapes.hpp` and `tapes.cuh`: the strings a tape is assembled from, the segments a device gathers them in, and the host twin of the device kernels.
   - `blocking_files.hpp`: whole-file mappings, paths joined into one buffer, directories created and removed, and shared libraries opened by name.
   - `algorithm.hpp`: searches over sorted batches, reservoir sampling over ordered iterators, and inserts and erases in trivially copyable buffers.

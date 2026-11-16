@@ -44,6 +44,45 @@ A handle pinned below it, or opened on a CPU lacking it, gets `ustore_status_uns
 `USTORE_CUDA_ARCH` adds NVMe's GPU compaction, whose kernels need only plain codes: `all` compiles a cubin per generation from Ampere through Blackwell and the Ampere PTX for every later GPU, `native` the code of each visible GPU, and one code like `100f` its cubin alone.
 The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set `USTORE_MARCH` with `USTORE_MULTIVERSIONED=OFF` and the one CUDA code of their GPU, and CI compiles each of them.
 
+## Dispatch Classes
+
+A CPU class bundles the waiter, the atomic reference and the StringZilla kit its silicon generation guarantees, in `src/engine.hpp`.
+Only a class whose kit, waiter or atomic reference differs from its parent's carries a variant, and a `static_assert` refuses a compiled class that no longer advances.
+
+| Value | Name            | Parent          | Waiter        | Atomics           | Strings kit                |
+| ----: | :-------------- | :-------------- | :------------ | :---------------- | :------------------------- |
+|     0 | `unknown`       |                 |               |                   | picks the newest that fits |
+|     1 | `serial`        |                 | PAUSE, YIELD  | standard          | serial                     |
+|     2 | `monoversioned` |                 | preferred     | preferred         | what the floor compiled    |
+|     3 | `intel-haswell` | `serial`        | PAUSE         | standard          | Haswell, Westmere          |
+|     4 | `intel-sierra`  | `intel-haswell` | TPAUSE        | CMPCCXADD         | Haswell, Goldmont          |
+|     5 | `intel-skylake` | `intel-haswell` | PAUSE         | standard          | Skylake                    |
+|     6 | `intel-icelake` | `intel-skylake` | PAUSE         | standard          | Ice Lake, Goldmont         |
+|    12 | `aws-g2`        | `serial`        | YIELD         | standard          | NEON, AES, SHA             |
+|    13 | `apple-m2`      | `aws-g2`        | YIELD         | LSE under RCpc    | NEON, AES, SHA             |
+|    15 | `aws-g5`        | `apple-m2`      | WFE           | LSE under RCpc    | NEON, AES, SHA             |
+|    17 | `alibaba-c930`  | `serial`        | WRS           | Zacas             | RVV                        |
+|    18 | `ibm-power10`   | `serial`        | `pause_short` | ISA 3.0 AMOs      | Power VSX                  |
+
+The serial floor spins on PAUSE or YIELD, a hint every core of its architecture has, rather than yielding to the scheduler.
+
+A GPU class names one generation of one vendor: `nvidia-ampere`, `nvidia-ada`, `nvidia-hopper`, `nvidia-blackwell`, `nvidia-blackwellrtx`, `amd-cdna3`, `amd-cdna4` and `amd-cdna5`.
+Its value 0 is `unknown`, which a listed device carries when no compiled code runs on it.
+
+### Picking Rules
+
+The CPU pick reads the libraries' detected masks, StringZilla's `sz_capabilities_detected_cpu` and ForkUnion's `cpu_capabilities`, never their enabled ones, as UStore compiles its own kits.
+A pinned value no class takes is `ustore_status_invalid_argument_k`, and a pinned class whose masks the machine lacks is `ustore_status_unsupported_k`.
+The ladder then takes the newest compiled class whose masks fit under the pin or the machine, and a build that compiled none refuses with `ustore_status_unsupported_k`.
+
+Every GPU class compiles its own bundle of its vendor's kernels for the configured codes naming its generation, so the classes partition those codes.
+Each vendor's oldest class is its floor, which carries later NVIDIA GPUs through Ampere's own PTX; a configured code no class claims, like Turing's, RDNA's or one newer than every class, stops the configure.
+A monoversioned build keeps only the newest class of each vendor holding codes.
+The GPU pick walks the device's vendor ladder newest first and takes the first class whose bundle the device's driver loads, at or under the `gpu_class` an executor pins.
+A class unit reads its class from its own `USTORE_TARGET_<VENDOR>_<CLASS>` and writes StringZilla's GPU floor target off, so its bundle holds UStore's kernels alone over StringZilla's building blocks.
+It scans with its generation's kit: `ampere_scan_t` for every NVIDIA class, `cdna3_scan_t` for CDNA3 and CDNA4, and `cdna5_scan_t`.
+A future NVIDIA GPU takes the newest class whose PTX its driver compiles, and a device no class serves lists `unknown` and refuses executors with `ustore_status_unsupported_k`.
+
 ## Layout and Namespaces
 
 | Path                    | Contents                                             | Namespace                         |
@@ -113,7 +152,7 @@ A name without it is a public contract, either a switch you may set or a value y
 
 | Family                    | Form                            | Example                       |
 | :------------------------ | :------------------------------ | :---------------------------- |
-| CPU class                 | `USTORE_TARGET_<CLASS>`         | `USTORE_TARGET_INTEL_HASWELL` |
+| CPU or GPU class          | `USTORE_TARGET_<CLASS>`         | `USTORE_TARGET_INTEL_HASWELL` |
 | Optional facility         | `USTORE_WITH_[<OS>_]<FACILITY>` | `USTORE_WITH_LINUX_SPDK`      |
 | Operating-system identity | `USTORE_OS_<OS>_`               | `USTORE_OS_POSIX_`            |
 

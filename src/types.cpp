@@ -10,12 +10,13 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm> // `std::find`, `std::reverse`
-#include <array>     // `std::array`
-#include <new>       // `std::nothrow`
-#include <span>      // `std::span`
-#include <utility>   // `std::move`
-#include <variant>   // `std::variant`, `std::get_if`, `std::visit`
+#include <algorithm>   // `std::find`, `std::reverse`
+#include <array>       // `std::array`
+#include <new>         // `std::nothrow`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
+#include <utility>     // `std::move`
+#include <variant>     // `std::variant`, `std::get_if`, `std::visit`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
@@ -102,12 +103,18 @@ constexpr enumerator_spelling<ustore_predicate_cost_t> predicate_cost_names_k[] 
 
 /** The canonical spelling of every CPU class, as UCall spells its classes. */
 constexpr enumerator_spelling<ustore_cpu_class_t> cpu_class_names_k[] {
-    {ustore_cpu_class_unknown_k, "automatic"},           {ustore_cpu_class_serial_k, "serial"},
-    {ustore_cpu_class_monoversioned_k, "monoversioned"}, {ustore_cpu_class_intel_haswell_k, "intel-haswell"},
-    {ustore_cpu_class_intel_sierra_k, "intel-sierra"},   {ustore_cpu_class_intel_skylake_k, "intel-skylake"},
-    {ustore_cpu_class_intel_icelake_k, "intel-icelake"}, {ustore_cpu_class_aws_g2_k, "aws-g2"},
-    {ustore_cpu_class_apple_m2_k, "apple-m2"},           {ustore_cpu_class_aws_g5_k, "aws-g5"},
-    {ustore_cpu_class_alibaba_c930_k, "alibaba-c930"},   {ustore_cpu_class_ibm_power10_k, "ibm-power10"},
+    {ustore_cpu_class_unknown_k, "unknown"},
+    {ustore_cpu_class_serial_k, "serial"},
+    {ustore_cpu_class_monoversioned_k, "monoversioned"},
+    {ustore_cpu_class_intel_haswell_k, "intel-haswell"},
+    {ustore_cpu_class_intel_sierra_k, "intel-sierra"},
+    {ustore_cpu_class_intel_skylake_k, "intel-skylake"},
+    {ustore_cpu_class_intel_icelake_k, "intel-icelake"},
+    {ustore_cpu_class_aws_g2_k, "aws-g2"},
+    {ustore_cpu_class_apple_m2_k, "apple-m2"},
+    {ustore_cpu_class_aws_g5_k, "aws-g5"},
+    {ustore_cpu_class_alibaba_c930_k, "alibaba-c930"},
+    {ustore_cpu_class_ibm_power10_k, "ibm-power10"},
 };
 
 /** The canonical spelling of every transport. */
@@ -387,19 +394,27 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     gpu_device_t const& device = devices[static_cast<std::size_t>(arguments->device)];
     if (device.vendor != gpu_vendor_t::nvidia_k && arguments->gds == ustore_gds_direct_k)
         return finish(outcome, {status_code_t::device_k, "GPUDirect Storage reaches NVIDIA devices alone"});
+    if (arguments->gpu_class != ustore_gpu_class_unknown_k &&
+        std::string_view {ustore_gpu_class_name(arguments->gpu_class)} == "unrecognized")
+        return finish(outcome, {status_code_t::invalid_argument_k, "Unknown GPU class"});
+    gpu_runtime_t& runtime = gpu_runtime();
+    gpu_class_t const gpu_class = pick_gpu_class(runtime.drivers, device,
+                                                 static_cast<gpu_class_t>(arguments->gpu_class));
+    if (gpu_class == gpu_class_t::unknown_k)
+        return finish(outcome, {status_code_t::unsupported_k, "No class this build compiled runs on the device"});
     // The caller is the one host thread: it stages, feeds the device and waits on it
     ustore_executor_t made = nullptr;
     if (status_t const status = spawn_across_machine(1, caller_exclusivity_t::caller_inclusive_k, fu_capabilities_all_k,
                                                      made);
         status.failed())
         return finish(outcome, status);
-    gpu_runtime_t& runtime = gpu_runtime();
-    if (status_t const status = runtime.spawn(device, gpu_class_of(device), arguments->stream, arguments->scratch_limit,
+    if (status_t const status = runtime.spawn(device, gpu_class, arguments->stream, arguments->scratch_limit,
                                               arguments->gds, made->device);
         status.failed()) {
         ustore_executor_free(made);
         return finish(outcome, status);
     }
+    made->gpu_class = gpu_class;
     *arguments->executor = made;
     finish(outcome, {});
 }
@@ -413,7 +428,7 @@ void ustore_gpu_devices(ustore_gpu_devices_t* arguments) {
         ustore_gpu_device_t& listed = arguments->devices[position];
         listed = {static_cast<ustore_gpu_vendor_t>(device.vendor),
                   device.vendor_ordinal,
-                  static_cast<ustore_gpu_class_t>(gpu_class_of(device)),
+                  static_cast<ustore_gpu_class_t>(gpu_runtime().classes[position]),
                   device.compute_units,
                   device.memory_bytes,
                   {}};

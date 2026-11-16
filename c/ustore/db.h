@@ -594,6 +594,10 @@ typedef struct ustore_database_description_t {
      *  elsewhere. */
     ustore_isolation_t isolation;
 
+    /** The CPU class the engine's calls run as, picked at open; @c ustore_cpu_class_unknown_k for
+     *  the RocksDB and LevelDB engines, which run no class's kernels. */
+    ustore_cpu_class_t cpu_class;
+
     /** Keys across every collection. */
     ustore_size_t keys;
 

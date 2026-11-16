@@ -8,7 +8,7 @@
 
 #include "ustore/docs.h" // `ustore_docs_field_type_t`, `ustore_docs_modification_t`
 
-#include "engine.hpp" // `engine_t`, `docs_verbs<home_t::host_k>`
+#include "engine.hpp" // `engine_t`, `docs_verbs<vendored_residency_t::host_k>`
 #include "lib.hpp"    // `route`, `open_cursor`, `free_cursor`, `enumerator_spelling`, `name_in`, `value_in`
 
 namespace unum::ustore {

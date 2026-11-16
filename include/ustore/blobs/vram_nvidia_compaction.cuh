@@ -24,7 +24,7 @@
 #include "ustore/blobs/nvme_compaction.hpp"        // `compaction_kind_t`, `compaction_output`
 #include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 
-#include "ustore/utilities/vram_scan.cuh" // `chain_ticket`, `chain_offset`, `block_exclusive_scan`
+#include "ustore/utilities/vram_scan.cuh" // `chain_ticket`, `chain_offset`, `block_scanned_t`
 
 #if !defined(__CUDACC__) && !defined(__HIP__)
 #include "ustore/utilities/vram_device.hpp" // `launch`, `carve_runs`, `rewind`
@@ -371,14 +371,13 @@ __device__ located_key_slot<key_slot_type_> merge_packed(located_key_slot<key_sl
  *  bytes' chain, and then writes. A survivor shares its key when a flagged record of the same key
  *  precedes it, which a walk back over that key's versions finds.
  */
-template <typename key_slot_type_, unsigned block_threads_>
+template <typename key_slot_type_, unsigned block_threads_, typename scan_type_>
 __device__ void merge_pack(located_key_slot<key_slot_type_> const* merged, std::uint8_t const* flags,
                            std::uint64_t records_count, std::uint64_t const* replaced,
                            located_key_slot<key_slot_type_> const* replacements, std::uint64_t replaced_count,
                            std::uint64_t tickets, located_key_slot<key_slot_type_>* survivors, std::uint64_t* prefix,
                            std::uint8_t* shares, std::uint64_t* chains) noexcept {
     using record_t = located_key_slot<key_slot_type_>;
-    using utilities::block_exclusive_scan;
     using utilities::block_scanned_t;
     std::uint64_t const ticket = utilities::chain_ticket(chains);
     std::uint64_t const tile = utilities::divide_round_up(records_count, tickets);
@@ -388,8 +387,8 @@ __device__ void merge_pack(located_key_slot<key_slot_type_> const* merged, std::
     std::uint64_t kept = 0, bytes = 0;
     for (std::uint64_t index = first + threadIdx.x; index < end; index += block_threads_)
         if (flags[index]) ++kept, bytes += merge_packed(merged, index, replaced, replacements, replaced_count).size;
-    std::uint64_t const kept_total = block_exclusive_scan<block_threads_>(kept).total;
-    std::uint64_t const bytes_total = block_exclusive_scan<block_threads_>(bytes).total;
+    std::uint64_t const kept_total = scan_type_::template block_exclusive<block_threads_>(kept).total;
+    std::uint64_t const bytes_total = scan_type_::template block_exclusive<block_threads_>(bytes).total;
     std::uint64_t kept_before = utilities::chain_offset(chains, ticket, tickets, kept_total);
     std::uint64_t bytes_before = utilities::chain_offset(chains + 1, ticket, tickets, bytes_total);
     if (ticket == 0 && threadIdx.x == 0 && prefix != nullptr) prefix[0] = 0;
@@ -400,8 +399,8 @@ __device__ void merge_pack(located_key_slot<key_slot_type_> const* merged, std::
         record_t const record = flagged ? merge_packed(merged, index, replaced, replacements, replaced_count)
                                         : record_t {};
         std::uint64_t const size = flagged ? record.size : 0;
-        block_scanned_t const kept_scan = block_exclusive_scan<block_threads_>(flagged ? 1 : 0);
-        block_scanned_t const bytes_scan = block_exclusive_scan<block_threads_>(size);
+        block_scanned_t const kept_scan = scan_type_::template block_exclusive<block_threads_>(flagged ? 1 : 0);
+        block_scanned_t const bytes_scan = scan_type_::template block_exclusive<block_threads_>(size);
         if (flagged) {
             std::uint64_t const into = kept_before + kept_scan.before;
             survivors[into] = record;

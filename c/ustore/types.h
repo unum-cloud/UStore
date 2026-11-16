@@ -612,7 +612,7 @@ USTORE_EXPORT ustore_status_t ustore_mood_from_name(ustore_bytes_view_t name, us
 /** The CPU generation a database or an executor confines itself to, named as the sibling libraries name it. */
 typedef enum ustore_cpu_class_t {
 
-    /** Whatever the running CPU offers. */
+    /** Picks the newest class this machine runs. */
     ustore_cpu_class_unknown_k = 0,
 
     // Portable
@@ -661,7 +661,7 @@ typedef enum ustore_cpu_class_t {
 } ustore_cpu_class_t;
 
 /** The canonical spelling of a CPU class, as @c ustore_cpu_class_intel_haswell_k spells "intel-haswell" and
- *  @c ustore_cpu_class_unknown_k spells "automatic", or "unrecognized". */
+ *  @c ustore_cpu_class_unknown_k spells "unknown", or "unrecognized". */
 USTORE_EXPORT char const* ustore_cpu_class_name(ustore_cpu_class_t cpu_class);
 
 /** Reads a CPU class back from its canonical spelling, or fails with
@@ -903,15 +903,15 @@ USTORE_EXPORT char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t vendor);
 USTORE_EXPORT ustore_status_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name, ustore_gpu_vendor_t* vendor);
 
 /** The GPU generations UStore tells apart, the device twin of @c ustore_cpu_class_t: a class implies its vendor, and
- *  within a vendor a newer device takes the newest class it satisfies. */
+ *  a device takes its vendor's newest class whose code it runs. */
 typedef enum ustore_gpu_class_t {
 
-    /** No class, which no listed device carries. */
+    /** No class, which a listed device carries when this build compiled no code that runs on it. */
     ustore_gpu_class_unknown_k = 0,
 
     // NVIDIA
 
-    /** Ampere-class NVIDIA and every NVIDIA GPU without a class of its own - A100, A10 & RTX 30. */
+    /** Ampere-class NVIDIA - A100, A10 & RTX 30, and every later GPU that compiles its PTX. */
     ustore_gpu_class_nvidia_ampere_k = 1,
 
     /** Ada-class NVIDIA - L4, L40S & RTX 40. */
@@ -992,9 +992,10 @@ typedef struct ustore_gpu_devices_t {
  *      ordinal @c ustore_executor_for_vram_t::device names it by.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  Each vendor's runtime opens on the first call, and a vendor whose runtime is absent lists no devices, so the call
- *  succeeds with a zero count on a machine without GPUs. Devices of no class UStore knows are left out. The listing is
- *  taken once per process and never changes after.
+ *  Each vendor's runtime opens on the first call, and a vendor whose runtime is absent lists no
+ *  devices, so the call succeeds with a zero count on a machine without GPUs. Each device lists the
+ *  newest class this build compiled code for that runs on it, or @c ustore_gpu_class_unknown_k
+ *  where none does. The listing is taken once per process and never changes after.
  */
 USTORE_EXPORT void ustore_gpu_devices(ustore_gpu_devices_t* arguments);
 
@@ -1021,6 +1022,10 @@ typedef struct ustore_executor_for_vram_t {
     /** How reads and compactions move bytes between the drives and the device. */
     ustore_gds_t gds;
 
+    /** The @b optional pinned class: the executor takes the newest class at or under it that serves
+     *  @c device, and @c ustore_gpu_class_unknown_k pins none. */
+    ustore_gpu_class_t gpu_class;
+
 } ustore_executor_for_vram_t;
 
 /**
@@ -1036,9 +1041,10 @@ typedef struct ustore_executor_for_vram_t {
  *  vendor's runtime opens at the first call and the library links none.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the @c gds mode is
- *    unknown, or ForkUnion refuses an argument.
- *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, or the operating
+ *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the @c gds mode or the
+ *    @c gpu_class is unknown, or ForkUnion refuses an argument.
+ *  - @c ustore_status_unsupported_k No class this build compiled serves the device at or under
+ *    the pinned @c gpu_class, the process may allocate on no memory domain, or the operating
  *    system denies ForkUnion an operation.
  *  - @c ustore_status_device_k No device carries the ordinal, its driver refuses a stream or an
  *    event, or @c ustore_gds_direct_k names a device other than NVIDIA.

@@ -42,6 +42,7 @@
 
 #include "harness.hpp"                   // `suite_exit_code`, `expect`, `expect_eq`
 #include "nvme/compaction_key_slots.hpp" // `inline_key_slot`, `fixed_width_key_slot`, `variable_width_key_slot`
+#include "vram/classes.hpp"              // `kernel_tables`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -1190,16 +1191,15 @@ struct options_t {
 
 /** Loads the library's bundle onto device zero into @p tables and answers its table, or null where
  *  this build of the suite links no bundle, as its host build does. */
-kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t const& drivers,
-                                                 kernel_tables<cuda_module_t>& tables) noexcept;
+kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t& drivers, kernel_tables<cuda_module_t>& tables) noexcept;
 
 /** Spawns an executor on CUDA device zero with a stream of its own, its scratch capped at @p scratch_limit bytes, or
  *  refuses with @c device_k where no driver reaches the device. */
 expected<cuda_executor_t> spawn_device_zero(options_t const& options, std::size_t scratch_limit) noexcept {
     if (options.drivers == nullptr || options.drivers->cuda_contexts[0] == nullptr)
         return status_t {status_code_t::device_k, "No CUDA device zero"};
-    return cuda_executor_t::spawn(options.drivers->cuda, options.drivers->cuda_contexts[0], 0, gpu_class_t::unknown_k,
-                                  nullptr, scratch_limit, ustore_gds_automatic_k, options.kernels);
+    return cuda_executor_t::spawn(options.drivers->cuda, options.drivers->cuda_contexts[0], 0, nullptr, scratch_limit,
+                                  ustore_gds_automatic_k, options.kernels);
 }
 
 /** Bounds of one-mebibyte sorted runs. */

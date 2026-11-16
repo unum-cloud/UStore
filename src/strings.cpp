@@ -25,7 +25,7 @@ namespace unum::ustore {
 template <typename match_type_>
 status_t pull_through(engine_t const& engine, ustore_strings_cursor_next_t const& arguments,
                       ustore_strings_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept {
-    strings_verbs<home_t::host_k> const& verbs = *engine.host.strings;
+    strings_verbs<vendored_residency_t::host_k> const& verbs = *engine.host.strings;
     if (!arguments.strings || !arguments.written)
         return {status_code_t::invalid_argument_k, "Need outputs for the strings and the count written"};
     if (arguments.values && !verbs.read)

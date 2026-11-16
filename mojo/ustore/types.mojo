@@ -241,7 +241,7 @@ struct CPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     var code: c_int
     """The raw `ustore_cpu_class_t` value the ABI exchanges."""
     comptime UNKNOWN = Self(0)
-    """Whatever the running CPU offers."""
+    """Picks the newest class this machine runs."""
     comptime SERIAL = Self(1)
     """The portable floor every CPU runs."""
     comptime MONOVERSIONED = Self(2)
@@ -892,6 +892,7 @@ struct ExecutorForVramArguments(ImplicitlyCopyable):
     var stream: Address
     var scratch_limit: c_size_t
     var gds: Gds
+    var gpu_class: GPUClass
 
 
 @fieldwise_init
@@ -981,7 +982,7 @@ struct Executor:
             library: The loaded engine, kept so the shared object stays mapped.
             ram: The memory domains it serves; copied, not borrowed.
             threads: Threads to spawn; zero takes 7/8 of the cores those domains carry.
-            cpu_class: The class its threads confine their waits and atomics to; `UNKNOWN` derives.
+            cpu_class: The class its threads confine their waits and atomics to; `UNKNOWN` picks the newest this machine runs.
 
         Raises:
             `Error` if the domains cannot be resolved or the OS refuses the threads.
@@ -1035,7 +1036,7 @@ struct Executor:
             library: The loaded engine, kept so the shared object stays mapped.
             nvme: How the databases it opens move bytes; copied, not borrowed.
             threads: Threads to spawn; zero derives them from the cores.
-            cpu_class: The class its threads confine their waits and atomics to; `UNKNOWN` derives.
+            cpu_class: The class its threads confine their waits and atomics to; `UNKNOWN` picks the newest this machine runs.
 
         Raises:
             `Error` if the transport is unknown or the OS refuses the threads.
@@ -1076,7 +1077,9 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForVramArguments(created, outcome, Int32(device), stream, c_size_t(scratch_limit), gds),
+            ExecutorForVramArguments(
+                created, outcome, Int32(device), stream, c_size_t(scratch_limit), gds, GPUClass.UNKNOWN
+            ),
             library.symbols().executor_for_vram,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_vram"), vram=True)

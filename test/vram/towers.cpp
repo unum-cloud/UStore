@@ -30,9 +30,10 @@
 
 #include "ustore/ustore.h"
 #include "ustore/utilities/blocking_files.hpp" // `shared_library_t`
-#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `spawn_gpu_executor`, `kernel_tables`, `assemble_tape`
+#include "ustore/utilities/vram_device.hpp"    // `gpu_drivers_t`, `assemble_tape`
 
-#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_success`, `report`
+#include "harness.hpp"      // `suite_exit_code`, `expect`, `expect_success`, `report`
+#include "vram/classes.hpp" // `kernel_tables`, `open_gpu_device`, `spawn_gpu_executor`, `gpu_class_bundle`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -85,11 +86,12 @@ class mover_t {
         gpu_device_t device;
         device.vendor = static_cast<gpu_vendor_t>(listed.vendor);
         device.vendor_ordinal = listed.vendor_ordinal;
-        if (status_t const opened = open_gpu_device(drivers_, device, cuda_kernels_, hip_kernels_); opened.failed())
+        gpu_class_t const gpu_class = static_cast<gpu_class_t>(listed.gpu_class);
+        if (status_t const opened = open_gpu_device(drivers_, device, gpu_class, cuda_kernels_, hip_kernels_);
+            opened.failed())
             return opened;
-        return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, device,
-                                  static_cast<gpu_class_t>(listed.gpu_class), nullptr, 0, ustore_gds_automatic_k,
-                                  executor_);
+        return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, device, gpu_class, nullptr, 0,
+                                  ustore_gds_automatic_k, executor_);
     }
 
     ~mover_t() noexcept {
@@ -833,9 +835,9 @@ void admit_even_keys(ustore_key_t const* keys, ustore_admission_t* admissions, u
         admissions[index] = keys[index].uuid.bytes[15] % 2 == 0 ? ustore_admit_k : ustore_reject_k;
 }
 
-/** Whether the library embeds kernels for the vendor of @p listed. */
+/** Whether the library embeds kernels for the class of @p listed. */
 bool embeds_kernels(ustore_gpu_device_t const& listed) {
-    return listed.vendor == ustore_gpu_vendor_nvidia_k ? !vram_nvidia_bundle().empty() : !vram_amd_bundle().empty();
+    return !gpu_class_bundle(static_cast<gpu_class_t>(listed.gpu_class)).empty();
 }
 
 case_result_t vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, config_t config) {

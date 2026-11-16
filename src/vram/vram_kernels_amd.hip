@@ -2,28 +2,35 @@
  *  @file src/vram/vram_kernels_amd.hip
  *  @author Ash Vardanian
  *  @date October 29, 2026
- *  @brief The kernels of AMD devices, built device-only into the one bundle every device loads at
- *      its first executor's spawn, from the templates the NVIDIA unit builds, as none of them
- *      depends on the lane width.
+ *  @brief The kernels of AMD devices, built device-only into the bundle of every kept AMD class,
+ *      which a device loads at the first spawn of its class, from the templates the NVIDIA unit
+ *      builds, passing them its class's block scan kit.
  */
+#include <type_traits> // `std::conditional_t`
+
 #include <hip/hip_runtime.h> // `threadIdx`
 
-#include <stringzilla/rocm.cuh> // `sz_lanes_any_rocm_`, `sz_shuffle_up_rocm_` & kin
+#include <stringzilla/rocm.cuh> // `sz_lanes_any_rocm_` & kin
 
 #include "ustore/blobs/vram_nvidia_compaction.cuh"     // `merge_rank`, `merge_pack`, `merge_place`
 #include "ustore/docs/vram_gather.cuh"                 // `gather_scalars`, `measure_texts`, `write_texts`
 #include "ustore/graph/vram_nvidia_adjacency_fold.cuh" // `fold_chains`, `fold_write`
 #include "ustore/utilities/tapes.cuh"                  // `tape_offsets_block`, `tape_gather_block`
+#include "ustore/utilities/vram_amd_scan.hip"          // `cdna3_scan_t`, `cdna5_scan_t`
 #include "ustore/utilities/vram_matching.cuh"          // `substrings_per_thread`, `matching_page_t` & kin
 
 using namespace unum::ustore::utilities;
+
+/** The block scan kit of this bundle's class by its own gate: CDNA5's, else CDNA3's, CDNA4 too. */
+using scan_t = std::conditional_t<USTORE_TARGET_AMD_CDNA5 != 0, cdna5_scan_t, cdna3_scan_t>;
 
 /** Scans the lengths of @p count sources into 32-bit @p offsets and cuts the segments,
  *  on one block. */
 extern "C" __global__ void __launch_bounds__(tape_block_threads_k)
     ustore_tape_offsets_u32(tape_source_t const* sources, std::uint64_t count, std::uint32_t sources_per_segment,
                             std::uint32_t* offsets, tape_segment_t* segments) {
-    tape_offsets_block<std::uint32_t, tape_block_threads_k>(sources, count, sources_per_segment, offsets, segments);
+    tape_offsets_block<std::uint32_t, tape_block_threads_k, scan_t>(sources, count, sources_per_segment, offsets,
+                                                                    segments);
 }
 
 /** Scans the lengths of @p count sources into 64-bit @p offsets and cuts the segments,
@@ -31,7 +38,8 @@ extern "C" __global__ void __launch_bounds__(tape_block_threads_k)
 extern "C" __global__ void __launch_bounds__(tape_block_threads_k)
     ustore_tape_offsets_u64(tape_source_t const* sources, std::uint64_t count, std::uint32_t sources_per_segment,
                             std::uint64_t* offsets, tape_segment_t* segments) {
-    tape_offsets_block<std::uint64_t, tape_block_threads_k>(sources, count, sources_per_segment, offsets, segments);
+    tape_offsets_block<std::uint64_t, tape_block_threads_k, scan_t>(sources, count, sources_per_segment, offsets,
+                                                                    segments);
 }
 
 /** Copies the strings of every segment into @p bytes, one block per segment. */
@@ -70,9 +78,9 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     std::uint64_t replaced_count, std::uint64_t tickets,
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_12_bytes_k>>* survivors,
     std::uint64_t* prefix, std::uint8_t* shares, std::uint64_t* chains) {
-    merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_12_bytes_k>, merge_block_threads_k>(
-        merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors, prefix, shares,
-        chains);
+    merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_12_bytes_k>, merge_block_threads_k,
+               scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors, prefix,
+                       shares, chains);
 }
 
 /** Writes every cell of the new runs of a merge of inline 12 key slots. */
@@ -105,9 +113,9 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     std::uint64_t replaced_count, std::uint64_t tickets,
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_44_bytes_k>>* survivors,
     std::uint64_t* prefix, std::uint8_t* shares, std::uint64_t* chains) {
-    merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_44_bytes_k>, merge_block_threads_k>(
-        merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors, prefix, shares,
-        chains);
+    merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_44_bytes_k>, merge_block_threads_k,
+               scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors, prefix,
+                       shares, chains);
 }
 
 /** Writes every cell of the new runs of a merge of inline 44 key slots. */
@@ -139,9 +147,9 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     std::uint64_t replaced_count, std::uint64_t tickets,
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>>* survivors,
     std::uint64_t* prefix, std::uint8_t* shares, std::uint64_t* chains) {
-    merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>, merge_block_threads_k>(
-        merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors, prefix, shares,
-        chains);
+    merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>, merge_block_threads_k,
+               scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors, prefix,
+                       shares, chains);
 }
 
 /** Writes every cell of the new runs of a merge of fixed width key slots. */
@@ -174,9 +182,9 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     std::uint64_t replaced_count, std::uint64_t tickets,
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>>* survivors,
     std::uint64_t* prefix, std::uint8_t* shares, std::uint64_t* chains) {
-    merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>, merge_block_threads_k>(
-        merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors, prefix, shares,
-        chains);
+    merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>, merge_block_threads_k,
+               scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors, prefix,
+                       shares, chains);
 }
 
 /** Writes every cell of the new runs of a merge of variable width key slots. */
@@ -221,7 +229,7 @@ extern "C" __global__ void __launch_bounds__(fold_block_threads_k)
     ustore_fold_chains(half_edge_record_t const* records, std::uint32_t const* starts, std::uint32_t chains_count,
                        std::uint32_t* kept, std::uint32_t* kept_counts) {
     extern __shared__ std::uint32_t sorted[];
-    fold_chains<fold_block_threads_k>(records, starts, chains_count, sorted, kept, kept_counts);
+    fold_chains<fold_block_threads_k, scan_t>(records, starts, chains_count, sorted, kept, kept_counts);
 }
 
 /** Writes the kept records of every chain of a graph merge back to back, one tile
@@ -231,8 +239,8 @@ extern "C" __global__ void __launch_bounds__(fold_block_threads_k)
                       std::uint32_t const* kept_counts, std::uint32_t chains_count, std::uint64_t tickets,
                       half_edge_record_t removal, half_edge_record_t* composed, std::uint64_t* offsets,
                       std::uint64_t* chain) {
-    fold_write<fold_block_threads_k>(records, starts, kept, kept_counts, chains_count, tickets, removal, composed,
-                                     offsets, chain);
+    fold_write<fold_block_threads_k, scan_t>(records, starts, kept, kept_counts, chains_count, tickets, removal,
+                                             composed, offsets, chain);
 }
 
 #pragma endregion Fold Kernels
@@ -241,10 +249,17 @@ extern "C" __global__ void __launch_bounds__(fold_block_threads_k)
 
 /** This vendor's 32 lanes as one group of the walks. */
 __device__ inline sz_simt_group_t matching_group() noexcept {
-    return {matching_group_lanes_k, threadIdx.x % matching_group_lanes_k,
-            sz_lanes_any_rocm_,     sz_lanes_ballot_rocm_,
-            sz_lanes_first_rocm_,   sz_lanes_below_rocm_,
-            sz_shuffle_index_rocm_, sz_shuffle_up_rocm_,
+    return {matching_group_lanes_k,
+            threadIdx.x % matching_group_lanes_k,
+            sz_lanes_any_rocm_,
+            sz_lanes_ballot_rocm_,
+            sz_lanes_first_rocm_,
+            sz_lanes_below_rocm_,
+            sz_shuffle_index_rocm_,
+            sz_shuffle_up_rocm_,
+            sz_u32_lanes_prefix_sum_rocm_,
+            sz_i32_lanes_prefix_min_rocm_,
+            sz_u64_lanes_sum_rocm_,
             sz_group_sync_rocm_};
 }
 

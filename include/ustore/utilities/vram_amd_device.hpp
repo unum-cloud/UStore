@@ -24,7 +24,7 @@
 
 #include "ustore/utilities/blocking_files.hpp" // `shared_library_t`
 #include "ustore/utilities/ram_buffers.hpp"    // `pinned_bounce`, `managed_blocks_t`, `free_blocks`
-#include "ustore/utilities/types.hpp"          // `gpu_device_t`, `gpu_class_t`, `expected`, `status_t`
+#include "ustore/utilities/types.hpp"          // `gpu_device_t`, `expected`, `status_t`
 
 namespace unum::ustore::utilities {
 
@@ -292,20 +292,17 @@ class hip_executor_t {
     /** The kernels this executor launches. */
     using function_t = hip_function_handle_t;
 
-    /** Binds HIP ordinal @p ordinal of class @p gpu_class, and queues on @p borrowed,
-     *  a @c hipStream_t of the caller's on that device which outlives the executor, or
-     *  on one of its own for null; its scratch never grows past @p scratch_limit
-     *  bytes, zero for no limit, and its launches find their kernels in @p kernels,
-     *  the device's table of the library's bundle, or none for null. */
-    static expected<hip_executor_t> spawn(hip_api_t const& api, int ordinal, gpu_class_t gpu_class, void* borrowed,
-                                          std::size_t scratch_limit,
+    /** Binds HIP ordinal @p ordinal, and queues on @p borrowed, a @c hipStream_t of the caller's on
+     *  that device which outlives the executor, or on one of its own for null; its scratch never
+     *  grows past @p scratch_limit bytes, zero for no limit, and its launches find their kernels in
+     *  @p kernels, the device's table of the library's bundle, or none for null. */
+    static expected<hip_executor_t> spawn(hip_api_t const& api, int ordinal, void* borrowed, std::size_t scratch_limit,
                                           kernel_table<hip_module_t> const* kernels = nullptr) noexcept {
         if (!api || api.set_device(ordinal) != hip_success_k)
             return status_t {status_code_t::device_k, "The HIP runtime refused the device"};
         hip_executor_t executor;
         executor.api_ = &api;
         executor.device_ = ordinal;
-        executor.gpu_class_ = gpu_class;
         executor.scratch_limit_ = scratch_limit;
         executor.kernels_ = kernels;
         executor.stream_ = static_cast<hip_stream_handle_t>(borrowed);
@@ -348,14 +345,6 @@ class hip_executor_t {
 
     /** The HIP ordinal every call and arena of the executor uses. */
     int device() const noexcept { return device_; }
-
-    /** The class of the device. */
-    gpu_class_t gpu_class() const noexcept { return gpu_class_; }
-
-    /** The StringZilla capabilities the device's class runs, the one ROCm tier for every class. */
-    sz_capability_t capabilities() const noexcept {
-        return gpu_class_ == gpu_class_t::unknown_k ? sz_capability_t {0} : sz_capability_t {sz_cap_rocm_k};
-    }
 
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
@@ -450,7 +439,7 @@ class hip_executor_t {
 
     void swap(hip_executor_t& other) noexcept {
         std::swap(api_, other.api_), std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);
-        std::swap(event_, other.event_), std::swap(device_, other.device_), std::swap(gpu_class_, other.gpu_class_);
+        std::swap(event_, other.event_), std::swap(device_, other.device_);
         std::swap(scratch_limit_, other.scratch_limit_), std::swap(kernels_, other.kernels_);
         std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
     }
@@ -463,7 +452,6 @@ class hip_executor_t {
     hip_stream_handle_t stream_ = nullptr;
     hip_event_t event_;
     int device_ = 0;
-    gpu_class_t gpu_class_ = gpu_class_t::unknown_k;
     std::size_t scratch_limit_ = 0;
     kernel_table<hip_module_t> const* kernels_ = nullptr;
     pinned_bounce<hip_api_t> bounce_;

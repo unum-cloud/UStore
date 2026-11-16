@@ -194,11 +194,8 @@ __attribute__((visibility("default"))) int hipModuleLoadData(void** module, void
 
 __attribute__((visibility("default"))) int hipModuleUnload(void*) { return success_k; }
 
-__attribute__((visibility("default"))) int hipModuleGetFunction(void** function, void*, char const* name) {
-    if (!name || std::strncmp(name, "ustore_", 7) != 0) return invalid_value_k;
-    *function = &token;
-    return success_k;
-}
+/** The stand-in runs no kernel, so a bundle it loads exports none and a device keeps no table. */
+__attribute__((visibility("default"))) int hipModuleGetFunction(void**, void*, char const*) { return invalid_value_k; }
 
 __attribute__((visibility("default"))) int hipFuncGetAttribute(int* value, int, void*) {
     *value = 0;

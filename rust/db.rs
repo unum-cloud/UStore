@@ -459,6 +459,7 @@ pub(crate) mod ffi {
         pub stream: *mut c_void,
         pub scratch_limit: ustore_size_t,
         pub gds: ustore_gds_t,
+        pub gpu_class: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -569,6 +570,7 @@ pub(crate) mod ffi {
         pub capabilities: ustore_enum_t,
         pub engine: ustore_enum_t,
         pub isolation: ustore_enum_t,
+        pub cpu_class: ustore_enum_t,
         pub keys: ustore_size_t,
         pub memory_bytes: ustore_size_t,
         pub disk_bytes: ustore_size_t,
@@ -2457,6 +2459,9 @@ pub struct Description {
     pub engine: Engine,
     /// How transactions see each other: what the RAM engine was started with, and [`Isolation::Snapshot`] elsewhere.
     pub isolation: Isolation,
+    /// The CPU class the engine's calls run as, picked at open; `None` for RocksDB and LevelDB,
+    /// which run no class's kernels.
+    pub cpu_class: Option<CPUClass>,
     /// Keys across every collection.
     pub keys: usize,
     /// Bytes of memory the engine holds for the data.
@@ -2685,6 +2690,7 @@ impl Database {
             capabilities: description.capabilities,
             engine,
             isolation,
+            cpu_class: CPUClass::from_raw(description.cpu_class),
             keys: description.keys as usize,
             memory_bytes: description.memory_bytes,
             disk_bytes: description.disk_bytes,
@@ -3911,6 +3917,7 @@ impl Executor {
             stream,
             scratch_limit: scratch_limit as ffi::ustore_size_t,
             gds,
+            gpu_class: 0,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and the caller vouches
         // for the stream.

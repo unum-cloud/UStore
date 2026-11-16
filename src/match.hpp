@@ -32,7 +32,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_rewind`
 #include "ustore/utilities/types.hpp"       // `stringzilla_refusal`
 
-#include "engine.hpp"             // `home_t`, `home_tables`, `view_t`
+#include "engine.hpp"             // `vendored_residency_t`, `residency_tables`, `view_t`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `validate_scan`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -60,13 +60,13 @@ struct match_everything_t {};
 using value_matcher_t =
     std::variant<match_everything_t, sz_regex_engine_t*, sz_substrings_engine_t*, sz_subdocuments_engine_t*>;
 
-/** What one call or cursor matches at one home. */
-template <home_t>
+/** What one call or cursor matches at one residency. */
+template <vendored_residency_t>
 struct compiled_match;
 
 /** A host match: the compiled patterns or filter, and the caller's predicate. */
 template <>
-struct compiled_match<home_t::host_k> {
+struct compiled_match<vendored_residency_t::host_k> {
 
     /** The compiled regex, substrings or subdocuments engine, if the match reads values. */
     value_matcher_t matcher;
@@ -176,15 +176,15 @@ struct compiled_match<home_t::host_k> {
 
 /** A device match: the engine compiled for the executor's device, and the host half asking the predicate and scoring
  *  what the device kept, as the listing runs on the host either way. */
-template <home_t home_>
-    requires(home_ != home_t::host_k)
-struct compiled_match<home_> {
+template <vendored_residency_t residency_>
+    requires(residency_ != vendored_residency_t::host_k)
+struct compiled_match<residency_> {
 
     /** The compiled engine on the executor's device, if the match reads values. */
     value_matcher_t matcher;
 
     /** The caller's predicate and the BM25 scorer, whose own matcher reads no values. */
-    compiled_match<home_t::host_k> host;
+    compiled_match<vendored_residency_t::host_k> host;
 
     /** @c matcher rebased onto its tables' copy in the executor's managed runs, which the kernels
      *  take by value, or nothing for an engine no kernel walks, which the host matches. */
@@ -335,9 +335,10 @@ status_t compile_values(arguments_type_ const& arguments, ustore_arena_t into, s
 /** Compiles what @p arguments match on the host, laying the engine handles and their state out in @p into, which must
  *  outlive the match, for the kernels @p capabilities allow. */
 template <typename arguments_type_>
-expected<compiled_match<home_t::host_k>> compile_match(arguments_type_ const& arguments, ustore_arena_t into,
-                                                       sz_capability_t capabilities) noexcept {
-    compiled_match<home_t::host_k> match;
+expected<compiled_match<vendored_residency_t::host_k>> compile_match(arguments_type_ const& arguments,
+                                                                     ustore_arena_t into,
+                                                                     sz_capability_t capabilities) noexcept {
+    compiled_match<vendored_residency_t::host_k> match;
     if (status_t const status = compile_values(arguments, into, capabilities, stringzilla_allocator(into),
                                                match.matcher);
         status.failed())
@@ -387,7 +388,7 @@ status_t run_steps(plan_type_& plan, view_t const& view, progress_t& progress) n
 /** Reads into @p values the values of @p keys of @p collection through the host verbs of @p engine, as the scan of
  *  @p scan_type_ matches them: blobs as stored, documents whole, pages rendered as XML. */
 template <typename scan_type_>
-status_t read_page_values(home_tables<home_t::host_k> const& engine, ustore_database_t database,
+status_t read_page_values(residency_tables<vendored_residency_t::host_k> const& engine, ustore_database_t database,
                           ustore_collection_id_t const& collection, std::span<ustore_key_t const> keys,
                           ustore_arena_t page, view_t const& view, strings_arg_t& values) noexcept {
     values = {};
@@ -439,13 +440,13 @@ using keyed_survivors_t = st::vector<ustore_key_t, arena_allocator<ustore_key_t>
  *  key the next listing resumes at, or nothing once the range ends.
  */
 template <typename scan_type_, typename match_type_>
-status_t list_matched_keys(home_tables<home_t::host_k> const& engine, ustore_database_t database,
+status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> const& engine, ustore_database_t database,
                            ustore_collection_id_t const& collection, ustore_key_t start, ustore_key_t const* end,
                            ustore_scan_direction_t direction, std::size_t wanted, match_type_ const& match,
                            ustore_arena_t page, view_t const& view, keyed_survivors_t& survivors,
                            std::variant<ustore_key_t, exhausted_t>& resume, scores_sink_t* scores = nullptr) noexcept {
-    auto const* const verbs = engine.*verb_slot<scan_type_>::template table<home_t::host_k>;
-    auto const scan_verb = verbs->*verb_slot<scan_type_>::template verb<home_t::host_k>;
+    auto const* const verbs = engine.*verb_slot<scan_type_>::template table<vendored_residency_t::host_k>;
+    auto const scan_verb = verbs->*verb_slot<scan_type_>::template verb<vendored_residency_t::host_k>;
     view_t page_view = view;
     page_view.scratch = page;
     std::size_t const first = survivors.size();
@@ -527,7 +528,7 @@ template <typename scan_type_, typename match_type_>
 struct keyed_scan_plan {
     using step_t = std::size_t;
 
-    home_tables<home_t::host_k> const& engine;
+    residency_tables<vendored_residency_t::host_k> const& engine;
     match_type_ const& match;
     scan_type_ const& arguments;
     std::span<ustore_length_t> offsets;
@@ -557,8 +558,8 @@ struct keyed_scan_plan {
 /** Serves the scan @p arguments with @p match through the host verbs of @p engine as a plan of one step per task, the
  *  call's arena holding one page at a time until the survivors are copied into it. */
 template <typename scan_type_, typename match_type_>
-status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ const& match, scan_type_ const& arguments,
-                      view_t const& view) noexcept {
+status_t scan_matched(residency_tables<vendored_residency_t::host_k> const& engine, match_type_ const& match,
+                      scan_type_ const& arguments, view_t const& view) noexcept {
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
     auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(view.scratch, arguments.count + 1);
     if (offsets_status.failed()) return offsets_status;
@@ -617,14 +618,14 @@ constexpr start_bound_t resume_bound_of(ustore_scan_direction_t direction) noexc
  *  once the range ends; the next listing starts there as @c resume_bound_of says.
  */
 template <typename match_type_, typename survivors_type_, typename resume_bytes_type_>
-status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_database_t database,
+status_t list_matched_strings(residency_tables<vendored_residency_t::host_k> const& engine, ustore_database_t database,
                               ustore_collection_id_t const& collection, ustore_bytes_view_t prefix,
                               ustore_bytes_view_t start, start_bound_t start_bound, ustore_bytes_view_t end,
                               ustore_scan_direction_t direction, std::size_t wanted, match_type_ const& match,
                               ustore_arena_t page, view_t const& view, survivors_type_& survivors,
                               resume_bytes_type_& resume_bytes, std::variant<ustore_bytes_view_t, exhausted_t>& resume,
                               scores_sink_t* scores = nullptr) noexcept {
-    strings_verbs<home_t::host_k> const& verbs = *engine.strings;
+    strings_verbs<vendored_residency_t::host_k> const& verbs = *engine.strings;
     view_t page_view = view;
     page_view.scratch = page;
     std::size_t const first = survivors.size();
@@ -717,7 +718,7 @@ status_t list_matched_strings(home_tables<home_t::host_k> const& engine, ustore_
 /** Serves the strings scan @p arguments with @p match through the host verbs of @p engine, one filtered listing per
  *  task, as @c scan_matched serves the keyed scans. */
 template <typename match_type_>
-status_t scan_matched(home_tables<home_t::host_k> const& engine, match_type_ const& match,
+status_t scan_matched(residency_tables<vendored_residency_t::host_k> const& engine, match_type_ const& match,
                       ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
                       strings_arg_t const& starts, strings_arg_t const& ends, view_t const& view) noexcept {
     if (arguments.mode != ustore_scan_ordered_k && arguments.mode != ustore_scan_unordered_k)

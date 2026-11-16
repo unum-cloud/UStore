@@ -30,10 +30,11 @@
 #include "ustore/blobs/nvme_tree.hpp"              // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
 #include "ustore/blobs/vram_nvidia_compaction.cuh" // `cuda_compactor_t`, `strings_merge_verdict`
 #include "ustore/utilities/ram_device.hpp"         // `executor_t`, `pool_view_t`
-#include "ustore/utilities/vram_device.hpp"        // `gpu_drivers_t`, `kernel_tables`, `vram_nvidia_bundle`
+#include "ustore/utilities/vram_device.hpp"        // `gpu_drivers_t`
 
 #include "nvme/allocation_watch.hpp" // `allocation_watch_t`, `allocation_watch_g`
 #include "nvme/fixture.hpp"          // `run_on_transport`, `expectation_t`, `painted`
+#include "vram/classes.hpp"          // `kernel_tables`, `pick_gpu_class`
 
 namespace unum::ustore::test {
 
@@ -1398,10 +1399,14 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     gpu_drivers_t drivers;
     kernel_tables<cuda_module_t> kernels;
     expected<cuda_executor_t> executor = status_t {status_code_t::device_k, "No CUDA device zero"};
+    gpu_device_t device_zero;
+    gpu_class_t const gpu_class = list_nvidia_gpu_devices(drivers.cuda, {&device_zero, 1})
+                                      ? pick_gpu_class(drivers, device_zero, gpu_class_t::unknown_k)
+                                      : gpu_class_t::unknown_k;
     if (drivers.retain_context(0) &&
-        kernels.load(drivers.cuda, drivers.cuda_contexts[0], 0, vram_nvidia_bundle(), vram_kernel_names_k).succeeded())
-        executor = cuda_executor_t::spawn(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class_t::unknown_k, nullptr, 0,
-                                          ustore_gds_automatic_k, kernels.table_of(vram_nvidia_bundle(), 0));
+        kernels.load(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class, vram_kernel_names_k).succeeded())
+        executor = cuda_executor_t::spawn(drivers.cuda, drivers.cuda_contexts[0], 0, nullptr, 0, ustore_gds_automatic_k,
+                                          kernels.table_of(0, gpu_class));
     expected<cuda_compactor_t> compactor = executor ? cuda_compactor_t::make(*executor)
                                                     : expected<cuda_compactor_t> {executor.status()};
     if (compactor) request.compactor = std::addressof(*compactor);

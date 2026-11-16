@@ -209,7 +209,7 @@ static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNU
 
 static char const doc_Database_open_ram[] =                                                  //
     "open_ram(directory=None, *, isolation=Isolation.STRICT_SERIALIZABLE, executor=None,\n"  //
-    "cpu_class=CPUClass.AUTOMATIC) answers a database in memory.\n"                          //
+    "cpu_class=CPUClass.UNKNOWN) answers a database in memory.\n"                            //
     "\n"                                                                                     //
     "Calls `ustore_database_open_ram` with a directory and `ustore_database_init_ram`\n"     //
     "without one.\n"                                                                         //
@@ -221,7 +221,7 @@ static char const doc_Database_open_ram[] =                                     
     "  executor (Executor, optional): The executor the open blocks on, or None to open on\n" //
     "    the calling thread.\n"                                                              //
     "  cpu_class (CPUClass): The CPU class the database confines its waits, atomics and\n"   //
-    "    string kernels to; AUTOMATIC takes what the CPU offers.\n"                          //
+    "    string kernels to; UNKNOWN takes what the CPU offers.\n"                            //
     "Returns:\n"                                                                             //
     "  Database: The opened database.\n"                                                     //
     "Raises:\n"                                                                              //
@@ -428,7 +428,7 @@ failed:
 }
 
 static char const doc_Database_open_nvme[] =                                                     //
-    "open_nvme(manifest, *, executor=None, cpu_class=CPUClass.AUTOMATIC, **sizes) answers a\n"   //
+    "open_nvme(manifest, *, executor=None, cpu_class=CPUClass.UNKNOWN, **sizes) answers a\n"     //
     "database on NVMe.\n"                                                                        //
     "\n"                                                                                         //
     "Every size keyword names a field of ustore_database_open_nvme_t, like memory_limit,\n"      //
@@ -446,7 +446,7 @@ static char const doc_Database_open_nvme[] =                                    
     "  compactions (Executor, optional): An executor of Executor.for_vram() whose device and\n"  //
     "    scratch limit every merge takes, read once here; None merges on host threads.\n"        //
     "  cpu_class (CPUClass): The CPU class the database confines its waits, atomics and\n"       //
-    "    string kernels to; AUTOMATIC takes what the CPU offers.\n"                              //
+    "    string kernels to; UNKNOWN takes what the CPU offers.\n"                                //
     "Returns:\n"                                                                                 //
     "  Database: The opened database.\n"                                                         //
     "Raises:\n"                                                                                  //
@@ -732,16 +732,17 @@ static void describe_submit(void* arguments) { ustore_database_describe((ustore_
 
 static PyObject* describe_answer(void* erased) {
     ustore_database_description_t const* const description = &((describe_call_t const*)erased)->description;
-    PyObject* fields[8] = {capabilities_object(description->capabilities)};
+    PyObject* fields[9] = {capabilities_object(description->capabilities)};
     fields[1] = fields[0] ? ustore_py_enum_to_object(ustore_py_enum_engine_k, (int)description->engine) : NULL;
     fields[2] = fields[1] ? ustore_py_enum_to_object(ustore_py_enum_isolation_k, (int)description->isolation) : NULL;
-    fields[3] = fields[2] ? PyLong_FromUnsignedLongLong(description->keys) : NULL;
-    fields[4] = fields[3] ? PyLong_FromUnsignedLongLong(description->memory_bytes) : NULL;
-    fields[5] = fields[4] ? PyLong_FromUnsignedLongLong(description->disk_bytes) : NULL;
-    fields[6] = fields[5] ? PyLong_FromUnsignedLongLong(description->pin_refused_bytes) : NULL;
-    fields[7] = fields[6] ? PyLong_FromUnsignedLongLong(description->crossing_requests) : NULL;
-    PyObject* const described = fields[7] ? PyStructSequence_New(DescriptionType) : NULL;
-    for (Py_ssize_t index = 0; index != 8; ++index)
+    fields[3] = fields[2] ? ustore_py_enum_to_object(ustore_py_enum_cpu_class_k, (int)description->cpu_class) : NULL;
+    fields[4] = fields[3] ? PyLong_FromUnsignedLongLong(description->keys) : NULL;
+    fields[5] = fields[4] ? PyLong_FromUnsignedLongLong(description->memory_bytes) : NULL;
+    fields[6] = fields[5] ? PyLong_FromUnsignedLongLong(description->disk_bytes) : NULL;
+    fields[7] = fields[6] ? PyLong_FromUnsignedLongLong(description->pin_refused_bytes) : NULL;
+    fields[8] = fields[7] ? PyLong_FromUnsignedLongLong(description->crossing_requests) : NULL;
+    PyObject* const described = fields[8] ? PyStructSequence_New(DescriptionType) : NULL;
+    for (Py_ssize_t index = 0; index != 9; ++index)
         if (described) PyStructSequence_SetItem(described, index, fields[index]);
         else Py_XDECREF(fields[index]);
     return described;

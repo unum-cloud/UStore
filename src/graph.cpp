@@ -8,7 +8,7 @@
 
 #include "ustore/graph.h" // `ustore_vertex_role_t`
 
-#include "engine.hpp" // `engine_t`, `graph_verbs<home_t::host_k>`
+#include "engine.hpp" // `engine_t`, `graph_verbs<vendored_residency_t::host_k>`
 #include "lib.hpp"    // `route`, `open_cursor`, `free_cursor`, `enumerator_spelling`, `name_in`, `value_in`
 
 namespace unum::ustore {

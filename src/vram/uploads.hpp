@@ -22,7 +22,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `device_blocks_t`
 #include "ustore/utilities/vram_device.hpp" // `device_blocks_of`
 
-#include "engine.hpp"       // `home_tables`, `home_executor`, `engine_of`, `database_of`
+#include "engine.hpp"       // `residency_tables`, `residency_executor`, `engine_of`, `database_of`
 #include "lib.hpp"          // `verb_slot`
 #include "vram/columns.hpp" // `upload_output_columns`
 #include "vram/gathers.hpp" // `gather_documents_on_device`, `read_documents_on_device`, `device_answer_t`
@@ -30,22 +30,23 @@
 namespace unum::ustore {
 
 /**
- *  @brief Serves a device verb of @p home_ through the host verb of the same slot, as the upload tower does.
+ *  @brief Serves a device verb of @p residency_ through the host verb of the same slot, as the
+ *      upload tower does.
  *
  *  The trailing @p rest are the ragged inputs the router gathered, then the view and the executor, so one adapter fills
  *  every slot. A warm call allocates nothing: the bounce and the arena keep their newest block and run.
  */
-template <home_t home_, typename arguments_type_, typename... rest_types_>
+template <vendored_residency_t residency_, typename arguments_type_, typename... rest_types_>
 status_t upload_through_host(arguments_type_ const& arguments, rest_types_&... rest) noexcept {
     constexpr std::size_t ragged_count = sizeof...(rest_types_) - 2;
     std::tuple<rest_types_&...> const tail {rest...};
     view_t const& view = std::get<ragged_count>(tail);
-    home_executor<home_>& executor = std::get<ragged_count + 1>(tail);
+    residency_executor<residency_>& executor = std::get<ragged_count + 1>(tail);
 
     engine_t const& engine = engine_of(database_of(arguments));
-    auto const* const verbs = engine.host.*verb_slot<arguments_type_>::template table<home_t::host_k>;
+    auto const* const verbs = engine.host.*verb_slot<arguments_type_>::template table<vendored_residency_t::host_k>;
     if (!verbs) return {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
-    auto const verb = verbs->*verb_slot<arguments_type_>::template verb<home_t::host_k>;
+    auto const verb = verbs->*verb_slot<arguments_type_>::template verb<vendored_residency_t::host_k>;
     if (!verb) return {status_code_t::unsupported_k, "The engine does not implement this call"};
     utilities::device_blocks_t* const blocks = utilities::device_blocks_of(arguments.arena, executor);
     if (!blocks) return {status_code_t::device_k, "The arena lives where another executor computes"};
@@ -59,58 +60,58 @@ status_t upload_through_host(arguments_type_ const& arguments, rest_types_&... r
     return upload_output_columns(hosted, *blocks, executor);
 }
 
-/** Serves a device verb of @p home_ through @p on_device_, and through the upload tower when that
- *  verb leaves the call to the host. */
-template <home_t home_, auto on_device_, typename arguments_type_, typename... rest_types_>
+/** Serves a device verb of @p residency_ through @p on_device_, and through the upload tower when
+ *  that verb leaves the call to the host. */
+template <vendored_residency_t residency_, auto on_device_, typename arguments_type_, typename... rest_types_>
 status_t serve_on_device(arguments_type_ const& arguments, rest_types_&... rest) noexcept {
     auto [answer, status] = on_device_(arguments, rest...);
     if (status.failed()) return status;
     if (answer == device_answer_t::served_k) return {};
-    return upload_through_host<home_>(arguments, rest...);
+    return upload_through_host<residency_>(arguments, rest...);
 }
 
-template <home_t home_>
-inline constexpr blobs_verbs<home_> uploading_vram_blobs {
-    .read = &upload_through_host<home_, ustore_blobs_read_t>,
-    .scan = &upload_through_host<home_, ustore_blobs_scan_t>,
-    .sample = &upload_through_host<home_, ustore_blobs_sample_t>,
+template <vendored_residency_t residency_>
+inline constexpr blobs_verbs<residency_> uploading_vram_blobs {
+    .read = &upload_through_host<residency_, ustore_blobs_read_t>,
+    .scan = &upload_through_host<residency_, ustore_blobs_scan_t>,
+    .sample = &upload_through_host<residency_, ustore_blobs_sample_t>,
 };
 
-template <home_t home_>
-inline constexpr strings_verbs<home_> uploading_vram_strings {
-    .read = &upload_through_host<home_, ustore_strings_read_t>,
-    .scan = &upload_through_host<home_, ustore_strings_scan_t>,
+template <vendored_residency_t residency_>
+inline constexpr strings_verbs<residency_> uploading_vram_strings {
+    .read = &upload_through_host<residency_, ustore_strings_read_t>,
+    .scan = &upload_through_host<residency_, ustore_strings_scan_t>,
 };
 
-template <home_t home_>
-inline constexpr docs_verbs<home_> uploading_vram_docs {
-    .read = &serve_on_device<home_, &read_documents_on_device<home_>, ustore_docs_read_t>,
-    .gather = &serve_on_device<home_, &gather_documents_on_device<home_>, ustore_docs_gather_t>,
-    .scan = &upload_through_host<home_, ustore_docs_scan_t>,
-    .sample = &upload_through_host<home_, ustore_docs_sample_t>,
+template <vendored_residency_t residency_>
+inline constexpr docs_verbs<residency_> uploading_vram_docs {
+    .read = &serve_on_device<residency_, &read_documents_on_device<residency_>, ustore_docs_read_t>,
+    .gather = &serve_on_device<residency_, &gather_documents_on_device<residency_>, ustore_docs_gather_t>,
+    .scan = &upload_through_host<residency_, ustore_docs_scan_t>,
+    .sample = &upload_through_host<residency_, ustore_docs_sample_t>,
 };
 
-template <home_t home_>
-inline constexpr graph_verbs<home_> uploading_vram_graph {
-    .read_edges = &upload_through_host<home_, ustore_graph_read_edges_t>,
-    .scan_vertices = &upload_through_host<home_, ustore_graph_scan_vertices_t>,
+template <vendored_residency_t residency_>
+inline constexpr graph_verbs<residency_> uploading_vram_graph {
+    .read_edges = &upload_through_host<residency_, ustore_graph_read_edges_t>,
+    .scan_vertices = &upload_through_host<residency_, ustore_graph_scan_vertices_t>,
 };
 
-template <home_t home_>
-inline constexpr pages_verbs<home_> uploading_vram_pages {
-    .read = &upload_through_host<home_, ustore_pages_read_t>,
-    .scan = &upload_through_host<home_, ustore_pages_scan_t>,
+template <vendored_residency_t residency_>
+inline constexpr pages_verbs<residency_> uploading_vram_pages {
+    .read = &upload_through_host<residency_, ustore_pages_read_t>,
+    .scan = &upload_through_host<residency_, ustore_pages_scan_t>,
 };
 
-/** The device tables at @p home_ of an engine with no device kernels, every verb served by its host twin through the
- *  bounce. */
-template <home_t home_>
-inline constexpr home_tables<home_> uploading_vram_tables {
-    .blobs = &uploading_vram_blobs<home_>,
-    .strings = &uploading_vram_strings<home_>,
-    .docs = &uploading_vram_docs<home_>,
-    .graph = &uploading_vram_graph<home_>,
-    .pages = &uploading_vram_pages<home_>,
+/** The device tables at @p residency_ of an engine with no device kernels, every verb served by its
+ *  host twin through the bounce. */
+template <vendored_residency_t residency_>
+inline constexpr residency_tables<residency_> uploading_vram_tables {
+    .blobs = &uploading_vram_blobs<residency_>,
+    .strings = &uploading_vram_strings<residency_>,
+    .docs = &uploading_vram_docs<residency_>,
+    .graph = &uploading_vram_graph<residency_>,
+    .pages = &uploading_vram_pages<residency_>,
 };
 
 } // namespace unum::ustore

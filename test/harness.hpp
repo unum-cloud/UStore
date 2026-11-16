@@ -318,7 +318,7 @@ template <typename condition_type_>
 [[nodiscard]] inline bool spin_until(condition_type_&& condition) noexcept {
     for (std::size_t spins = 0; spins != spin_limit_k; ++spins) {
         if (condition()) return true;
-        fu::preferred_yield_t {}(spins, spins, std::size_t {0});
+        fu::preferred_yield_t {}(&spins, spins, std::size_t {0});
     }
     return false;
 }

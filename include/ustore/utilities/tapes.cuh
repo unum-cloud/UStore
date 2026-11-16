@@ -5,11 +5,10 @@
  *  @brief The device halves of a tape's assembly: one block scanning the lengths into the offsets and cutting the
  *      strings into segments, and one block per segment copying its strings, as @c assemble_tape lays them on the host.
  *
- *  Both templates synchronize through block-shared memory and @c __syncthreads alone, with no
- *  warp intrinsic, CUB or rocPRIM, so one source compiles for 32-lane NVIDIA warps and
- *  64-lane AMD wavefronts alike. A tape takes two launches, the offsets on one block and the
- *  gather on one block per segment, which wait for nothing in between but the stream's own
- *  order, and allocate nothing.
+ *  Both templates synchronize through @c __syncthreads and the block scan kit of the class, with
+ *  no CUB or rocPRIM, so one source compiles for 32-lane NVIDIA warps and 64-lane AMD wavefronts
+ *  alike. A tape takes two launches, the offsets on one block and the gather on one block per
+ *  segment, which wait for nothing in between but the stream's own order, and allocate nothing.
  */
 
 #pragma once
@@ -17,42 +16,31 @@
 #include <cstddef> // `std::byte`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
-#include "ustore/utilities/tapes.hpp" // `tape_source_t`, `tape_segment_t`
+#include "ustore/utilities/tapes.hpp"     // `tape_source_t`, `tape_segment_t`
+#include "ustore/utilities/vram_scan.cuh" // `block_scanned_t`
 
 namespace unum::ustore::utilities {
 
 /**
- *  @brief Scans the lengths of @p count sources into @p offsets on one block of @p block_threads_ threads, then cuts
- *      the sources into segments of @p sources_per_segment each, every one starting at the offset of its first.
+ *  @brief Scans the lengths of @p count sources into @p offsets on one block of @p block_threads_
+ *      threads through @p scan_type_, then cuts the sources into segments of
+ *      @p sources_per_segment each, every one starting at the offset of its first.
  *  @param[in] sources The strings, in tape order.
  *  @param[out] offsets One offset per string and one past the last, the first zero.
  *  @param[out] segments Room for @p count divided by @p sources_per_segment and rounded up, one block of the gather
  *      each.
  */
-template <typename offset_type_, unsigned block_threads_>
+template <typename offset_type_, unsigned block_threads_, typename scan_type_>
 __device__ void tape_offsets_block(tape_source_t const* sources, std::uint64_t count, std::uint32_t sources_per_segment,
                                    offset_type_* offsets, tape_segment_t* segments) noexcept {
-    __shared__ std::uint64_t scanned[block_threads_];
-    __shared__ std::uint64_t carried;
     unsigned const thread = threadIdx.x;
-    if (thread == 0) carried = 0;
-    __syncthreads();
+    std::uint64_t carried = 0;
     for (std::uint64_t base = 0; base < count; base += block_threads_) {
         std::uint64_t const index = base + thread;
         std::uint64_t const length = index < count ? sources[index].length : 0;
-        scanned[thread] = length;
-        __syncthreads();
-        // An inclusive Hillis-Steele scan, whose every step reads before any thread of the block writes.
-        for (unsigned stride = 1; stride < block_threads_; stride *= 2) {
-            std::uint64_t const before = thread >= stride ? scanned[thread - stride] : 0;
-            __syncthreads();
-            scanned[thread] += before;
-            __syncthreads();
-        }
-        if (index < count) offsets[index] = static_cast<offset_type_>(carried + scanned[thread] - length);
-        __syncthreads();
-        if (thread == 0) carried += scanned[block_threads_ - 1];
-        __syncthreads();
+        block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(length);
+        if (index < count) offsets[index] = static_cast<offset_type_>(carried + scan.before);
+        carried += scan.total;
     }
     if (thread == 0) offsets[count] = static_cast<offset_type_>(carried);
     __syncthreads();

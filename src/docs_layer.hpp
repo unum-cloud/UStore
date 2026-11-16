@@ -43,7 +43,7 @@
 #include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`, `heap_sort`, `radix_sort`, `word_byte`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`
 
-#include "engine.hpp"            // `blobs_verbs<home_t::host_k>`, `view_t`
+#include "engine.hpp"            // `blobs_verbs<vendored_residency_t::host_k>`, `view_t`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
 #include "utilities/outputs.hpp" // `read_outputs_t`
 #include "utilities/slices.hpp"  // `for_task_slices`, `slice_slots`
@@ -731,7 +731,7 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
 /** The documents of an engine keeping each as one whole value, read and written through @c values_verbs, the
  *  unchecked whole-value verbs of that one engine. */
 struct documents_in_values_t {
-    blobs_verbs<home_t::host_k> const& values_verbs;
+    blobs_verbs<vendored_residency_t::host_k> const& values_verbs;
     ustore_database_t database;
 
     /** Reads the binary documents at @p places through @p view, appending to its scratch rather than rewinding it. */
@@ -767,7 +767,7 @@ struct documents_in_values_t {
 /** The document verbs of an engine keeping every document as one whole value of JSON text, bound to its unchecked
  *  whole-value verbs @p values_verbs_ and its resolver @p resolve_, which refuses every collection holding another
  *  modality first. */
-template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
+template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_>
 status_t docs_write_over_blobs(ustore_docs_write_t const& arguments, strings_arg_t const& fields,
                                strings_arg_t const& values, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
@@ -776,7 +776,8 @@ status_t docs_write_over_blobs(ustore_docs_write_t const& arguments, strings_arg
     return write_documents(documents_in_values_t {values_verbs_, arguments.database}, arguments, fields, values, view);
 }
 
-template <strings_kit_concept strings_kit_type_, blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
+template <strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+          auto resolve_>
 status_t docs_read_over_blobs(ustore_docs_read_t const& arguments, strings_arg_t const& fields,
                               view_t const& view) noexcept {
     if (!arguments.count) return {};
@@ -798,7 +799,7 @@ status_t docs_read_over_blobs(ustore_docs_read_t const& arguments, strings_arg_t
     return values_verbs_.read(read, view);
 }
 
-template <blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
+template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_>
 status_t docs_gist_over_blobs(ustore_docs_gist_t const& arguments, view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
                                        ustore_modality_docs_k, view);
@@ -806,7 +807,8 @@ status_t docs_gist_over_blobs(ustore_docs_gist_t const& arguments, view_t const&
     return gist_documents(documents_in_values_t {values_verbs_, arguments.database}, arguments, view);
 }
 
-template <strings_kit_concept strings_kit_type_, blobs_verbs<home_t::host_k> const& values_verbs_, auto resolve_>
+template <strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+          auto resolve_>
 status_t docs_gather_over_blobs(ustore_docs_gather_t const& arguments, strings_arg_t const& fields,
                                 view_t const& view) noexcept {
     status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,

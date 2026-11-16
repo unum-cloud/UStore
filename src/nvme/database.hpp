@@ -275,22 +275,22 @@ struct nvme_variant {
 
     /** The unchecked whole-value reads, removals and key scans of this class, through each collection's own store,
      *  which its docs, graph and pages verbs reach after their resolver. */
-    static blobs_verbs<home_t::host_k> const values_verbs_k;
+    static blobs_verbs<vendored_residency_t::host_k> const values_verbs_k;
 
     /** The verbs of this class's blobs collections. */
-    static blobs_verbs<home_t::host_k> const blobs_verbs_k;
+    static blobs_verbs<vendored_residency_t::host_k> const blobs_verbs_k;
 
     /** The verbs of this class's strings collections. */
-    static strings_verbs<home_t::host_k> const strings_verbs_k;
+    static strings_verbs<vendored_residency_t::host_k> const strings_verbs_k;
 
     /** The verbs of this class's documents collections. */
-    static docs_verbs<home_t::host_k> const docs_verbs_k;
+    static docs_verbs<vendored_residency_t::host_k> const docs_verbs_k;
 
     /** The verbs of this class's graph collections. */
-    static graph_verbs<home_t::host_k> const graph_verbs_k;
+    static graph_verbs<vendored_residency_t::host_k> const graph_verbs_k;
 
     /** The verbs of this class's pages collections. */
-    static pages_verbs<home_t::host_k> const pages_verbs_k;
+    static pages_verbs<vendored_residency_t::host_k> const pages_verbs_k;
 
     /** The table every handle the open of this class hands out is stamped with. */
     static engine_t const engine_k;
@@ -333,7 +333,7 @@ class device_compaction {
         gpu_device_t twin {};
         twin.vendor = caller ? cuda_executor_t::vendor_k : hip_executor_t::vendor_k;
         twin.vendor_ordinal = static_cast<std::uint32_t>(caller ? caller->device() : amd->device());
-        if (status_t const spawned = runtime.spawn(twin, caller ? caller->gpu_class() : amd->gpu_class(), nullptr,
+        if (status_t const spawned = runtime.spawn(twin, compactions.gpu_class, nullptr,
                                                    caller ? caller->scratch_limit() : amd->scratch_limit(),
                                                    caller ? caller->gds() : ustore_gds_compatibility_k, executor_);
             spawned.failed())
@@ -1731,6 +1731,7 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
             .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k),
             .engine = ustore_engine_nvme_k,
             .isolation = ustore_isolation_snapshot_k,
+            .cpu_class = static_cast<ustore_cpu_class_t>(cpu_class_),
             .keys = static_cast<ustore_size_t>(state.store->population_count()),
             .memory_bytes = static_cast<ustore_size_t>(state.resources->memory_constraint.used()),
             .disk_bytes = static_cast<ustore_size_t>(state.store->size_bytes()),

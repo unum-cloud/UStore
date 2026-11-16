@@ -33,7 +33,7 @@
 #include "ustore/utilities/vram_matching.cuh" // `matching_walkers_t`, `matching_found_t`
 
 #include "docs_layer.hpp"    // `field_of`, `reads_whole_documents`
-#include "engine.hpp"        // `engine_of`, `home_executor`
+#include "engine.hpp"        // `engine_of`, `residency_executor`
 #include "vram/matching.hpp" // `match_memory`, `rebase_on_device`, `shape_of`, `matching_frames_k`
 
 namespace unum::ustore {
@@ -131,7 +131,7 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
         status != sz_success_k)
         return stringzilla_refusal(status, status_code_t::invalid_argument_k,
                                    "The fields compile into no path the engine takes");
-    compiled_match<home_of_executors<executor_type_>> rebased;
+    compiled_match<vendored_residency_of<executor_type_>> rebased;
     rebased.matcher = engine_slot.data();
     if (status_t const status = rebase_on_device(rebased, executor); status.failed()) return status;
     sz_subdocuments_engine_t const* const on_device = std::get_if<sz_subdocuments_engine_t>(&rebased.on_device);
@@ -304,9 +304,10 @@ inline bool converts_on_device(ustore_docs_gather_t const& arguments) noexcept {
  *  and a text column's offsets and bytes two more, behind 64-bit offsets; the views naming them
  *  are uploaded last.
  */
-template <home_t home_>
+template <vendored_residency_t residency_>
 expected<device_answer_t> gather_documents_on_device(ustore_docs_gather_t const& arguments, strings_arg_t const& fields,
-                                                     view_t const& view, home_executor<home_>& executor) noexcept {
+                                                     view_t const& view,
+                                                     residency_executor<residency_>& executor) noexcept {
     if (!arguments.count || !arguments.fields_count) return device_answer_t::served_k;
     if (!arguments.columns) return status_t {status_code_t::invalid_argument_k, "Need an output for the columns"};
     if (!fields || !arguments.outputs_types)
@@ -402,9 +403,10 @@ expected<device_answer_t> gather_documents_on_device(ustore_docs_gather_t const&
  *
  *  A read of whole JSON documents only is left to the host verbs, which read them as stored.
  */
-template <home_t home_>
+template <vendored_residency_t residency_>
 expected<device_answer_t> read_documents_on_device(ustore_docs_read_t const& arguments, strings_arg_t const& fields,
-                                                   view_t const& view, home_executor<home_>& executor) noexcept {
+                                                   view_t const& view,
+                                                   residency_executor<residency_>& executor) noexcept {
     if (!arguments.count) return device_answer_t::served_k;
     if (reads_whole_documents(arguments, fields) || !executor.kernels() || arguments.count > no_cell_path_k)
         return device_answer_t::left_to_host_k;

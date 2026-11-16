@@ -87,8 +87,8 @@ expected<byte_t*> copy_for_device(void const* memory, std::size_t bytes, executo
  *  subdocuments engine's nested regex and a regex engine's column images, for the engines the
  *  kernels walk: byte-exact substrings, byte-exact regex with a start automaton and no lookarounds,
  *  and subdocuments paths without filters. */
-template <home_t home_>
-status_t rebase_on_device(compiled_match<home_>& match, home_executor<home_>& executor) noexcept {
+template <vendored_residency_t residency_>
+status_t rebase_on_device(compiled_match<residency_>& match, residency_executor<residency_>& executor) noexcept {
     if (sz_substrings_engine_t* const* const substrings = std::get_if<sz_substrings_engine_t*>(&match.matcher)) {
         if ((*substrings)->case_sensitivity != sz_cased_k) return {};
         auto [tables, tables_status] = copy_for_device((*substrings)->memory, (*substrings)->memory_bytes, executor);
@@ -133,13 +133,13 @@ status_t rebase_on_device(compiled_match<home_>& match, home_executor<home_>& ex
  *  the library's kernels walk, and the host half, the predicate and the BM25 scorer, all
  *  for @p host_capabilities, laid out in @p into, which must outlive the match. */
 template <typename arguments_type_, gpu_executor_concept executor_type_>
-expected<compiled_match<home_of_executors<executor_type_>>> compile_match(arguments_type_ const& arguments,
-                                                                          ustore_arena_t into,
-                                                                          sz_capability_t host_capabilities,
-                                                                          executor_type_& executor) noexcept {
+expected<compiled_match<vendored_residency_of<executor_type_>>> compile_match(arguments_type_ const& arguments,
+                                                                              ustore_arena_t into,
+                                                                              sz_capability_t host_capabilities,
+                                                                              executor_type_& executor) noexcept {
     if (reads_values(arguments) && !executor.kernels())
         return status_t {status_code_t::unsupported_k, "The device loaded no bundle of the library's kernels"};
-    compiled_match<home_of_executors<executor_type_>> match;
+    compiled_match<vendored_residency_of<executor_type_>> match;
     if (status_t const status = compile_values(arguments, into, host_capabilities, match_memory(executor),
                                                match.matcher);
         status.failed())
@@ -242,10 +242,10 @@ expected<std::span<matching_chunk_t>> chunks_of(offset_type_ const* offsets, std
  *  Every page lays out in the executor's bounce and in @p blocks, the call's device arena, both rewound per page, as
  *  every copy queued for the page before was waited for.
  */
-template <home_t home_>
+template <vendored_residency_t residency_>
 class device_match {
   public:
-    device_match(compiled_match<home_> const& match, home_executor<home_>& executor,
+    device_match(compiled_match<residency_> const& match, residency_executor<residency_>& executor,
                  utilities::device_blocks_t& blocks) noexcept
         : match_(match), executor_(executor), blocks_(blocks) {}
 
@@ -290,7 +290,7 @@ class device_match {
     }
 
   private:
-    using kits_t = utilities::vram_matching_kits<typename home_executor<home_>::function_t>;
+    using kits_t = utilities::vram_matching_kits<typename residency_executor<residency_>::function_t>;
 
     /** Packs the strings @p views name into one tape in @p work, then matches it as @c contains does. */
     status_t contains_packed(std::span<sz_string_view_t const> views, ustore_arena_t work,
@@ -502,8 +502,8 @@ class device_match {
         return {};
     }
 
-    compiled_match<home_> const& match_;
-    home_executor<home_>& executor_;
+    compiled_match<residency_> const& match_;
+    residency_executor<residency_>& executor_;
     utilities::device_blocks_t& blocks_;
 };
 
@@ -547,23 +547,25 @@ inline status_t settle(ustore_strings_view_t& strings, std::size_t count, ustore
 }
 
 /**
- *  @brief Serves the filtered scan @p arguments at @p home_ through the host verbs of @p engine, as @c scan_matched
- *      serves a host scan, with the values matched on the device and the outputs moved there once.
+ *  @brief Serves the filtered scan @p arguments at @p residency_ through the host verbs of
+ *      @p engine, as @c scan_matched serves a host scan, with the values matched on the device and
+ *      the outputs moved there once.
  *
  *  The trailing @p rest are the ragged inputs the router gathered, then the view and the executor, as the upload tower
  *  takes them.
  */
-template <home_t home_, typename arguments_type_, typename... rest_types_>
-status_t scan_matched_on_device(home_tables<home_t::host_k> const& engine, compiled_match<home_> const& match,
-                                arguments_type_ const& arguments, rest_types_&... rest) noexcept {
+template <vendored_residency_t residency_, typename arguments_type_, typename... rest_types_>
+status_t scan_matched_on_device(residency_tables<vendored_residency_t::host_k> const& engine,
+                                compiled_match<residency_> const& match, arguments_type_ const& arguments,
+                                rest_types_&... rest) noexcept {
     constexpr std::size_t ragged_count = sizeof...(rest_types_) - 2;
     std::tuple<rest_types_&...> const tail {rest...};
     view_t const& view = std::get<ragged_count>(tail);
-    home_executor<home_>& executor = std::get<ragged_count + 1>(tail);
+    residency_executor<residency_>& executor = std::get<ragged_count + 1>(tail);
     utilities::device_blocks_t* const blocks = utilities::device_blocks_of(arguments.arena, executor);
     if (!blocks) return {status_code_t::device_k, "The arena lives where another executor computes"};
 
-    device_match<home_> const matching {match, executor, *blocks};
+    device_match<residency_> const matching {match, executor, *blocks};
     arguments_type_ hosted = arguments;
     hosted.arena = executor.bounce();
     std::size_t const count = static_cast<std::size_t>(arguments.count);

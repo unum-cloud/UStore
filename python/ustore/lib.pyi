@@ -161,7 +161,7 @@ class CPUClass(IntEnum):
     """The CPU generation a database confines its waits, atomics and string kernels to, valued as
     `ustore_cpu_class_t`."""
 
-    AUTOMATIC = 0
+    UNKNOWN = 0
     SERIAL = 1
     MONOVERSIONED = 2
     INTEL_HASWELL = 3
@@ -777,7 +777,7 @@ class GPUDevice(structseq[Any], tuple[int, GPUVendor, int, GPUClass, int, int, s
         """The vendor's own name for the device."""
 
 @final
-class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, int, int, int, int, int]):
+class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, CPUClass, int, int, int, int, int]):
     """What an open database reports about itself, as `describe()` answers it, every size the engine's estimate."""
 
     @property
@@ -791,6 +791,10 @@ class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, int, in
     @property
     def isolation(self) -> Isolation:
         """How transactions see each other: what the RAM engine was opened with, and `SNAPSHOT` elsewhere."""
+
+    @property
+    def cpu_class(self) -> CPUClass:
+        """The class the engine's calls run as, picked at open; `UNKNOWN` for RocksDB and LevelDB."""
 
     @property
     def keys(self) -> int:
@@ -1594,7 +1598,7 @@ class Database(_Writes, _Receivers):
         *,
         isolation: Isolation = Isolation.STRICT_SERIALIZABLE,
         executor: Executor | None = None,
-        cpu_class: CPUClass = CPUClass.AUTOMATIC,
+        cpu_class: CPUClass = CPUClass.UNKNOWN,
     ) -> Self:
         """An in-memory database, persisted as one image when it names a directory, opened blocking on `executor`
         and confined to `cpu_class`."""
@@ -1632,7 +1636,7 @@ class Database(_Writes, _Receivers):
         executor: Executor | None = None,
         data_directories: Sequence[DataDirectory] = (),
         compactions: Executor | None = None,
-        cpu_class: CPUClass = CPUClass.AUTOMATIC,
+        cpu_class: CPUClass = CPUClass.UNKNOWN,
         memory_limit: int = 0,
         transaction_max_bytes: int = 0,
         transaction_max_deltas: int = 0,

@@ -2,13 +2,13 @@
  *  @file include/ustore/utilities/vram_scan.cuh
  *  @author Ash Vardanian
  *  @date October 31, 2026
- *  @brief The device steps a kernel scans with: a block-wide exclusive scan, and a chain that hands
- *      every block of a launch the total of the blocks before it, so one launch compacts what it
- *      flags without a second pass.
+ *  @brief The device steps a kernel scans with: what a block scan kit answers, and a chain that
+ *      hands every block of a launch the total of the blocks before it, so one launch compacts what
+ *      it flags without a second pass.
  *
- *  Every step synchronizes through block-shared memory, @c __syncthreads and device atomics
- *  alone, with no warp intrinsic, so one source compiles for 32-lane NVIDIA warps and 64-lane
- *  AMD wavefronts alike.
+ *  A kernel template takes its block scan as a kit, which its class's unit names: one per GPU
+ *  generation, in @c vram_nvidia_scan.cuh and @c vram_amd_scan.hip, each over StringZilla's block
+ *  scan of its generation's lane steps. The chain uses device atomics and no warp intrinsic.
  *
  *  A chain is one 64-bit slot the host zeroes before the launch. Blocks take tickets in the order
  *  they start, and each waits for the ticket before its own to chain its total, adds its own, and
@@ -78,27 +78,6 @@ struct block_scanned_t {
     std::uint64_t before = 0;
     std::uint64_t total = 0;
 };
-
-/** Scans @p value across a block of @p block_threads_ threads; every thread calls it, and it ends
- *  in a barrier. */
-template <unsigned block_threads_>
-__device__ block_scanned_t block_exclusive_scan(std::uint64_t value) noexcept {
-    __shared__ std::uint64_t scanned[block_threads_];
-    unsigned const thread = threadIdx.x;
-    scanned[thread] = value;
-    __syncthreads();
-    // An inclusive Hillis-Steele scan, whose every step reads before any thread of
-    // the block writes.
-    for (unsigned stride = 1; stride < block_threads_; stride *= 2) {
-        std::uint64_t const before = thread >= stride ? scanned[thread - stride] : 0;
-        __syncthreads();
-        scanned[thread] += before;
-        __syncthreads();
-    }
-    block_scanned_t const scan {scanned[thread] - value, scanned[block_threads_ - 1]};
-    __syncthreads();
-    return scan;
-}
 
 #endif
 

@@ -18,9 +18,10 @@
 #include "ustore/graph/adjacency_fold.hpp"             // `adjacency_fold_t`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
 #include "ustore/utilities/folds.hpp"                  // `last_write_fold_t`
-#include "ustore/utilities/vram_device.hpp"            // `kernel_tables`, `kernel_table`, `gpu_drivers_t`
+#include "ustore/utilities/vram_device.hpp"            // `kernel_table`, `gpu_drivers_t`
 
 #include "nvme/compaction_key_slots.hpp" // `inline_key_slot`, `fixed_width_key_slot`, `variable_width_key_slot`
+#include "vram/classes.hpp"              // `kernel_tables`
 
 namespace unum::ustore {
 
@@ -101,8 +102,9 @@ template st::status_t blobs::cuda_compactor_t::compact(
 
 } // namespace unum::ustore
 
+using namespace unum::ustore;
 using namespace unum::ustore::utilities;
 
-kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t const&, kernel_tables<cuda_module_t>&) noexcept {
+kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t&, kernel_tables<cuda_module_t>&) noexcept {
     return nullptr;
 }
