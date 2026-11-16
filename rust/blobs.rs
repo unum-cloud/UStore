@@ -25,8 +25,8 @@ use crate::db::ffi::{
 };
 use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
-    check, exported_slice, fail, Address, Arena, CollectionID, Collections, Deferring, Durability, Key, KeyRange,
-    Matched, Matching, On, Progress, ProgressCallback, Result, Rows, ScanMode, Status, Strings, Tape,
+    Address, Arena, CollectionID, Collections, Deferring, Durability, Key, KeyRange, Matching, On, Progress,
+    ProgressCallback, Result, Rows, ScanMode, Status, Strings, Tape, check, exported_slice, fail,
 };
 use crate::docs::Bitmap;
 
@@ -184,7 +184,7 @@ pub(crate) mod ffi {
         pub arena: ustore_arena_t,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn ustore_blobs_write(arguments: *mut ustore_blobs_write_t);
         pub fn ustore_blobs_remove(arguments: *mut ustore_blobs_remove_t);
         pub fn ustore_blobs_read(arguments: *mut ustore_blobs_read_t);
@@ -214,11 +214,7 @@ pub struct Entry<'value> {
 impl<'value> Entry<'value> {
     /// Pairs a key with the bytes to store under it.
     pub fn new(key: Key, value: &'value [u8]) -> Self {
-        Entry {
-            key,
-            value: value.into(),
-            marker: PhantomData,
-        }
+        Entry { key, value: value.into(), marker: PhantomData }
     }
 
     /// The key this entry stores under.
@@ -301,17 +297,12 @@ pub struct BlobsScanConfig<'config> {
     /// In what order the keys come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<&'config mut ProgressCallback<'config>>,
+    pub progress: Option<Box<ProgressCallback<'config>>>,
 }
 
 impl From<usize> for BlobsScanConfig<'_> {
     fn from(wanted: usize) -> Self {
-        BlobsScanConfig {
-            wanted,
-            matching: Matching::default(),
-            mode: ScanMode::Ordered,
-            progress: None,
-        }
+        BlobsScanConfig { wanted, matching: Matching::default(), mode: ScanMode::Ordered, progress: None }
     }
 }
 
@@ -368,16 +359,15 @@ impl<'arena> Values<'arena> {
         presences: Address<ustore_octet_t>,
         values: ustore_strings_view_t,
     ) -> Result<Self> {
-        if count == 0 {
-            return Ok(Values {
-                presences: Bitmap::new(&[], 0),
-                values: Strings::empty(),
-            });
+        unsafe {
+            if count == 0 {
+                return Ok(Values { presences: Bitmap::new(&[], 0), values: Strings::empty() });
+            }
+            Ok(Values {
+                presences: Bitmap::new(exported_slice(presences.0, count.div_ceil(8)), count),
+                values: Strings::exported(values, count)?,
+            })
         }
-        Ok(Values {
-            presences: Bitmap::new(exported_slice(presences.0, count.div_ceil(8)), count),
-            values: Strings::exported(values, count)?,
-        })
     }
 
     /// How many keys the read covered.
@@ -474,11 +464,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Entries>,
     {
-        let verb = Write {
-            collections: collections.into(),
-            entries,
-            durability,
-        };
+        let verb = Write { collections: collections.into(), entries, durability };
         Completion::answer(self, verb)
     }
 
@@ -494,11 +480,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
     {
-        let verb = Remove {
-            collections: collections.into(),
-            keys,
-            durability,
-        };
+        let verb = Remove { collections: collections.into(), keys, durability };
         Completion::answer(self, verb)
     }
 
@@ -510,11 +492,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
         range: Range<Key>,
         durability: Durability,
     ) -> Completion::Answer<RemoveRange> {
-        let verb = RemoveRange {
-            collection,
-            range,
-            durability,
-        };
+        let verb = RemoveRange { collection, range, durability };
         Completion::answer(self, verb)
     }
 }
@@ -596,21 +574,16 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         Completion: Accepts<BlobsScanConfig<'config>>,
     {
         let range = range.into();
-        let BlobsScanConfig {
-            wanted,
-            matching,
-            mode,
-            progress,
-        } = config.into();
+        let BlobsScanConfig { wanted, matching, mode, progress } = config.into();
         let verb = Scan {
             collection,
             start: range.start_key(),
             range,
             arena,
             wanted,
-            matched: Matched::new(matching),
+            matched: matching,
             mode,
-            progress: Progress::new(progress),
+            progress: Progress(progress),
             found: Found::default(),
             scores: Address::default(),
         };
@@ -626,12 +599,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         config: impl Into<BlobsSampleConfig>,
         arena: &'arena mut Arena,
     ) -> Completion::Answer<Sample<'arena>> {
-        let verb = Sample {
-            collection,
-            arena,
-            wanted: config.into().wanted,
-            found: Found::default(),
-        };
+        let verb = Sample { collection, arena, wanted: config.into().wanted, found: Found::default() };
         Completion::answer(self, verb)
     }
 
@@ -645,13 +613,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         arena: &'arena mut Arena,
     ) -> Completion::Answer<Measure<'arena>> {
         let range = range.into();
-        let verb = Measure {
-            collection,
-            start: range.start_key(),
-            range,
-            arena,
-            bounds: Default::default(),
-        };
+        let verb = Measure { collection, start: range.start_key(), range, arena, bounds: Default::default() };
         Completion::answer(self, verb)
     }
 }
@@ -678,7 +640,7 @@ impl<'view, Parent> On<'view, Parent> {
             handle: ptr::null_mut(),
             database: self.database(),
             executor: self.executor(),
-            matched: Box::new(Matched::new(config.into().matching)),
+            matched: Box::new(config.into().matching),
             marker: PhantomData,
         };
         let mut outcome = ustore_outcome_t::default();
@@ -692,8 +654,8 @@ impl<'view, Parent> On<'view, Parent> {
             start_key: range.start_key(),
             end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
             direction: range.direction,
-            patterns: cursor.matched.patterns(),
-            predicate: cursor.matched.predicate(),
+            patterns: cursor.matched.lowered_patterns(),
+            predicate: cursor.matched.lowered_predicate(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_blobs_cursor_init(&mut arguments) };
@@ -772,7 +734,7 @@ impl<Entries: Pairs> Calling for Write<'_, Entries> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_blobs_write(arguments)
+        unsafe { ffi::ustore_blobs_write(arguments) }
     }
 
     fn finish(self) -> Result<Entries> {
@@ -818,7 +780,7 @@ impl<Keys: AsRef<[Key]>> Calling for Remove<'_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_blobs_remove(arguments)
+        unsafe { ffi::ustore_blobs_remove(arguments) }
     }
 
     fn finish(self) -> Result<Keys> {
@@ -860,7 +822,7 @@ impl Calling for RemoveRange {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_blobs_remove(arguments)
+        unsafe { ffi::ustore_blobs_remove(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -919,7 +881,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for Read<'arena, '_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_blobs_read(arguments)
+        unsafe { ffi::ustore_blobs_read(arguments) }
     }
 
     fn finish(self) -> Result<Values<'arena>> {
@@ -942,9 +904,11 @@ impl Found {
     /// # Safety
     /// The call succeeded, exporting two offsets and the keys between them into an arena alive for `'arena`.
     pub(crate) unsafe fn keys<'arena>(&self) -> &'arena [Key] {
-        let offsets = exported_slice(self.offsets.0, 2);
-        let (begin, end) = (offsets[0] as usize, offsets[1] as usize);
-        exported_slice(self.keys.0.wrapping_add(begin), end - begin)
+        unsafe {
+            let offsets = exported_slice(self.offsets.0, 2);
+            let (begin, end) = (offsets[0] as usize, offsets[1] as usize);
+            exported_slice(self.keys.0.wrapping_add(begin), end - begin)
+        }
     }
 }
 
@@ -956,7 +920,7 @@ pub struct Scan<'arena, 'matching> {
     range: KeyRange,
     arena: &'arena mut Arena,
     wanted: usize,
-    matched: Matched<'matching>,
+    matched: Matching<'matching>,
     mode: ScanMode,
     progress: Progress<'matching>,
     found: Found,
@@ -995,8 +959,8 @@ impl<'arena> Calling for Scan<'arena, '_> {
             start_keys: ustore_strided_view_t::repeated(&self.start),
             end_keys: self.range.end_keys(),
             direction: self.range.direction,
-            patterns: self.matched.patterns(),
-            predicate: self.matched.predicate(),
+            patterns: self.matched.lowered_patterns(),
+            predicate: self.matched.lowered_predicate(),
             offsets: &mut self.found.offsets.0,
             keys: &mut self.found.keys.0,
             scores: match self.matched.scores() {
@@ -1012,12 +976,7 @@ impl<'arena> Calling for Scan<'arena, '_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_blobs_scan(arguments)
-    }
-
-    fn raise(&mut self) {
-        self.matched.raise();
-        self.progress.raise();
+        unsafe { ffi::ustore_blobs_scan(arguments) }
     }
 
     fn finish(self) -> Result<Scanned<'arena>> {
@@ -1025,10 +984,7 @@ impl<'arena> Calling for Scan<'arena, '_> {
         // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`.
         let keys = unsafe { self.found.keys() };
         // SAFETY: a scan with weighted patterns wrote one score per key into the same arena.
-        let scores = self
-            .matched
-            .scores()
-            .then(|| unsafe { exported_slice(self.scores.0, keys.len()) });
+        let scores = self.matched.scores().then(|| unsafe { exported_slice(self.scores.0, keys.len()) });
         Ok(Scanned { keys, scores })
     }
 }
@@ -1068,7 +1024,7 @@ impl<'arena> Calling for Sample<'arena> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_blobs_sample(arguments)
+        unsafe { ffi::ustore_blobs_sample(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
@@ -1098,8 +1054,14 @@ impl Calling for Measure<'_> {
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let [min_cardinalities, max_cardinalities, min_value_bytes, max_value_bytes, min_space_usages, max_space_usages] =
-            &mut self.bounds.0;
+        let [
+            min_cardinalities,
+            max_cardinalities,
+            min_value_bytes,
+            max_value_bytes,
+            min_space_usages,
+            max_space_usages,
+        ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_blobs_measure_t {
             database: view.database(),
             executor: view.executor(),
@@ -1122,7 +1084,7 @@ impl Calling for Measure<'_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_blobs_measure(arguments)
+        unsafe { ffi::ustore_blobs_measure(arguments) }
     }
 
     fn finish(self) -> Result<Measurement> {
@@ -1142,15 +1104,17 @@ impl Bounds {
     /// # Safety
     /// A measurement of one range succeeded, exporting every bound into an arena still alive.
     pub(crate) unsafe fn measurement(&self) -> Measurement {
-        let [min_cardinality, max_cardinality, min_value_bytes, max_value_bytes, min_space_usage, max_space_usage] =
-            self.0.each_ref().map(|bound| *bound.0);
-        Measurement {
-            min_cardinality: min_cardinality as usize,
-            max_cardinality: max_cardinality as usize,
-            min_value_bytes,
-            max_value_bytes,
-            min_space_usage,
-            max_space_usage,
+        unsafe {
+            let [min_cardinality, max_cardinality, min_value_bytes, max_value_bytes, min_space_usage, max_space_usage] =
+                self.0.each_ref().map(|bound| *bound.0);
+            Measurement {
+                min_cardinality: min_cardinality as usize,
+                max_cardinality: max_cardinality as usize,
+                min_value_bytes,
+                max_value_bytes,
+                min_space_usage,
+                max_space_usage,
+            }
         }
     }
 }
@@ -1172,7 +1136,7 @@ pub struct Cursor<'view> {
     handle: ffi::ustore_blobs_cursor_t,
     database: ustore_database_t,
     executor: ustore_executor_t,
-    matched: Box<Matched<'view>>,
+    matched: Box<Matching<'view>>,
     marker: PhantomData<&'view ()>,
 }
 
@@ -1222,7 +1186,6 @@ impl Cursor<'_> {
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_blobs_cursor_next(&mut arguments) };
-        self.matched.raise();
         check(outcome)?;
         arena.host()?;
         // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
@@ -1285,11 +1248,7 @@ mod tests {
     fn populated() -> (Database, CollectionID, Arena) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let blobs = created(&database, Modality::Blobs);
-        let entries = [
-            Entry::new(key(1), b"alpha"),
-            Entry::new(key(2), b"beta"),
-            Entry::new(key(3), b"gamma"),
-        ];
+        let entries = [Entry::new(key(1), b"alpha"), Entry::new(key(2), b"beta"), Entry::new(key(3), b"gamma")];
         database.head().write(blobs, &entries, Durability::Buffered).unwrap();
         (database, blobs, Arena::new().unwrap())
     }
@@ -1306,14 +1265,7 @@ mod tests {
         assert_eq!(values.len(), 3);
         assert!(!values.is_empty());
         let read: Vec<Option<&[u8]>> = values.iter().collect();
-        assert_eq!(
-            read,
-            vec![
-                Some(b"gamma".as_slice()),
-                Some(b"alpha".as_slice()),
-                Some(b"beta".as_slice())
-            ]
-        );
+        assert_eq!(read, vec![Some(b"gamma".as_slice()), Some(b"alpha".as_slice()), Some(b"beta".as_slice())]);
         // A key past the batch is absent rather than a panic.
         assert_eq!(values.get(3), None);
         // The rows also walk backwards, know their count, and serve a `for` loop over a borrow.
@@ -1355,10 +1307,7 @@ mod tests {
     #[test]
     fn removals_take_every_key_they_name() {
         let (database, blobs, mut arena) = populated();
-        database
-            .head()
-            .remove(blobs, keys([1, 3]), Durability::Buffered)
-            .unwrap();
+        database.head().remove(blobs, keys([1, 3]), Durability::Buffered).unwrap();
         let values = database.head().read(blobs, keys([1, 2, 3]), &mut arena).unwrap();
         assert_eq!(values.get(0), None);
         assert_eq!(values.get(1), Some(b"beta".as_slice()));
@@ -1372,32 +1321,19 @@ mod tests {
         let blobs = created(&database, Modality::Blobs);
         let written = database
             .head()
-            .write(
-                blobs,
-                (keys([1, 2, 3]), tape([b"alpha", b"", b"gamma"])),
-                Durability::Buffered,
-            )
+            .write(blobs, (keys([1, 2, 3]), tape([b"alpha", b"", b"gamma"])), Durability::Buffered)
             .unwrap();
         assert_eq!(written.1.len(), 3, "a write hands its inputs back");
         let narrow: BytesTape<u32> = [b"delta".as_slice()].into_iter().collect();
-        database
-            .head()
-            .write(blobs, (keys([4]), narrow), Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, (keys([4]), narrow), Durability::Buffered).unwrap();
 
         // A read whose bytes fit in 4 GiB answers a tape of 32-bit offsets.
         let values = database.head().read(blobs, keys([1, 2, 3, 4]), &mut arena).unwrap();
         let read: Vec<Option<&[u8]>> = values.iter().collect();
-        assert_eq!(
-            read,
-            [Some(b"alpha".as_slice()), Some(b""), Some(b"gamma"), Some(b"delta")]
-        );
+        assert_eq!(read, [Some(b"alpha".as_slice()), Some(b""), Some(b"gamma"), Some(b"delta")]);
         assert!(matches!(values.tape(), Tape::U32(tape) if tape.len() == 4));
 
-        let failure = database
-            .head()
-            .write(blobs, (keys([1, 2]), tape([b"alpha"])), Durability::Buffered)
-            .unwrap_err();
+        let failure = database.head().write(blobs, (keys([1, 2]), tape([b"alpha"])), Durability::Buffered).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
 
@@ -1412,29 +1348,17 @@ mod tests {
 
         // Writes and removals hand their inputs back, whichever way the call finishes.
         let pairs = blocking.write(blobs, pairs, Durability::Buffered).unwrap();
-        let (written, _) = deferred
-            .write(blobs, pairs, Durability::Buffered)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let (written, _) = deferred.write(blobs, pairs, Durability::Buffered).unwrap().wait().unwrap();
         assert_eq!(written, keys([1, 2, 3]));
         let removed = blocking.remove(blobs, keys([3]), Durability::Buffered).unwrap();
-        let removed = deferred
-            .remove(blobs, removed, Durability::Buffered)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let removed = deferred.remove(blobs, removed, Durability::Buffered).unwrap().wait().unwrap();
         assert_eq!(removed, keys([3]));
 
         // Reads borrow one arena on either view, and each call rewinds it for the next.
         let mut arena = Arena::new_in(&executor).unwrap();
         let read = blocking.read(blobs, keys([1, 3]), &mut arena).unwrap();
         assert_eq!(read.get(0), Some(b"alpha".as_slice()));
-        let read = deferred
-            .read(blobs, vec![key(2), key(3)], &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let read = deferred.read(blobs, vec![key(2), key(3)], &mut arena).unwrap().wait().unwrap();
         assert_eq!(read.get(0), Some(b"beta".as_slice()));
         assert_eq!(read.get(1), None);
 
@@ -1444,11 +1368,7 @@ mod tests {
         let sampled = deferred.sample(blobs, 10, &mut arena).unwrap().wait().unwrap();
         assert_eq!(sampled.len(), 2);
         assert_eq!(blocking.sample(blobs, 1, &mut arena).unwrap().len(), 1);
-        let measured = deferred
-            .measure(blobs, key(1)..key(3), &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let measured = deferred.measure(blobs, key(1)..key(3), &mut arena).unwrap().wait().unwrap();
         assert!(measured.max_cardinality >= measured.min_cardinality);
         let measured = blocking.measure(blobs, key(1)..key(3), &mut arena).unwrap();
         assert!(measured.max_value_bytes >= measured.min_value_bytes);
@@ -1503,21 +1423,10 @@ mod tests {
     #[test]
     fn scans_match_patterns_score_weights_and_ask_predicates() {
         let (database, blobs, mut arena) = populated();
-        let starting_with_a = Matching {
-            patterns: &["^a"],
-            ..Matching::default()
-        };
+        let starting_with_a = Matching { patterns: &["^a"], ..Matching::default() };
         let matched = database
             .head()
-            .scan(
-                blobs,
-                key(0),
-                BlobsScanConfig {
-                    matching: starting_with_a,
-                    ..BlobsScanConfig::from(8)
-                },
-                &mut arena,
-            )
+            .scan(blobs, key(0), BlobsScanConfig { matching: starting_with_a, ..BlobsScanConfig::from(8) }, &mut arena)
             .unwrap();
         assert_eq!(matched.keys, &keys([1]));
         assert!(matched.scores.is_none());
@@ -1530,70 +1439,36 @@ mod tests {
         };
         let scored = database
             .head()
-            .scan(
-                blobs,
-                key(0),
-                BlobsScanConfig {
-                    matching: weighted,
-                    ..BlobsScanConfig::from(8)
-                },
-                &mut arena,
-            )
+            .scan(blobs, key(0), BlobsScanConfig { matching: weighted, ..BlobsScanConfig::from(8) }, &mut arena)
             .unwrap();
         assert_eq!(scored.keys, &keys([1, 2, 3]));
         // "alpha" and "gamma" hold "a" twice, "beta" once, and no length normalization applies
         let expected = |count: f32| count * 2.2 / (count + 1.2);
-        assert_eq!(
-            scored.scores,
-            Some([expected(2.0), expected(1.0), expected(2.0)].as_slice())
-        );
+        assert_eq!(scored.scores, Some([expected(2.0), expected(1.0), expected(2.0)].as_slice()));
 
         let mut asked = 0;
         let mut only_the_second = |listed: &[Key], admissions: &mut [Admission]| {
             asked += 1;
             for (admission, listed) in admissions.iter_mut().zip(listed) {
-                *admission = if *listed == key(2) {
-                    Admission::Admit
-                } else {
-                    Admission::Reject
-                };
+                *admission = if *listed == key(2) { Admission::Admit } else { Admission::Reject };
             }
         };
         let predicated = Matching {
-            predicate: Some(&mut only_the_second),
+            predicate: Some(Box::new(&mut only_the_second)),
             predicate_cost: PredicateCost::Expensive,
             ..Matching::default()
         };
         let admitted = database
             .head()
-            .scan(
-                blobs,
-                key(0),
-                BlobsScanConfig {
-                    matching: predicated,
-                    ..BlobsScanConfig::from(2)
-                },
-                &mut arena,
-            )
+            .scan(blobs, key(0), BlobsScanConfig { matching: predicated, ..BlobsScanConfig::from(2) }, &mut arena)
             .unwrap();
         assert_eq!(admitted.keys, &keys([2]));
         assert_eq!(asked, 2);
 
-        let unbalanced = Matching {
-            patterns: &["("],
-            ..Matching::default()
-        };
+        let unbalanced = Matching { patterns: &["("], ..Matching::default() };
         let refused = database
             .head()
-            .scan(
-                blobs,
-                key(0),
-                BlobsScanConfig {
-                    matching: unbalanced,
-                    ..BlobsScanConfig::from(8)
-                },
-                &mut arena,
-            )
+            .scan(blobs, key(0), BlobsScanConfig { matching: unbalanced, ..BlobsScanConfig::from(8) }, &mut arena)
             .unwrap_err();
         assert_eq!(refused.status, Status::InvalidArgument);
     }
@@ -1609,19 +1484,10 @@ mod tests {
         assert_eq!(second_page, &keys([3]));
 
         // A walk starting past the last key finds nothing.
-        assert!(database
-            .head()
-            .scan(blobs, key(99), 2, &mut arena)
-            .unwrap()
-            .keys
-            .is_empty());
+        assert!(database.head().scan(blobs, key(99), 2, &mut arena).unwrap().keys.is_empty());
 
         // A descending walk starts at the largest key and stops before its end.
-        let descending = KeyRange {
-            start: None,
-            end: Some(key(1)),
-            direction: ScanDirection::Descending,
-        };
+        let descending = KeyRange { start: None, end: Some(key(1)), direction: ScanDirection::Descending };
         let found = database.head().scan(blobs, descending, 8, &mut arena).unwrap().keys;
         assert_eq!(found, &keys([3, 2]));
     }
@@ -1631,10 +1497,7 @@ mod tests {
         let (database, blobs, mut arena) = populated();
         let head = database.head();
         let sliced = head.read_slices(blobs, keys([1, 3]), 1..3, &mut arena).unwrap();
-        assert_eq!(
-            (sliced.get(0), sliced.get(1)),
-            (Some(b"lp".as_slice()), Some(b"am".as_slice()))
-        );
+        assert_eq!((sliced.get(0), sliced.get(1)), (Some(b"lp".as_slice()), Some(b"am".as_slice())));
         head.remove_range(blobs, key(1)..key(3), Durability::Buffered).unwrap();
         let left = head.scan(blobs, key(0), 8, &mut arena).unwrap().keys;
         assert_eq!(left, &keys([3]));
@@ -1674,10 +1537,7 @@ mod tests {
         let (database, blobs, mut arena) = populated();
         let executor = Executor::for_ram(&[], 1).unwrap();
         let snapshot = database.snapshot().unwrap();
-        let mut cursor = snapshot
-            .on(&executor)
-            .cursor(blobs, key(0), Matching::default())
-            .unwrap();
+        let mut cursor = snapshot.on(&executor).cursor(blobs, key(0), Matching::default()).unwrap();
         database.head().remove(blobs, keys([2]), Durability::Buffered).unwrap();
 
         let page = cursor.next_pairs(10, &mut arena).unwrap();
@@ -1692,10 +1552,7 @@ mod tests {
         let drawn = database.head().sample(blobs, 2, &mut arena).unwrap();
         assert_eq!(drawn.len(), 2);
         for drawn_key in drawn {
-            assert!(
-                (key(1)..=key(3)).contains(drawn_key),
-                "{drawn_key} is not one of the written keys"
-            );
+            assert!((key(1)..=key(3)).contains(drawn_key), "{drawn_key} is not one of the written keys");
         }
     }
 
@@ -1717,15 +1574,9 @@ mod tests {
 
         let entries = [Entry::new(key(1), b"Ada"), Entry::new(key(1), b"Kent")];
         let written = [people, places];
-        database
-            .head()
-            .write(written.as_slice(), &entries, Durability::Buffered)
-            .unwrap();
+        database.head().write(written.as_slice(), &entries, Durability::Buffered).unwrap();
 
-        let values = database
-            .head()
-            .read(Collections::Each(&written), keys([1, 1]), &mut arena)
-            .unwrap();
+        let values = database.head().read(Collections::Each(&written), keys([1, 1]), &mut arena).unwrap();
         assert_eq!(values.get(0), Some(b"Ada".as_slice()));
         assert_eq!(values.get(1), Some(b"Kent".as_slice()));
 
@@ -1733,14 +1584,8 @@ mod tests {
         let inside = database.head().read(people, keys([1]), &mut arena).unwrap();
         assert_eq!(inside.get(0), Some(b"Ada".as_slice()));
 
-        database
-            .head()
-            .remove(written.as_slice(), keys([1, 1]), Durability::Buffered)
-            .unwrap();
-        let removed = database
-            .head()
-            .read(Collections::Each(&written), keys([1, 1]), &mut arena)
-            .unwrap();
+        database.head().remove(written.as_slice(), keys([1, 1]), Durability::Buffered).unwrap();
+        let removed = database.head().read(Collections::Each(&written), keys([1, 1]), &mut arena).unwrap();
         assert_eq!((removed.get(0), removed.get(1)), (None, None));
     }
 
@@ -1748,17 +1593,11 @@ mod tests {
     fn a_batch_of_collections_matches_the_batch_of_tasks() {
         let (database, blobs, mut arena) = populated();
         let one = [blobs];
-        let failure = database
-            .head()
-            .read(Collections::Each(&one), keys([1, 2]), &mut arena)
-            .unwrap_err();
+        let failure = database.head().read(Collections::Each(&one), keys([1, 2]), &mut arena).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
 
         let entries = [Entry::new(key(1), b"alpha"), Entry::new(key(2), b"beta")];
-        let failure = database
-            .head()
-            .write(Collections::Each(&one), &entries, Durability::Buffered)
-            .unwrap_err();
+        let failure = database.head().write(Collections::Each(&one), &entries, Durability::Buffered).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
 
@@ -1766,15 +1605,10 @@ mod tests {
     fn an_unknown_collection_is_refused() {
         let (database, _, mut arena) = populated();
         // Every call resolves its collections first, so an identifier nobody created reaches nothing.
-        let failure = database
-            .head()
-            .read(CollectionID::from(4242u64), keys([1]), &mut arena)
-            .unwrap_err();
+        let failure = database.head().read(CollectionID::from(4242u64), keys([1]), &mut arena).unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
 
-        let failure = database
-            .collection_drop(CollectionID::from(4242u64), DropMode::Collection)
-            .unwrap_err();
+        let failure = database.collection_drop(CollectionID::from(4242u64), DropMode::Collection).unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
     }
 }

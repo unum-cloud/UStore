@@ -1,5 +1,9 @@
 //! A directory the suites open persistent databases in, removed when the test that took it ends, the one-thread
 //! executor their `async` blocks run on, and the collection each suite writes into.
+//!
+//! File: rust/testing.rs
+//! Author: Ash Vardanian
+//! Date: September 16, 2026
 
 use std::fs;
 use std::future::Future;
@@ -56,11 +60,7 @@ impl Drop for TemporaryDirectory {
 
 /// An empty directory named after the test that takes it, which no other process shares.
 pub fn temporary_directory(name: &str) -> TemporaryDirectory {
-    let path = format!(
-        "{}/target/rust_tests/{name}-{}",
-        env!("CARGO_MANIFEST_DIR"),
-        std::process::id()
-    );
+    let path = format!("{}/target/rust_tests/{name}-{}", env!("CARGO_MANIFEST_DIR"), std::process::id());
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).expect("the suite needs a directory to open a database in");
     TemporaryDirectory { path }

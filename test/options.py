@@ -1,4 +1,10 @@
-"""The options a verb takes as keywords, and the views of a transaction that keep or drop its watch."""
+"""The options a verb takes as keywords, the views of a transaction that keep or drop its watch, and the CPU class
+ceiling an open takes.
+
+File: test/options.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import pytest
 from capabilities import NEEDS_TRANSACTIONS
@@ -155,3 +161,25 @@ def test_modes_accept_plain_integers(database, blobs):
 
 
 # endregion Enums
+
+
+# region CPU Class Ceiling
+
+
+def test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick():
+    """A ceiling caps the class the database runs as: one the CPU lacks narrows the pick rather than refusing it."""
+    with ustore.Database.open_ram() as unbounded:
+        machine = unbounded.describe().cpu_class
+    if machine is ustore.CPUClass.MONOVERSIONED:
+        pytest.skip("a monoversioned build compiles no class under a foreign ceiling")
+    with ustore.Database.open_ram(cpu_class_ceiling=machine) as capped:
+        assert capped.describe().cpu_class is machine
+    # Power10 and AWS G5 share no architecture, so one of them is foreign to every machine
+    foreign = ustore.CPUClass.AWS_G5 if machine is ustore.CPUClass.IBM_POWER10 else ustore.CPUClass.IBM_POWER10
+    with ustore.Database.open_ram(cpu_class_ceiling=foreign) as narrowed:
+        assert narrowed.describe().cpu_class not in (foreign, ustore.CPUClass.UNKNOWN)
+    with pytest.raises(ValueError):
+        ustore.Database.open_ram(cpu_class_ceiling=7)
+
+
+# endregion CPU Class Ceiling

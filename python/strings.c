@@ -96,7 +96,7 @@ static int ustore_py_name_view_order(void const* first_pointer, void const* seco
 PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char const* after, size_t after_length,
                                      size_t limit, PyObject* arena) {
     PyObject* claimed = NULL;
-    if (ustore_py_arena_claim(arena, &claimed) != 0) return NULL;
+    if (ustore_py_arena_from_object(arena, &claimed) != 0) return NULL;
     ustore_strings_view_t names = {0};
     ustore_size_t count = 0;
     ustore_outcome_t outcome = {0};
@@ -112,14 +112,14 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
     Py_END_ALLOW_THREADS;
 
     if (ustore_py_raise_on_outcome(&outcome) != 0) {
-        ustore_py_arena_unclaim(claimed);
+        Py_DECREF(claimed);
         return NULL;
     }
 
     // An engine lists in an order of its own, so the named collections are gathered and sorted here
     ustore_py_name_view_t* const views = PyMem_New(ustore_py_name_view_t, count ? count : 1);
     if (!views) {
-        ustore_py_arena_unclaim(claimed);
+        Py_DECREF(claimed);
         return PyErr_NoMemory();
     }
     size_t named = 0;
@@ -151,7 +151,7 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
     }
 
     PyMem_Free(views);
-    ustore_py_arena_unclaim(claimed);
+    Py_DECREF(claimed);
     return listed;
 }
 
@@ -191,9 +191,6 @@ typedef struct strings_call_t {
 
     /** Output slot for the strings of a scan or a sample, inside the arena. */
     ustore_strings_view_t strings;
-
-    /** Output slots for the six bounds of a measurement, in the order of @c MeasurementType. */
-    ustore_size_t const* limits[6];
 } strings_call_t;
 
 static void strings_release(void* erased) {
@@ -273,14 +270,9 @@ static PyObject* strings_listing_answer(void* erased) {
 }
 
 static PyObject* strings_measure_answer(void* erased) {
-    strings_call_t const* const call = (strings_call_t const*)erased;
-    PyObject* bounds = PyStructSequence_New(MeasurementType);
-    for (Py_ssize_t index = 0; bounds && index != 6; ++index) {
-        PyObject* const value = PyLong_FromUnsignedLongLong(call->limits[index] ? call->limits[index][0] : 0);
-        if (!value) Py_CLEAR(bounds);
-        else PyStructSequence_SetItem(bounds, index, value);
-    }
-    return bounds;
+    Measurement* const bounds = (Measurement*)((ustore_py_call_t*)erased)->result;
+    ustore_py_measurement_settle(bounds);
+    return Py_NewRef((PyObject*)bounds);
 }
 
 static ustore_py_verb_t const strings_write_verb = {sizeof(strings_call_t), strings_write_submit,
@@ -425,7 +417,7 @@ PyObject* ustore_py_api_strings_read(PyObject* self, PyObject* const* arguments,
     strings_call_t* const call = ustore_py_call_open(&context, &strings_read_verb, &stack);
     if (!call) return NULL;
     if (ustore_py_texts_from_object(arguments[0], "strings", NULL, NULL, &call->texts) != 0 ||
-        ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &strings_read_verb, call);
     call->call.collection = options.collection;
     ustore_strings_read_t read = {
@@ -493,7 +485,7 @@ PyObject* ustore_py_api_strings_scan(PyObject* self, PyObject* const* arguments,
     if (strings_bound_from_object(prefix, "prefix", &call->held[0], &call->bounds[0]) != 0 ||
         strings_bound_from_object(keywords[0], "start", &call->held[1], &call->bounds[1]) != 0 ||
         strings_bound_from_object(keywords[1], "end", &call->held[2], &call->bounds[2]) != 0 ||
-        ustore_py_arena_claim(arguments[2], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[2], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &strings_scan_verb, call);
     call->call.collection = options.collection;
     ustore_strings_scan_t scan = {
@@ -545,7 +537,7 @@ PyObject* ustore_py_api_strings_sample(PyObject* self, PyObject* const* argument
     strings_call_t stack;
     strings_call_t* const call = ustore_py_call_open(&context, &strings_sample_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
+    if (ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &strings_sample_verb, call);
     call->call.collection = options.collection;
     ustore_strings_sample_t sample = {
@@ -606,9 +598,10 @@ PyObject* ustore_py_api_strings_measure(PyObject* self, PyObject* const* argumen
     if (!call) return NULL;
     PyObject* const start = arguments[0] == Py_None ? NULL : arguments[0];
     PyObject* const end = arguments[1] == Py_None ? NULL : arguments[1];
-    if (strings_bound_from_object(start, "start", &call->held[1], &call->bounds[1]) != 0 ||
+    Measurement* const bounds = (Measurement*)(call->call.result = ustore_py_report_new(&MeasurementType));
+    if (!bounds || strings_bound_from_object(start, "start", &call->held[1], &call->bounds[1]) != 0 ||
         strings_bound_from_object(end, "end", &call->held[2], &call->bounds[2]) != 0 ||
-        ustore_py_arena_claim(arguments[2], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[2], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &strings_measure_verb, call);
     call->call.collection = options.collection;
     ustore_strings_measure_t measure = {
@@ -622,12 +615,12 @@ PyObject* ustore_py_api_strings_measure(PyObject* self, PyObject* const* argumen
         .start_strings = strings_bound(call, 1),
         .end_strings = strings_bound(call, 2),
         .direction = (ustore_scan_direction_t)direction,
-        .min_cardinalities = &call->limits[0],
-        .max_cardinalities = &call->limits[1],
-        .min_value_bytes = &call->limits[2],
-        .max_value_bytes = &call->limits[3],
-        .min_space_usages = &call->limits[4],
-        .max_space_usages = &call->limits[5],
+        .min_cardinalities = &bounds->slots[0],
+        .max_cardinalities = &bounds->slots[1],
+        .min_value_bytes = &bounds->slots[2],
+        .max_value_bytes = &bounds->slots[3],
+        .min_space_usages = &bounds->slots[4],
+        .max_space_usages = &bounds->slots[5],
         .arena = ustore_py_arena_handle(call->call.arena),
     };
     return ustore_py_call_run(&context, &strings_measure_verb, call, &measure);

@@ -209,7 +209,7 @@ static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNU
 
 static char const doc_Database_open_ram[] =                                                  //
     "open_ram(directory=None, *, isolation=Isolation.STRICT_SERIALIZABLE, executor=None,\n"  //
-    "cpu_class=CPUClass.UNKNOWN) answers a database in memory.\n"                            //
+    "cpu_class_ceiling=CPUClass.UNKNOWN) answers a database in memory.\n"                    //
     "\n"                                                                                     //
     "Calls `ustore_database_open_ram` with a directory and `ustore_database_init_ram`\n"     //
     "without one.\n"                                                                         //
@@ -220,18 +220,21 @@ static char const doc_Database_open_ram[] =                                     
     "  isolation (Isolation): How transactions see each other.\n"                            //
     "  executor (Executor, optional): The executor the open blocks on, or None to open on\n" //
     "    the calling thread.\n"                                                              //
-    "  cpu_class (CPUClass): The CPU class the database confines its waits, atomics and\n"   //
-    "    string kernels to; UNKNOWN takes what the CPU offers.\n"                            //
+    "  cpu_class_ceiling (CPUClass): The newest CPU class the database may confine its\n"    //
+    "    waits, atomics and string kernels to, narrowed to what the CPU runs, so a class\n"  //
+    "    the CPU lacks is never refused; UNKNOWN sets none.\n"                               //
     "Returns:\n"                                                                             //
-    "  Database: The opened database.\n"                                                     //
+    "  Database: The opened database, whose describe() reports the class picked.\n"          //
     "Raises:\n"                                                                              //
-    "  UnsupportedError: The CPU does not run the `cpu_class`.";
+    "  ValueError: No CPU class takes the `cpu_class_ceiling`.\n"                            //
+    "  UnsupportedError: No class this build compiled fits under the `cpu_class_ceiling`\n"  //
+    "    on this CPU.";
 
 static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* arguments,
                                    Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     opening_t opening = {0};
     int isolation = ustore_isolation_strict_serializable_k;
-    int cpu_class = ustore_cpu_class_unknown_k;
+    int cpu_class_ceiling = ustore_cpu_class_unknown_k;
     Py_ssize_t const keyword_names_count = opening_positional(&opening, "open_ram", arguments,
                                                               positional_arguments_count, keyword_names_tuple);
     if (keyword_names_count < 0) goto failed;
@@ -243,8 +246,9 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         else if (PyUnicode_CompareWithASCIIString(name, "isolation") == 0)
             read = ustore_py_enum_from_object(value, "isolation", ustore_py_enum_isolation_k, &isolation);
         else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(&opening, value);
-        else if (PyUnicode_CompareWithASCIIString(name, "cpu_class") == 0)
-            read = ustore_py_enum_from_object(value, "cpu_class", ustore_py_enum_cpu_class_k, &cpu_class);
+        else if (PyUnicode_CompareWithASCIIString(name, "cpu_class_ceiling") == 0)
+            read = ustore_py_enum_from_object(value, "cpu_class_ceiling", ustore_py_enum_cpu_class_k,
+                                              &cpu_class_ceiling);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
     }
@@ -256,7 +260,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         .executor = opening.executor,
         .outcome = &outcome,
         .isolation = (ustore_isolation_t)isolation,
-        .cpu_class = (ustore_cpu_class_t)cpu_class,
+        .cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling,
     };
     ustore_database_open_ram_t open_ram = {
         .database = &handle,
@@ -264,7 +268,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         .outcome = &outcome,
         .directory = path_bytes(opening.directory),
         .isolation = (ustore_isolation_t)isolation,
-        .cpu_class = (ustore_cpu_class_t)cpu_class,
+        .cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling,
     };
     Py_BEGIN_ALLOW_THREADS;
     if (opening.directory) ustore_database_open_ram(&open_ram);
@@ -428,8 +432,8 @@ failed:
 }
 
 static char const doc_Database_open_nvme[] =                                                     //
-    "open_nvme(manifest, *, executor=None, cpu_class=CPUClass.UNKNOWN, **sizes) answers a\n"     //
-    "database on NVMe.\n"                                                                        //
+    "open_nvme(manifest, *, executor=None, cpu_class_ceiling=CPUClass.UNKNOWN, **sizes)\n"       //
+    "answers a database on NVMe.\n"                                                              //
     "\n"                                                                                         //
     "Every size keyword names a field of ustore_database_open_nvme_t, like memory_limit,\n"      //
     "transaction_max_bytes or collection_cache_limit, where zero keeps the engine's default.\n"  //
@@ -445,13 +449,14 @@ static char const doc_Database_open_nvme[] =                                    
     "    (path, max_bytes) pair, where zero bytes take the whole medium.\n"                      //
     "  compactions (Executor, optional): An executor of Executor.for_vram() whose device and\n"  //
     "    scratch limit every merge takes, read once here; None merges on host threads.\n"        //
-    "  cpu_class (CPUClass): The CPU class the database confines its waits, atomics and\n"       //
-    "    string kernels to; UNKNOWN takes what the CPU offers.\n"                                //
+    "  cpu_class_ceiling (CPUClass): The newest CPU class the database may confine its\n"        //
+    "    waits, atomics and string kernels to, narrowed to what the CPU runs, so a class\n"      //
+    "    the CPU lacks is never refused; UNKNOWN sets none.\n"                                   //
     "Returns:\n"                                                                                 //
     "  Database: The opened database.\n"                                                         //
     "Raises:\n"                                                                                  //
-    "  UnsupportedError: This build carries no NVMe engine, or the CPU does not run the\n"       //
-    "    `cpu_class`.\n"                                                                         //
+    "  UnsupportedError: This build carries no NVMe engine, or no class it compiled fits\n"      //
+    "    under the `cpu_class_ceiling` on this CPU.\n"                                           //
     "  DeviceError: The `compactions` executor was not made by Executor.for_vram().";
 
 static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* arguments,
@@ -478,10 +483,11 @@ static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* 
             read = opening_data_directories(&opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "compactions") == 0)
             read = executor_option(value, "compactions", &open_nvme.compactions);
-        else if (PyUnicode_CompareWithASCIIString(name, "cpu_class") == 0) {
-            int cpu_class = ustore_cpu_class_unknown_k;
-            read = ustore_py_enum_from_object(value, "cpu_class", ustore_py_enum_cpu_class_k, &cpu_class);
-            open_nvme.cpu_class = (ustore_cpu_class_t)cpu_class;
+        else if (PyUnicode_CompareWithASCIIString(name, "cpu_class_ceiling") == 0) {
+            int cpu_class_ceiling = ustore_cpu_class_unknown_k;
+            read = ustore_py_enum_from_object(value, "cpu_class_ceiling", ustore_py_enum_cpu_class_k,
+                                              &cpu_class_ceiling);
+            open_nvme.cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling;
         }
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
@@ -547,21 +553,11 @@ static PyObject* Database_repr(Database* self) {
     return PyUnicode_FromFormat("Database(at=%p)", (void*)self->handle);
 }
 
-/** A new @c Capabilities of what @p flags marks, or NULL with an exception set. */
-static PyObject* capabilities_object(ustore_capabilities_t flags) {
-    PyObject* const capabilities = PyStructSequence_New(CapabilitiesType);
-    if (!capabilities) return NULL;
-    ustore_capabilities_t const named[2] = {ustore_capabilities_transactions_k, ustore_capabilities_snapshots_k};
-    for (Py_ssize_t index = 0; index != 2; ++index)
-        PyStructSequence_SetItem(capabilities, index, PyBool_FromLong((flags & named[index]) != 0));
-    return capabilities;
-}
-
 static char const doc_Database_capabilities[] =
     "What the engine supports, as a Capabilities of `transactions` and `snapshots`.";
 
 static PyObject* Database_get_capabilities(Database* self, void* Py_UNUSED(closure)) {
-    return capabilities_object(self->capabilities);
+    return ustore_py_capabilities_to_object(self->capabilities);
 }
 
 /** Fills @p context for a verb of the database itself, refusing a view of a transaction or of a snapshot. */
@@ -633,20 +629,100 @@ static PyObject* Database_clear(PyObject* self, PyObject* mode_object) {
     return ustore_py_call_run(&context, &clear_verb, call, &clear);
 }
 
-static char const doc_Database_compact[] =                                                     //
-    "compact(*, progress=None) answers None.\n"                                                //
-    "\n"                                                                                       //
-    "Reclaims the space overwritten and removed data still takes, one collection at a time:\n" //
-    "RocksDB and LevelDB flush and compact their trees, and the RAM engine frees the\n"        //
-    "versions no reader needs and rewrites its image. Calls `ustore_database_compact`.\n"      //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  progress (Callable[[int, int], bool | None], optional): Called with the units\n"        //
-    "    compacted and the units in all, bytes where the engine measures them, as RocksDB\n"   //
-    "    does, and collections elsewhere. A falsy answer other than None stops between\n"      //
-    "    collections, keeping what was compacted.\n"                                           //
-    "Raises:\n"                                                                                //
-    "  CancelledError: The progress callable stopped the compaction.\n"                        //
+static char const doc_CompactPlan[] =                                                            //
+    "CompactPlan() answers a plan no call has opened yet.\n"                                     //
+    "\n"                                                                                         //
+    "A compaction in flight: its phase, the unit it reached, and the collections it opened\n"    //
+    "with. Passed as `plan=` to `compact`, the first call opens it and a stop leaves it live,\n" //
+    "so the next call naming it continues from the unit it stopped at, and\n"                    //
+    "`compact_plan_finish(plan)` frees it. Every call names the database and executor it was\n"  //
+    "opened through, and the database admits one live plan at a time. A plan dropped\n"          //
+    "unfinished leaks and keeps the database from opening another.\n"                            //
+    "\n"                                                                                         //
+    "Attributes:\n"                                                                              //
+    "  phase (Phase): Where the last call naming it stopped, `Phase.DONE` once it ended.\n"      //
+    "  ordinal (int): That phase's position among the ones the plan runs.\n"                     //
+    "  completed (int): Units of that phase done: collections, column families, passes or\n"     //
+    "    bytes, as the engine counts them.\n"                                                    //
+    "  total (int): Units of that phase in all.";
+
+static PyObject* CompactPlan_tp_new(PyTypeObject* type, PyObject* arguments, PyObject* keywords) {
+    if (PyTuple_GET_SIZE(arguments) != 0 || (keywords && PyDict_GET_SIZE(keywords) != 0)) {
+        PyErr_SetString(PyExc_TypeError, "CompactPlan() takes no arguments");
+        return NULL;
+    }
+    return type->tp_alloc(type, 0);
+}
+
+static PyObject* CompactPlan_get_phase(CompactPlan* self, void* Py_UNUSED(closure)) {
+    return ustore_py_enum_to_object(ustore_py_enum_phase_k, (int)self->progress.phase);
+}
+
+static PyGetSetDef CompactPlan_getset[] = {
+    {"phase", (getter)CompactPlan_get_phase, NULL, "Where the last call naming the plan stopped, as a Phase.", NULL},
+    {NULL, NULL, NULL, NULL, NULL},
+};
+
+static PyMemberDef CompactPlan_members[] = {
+    {"ordinal", Py_T_ULONGLONG, offsetof(CompactPlan, progress.ordinal), Py_READONLY,
+     "That phase's position among the ones the plan runs."},
+    {"completed", Py_T_ULONGLONG, offsetof(CompactPlan, progress.completed), Py_READONLY,
+     "Units of that phase done: collections, column families, passes or bytes, as the engine counts them."},
+    {"total", Py_T_ULONGLONG, offsetof(CompactPlan, progress.total), Py_READONLY, "Units of that phase in all."},
+    {NULL, 0, 0, 0, NULL},
+};
+
+static PyObject* CompactPlan_repr(CompactPlan* self) {
+    return PyUnicode_FromFormat("CompactPlan(phase=%s, completed=%llu, total=%llu)",
+                                ustore_phase_name(self->progress.phase), (unsigned long long)self->progress.completed,
+                                (unsigned long long)self->progress.total);
+}
+
+PyTypeObject CompactPlanType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.CompactPlan",
+    .tp_doc = doc_CompactPlan,
+    .tp_basicsize = sizeof(CompactPlan),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = CompactPlan_tp_new,
+    .tp_repr = (reprfunc)CompactPlan_repr,
+    .tp_members = CompactPlan_members,
+    .tp_getset = CompactPlan_getset,
+};
+
+/** Reads @p object, a @c CompactPlan or None, as the plan a call holds, refusing anything else. */
+static int compact_plan_from_object(PyObject* object, CompactPlan** plan) {
+    *plan = NULL;
+    if (!object || object == Py_None) return 0;
+    if (!PyObject_TypeCheck(object, &CompactPlanType)) {
+        PyErr_Format(PyExc_TypeError, "The 'plan' option takes a CompactPlan or None, got %S", Py_TYPE(object));
+        return -1;
+    }
+    *plan = (CompactPlan*)object;
+    return 0;
+}
+
+static char const doc_Database_compact[] =                                                        //
+    "compact(*, progress=None, plan=None) answers None.\n"                                        //
+    "\n"                                                                                          //
+    "Reclaims the space overwritten and removed data still takes, in phases: flush, merge one\n"  //
+    "unit at a time, then reclaim, each engine running the ones it has. RocksDB and LevelDB\n"    //
+    "flush and compact their trees, the NVMe engine flushes its memory runs and merges its\n"     //
+    "levels, and the RAM engine frees the versions no reader needs and rewrites its image.\n"     //
+    "With a `plan`, a stop leaves it live and the next call naming it continues from the unit\n"  //
+    "it stopped at; `compact_plan_finish(plan)` frees it. Calls `ustore_database_compact`.\n"     //
+    "\n"                                                                                          //
+    "Args:\n"                                                                                     //
+    "  progress (Callable[[int, int], bool | None], optional): Called with the units\n"           //
+    "    compacted and the units in all, bytes where the engine measures them, as RocksDB\n"      //
+    "    does, and units elsewhere. A falsy answer other than None, or a raise, which goes to\n"  //
+    "    `sys.unraisablehook`, stops between units, keeping what was compacted.\n"                //
+    "  plan (CompactPlan, optional): The compaction to open or continue, whose phase this call\n" //
+    "    writes; None runs it to its end.\n"                                                      //
+    "Raises:\n"                                                                                   //
+    "  CancelledError: The progress callable stopped the compaction; a plan stays live.\n"        //
+    "  ContendedError: Another live plan compacts the database.\n"                                //
+    "  InvalidArgumentError: The plan was opened on another database or executor.\n"              //
     "  ReadOnlyError: The database was opened read-only.";
 
 static void compact_submit(void* arguments) { ustore_database_compact((ustore_database_compact_t*)arguments); }
@@ -657,14 +733,27 @@ static ustore_py_verb_t const compact_verb = {sizeof(ustore_py_call_t), compact_
 static PyObject* Database_compact(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                   PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
+    if (database_context(self, "compact", &context) != 0) return NULL;
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked("compact", positional_arguments_count,
+                                                                                 keyword_names_tuple, 0);
+    if (keyword_names_count < 0) return NULL;
     PyObject* progress = NULL;
-    if (database_context(self, "compact", &context) != 0 ||
-        progress_keyword("compact", arguments, positional_arguments_count, keyword_names_tuple, 0, &progress) != 0)
-        return NULL;
+    CompactPlan* plan = NULL;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
+        int read = -1;
+        if (PyUnicode_CompareWithASCIIString(name, "progress") == 0)
+            read = ustore_py_progress_from_object(value, &progress);
+        else if (PyUnicode_CompareWithASCIIString(name, "plan") == 0) read = compact_plan_from_object(value, &plan);
+        else PyErr_Format(PyExc_TypeError, "compact() takes 'progress' and 'plan' as its keywords, not %S", name);
+        if (read != 0) return NULL;
+    }
     ustore_py_call_t stack;
     ustore_py_call_t* const call = ustore_py_call_open(&context, &compact_verb, &stack);
     if (!call) return NULL;
     call->progress = Py_XNewRef(progress);
+    call->result = Py_XNewRef((PyObject*)plan);
     ustore_database_compact_t compact = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
@@ -672,8 +761,53 @@ static PyObject* Database_compact(PyObject* self, PyObject* const* arguments, Py
         .completion = context.completion,
         .progress = ustore_py_progress_callback(call),
         .progress_state = call,
+        .plan = plan ? &plan->handle : NULL,
+        .phase = plan ? &plan->progress : NULL,
     };
     return ustore_py_call_run(&context, &compact_verb, call, &compact);
+}
+
+static char const doc_Database_compact_plan_finish[] =                                        //
+    "compact_plan_finish(plan) answers None.\n"                                               //
+    "\n"                                                                                      //
+    "Frees a CompactPlan on this database and the receiver's executor, the ones it was\n"     //
+    "opened with, whatever the call answers, so another compaction may open. A plan a stop\n" //
+    "left live keeps what it compacted. Calls `ustore_database_compact_plan_finish`.\n"       //
+    "\n"                                                                                      //
+    "Raises:\n"                                                                               //
+    "  InvalidArgumentError: The plan was never opened, is already finished, or was opened\n" //
+    "    on another database or executor; it is freed all the same.";
+
+static void compact_plan_finish_submit(void* arguments) {
+    ustore_database_compact_plan_finish((ustore_database_compact_plan_finish_t*)arguments);
+}
+
+static ustore_py_verb_t const compact_plan_finish_verb = {sizeof(ustore_py_call_t), compact_plan_finish_submit,
+                                                          ustore_py_call_answer_none, header_release};
+
+static PyObject* Database_compact_plan_finish(PyObject* self, PyObject* plan_object) {
+    ustore_py_context_t context;
+    CompactPlan* plan = NULL;
+    if (database_context(self, "compact_plan_finish", &context) != 0 ||
+        compact_plan_from_object(plan_object, &plan) != 0)
+        return NULL;
+    if (!plan) {
+        PyErr_SetString(PyExc_TypeError, "compact_plan_finish() takes a CompactPlan, got None");
+        return NULL;
+    }
+    ustore_py_call_t stack;
+    ustore_py_call_t* const call = ustore_py_call_open(&context, &compact_plan_finish_verb, &stack);
+    if (!call) return NULL;
+    ustore_database_compact_plan_finish_t finish = {
+        .database = context.database_handle,
+        .executor = ustore_py_context_executor(&context),
+        .outcome = &call->outcome,
+        .completion = context.completion,
+        .plan = plan->handle,
+    };
+    // The library frees the plan whatever it answers, so the slot lets go of it before the call.
+    plan->handle = NULL;
+    return ustore_py_call_run(&context, &compact_plan_finish_verb, call, &finish);
 }
 
 static char const doc_Database_flush[] =                                                    //
@@ -718,51 +852,28 @@ static char const doc_Database_describe[] =                                     
     "  Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,\n"  //
     "  `disk_bytes`, `pin_refused_bytes` and `crossing_requests` of the database.";
 
-/** A description of the database, which the library fills whole. */
-typedef struct describe_call_t {
-
-    /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
-
-    /** Output slot for the description. */
-    ustore_database_description_t description;
-} describe_call_t;
-
 static void describe_submit(void* arguments) { ustore_database_describe((ustore_database_describe_t*)arguments); }
 
-static PyObject* describe_answer(void* erased) {
-    ustore_database_description_t const* const description = &((describe_call_t const*)erased)->description;
-    PyObject* fields[9] = {capabilities_object(description->capabilities)};
-    fields[1] = fields[0] ? ustore_py_enum_to_object(ustore_py_enum_engine_k, (int)description->engine) : NULL;
-    fields[2] = fields[1] ? ustore_py_enum_to_object(ustore_py_enum_isolation_k, (int)description->isolation) : NULL;
-    fields[3] = fields[2] ? ustore_py_enum_to_object(ustore_py_enum_cpu_class_k, (int)description->cpu_class) : NULL;
-    fields[4] = fields[3] ? PyLong_FromUnsignedLongLong(description->keys) : NULL;
-    fields[5] = fields[4] ? PyLong_FromUnsignedLongLong(description->memory_bytes) : NULL;
-    fields[6] = fields[5] ? PyLong_FromUnsignedLongLong(description->disk_bytes) : NULL;
-    fields[7] = fields[6] ? PyLong_FromUnsignedLongLong(description->pin_refused_bytes) : NULL;
-    fields[8] = fields[7] ? PyLong_FromUnsignedLongLong(description->crossing_requests) : NULL;
-    PyObject* const described = fields[8] ? PyStructSequence_New(DescriptionType) : NULL;
-    for (Py_ssize_t index = 0; index != 9; ++index)
-        if (described) PyStructSequence_SetItem(described, index, fields[index]);
-        else Py_XDECREF(fields[index]);
-    return described;
-}
+/** Answers the @c Description the call wrote into. */
+static PyObject* report_answer(void* call) { return Py_NewRef(((ustore_py_call_t*)call)->result); }
 
-static ustore_py_verb_t const describe_verb = {sizeof(describe_call_t), describe_submit, describe_answer,
+static ustore_py_verb_t const describe_verb = {sizeof(ustore_py_call_t), describe_submit, report_answer,
                                                header_release};
 
 static PyObject* Database_describe(PyObject* self, PyObject* Py_UNUSED(ignored)) {
     ustore_py_context_t context;
     if (database_context(self, "describe", &context) != 0) return NULL;
-    describe_call_t stack;
-    describe_call_t* const call = ustore_py_call_open(&context, &describe_verb, &stack);
+    ustore_py_call_t stack;
+    ustore_py_call_t* const call = ustore_py_call_open(&context, &describe_verb, &stack);
     if (!call) return NULL;
+    Description* const description = (Description*)(call->result = ustore_py_report_new(&DescriptionType));
+    if (!description) return ustore_py_call_discard(&context, &describe_verb, call);
     ustore_database_describe_t describe = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->outcome,
         .completion = context.completion,
-        .description = &call->description,
+        .description = &description->description,
     };
     return ustore_py_call_run(&context, &describe_verb, call, &describe);
 }
@@ -913,7 +1024,7 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* argum
         return ustore_py_call_discard(&context, &find_verb, call);
     call->name = Py_NewRef(name_object);
     call->text.length = (ustore_size_t)length;
-    if (ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
+    if (ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &find_verb, call);
     ustore_collection_find_t find = {
         .database = context.database_handle,
@@ -1010,7 +1121,8 @@ static PyObject* Database_collection_list(PyObject* self, PyObject* arena) {
     list_call_t stack;
     list_call_t* const call = ustore_py_call_open(&context, &list_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_claim(arena, &call->call.arena) != 0) return ustore_py_call_discard(&context, &list_verb, call);
+    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0)
+        return ustore_py_call_discard(&context, &list_verb, call);
     ustore_collection_list_t list = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
@@ -1763,6 +1875,8 @@ static PyMethodDef Database_methods[] = {
     {"deferred", (PyCFunction)(void (*)(void))receiver_deferred, METH_O, doc_deferred},
     {"clear", (PyCFunction)(void (*)(void))Database_clear, METH_O, doc_Database_clear},
     {"compact", (PyCFunction)(void (*)(void))Database_compact, ustore_py_method_flags_k, doc_Database_compact},
+    {"compact_plan_finish", (PyCFunction)(void (*)(void))Database_compact_plan_finish, METH_O,
+     doc_Database_compact_plan_finish},
     {"flush", (PyCFunction)(void (*)(void))Database_flush, METH_NOARGS, doc_Database_flush},
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"cursor", (PyCFunction)(void (*)(void))ustore_py_api_cursor, ustore_py_method_flags_k, doc_cursor},
@@ -2104,6 +2218,8 @@ static PyMethodDef On_methods[] = {
     {"save", (PyCFunction)(void (*)(void))Snapshot_save, ustore_py_method_flags_k, doc_Snapshot_save},
     {"clear", (PyCFunction)(void (*)(void))Database_clear, METH_O, doc_Database_clear},
     {"compact", (PyCFunction)(void (*)(void))Database_compact, ustore_py_method_flags_k, doc_Database_compact},
+    {"compact_plan_finish", (PyCFunction)(void (*)(void))Database_compact_plan_finish, METH_O,
+     doc_Database_compact_plan_finish},
     {"flush", (PyCFunction)(void (*)(void))Database_flush, METH_NOARGS, doc_Database_flush},
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"cursor", (PyCFunction)(void (*)(void))ustore_py_api_cursor, ustore_py_method_flags_k, doc_cursor},
@@ -2221,6 +2337,8 @@ static PyMethodDef DeferredOn_methods[] = {
     {"save", (PyCFunction)(void (*)(void))Snapshot_save, ustore_py_method_flags_k, doc_Snapshot_save},
     {"clear", (PyCFunction)(void (*)(void))Database_clear, METH_O, doc_Database_clear},
     {"compact", (PyCFunction)(void (*)(void))Database_compact, ustore_py_method_flags_k, doc_Database_compact},
+    {"compact_plan_finish", (PyCFunction)(void (*)(void))Database_compact_plan_finish, METH_O,
+     doc_Database_compact_plan_finish},
     {"flush", (PyCFunction)(void (*)(void))Database_flush, METH_NOARGS, doc_Database_flush},
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"collection_find", (PyCFunction)(void (*)(void))Database_collection_find, METH_FASTCALL,

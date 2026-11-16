@@ -7,8 +7,8 @@
  *  A document read answers the same tape a binary read does, one run of bytes per task, while a
  *  gather answers typed columns whose scalars export in place and whose strings decode on access.
  *  Every verb fills a call the driver keeps on the stack or inside a @c Deferred, holding the
- *  strings and documents it borrows until the call finishes, and every read claims the arena it is
- *  given and answers results viewing it, or copies out of a one-off arena for the mapping views.
+ *  strings and documents it borrows until the call finishes, and every read writes into the arena
+ *  it is given and answers results viewing it, or copies out of a one-off arena for a mapping view.
  */
 #include "lib.h"
 
@@ -215,12 +215,13 @@ static int json_from_dict(PyObject* object, yyjson_mut_doc* document, yyjson_mut
         PyErr_NoMemory();
         return -1;
     }
+    // The pairs are copied out in one call, so another thread changing the dict cannot move them.
+    PyObject* const pairs = PyDict_Items(object);
+    if (!pairs) return -1;
     int failed = 0;
-    Py_ssize_t position = 0;
-    PyObject* name = NULL;
-    PyObject* member = NULL;
-    ustore_py_critical_section_begin_(object);
-    while (!failed && PyDict_Next(object, &position, &name, &member)) {
+    for (Py_ssize_t index = 0; !failed && index != PyList_GET_SIZE(pairs); ++index) {
+        PyObject* const pair = PyList_GET_ITEM(pairs, index);
+        PyObject* const name = PyTuple_GET_ITEM(pair, 0);
         if (!PyUnicode_Check(name)) {
             PyErr_Format(PyExc_TypeError, "A document's keys are strings, not %S", Py_TYPE(name));
             failed = 1;
@@ -229,15 +230,12 @@ static int json_from_dict(PyObject* object, yyjson_mut_doc* document, yyjson_mut
         Py_ssize_t length = 0;
         char const* const text = PyUnicode_AsUTF8AndSize(name, &length);
         yyjson_mut_val* const key = text ? yyjson_mut_strncpy(document, text, (size_t)length) : NULL;
-        // The member is held, since a nested critical section may let another thread change this dict.
-        PyObject* const held = Py_NewRef(member);
         yyjson_mut_val* item = NULL;
-        failed = !key || ustore_py_json_from_object(held, document, &item) != 0 ||
+        failed = !key || ustore_py_json_from_object(PyTuple_GET_ITEM(pair, 1), document, &item) != 0 ||
                  !yyjson_mut_obj_add(members, key, item);
-        Py_DECREF(held);
         if (failed && !PyErr_Occurred()) PyErr_NoMemory();
     }
-    ustore_py_critical_section_end_();
+    Py_DECREF(pairs);
     *value = members;
     return failed ? -1 : 0;
 }
@@ -249,16 +247,17 @@ static int json_from_sequence(PyObject* object, yyjson_mut_doc* document, yyjson
         PyErr_NoMemory();
         return -1;
     }
+    // A list is copied into a tuple in one call, so another thread changing it cannot move them.
+    PyObject* const fixed = PySequence_Tuple(object);
+    if (!fixed) return -1;
     int failed = 0;
-    ustore_py_critical_section_begin_(object);
-    for (Py_ssize_t index = 0; !failed && index < PySequence_Fast_GET_SIZE(object); ++index) {
-        PyObject* const held = Py_NewRef(PySequence_Fast_GET_ITEM(object, index));
+    for (Py_ssize_t index = 0; !failed && index != PyTuple_GET_SIZE(fixed); ++index) {
         yyjson_mut_val* item = NULL;
-        failed = ustore_py_json_from_object(held, document, &item) != 0 || !yyjson_mut_arr_append(items, item);
-        Py_DECREF(held);
+        failed = ustore_py_json_from_object(PyTuple_GET_ITEM(fixed, index), document, &item) != 0 ||
+                 !yyjson_mut_arr_append(items, item);
         if (failed && !PyErr_Occurred()) PyErr_NoMemory();
     }
-    ustore_py_critical_section_end_();
+    Py_DECREF(fixed);
     *value = items;
     return failed ? -1 : 0;
 }
@@ -760,7 +759,7 @@ ustore_py_verb_t const ustore_py_docs_read_drawn_verb = {sizeof(ustore_py_read_c
 PyObject* ustore_py_docs_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                               ustore_docs_field_type_t type, ustore_py_verb_t const* verb, ustore_py_read_call_t* call,
                               PyObject* arena) {
-    if (ustore_py_arena_claim(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, verb, call);
+    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, verb, call);
     call->call.collection = options->collection;
     call->field_view = cached_bytes(call->field);
     ustore_docs_read_t read = {
@@ -917,7 +916,7 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py
     gist_call_t* const call = ustore_py_call_open(&context, &gist_verb, &stack);
     if (!call) return NULL;
     if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
-        ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &gist_verb, call);
     call->call.collection = options.collection;
     ustore_docs_gist_t gist = {
@@ -1003,16 +1002,16 @@ PyObject* ustore_py_api_docs_measure(PyObject* self, PyObject* const* arguments,
 #pragma region Gathers
 
 /**
- *  @brief A new @c Columns over the columns a gather wrote into @p arena, which its call still claims.
+ *  @brief A new @c Columns over the columns a gather wrote into @p arena.
  *  @param[in] types The type of every field, copied into the result.
  *  @return A new reference, or NULL with an exception set.
  */
-static PyObject* columns_new(PyObject* arena, ustore_docs_column_view_t const* columns,
+static PyObject* columns_new(PyObject* arena, ustore_docs_column_view_t const* columns, PyObject* fields,
                              ustore_docs_field_type_t const* types, size_t fields_count, size_t docs_count) {
     Columns* const instance = PyObject_NewVar(Columns, &ColumnsType, (Py_ssize_t)fields_count);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
-    instance->generation = ustore_py_arena_generation(arena);
+    instance->fields = Py_NewRef(fields);
     instance->columns = columns;
     instance->fields_count = fields_count;
     instance->docs_count = docs_count;
@@ -1068,7 +1067,8 @@ static void gather_submit(void* arguments) { ustore_docs_gather((ustore_docs_gat
 
 static PyObject* gather_answer(void* erased) {
     gather_call_t const* const call = (gather_call_t const*)erased;
-    return columns_new(call->call.arena, call->columns, call->types, call->fields_count, call->keys.count);
+    return columns_new(call->call.arena, call->columns, call->fields_held, call->types, call->fields_count,
+                       call->keys.count);
 }
 
 static void gather_release(void* erased) {
@@ -1153,7 +1153,7 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, 
     Py_XDECREF(types_held);
 
     if (failed || ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
-        ustore_py_arena_claim(arguments[3], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[3], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &gather_verb, call);
     call->call.collection = options.collection;
     ustore_docs_gather_t gather = {
@@ -1187,11 +1187,11 @@ static char const doc_Columns[] =                                               
     "`FieldType.F16` column carries the 'e' format, which NumPy reads as float16 without a\n"  //
     "copy.\n"                                                                                  //
     "\n"                                                                                       //
-    "The bitmaps address documents least significant bit first, as Apache Arrow does. Every\n" //
-    "view pins the arena against the next call until it is released, and a read after a\n"     //
-    "later call rewound the arena raises `UninitializedError`.";
+    "The bitmaps address documents least significant bit first, as Apache Arrow does. Read\n"  //
+    "after a later call rewound the arena, a view reads whatever the arena then holds.";
 
 static void Columns_dealloc(Columns* self) {
+    Py_XDECREF(self->fields);
     Py_XDECREF(self->arena);
     PyObject_Free(self);
 }
@@ -1246,19 +1246,16 @@ static PyObject* Columns_item(Columns* self, Py_ssize_t field_index) {
         PyErr_SetString(PyExc_IndexError, "Field index out of range");
         return NULL;
     }
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     ustore_docs_column_view_t const* const column = columns_column(self, (size_t)field_index);
     ustore_docs_field_type_t const type = self->types[field_index];
     char const* const format = field_type_format(type);
     Py_ssize_t const shape[2] = {(Py_ssize_t)self->docs_count, uuid_bytes_k};
     PyObject* item = NULL;
     if (format)
-        item = ustore_py_span_view(self->arena, self->generation, column->scalars, format,
-                                   (Py_ssize_t)field_type_width(type), 1, shape);
+        item = ustore_py_span_view(self->arena, column->scalars, format, (Py_ssize_t)field_type_width(type), 1, shape);
     else if (type == ustore_docs_field_type_uuid_k)
-        item = ustore_py_span_view(self->arena, self->generation, column->scalars, "B", 1, 2, shape);
+        item = ustore_py_span_view(self->arena, column->scalars, "B", 1, 2, shape);
     else item = column_strings(column, type, self->docs_count);
-    ustore_py_arena_unpin(self->arena);
     return item;
 }
 
@@ -1273,12 +1270,10 @@ typedef enum column_bitmap_t {
 static PyObject* columns_bitmap(Columns* self, column_bitmap_t bitmap, PyObject* index_object) {
     size_t field_index = 0;
     if (columns_field_index(self, index_object, &field_index) != 0) return NULL;
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     ustore_docs_column_view_t const* const column = columns_column(self, field_index);
     ustore_octet_t const* const bitmaps[3] = {column->validities, column->conversions, column->collisions};
     Py_ssize_t const bytes = (Py_ssize_t)((self->docs_count + 7) / 8);
-    PyObject* const view = ustore_py_span_view(self->arena, self->generation, bitmaps[bitmap], "B", 1, 1, &bytes);
-    ustore_py_arena_unpin(self->arena);
+    PyObject* const view = ustore_py_span_view(self->arena, bitmaps[bitmap], "B", 1, 1, &bytes);
     return view;
 }
 
@@ -1329,7 +1324,175 @@ static PyObject* Columns_repr(Columns* self) {
     return PyUnicode_FromFormat("Columns(fields=%zu, rows=%zu)", self->fields_count, self->docs_count);
 }
 
+/** What a struct array of gathered columns holds until its consumer releases it: the @c Columns,
+ *  which keeps the arena and the field names alive, and the columns C exported into the arena. */
+typedef struct columns_export_t {
+
+    /** The @c Columns the export reads, held by a strong reference. */
+    Columns* owner;
+
+    /** Columns exported, the children of the struct array and of its schema. */
+    size_t count;
+
+    /** The struct array's one buffer, its validity, left NULL as every row is present. */
+    void const* buffers[1];
+
+    /** The child schemas, then the child arrays, then pointers to each, carved past the header. */
+    struct ArrowSchema* schemas;
+    struct ArrowArray* arrays;
+    struct ArrowSchema** schema_children;
+    struct ArrowArray** array_children;
+} columns_export_t;
+
+/** Allocates the header and the trailing children of an export of @p count columns. */
+static columns_export_t* columns_export_new(size_t count) {
+    size_t const bytes = sizeof(columns_export_t) + count * (sizeof(struct ArrowSchema) + sizeof(struct ArrowArray) +
+                                                             sizeof(struct ArrowSchema*) + sizeof(struct ArrowArray*));
+    columns_export_t* const exported = (columns_export_t*)PyMem_RawCalloc(1, bytes);
+    if (!exported) return NULL;
+    exported->count = count;
+    exported->schemas = (struct ArrowSchema*)(exported + 1);
+    exported->arrays = (struct ArrowArray*)(exported->schemas + count);
+    exported->schema_children = (struct ArrowSchema**)(exported->arrays + count);
+    exported->array_children = (struct ArrowArray**)(exported->schema_children + count);
+    return exported;
+}
+
+/** Releases every child the export still owns, then lets go of the @c Columns under the
+ *  interpreter, as a consumer may release from a thread of its own. */
+static void columns_export_free(columns_export_t* exported) {
+    for (size_t index = 0; index != exported->count; ++index) {
+        if (exported->arrays[index].release) exported->arrays[index].release(&exported->arrays[index]);
+        if (exported->schemas[index].release) exported->schemas[index].release(&exported->schemas[index]);
+    }
+    if (exported->owner) {
+        PyGILState_STATE const state = PyGILState_Ensure();
+        Py_DECREF(exported->owner);
+        PyGILState_Release(state);
+    }
+    PyMem_RawFree(exported);
+}
+
+/** The struct schema shares the export with the struct array, so only the array frees it. */
+static void columns_schema_release(struct ArrowSchema* schema) { schema->release = NULL; }
+
+static void columns_array_release(struct ArrowArray* array) {
+    columns_export_free((columns_export_t*)array->private_data);
+    array->release = NULL;
+}
+
+static void columns_schema_capsule_free(PyObject* capsule) {
+    struct ArrowSchema* const schema = (struct ArrowSchema*)PyCapsule_GetPointer(capsule, "arrow_schema");
+    if (schema->release) schema->release(schema);
+    PyMem_RawFree(schema);
+}
+
+static void columns_array_capsule_free(PyObject* capsule) {
+    struct ArrowArray* const array = (struct ArrowArray*)PyCapsule_GetPointer(capsule, "arrow_array");
+    if (array->release) array->release(array);
+    PyMem_RawFree(array);
+}
+
+/** Exports every column of @p self through @c ustore_docs_column_view_to_arrow into @p exported,
+ *  each named by its field, raising where C refuses one or leaves it on a device. */
+static int columns_export_children(Columns* self, columns_export_t* exported) {
+    ustore_arena_t const arena = ((Arena*)self->arena)->handle;
+    for (size_t index = 0; index != self->fields_count; ++index) {
+        struct ArrowDeviceArray column = {0};
+        ustore_status_t const status = ustore_docs_column_view_to_arrow(
+            columns_column(self, index), (ustore_size_t)self->docs_count, self->types[index], arena,
+            &exported->schemas[index], &column);
+        if (status != ustore_status_success_k) {
+            ustore_py_raise(status, "Failed to export a gathered column");
+            return -1;
+        }
+        exported->arrays[index] = column.array;
+        if (column.device_type != ARROW_DEVICE_CPU) {
+            PyErr_SetString(PyExc_ValueError, "A column the gather left on a device exports through C alone");
+            return -1;
+        }
+        exported->schemas[index].name = PyUnicode_AsUTF8(PyTuple_GET_ITEM(self->fields, (Py_ssize_t)index));
+        if (!exported->schemas[index].name) return -1;
+        exported->schema_children[index] = &exported->schemas[index];
+        exported->array_children[index] = &exported->arrays[index];
+    }
+    return 0;
+}
+
+static char const doc_Columns_arrow_c_array[] =                                            //
+    "__arrow_c_array__(requested_schema=None) answers the schema and array PyCapsules.\n"  //
+    "\n"                                                                                   //
+    "Exports the gather as an Arrow struct array with one child per field, named by the\n" //
+    "field, each exported in place by `ustore_docs_column_view_to_arrow` with the\n"       //
+    "validity of every row. The array keeps this object and its arena alive until Arrow\n" //
+    "releases it, and reads what the arena holds, so it is valid until the next call\n"    //
+    "naming the arena. A requested schema is ignored.";
+
+static PyObject* Columns_arrow_c_array(Columns* self, PyObject* const* Py_UNUSED(arguments),
+                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    int const named = keyword_names_count == 1 &&
+                      PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(keyword_names_tuple, 0), "requested_schema") ==
+                          0;
+    if (positional_arguments_count + keyword_names_count > 1 || (keyword_names_count && !named)) {
+        PyErr_SetString(PyExc_TypeError, "__arrow_c_array__() takes at most the 'requested_schema' argument");
+        return NULL;
+    }
+
+    struct ArrowSchema* const schema = (struct ArrowSchema*)PyMem_RawCalloc(1, sizeof(struct ArrowSchema));
+    struct ArrowArray* const array = (struct ArrowArray*)PyMem_RawCalloc(1, sizeof(struct ArrowArray));
+    columns_export_t* const exported = columns_export_new(self->fields_count);
+    if (!schema || !array || !exported) {
+        if (exported) columns_export_free(exported);
+        PyMem_RawFree(array);
+        PyMem_RawFree(schema);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    exported->owner = (Columns*)Py_NewRef((PyObject*)self);
+    if (columns_export_children(self, exported) != 0) {
+        columns_export_free(exported);
+        PyMem_RawFree(array);
+        PyMem_RawFree(schema);
+        return NULL;
+    }
+    *schema = (struct ArrowSchema) {.format = "+s",
+                                    .name = "",
+                                    .n_children = (int64_t)self->fields_count,
+                                    .children = exported->schema_children,
+                                    .release = columns_schema_release};
+    *array = (struct ArrowArray) {.length = (int64_t)self->docs_count,
+                                  .null_count = 0,
+                                  .n_buffers = 1,
+                                  .n_children = (int64_t)self->fields_count,
+                                  .buffers = exported->buffers,
+                                  .children = exported->array_children,
+                                  .release = columns_array_release,
+                                  .private_data = exported};
+
+    PyObject* const schema_capsule = PyCapsule_New(schema, "arrow_schema", columns_schema_capsule_free);
+    if (!schema_capsule) {
+        PyMem_RawFree(schema);
+        columns_array_release(array);
+        PyMem_RawFree(array);
+        return NULL;
+    }
+    PyObject* const array_capsule = PyCapsule_New(array, "arrow_array", columns_array_capsule_free);
+    if (!array_capsule) {
+        Py_DECREF(schema_capsule);
+        columns_array_release(array);
+        PyMem_RawFree(array);
+        return NULL;
+    }
+    PyObject* const capsules = PyTuple_Pack(2, schema_capsule, array_capsule);
+    Py_DECREF(schema_capsule);
+    Py_DECREF(array_capsule);
+    return capsules;
+}
+
 static PyMethodDef Columns_methods[] = {
+    {"__arrow_c_array__", (PyCFunction)(void (*)(void))Columns_arrow_c_array, ustore_py_method_flags_k,
+     doc_Columns_arrow_c_array},
     {"validities", (PyCFunction)(void (*)(void))Columns_validities, METH_O, doc_Columns_validities},
     {"conversions", (PyCFunction)(void (*)(void))Columns_conversions, METH_O, doc_Columns_conversions},
     {"collisions", (PyCFunction)(void (*)(void))Columns_collisions, METH_O, doc_Columns_collisions},

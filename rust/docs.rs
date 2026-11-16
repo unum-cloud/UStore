@@ -86,7 +86,7 @@ use std::str::FromStr;
 
 use stringtape::CharsTape;
 
-use crate::arrow::{ffi as arrow_ffi, ArrowDeviceArray, ArrowExport, ArrowSchema};
+use crate::arrow::{ArrowDeviceArray, ArrowExport, ArrowSchema, ffi as arrow_ffi};
 use crate::blobs::{Bounds, Found, Measurement, Page, Values};
 use crate::db::ffi::{
     ustore_arena_t, ustore_byte_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t,
@@ -97,9 +97,9 @@ use crate::db::ffi::{
 };
 use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
-    check, exported_slice, fail, host_arena, read_spelling, spelling, Address, Arena, CollectionID, Collections,
-    Deferring, Durability, Error, Key, KeyRange, Matched, Matching, On, Progress, ProgressCallback, Result, Rows,
-    ScanMode, Status, Strings, UUID,
+    Address, Arena, CollectionID, Collections, Deferring, Durability, Error, Key, KeyRange, Matching, On, Progress,
+    ProgressCallback, Result, Rows, ScanMode, Status, Strings, UUID, check, exported_slice, fail, host_arena,
+    read_spelling, spelling,
 };
 
 // region: Raw Declarations
@@ -301,7 +301,7 @@ pub(crate) mod ffi {
         pub arena: ustore_arena_t,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn ustore_docs_cursor_init(arguments: *mut ustore_docs_cursor_init_t);
         pub fn ustore_docs_cursor_next(arguments: *mut ustore_docs_cursor_next_t);
         pub fn ustore_docs_cursor_free(cursor: ustore_docs_cursor_t);
@@ -676,11 +676,7 @@ pub struct DocumentEntry<'value, Format: FieldFormat> {
 impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
     /// Pairs a key with the document to store under it.
     pub fn new(key: Key, value: &'value Format::Value) -> Self {
-        DocumentEntry {
-            key,
-            value: Format::bytes(value).into(),
-            marker: PhantomData,
-        }
+        DocumentEntry { key, value: Format::bytes(value).into(), marker: PhantomData }
     }
 
     /// The key this entry stores under.
@@ -701,10 +697,7 @@ pub struct Document<'text> {
 impl<'text> Document<'text> {
     /// Borrows the JSON text of a document.
     pub fn new(text: &'text str) -> Self {
-        Document {
-            text: text.as_bytes().into(),
-            marker: PhantomData,
-        }
+        Document { text: text.as_bytes().into(), marker: PhantomData }
     }
 }
 
@@ -733,12 +726,7 @@ pub struct FieldEntry<'value, Format: FieldFormat> {
 impl<'value, Format: FieldFormat> FieldEntry<'value, Format> {
     /// Pairs a field with the value to write into it.
     pub fn new(key: Key, field: &'value str, value: &'value Format::Value) -> Self {
-        FieldEntry {
-            key,
-            field: field.as_bytes().into(),
-            value: Format::bytes(value).into(),
-            marker: PhantomData,
-        }
+        FieldEntry { key, field: field.as_bytes().into(), value: Format::bytes(value).into(), marker: PhantomData }
     }
 }
 
@@ -754,11 +742,7 @@ pub struct FieldAddress<'field> {
 impl<'field> FieldAddress<'field> {
     /// Addresses `field` of the document under `key`.
     pub fn new(key: Key, field: &'field str) -> Self {
-        FieldAddress {
-            key,
-            field: field.as_bytes().into(),
-            marker: PhantomData,
-        }
+        FieldAddress { key, field: field.as_bytes().into(), marker: PhantomData }
     }
 }
 
@@ -772,10 +756,7 @@ pub struct Column<'field> {
 impl<'field> Column<'field> {
     /// Gathers `field`, a `&str` or an owned `String`, converted into `Format`.
     pub fn new<Format: ColumnFormat>(field: impl Into<Cow<'field, str>>) -> Self {
-        Column {
-            field: field.into(),
-            format: Format::TYPE,
-        }
+        Column { field: field.into(), format: Format::TYPE }
     }
 }
 
@@ -786,10 +767,12 @@ unsafe extern "C" fn column_fields(
     count: ustore_size_t,
     views: *mut ustore_bytes_view_t,
 ) {
-    let columns = handle.cast::<Column<'static>>();
-    for slot in 0..count as usize {
-        let column = &*columns.add(*indices.add(slot) as usize);
-        *views.add(slot) = column.field.as_bytes().into();
+    unsafe {
+        let columns = handle.cast::<Column<'static>>();
+        for slot in 0..count as usize {
+            let column = &*columns.add(*indices.add(slot) as usize);
+            *views.add(slot) = column.field.as_bytes().into();
+        }
     }
 }
 
@@ -913,11 +896,7 @@ impl<Keys: AsRef<[Key]>, PathsOffset: TapeOffset, ValuesOffset: TapeOffset> Writ
 
 /// The tasks reading the whole documents under `keys`.
 fn whole_documents(keys: &[Key]) -> ReadTasks {
-    ReadTasks {
-        count: keys.len(),
-        keys: ustore_strided_view_t::packed(keys),
-        fields: ustore_strings_view_t::default(),
-    }
+    ReadTasks { count: keys.len(), keys: ustore_strided_view_t::packed(keys), fields: ustore_strings_view_t::default() }
 }
 
 impl Addresses for &[Key] {
@@ -990,17 +969,12 @@ pub struct DocsScanConfig<'config> {
     /// In what order the keys come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<&'config mut ProgressCallback<'config>>,
+    pub progress: Option<Box<ProgressCallback<'config>>>,
 }
 
 impl From<usize> for DocsScanConfig<'_> {
     fn from(wanted: usize) -> Self {
-        DocsScanConfig {
-            wanted,
-            matching: Matching::default(),
-            mode: ScanMode::Ordered,
-            progress: None,
-        }
+        DocsScanConfig { wanted, matching: Matching::default(), mode: ScanMode::Ordered, progress: None }
     }
 }
 
@@ -1061,12 +1035,14 @@ impl<'arena> Paths<'arena> {
     /// # Safety
     /// A successful gist exported `count` paths as the tape `fields`, which stays alive for `'arena`.
     unsafe fn exported(count: ustore_size_t, fields: ustore_strings_view_t) -> Result<Self> {
-        let paths = Strings::exported(fields, count as usize)?;
-        for index in 0..paths.len() {
-            let path = paths.get(index).unwrap_or_default();
-            std::str::from_utf8(path).map_err(|_| fail(Status::Malformed, "a path is not UTF-8"))?;
+        unsafe {
+            let paths = Strings::exported(fields, count as usize)?;
+            for index in 0..paths.len() {
+                let path = paths.get(index).unwrap_or_default();
+                std::str::from_utf8(path).map_err(|_| fail(Status::Malformed, "a path is not UTF-8"))?;
+            }
+            Ok(Paths { paths })
         }
-        Ok(Paths { paths })
     }
 
     /// How many unique paths the gist found.
@@ -1082,13 +1058,11 @@ impl<'arena> Paths<'arena> {
     /// The JSON Pointer at `index`, ready to address a field, or `None` past the end.
     pub fn get(&self, index: usize) -> Option<&'arena str> {
         // SAFETY: every path was checked for UTF-8 when the gist returned.
-        self.paths
-            .get(index)
-            .map(|path| unsafe { std::str::from_utf8_unchecked(path) })
+        self.paths.get(index).map(|path| unsafe { std::str::from_utf8_unchecked(path) })
     }
 
     /// Every path in the order the gist found it.
-    pub fn iter(&self) -> impl Iterator<Item = &'arena str> + 'arena {
+    pub fn iter(&self) -> impl Iterator<Item = &'arena str> + 'arena + use<'arena> {
         let paths = *self;
         (0..paths.len()).filter_map(move |index| paths.get(index))
     }
@@ -1243,20 +1217,14 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
             Binary::TYPE => 0,
             _ => return Err(fail(Status::InvalidArgument, "the column was not gathered as strings")),
         };
-        let validities = self
-            .bitmap(column, |view| view.validities)?
-            .unwrap_or(Bitmap { bytes: &[], count: 0 });
+        let validities = self.bitmap(column, |view| view.validities)?.unwrap_or(Bitmap { bytes: &[], count: 0 });
         let strings = match self.views.get(column) {
             // SAFETY: a successful gather exports the strings of every row of a string column as a tape in the arena,
             // which stays borrowed.
             Some(view) => unsafe { Strings::exported(view.strings, self.rows)? },
             None => Strings::empty(),
         };
-        Ok(StringColumn {
-            validities,
-            strings,
-            terminator,
-        })
+        Ok(StringColumn { validities, strings, terminator })
     }
 
     /// Every column as one Arrow array beside its schema, in request order, or none for a gather
@@ -1302,15 +1270,8 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
                     &mut array,
                 )
             };
-            check(ustore_outcome_t {
-                status,
-                message: c"failed to export a gathered column".as_ptr(),
-            })?;
-            exported.push(ArrowExport {
-                schema,
-                array,
-                marker: PhantomData,
-            });
+            check(ustore_outcome_t { status, message: c"failed to export a gathered column".as_ptr() })?;
+            exported.push(ArrowExport { schema, array, marker: PhantomData });
         }
         Ok(exported)
     }
@@ -1341,10 +1302,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
             }
             None => &[],
         };
-        Ok(Some(Bitmap {
-            bytes,
-            count: self.rows,
-        }))
+        Ok(Some(Bitmap { bytes, count: self.rows }))
     }
 }
 
@@ -1377,12 +1335,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Documents>,
     {
-        let verb = DocsWrite {
-            collections: collections.into(),
-            documents,
-            modification,
-            durability,
-        };
+        let verb = DocsWrite { collections: collections.into(), documents, modification, durability };
         Completion::answer(self, verb)
     }
 
@@ -1398,11 +1351,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
     {
-        let verb = DocsRemove {
-            collections: collections.into(),
-            keys,
-            durability,
-        };
+        let verb = DocsRemove { collections: collections.into(), keys, durability };
         Completion::answer(self, verb)
     }
 
@@ -1414,11 +1363,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
         range: Range<Key>,
         durability: Durability,
     ) -> Completion::Answer<DocsRemoveRange> {
-        let verb = DocsRemoveRange {
-            collection,
-            range,
-            durability,
-        };
+        let verb = DocsRemoveRange { collection, range, durability };
         Completion::answer(self, verb)
     }
 }
@@ -1439,21 +1384,16 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         Completion: Accepts<DocsScanConfig<'config>>,
     {
         let range = range.into();
-        let DocsScanConfig {
-            wanted,
-            matching,
-            mode,
-            progress,
-        } = config.into();
+        let DocsScanConfig { wanted, matching, mode, progress } = config.into();
         let verb = DocsScan {
             collection,
             start: range.start_key(),
             range,
             arena,
             wanted,
-            matched: Matched::new(matching),
+            matched: matching,
             mode,
-            progress: Progress::new(progress),
+            progress: Progress(progress),
             found: Found::default(),
         };
         Completion::answer(self, verb)
@@ -1466,12 +1406,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         config: impl Into<DocsSampleConfig>,
         arena: &'arena mut Arena,
     ) -> Completion::Answer<DocsSample<'arena>> {
-        let verb = DocsSample {
-            collection,
-            arena,
-            wanted: config.into().wanted,
-            found: Found::default(),
-        };
+        let verb = DocsSample { collection, arena, wanted: config.into().wanted, found: Found::default() };
         Completion::answer(self, verb)
     }
 
@@ -1484,13 +1419,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         arena: &'arena mut Arena,
     ) -> Completion::Answer<DocsMeasure<'arena>> {
         let range = range.into();
-        let verb = DocsMeasure {
-            collection,
-            start: range.start_key(),
-            range,
-            arena,
-            bounds: Bounds::default(),
-        };
+        let verb = DocsMeasure { collection, start: range.start_key(), range, arena, bounds: Bounds::default() };
         Completion::answer(self, verb)
     }
 
@@ -1617,7 +1546,7 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_write(arguments)
+        unsafe { ffi::ustore_docs_write(arguments) }
     }
 
     fn finish(self) -> Result<Documents> {
@@ -1663,7 +1592,7 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_remove(arguments)
+        unsafe { ffi::ustore_docs_remove(arguments) }
     }
 
     fn finish(self) -> Result<Keys> {
@@ -1705,7 +1634,7 @@ impl Calling for DocsRemoveRange {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_remove(arguments)
+        unsafe { ffi::ustore_docs_remove(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -1721,7 +1650,7 @@ pub struct DocsScan<'arena, 'matching> {
     range: KeyRange,
     arena: &'arena mut Arena,
     wanted: usize,
-    matched: Matched<'matching>,
+    matched: Matching<'matching>,
     mode: ScanMode,
     progress: Progress<'matching>,
     found: Found,
@@ -1749,8 +1678,8 @@ impl<'arena> Calling for DocsScan<'arena, '_> {
             start_keys: ustore_strided_view_t::repeated(&self.start),
             end_keys: self.range.end_keys(),
             direction: self.range.direction,
-            filter: self.matched.filter(),
-            predicate: self.matched.predicate(),
+            filter: self.matched.lowered_filter(),
+            predicate: self.matched.lowered_predicate(),
             offsets: &mut self.found.offsets.0,
             keys: &mut self.found.keys.0,
             arena: self.arena.handle,
@@ -1762,12 +1691,7 @@ impl<'arena> Calling for DocsScan<'arena, '_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_scan(arguments)
-    }
-
-    fn raise(&mut self) {
-        self.matched.raise();
-        self.progress.raise();
+        unsafe { ffi::ustore_docs_scan(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
@@ -1812,7 +1736,7 @@ impl<'arena> Calling for DocsSample<'arena> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_sample(arguments)
+        unsafe { ffi::ustore_docs_sample(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
@@ -1842,8 +1766,14 @@ impl Calling for DocsMeasure<'_> {
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let [min_cardinalities, max_cardinalities, min_value_bytes, max_value_bytes, min_space_usages, max_space_usages] =
-            &mut self.bounds.0;
+        let [
+            min_cardinalities,
+            max_cardinalities,
+            min_value_bytes,
+            max_value_bytes,
+            min_space_usages,
+            max_space_usages,
+        ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_docs_measure_t {
             database: view.database(),
             executor: view.executor(),
@@ -1866,7 +1796,7 @@ impl Calling for DocsMeasure<'_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_measure(arguments)
+        unsafe { ffi::ustore_docs_measure(arguments) }
     }
 
     fn finish(self) -> Result<Measurement> {
@@ -1924,7 +1854,7 @@ impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_read(arguments)
+        unsafe { ffi::ustore_docs_read(arguments) }
     }
 
     fn finish(self) -> Result<Values<'arena>> {
@@ -1971,7 +1901,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for DocsGist<'arena, '_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_gist(arguments)
+        unsafe { ffi::ustore_docs_gist(arguments) }
     }
 
     fn finish(self) -> Result<Paths<'arena>> {
@@ -2032,7 +1962,7 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_docs_gather(arguments)
+        unsafe { ffi::ustore_docs_gather(arguments) }
     }
 
     fn finish(self) -> Result<Columns<'arena, Requested>> {
@@ -2040,12 +1970,7 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
         // SAFETY: the gather succeeded into the arena, which stays borrowed for `'arena`, or reached no engine and left
         // the views null.
         let views = unsafe { exported_slice(self.views.0, fields) };
-        Ok(Columns {
-            rows: self.keys.as_ref().len(),
-            arena: self.arena.handle,
-            requested: self.columns,
-            views,
-        })
+        Ok(Columns { rows: self.keys.as_ref().len(), arena: self.arena.handle, requested: self.columns, views })
     }
 }
 
@@ -2069,32 +1994,21 @@ mod tests {
         let docs = created(&database, Modality::Docs);
         let documents = [
             DocumentEntry::<Json>::new(key(1), r#"{"name":"Ada","born":1815,"languages":["English","French"]}"#),
-            DocumentEntry::<Json>::new(
-                key(2),
-                r#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#,
-            ),
+            DocumentEntry::<Json>::new(key(2), r#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#),
         ];
-        database
-            .head()
-            .docs_write(docs, &documents, Modification::Upsert, Durability::Buffered)
-            .unwrap();
+        database.head().docs_write(docs, &documents, Modification::Upsert, Durability::Buffered).unwrap();
         (database, docs, Arena::new().unwrap())
     }
 
     #[test]
     fn filters_narrow_documents_cursors() {
         let (database, docs, mut arena) = populated();
-        let graces = Matching {
-            filter: Some(r#"?@.name == "Grace""#),
-            ..Matching::default()
-        };
+        let graces = Matching { filter: Some(r#"?@.name == "Grace""#), ..Matching::default() };
         let head = database.head();
         let mut cursor = head.docs_cursor(docs, key(0), graces).unwrap();
         let page = cursor.next_pairs(8, &mut arena).unwrap();
         assert_eq!(page.keys(), &keys([2]));
-        assert!(std::str::from_utf8(page.get(0).unwrap())
-            .unwrap()
-            .contains("Rear Admiral"));
+        assert!(std::str::from_utf8(page.get(0).unwrap()).unwrap().contains("Rear Admiral"));
         assert!(cursor.next(8, &mut arena).unwrap().is_empty());
     }
 
@@ -2105,27 +2019,15 @@ mod tests {
         assert_eq!(head.docs_sample(docs, 8, &mut arena).unwrap().len(), 2);
         let scanned = head.docs_scan(docs, key(0), 8, &mut arena).unwrap();
         assert_eq!(scanned, &keys([1, 2]));
-        let graces = Matching {
-            filter: Some(r#"?@.name == "Grace""#),
-            ..Matching::default()
-        };
+        let graces = Matching { filter: Some(r#"?@.name == "Grace""#), ..Matching::default() };
         assert_eq!(
-            head.docs_scan(
-                docs,
-                key(0),
-                DocsScanConfig {
-                    matching: graces,
-                    ..DocsScanConfig::from(8)
-                },
-                &mut arena
-            )
-            .unwrap(),
+            head.docs_scan(docs, key(0), DocsScanConfig { matching: graces, ..DocsScanConfig::from(8) }, &mut arena)
+                .unwrap(),
             &keys([2])
         );
         let measured = head.docs_measure(docs, key(1)..key(2), &mut arena).unwrap();
         assert!(measured.min_cardinality <= 1 && measured.max_cardinality >= measured.min_cardinality);
-        head.docs_remove_range(docs, key(1)..key(2), Durability::Buffered)
-            .unwrap();
+        head.docs_remove_range(docs, key(1)..key(2), Durability::Buffered).unwrap();
         let mut cursor = head.docs_cursor(docs, key(0), Matching::default()).unwrap();
         assert_eq!(cursor.next(8, &mut arena).unwrap(), &keys([2]));
     }
@@ -2139,20 +2041,14 @@ mod tests {
     fn whole_documents_read_back_as_written() {
         let (database, docs, mut arena) = populated();
         let grace = r#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#;
-        let documents = database
-            .head()
-            .docs_read(docs, keys([2, 1, 3]), Json, &mut arena)
-            .unwrap();
+        let documents = database.head().docs_read(docs, keys([2, 1, 3]), Json, &mut arena).unwrap();
         assert_eq!(documents.len(), 3);
         assert_eq!(text(&documents, 0), Some(grace));
         assert!(text(&documents, 1).unwrap().starts_with(r#"{"name":"Ada""#));
         assert_eq!(documents.get(2), None, "a key nobody wrote holds no document");
 
         // An empty field addresses the whole document, as the empty JSON Pointer does.
-        let whole = database
-            .head()
-            .docs_read(docs, &[FieldAddress::new(key(2), "")], Json, &mut arena)
-            .unwrap();
+        let whole = database.head().docs_read(docs, &[FieldAddress::new(key(2), "")], Json, &mut arena).unwrap();
         assert_eq!(text(&whole, 0), Some(grace));
     }
 
@@ -2161,10 +2057,8 @@ mod tests {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let docs = created(&database, Modality::Docs);
         let documents = [DocumentEntry::<Json>::new(key(1), "{\"name\":")];
-        let failure = database
-            .head()
-            .docs_write(docs, &documents, Modification::Upsert, Durability::Buffered)
-            .unwrap_err();
+        let failure =
+            database.head().docs_write(docs, &documents, Modification::Upsert, Durability::Buffered).unwrap_err();
         assert_eq!(failure.status, Status::Malformed);
     }
 
@@ -2172,31 +2066,16 @@ mod tests {
     fn documents_insert_once_and_update_in_place() {
         let (database, docs, mut arena) = populated();
         let again = [DocumentEntry::<Json>::new(key(1), r#"{"name":"Someone else"}"#)];
-        let failure = database
-            .head()
-            .docs_write(docs, &again, Modification::Insert, Durability::Buffered)
-            .unwrap_err();
+        let failure = database.head().docs_write(docs, &again, Modification::Insert, Durability::Buffered).unwrap_err();
         assert_eq!(failure.status, Status::AlreadyExists);
 
         let fresh = [DocumentEntry::<Json>::new(key(3), r#"{"name":"Katherine"}"#)];
-        database
-            .head()
-            .docs_write(docs, &fresh, Modification::Insert, Durability::Buffered)
-            .unwrap();
+        database.head().docs_write(docs, &fresh, Modification::Insert, Durability::Buffered).unwrap();
 
         let merge = [DocumentEntry::<Json>::new(key(3), r#"{"born":1918}"#)];
-        database
-            .head()
-            .docs_write(docs, &merge, Modification::Merge, Durability::Buffered)
-            .unwrap();
-        let patch = [DocumentEntry::<Json>::new(
-            key(3),
-            r#"[{"op":"add","path":"/surname","value":"Johnson"}]"#,
-        )];
-        database
-            .head()
-            .docs_write(docs, &patch, Modification::Patch, Durability::Buffered)
-            .unwrap();
+        database.head().docs_write(docs, &merge, Modification::Merge, Durability::Buffered).unwrap();
+        let patch = [DocumentEntry::<Json>::new(key(3), r#"[{"op":"add","path":"/surname","value":"Johnson"}]"#)];
+        database.head().docs_write(docs, &patch, Modification::Patch, Durability::Buffered).unwrap();
 
         let fields = [
             FieldAddress::new(key(3), "name"),
@@ -2212,23 +2091,14 @@ mod tests {
     #[test]
     fn a_patch_that_does_not_apply_is_refused() {
         let (database, docs, _) = populated();
-        let patch = [DocumentEntry::<Json>::new(
-            key(1),
-            r#"[{"op":"remove","path":"/nowhere"}]"#,
-        )];
-        let failure = database
-            .head()
-            .docs_write(docs, &patch, Modification::Patch, Durability::Buffered)
-            .unwrap_err();
+        let patch = [DocumentEntry::<Json>::new(key(1), r#"[{"op":"remove","path":"/nowhere"}]"#)];
+        let failure = database.head().docs_write(docs, &patch, Modification::Patch, Durability::Buffered).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument, "{failure:?}");
 
         // An update or a patch replaces what exists, so a missing document refuses both.
         for modification in [Modification::Update, Modification::Patch] {
             let modifier = [DocumentEntry::<Json>::new(key(42), r#"[]"#)];
-            let failure = database
-                .head()
-                .docs_write(docs, &modifier, modification, Durability::Buffered)
-                .unwrap_err();
+            let failure = database.head().docs_write(docs, &modifier, modification, Durability::Buffered).unwrap_err();
             assert_eq!(failure.status, Status::NotFound, "{modification:?}");
         }
     }
@@ -2238,27 +2108,14 @@ mod tests {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let docs = created(&database, Modality::Docs);
         let mut arena = Arena::new().unwrap();
-        let documents = [
-            Document::new(r#"{"_id":7,"name":"Ada"}"#),
-            Document::new(r#"{"_id":9,"name":"Grace"}"#),
-        ];
+        let documents = [Document::new(r#"{"_id":7,"name":"Ada"}"#), Document::new(r#"{"_id":9,"name":"Grace"}"#)];
         database
             .head()
-            .docs_write(
-                docs,
-                KeyedBy("_id", &documents),
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, KeyedBy("_id", &documents), Modification::Upsert, Durability::Buffered)
             .unwrap();
         let names = database
             .head()
-            .docs_read(
-                docs,
-                &[FieldAddress::new(key(9), "name"), FieldAddress::new(key(7), "name")],
-                Text,
-                &mut arena,
-            )
+            .docs_read(docs, &[FieldAddress::new(key(9), "name"), FieldAddress::new(key(7), "name")], Text, &mut arena)
             .unwrap();
         assert_eq!(text(&names, 0), Some("Grace"));
         assert_eq!(text(&names, 1), Some("Ada"));
@@ -2266,12 +2123,7 @@ mod tests {
         let unkeyed = [Document::new(r#"{"_id":"seven"}"#)];
         let failure = database
             .head()
-            .docs_write(
-                docs,
-                KeyedBy("_id", &unkeyed),
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, KeyedBy("_id", &unkeyed), Modification::Upsert, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::Malformed);
     }
@@ -2331,14 +2183,8 @@ mod tests {
     fn fields_are_removed_by_merging_a_null() {
         let (database, docs, mut arena) = populated();
         let removal = [DocumentEntry::<Json>::new(key(1), r#"{"born":null}"#)];
-        database
-            .head()
-            .docs_write(docs, &removal, Modification::Merge, Durability::Buffered)
-            .unwrap();
-        let born = database
-            .head()
-            .docs_read(docs, &[FieldAddress::new(key(1), "born")], Text, &mut arena)
-            .unwrap();
+        database.head().docs_write(docs, &removal, Modification::Merge, Durability::Buffered).unwrap();
+        let born = database.head().docs_read(docs, &[FieldAddress::new(key(1), "born")], Text, &mut arena).unwrap();
         assert_eq!(born.get(0), None);
     }
 
@@ -2346,17 +2192,12 @@ mod tests {
     fn fields_refuse_a_document_or_a_path_that_is_not_there() {
         let (database, docs, _) = populated();
         let orphan = [FieldEntry::<Text>::new(key(42), "name", "Nobody")];
-        let failure = database
-            .head()
-            .docs_write(docs, &orphan, Modification::Upsert, Durability::Buffered)
-            .unwrap_err();
+        let failure =
+            database.head().docs_write(docs, &orphan, Modification::Upsert, Durability::Buffered).unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
 
         let deep = [FieldEntry::<Text>::new(key(1), "/missing/deeper", "value")];
-        let failure = database
-            .head()
-            .docs_write(docs, &deep, Modification::Update, Durability::Buffered)
-            .unwrap_err();
+        let failure = database.head().docs_write(docs, &deep, Modification::Update, Durability::Buffered).unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
     }
 
@@ -2381,32 +2222,22 @@ mod tests {
         let values = created(&database, Modality::Blobs);
         let blob = [Entry::new(key(1), b"not a document")];
         database.head().write(values, &blob, Durability::Buffered).unwrap();
-        let failure = database
-            .head()
-            .docs_read(values, &[FieldAddress::new(key(1), "name")], Text, &mut arena)
-            .unwrap_err();
+        let failure =
+            database.head().docs_read(values, &[FieldAddress::new(key(1), "name")], Text, &mut arena).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
         let documents = [DocumentEntry::<Json>::new(key(1), "{}")];
-        let failure = database
-            .head()
-            .docs_write(values, &documents, Modification::Upsert, Durability::Buffered)
-            .unwrap_err();
+        let failure =
+            database.head().docs_write(values, &documents, Modification::Upsert, Durability::Buffered).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
 
     #[test]
     fn gists_list_every_leaf_once() {
         let (database, docs, mut arena) = populated();
-        let paths = database
-            .head()
-            .docs_gist(docs, keys([1, 2, 1, 42]), &mut arena)
-            .unwrap();
+        let paths = database.head().docs_gist(docs, keys([1, 2, 1, 42]), &mut arena).unwrap();
         let mut listed: Vec<&str> = paths.iter().collect();
         listed.sort_unstable();
-        assert_eq!(
-            listed,
-            vec!["/born", "/languages/0", "/languages/1", "/name", "/navy/rank"]
-        );
+        assert_eq!(listed, vec!["/born", "/languages/0", "/languages/1", "/name", "/navy/rank"]);
         assert_eq!(paths.len(), 5);
         assert!(paths.get(5).is_none());
     }
@@ -2418,10 +2249,7 @@ mod tests {
         let mut arena = Arena::new().unwrap();
         let document = format!("{{\"{}\":1}}", "k".repeat(600));
         let documents = [DocumentEntry::<Json>::new(key(1), &document)];
-        database
-            .head()
-            .docs_write(docs, &documents, Modification::Upsert, Durability::Buffered)
-            .unwrap();
+        database.head().docs_write(docs, &documents, Modification::Upsert, Durability::Buffered).unwrap();
         let failure = database.head().docs_gist(docs, keys([1]), &mut arena).unwrap_err();
         assert_eq!(failure.status, Status::CapacityExhausted);
     }
@@ -2430,10 +2258,7 @@ mod tests {
     fn gathered_columns_export_in_place() {
         let (database, docs, mut arena) = populated();
         let columns = [Column::new::<u64>("born"), Column::new::<Binary>("name")];
-        let gathered = database
-            .head()
-            .docs_gather(docs, &keys([1, 2, 42]), &columns, &mut arena)
-            .unwrap();
+        let gathered = database.head().docs_gather(docs, &keys([1, 2, 42]), &columns, &mut arena).unwrap();
         let exported = gathered.to_arrow().unwrap();
         assert_eq!(exported.len(), 2);
         let born = exported[0].array();
@@ -2442,20 +2267,14 @@ mod tests {
         let values = unsafe { *born.array.buffers.add(1) };
         assert_eq!(values.cast(), gathered.scalars::<u64>(0).unwrap().as_ptr());
         let validities = unsafe { *born.array.buffers };
-        assert_eq!(
-            validities.cast(),
-            gathered.validities(0).unwrap().unwrap().as_bytes().as_ptr()
-        );
+        assert_eq!(validities.cast(), gathered.validities(0).unwrap().unwrap().as_bytes().as_ptr());
     }
 
     #[test]
     fn gathered_text_exports_without_terminators() {
         let (database, docs, mut arena) = populated();
         let columns = [Column::new::<Text>("name")];
-        let gathered = database
-            .head()
-            .docs_gather(docs, &keys([1, 2]), &columns, &mut arena)
-            .unwrap();
+        let gathered = database.head().docs_gather(docs, &keys([1, 2]), &columns, &mut arena).unwrap();
         let exported = gathered.to_arrow().unwrap();
         let (schema, array) = (exported[0].schema(), exported[0].array());
         // SAFETY: a string column on the host holds validities, offsets and bytes, as its schema
@@ -2480,19 +2299,13 @@ mod tests {
             Column::new::<bool>("navy"),
             Column::new::<u8>("/languages/0"),
         ];
-        let gathered = database
-            .head()
-            .docs_gather(docs, &keys([1, 2, 42]), &columns, &mut arena)
-            .unwrap();
+        let gathered = database.head().docs_gather(docs, &keys([1, 2, 42]), &columns, &mut arena).unwrap();
         assert_eq!((gathered.rows(), gathered.columns()), (3, 6));
 
         let born = gathered.scalars::<u64>(0).unwrap();
         assert_eq!(&born[..2], &[1815, 1906]);
         let validities = gathered.validities(0).unwrap().unwrap();
-        assert_eq!(
-            (validities.get(0), validities.get(1), validities.get(2)),
-            (true, true, false)
-        );
+        assert_eq!((validities.get(0), validities.get(1), validities.get(2)), (true, true, false));
         let conversions = gathered.conversions(0).unwrap().unwrap();
         assert!(!conversions.get(0), "a positive integer is unsigned as it stands");
         assert!(conversions.get(1), "a string parsed into an integer is a conversion");
@@ -2524,10 +2337,7 @@ mod tests {
     fn columns_refuse_to_be_read_as_something_else() {
         let (database, docs, mut arena) = populated();
         let columns = [Column::new::<i64>("born"), Column::new::<Text>("name")];
-        let gathered = database
-            .head()
-            .docs_gather(docs, &keys([1]), &columns, &mut arena)
-            .unwrap();
+        let gathered = database.head().docs_gather(docs, &keys([1]), &columns, &mut arena).unwrap();
         assert_eq!(gathered.scalars::<u64>(0).unwrap_err().status, Status::InvalidArgument);
         assert_eq!(gathered.scalars::<i64>(1).unwrap_err().status, Status::InvalidArgument);
         assert_eq!(gathered.strings(0).unwrap_err().status, Status::InvalidArgument);
@@ -2541,10 +2351,7 @@ mod tests {
         let mut columns_arena = Arena::new().unwrap();
         let paths = database.head().docs_gist(docs, keys([1]), &mut paths_arena).unwrap();
         let columns: Vec<Column<'_>> = paths.iter().map(Column::new::<Text>).collect();
-        let gathered = database
-            .head()
-            .docs_gather(docs, &keys([1]), &columns, &mut columns_arena)
-            .unwrap();
+        let gathered = database.head().docs_gather(docs, &keys([1]), &columns, &mut columns_arena).unwrap();
         assert_eq!(gathered.columns(), 4);
         for column in 0..gathered.columns() {
             assert!(gathered.validities(column).unwrap().unwrap().get(0));
@@ -2589,35 +2396,20 @@ mod tests {
             DocumentEntry::<Json>::new(key(1), r#"{"name":"Ada"}"#),
             DocumentEntry::<Json>::new(key(1), r#"{"name":"Kent"}"#),
         ];
-        database
-            .head()
-            .docs_write(
-                spanned.as_slice(),
-                &documents,
-                Modification::Upsert,
-                Durability::Buffered,
-            )
-            .unwrap();
+        database.head().docs_write(spanned.as_slice(), &documents, Modification::Upsert, Durability::Buffered).unwrap();
 
         let fields = [FieldAddress::new(key(1), "name"), FieldAddress::new(key(1), "name")];
-        let names = database
-            .head()
-            .docs_read(Collections::Each(&spanned), &fields, Text, &mut arena)
-            .unwrap();
+        let names = database.head().docs_read(Collections::Each(&spanned), &fields, Text, &mut arena).unwrap();
         assert_eq!((text(&names, 0), text(&names, 1)), (Some("Ada"), Some("Kent")));
 
         let columns = [Column::new::<Text>("name")];
-        let gathered = database
-            .head()
-            .docs_gather(Collections::Each(&spanned), &keys([1, 1]), &columns, &mut arena)
-            .unwrap();
+        let gathered =
+            database.head().docs_gather(Collections::Each(&spanned), &keys([1, 1]), &columns, &mut arena).unwrap();
         assert_eq!(gathered.strings(0).unwrap().get(1), Some(b"Kent".as_slice()));
 
         // A run of collections that is not one per task is refused before the call.
-        let failure = database
-            .head()
-            .docs_gather(Collections::Each(&spanned), &keys([1]), &columns, &mut arena)
-            .unwrap_err();
+        let failure =
+            database.head().docs_gather(Collections::Each(&spanned), &keys([1]), &columns, &mut arena).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
 
@@ -2633,20 +2425,10 @@ mod tests {
             ),
             DocumentEntry::<Json>::new(key(2), r#"{"weight":0.0,"id":"not a uuid","huge":1.0}"#),
         ];
-        database
-            .head()
-            .docs_write(docs, &documents, Modification::Upsert, Durability::Buffered)
-            .unwrap();
+        database.head().docs_write(docs, &documents, Modification::Upsert, Durability::Buffered).unwrap();
 
-        let columns = [
-            Column::new::<Half>("weight"),
-            Column::new::<UUID>("id"),
-            Column::new::<Half>("huge"),
-        ];
-        let gathered = database
-            .head()
-            .docs_gather(docs, &keys([1, 2]), &columns, &mut arena)
-            .unwrap();
+        let columns = [Column::new::<Half>("weight"), Column::new::<UUID>("id"), Column::new::<Half>("huge")];
+        let gathered = database.head().docs_gather(docs, &keys([1, 2]), &columns, &mut arena).unwrap();
 
         // A half is two bytes the caller reinterprets; 1.5 is sign zero, exponent fifteen, mantissa one half.
         let weights = gathered.scalars::<Half>(0).unwrap();
@@ -2658,11 +2440,7 @@ mod tests {
             identifiers[0],
             UUID([0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17, 0x40, 0x00])
         );
-        assert_eq!(
-            identifiers[1],
-            UUID::default(),
-            "text that is no UUID leaves its cell zero"
-        );
+        assert_eq!(identifiers[1], UUID::default(), "text that is no UUID leaves its cell zero");
         assert!(gathered.collisions(1).unwrap().unwrap().get(1));
 
         // A magnitude past the range of a half collides rather than rounding to infinity.
@@ -2683,8 +2461,7 @@ mod tests {
         let no_documents: &[DocumentEntry<'_, Json>] = &[];
         head.docs_write(docs, no_documents, upsert, buffered).unwrap();
         let no_texts: &[Document<'_>] = &[];
-        head.docs_write(docs, KeyedBy("_id", no_texts), upsert, buffered)
-            .unwrap();
+        head.docs_write(docs, KeyedBy("_id", no_texts), upsert, buffered).unwrap();
         let no_fields: &[FieldEntry<'_, Json>] = &[];
         head.docs_write(docs, no_fields, upsert, buffered).unwrap();
         assert!(head.docs_read(docs, [], Json, &mut arena).unwrap().is_empty());
@@ -2698,10 +2475,7 @@ mod tests {
         assert!(gathered.scalars::<i64>(0).unwrap().is_empty());
         assert!(gathered.strings(1).unwrap().is_empty());
         assert!(gathered.validities(0).unwrap().unwrap().is_empty());
-        assert_eq!(
-            head.docs_gather(docs, &keys([1]), &[], &mut arena).unwrap().columns(),
-            0
-        );
+        assert_eq!(head.docs_gather(docs, &keys([1]), &[], &mut arena).unwrap().columns(), 0);
     }
 
     #[test]
@@ -2709,10 +2483,7 @@ mod tests {
         let (database, docs, mut arena) = populated();
         let mut transaction = database.transaction().unwrap();
         let rank = [FieldEntry::<Text>::new(key(2), "/navy/rank", "Commodore")];
-        transaction
-            .view(Watch::Keys)
-            .docs_write(docs, &rank, Modification::Update, Durability::Buffered)
-            .unwrap();
+        transaction.view(Watch::Keys).docs_write(docs, &rank, Modification::Update, Durability::Buffered).unwrap();
         let flushed = transaction
             .view(Watch::Keys)
             .docs_write(docs, &rank, Modification::Update, Durability::Flushed)
@@ -2720,10 +2491,7 @@ mod tests {
         assert_eq!(flushed.status, Status::InvalidArgument);
 
         let address = [FieldAddress::new(key(2), "/navy/rank")];
-        let inside = transaction
-            .view(Watch::Keys)
-            .docs_read(docs, &address, Text, &mut arena)
-            .unwrap();
+        let inside = transaction.view(Watch::Keys).docs_read(docs, &address, Text, &mut arena).unwrap();
         assert_eq!(text(&inside, 0), Some("Commodore"));
         let outside = database.head().docs_read(docs, &address, Text, &mut arena).unwrap();
         assert_eq!(text(&outside, 0), Some("Rear Admiral"));
@@ -2743,20 +2511,12 @@ mod tests {
 
         let read = blocking.docs_read(docs, keys([1]), Json, &mut arena).unwrap();
         assert!(text(&read, 0).unwrap().starts_with(r#"{"name":"Ada""#));
-        let read = deferred
-            .docs_read(docs, vec![key(2), key(3)], Json, &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let read = deferred.docs_read(docs, vec![key(2), key(3)], Json, &mut arena).unwrap().wait().unwrap();
         assert!(text(&read, 0).unwrap().starts_with(r#"{"name":"Grace""#));
         assert_eq!(read.get(1), None);
 
         assert_eq!(blocking.docs_gist(docs, keys([1]), &mut arena).unwrap().len(), 4);
-        let paths = deferred
-            .docs_gist(docs, keys([1, 2]), &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let paths = deferred.docs_gist(docs, keys([1, 2]), &mut arena).unwrap().wait().unwrap();
         assert_eq!(paths.len(), 5);
     }
 
@@ -2780,11 +2540,7 @@ mod tests {
 
         let texts: CharsTape<u64> = ["{}"].into_iter().collect();
         let refused = deferred.docs_write(docs, (keys([1, 2]), texts), upsert, buffered);
-        assert_eq!(
-            refused.unwrap_err().status,
-            Status::InvalidArgument,
-            "the tape holds a value per key"
-        );
+        assert_eq!(refused.unwrap_err().status, Status::InvalidArgument, "the tape holds a value per key");
     }
 
     #[test]
@@ -2796,21 +2552,13 @@ mod tests {
         database
             .head()
             .deferred(&executor)
-            .docs_write(
-                docs,
-                KeyedBy(String::from("_id"), texts),
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, KeyedBy(String::from("_id"), texts), Modification::Upsert, Durability::Buffered)
             .unwrap()
             .wait()
             .unwrap();
 
         let mut arena = Arena::new().unwrap();
-        let names = database
-            .head()
-            .docs_read(docs, &[FieldAddress::new(key(7), "name")], Text, &mut arena)
-            .unwrap();
+        let names = database.head().docs_read(docs, &[FieldAddress::new(key(7), "name")], Text, &mut arena).unwrap();
         assert_eq!(text(&names, 0), Some("Ada"));
     }
 
@@ -2823,20 +2571,12 @@ mod tests {
         database
             .head()
             .deferred(&executor)
-            .docs_write(
-                docs,
-                (keys([1, 2]), paths, values),
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, (keys([1, 2]), paths, values), Modification::Upsert, Durability::Buffered)
             .unwrap()
             .wait()
             .unwrap();
 
-        let fields = [
-            FieldAddress::new(key(1), "died"),
-            FieldAddress::new(key(2), "/navy/rank"),
-        ];
+        let fields = [FieldAddress::new(key(1), "died"), FieldAddress::new(key(2), "/navy/rank")];
         let read = database.head().docs_read(docs, &fields, Text, &mut arena).unwrap();
         assert_eq!((text(&read, 0), text(&read, 1)), (Some("1852"), Some("Commodore")));
     }
@@ -2848,11 +2588,7 @@ mod tests {
         let deferred = database.head().deferred(&executor);
 
         let paths: CharsTape<u64> = ["name", "/navy/rank"].into_iter().collect();
-        let read = deferred
-            .docs_read(docs, (vec![key(1), key(2)], paths), Text, &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let read = deferred.docs_read(docs, (vec![key(1), key(2)], paths), Text, &mut arena).unwrap().wait().unwrap();
         assert_eq!(text(&read, 0), Some("Ada"));
         assert_eq!(text(&read, 1), Some("Rear Admiral"));
 
@@ -2899,7 +2635,7 @@ pub struct DocsCursor<'view> {
     handle: ffi::ustore_docs_cursor_t,
     database: ustore_database_t,
     executor: ustore_executor_t,
-    matched: Box<Matched<'view>>,
+    matched: Box<Matching<'view>>,
     marker: PhantomData<&'view ()>,
 }
 
@@ -2919,7 +2655,7 @@ impl<'view, Parent> On<'view, Parent> {
             handle: ptr::null_mut(),
             database: self.database(),
             executor: self.executor(),
-            matched: Box::new(Matched::new(config.into().matching)),
+            matched: Box::new(config.into().matching),
             marker: PhantomData,
         };
         let mut outcome = ustore_outcome_t::default();
@@ -2933,8 +2669,8 @@ impl<'view, Parent> On<'view, Parent> {
             start_key: range.start_key(),
             end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
             direction: range.direction,
-            filter: cursor.matched.filter(),
-            predicate: cursor.matched.predicate(),
+            filter: cursor.matched.lowered_filter(),
+            predicate: cursor.matched.lowered_predicate(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_docs_cursor_init(&mut arguments) };
@@ -2987,7 +2723,6 @@ impl DocsCursor<'_> {
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_docs_cursor_next(&mut arguments) };
-        self.matched.raise();
         check(outcome)?;
         arena.host()?;
         // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.

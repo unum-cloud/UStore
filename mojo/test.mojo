@@ -11,27 +11,39 @@ Date: November 8, 2026
 
 from std.os import listdir, remove, rmdir
 from std.tempfile import mkdtemp
+from std.sys.info import CompilationTarget
 from std.testing import TestSuite, assert_equal, assert_false, assert_raises, assert_true
 
 from ustore import (
     Admission,
     Arena,
     BlobsScanConfig,
+    CPUClass,
     CollectionID,
     CollectionsView,
     Continuation,
     Database,
+    DatabaseCompactPlan,
     DocsReadConfig,
+    FieldType,
     Error,
     Executor,
+    GPUClass,
+    GPUVendor,
     Key,
     KeysView,
     Library,
     Modality,
     Mood,
+    Phase,
+    PhaseProgress,
     Predicate,
     Progress,
     Residency,
+    column_to_arrow,
+    keys_from_arrow,
+    keys_to_arrow,
+    tape_to_arrow,
     StringsView,
     Status,
     UUID,
@@ -107,6 +119,10 @@ def test_library_reports_its_version_and_names() raises:
     with assert_raises():
         _ = library.durability_from_name("bogus")
     assert_equal(library.modality_name(Modality.GRAPH), "graph")
+    assert_equal(library.phase_name(Phase.MERGE), "merge")
+    assert_true(library.phase_from_name("reclaim") == Phase.RECLAIM)
+    assert_equal(library.gpu_vendor_name(GPUVendor.APPLE), "apple")
+    assert_true(library.gpu_class_from_name("apple-metal9") == GPUClass.APPLE_METAL9)
 
 
 def test_blobs_write_read_and_scan() raises:
@@ -264,8 +280,8 @@ def test_deferred_calls_match_blocking_ones() raises:
 struct _Holder:
     """What a predicate writes through, on the executor its own scan holds, and the status the write finished with."""
 
-    var database: Pointer[Database, MutAnyOrigin]
-    var executor: Pointer[Executor, MutAnyOrigin]
+    var database: Pointer[Database, MutUntrackedOrigin]
+    var executor: Pointer[Executor, MutUntrackedOrigin]
     var collection: CollectionID
     var refused: Status
 
@@ -304,8 +320,8 @@ def test_a_held_executor_refuses_the_next_call() raises:
     db.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
 
     var holder = _Holder(
-        Pointer(to=db).unsafe_origin_cast[MutAnyOrigin](),
-        Pointer(to=executor).unsafe_origin_cast[MutAnyOrigin](),
+        Pointer(to=db).unsafe_origin_cast[MutUntrackedOrigin](),
+        Pointer(to=executor).unsafe_origin_cast[MutUntrackedOrigin](),
         people,
         Status.DEFERRED,
     )
@@ -382,6 +398,49 @@ def test_progress_cancels_a_scan() raises:
         refused = error.status
     assert_true(refused == Status.CANCELLED, "a cancelling handler must stop the scan")
     assert_equal(reports, 1)
+
+
+def test_compact_plans_stay_live_until_finished() raises:
+    """A cancelled compaction leaves its plan live, a deferred one continues it to the end, and a finish frees it."""
+    if not _engine_is_present():
+        print("skipped: no UStore library on the loader path")
+        return
+    var library = Library()
+    var executor = Executor.for_ram(library, threads=2)
+    var db = Database.init_ram(Executor(library))
+    var keys: List[Key] = [Key(1), Key(2)]
+    var values = Tape(["a", "b"])
+    for name in ["first", "second"]:
+        var collection = db.collection_create(name, Modality.BLOBS)
+        db.write(CollectionsView.repeating(collection), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
+        db.write(CollectionsView.repeating(collection), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
+
+    var plan = DatabaseCompactPlan()
+    var phase = PhaseProgress()
+    var reports = 0
+    var refused = Status.SUCCESS
+    try:
+        db.on(executor).compact(
+            Progress.of[_stop_at_first_report](Pointer(to=reports)), Pointer(to=plan), Pointer(to=phase)
+        )
+    except error:
+        refused = error.status
+    assert_true(refused == Status.CANCELLED, "a cancelling handler must stop the compaction")
+    assert_true(plan.address != 0, "the cancelled call leaves its plan live")
+
+    var continued = db.deferred(executor).compact(plan=Pointer(to=plan), phase=Pointer(to=phase))
+    _ = continued.wait()
+    assert_true(phase.phase == Phase.DONE, "the continued plan runs to its end")
+    var finished = db.deferred(executor).compact_plan_finish(plan^)
+    _ = finished.wait()
+
+    var again = Status.SUCCESS
+    try:
+        db.on(executor).compact_plan_finish(DatabaseCompactPlan())
+    except error:
+        again = error.status
+    assert_true(again == Status.INVALID_ARGUMENT, "a plan no compaction opened is refused")
+    _ = db^  # the database a plan names outlives its finish
 
 
 def _admit_even(keys: Span[Key, MutAnyOrigin], admissions: Span[Admission, MutAnyOrigin], asked: Pointer[Int, MutAnyOrigin]):
@@ -462,6 +521,64 @@ def test_open_ram_persists_across_reopens() raises:
     rmdir(directory)
 
 
+def test_arrow_exports_read_in_place() raises:
+    """Scanned keys export as Arrow and read back as a call's keys, and a read's tape and a gathered column export."""
+    if not _engine_is_present():
+        print("skipped: no UStore library on the loader path")
+        return
+    var library = Library()
+    var db = Database.init_ram(Executor(library))
+    var people = db.collection_create("people", Modality.BLOBS)
+    var keys: List[Key] = [Key(1), Key(2), Key(3)]
+    var values = Tape(["Ada", "Grace", "Barbara"])
+    db.write(CollectionsView.repeating(people), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
+    var arena = Arena(library)
+    var start = Key(0)
+    var scanned = db.scan(CollectionsView.repeating(people), KeysView.repeating(start), 10, arena)
+    var listed = scanned.keys()
+    var exported = keys_to_arrow(KeysView.of(listed), arena)
+    assert_equal(len(exported), 3)
+    assert_equal(exported.device_type(), 1)
+    var back = keys_from_arrow(arena, exported.schema_address(), exported.array_address())
+    assert_equal(len(back), 3)
+    # Mojo frees a value at its last use, so the export lives past the view that reads its buffers
+    _ = exported^
+    var read = db.read(CollectionsView.repeating(people), KeysView.of(keys), arena)
+    if not CompilationTarget.is_x86():
+        assert_equal(len(tape_to_arrow(read.values())), 3)
+
+    var movies = db.collection_create("movies", Modality.DOCS)
+    var key = Key(1)
+    var documents = Tape(['{"year":1979}'])
+    db.docs_write(CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(documents.bytes, documents.offsets))
+    var fields = Tape(["year"])
+    var types: List[FieldType] = [FieldType.I64]
+    var gathered = db.docs_gather(
+        CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(fields.bytes, fields.offsets), types, arena
+    )
+    assert_equal(len(column_to_arrow(gathered.column(0), FieldType.I64)), 1)
+
+
+def test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick() raises:
+    """A ceiling caps the class the database runs as: one the CPU lacks narrows the pick rather than refusing it."""
+    if not _engine_is_present():
+        print("skipped: no UStore library on the loader path")
+        return
+    var library = Library()
+    var machine = Database.init_ram(Executor(library)).describe().cpu_class
+    # A monoversioned build compiles no class under any other, so it refuses a lower ceiling
+    if machine == CPUClass.MONOVERSIONED:
+        print("skipped: a monoversioned build compiles no class under a foreign ceiling")
+        return
+    var capped = Database.init_ram(Executor(library), cpu_class_ceiling=machine)
+    assert_true(capped.describe().cpu_class == machine)
+    # Power10 and AWS G5 share no architecture, so one of them is foreign to every machine
+    var foreign = CPUClass.AWS_G5 if machine == CPUClass.IBM_POWER10 else CPUClass.IBM_POWER10
+    var narrowed = Database.init_ram(Executor(library), cpu_class_ceiling=foreign).describe().cpu_class
+    assert_false(narrowed == foreign)
+    assert_false(narrowed == CPUClass.UNKNOWN)
+
+
 # endregion Engine
 
 
@@ -478,7 +595,10 @@ def main() raises:
     suite.test[test_a_held_executor_refuses_the_next_call]()
     suite.test[test_a_drain_frees_the_executor_in_either_mood]()
     suite.test[test_progress_cancels_a_scan]()
+    suite.test[test_compact_plans_stay_live_until_finished]()
     suite.test[test_predicate_filters_a_scan]()
     suite.test[test_transactions_commit_their_writes]()
     suite.test[test_open_ram_persists_across_reopens]()
+    suite.test[test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick]()
+    suite.test[test_arrow_exports_read_in_place]()
     suite^.run()

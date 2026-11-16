@@ -25,9 +25,9 @@ use crate::db::ffi::{
 };
 use crate::db::sealed::{Accepts, Calling, Writable};
 use crate::db::{
-    check, exported_slice, fail, read_spelling, spelling, string_views, Address, Arena, CollectionID, Collections,
-    Deferring, Durability, Error, Key, KeyRange, Matched, Matching, On, Progress, ProgressCallback, Result, ScanMode,
-    Status, Strings,
+    Address, Arena, CollectionID, Collections, Deferring, Durability, Error, Key, KeyRange, Matching, On, Progress,
+    ProgressCallback, Result, ScanMode, Status, Strings, check, exported_slice, fail, read_spelling, spelling,
+    string_views,
 };
 
 /// The encoding pages render in, as `ustore_page_encoding_t` spells it.
@@ -325,7 +325,7 @@ pub(crate) mod ffi {
         pub arena: ustore_arena_t,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn ustore_pages_cursor_init(arguments: *mut ustore_pages_cursor_init_t);
         pub fn ustore_pages_cursor_next(arguments: *mut ustore_pages_cursor_next_t);
         pub fn ustore_pages_cursor_free(cursor: ustore_pages_cursor_t);
@@ -357,15 +357,12 @@ pub struct PagesImportConfig<'config> {
     /// The encoding of the markup.
     pub encoding: PageEncoding,
     /// Reports the pages imported and stops wherever it says to.
-    pub progress: Option<&'config mut ProgressCallback<'config>>,
+    pub progress: Option<Box<ProgressCallback<'config>>>,
 }
 
 impl From<PageEncoding> for PagesImportConfig<'_> {
     fn from(encoding: PageEncoding) -> Self {
-        PagesImportConfig {
-            encoding,
-            progress: None,
-        }
+        PagesImportConfig { encoding, progress: None }
     }
 }
 
@@ -384,12 +381,7 @@ pub struct PagesInsertConfig<'config> {
 
 impl From<PageEncoding> for PagesInsertConfig<'_> {
     fn from(encoding: PageEncoding) -> Self {
-        PagesInsertConfig {
-            elements: &[],
-            parents: &[],
-            anchors: &[],
-            encoding,
-        }
+        PagesInsertConfig { elements: &[], parents: &[], anchors: &[], encoding }
     }
 }
 
@@ -404,10 +396,7 @@ pub struct PagesReadConfig<'config> {
 
 impl From<PageEncoding> for PagesReadConfig<'_> {
     fn from(outputs_encoding: PageEncoding) -> Self {
-        PagesReadConfig {
-            elements: &[],
-            outputs_encoding,
-        }
+        PagesReadConfig { elements: &[], outputs_encoding }
     }
 }
 
@@ -420,17 +409,12 @@ pub struct PagesScanConfig<'config> {
     /// In what order the page keys come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<&'config mut ProgressCallback<'config>>,
+    pub progress: Option<Box<ProgressCallback<'config>>>,
 }
 
 impl From<usize> for PagesScanConfig<'_> {
     fn from(wanted: usize) -> Self {
-        PagesScanConfig {
-            wanted,
-            matching: Matching::default(),
-            mode: ScanMode::Ordered,
-            progress: None,
-        }
+        PagesScanConfig { wanted, matching: Matching::default(), mode: ScanMode::Ordered, progress: None }
     }
 }
 
@@ -475,10 +459,7 @@ fn column<Value>(values: &[Value], count: usize) -> Result<ustore_strided_view_t
     match values.len() {
         0 => Ok(ustore_strided_view_t::default()),
         length if length == count => Ok(ustore_strided_view_t::packed(values)),
-        _ => Err(fail(
-            Status::InvalidArgument,
-            "every column of a batch holds one item per task",
-        )),
+        _ => Err(fail(Status::InvalidArgument, "every column of a batch holds one item per task")),
     }
 }
 
@@ -486,10 +467,7 @@ fn column<Value>(values: &[Value], count: usize) -> Result<ustore_strided_view_t
 fn texts(texts: &[&str], count: usize) -> Result<ustore_strings_view_t> {
     match texts.len() == count {
         true => Ok(ustore_strings_view_t::accessor(string_views, texts.as_ptr().cast())),
-        false => Err(fail(
-            Status::InvalidArgument,
-            "every column of a batch holds one item per task",
-        )),
+        false => Err(fail(Status::InvalidArgument, "every column of a batch holds one item per task")),
     }
 }
 
@@ -519,7 +497,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
             keys,
             markups,
             encoding,
-            progress: Progress::new(progress),
+            progress: Progress(progress),
             durability,
         };
         Completion::answer(self, verb)
@@ -571,12 +549,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Elements>,
     {
-        let verb = PagesRemove {
-            collections: collections.into(),
-            keys,
-            elements,
-            durability,
-        };
+        let verb = PagesRemove { collections: collections.into(), keys, elements, durability };
         Completion::answer(self, verb)
     }
 
@@ -604,14 +577,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
             + Accepts<Parents>
             + Accepts<Anchors>,
     {
-        let verb = PagesMove {
-            collections: collections.into(),
-            keys,
-            elements,
-            parents,
-            anchors,
-            durability,
-        };
+        let verb = PagesMove { collections: collections.into(), keys, elements, parents, anchors, durability };
         Completion::answer(self, verb)
     }
 
@@ -642,15 +608,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
             + Accepts<Lengths>
             + Accepts<Texts>,
     {
-        let verb = PagesSplice {
-            collections: collections.into(),
-            keys,
-            elements,
-            starts,
-            lengths,
-            texts,
-            durability,
-        };
+        let verb = PagesSplice { collections: collections.into(), keys, elements, starts, lengths, texts, durability };
         Completion::answer(self, verb)
     }
 
@@ -674,14 +632,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
         Completion:
             Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Elements> + Accepts<Fields> + Accepts<Texts>,
     {
-        let verb = PagesSetAttributes {
-            collections: collections.into(),
-            keys,
-            elements,
-            fields,
-            values,
-            durability,
-        };
+        let verb = PagesSetAttributes { collections: collections.into(), keys, elements, fields, values, durability };
         Completion::answer(self, verb)
     }
 
@@ -702,13 +653,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
         Fields: AsRef<[&'texts str]>,
         Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Elements> + Accepts<Fields>,
     {
-        let verb = PagesRemoveAttributes {
-            collections: collections.into(),
-            keys,
-            elements,
-            fields,
-            durability,
-        };
+        let verb = PagesRemoveAttributes { collections: collections.into(), keys, elements, fields, durability };
         Completion::answer(self, verb)
     }
 }
@@ -753,21 +698,16 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         Completion: Accepts<PagesScanConfig<'config>>,
     {
         let range = range.into();
-        let PagesScanConfig {
-            wanted,
-            matching,
-            mode,
-            progress,
-        } = config.into();
+        let PagesScanConfig { wanted, matching, mode, progress } = config.into();
         let verb = PagesScan {
             collection,
             start: range.start_key(),
             range,
             arena,
             wanted,
-            matched: Matched::new(matching),
+            matched: matching,
             mode,
-            progress: Progress::new(progress),
+            progress: Progress(progress),
             found: Found::default(),
         };
         Completion::answer(self, verb)
@@ -782,12 +722,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         config: impl Into<PagesSampleConfig>,
         arena: &'arena mut Arena,
     ) -> Completion::Answer<PagesSample<'arena>> {
-        let verb = PagesSample {
-            collection,
-            arena,
-            wanted: config.into().wanted,
-            found: Found::default(),
-        };
+        let verb = PagesSample { collection, arena, wanted: config.into().wanted, found: Found::default() };
         Completion::answer(self, verb)
     }
 
@@ -802,13 +737,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         arena: &'arena mut Arena,
     ) -> Completion::Answer<PagesMeasure<'arena>> {
         let range = range.into();
-        let verb = PagesMeasure {
-            collection,
-            start: range.start_key(),
-            range,
-            arena,
-            bounds: Bounds::default(),
-        };
+        let verb = PagesMeasure { collection, start: range.start_key(), range, arena, bounds: Bounds::default() };
         Completion::answer(self, verb)
     }
 }
@@ -858,11 +787,7 @@ impl<'texts, Keys: AsRef<[Key]>, Markups: AsRef<[&'texts str]>> Calling for Page
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_import(arguments)
-    }
-
-    fn raise(&mut self) {
-        self.progress.raise();
+        unsafe { ffi::ustore_pages_import(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -920,7 +845,7 @@ impl<'arena, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>> Callin
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_insert(arguments)
+        unsafe { ffi::ustore_pages_insert(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
@@ -971,7 +896,7 @@ impl<Keys: AsRef<[Key]>, Elements: AsRef<[Key]>> Calling for PagesRemove<'_, Key
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_remove(arguments)
+        unsafe { ffi::ustore_pages_remove(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -1028,7 +953,7 @@ where
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_move(arguments)
+        unsafe { ffi::ustore_pages_move(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -1088,7 +1013,7 @@ where
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_splice(arguments)
+        unsafe { ffi::ustore_pages_splice(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -1145,7 +1070,7 @@ where
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_set_attributes(arguments)
+        unsafe { ffi::ustore_pages_set_attributes(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -1199,7 +1124,7 @@ where
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_remove_attributes(arguments)
+        unsafe { ffi::ustore_pages_remove_attributes(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -1251,7 +1176,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for PagesRead<'arena, '_, '_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_read(arguments)
+        unsafe { ffi::ustore_pages_read(arguments) }
     }
 
     fn finish(self) -> Result<Values<'arena>> {
@@ -1269,7 +1194,7 @@ pub struct PagesScan<'arena, 'config> {
     range: KeyRange,
     arena: &'arena mut Arena,
     wanted: usize,
-    matched: Matched<'config>,
+    matched: Matching<'config>,
     mode: ScanMode,
     progress: Progress<'config>,
     found: Found,
@@ -1297,8 +1222,8 @@ impl<'arena> Calling for PagesScan<'arena, '_> {
             start_keys: ustore_strided_view_t::repeated(&self.start),
             end_keys: self.range.end_keys(),
             direction: self.range.direction,
-            filter: self.matched.filter(),
-            predicate: self.matched.predicate(),
+            filter: self.matched.lowered_filter(),
+            predicate: self.matched.lowered_predicate(),
             offsets: &mut self.found.offsets.0,
             keys: &mut self.found.keys.0,
             arena: self.arena.handle,
@@ -1310,12 +1235,7 @@ impl<'arena> Calling for PagesScan<'arena, '_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_scan(arguments)
-    }
-
-    fn raise(&mut self) {
-        self.matched.raise();
-        self.progress.raise();
+        unsafe { ffi::ustore_pages_scan(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
@@ -1360,7 +1280,7 @@ impl<'arena> Calling for PagesSample<'arena> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_sample(arguments)
+        unsafe { ffi::ustore_pages_sample(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
@@ -1390,8 +1310,14 @@ impl Calling for PagesMeasure<'_> {
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let [min_cardinalities, max_cardinalities, min_value_bytes, max_value_bytes, min_space_usages, max_space_usages] =
-            &mut self.bounds.0;
+        let [
+            min_cardinalities,
+            max_cardinalities,
+            min_value_bytes,
+            max_value_bytes,
+            min_space_usages,
+            max_space_usages,
+        ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_pages_measure_t {
             database: view.database(),
             executor: view.executor(),
@@ -1414,7 +1340,7 @@ impl Calling for PagesMeasure<'_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_pages_measure(arguments)
+        unsafe { ffi::ustore_pages_measure(arguments) }
     }
 
     fn finish(self) -> Result<Measurement> {
@@ -1437,7 +1363,7 @@ pub struct PagesCursor<'view> {
     handle: ffi::ustore_pages_cursor_t,
     database: ustore_database_t,
     executor: ustore_executor_t,
-    matched: Box<Matched<'view>>,
+    matched: Box<Matching<'view>>,
     marker: PhantomData<&'view ()>,
 }
 
@@ -1457,7 +1383,7 @@ impl<'view, Parent> On<'view, Parent> {
             handle: ptr::null_mut(),
             database: self.database(),
             executor: self.executor(),
-            matched: Box::new(Matched::new(config.into().matching)),
+            matched: Box::new(config.into().matching),
             marker: PhantomData,
         };
         let mut outcome = ustore_outcome_t::default();
@@ -1471,8 +1397,8 @@ impl<'view, Parent> On<'view, Parent> {
             start_key: range.start_key(),
             end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
             direction: range.direction,
-            filter: cursor.matched.filter(),
-            predicate: cursor.matched.predicate(),
+            filter: cursor.matched.lowered_filter(),
+            predicate: cursor.matched.lowered_predicate(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_pages_cursor_init(&mut arguments) };
@@ -1533,7 +1459,6 @@ impl PagesCursor<'_> {
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_pages_cursor_next(&mut arguments) };
-        self.matched.raise();
         check(outcome)?;
         arena.host()?;
         // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
@@ -1564,20 +1489,14 @@ mod tests {
     fn imported(markup: &str) -> (Database, CollectionID, Arena) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let pages = created(&database, Modality::Pages);
-        database
-            .head()
-            .pages_import(pages, [key(500)], [markup], PageEncoding::Xml, BUFFERED)
-            .unwrap();
+        database.head().pages_import(pages, [key(500)], [markup], PageEncoding::Xml, BUFFERED).unwrap();
         (database, pages, Arena::new().unwrap())
     }
 
     /// The rendering of `element` of the page keyed five hundred, or of the whole page, and `None`
     /// where it is missing.
     fn rendered(database: &Database, pages: CollectionID, element: Option<Key>, arena: &mut Arena) -> Option<String> {
-        let config = PagesReadConfig {
-            elements: element.as_slice(),
-            outputs_encoding: PageEncoding::Xml,
-        };
+        let config = PagesReadConfig { elements: element.as_slice(), outputs_encoding: PageEncoding::Xml };
         let values = database.head().pages_read(pages, [key(500)], config, arena).unwrap();
         values.get(0).map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
     }
@@ -1596,9 +1515,7 @@ mod tests {
             parents: parent.as_slice(),
             ..PagesInsertConfig::from(PageEncoding::Xml)
         };
-        let landed = head
-            .pages_insert(pages, [key(500)], [fragment], config, arena, BUFFERED)
-            .unwrap();
+        let landed = head.pages_insert(pages, [key(500)], [fragment], config, arena, BUFFERED).unwrap();
         assert_eq!(landed, &[element]);
     }
 
@@ -1612,18 +1529,10 @@ mod tests {
             Some(r#"<h1>title</h1><doc><p id="1">one</p></doc>"#)
         );
 
-        let under = PagesInsertConfig {
-            parents: &[key(10)],
-            ..PagesInsertConfig::from(PageEncoding::Xml)
-        };
-        let minted = head
-            .pages_insert(pages, [key(500)], ["<i>x</i>"], under, &mut arena, BUFFERED)
-            .unwrap()[0];
+        let under = PagesInsertConfig { parents: &[key(10)], ..PagesInsertConfig::from(PageEncoding::Xml) };
+        let minted = head.pages_insert(pages, [key(500)], ["<i>x</i>"], under, &mut arena, BUFFERED).unwrap()[0];
         assert_ne!(minted, key(0));
-        assert_eq!(
-            rendered(&database, pages, Some(key(10)), &mut arena).as_deref(),
-            Some("<h1>title<i>x</i></h1>")
-        );
+        assert_eq!(rendered(&database, pages, Some(key(10)), &mut arena).as_deref(), Some("<h1>title<i>x</i></h1>"));
         assert_eq!(rendered(&database, pages, Some(key(404)), &mut arena), None);
     }
 
@@ -1633,20 +1542,14 @@ mod tests {
         let head = database.head();
         let page = [key(500)];
         inserted(&head, pages, "<h1>title</h1>", key(10), None, &mut arena);
-        head.pages_splice(pages, page, [key(10)], [0u64], [5u64], ["Head"], BUFFERED)
-            .unwrap();
-        head.pages_set_attributes(pages, page, [key(10)], ["class"], ["a<b"], BUFFERED)
-            .unwrap();
+        head.pages_splice(pages, page, [key(10)], [0u64], [5u64], ["Head"], BUFFERED).unwrap();
+        head.pages_set_attributes(pages, page, [key(10)], ["class"], ["a<b"], BUFFERED).unwrap();
         assert_eq!(
             rendered(&database, pages, Some(key(10)), &mut arena).as_deref(),
             Some(r#"<h1 class="a&lt;b">Head</h1>"#)
         );
-        head.pages_remove_attributes(pages, page, [key(10)], ["class"], BUFFERED)
-            .unwrap();
-        assert_eq!(
-            rendered(&database, pages, Some(key(10)), &mut arena).as_deref(),
-            Some("<h1>Head</h1>")
-        );
+        head.pages_remove_attributes(pages, page, [key(10)], ["class"], BUFFERED).unwrap();
+        assert_eq!(rendered(&database, pages, Some(key(10)), &mut arena).as_deref(), Some("<h1>Head</h1>"));
     }
 
     #[test]
@@ -1659,17 +1562,11 @@ mod tests {
 
         // Empty parents and anchors move the element to the front of the root.
         head.pages_move(pages, page, [key(11)], [], [], BUFFERED).unwrap();
-        assert_eq!(
-            rendered(&database, pages, None, &mut arena).as_deref(),
-            Some("<i>x</i><h1>title</h1><doc/>")
-        );
+        assert_eq!(rendered(&database, pages, None, &mut arena).as_deref(), Some("<i>x</i><h1>title</h1><doc/>"));
 
         head.pages_remove(pages, page, [key(10)], BUFFERED).unwrap();
         assert_eq!(rendered(&database, pages, Some(key(10)), &mut arena), None);
-        assert_eq!(
-            rendered(&database, pages, Some(key(11)), &mut arena).as_deref(),
-            Some("<i>x</i>")
-        );
+        assert_eq!(rendered(&database, pages, Some(key(11)), &mut arena).as_deref(), Some("<i>x</i>"));
         head.pages_remove(pages, page, [Key::default()], BUFFERED).unwrap();
         assert_eq!(rendered(&database, pages, None, &mut arena), None);
     }
@@ -1678,18 +1575,11 @@ mod tests {
     fn scans_keep_the_pages_their_filter_matches() {
         let (database, pages, mut arena) = imported("<p/>");
         let head = database.head();
-        head.pages_import(pages, [key(2)], ["<p><b/></p>"], PageEncoding::Xml, BUFFERED)
-            .unwrap();
-        assert_eq!(
-            head.pages_scan(pages, key(0), 10, &mut arena).unwrap(),
-            &[key(2), key(500)]
-        );
+        head.pages_import(pages, [key(2)], ["<p><b/></p>"], PageEncoding::Xml, BUFFERED).unwrap();
+        assert_eq!(head.pages_scan(pages, key(0), 10, &mut arena).unwrap(), &[key(2), key(500)]);
 
         let config = PagesScanConfig {
-            matching: Matching {
-                filter: Some("//b"),
-                ..Matching::default()
-            },
+            matching: Matching { filter: Some("//b"), ..Matching::default() },
             ..PagesScanConfig::from(10)
         };
         assert_eq!(head.pages_scan(pages, key(0), config, &mut arena).unwrap(), &[key(2)]);
@@ -1697,13 +1587,9 @@ mod tests {
 
     #[test]
     fn encodings_read_back_from_their_spelling() {
-        for encoding in [
-            PageEncoding::Html,
-            PageEncoding::Xml,
-            PageEncoding::Markdown,
-            PageEncoding::Text,
-            PageEncoding::Json,
-        ] {
+        for encoding in
+            [PageEncoding::Html, PageEncoding::Xml, PageEncoding::Markdown, PageEncoding::Text, PageEncoding::Json]
+        {
             assert_eq!(encoding.to_string().parse::<PageEncoding>().unwrap(), encoding);
         }
         assert_eq!(PageEncoding::Markdown.to_string(), "markdown");

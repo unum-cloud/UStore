@@ -27,9 +27,9 @@ use crate::db::ffi::{
 };
 use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
-    check, exported_slice, fail, string_views, Address, Arena, CollectionID, Collections, Deferring, Durability, Key,
-    Matched, Matching, Modality, On, Progress, ProgressCallback, Result, Rows, ScanDirection, ScanMode, Status,
-    Strings,
+    Address, Arena, CollectionID, Collections, Deferring, Durability, Key, Matching, Modality, On, Progress,
+    ProgressCallback, Result, Rows, ScanDirection, ScanMode, Status, Strings, check, exported_slice, fail,
+    string_views,
 };
 use crate::docs::Bitmap;
 
@@ -195,7 +195,7 @@ pub(crate) mod ffi {
         pub progress_state: *mut c_void,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn ustore_strings_write(arguments: *mut ustore_strings_write_t);
         pub fn ustore_strings_remove(arguments: *mut ustore_strings_remove_t);
         pub fn ustore_strings_read(arguments: *mut ustore_strings_read_t);
@@ -265,17 +265,12 @@ pub struct StringsScanConfig<'config> {
     /// In what order the strings come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<&'config mut ProgressCallback<'config>>,
+    pub progress: Option<Box<ProgressCallback<'config>>>,
 }
 
 impl From<usize> for StringsScanConfig<'_> {
     fn from(wanted: usize) -> Self {
-        StringsScanConfig {
-            wanted,
-            matching: Matching::default(),
-            mode: ScanMode::Ordered,
-            progress: None,
-        }
+        StringsScanConfig { wanted, matching: Matching::default(), mode: ScanMode::Ordered, progress: None }
     }
 }
 
@@ -310,12 +305,8 @@ use sealed::Texts;
 
 impl Texts for &[&str] {
     fn texts(&self) -> Result<Option<(usize, ustore_strings_view_t)>> {
-        Ok((!self.is_empty()).then(|| {
-            (
-                self.len(),
-                ustore_strings_view_t::accessor(string_views, self.as_ptr().cast()),
-            )
-        }))
+        Ok((!self.is_empty())
+            .then(|| (self.len(), ustore_strings_view_t::accessor(string_views, self.as_ptr().cast()))))
     }
 }
 
@@ -350,10 +341,7 @@ pub struct TextRange<'text> {
 
 impl<'text> From<&'text str> for TextRange<'text> {
     fn from(prefix: &'text str) -> Self {
-        TextRange {
-            prefix: Some(prefix),
-            ..TextRange::default()
-        }
+        TextRange { prefix: Some(prefix), ..TextRange::default() }
     }
 }
 
@@ -420,13 +408,12 @@ impl<'arena> Listing<'arena> {
         strings: ustore_strings_view_t,
         scores: Option<*const f32>,
     ) -> Result<Self> {
-        let offsets = exported_slice(offsets.0, 2);
-        let listed = (offsets[1] - offsets[0]) as usize;
-        let strings = Strings::exported(strings, offsets[1] as usize)?;
-        Ok(Listing {
-            strings,
-            scores: scores.map(|scores| exported_slice(scores, listed)),
-        })
+        unsafe {
+            let offsets = exported_slice(offsets.0, 2);
+            let listed = (offsets[1] - offsets[0]) as usize;
+            let strings = Strings::exported(strings, offsets[1] as usize)?;
+            Ok(Listing { strings, scores: scores.map(|scores| exported_slice(scores, listed)) })
+        }
     }
 
     /// How many strings the call listed.
@@ -446,9 +433,7 @@ impl<'arena> Listing<'arena> {
 
     /// Every string in the order the call listed it.
     pub fn iter(&self) -> Rows<Listing<'arena>, &'arena [u8]> {
-        Rows::new(*self, self.len(), |listing, index| {
-            listing.get(index).unwrap_or_default()
-        })
+        Rows::new(*self, self.len(), |listing, index| listing.get(index).unwrap_or_default())
     }
 
     /// One score per string when the patterns carried weights.
@@ -475,12 +460,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Strs> + Accepts<Keys>,
     {
-        let verb = StringsWrite {
-            collections: collections.into(),
-            strings,
-            keys,
-            durability,
-        };
+        let verb = StringsWrite { collections: collections.into(), strings, keys, durability };
         Completion::answer(self, verb)
     }
 
@@ -497,11 +477,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Strs>,
     {
-        let verb = StringsRemove {
-            collections: collections.into(),
-            strings,
-            durability,
-        };
+        let verb = StringsRemove { collections: collections.into(), strings, durability };
         Completion::answer(self, verb)
     }
 }
@@ -545,20 +521,15 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
     where
         Completion: Accepts<TextRange<'text>> + Accepts<StringsScanConfig<'config>>,
     {
-        let StringsScanConfig {
-            wanted,
-            matching,
-            mode,
-            progress,
-        } = config.into();
+        let StringsScanConfig { wanted, matching, mode, progress } = config.into();
         let verb = StringsScan {
             collection,
             range: range.into(),
             arena,
             wanted,
-            matched: Matched::new(matching),
+            matched: matching,
             mode,
-            progress: Progress::new(progress),
+            progress: Progress(progress),
             offsets: Address::default(),
             strings: ustore_strings_view_t::default(),
             scores: Address::default(),
@@ -650,7 +621,7 @@ impl<Strs: Texts, Keys: AsRef<[Key]>> Calling for StringsWrite<'_, Strs, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_strings_write(arguments)
+        unsafe { ffi::ustore_strings_write(arguments) }
     }
 
     fn finish(self) -> Result<(Strs, Keys)> {
@@ -695,7 +666,7 @@ impl<Strs: Texts> Calling for StringsRemove<'_, Strs> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_strings_remove(arguments)
+        unsafe { ffi::ustore_strings_remove(arguments) }
     }
 
     fn finish(self) -> Result<Strs> {
@@ -744,16 +715,13 @@ impl<'arena, Strs: Texts> Calling for StringsRead<'arena, '_, Strs> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_strings_read(arguments)
+        unsafe { ffi::ustore_strings_read(arguments) }
     }
 
     fn finish(self) -> Result<Mapped<'arena>> {
         self.arena.host()?;
         if self.count == 0 {
-            return Ok(Mapped {
-                presences: Bitmap::new(&[], 0),
-                keys: &[],
-            });
+            return Ok(Mapped { presences: Bitmap::new(&[], 0), keys: &[] });
         }
         // SAFETY: the read succeeded over every string, exporting a presence bit and a key for each
         // into the arena, which stays borrowed for `'arena`.
@@ -773,7 +741,7 @@ pub struct StringsScan<'arena, 'text, 'matching> {
     range: TextRange<'text>,
     arena: &'arena mut Arena,
     wanted: usize,
-    matched: Matched<'matching>,
+    matched: Matching<'matching>,
     mode: ScanMode,
     progress: Progress<'matching>,
     offsets: Address<ustore_length_t>,
@@ -804,8 +772,8 @@ impl<'arena> Calling for StringsScan<'arena, '_, '_> {
             start_strings: lent(&self.range.start),
             end_strings: lent(&self.range.end),
             direction: self.range.direction,
-            patterns: self.matched.patterns(),
-            predicate: self.matched.predicate(),
+            patterns: self.matched.lowered_patterns(),
+            predicate: self.matched.lowered_predicate(),
             offsets: &mut self.offsets.0,
             strings: &mut self.strings,
             scores: match self.matched.scores() {
@@ -821,25 +789,14 @@ impl<'arena> Calling for StringsScan<'arena, '_, '_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_strings_scan(arguments)
-    }
-
-    fn raise(&mut self) {
-        self.matched.raise();
-        self.progress.raise();
+        unsafe { ffi::ustore_strings_scan(arguments) }
     }
 
     fn finish(self) -> Result<Listing<'arena>> {
         self.arena.host()?;
         // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`; a scan with
         // weighted patterns wrote one score per string into the same arena.
-        unsafe {
-            Listing::exported(
-                self.offsets,
-                self.strings,
-                self.matched.scores().then_some(self.scores.0),
-            )
-        }
+        unsafe { Listing::exported(self.offsets, self.strings, self.matched.scores().then_some(self.scores.0)) }
     }
 }
 
@@ -879,7 +836,7 @@ impl<'arena> Calling for StringsSample<'arena> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_strings_sample(arguments)
+        unsafe { ffi::ustore_strings_sample(arguments) }
     }
 
     fn finish(self) -> Result<Listing<'arena>> {
@@ -908,8 +865,14 @@ impl Calling for StringsMeasure<'_, '_> {
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let [min_cardinalities, max_cardinalities, min_value_bytes, max_value_bytes, min_space_usages, max_space_usages] =
-            &mut self.bounds.0;
+        let [
+            min_cardinalities,
+            max_cardinalities,
+            min_value_bytes,
+            max_value_bytes,
+            min_space_usages,
+            max_space_usages,
+        ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_strings_measure_t {
             database: view.database(),
             executor: view.executor(),
@@ -932,7 +895,7 @@ impl Calling for StringsMeasure<'_, '_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_strings_measure(arguments)
+        unsafe { ffi::ustore_strings_measure(arguments) }
     }
 
     fn finish(self) -> Result<Measurement> {
@@ -1009,14 +972,8 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
     where
         Completion: Accepts<Name>,
     {
-        let verb = CollectionNames {
-            prefix,
-            start,
-            arena,
-            wanted,
-            written: 0,
-            names: ustore_strings_view_t::default(),
-        };
+        let verb =
+            CollectionNames { prefix, start, arena, wanted, written: 0, names: ustore_strings_view_t::default() };
         Completion::answer(self, verb)
     }
 }
@@ -1061,7 +1018,7 @@ impl<Name: AsRef<str>> Calling for CollectionFind<'_, Name> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        db_ffi::ustore_collection_find(arguments)
+        unsafe { db_ffi::ustore_collection_find(arguments) }
     }
 
     fn finish(self) -> Result<(CollectionID, Modality)> {
@@ -1096,22 +1053,25 @@ impl<Name: AsRef<str>> CollectionNames<'_, Name> {
     /// # Safety
     /// The listing succeeded, and the arena it exported into stays alive and untouched for `'arena`.
     unsafe fn listed<'arena>(&self) -> Result<Names<'arena>> {
-        // A collection without a name has an empty one on the tape.
-        let listed = Strings::exported(self.names, self.written as usize)?;
-        let (prefix, start) = (self.prefix.as_ref(), self.start.as_ref().map(AsRef::as_ref));
-        let mut names = Vec::new();
-        for bytes in (0..listed.len()).filter_map(|index| listed.get(index)) {
-            if bytes.is_empty() {
-                continue;
+        unsafe {
+            // A collection without a name has an empty one on the tape.
+            let listed = Strings::exported(self.names, self.written as usize)?;
+            let (prefix, start) = (self.prefix.as_ref(), self.start.as_ref().map(AsRef::as_ref));
+            let mut names = Vec::new();
+            for bytes in (0..listed.len()).filter_map(|index| listed.get(index)) {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let name =
+                    std::str::from_utf8(bytes).map_err(|_| fail(Status::Malformed, "a stored name is not UTF-8"))?;
+                if name.starts_with(prefix) && start.is_none_or(|start| name >= start) {
+                    names.push(name);
+                }
             }
-            let name = std::str::from_utf8(bytes).map_err(|_| fail(Status::Malformed, "a stored name is not UTF-8"))?;
-            if name.starts_with(prefix) && start.is_none_or(|start| name >= start) {
-                names.push(name);
-            }
+            names.sort_unstable();
+            names.truncate(self.wanted);
+            Ok(Names { names })
         }
-        names.sort_unstable();
-        names.truncate(self.wanted);
-        Ok(Names { names })
     }
 }
 
@@ -1140,7 +1100,7 @@ impl<'arena, Name: AsRef<str>> Calling for CollectionNames<'arena, Name> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        db_ffi::ustore_collection_list(arguments)
+        unsafe { db_ffi::ustore_collection_list(arguments) }
     }
 
     fn finish(self) -> Result<Names<'arena>> {
@@ -1176,12 +1136,7 @@ mod tests {
         let strings = created(&database, Modality::Strings);
         database
             .head()
-            .strings_write(
-                strings,
-                &["apple", "apricot", "banana"],
-                keys([1, 2, 3]),
-                Durability::Buffered,
-            )
+            .strings_write(strings, &["apple", "apricot", "banana"], keys([1, 2, 3]), Durability::Buffered)
             .unwrap();
         (database, strings, Arena::new().unwrap())
     }
@@ -1189,24 +1144,12 @@ mod tests {
     #[test]
     fn strings_read_back_their_keys_and_report_the_missing() {
         let (database, strings, mut arena) = populated();
-        let mapped = database
-            .head()
-            .strings_read(strings, &["banana", "cherry", "apple"], &mut arena)
-            .unwrap();
-        assert_eq!(
-            mapped.iter().collect::<Vec<_>>(),
-            vec![Some(key(3)), None, Some(key(1))]
-        );
+        let mapped = database.head().strings_read(strings, &["banana", "cherry", "apple"], &mut arena).unwrap();
+        assert_eq!(mapped.iter().collect::<Vec<_>>(), vec![Some(key(3)), None, Some(key(1))]);
         assert!(!mapped.presences().get(1));
 
-        database
-            .head()
-            .strings_remove(strings, &["apple", "cherry"], Durability::Buffered)
-            .unwrap();
-        let mapped = database
-            .head()
-            .strings_read(strings, &["apple", "apricot"], &mut arena)
-            .unwrap();
+        database.head().strings_remove(strings, &["apple", "cherry"], Durability::Buffered).unwrap();
+        let mapped = database.head().strings_read(strings, &["apple", "apricot"], &mut arena).unwrap();
         assert_eq!(mapped.iter().collect::<Vec<_>>(), vec![None, Some(key(2))]);
     }
 
@@ -1217,20 +1160,11 @@ mod tests {
         let under = head.strings_scan(strings, "ap", 10, &mut arena).unwrap();
         assert_eq!(under.iter().collect::<Vec<_>>(), vec![b"apple".as_slice(), b"apricot"]);
 
-        let backwards = TextRange {
-            direction: ScanDirection::Descending,
-            ..TextRange::default()
-        };
+        let backwards = TextRange { direction: ScanDirection::Descending, ..TextRange::default() };
         let listed = head.strings_scan(strings, backwards, 2, &mut arena).unwrap();
-        assert_eq!(
-            listed.iter().collect::<Vec<_>>(),
-            vec![b"banana".as_slice(), b"apricot"]
-        );
+        assert_eq!(listed.iter().collect::<Vec<_>>(), vec![b"banana".as_slice(), b"apricot"]);
 
-        let resumed = TextRange {
-            start: Some("apricot"),
-            ..TextRange::default()
-        };
+        let resumed = TextRange { start: Some("apricot"), ..TextRange::default() };
         let listed = head.strings_scan(strings, resumed, 10, &mut arena).unwrap();
         assert_eq!(listed.get(0), Some(b"apricot".as_slice()));
         assert_eq!(listed.len(), 2);
@@ -1251,17 +1185,9 @@ mod tests {
         let executor = Executor::for_ram(&[], 1).unwrap();
         let deferred = database.head().deferred(&executor);
         let texts: CharsTape<u64> = ["cherry", "date"].into_iter().collect();
-        deferred
-            .strings_write(strings, texts, keys([4, 5]), Durability::Buffered)
-            .unwrap()
-            .wait()
-            .unwrap();
+        deferred.strings_write(strings, texts, keys([4, 5]), Durability::Buffered).unwrap().wait().unwrap();
         let texts: CharsTape<u64> = ["date", "fig"].into_iter().collect();
-        let mapped = deferred
-            .strings_read(strings, texts, &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let mapped = deferred.strings_read(strings, texts, &mut arena).unwrap().wait().unwrap();
         assert_eq!(mapped.iter().collect::<Vec<_>>(), vec![Some(key(5)), None]);
     }
 
@@ -1291,10 +1217,7 @@ mod tests {
         let page = database.head().collection_names("", None, 2, &mut arena).unwrap();
         assert_eq!(page.len(), 2);
         let resume = page.get(1).unwrap().to_string();
-        let rest = database
-            .head()
-            .collection_names("", Some(resume.as_str()), 2, &mut arena)
-            .unwrap();
+        let rest = database.head().collection_names("", Some(resume.as_str()), 2, &mut arena).unwrap();
         assert_eq!(rest.get(0), Some("places"), "a walk resumes at the start it is given");
 
         // A prefix nothing shares walks nothing.
@@ -1318,32 +1241,16 @@ mod tests {
         let people = database.collection_create("people", Modality::Blobs).unwrap();
 
         // The snapshot predates the binding, so only the head resolves the name.
-        assert_eq!(
-            database.head().collection_find("people", &mut arena).unwrap(),
-            (people, Modality::Blobs)
-        );
-        assert_eq!(
-            snapshot
-                .view()
-                .collection_find("people", &mut arena)
-                .unwrap_err()
-                .status,
-            Status::NotFound
-        );
+        assert_eq!(database.head().collection_find("people", &mut arena).unwrap(), (people, Modality::Blobs));
+        assert_eq!(snapshot.view().collection_find("people", &mut arena).unwrap_err().status, Status::NotFound);
 
         // A transaction resolves names at the head, so it reaches a collection created after it began, and a name
         // it found missing never fails its commit.
         let mut transaction = database.transaction().unwrap();
-        assert!(transaction
-            .view(Watch::Keys)
-            .collection_find("planets", &mut arena)
-            .is_err());
+        assert!(transaction.view(Watch::Keys).collection_find("planets", &mut arena).is_err());
         let planets = database.collection_create("planets", Modality::Blobs).unwrap();
         assert_eq!(
-            transaction
-                .view(Watch::Keys)
-                .collection_find("planets", &mut arena)
-                .unwrap(),
+            transaction.view(Watch::Keys).collection_find("planets", &mut arena).unwrap(),
             (planets, Modality::Blobs)
         );
         transaction.commit(Durability::Buffered).unwrap();
@@ -1357,14 +1264,7 @@ mod tests {
         let taken = database.collection_create("people", Modality::Blobs).unwrap_err();
         assert_eq!(taken.status, Status::AlreadyExists);
         drop_named(&database, "people", &mut arena);
-        assert_eq!(
-            database
-                .head()
-                .collection_find("people", &mut arena)
-                .unwrap_err()
-                .status,
-            Status::NotFound
-        );
+        assert_eq!(database.head().collection_find("people", &mut arena).unwrap_err().status, Status::NotFound);
         let second = database.collection_create("people", Modality::Blobs).unwrap();
         assert_ne!(first, second);
 
@@ -1384,17 +1284,9 @@ mod tests {
         let (database, mut arena) = three_named();
         let executor = Executor::for_ram(&[], 1).unwrap();
         let deferred = database.head().deferred(&executor);
-        let found = deferred
-            .collection_find(String::from("places"), &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let found = deferred.collection_find(String::from("places"), &mut arena).unwrap().wait().unwrap();
         assert_eq!(found, database.head().collection_find("places", &mut arena).unwrap());
-        let missing = deferred
-            .collection_find("nowhere", &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap_err();
+        let missing = deferred.collection_find("nowhere", &mut arena).unwrap().wait().unwrap_err();
         assert_eq!(missing.status, Status::NotFound);
     }
 
@@ -1403,17 +1295,9 @@ mod tests {
         let (database, mut arena) = three_named();
         let executor = Executor::for_ram(&[], 1).unwrap();
         let deferred = database.head().deferred(&executor);
-        let listing = deferred
-            .collection_names(String::from("pl"), None, 10, &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let listing = deferred.collection_names(String::from("pl"), None, 10, &mut arena).unwrap().wait().unwrap();
         assert_eq!(listing.iter().collect::<Vec<&str>>(), vec!["places", "planets"]);
-        let resumed = deferred
-            .collection_names("", Some("places"), 1, &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let resumed = deferred.collection_names("", Some("places"), 1, &mut arena).unwrap().wait().unwrap();
         assert_eq!(resumed.iter().collect::<Vec<&str>>(), vec!["places"]);
     }
 }

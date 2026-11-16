@@ -16,15 +16,14 @@
 //! Author: Ash Vardanian
 //! Date: September 16, 2026
 
-use std::any::Any;
-use std::ffi::{c_char, c_void, CStr};
+use std::borrow::BorrowMut;
+use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
 use std::future::{Future, IntoFuture};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::{ControlFlow, Range};
-use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
 use std::str::FromStr;
@@ -108,19 +107,13 @@ pub(crate) mod ffi {
 
     impl Default for ustore_bytes_view_t {
         fn default() -> Self {
-            ustore_bytes_view_t {
-                data: ptr::null(),
-                length: 0,
-            }
+            ustore_bytes_view_t { data: ptr::null(), length: 0 }
         }
     }
 
     impl From<&[u8]> for ustore_bytes_view_t {
         fn from(bytes: &[u8]) -> Self {
-            ustore_bytes_view_t {
-                data: bytes.as_ptr(),
-                length: bytes.len() as ustore_size_t,
-            }
+            ustore_bytes_view_t { data: bytes.as_ptr(), length: bytes.len() as ustore_size_t }
         }
     }
 
@@ -136,35 +129,23 @@ pub(crate) mod ffi {
     impl<Element> ustore_strided_view_t<Element> {
         /// The run of `elements` packed one after another.
         pub fn packed(elements: &[Element]) -> Self {
-            ustore_strided_view_t {
-                data: elements.as_ptr(),
-                stride: size_of::<Element>() as ustore_size_t,
-            }
+            ustore_strided_view_t { data: elements.as_ptr(), stride: size_of::<Element>() as ustore_size_t }
         }
 
         /// The run repeating `element` for every task.
         pub fn repeated(element: &Element) -> Self {
-            ustore_strided_view_t {
-                data: element,
-                stride: 0,
-            }
+            ustore_strided_view_t { data: element, stride: 0 }
         }
 
         /// The run of one `Element` inside each of `records`, starting at `first` inside the first record.
         pub fn inside<Record>(first: &Element) -> Self {
-            ustore_strided_view_t {
-                data: first,
-                stride: size_of::<Record>() as ustore_size_t,
-            }
+            ustore_strided_view_t { data: first, stride: size_of::<Record>() as ustore_size_t }
         }
     }
 
     impl<Element> Default for ustore_strided_view_t<Element> {
         fn default() -> Self {
-            ustore_strided_view_t {
-                data: ptr::null(),
-                stride: 0,
-            }
+            ustore_strided_view_t { data: ptr::null(), stride: 0 }
         }
     }
 
@@ -222,9 +203,7 @@ pub(crate) mod ffi {
         pub fn u32_tape(data: *const u8, offsets: *const u32) -> Self {
             ustore_strings_view_t {
                 layout: USTORE_STRINGS_U32_TAPE_K,
-                data: ustore_strings_data_t {
-                    u32_tape: ustore_strings_tape_t { data, offsets },
-                },
+                data: ustore_strings_data_t { u32_tape: ustore_strings_tape_t { data, offsets } },
             }
         }
 
@@ -232,9 +211,7 @@ pub(crate) mod ffi {
         pub fn u64_tape(data: *const u8, offsets: *const u64) -> Self {
             ustore_strings_view_t {
                 layout: USTORE_STRINGS_U64_TAPE_K,
-                data: ustore_strings_data_t {
-                    u64_tape: ustore_strings_tape_t { data, offsets },
-                },
+                data: ustore_strings_data_t { u64_tape: ustore_strings_tape_t { data, offsets } },
             }
         }
 
@@ -242,9 +219,7 @@ pub(crate) mod ffi {
         pub fn accessor(get: ustore_strings_get_t, handle: *const c_void) -> Self {
             ustore_strings_view_t {
                 layout: USTORE_STRINGS_ACCESSOR_K,
-                data: ustore_strings_data_t {
-                    accessor: ustore_strings_accessor_t { get: Some(get), handle },
-                },
+                data: ustore_strings_data_t { accessor: ustore_strings_accessor_t { get: Some(get), handle } },
             }
         }
     }
@@ -286,10 +261,7 @@ pub(crate) mod ffi {
 
     impl Default for ustore_outcome_t {
         fn default() -> Self {
-            ustore_outcome_t {
-                status: ustore_status_t::SUCCESS,
-                message: core::ptr::null(),
-            }
+            ustore_outcome_t { status: ustore_status_t::SUCCESS, message: core::ptr::null() }
         }
     }
 
@@ -343,11 +315,7 @@ pub(crate) mod ffi {
 
     impl Default for ustore_predicate_t {
         fn default() -> Self {
-            ustore_predicate_t {
-                callback: None,
-                state: ptr::null_mut(),
-                cost: 0,
-            }
+            ustore_predicate_t { callback: None, state: ptr::null_mut(), cost: 0 }
         }
     }
 
@@ -402,7 +370,7 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub ram: ustore_ram_options_t,
         pub threads: ustore_size_t,
-        pub cpu_class: ustore_enum_t,
+        pub cpu_class_ceiling: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -430,7 +398,7 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub nvme: ustore_nvme_options_t,
         pub threads: ustore_size_t,
-        pub cpu_class: ustore_enum_t,
+        pub cpu_class_ceiling: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -459,7 +427,7 @@ pub(crate) mod ffi {
         pub stream: *mut c_void,
         pub scratch_limit: ustore_size_t,
         pub gds: ustore_gds_t,
-        pub gpu_class: ustore_enum_t,
+        pub gpu_class_ceiling: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -504,7 +472,7 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub completion: ustore_completion_t,
         pub isolation: ustore_enum_t,
-        pub cpu_class: ustore_enum_t,
+        pub cpu_class_ceiling: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -515,7 +483,7 @@ pub(crate) mod ffi {
         pub completion: ustore_completion_t,
         pub directory: ustore_bytes_view_t,
         pub isolation: ustore_enum_t,
-        pub cpu_class: ustore_enum_t,
+        pub cpu_class_ceiling: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -561,7 +529,7 @@ pub(crate) mod ffi {
         pub collection_level_enlarge_factor: ustore_size_t,
         pub collection_value_size: ustore_size_t,
         pub collection_value_max_size: ustore_size_t,
-        pub cpu_class: ustore_enum_t,
+        pub cpu_class_ceiling: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -597,6 +565,13 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
+    pub struct ustore_database_compact_plan_handle_t {
+        _private: [u8; 0],
+    }
+    pub type ustore_database_compact_plan_t = *mut ustore_database_compact_plan_handle_t;
+    pub type ustore_phase_progress_t = super::PhaseProgress;
+
+    #[repr(C)]
     pub struct ustore_database_compact_t {
         pub database: ustore_database_t,
         pub executor: ustore_executor_t,
@@ -604,6 +579,17 @@ pub(crate) mod ffi {
         pub completion: ustore_completion_t,
         pub progress: ustore_progress_callback_t,
         pub progress_state: *mut c_void,
+        pub plan: *mut ustore_database_compact_plan_t,
+        pub phase: *mut ustore_phase_progress_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_database_compact_plan_finish_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub plan: ustore_database_compact_plan_t,
     }
 
     #[repr(C)]
@@ -724,7 +710,7 @@ pub(crate) mod ffi {
         pub transaction: ustore_transaction_t,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn ustore_status_name(status: ustore_status_t) -> *const c_char;
         pub fn ustore_status_from_name(name: ustore_bytes_view_t, status: *mut ustore_status_t) -> ustore_status_t;
         pub fn ustore_outcome_wait(outcome: *mut ustore_outcome_t) -> ustore_status_t;
@@ -740,6 +726,8 @@ pub(crate) mod ffi {
             name: ustore_bytes_view_t,
             durability: *mut ustore_enum_t,
         ) -> ustore_status_t;
+        pub fn ustore_phase_name(phase: ustore_enum_t) -> *const c_char;
+        pub fn ustore_phase_from_name(name: ustore_bytes_view_t, phase: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_watch_name(watch: ustore_enum_t) -> *const c_char;
         pub fn ustore_watch_from_name(name: ustore_bytes_view_t, watch: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_drop_mode_name(drop_mode: ustore_enum_t) -> *const c_char;
@@ -801,6 +789,7 @@ pub(crate) mod ffi {
         pub fn ustore_database_describe(arguments: *mut ustore_database_describe_t);
         pub fn ustore_database_clear(arguments: *mut ustore_database_clear_t);
         pub fn ustore_database_compact(arguments: *mut ustore_database_compact_t);
+        pub fn ustore_database_compact_plan_finish(arguments: *mut ustore_database_compact_plan_finish_t);
         pub fn ustore_database_flush(arguments: *mut ustore_database_flush_t);
 
         pub fn ustore_snapshot_init(arguments: *mut ustore_snapshot_init_t);
@@ -908,11 +897,7 @@ impl Status {
     /// The canonical lowercase spelling the library gives this status, such as "out-of-memory".
     fn name(self) -> &'static str {
         // SAFETY: the library answers a static null-terminated spelling for every value.
-        unsafe {
-            static_string(ffi::ustore_status_name(ffi::ustore_status_t(
-                self as ffi::ustore_enum_t,
-            )))
-        }
+        unsafe { static_string(ffi::ustore_status_name(ffi::ustore_status_t(self as ffi::ustore_enum_t))) }
     }
 }
 
@@ -987,10 +972,12 @@ pub(crate) fn fail(status: Status, message: &'static str) -> Error {
 
 /// Borrows a static null-terminated string the library owns.
 unsafe fn static_string(raw: *const c_char) -> &'static str {
-    if raw.is_null() {
-        return "";
+    unsafe {
+        if raw.is_null() {
+            return "";
+        }
+        CStr::from_ptr(raw).to_str().unwrap_or("")
     }
-    CStr::from_ptr(raw).to_str().unwrap_or("")
 }
 
 /// The canonical spelling the library gives `value` through one of its `ustore_*_name` functions.
@@ -1016,7 +1003,8 @@ pub(crate) fn read_spelling<Value>(
     lift(value).ok_or(fail(Status::InvalidArgument, "no enumerator is spelled that way"))
 }
 
-/// The version of the library the program runs against, like "1.0.0".
+/// The version of the library the program runs against, pre-release suffix included, like
+/// "1.0.0-rc.1".
 ///
 /// Calls `ustore_version_name`.
 pub fn version() -> &'static str {
@@ -1082,7 +1070,7 @@ impl Key {
     /// The key right after this one in their order, where a scan resuming past it starts; the last key wraps to the
     /// first.
     pub fn next(self) -> Key {
-        Key(UUID::from(u128::from_be_bytes(self.0 .0).wrapping_add(1)))
+        Key(UUID::from(u128::from_be_bytes(self.0.0).wrapping_add(1)))
     }
 }
 
@@ -1447,20 +1435,13 @@ impl KeyRange {
 
 impl From<Key> for KeyRange {
     fn from(start: Key) -> Self {
-        KeyRange {
-            start: Some(start),
-            ..KeyRange::default()
-        }
+        KeyRange { start: Some(start), ..KeyRange::default() }
     }
 }
 
 impl From<Range<Key>> for KeyRange {
     fn from(range: Range<Key>) -> Self {
-        KeyRange {
-            start: Some(range.start),
-            end: Some(range.end),
-            direction: ScanDirection::Ascending,
-        }
+        KeyRange { start: Some(range.start), end: Some(range.end), direction: ScanDirection::Ascending }
     }
 }
 
@@ -1502,6 +1483,77 @@ impl FromStr for Mood {
 
 // endregion: Handles and Constants
 
+// region: Phases
+
+/// The kind of work a plan is doing, shared by every long operation: a compaction's flush, its
+/// merges one unit at a time, then its reclaim.
+///
+/// Mirrors `ustore_phase_t`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Phase {
+    /// No plan, or one that has not started.
+    #[default]
+    None = 0,
+    /// Writing what memory holds to storage: memory runs on NVMe, memtables on RocksDB.
+    Flush = 1,
+    /// Merging or vacuuming the stored versions one unit at a time: a collection, a column family
+    /// or an NVMe pass.
+    Merge = 2,
+    /// Freeing what no reader reaches any more and rewriting the image that names the rest.
+    Reclaim = 3,
+    /// The plan ran to its end, and nothing is pending.
+    Done = 4,
+}
+
+impl Phase {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(Phase::None),
+            1 => Some(Phase::Flush),
+            2 => Some(Phase::Merge),
+            3 => Some(Phase::Reclaim),
+            4 => Some(Phase::Done),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Phase {
+    /// Calls `ustore_phase_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_phase_name, *self as ffi::ustore_enum_t))
+    }
+}
+
+impl FromStr for Phase {
+    type Err = Error;
+
+    /// Calls `ustore_phase_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(text, ffi::ustore_phase_from_name, Phase::from_raw)
+    }
+}
+
+/// Where a plan stands: its phase, that phase's position in the plan, and its own count.
+///
+/// Mirrors `ustore_phase_progress_t`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct PhaseProgress {
+    /// The kind of work in hand.
+    pub phase: Phase,
+    /// This phase's position among the ones the plan runs, from zero.
+    pub ordinal: ffi::ustore_size_t,
+    /// Units of this phase done: collections, column families, passes or bytes, as the engine
+    /// counts them.
+    pub completed: ffi::ustore_size_t,
+    /// Units of this phase in all.
+    pub total: ffi::ustore_size_t,
+}
+
+// endregion: Phases
+
 // region: Arenas
 
 /// Memory the library writes every output whose length scales with a call into, reused across calls.
@@ -1534,15 +1586,9 @@ impl Arena {
 
     /// The arena `executor` places, where null places it for the calling thread.
     fn made_by(executor: ffi::ustore_executor_t) -> Result<Self> {
-        let mut arena = Arena {
-            handle: ptr::null_mut(),
-        };
+        let mut arena = Arena { handle: ptr::null_mut() };
         let mut outcome = ffi::ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_arena_init_t {
-            arena: &mut arena.handle,
-            executor,
-            outcome: &mut outcome,
-        };
+        let mut arguments = ffi::ustore_arena_init_t { arena: &mut arena.handle, executor, outcome: &mut outcome };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_arena_init(&mut arguments) };
         check(outcome).map(|()| arena)
@@ -1565,11 +1611,8 @@ impl Arena {
 fn describe_arena(handle: ffi::ustore_arena_t) -> Result<ArenaDescription> {
     let mut description = ffi::ustore_arena_description_t::default();
     let mut outcome = ffi::ustore_outcome_t::default();
-    let mut arguments = ffi::ustore_arena_describe_t {
-        arena: handle,
-        outcome: &mut outcome,
-        description: &mut description,
-    };
+    let mut arguments =
+        ffi::ustore_arena_describe_t { arena: handle, outcome: &mut outcome, description: &mut description };
     // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
     unsafe { ffi::ustore_arena_describe(&mut arguments) };
     check(outcome)?;
@@ -1660,11 +1703,7 @@ pub struct Rows<Results, Row> {
 
 impl<Results, Row> Rows<Results, Row> {
     pub(crate) fn new(results: Results, count: usize, row: fn(&Results, usize) -> Row) -> Self {
-        Rows {
-            results,
-            rows: 0..count,
-            row,
-        }
+        Rows { results, rows: 0..count, row }
     }
 }
 
@@ -1698,13 +1737,13 @@ unsafe extern "C" fn record_views<Record>(
     count: ffi::ustore_size_t,
     views: *mut ffi::ustore_bytes_view_t,
 ) {
-    let first = handle.cast::<u8>();
-    for slot in 0..count as usize {
-        let index = *indices.add(slot) as usize;
-        let view = first
-            .add(index * size_of::<Record>())
-            .cast::<ffi::ustore_bytes_view_t>();
-        *views.add(slot) = view.read();
+    unsafe {
+        let first = handle.cast::<u8>();
+        for slot in 0..count as usize {
+            let index = *indices.add(slot) as usize;
+            let view = first.add(index * size_of::<Record>()).cast::<ffi::ustore_bytes_view_t>();
+            *views.add(slot) = view.read();
+        }
     }
 }
 
@@ -1745,10 +1784,7 @@ pub(crate) struct Strings<'arena> {
 impl<'arena> Strings<'arena> {
     /// The strings of a call that wrote none.
     pub(crate) fn empty() -> Self {
-        Strings {
-            bytes: &[],
-            offsets: Offsets::U32(&[0]),
-        }
+        Strings { bytes: &[], offsets: Offsets::U32(&[0]) }
     }
 
     /// The `count` strings a call wrote as the tape `view`, which a call with nothing to report left zeroed.
@@ -1756,23 +1792,25 @@ impl<'arena> Strings<'arena> {
     /// # Safety
     /// A successful call wrote `view` as a tape of `count` strings into an arena alive for `'arena`, or left it zeroed.
     pub(crate) unsafe fn exported(view: ffi::ustore_strings_view_t, count: usize) -> Result<Self> {
-        match view.layout {
-            ffi::USTORE_STRINGS_U32_TAPE_K if !view.data.u32_tape.offsets.is_null() => {
-                let offsets = exported_slice(view.data.u32_tape.offsets, count + 1);
-                Ok(Strings {
-                    bytes: exported_slice(view.data.u32_tape.data, offsets[count] as usize),
-                    offsets: Offsets::U32(offsets),
-                })
+        unsafe {
+            match view.layout {
+                ffi::USTORE_STRINGS_U32_TAPE_K if !view.data.u32_tape.offsets.is_null() => {
+                    let offsets = exported_slice(view.data.u32_tape.offsets, count + 1);
+                    Ok(Strings {
+                        bytes: exported_slice(view.data.u32_tape.data, offsets[count] as usize),
+                        offsets: Offsets::U32(offsets),
+                    })
+                }
+                ffi::USTORE_STRINGS_U64_TAPE_K if !view.data.u64_tape.offsets.is_null() => {
+                    let offsets = exported_slice(view.data.u64_tape.offsets, count + 1);
+                    Ok(Strings {
+                        bytes: exported_slice(view.data.u64_tape.data, offsets[count] as usize),
+                        offsets: Offsets::U64(offsets),
+                    })
+                }
+                ffi::USTORE_STRINGS_U32_TAPE_K | ffi::USTORE_STRINGS_U64_TAPE_K => Ok(Strings::empty()),
+                _ => Err(fail(Status::Internal, "the library wrote strings in no tape layout")),
             }
-            ffi::USTORE_STRINGS_U64_TAPE_K if !view.data.u64_tape.offsets.is_null() => {
-                let offsets = exported_slice(view.data.u64_tape.offsets, count + 1);
-                Ok(Strings {
-                    bytes: exported_slice(view.data.u64_tape.data, offsets[count] as usize),
-                    offsets: Offsets::U64(offsets),
-                })
-            }
-            ffi::USTORE_STRINGS_U32_TAPE_K | ffi::USTORE_STRINGS_U64_TAPE_K => Ok(Strings::empty()),
-            _ => Err(fail(Status::Internal, "the library wrote strings in no tape layout")),
         }
     }
 
@@ -1971,6 +2009,8 @@ pub enum GPUVendor {
     Nvidia = 1,
     /// AMD, through the HIP runtime.
     Amd = 2,
+    /// Apple, through Metal.
+    Apple = 3,
 }
 
 impl GPUVendor {
@@ -1978,6 +2018,7 @@ impl GPUVendor {
         match raw {
             1 => Some(GPUVendor::Nvidia),
             2 => Some(GPUVendor::Amd),
+            3 => Some(GPUVendor::Apple),
             _ => None,
         }
     }
@@ -2018,6 +2059,12 @@ pub enum GPUClass {
     AMDCDNA4 = 8,
     /// CDNA5 AMD - MI400.
     AMDCDNA5 = 9,
+    /// Apple7-family GPUs and every Apple GPU without a class of its own - M1 & M2.
+    AppleMetal7 = 10,
+    /// Apple9-family GPUs - M3 & M4.
+    AppleMetal9 = 11,
+    /// Apple10-family GPUs - M5.
+    AppleMetal10 = 12,
 }
 
 impl GPUClass {
@@ -2031,6 +2078,9 @@ impl GPUClass {
             7 => Some(GPUClass::AMDCDNA3),
             8 => Some(GPUClass::AMDCDNA4),
             9 => Some(GPUClass::AMDCDNA5),
+            10 => Some(GPUClass::AppleMetal7),
+            11 => Some(GPUClass::AppleMetal9),
+            12 => Some(GPUClass::AppleMetal10),
             _ => None,
         }
     }
@@ -2071,8 +2121,8 @@ pub struct GPUDevice {
     pub name: String,
 }
 
-/// Every GPU this process can drive, NVIDIA devices first, then AMD, each at the ordinal [`Executor::for_vram`] names
-/// it by; empty on a machine without GPUs or their runtimes.
+/// Every GPU this process can drive, NVIDIA devices first, then AMD, then Apple, each at the
+/// ordinal [`Executor::for_vram`] names it by; empty on a machine without GPUs or their runtimes.
 ///
 /// Calls `ustore_gpu_devices`.
 pub fn gpu_devices() -> Result<Vec<GPUDevice>> {
@@ -2291,9 +2341,10 @@ pub struct RAMOptions<'options> {
     pub isolation: Isolation,
     /// The executor the open runs on; `None` opens on the calling thread.
     pub executor: Option<&'options Executor>,
-    /// The CPU class the database confines itself to, failing with [`Status::Unsupported`] where the CPU does not run
-    /// it; `None` takes what the CPU offers.
-    pub cpu_class: Option<CPUClass>,
+    /// The newest CPU class the database may confine itself to, where a class the CPU lacks narrows
+    /// the pick rather than failing and `None` sets no ceiling. [`Database::describe`] reports the
+    /// class picked, and [`Status::Unsupported`] means no compiled class fits under it.
+    pub cpu_class_ceiling: Option<CPUClass>,
 }
 
 /// What [`Database::open_rocksdb`] and [`Database::view_rocksdb`] open.
@@ -2310,10 +2361,7 @@ pub struct RocksDBOptions<'options> {
 impl<'options> RocksDBOptions<'options> {
     /// A database in an existing directory.
     pub fn at(directory: &'options str) -> Self {
-        RocksDBOptions {
-            directory,
-            ..RocksDBOptions::default()
-        }
+        RocksDBOptions { directory, ..RocksDBOptions::default() }
     }
 }
 
@@ -2329,10 +2377,7 @@ pub struct LevelDBOptions<'options> {
 impl<'options> LevelDBOptions<'options> {
     /// A database in an existing directory.
     pub fn at(directory: &'options str) -> Self {
-        LevelDBOptions {
-            directory,
-            executor: None,
-        }
+        LevelDBOptions { directory, executor: None }
     }
 }
 
@@ -2371,18 +2416,16 @@ pub struct NVMEOptions<'path> {
     pub collection_value_size: u64,
     /// Bytes of the largest value of a collection whose values vary in size.
     pub collection_value_max_size: u64,
-    /// The CPU class the database confines itself to, failing with [`Status::Unsupported`] where the CPU does not run
-    /// it; `None` takes what the CPU offers.
-    pub cpu_class: Option<CPUClass>,
+    /// The newest CPU class the database may confine itself to, where a class the CPU lacks narrows
+    /// the pick rather than failing and `None` sets no ceiling. [`Database::describe`] reports the
+    /// class picked, and [`Status::Unsupported`] means no compiled class fits under it.
+    pub cpu_class_ceiling: Option<CPUClass>,
 }
 
 impl<'path> NVMEOptions<'path> {
     /// The database a manifest names, with every default.
     pub fn at(manifest: &'path str) -> Self {
-        NVMEOptions {
-            manifest,
-            ..NVMEOptions::default()
-        }
+        NVMEOptions { manifest, ..NVMEOptions::default() }
     }
 }
 
@@ -2459,8 +2502,8 @@ pub struct Description {
     pub engine: Engine,
     /// How transactions see each other: what the RAM engine was started with, and [`Isolation::Snapshot`] elsewhere.
     pub isolation: Isolation,
-    /// The CPU class the engine's calls run as, picked at open; `None` for RocksDB and LevelDB,
-    /// which run no class's kernels.
+    /// The CPU class the engine's calls run as, picked at open under the `cpu_class_ceiling`, or
+    /// `None` for RocksDB and LevelDB, which run no class's kernels.
     pub cpu_class: Option<CPUClass>,
     /// Keys across every collection.
     pub keys: usize,
@@ -2507,9 +2550,7 @@ impl Database {
     ///
     /// Calls `ustore_database_init_ram`.
     pub fn init_ram(options: &RAMOptions<'_>) -> Result<Self> {
-        let mut database = Database {
-            handle: ptr::null_mut(),
-        };
+        let mut database = Database { handle: ptr::null_mut() };
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_init_ram_t {
             database: &mut database.handle,
@@ -2517,7 +2558,7 @@ impl Database {
             outcome: &mut outcome,
             completion: ffi::ustore_completion_t::Blocking,
             isolation: options.isolation as ffi::ustore_enum_t,
-            cpu_class: CPUClass::to_raw(options.cpu_class),
+            cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_init_ram(&mut arguments) };
@@ -2530,9 +2571,7 @@ impl Database {
     ///
     /// Calls `ustore_database_open_ram`.
     pub fn open_ram(directory: &str, options: &RAMOptions<'_>) -> Result<Self> {
-        let mut database = Database {
-            handle: ptr::null_mut(),
-        };
+        let mut database = Database { handle: ptr::null_mut() };
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_open_ram_t {
             database: &mut database.handle,
@@ -2541,7 +2580,7 @@ impl Database {
             completion: ffi::ustore_completion_t::Blocking,
             directory: directory.as_bytes().into(),
             isolation: options.isolation as ffi::ustore_enum_t,
-            cpu_class: CPUClass::to_raw(options.cpu_class),
+            cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_open_ram(&mut arguments) };
@@ -2575,9 +2614,7 @@ impl Database {
         open: unsafe extern "C" fn(*mut ffi::ustore_database_open_rocksdb_t),
     ) -> Result<Self> {
         let data_directories = data_directories(options.data_directories)?;
-        let mut database = Database {
-            handle: ptr::null_mut(),
-        };
+        let mut database = Database { handle: ptr::null_mut() };
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_open_rocksdb_t {
             database: &mut database.handle,
@@ -2599,9 +2636,7 @@ impl Database {
     ///
     /// Calls `ustore_database_open_leveldb`.
     pub fn open_leveldb(options: &LevelDBOptions<'_>) -> Result<Self> {
-        let mut database = Database {
-            handle: ptr::null_mut(),
-        };
+        let mut database = Database { handle: ptr::null_mut() };
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_open_leveldb_t {
             database: &mut database.handle,
@@ -2622,9 +2657,7 @@ impl Database {
     /// Calls `ustore_database_open_nvme`.
     pub fn open_nvme(options: &NVMEOptions<'_>) -> Result<Self> {
         let data_directories = data_directories(options.data_directories)?;
-        let mut database = Database {
-            handle: ptr::null_mut(),
-        };
+        let mut database = Database { handle: ptr::null_mut() };
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_open_nvme_t {
             database: &mut database.handle,
@@ -2645,7 +2678,7 @@ impl Database {
             collection_level_enlarge_factor: options.collection_level_enlarge_factor as ffi::ustore_size_t,
             collection_value_size: options.collection_value_size,
             collection_value_max_size: options.collection_value_max_size,
-            cpu_class: CPUClass::to_raw(options.cpu_class),
+            cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
         };
         // SAFETY: every pointer in `arguments` outlives the call, the paths included.
         unsafe { ffi::ustore_database_open_nvme(&mut arguments) };
@@ -2677,14 +2710,10 @@ impl Database {
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_database_describe(&mut arguments) };
         check(outcome)?;
-        let (Some(engine), Some(isolation)) = (
-            Engine::from_raw(description.engine),
-            Isolation::from_raw(description.isolation),
-        ) else {
-            return Err(fail(
-                Status::Malformed,
-                "the engine described itself in values a newer library added",
-            ));
+        let (Some(engine), Some(isolation)) =
+            (Engine::from_raw(description.engine), Isolation::from_raw(description.isolation))
+        else {
+            return Err(fail(Status::Malformed, "the engine described itself in values a newer library added"));
         };
         Ok(Description {
             capabilities: description.capabilities,
@@ -2704,10 +2733,18 @@ impl Database {
         self.head().clear(mode)
     }
 
-    /// Reclaims the space overwritten and removed data still takes, one collection at a time; see
+    /// Reclaims the space overwritten and removed data still takes, one unit at a time; see
     /// [`On::compact`].
-    pub fn compact<'config>(&self, config: impl Into<CompactConfig<'config>>) -> Result<()> {
+    pub fn compact<'config, Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>>(
+        &self,
+        config: impl Into<CompactConfig<'config, Plan, Phase>>,
+    ) -> Result<()> {
         self.head().compact(config)
+    }
+
+    /// Frees a compaction plan, whatever the call answers; see [`On::compact_plan_finish`].
+    pub fn compact_plan_finish(&self, plan: CompactPlan) -> Result<()> {
+        self.head().compact_plan_finish(plan)
     }
 
     /// Makes every commit that returned before the call durable; see [`On::flush`].
@@ -2743,10 +2780,7 @@ impl Database {
         unsafe { ffi::ustore_transaction_init(&mut arguments) };
         check(outcome)?;
         match handle.is_null() {
-            true => Err(fail(
-                Status::Internal,
-                "the library returned no transaction and no error",
-            )),
+            true => Err(fail(Status::Internal, "the library returned no transaction and no error")),
             false => Ok(Transaction { database: self, handle }),
         }
     }
@@ -2769,11 +2803,7 @@ impl Database {
         check(outcome)?;
         match handle.is_null() {
             true => Err(fail(Status::Internal, "the library returned no snapshot and no error")),
-            false => Ok(Snapshot {
-                database: self,
-                handle,
-                read_stamp,
-            }),
+            false => Ok(Snapshot { database: self, handle, read_stamp }),
         }
     }
 
@@ -2810,9 +2840,11 @@ impl Drop for Database {
 /// # Safety
 /// `first` addresses `count` initialized values that stay alive for `'arena`.
 pub(crate) unsafe fn exported_slice<'arena, Value>(first: *const Value, count: usize) -> &'arena [Value] {
-    match count == 0 || first.is_null() {
-        true => &[],
-        false => std::slice::from_raw_parts(first, count),
+    unsafe {
+        match count == 0 || first.is_null() {
+            true => &[],
+            false => std::slice::from_raw_parts(first, count),
+        }
     }
 }
 
@@ -2862,10 +2894,7 @@ impl<'view, Parent, Completion> On<'view, Parent, Completion> {
     where
         'view: 'with,
     {
-        On {
-            executor: executor.handle,
-            ..self
-        }
+        On { executor: executor.handle, ..self }
     }
 
     /// This view with every verb through it deferred on `executor`, answering a [`Deferred`] once submitted.
@@ -2921,11 +2950,7 @@ impl<Parent, Completion: sealed::Completion> On<'_, Parent, Completion> {
     ///
     /// Calls `ustore_collection_list`.
     pub fn collection_list<'arena>(&self, arena: &'arena mut Arena) -> Completion::Answer<CollectionList<'arena>> {
-        let verb = CollectionList {
-            arena,
-            written: 0,
-            collections: Address::default(),
-        };
+        let verb = CollectionList { arena, written: 0, collections: Address::default() };
         Completion::answer(self, verb)
     }
 }
@@ -2951,22 +2976,38 @@ impl<Completion: sealed::Completion> On<'_, Database, Completion> {
         Completion::answer(self, Clear { mode })
     }
 
-    /// Reclaims the space overwritten and removed data still takes: RocksDB and LevelDB flush and compact their
-    /// trees, and the RAM engine frees the versions no reader needs and rewrites its image.
+    /// Reclaims the space overwritten and removed data still takes: RocksDB and LevelDB flush and
+    /// compact their trees, the NVMe engine flushes its memory runs and merges its levels, and the
+    /// RAM engine frees the versions no reader needs and rewrites its image.
     ///
-    /// The work runs one collection at a time, and `progress` counts the bytes of the collections compacted where the
-    /// engine measures them, as RocksDB does, and one unit per collection elsewhere. A cancelled compaction stops
-    /// between collections, keeping what it compacted.
+    /// The work runs in [`Phase`]s, each engine running the ones it has, and the merge runs one
+    /// unit at a time: a collection on RAM and LevelDB, a column family on RocksDB, a pass on NVMe.
+    /// `progress` counts the bytes of the units where the engine measures them, as RocksDB does,
+    /// and one per unit elsewhere. A cancel stops between units, keeping what it compacted. Without
+    /// a plan the call runs to its end; a fresh [`CompactPlan`] opens one that a cancel leaves
+    /// live, the next call naming it continues from the unit it stopped at, on the same database
+    /// and executor, and [`On::compact_plan_finish`] frees it. A database admits one live plan at a
+    /// time, answering [`Status::Contended`] to a second.
     ///
     /// Calls `ustore_database_compact`.
-    pub fn compact<'config>(&self, config: impl Into<CompactConfig<'config>>) -> Completion::Answer<Compact<'config>>
+    pub fn compact<'config, Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>>(
+        &self,
+        config: impl Into<CompactConfig<'config, Plan, Phase>>,
+    ) -> Completion::Answer<Compact<'config, Plan, Phase>>
     where
-        Completion: sealed::Accepts<CompactConfig<'config>>,
+        Completion: sealed::Accepts<CompactConfig<'config, Plan, Phase>>,
     {
-        let verb = Compact {
-            progress: Progress::new(config.into().progress),
-        };
-        Completion::answer(self, verb)
+        Completion::answer(self, Compact { config: config.into() })
+    }
+
+    /// Frees `plan` whatever the call answers, after every call naming it is final, so another
+    /// compaction may open on the database. A plan a cancel stopped keeps what it compacted; a
+    /// fresh one is refused with [`Status::InvalidArgument`], as is one opened on another database
+    /// or executor.
+    ///
+    /// Calls `ustore_database_compact_plan_finish`.
+    pub fn compact_plan_finish(&self, plan: CompactPlan) -> Completion::Answer<CompactPlanFinish> {
+        Completion::answer(self, CompactPlanFinish { plan })
     }
 
     /// Makes every commit that returned before this call durable, as if each had asked for
@@ -3012,7 +3053,7 @@ impl<'arena> sealed::Calling for CollectionList<'arena> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_collection_list(arguments)
+        unsafe { ffi::ustore_collection_list(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [CollectionID]> {
@@ -3052,7 +3093,7 @@ impl sealed::Calling for CollectionDrop {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_collection_drop(arguments)
+        unsafe { ffi::ustore_collection_drop(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -3086,7 +3127,7 @@ impl sealed::Calling for Clear {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_database_clear(arguments)
+        unsafe { ffi::ustore_database_clear(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -3094,25 +3135,86 @@ impl sealed::Calling for Clear {
     }
 }
 
-/// How a compaction reports; see [`On::compact`].
-pub struct CompactConfig<'config> {
-    /// Reports the work done and stops between collections wherever it says to.
-    pub progress: Option<&'config mut ProgressCallback<'config>>,
+/// How a compaction reports, and the plan it opens or continues; see [`On::compact`].
+///
+/// A blocking call borrows its plan and phase; a deferred one owns them, and
+/// [`Deferred::wait_with_inputs`] hands them back.
+pub struct CompactConfig<'config, Plan = &'config mut CompactPlan, Phase = &'config mut PhaseProgress> {
+    /// Reports the units done and stops between units wherever it says to.
+    pub progress: Option<Box<ProgressCallback<'config>>>,
+    /// A plan a cancel leaves live and the next call continues, opened when fresh; `None` runs to
+    /// the end.
+    pub plan: Option<Plan>,
+    /// Where the call stopped, [`Phase::Done`] once the compaction ended.
+    pub phase: Option<Phase>,
 }
 
-impl<'config> From<Option<&'config mut ProgressCallback<'config>>> for CompactConfig<'config> {
-    fn from(progress: Option<&'config mut ProgressCallback<'config>>) -> Self {
-        CompactConfig { progress }
+impl Default for CompactConfig<'_> {
+    fn default() -> Self {
+        CompactConfig { progress: None, plan: None, phase: None }
     }
 }
 
-/// A compaction of every collection; see [`On::compact`].
-#[derive(Debug)]
-pub struct Compact<'progress> {
-    progress: Progress<'progress>,
+impl<'config> From<Option<Box<ProgressCallback<'config>>>> for CompactConfig<'config> {
+    fn from(progress: Option<Box<ProgressCallback<'config>>>) -> Self {
+        CompactConfig { progress, ..CompactConfig::default() }
+    }
 }
 
-impl sealed::Calling for Compact<'_> {
+impl From<CompactPlan> for CompactConfig<'_, CompactPlan, PhaseProgress> {
+    /// A deferred call owning `plan` and the phase it writes.
+    fn from(plan: CompactPlan) -> Self {
+        CompactConfig { progress: None, plan: Some(plan), phase: Some(PhaseProgress::default()) }
+    }
+}
+
+/// A compaction in flight between calls, which [`On::compact_plan_finish`] frees.
+///
+/// A fresh one is opened by the first call holding it, and every call naming it runs on the
+/// database and executor it was opened with. Dropping a fresh one frees nothing, and dropping a
+/// live one leaves its database compacting.
+///
+/// Mirrors `ustore_database_compact_plan_t`.
+#[derive(Debug)]
+pub struct CompactPlan {
+    handle: ffi::ustore_database_compact_plan_t,
+}
+
+impl Default for CompactPlan {
+    /// A fresh plan, which the first call holding it opens.
+    fn default() -> Self {
+        CompactPlan { handle: ptr::null_mut() }
+    }
+}
+
+impl CompactPlan {
+    /// Whether a call opened the plan, which only [`On::compact_plan_finish`] frees.
+    pub fn is_open(&self) -> bool {
+        !self.handle.is_null()
+    }
+}
+
+// SAFETY: a plan is driven by one call at a time, which the `&mut` or the ownership holding it
+// enforces.
+unsafe impl Send for CompactPlan {}
+
+/// A compaction of every collection; see [`On::compact`].
+pub struct Compact<'config, Plan, Phase> {
+    config: CompactConfig<'config, Plan, Phase>,
+}
+
+impl<Plan, Phase> fmt::Debug for Compact<'_, Plan, Phase> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Compact")
+            .field("progress", &self.config.progress.is_some())
+            .field("plan", &self.config.plan.is_some())
+            .field("phase", &self.config.phase.is_some())
+            .finish()
+    }
+}
+
+impl<Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>> sealed::Calling for Compact<'_, Plan, Phase> {
     type Arguments = ffi::ustore_database_compact_t;
     type Output = ();
 
@@ -3122,7 +3224,8 @@ impl sealed::Calling for Compact<'_> {
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let (progress, progress_state) = self.progress.lowered();
+        let config = &mut self.config;
+        let (progress, progress_state) = lowered_progress(&mut config.progress);
         Ok(Some(ffi::ustore_database_compact_t {
             database: view.database(),
             executor: view.executor(),
@@ -3130,15 +3233,57 @@ impl sealed::Calling for Compact<'_> {
             completion,
             progress,
             progress_state,
+            plan: config.plan.as_mut().map_or(ptr::null_mut(), |plan| &mut plan.borrow_mut().handle),
+            phase: config.phase.as_mut().map_or(ptr::null_mut(), |phase| phase.borrow_mut()),
         }))
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_database_compact(arguments)
+        unsafe { ffi::ustore_database_compact(arguments) }
     }
 
-    fn raise(&mut self) {
-        self.progress.raise()
+    fn finish(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<'config, Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>> sealed::Lending
+    for Compact<'config, Plan, Phase>
+{
+    type Inputs = CompactConfig<'config, Plan, Phase>;
+
+    fn finish_with_inputs(self) -> (Result<()>, Self::Inputs) {
+        (Ok(()), self.config)
+    }
+}
+
+/// The free of a compaction plan; see [`On::compact_plan_finish`].
+#[derive(Debug)]
+pub struct CompactPlanFinish {
+    plan: CompactPlan,
+}
+
+impl sealed::Calling for CompactPlanFinish {
+    type Arguments = ffi::ustore_database_compact_plan_finish_t;
+    type Output = ();
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &On<'_, Parent, Completion>,
+        outcome: *mut ffi::ustore_outcome_t,
+        completion: ffi::ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        Ok(Some(ffi::ustore_database_compact_plan_finish_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            plan: self.plan.handle,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        unsafe { ffi::ustore_database_compact_plan_finish(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -3169,7 +3314,7 @@ impl sealed::Calling for Flush {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_database_flush(arguments)
+        unsafe { ffi::ustore_database_flush(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -3306,14 +3451,18 @@ impl FromStr for PredicateCost {
 /// A caller's verdict on one page of listed keys, writing one [`Admission`] per key, every one starting as
 /// [`Admission::Reject`].
 ///
-/// It runs on whichever thread runs the call, never on two at once within one call, so it owes `Send` and may be
-/// `FnMut`. A panic inside it rejects the rest of the call's keys and resurfaces once the call is final.
+/// It runs on whichever thread runs the call, never on two at once within one call, so it owes
+/// `Send` and may be `FnMut`. It must not panic: unwinding out of the library's `extern "C"` frame
+/// aborts the process.
 ///
 /// Mirrors `ustore_predicate_callback_t`.
 pub type PredicateCallback<'handler> = dyn FnMut(&[Key], &mut [Admission]) + Send + 'handler;
 
 /// What a scan or a cursor narrows its keys by, every part left empty to keep every key: patterns over the values of
 /// blobs, a JSONPath or XPath filter over documents and pages, and a predicate over the keys.
+///
+/// The predicate is boxed, so a deferred call owns it outright, while a blocking one may box a
+/// borrow.
 ///
 /// Mirrors the `patterns`, `filter` and `predicate` fields of `ustore_blobs_scan_t` and its kin.
 #[derive(Default)]
@@ -3329,7 +3478,7 @@ pub struct Matching<'matching> {
     /// The JSONPath, root filter or XPath every listed document or page matches.
     pub filter: Option<&'matching str>,
     /// The caller's verdict on the keys of every page.
-    pub predicate: Option<&'matching mut PredicateCallback<'matching>>,
+    pub predicate: Option<Box<PredicateCallback<'matching>>>,
     /// Where the predicate is asked.
     pub predicate_cost: PredicateCost,
 }
@@ -3349,71 +3498,43 @@ impl fmt::Debug for Matching<'_> {
     }
 }
 
-/// The matching one call or cursor lends the library, and the first panic its predicate raised, which resurfaces once
-/// the call is final, since unwinding out of an `extern "C"` frame aborts.
-pub(crate) struct Matched<'matching> {
-    matching: Matching<'matching>,
-    panic: Option<Box<dyn Any + Send>>,
-}
-
-impl<'matching> Matched<'matching> {
-    pub(crate) fn new(matching: Matching<'matching>) -> Self {
-        Matched { matching, panic: None }
-    }
-
+impl Matching<'_> {
     /// The patterns as the ABI takes them, viewing what `self` borrows.
-    pub(crate) fn patterns(&self) -> ffi::ustore_patterns_t {
-        let patterns = self.matching.patterns;
+    pub(crate) fn lowered_patterns(&self) -> ffi::ustore_patterns_t {
+        let patterns = self.patterns;
         if patterns.is_empty() {
             return ffi::ustore_patterns_t::default();
         }
         ffi::ustore_patterns_t {
             patterns: ffi::ustore_strings_view_t::accessor(string_views, patterns.as_ptr().cast()),
             count: patterns.len() as ffi::ustore_size_t,
-            kind: self.matching.pattern_kind as ffi::ustore_enum_t,
-            sensitivity: self.matching.sensitivity as ffi::ustore_enum_t,
-            weights: self.matching.weights.map_or(ptr::null(), <[f32]>::as_ptr),
+            kind: self.pattern_kind as ffi::ustore_enum_t,
+            sensitivity: self.sensitivity as ffi::ustore_enum_t,
+            weights: self.weights.map_or(ptr::null(), <[f32]>::as_ptr),
         }
     }
 
     /// The filter as the ABI takes it, viewing what `self` borrows.
-    pub(crate) fn filter(&self) -> ffi::ustore_bytes_view_t {
-        self.matching
-            .filter
-            .map_or_else(ffi::ustore_bytes_view_t::default, |filter| filter.as_bytes().into())
+    pub(crate) fn lowered_filter(&self) -> ffi::ustore_bytes_view_t {
+        self.filter.map_or_else(ffi::ustore_bytes_view_t::default, |filter| filter.as_bytes().into())
     }
 
     /// Whether the patterns carry weights, so a scan writes scores.
     pub(crate) fn scores(&self) -> bool {
-        self.matching.weights.is_some()
+        self.weights.is_some()
     }
 
-    /// The predicate as the ABI takes it, addressing `self`, which stays in place until the call or the cursor ends.
-    pub(crate) fn predicate(&mut self) -> ffi::ustore_predicate_t {
-        match self.matching.predicate {
-            Some(_) => ffi::ustore_predicate_t {
+    /// The predicate as the ABI takes it, addressing the box in `self`, which stays in place until
+    /// the call or the cursor ends.
+    pub(crate) fn lowered_predicate(&mut self) -> ffi::ustore_predicate_t {
+        match &mut self.predicate {
+            Some(handler) => ffi::ustore_predicate_t {
                 callback: Some(predicate_trampoline),
-                state: ptr::from_mut(self).cast(),
-                cost: self.matching.predicate_cost as ffi::ustore_enum_t,
+                state: ptr::from_mut(handler).cast(),
+                cost: self.predicate_cost as ffi::ustore_enum_t,
             },
             None => ffi::ustore_predicate_t::default(),
         }
-    }
-
-    /// Re-raises the first panic the predicate raised, once the call is final.
-    pub(crate) fn raise(&mut self) {
-        if let Some(panic) = self.panic.take() {
-            std::panic::resume_unwind(panic)
-        }
-    }
-}
-
-impl fmt::Debug for Matched<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Matched")
-            .field("matching", &self.matching)
-            .finish_non_exhaustive()
     }
 }
 
@@ -3424,38 +3545,32 @@ pub(crate) unsafe extern "C" fn string_views(
     count: ffi::ustore_size_t,
     views: *mut ffi::ustore_bytes_view_t,
 ) {
-    let texts = handle.cast::<&str>();
-    for slot in 0..count as usize {
-        let text = *texts.add(*indices.add(slot) as usize);
-        *views.add(slot) = text.as_bytes().into();
+    unsafe {
+        let texts = handle.cast::<&str>();
+        for slot in 0..count as usize {
+            let text = *texts.add(*indices.add(slot) as usize);
+            *views.add(slot) = text.as_bytes().into();
+        }
     }
 }
 
-/// Runs the predicate of the [`Matched`] at `state` over one page, rejecting every key on a panic.
+/// Runs the boxed predicate at `state` over one page.
 ///
 /// # Safety
-/// `state` addresses the `Matched` of the call or cursor the predicate was passed to, which nothing else reaches until
-/// the callback returns, and `keys` and `admissions` hold `count` entries each.
+/// `state` addresses the predicate box of the call or cursor it was passed to, which nothing else
+/// reaches until the callback returns, and `keys` and `admissions` hold `count` entries each.
 unsafe extern "C" fn predicate_trampoline(
     keys: *const ffi::ustore_key_t,
     admissions: *mut ffi::ustore_enum_t,
     count: ffi::ustore_size_t,
     state: *mut c_void,
 ) {
-    let matched = &mut *state.cast::<Matched<'_>>();
-    let count = count as usize;
-    // SAFETY: the library wrote a rejection into every admission, a valid `Admission` of the same width.
-    let admissions = std::slice::from_raw_parts_mut(admissions.cast::<Admission>(), count);
-    let Some(handler) = matched.matching.predicate.as_mut() else {
-        return;
-    };
-    if matched.panic.is_some() {
-        return;
-    }
-    let keys = std::slice::from_raw_parts(keys, count);
-    if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| handler(keys, &mut *admissions))) {
-        admissions.fill(Admission::Reject);
-        matched.panic = Some(panic);
+    unsafe {
+        let handler = &mut *state.cast::<Box<PredicateCallback<'_>>>();
+        let count = count as usize;
+        // SAFETY: the library wrote a rejection, a valid `Admission` of that width, into each slot.
+        let admissions = std::slice::from_raw_parts_mut(admissions.cast::<Admission>(), count);
+        handler(std::slice::from_raw_parts(keys, count), admissions);
     }
 }
 
@@ -3463,73 +3578,60 @@ unsafe extern "C" fn predicate_trampoline(
 
 // region: Progress
 
-/// A periodic report of the units a call finished and the units it finishes if it runs to the end, where
-/// `ControlFlow::Break` cancels the call, which then fails with [`Status::Cancelled`] and publishes nothing.
+/// A periodic report of the units a call finished and the units it finishes if it runs to the end,
+/// where `ControlFlow::Break` cancels the call, which then fails with [`Status::Cancelled`].
 ///
-/// It runs on whichever thread advanced the work, never on two at once and never after the call is final, so it owes
-/// `Send` and may be `FnMut`. A panic inside it cancels the call as well, and resurfaces once the call is final.
+/// It runs on whichever thread advanced the work, never on two at once and never after the call is
+/// final, so it owes `Send` and may be `FnMut`. It must not panic: unwinding out of the library's
+/// `extern "C"` frame aborts the process. A config holds it boxed, so a deferred call owns it
+/// outright, while a blocking one may box a borrow.
 ///
 /// Mirrors `ustore_progress_callback_t`.
 pub type ProgressCallback<'handler> = dyn FnMut(usize, usize) -> ControlFlow<()> + Send + 'handler;
 
-/// The progress handler one call lends the library, and the first panic it raised, which resurfaces once the call is
-/// final, since unwinding out of an `extern "C"` frame aborts.
-pub(crate) struct Progress<'handler> {
-    handler: Option<&'handler mut ProgressCallback<'handler>>,
-    panic: Option<Box<dyn Any + Send>>,
-}
+/// The progress handler one call lends the library.
+pub(crate) struct Progress<'handler>(pub(crate) Option<Box<ProgressCallback<'handler>>>);
 
-impl<'handler> Progress<'handler> {
-    pub(crate) fn new(handler: Option<&'handler mut ProgressCallback<'handler>>) -> Self {
-        Progress { handler, panic: None }
-    }
-
-    /// The callback and state a reporting verb passes, addressing `self`, which stays in place until the call is
-    /// final, or nulls without a handler.
+impl Progress<'_> {
+    /// The callback and state the verb passes, addressing the handler's box, which stays in place
+    /// until the call is final.
     pub(crate) fn lowered(&mut self) -> (ffi::ustore_progress_callback_t, *mut c_void) {
-        match self.handler {
-            Some(_) => (Some(progress_trampoline), ptr::from_mut(self).cast()),
-            None => (None, ptr::null_mut()),
-        }
-    }
-
-    /// Re-raises the first panic the handler raised, once the call is final.
-    pub(crate) fn raise(&mut self) {
-        if let Some(panic) = self.panic.take() {
-            std::panic::resume_unwind(panic)
-        }
+        lowered_progress(&mut self.0)
     }
 }
 
 impl fmt::Debug for Progress<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Progress")
-            .field("reporting", &self.handler.is_some())
-            .finish_non_exhaustive()
+        formatter.debug_struct("Progress").field("reporting", &self.0.is_some()).finish()
     }
 }
 
-/// Runs the handler of the [`Progress`] at `state`, cancelling the call on a `Break` or a panic.
+/// The callback and state a reporting verb passes for `handler`, addressing its box, which stays in
+/// place until the call is final, or nulls without one.
+pub(crate) fn lowered_progress(
+    handler: &mut Option<Box<ProgressCallback<'_>>>,
+) -> (ffi::ustore_progress_callback_t, *mut c_void) {
+    match handler {
+        Some(handler) => (Some(progress_trampoline), ptr::from_mut(handler).cast()),
+        None => (None, ptr::null_mut()),
+    }
+}
+
+/// Runs the boxed handler at `state`, cancelling the call on a `Break`.
 ///
 /// # Safety
-/// `state` addresses the `Progress` of the call the callback was passed to, which nothing else reaches until the
-/// callback returns, since the library never runs one callback concurrently with itself.
+/// `state` addresses the handler box of the call it was passed to, which nothing else reaches until
+/// the callback returns, since the library never runs one callback concurrently with itself.
 unsafe extern "C" fn progress_trampoline(
     finished: ffi::ustore_size_t,
     total: ffi::ustore_size_t,
     state: *mut c_void,
 ) -> ffi::ustore_enum_t {
-    let progress = &mut *state.cast::<Progress<'_>>();
-    let Some(handler) = progress.handler.as_mut() else {
-        return ffi::USTORE_CONTINUE_K;
-    };
-    match std::panic::catch_unwind(AssertUnwindSafe(|| handler(finished as usize, total as usize))) {
-        Ok(ControlFlow::Continue(())) => ffi::USTORE_CONTINUE_K,
-        Ok(ControlFlow::Break(())) => ffi::USTORE_CANCEL_K,
-        Err(panic) => {
-            progress.panic.get_or_insert(panic);
-            ffi::USTORE_CANCEL_K
+    unsafe {
+        let handler = &mut *state.cast::<Box<ProgressCallback<'_>>>();
+        match handler(finished as usize, total as usize) {
+            ControlFlow::Continue(()) => ffi::USTORE_CONTINUE_K,
+            ControlFlow::Break(()) => ffi::USTORE_CANCEL_K,
         }
     }
 }
@@ -3540,7 +3642,7 @@ unsafe extern "C" fn progress_trampoline(
 
 /// The traits only this crate implements.
 pub(crate) mod sealed {
-    use super::{ffi, On, Result};
+    use super::{On, Result, ffi};
 
     /// One verb over one `#[repr(C)]` argument struct: where the arguments point, which C entry point takes them,
     /// and what a successful call hands back.
@@ -3566,11 +3668,18 @@ pub(crate) mod sealed {
         /// Everything `arguments` points to stays alive and in place until the outcome is final.
         unsafe fn call(arguments: *mut Self::Arguments);
 
-        /// Re-raises the first panic a handler the verb lent raised, once the call is final.
-        fn raise(&mut self) {}
-
         /// What the verb hands back once its outcome is a success.
         fn finish(self) -> Result<Self::Output>;
+    }
+
+    /// A verb whose inputs a deferred call hands back beside its answer, like a plan a stop left
+    /// live.
+    pub trait Lending: Calling {
+        /// What the verb owned.
+        type Inputs;
+
+        /// What [`Calling::finish`] hands back, beside the inputs.
+        fn finish_with_inputs(self) -> (Result<Self::Output>, Self::Inputs);
     }
 
     /// How the verbs of a view complete, which decides what each of them answers.
@@ -3590,7 +3699,7 @@ pub(crate) mod sealed {
         label = "the library would still read this borrow after the verb returns",
         note = "pass keys or edges in an array or a `Vec`, keys beside a `BytesTape` or a `CharsTape`, paths in a \
                 `CharsTape`, columns in a `Vec<Column<'static>>`, names as a `String`, and `'static` collections, \
-                roles, fields, names and progress handlers"
+                roles, fields and names, and boxed handlers that borrow nothing"
     )]
     pub trait Accepts<Input> {}
 
@@ -3623,7 +3732,6 @@ impl sealed::Completion for Blocking {
             // SAFETY: the arguments point into `verb` and `outcome`, which stay in place until the call returns, and
             // a blocking call is final on return.
             unsafe { Verb::call(&mut arguments) };
-            verb.raise();
             check(outcome)?;
         }
         verb.finish()
@@ -3634,19 +3742,13 @@ impl sealed::Completion for Deferring {
     type Answer<Verb: sealed::Calling> = Result<Deferred<Verb>>;
 
     fn answer<Parent, Verb: sealed::Calling>(view: &On<'_, Parent, Deferring>, verb: Verb) -> Result<Deferred<Verb>> {
-        let lent = Box::into_raw(Box::new(Lent {
-            outcome: ffi::ustore_outcome_t::default(),
-            verb,
-        }));
+        let lent = Box::into_raw(Box::new(Lent { outcome: ffi::ustore_outcome_t::default(), verb }));
         // SAFETY: the box is fresh and reached through `lent` alone, and the arguments point into its fields, where
         // they stay until the box is freed, while submission copies the arguments themselves. A verb that reaches no
         // engine leaves the outcome a final success.
         unsafe {
             let outcome = ptr::addr_of_mut!((*lent).outcome);
-            match (*lent)
-                .verb
-                .arguments(view, outcome, ffi::ustore_completion_t::Deferred)
-            {
+            match (*lent).verb.arguments(view, outcome, ffi::ustore_completion_t::Deferred) {
                 Ok(Some(mut arguments)) => Verb::call(&mut arguments),
                 Ok(None) => {}
                 Err(refusal) => {
@@ -3654,9 +3756,7 @@ impl sealed::Completion for Deferring {
                     return Err(refusal);
                 }
             }
-            Ok(Deferred {
-                lent: NonNull::new_unchecked(lent),
-            })
+            Ok(Deferred { lent: NonNull::new_unchecked(lent) })
         }
     }
 }
@@ -3691,7 +3791,7 @@ impl sealed::Accepts<Vec<Edge>> for Deferring {}
 impl<const COUNT: usize> sealed::Accepts<[Edge; COUNT]> for Deferring {}
 impl sealed::Accepts<Collections<'static>> for Deferring {}
 impl sealed::Accepts<Roles<'static>> for Deferring {}
-impl sealed::Accepts<CompactConfig<'static>> for Deferring {}
+impl<Plan: 'static, Phase: 'static> sealed::Accepts<CompactConfig<'static, Plan, Phase>> for Deferring {}
 impl<Path> sealed::Accepts<SaveConfig<'static, Path>> for Deferring where Deferring: sealed::Accepts<Path> {}
 impl sealed::Accepts<Matching<'static>> for Deferring {}
 impl sealed::Accepts<crate::strings::TextRange<'static>> for Deferring {}
@@ -3703,9 +3803,9 @@ impl sealed::Writable for Transaction<'_> {}
 /// A submitted call, which owns its outcome, inputs and output slots in one box the library reads until the call is
 /// final, and borrows its arena as a blocking call does.
 ///
-/// [`Deferred::status`] polls without blocking, and [`Deferred::wait`] blocks until the call is final and hands back
-/// what it produced, while `.await` polls it from async code. Dropping an unfinished one waits for it, then frees the
-/// box. A panic its progress handler raised resurfaces from `wait`, `.await`, or a drop outside unwinding.
+/// [`Deferred::status`] polls without blocking, and [`Deferred::wait`] blocks until the call is
+/// final and hands back what it produced, while `.await` polls it from async code. Dropping an
+/// unfinished one waits for it, then frees the box.
 ///
 /// Rust-only; polling calls `ustore_outcome_status`, and waiting and dropping call `ustore_outcome_wait`.
 #[must_use = "a deferred call's outcome is seen only through `status`, `wait` or `.await`"]
@@ -3726,15 +3826,32 @@ impl<Verb: sealed::Calling> Deferred<Verb> {
     ///
     /// Calls `ustore_outcome_wait`.
     pub fn wait(self) -> Result<Verb::Output> {
+        let (outcome, verb) = self.waited();
+        check(outcome)?;
+        verb.finish()
+    }
+
+    /// Blocks until the call is final, then frees the box, handing back its outcome and the verb.
+    fn waited(self) -> (ffi::ustore_outcome_t, Verb) {
         let lent = ManuallyDrop::new(self).lent.as_ptr();
         // SAFETY: once the outcome is final the library touches the box no more, so it is freed here.
-        let Lent { outcome, mut verb } = unsafe {
+        let Lent { outcome, verb } = unsafe {
             ffi::ustore_outcome_wait(ptr::addr_of_mut!((*lent).outcome));
             *Box::from_raw(lent)
         };
-        verb.raise();
-        check(outcome)?;
-        verb.finish()
+        (outcome, verb)
+    }
+}
+
+impl<Verb: sealed::Lending> Deferred<Verb> {
+    /// Blocks until the call is final, then hands back what it produced beside the inputs it owned,
+    /// like a plan a stop left live.
+    ///
+    /// Calls `ustore_outcome_wait`.
+    pub fn wait_with_inputs(self) -> (Result<Verb::Output>, Verb::Inputs) {
+        let (outcome, verb) = self.waited();
+        let (output, inputs) = verb.finish_with_inputs();
+        (check(outcome).and(output), inputs)
     }
 }
 
@@ -3742,13 +3859,9 @@ impl<Verb: sealed::Calling> Drop for Deferred<Verb> {
     fn drop(&mut self) {
         let lent = self.lent.as_ptr();
         // SAFETY: once the outcome is final the library touches the box no more, and this `Deferred` owned it.
-        let Lent { mut verb, .. } = unsafe {
+        unsafe {
             ffi::ustore_outcome_wait(ptr::addr_of_mut!((*lent).outcome));
-            *Box::from_raw(lent)
-        };
-        // A second panic while unwinding would abort, so only a drop outside one re-raises.
-        if !std::thread::panicking() {
-            verb.raise();
+            drop(Box::from_raw(lent));
         }
     }
 }
@@ -3771,10 +3884,9 @@ impl<Verb: sealed::Calling> IntoFuture for Deferred<Verb> {
     }
 }
 
-/// A [`Deferred`] being awaited: every poll reads its status, and one not yet final asks to be polled again.
-///
-/// The C library has no wake-up, so an executor re-polls it while other tasks run, spinning only when nothing else is
-/// ready; [`Deferred::wait`] blocks without spinning.
+/// A [`Deferred`] being awaited: every poll reads its status, and one not yet final asks to be
+/// polled again and returns, so the runtime decides when, and no thread sleeps or parks in
+/// `ustore_outcome_wait` on the awaiting task's behalf; [`Deferred::wait`] blocks there instead.
 ///
 /// Rust-only; every poll calls `ustore_outcome_status`, and the final one `ustore_outcome_wait`, which returns at once.
 #[must_use = "an awaited call does nothing unless polled"]
@@ -3844,7 +3956,7 @@ impl Executor {
             outcome: &mut outcome,
             ram: ram_options(memory_domains),
             threads: threads as ffi::ustore_size_t,
-            cpu_class: CPUClass::to_raw(None),
+            cpu_class_ceiling: CPUClass::to_raw(None),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return and copies the domains.
         unsafe { ffi::ustore_executor_for_ram(&mut arguments) };
@@ -3862,18 +3974,20 @@ impl Executor {
     /// # Safety
     /// `pool` must address a live ForkUnion `fu_pool_t` that outlives the executor.
     pub unsafe fn on_pool(memory_domains: &[i32], pool: *mut c_void) -> Result<Self> {
-        let mut handle: ffi::ustore_executor_t = ptr::null_mut();
-        let mut outcome = ffi::ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_executor_on_pool_t {
-            executor: &mut handle,
-            outcome: &mut outcome,
-            ram: ram_options(memory_domains),
-            pool,
-        };
-        // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and the caller vouches
-        // for the pool.
-        ffi::ustore_executor_on_pool(&mut arguments);
-        Executor::created(handle, outcome)
+        unsafe {
+            let mut handle: ffi::ustore_executor_t = ptr::null_mut();
+            let mut outcome = ffi::ustore_outcome_t::default();
+            let mut arguments = ffi::ustore_executor_on_pool_t {
+                executor: &mut handle,
+                outcome: &mut outcome,
+                ram: ram_options(memory_domains),
+                pool,
+            };
+            // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and
+            // the caller vouches for the pool.
+            ffi::ustore_executor_on_pool(&mut arguments);
+            Executor::created(handle, outcome)
+        }
     }
 
     /// Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O
@@ -3889,40 +4003,42 @@ impl Executor {
             outcome: &mut outcome,
             nvme: nvme_options(io),
             threads: threads as ffi::ustore_size_t,
-            cpu_class: CPUClass::to_raw(None),
+            cpu_class_ceiling: CPUClass::to_raw(None),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_executor_for_nvme(&mut arguments) };
         Executor::created(handle, outcome)
     }
 
-    /// Opens one submission stream on `device`, a [`GPUDevice::ordinal`] of either vendor, or
-    /// borrows the caller's `stream`, fed by the calling thread, which is why this takes no thread
-    /// count, moving bytes as `gds` says. Zero `scratch_limit` lets scratch grow as calls ask. It
-    /// fails with [`Status::Device`] for an ordinal no device carries. [`NVMEOptions::compactions`]
+    /// Opens one submission stream on `device`, a [`GPUDevice::ordinal`] of any vendor, or borrows
+    /// the caller's `stream`, fed by the calling thread, which is why this takes no thread count,
+    /// moving bytes as `gds` says. Zero `scratch_limit` lets scratch grow as calls ask. It fails
+    /// with [`Status::Device`] for an ordinal no device carries. [`NVMEOptions::compactions`]
     /// places the merges of an NVMe database on one of an NVIDIA device.
     ///
     /// Calls `ustore_executor_for_vram`.
     ///
     /// # Safety
-    /// `stream` must be null or a live stream on `device` that outlives the executor: a `cudaStream_t` on NVIDIA and a
-    /// `hipStream_t` on AMD.
+    /// `stream` must be null or a live stream on `device` that outlives the executor: a
+    /// `cudaStream_t` on NVIDIA, a `hipStream_t` on AMD and an `id<MTLCommandQueue>` on Apple.
     pub unsafe fn for_vram(device: i32, stream: *mut c_void, scratch_limit: usize, gds: Gds) -> Result<Self> {
-        let mut handle: ffi::ustore_executor_t = ptr::null_mut();
-        let mut outcome = ffi::ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_executor_for_vram_t {
-            executor: &mut handle,
-            outcome: &mut outcome,
-            device,
-            stream,
-            scratch_limit: scratch_limit as ffi::ustore_size_t,
-            gds,
-            gpu_class: 0,
-        };
-        // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and the caller vouches
-        // for the stream.
-        ffi::ustore_executor_for_vram(&mut arguments);
-        Executor::created(handle, outcome)
+        unsafe {
+            let mut handle: ffi::ustore_executor_t = ptr::null_mut();
+            let mut outcome = ffi::ustore_outcome_t::default();
+            let mut arguments = ffi::ustore_executor_for_vram_t {
+                executor: &mut handle,
+                outcome: &mut outcome,
+                device,
+                stream,
+                scratch_limit: scratch_limit as ffi::ustore_size_t,
+                gds,
+                gpu_class_ceiling: 0,
+            };
+            // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and
+            // the caller vouches for the stream.
+            ffi::ustore_executor_for_vram(&mut arguments);
+            Executor::created(handle, outcome)
+        }
     }
 
     /// The executor a constructor wrote, refusing a handle the library left null.
@@ -3937,11 +4053,7 @@ impl Executor {
     /// Waits until no call holds the executor, then parks or spins its threads as `mood` asks.
     pub fn drain(&self, mood: Mood) -> Result<()> {
         let mut outcome = ffi::ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_executor_drain_t {
-            executor: self.handle,
-            outcome: &mut outcome,
-            mood,
-        };
+        let mut arguments = ffi::ustore_executor_drain_t { executor: self.handle, outcome: &mut outcome, mood };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_executor_drain(&mut arguments) };
         check(outcome)
@@ -4035,18 +4147,13 @@ impl<Completion: sealed::Completion> On<'_, Transaction<'_>, Completion> {
     /// Stages the writes of this view's transaction as the first phase of a two-phase commit, reporting the stamp the
     /// transaction reads at.
     pub fn stage(&self) -> Completion::Answer<Stage> {
-        let verb = Stage {
-            stamp: ReadStamp::default(),
-        };
+        let verb = Stage { stamp: ReadStamp::default() };
         Completion::answer(self, verb)
     }
 
     /// Commits the writes of this view's transaction, reporting the commit's position in commit order.
     pub fn commit(&self, durability: Durability) -> Completion::Answer<Commit> {
-        let verb = Commit {
-            durability,
-            stamp: CommitStamp::default(),
-        };
+        let verb = Commit { durability, stamp: CommitStamp::default() };
         Completion::answer(self, verb)
     }
 
@@ -4059,9 +4166,7 @@ impl<Completion: sealed::Completion> On<'_, Transaction<'_>, Completion> {
     /// Discards the reads and writes of this view's transaction and reopens it on the newest state, keeping its
     /// handle.
     pub fn reset(&self) -> Completion::Answer<Reset> {
-        let verb = Reset {
-            transaction: Address::default(),
-        };
+        let verb = Reset { transaction: Address::default() };
         Completion::answer(self, verb)
     }
 }
@@ -4093,7 +4198,7 @@ impl sealed::Calling for Stage {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_transaction_stage(arguments)
+        unsafe { ffi::ustore_transaction_stage(arguments) }
     }
 
     fn finish(self) -> Result<ReadStamp> {
@@ -4130,7 +4235,7 @@ impl sealed::Calling for Commit {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_transaction_commit(arguments)
+        unsafe { ffi::ustore_transaction_commit(arguments) }
     }
 
     fn finish(self) -> Result<CommitStamp> {
@@ -4162,7 +4267,7 @@ impl sealed::Calling for Rollback {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_transaction_rollback(arguments)
+        unsafe { ffi::ustore_transaction_rollback(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -4198,7 +4303,7 @@ impl sealed::Calling for Reset {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_transaction_init(arguments)
+        unsafe { ffi::ustore_transaction_init(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -4287,10 +4392,7 @@ impl<Completion: sealed::Completion> On<'_, Snapshot<'_>, Completion> {
         Completion: sealed::Accepts<SaveConfig<'config, Path>>,
     {
         let SaveConfig { path, progress } = config.into();
-        let verb = Save {
-            path,
-            progress: Progress::new(progress),
-        };
+        let verb = Save { path, progress: Progress(progress) };
         Completion::answer(self, verb)
     }
 }
@@ -4300,7 +4402,7 @@ pub struct SaveConfig<'config, Path> {
     /// The directory of the new database.
     pub path: Path,
     /// Reports the bytes saved and stops wherever it says to, removing what the save wrote.
-    pub progress: Option<&'config mut ProgressCallback<'config>>,
+    pub progress: Option<Box<ProgressCallback<'config>>>,
 }
 
 impl<Path: AsRef<str>> From<Path> for SaveConfig<'_, Path> {
@@ -4339,11 +4441,7 @@ impl<Path: AsRef<str>> sealed::Calling for Save<'_, Path> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_snapshot_save(arguments)
-    }
-
-    fn raise(&mut self) {
-        self.progress.raise()
+        unsafe { ffi::ustore_snapshot_save(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -4406,10 +4504,7 @@ impl Database {
         config: impl Into<ChangesCursorConfig>,
     ) -> Result<ChangesCursor<'_>> {
         let since = config.into().since;
-        let mut cursor = ChangesCursor {
-            handle: ptr::null_mut(),
-            marker: PhantomData,
-        };
+        let mut cursor = ChangesCursor { handle: ptr::null_mut(), marker: PhantomData };
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_changes_cursor_init_t {
             database: self.handle,
@@ -4633,10 +4728,7 @@ mod tests {
     #[test]
     fn databases_start_at_either_isolation() {
         for isolation in [Isolation::StrictSerializable, Isolation::Snapshot] {
-            let options = RAMOptions {
-                isolation,
-                ..RAMOptions::default()
-            };
+            let options = RAMOptions { isolation, ..RAMOptions::default() };
             let description = Database::init_ram(&options).unwrap().describe().unwrap();
             assert_eq!(description.isolation, isolation);
         }
@@ -4652,18 +4744,9 @@ mod tests {
         let nvme_manifest = format!("{}/ustore.ustore.json", nvme.path());
         let opened = [
             (Database::open_ram(ram.path(), &RAMOptions::default()), true),
-            (
-                Database::open_rocksdb(&RocksDBOptions::at(rocksdb.path())),
-                cfg!(feature = "rocksdb"),
-            ),
-            (
-                Database::open_leveldb(&LevelDBOptions::at(leveldb.path())),
-                cfg!(feature = "leveldb"),
-            ),
-            (
-                Database::open_nvme(&NVMEOptions::at(&nvme_manifest)),
-                cfg!(feature = "nvme"),
-            ),
+            (Database::open_rocksdb(&RocksDBOptions::at(rocksdb.path())), cfg!(feature = "rocksdb")),
+            (Database::open_leveldb(&LevelDBOptions::at(leveldb.path())), cfg!(feature = "leveldb")),
+            (Database::open_nvme(&NVMEOptions::at(&nvme_manifest)), cfg!(feature = "nvme")),
         ];
         let mut arena = Arena::new().unwrap();
         for (database, compiled) in opened {
@@ -4682,28 +4765,13 @@ mod tests {
         // Every engine but NVMe reopens on an executor, keeping what it held.
         let on = Some(&executor);
         let reopened = [
+            (Database::open_ram(ram.path(), &RAMOptions { executor: on, ..RAMOptions::default() }), true),
             (
-                Database::open_ram(
-                    ram.path(),
-                    &RAMOptions {
-                        executor: on,
-                        ..RAMOptions::default()
-                    },
-                ),
-                true,
-            ),
-            (
-                Database::open_rocksdb(&RocksDBOptions {
-                    executor: on,
-                    ..RocksDBOptions::at(rocksdb.path())
-                }),
+                Database::open_rocksdb(&RocksDBOptions { executor: on, ..RocksDBOptions::at(rocksdb.path()) }),
                 cfg!(feature = "rocksdb"),
             ),
             (
-                Database::open_leveldb(&LevelDBOptions {
-                    executor: on,
-                    ..LevelDBOptions::at(leveldb.path())
-                }),
+                Database::open_leveldb(&LevelDBOptions { executor: on, ..LevelDBOptions::at(leveldb.path()) }),
                 cfg!(feature = "leveldb"),
             ),
         ];
@@ -4757,10 +4825,7 @@ mod tests {
         assert_eq!(emptied.get(0), Some(b"".as_slice()), "the key stays without its value");
 
         database.clear(DropMode::Pairs).unwrap();
-        assert_eq!(
-            database.head().read(people, keys([1]), &mut arena).unwrap().get(0),
-            None
-        );
+        assert_eq!(database.head().read(people, keys([1]), &mut arena).unwrap().get(0), None);
         assert_eq!(database.head().collection_list(&mut arena).unwrap(), &[people]);
 
         // A snapshot belongs to its holder, so the collections stay while one is open.
@@ -4769,66 +4834,81 @@ mod tests {
         assert_eq!(refused.status, Status::InvalidArgument);
         drop(snapshot);
         let executor = Executor::for_ram(&[], 1).unwrap();
-        database
-            .head()
-            .deferred(&executor)
-            .clear(DropMode::Collection)
-            .unwrap()
-            .wait()
-            .unwrap();
+        database.head().deferred(&executor).clear(DropMode::Collection).unwrap().wait().unwrap();
         assert!(database.head().collection_list(&mut arena).unwrap().is_empty());
     }
 
     #[test]
-    fn progress_reports_cancels_and_resurfaces_a_panic() {
+    fn progress_reports_and_cancels() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
         for name in ["people", "places"] {
             let collection = database.collection_create(name, Modality::Blobs).unwrap();
-            database
-                .head()
-                .write(collection, &entries, Durability::Buffered)
-                .unwrap();
+            database.head().write(collection, &entries, Durability::Buffered).unwrap();
         }
         let mut reports = Vec::new();
-        let mut counting = |finished: usize, total: usize| {
+        let counting = |finished: usize, total: usize| {
             reports.push((finished, total));
             ControlFlow::Continue(())
         };
-        database
-            .compact(CompactConfig {
-                progress: Some(&mut counting),
-            })
-            .unwrap();
-        assert!(!reports.is_empty() && reports.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        database.compact(Some(Box::new(counting) as Box<ProgressCallback>)).unwrap();
+        assert!(!reports.is_empty() && reports.iter().all(|(finished, total)| finished <= total));
 
-        let mut stopping = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) };
-        let cancelled = database
-            .compact(CompactConfig {
-                progress: Some(&mut stopping),
-            })
-            .unwrap_err();
+        let stopping = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) };
+        let cancelled = database.compact(Some(Box::new(stopping) as Box<ProgressCallback>)).unwrap_err();
         assert_eq!(cancelled.status, Status::Cancelled);
 
-        let snapshot = database.snapshot().unwrap();
-        let directory = temporary_directory("progress_panics");
-        let mut panicking = |_: usize, _: usize| -> ControlFlow<()> { panic!("a progress fault") };
-        let resurfaced = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            snapshot.save(SaveConfig {
-                path: directory.path(),
-                progress: Some(&mut panicking),
-            })
-        }));
-        assert!(resurfaced.is_err(), "the panic resurfaces once the call is final");
-
-        // A deferred call owns its handler, which outlives the `Deferred`, and resurfaces the panic from `wait`.
+        // A deferred call owns its handler outright, so nothing it captures is borrowed or leaked.
         let executor = Executor::for_ram(&[], 1).unwrap();
-        let leaked: &'static mut ProgressCallback<'static> =
-            Box::leak(Box::new(|_: usize, _: usize| -> ControlFlow<()> {
-                panic!("a deferred progress fault")
-            }));
-        let compaction = database.head().deferred(&executor).compact(Some(leaked)).unwrap();
-        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| compaction.wait())).is_err());
+        let owned = Box::new(|_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) });
+        let compaction = database.head().deferred(&executor).compact(Some(owned as Box<ProgressCallback>)).unwrap();
+        assert_eq!(compaction.wait().unwrap_err().status, Status::Cancelled);
+    }
+
+    #[test]
+    fn compact_plans_open_through_a_stop_continue_and_finish() {
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
+        for name in ["people", "places", "things"] {
+            let collection = database.collection_create(name, Modality::Blobs).unwrap();
+            database.head().write(collection, &entries, Durability::Buffered).unwrap();
+        }
+        let executor = Executor::for_ram(&[], 1).unwrap();
+        let (mut plan, mut phase) = (CompactPlan::default(), PhaseProgress::default());
+        let stopping = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) };
+        let stopped = database.head().on(&executor).compact(CompactConfig {
+            progress: Some(Box::new(stopping)),
+            plan: Some(&mut plan),
+            phase: Some(&mut phase),
+        });
+        assert_eq!(stopped.unwrap_err().status, Status::Cancelled);
+        assert!(plan.is_open(), "a cancel leaves the plan live");
+        assert_ne!(phase.phase, Phase::Done);
+
+        let second = database.head().on(&executor).compact(CompactConfig::from(CompactPlan::default()));
+        assert_eq!(second.unwrap_err().status, Status::Contended, "one live plan per database");
+
+        let continued = database.head().deferred(&executor).compact(CompactConfig::from(plan)).unwrap();
+        let (finished, config) = continued.wait_with_inputs();
+        finished.unwrap();
+        assert_eq!(config.phase.unwrap().phase, Phase::Done);
+        let plan = config.plan.unwrap();
+        database.head().deferred(&executor).compact_plan_finish(plan).unwrap().wait().unwrap();
+
+        // The plan moved into its finish, so finishing again can only name a fresh one, which is
+        // refused.
+        let again = database.head().on(&executor).compact_plan_finish(CompactPlan::default());
+        assert_eq!(again.unwrap_err().status, Status::InvalidArgument);
+        database.compact(CompactConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn phases_spell_through_the_library() {
+        for phase in [Phase::None, Phase::Flush, Phase::Merge, Phase::Reclaim, Phase::Done] {
+            assert_eq!(phase.to_string().parse::<Phase>().unwrap(), phase);
+        }
+        assert_eq!("merge".parse::<Phase>().unwrap(), Phase::Merge);
+        assert!("stage".parse::<Phase>().is_err());
     }
 
     #[test]
@@ -4842,23 +4922,15 @@ mod tests {
     #[test]
     fn executors_take_memory_domains_or_refuse_them() {
         let unknown = [1 << 20];
-        assert_eq!(
-            Executor::for_ram(&unknown, 1).unwrap_err().status,
-            Status::InvalidArgument
-        );
+        assert_eq!(Executor::for_ram(&unknown, 1).unwrap_err().status, Status::InvalidArgument);
         // SAFETY: a null pool is refused before anything reads it.
         let lent = unsafe { Executor::on_pool(&[], ptr::null_mut()) };
         assert_eq!(lent.unwrap_err().status, Status::InvalidArgument);
-        let blocking = IOOptions {
-            transport: Transport::Blocking,
-            ..IOOptions::default()
-        };
+        let blocking = IOOptions { transport: Transport::Blocking, ..IOOptions::default() };
         drop(Executor::for_nvme(1, &blocking).unwrap());
         // A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries.
         // SAFETY: a null stream lends nothing, so the executor creates its own.
-        let devices = unsafe { Executor::for_vram(1 << 20, ptr::null_mut(), 0, Gds::Automatic) }
-            .unwrap_err()
-            .status;
+        let devices = unsafe { Executor::for_vram(1 << 20, ptr::null_mut(), 0, Gds::Automatic) }.unwrap_err().status;
         assert!(devices == Status::Unsupported || devices == Status::Device);
 
         // Zero threads derive their count from the cores of every domain.
@@ -4866,11 +4938,25 @@ mod tests {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let blobs = created(&database, Modality::Blobs);
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
-        database
-            .head()
-            .on(&derived)
-            .write(blobs, &entries, Durability::Buffered)
-            .unwrap();
+        database.head().on(&derived).write(blobs, &entries, Durability::Buffered).unwrap();
+    }
+
+    #[test]
+    fn a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick() {
+        let picked_under = |cpu_class_ceiling| {
+            let options = RAMOptions { cpu_class_ceiling, ..RAMOptions::default() };
+            Database::init_ram(&options).unwrap().describe().unwrap().cpu_class
+        };
+        let machine = picked_under(None).unwrap();
+        // A monoversioned build compiles no class under any other, so it refuses a lower ceiling.
+        if machine == CPUClass::Monoversioned {
+            return;
+        }
+        assert_eq!(picked_under(Some(machine)), Some(machine));
+        // Power10 and AWS G5 share no architecture, so one of them is foreign to every machine.
+        let foreign = if machine == CPUClass::IBMPower10 { CPUClass::AWSG5 } else { CPUClass::IBMPower10 };
+        let narrowed = picked_under(Some(foreign)).unwrap();
+        assert_ne!(narrowed, foreign);
     }
 
     #[test]
@@ -4890,26 +4976,19 @@ mod tests {
         assert_eq!("target".parse::<Role>(), Ok(Role::Target));
         assert_eq!("merge".parse::<Modification>(), Ok(Modification::Merge));
         assert_eq!(Engine::NVME.to_string().parse::<Engine>(), Ok(Engine::NVME));
-        assert_eq!(
-            ScanMode::Unordered.to_string().parse::<ScanMode>(),
-            Ok(ScanMode::Unordered)
-        );
+        assert_eq!(GPUVendor::Apple.to_string(), "apple");
+        assert_eq!(GPUClass::AppleMetal10.to_string(), "apple-metal10");
+        assert_eq!("apple-metal7".parse::<GPUClass>(), Ok(GPUClass::AppleMetal7));
+        assert_eq!(ScanMode::Unordered.to_string().parse::<ScanMode>(), Ok(ScanMode::Unordered));
         assert_eq!("unsorted".parse::<IngestOrder>(), Ok(IngestOrder::Unsorted));
         assert_eq!(FieldType::F16.to_string(), "f16");
         assert_eq!("uuid".parse::<FieldType>(), Ok(FieldType::UUID));
 
         // Every inverse answers its zero for a name it does not know, which the spelling check refuses.
         for unknown in ["levitating", "unrecognized", "Pairs", ""] {
-            assert_eq!(
-                unknown.parse::<DropMode>().unwrap_err().status,
-                Status::InvalidArgument,
-                "{unknown}"
-            );
+            assert_eq!(unknown.parse::<DropMode>().unwrap_err().status, Status::InvalidArgument, "{unknown}");
         }
-        assert!(
-            "unknown".parse::<Role>().is_err(),
-            "a role the binding never passes is refused"
-        );
+        assert!("unknown".parse::<Role>().is_err(), "a role the binding never passes is refused");
     }
 
     #[test]
@@ -4925,10 +5004,7 @@ mod tests {
         let places = database.collection_create("places", Modality::Graph).unwrap();
         assert_ne!(people, places);
         let head = database.head();
-        assert_eq!(
-            head.collection_find("people", &mut arena).unwrap(),
-            (people, Modality::Blobs)
-        );
+        assert_eq!(head.collection_find("people", &mut arena).unwrap(), (people, Modality::Blobs));
         assert_eq!(
             head.collection_find("places", &mut arena).unwrap(),
             (places, Modality::Graph),
@@ -4940,23 +5016,11 @@ mod tests {
         assert!(listed.contains(&people) && listed.contains(&places));
 
         // A name is bound once, and a name nobody bound addresses nothing.
-        assert_eq!(
-            database
-                .collection_create("people", Modality::Blobs)
-                .unwrap_err()
-                .status,
-            Status::AlreadyExists
-        );
-        assert_eq!(
-            head.collection_find("nowhere", &mut arena).unwrap_err().status,
-            Status::NotFound
-        );
+        assert_eq!(database.collection_create("people", Modality::Blobs).unwrap_err().status, Status::AlreadyExists);
+        assert_eq!(head.collection_find("nowhere", &mut arena).unwrap_err().status, Status::NotFound);
 
         database.collection_drop(people, DropMode::Collection).unwrap();
-        assert_eq!(
-            head.collection_find("people", &mut arena).unwrap_err().status,
-            Status::NotFound
-        );
+        assert_eq!(head.collection_find("people", &mut arena).unwrap_err().status, Status::NotFound);
         assert_eq!(head.collection_list(&mut arena).unwrap().len(), 1);
     }
 
@@ -4980,13 +5044,7 @@ mod tests {
         // A deferred view of the head drops the collection whole.
         let executor = Executor::for_ram(&[], 1).unwrap();
         database.head().write(people, &entries, Durability::Buffered).unwrap();
-        database
-            .head()
-            .deferred(&executor)
-            .collection_drop(people, DropMode::Collection)
-            .unwrap()
-            .wait()
-            .unwrap();
+        database.head().deferred(&executor).collection_drop(people, DropMode::Collection).unwrap().wait().unwrap();
         assert_eq!(database.head().collection_list(&mut arena).unwrap().len(), 0);
     }
 
@@ -4997,10 +5055,7 @@ mod tests {
         let mut arena = Arena::new().unwrap();
         let mut transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"alpha")];
-        transaction
-            .view(Watch::Keys)
-            .write(blobs, &entries, Durability::Buffered)
-            .unwrap();
+        transaction.view(Watch::Keys).write(blobs, &entries, Durability::Buffered).unwrap();
 
         // Nothing is visible at the head until the commit lands.
         let before = database.head().read(blobs, keys([1]), &mut arena).unwrap();
@@ -5022,21 +5077,12 @@ mod tests {
         let mut transaction = database.transaction().unwrap();
         let abandoned = [crate::blobs::Entry::new(key(2), b"abandoned")];
         let other = [crate::blobs::Entry::new(key(3), b"abandoned")];
-        transaction
-            .view(Watch::Keys)
-            .write(blobs, &abandoned, Durability::Buffered)
-            .unwrap();
-        transaction
-            .view(Watch::Keys)
-            .write(blobs, &other, Durability::Buffered)
-            .unwrap();
+        transaction.view(Watch::Keys).write(blobs, &abandoned, Durability::Buffered).unwrap();
+        transaction.view(Watch::Keys).write(blobs, &other, Durability::Buffered).unwrap();
         transaction.reset().unwrap();
 
         let kept = [crate::blobs::Entry::new(key(2), b"kept")];
-        transaction
-            .view(Watch::Keys)
-            .write(blobs, &kept, Durability::Buffered)
-            .unwrap();
+        transaction.view(Watch::Keys).write(blobs, &kept, Durability::Buffered).unwrap();
         transaction.commit(Durability::Buffered).unwrap();
 
         let values = database.head().read(blobs, keys([2, 3]), &mut arena).unwrap();
@@ -5051,10 +5097,7 @@ mod tests {
         let mut arena = Arena::new().unwrap();
         let mut transaction = database.transaction().unwrap();
         let kept = [crate::blobs::Entry::new(key(2), b"kept")];
-        transaction
-            .view(Watch::Keys)
-            .write(blobs, &kept, Durability::Buffered)
-            .unwrap();
+        transaction.view(Watch::Keys).write(blobs, &kept, Durability::Buffered).unwrap();
         transaction.stage().unwrap();
         transaction.rollback().unwrap();
         transaction.commit(Durability::Buffered).unwrap();
@@ -5069,10 +5112,7 @@ mod tests {
         let blobs = created(&database, Modality::Blobs);
         let transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(key(3), b"alpha")];
-        let failure = transaction
-            .view(Watch::Keys)
-            .write(blobs, &entries, Durability::Flushed)
-            .unwrap_err();
+        let failure = transaction.view(Watch::Keys).write(blobs, &entries, Durability::Flushed).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
 
@@ -5085,22 +5125,13 @@ mod tests {
 
         let mine = [crate::blobs::Entry::new(key(4), b"mine")];
         let yours = [crate::blobs::Entry::new(key(4), b"yours")];
-        first
-            .view(Watch::Keys)
-            .write(blobs, &mine, Durability::Buffered)
-            .unwrap();
-        second
-            .view(Watch::Keys)
-            .write(blobs, &yours, Durability::Buffered)
-            .unwrap();
+        first.view(Watch::Keys).write(blobs, &mine, Durability::Buffered).unwrap();
+        second.view(Watch::Keys).write(blobs, &yours, Durability::Buffered).unwrap();
         first.commit(Durability::Buffered).unwrap();
 
         let failure = second.commit(Durability::Buffered).unwrap_err();
         assert!(
-            matches!(
-                failure.status,
-                Status::WriteConflict | Status::ReadConflict | Status::PhantomConflict
-            ),
+            matches!(failure.status, Status::WriteConflict | Status::ReadConflict | Status::PhantomConflict),
             "{failure:?}"
         );
     }
@@ -5108,11 +5139,8 @@ mod tests {
     #[test]
     fn an_unwatched_view_records_nothing_to_conflict_over() {
         // Only snapshot isolation adds a watch of its own; a strictly serializable read is ordered anyway.
-        let database = Database::init_ram(&RAMOptions {
-            isolation: Isolation::Snapshot,
-            ..RAMOptions::default()
-        })
-        .unwrap();
+        let database =
+            Database::init_ram(&RAMOptions { isolation: Isolation::Snapshot, ..RAMOptions::default() }).unwrap();
         let blobs = created(&database, Modality::Blobs);
         let mut arena = Arena::new().unwrap();
         let seed = [crate::blobs::Entry::new(key(8), b"seed")];
@@ -5123,15 +5151,9 @@ mod tests {
         let read = watched.view(Watch::Keys).read(blobs, keys([8]), &mut arena).unwrap();
         assert_eq!(read.get(0), Some(b"seed".as_slice()));
         let overwritten = [crate::blobs::Entry::new(key(8), b"overwritten")];
-        database
-            .head()
-            .write(blobs, &overwritten, Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, &overwritten, Durability::Buffered).unwrap();
         let failure = watched.commit(Durability::Buffered).unwrap_err();
-        assert!(
-            matches!(failure.status, Status::ReadConflict | Status::WriteConflict),
-            "{failure:?}"
-        );
+        assert!(matches!(failure.status, Status::ReadConflict | Status::WriteConflict), "{failure:?}");
 
         // The same run through an unwatched view records nothing, so the commit stands.
         let mut unwatched = database.transaction().unwrap();
@@ -5158,11 +5180,7 @@ mod tests {
         let pinned = snapshot.view().read(blobs, keys([5]), &mut arena).unwrap();
         assert_eq!(pinned.get(0), Some(b"before".as_slice()));
         let pinned = snapshot.on(&executor).read(blobs, keys([5]), &mut arena).unwrap();
-        assert_eq!(
-            pinned.get(0),
-            Some(b"before".as_slice()),
-            "a snapshot reads the same on an executor"
-        );
+        assert_eq!(pinned.get(0), Some(b"before".as_slice()), "a snapshot reads the same on an executor");
         let latest = database.head().read(blobs, keys([5]), &mut arena).unwrap();
         assert_eq!(latest.get(0), Some(b"after".as_slice()));
     }
@@ -5180,16 +5198,8 @@ mod tests {
         let executor = Executor::for_ram(&[], 1).unwrap();
         let snapshot = database.snapshot().unwrap();
         snapshot.save(directory.path()).unwrap();
-        snapshot
-            .deferred(&executor)
-            .save(deferred_directory.path().to_owned())
-            .unwrap()
-            .wait()
-            .unwrap();
-        assert_eq!(
-            snapshot.save("/nonexistent/ustore/directory").unwrap_err().status,
-            Status::NotFound
-        );
+        snapshot.deferred(&executor).save(deferred_directory.path().to_owned()).unwrap().wait().unwrap();
+        assert_eq!(snapshot.save("/nonexistent/ustore/directory").unwrap_err().status, Status::NotFound);
 
         for path in [directory.path(), deferred_directory.path()] {
             let saved = Database::open_ram(path, &RAMOptions::default()).unwrap();
@@ -5205,10 +5215,7 @@ mod tests {
         let blobs = created(&database, Modality::Blobs);
         let keys: Vec<Key> = (0..count).map(Key::from).collect();
         let values: stringtape::BytesTape<u64> = keys.iter().map(|_| b"value".as_slice()).collect();
-        database
-            .head()
-            .write(blobs, (keys, values), Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, (keys, values), Durability::Buffered).unwrap();
         (database, blobs)
     }
 
@@ -5231,10 +5238,7 @@ mod tests {
         // A deferred view answers a `Deferred` per verb, which hands the same back.
         let transaction = database.transaction().unwrap();
         let kept = [crate::blobs::Entry::new(key(2), b"kept")];
-        transaction
-            .view(Watch::Keys)
-            .write(blobs, &kept, Durability::Buffered)
-            .unwrap();
+        transaction.view(Watch::Keys).write(blobs, &kept, Durability::Buffered).unwrap();
         let deferred = transaction.deferred(&executor);
         let staged = deferred.stage().unwrap().wait().unwrap();
         deferred.rollback().unwrap().wait().unwrap();
@@ -5243,17 +5247,9 @@ mod tests {
 
         let transaction = database.transaction().unwrap();
         let abandoned = [crate::blobs::Entry::new(key(3), b"abandoned")];
-        transaction
-            .view(Watch::Keys)
-            .write(blobs, &abandoned, Durability::Buffered)
-            .unwrap();
+        transaction.view(Watch::Keys).write(blobs, &abandoned, Durability::Buffered).unwrap();
         transaction.deferred(&executor).reset().unwrap().wait().unwrap();
-        transaction
-            .deferred(&executor)
-            .commit(Durability::Buffered)
-            .unwrap()
-            .wait()
-            .unwrap();
+        transaction.deferred(&executor).commit(Durability::Buffered).unwrap().wait().unwrap();
 
         let values = database.head().read(blobs, &keys([1, 2, 3]), &mut arena).unwrap();
         let read: Vec<Option<&[u8]>> = values.iter().collect();
@@ -5276,22 +5272,14 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(found, expected);
 
-        let pinned = snapshot
-            .deferred(&executor)
-            .collection_list(&mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let pinned = snapshot.deferred(&executor).collection_list(&mut arena).unwrap().wait().unwrap();
         assert_eq!(pinned, &[people], "a snapshot lists what it was taken at");
     }
 
     /// One arena serves every verb in turn, whether an executor made it or it serves the calling thread.
     #[test]
     fn arenas_of_host_executors_describe_host_pages() {
-        let host = ArenaDescription {
-            residency: Residency::Ram,
-            device: None,
-        };
+        let host = ArenaDescription { residency: Residency::Ram, device: None };
         assert_eq!(Arena::new().unwrap().describe(), Ok(host));
         let executor = Executor::for_ram(&[], 2).unwrap();
         assert_eq!(Arena::new_in(&executor).unwrap().describe(), Ok(host));
@@ -5305,15 +5293,9 @@ mod tests {
         let names = created(&database, Modality::Blobs);
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
         database.head().write(names, &entries, Durability::Buffered).unwrap();
-        let documents = [crate::docs::DocumentEntry::<crate::docs::Json>::new(
-            key(1),
-            r#"{"name":"Ada"}"#,
-        )];
+        let documents = [crate::docs::DocumentEntry::<crate::docs::Json>::new(key(1), r#"{"name":"Ada"}"#)];
         let upsert = crate::docs::Modification::Upsert;
-        database
-            .head()
-            .docs_write(people, &documents, upsert, Durability::Buffered)
-            .unwrap();
+        database.head().docs_write(people, &documents, upsert, Durability::Buffered).unwrap();
 
         for mut arena in [Arena::new().unwrap(), Arena::new_in(&executor).unwrap()] {
             let head = database.head().on(&executor);
@@ -5322,10 +5304,7 @@ mod tests {
             assert_eq!(head.docs_gist(people, keys([1]), &mut arena).unwrap().len(), 1);
             let listed = head.collection_list(&mut arena).unwrap();
             assert!(listed.len() == 2 && listed.contains(&people) && listed.contains(&names));
-            assert_eq!(
-                head.collection_find("people", &mut arena).unwrap(),
-                (people, Modality::Docs)
-            );
+            assert_eq!(head.collection_find("people", &mut arena).unwrap(), (people, Modality::Docs));
         }
     }
 
@@ -5350,10 +5329,7 @@ mod tests {
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_collection_list(&mut arguments) };
         assert_eq!(check(outcome).unwrap_err().status, Status::InvalidArgument);
-        assert!(
-            collections.is_null() && written == 0,
-            "a refused call leaves its outputs null"
-        );
+        assert!(collections.is_null() && written == 0, "a refused call leaves its outputs null");
     }
 
     #[test]
@@ -5387,20 +5363,14 @@ mod tests {
 
         let mut transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"alpha")];
-        transaction
-            .view(Watch::Keys)
-            .write(blobs, &entries, Durability::Buffered)
-            .unwrap();
+        transaction.view(Watch::Keys).write(blobs, &entries, Durability::Buffered).unwrap();
         let read = transaction.stage().unwrap();
         let commit = transaction.commit(Durability::Buffered).unwrap();
         let later = database.snapshot().unwrap();
 
         assert!(earlier.read_stamp() <= read);
         assert!(read.0 <= commit.0, "a stage reads below the commit it precedes");
-        assert!(
-            commit.0 <= later.read_stamp().0,
-            "a later snapshot reads at or above the commit"
-        );
+        assert!(commit.0 <= later.read_stamp().0, "a later snapshot reads at or above the commit");
         let seen = later.view().read(blobs, &keys([1]), &mut arena).unwrap();
         assert_eq!(seen.get(0), Some(b"alpha".as_slice()));
         let unseen = earlier.view().read(blobs, &keys([1]), &mut arena).unwrap();
@@ -5412,11 +5382,7 @@ mod tests {
         let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let (database, blobs) = crowded(100_000);
-        let scan = database
-            .head()
-            .deferred(&executor)
-            .scan(blobs, key(0), 100_000, &mut arena)
-            .unwrap();
+        let scan = database.head().deferred(&executor).scan(blobs, key(0), 100_000, &mut arena).unwrap();
         let lent = scan.lent;
         std::mem::forget(scan);
 
@@ -5432,18 +5398,11 @@ mod tests {
         let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let (database, blobs) = crowded(100_000);
-        let scan = database
-            .head()
-            .deferred(&executor)
-            .scan(blobs, key(0), 100_000, &mut arena)
-            .unwrap();
+        let scan = database.head().deferred(&executor).scan(blobs, key(0), 100_000, &mut arena).unwrap();
         drop(scan);
 
         // The drop waited for the scan to release the arena, so the next call through it is not contended.
-        assert_eq!(
-            database.head().scan(blobs, key(0), 1, &mut arena).unwrap().keys,
-            &keys([0])
-        );
+        assert_eq!(database.head().scan(blobs, key(0), 1, &mut arena).unwrap().keys, &keys([0]));
     }
 
     #[test]
@@ -5456,17 +5415,10 @@ mod tests {
 
         let scan = head.scan(blobs, key(0), 100_000, &mut scanned).unwrap();
         let refused = head.measure(blobs, key(0)..key(9), &mut measured).unwrap();
-        assert_eq!(
-            refused.status(),
-            Err(Status::Contended),
-            "a refused call is final at once"
-        );
+        assert_eq!(refused.status(), Err(Status::Contended), "a refused call is final at once");
         assert_eq!(refused.wait().unwrap_err().status, Status::Contended);
         assert_eq!(scan.wait().unwrap().keys.len(), 100_000);
-        head.measure(blobs, key(0)..key(9), &mut measured)
-            .unwrap()
-            .wait()
-            .unwrap();
+        head.measure(blobs, key(0)..key(9), &mut measured).unwrap().wait().unwrap();
     }
 
     #[test]
@@ -5478,21 +5430,12 @@ mod tests {
         let mut deferred_arena = Arena::new_in(&executor).unwrap();
 
         let every: Vec<Key> = (0..100_000u64).map(Key::from).collect();
-        let read = transaction
-            .deferred(&executor)
-            .read(blobs, every, &mut deferred_arena)
-            .unwrap();
-        let refused = transaction
-            .view(Watch::Keys)
-            .read(blobs, &keys([1]), &mut arena)
-            .unwrap_err();
+        let read = transaction.deferred(&executor).read(blobs, every, &mut deferred_arena).unwrap();
+        let refused = transaction.view(Watch::Keys).read(blobs, &keys([1]), &mut arena).unwrap_err();
         assert_eq!(refused.status, Status::Contended);
 
         assert_eq!(read.wait().unwrap().len(), 100_000);
-        let after = transaction
-            .view(Watch::Keys)
-            .read(blobs, &keys([1]), &mut arena)
-            .unwrap();
+        let after = transaction.view(Watch::Keys).read(blobs, &keys([1]), &mut arena).unwrap();
         assert_eq!(after.get(0), Some(b"value".as_slice()));
     }
 
@@ -5538,10 +5481,7 @@ mod tests {
             let refusal = unspelled.parse::<Status>().unwrap_err();
             assert_eq!(refusal.status, Status::InvalidArgument, "{unspelled}");
         }
-        let newer = ffi::ustore_outcome_t {
-            status: ffi::ustore_status_t(4242),
-            message: ptr::null(),
-        };
+        let newer = ffi::ustore_outcome_t { status: ffi::ustore_status_t(4242), message: ptr::null() };
         assert_eq!(check(newer).unwrap_err().status, Status::Internal);
         assert!(check(ffi::ustore_outcome_t::default()).is_ok());
         assert_eq!(Status::from_raw(ffi::ustore_status_t::DEFERRED), Err(Status::Deferred));

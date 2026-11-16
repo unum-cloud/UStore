@@ -249,6 +249,26 @@ def test_compact_keeps_the_data_unless_cancelled(database):
     assert database.get(63, collection="places") == b"v" * 64 and database.get(63, collection="people") == b"w" * 64
 
 
+def test_compact_plan_continues_a_stop_until_finished(database):
+    """A plan a stop leaves live continues deferred to its end, finishes once, and a second finish is refused."""
+    database.collection_create("people", modality=Modality.BLOBS)
+    database.collection_create("places", modality=Modality.BLOBS)
+    database.write(list(range(64)), b"v" * 64, collection="places")
+    database.write(list(range(64)), b"w" * 64, collection="people")
+    plan = ustore.CompactPlan()
+    assert plan.phase is ustore.Phase.NONE
+    with ustore.Executor.for_ram(1) as executor:
+        with pytest.raises(ustore.CancelledError):
+            database.on(executor).compact(progress=lambda finished, total: False, plan=plan)
+        assert plan.phase is not ustore.Phase.DONE
+        database.deferred(executor).compact(plan=plan).wait()
+        assert plan.phase is ustore.Phase.DONE
+        database.deferred(executor).compact_plan_finish(plan).wait()
+        with pytest.raises(ustore.InvalidArgumentError):
+            database.on(executor).compact_plan_finish(plan)
+    assert database.get(63, collection="places") == b"v" * 64 and database.get(63, collection="people") == b"w" * 64
+
+
 def test_flush_keeps_the_data_blocking_or_deferred(database):
     database.collection_create("people", modality=Modality.BLOBS)
     database.set(1, b"kept", collection="people")

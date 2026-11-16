@@ -274,7 +274,7 @@ finally:
     transaction.close()
 ```
 
-Every C enum is an `enum.IntEnum` built at import through the C `_name` functions, so "strict-serializable" is `Isolation.STRICT_SERIALIZABLE`, and `Status.from_name("write-conflict")` and its siblings parse a spelling through the C `_from_name` functions.
+Every C enum is an `enum.IntEnum` built at import through the C `_name` functions, so "strict-serializable" is `Isolation.STRICT_SERIALIZABLE`.
 
 ## Platform Notes
 

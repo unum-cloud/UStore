@@ -310,6 +310,8 @@ struct GPUVendor(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """NVIDIA, through the CUDA driver."""
     comptime AMD = Self(2)
     """AMD, through the HIP runtime."""
+    comptime APPLE = Self(3)
+    """Apple, through Metal."""
 
 
 @fieldwise_init
@@ -336,6 +338,12 @@ struct GPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """CDNA4 AMD, gfx950."""
     comptime AMD_CDNA5 = Self(9)
     """CDNA5 AMD, gfx1250."""
+    comptime APPLE_METAL7 = Self(10)
+    """Apple7-family GPUs and every Apple GPU without a class of its own."""
+    comptime APPLE_METAL9 = Self(11)
+    """Apple9-family GPUs."""
+    comptime APPLE_METAL10 = Self(12)
+    """Apple10-family GPUs."""
 
 
 struct GPUDevice(Copyable, Defaultable, Movable):
@@ -418,6 +426,43 @@ struct Progress(Defaultable, ImplicitlyCopyable):
         """
         var callback = _progress[T, handler]
         return Self(Pointer(to=callback).unsafe_bitcast[Int]()[], Int(state))
+
+
+@fieldwise_init
+struct Phase(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
+    """The kind of work a plan is doing, `ustore_phase_t`, shared by every long operation.
+    `Library.phase_name` spells each one as the engine does."""
+
+    var code: c_int
+    """The raw `ustore_phase_t` value the ABI exchanges."""
+    comptime NONE = Self(0)
+    """No plan, or one that has not started."""
+    comptime FLUSH = Self(1)
+    """Writing what memory holds to storage."""
+    comptime MERGE = Self(2)
+    """Merging or vacuuming the stored versions one unit at a time."""
+    comptime RECLAIM = Self(3)
+    """Freeing what no reader reaches and rewriting the image that names the rest."""
+    comptime DONE = Self(4)
+    """The plan ran to its end, and nothing is pending."""
+
+
+@fieldwise_init
+struct PhaseProgress(Defaultable, ImplicitlyCopyable):
+    """Where a plan stands, `ustore_phase_progress_t`: its phase, that phase's position, and its own count."""
+
+    var phase: Phase
+    """The kind of work in hand."""
+    var ordinal: c_size_t
+    """This phase's position among the ones the plan runs, from zero."""
+    var completed: c_size_t
+    """Units of this phase done, as the engine counts them."""
+    var total: c_size_t
+    """Units of this phase in all."""
+
+    def __init__(out self):
+        """No plan started, which is what an unwritten slot reads as."""
+        self = Self(Phase.NONE, 0, 0, 0)
 
 
 # endregion Execution
@@ -858,7 +903,7 @@ struct ExecutorForRamArguments(ImplicitlyCopyable):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var ram: RamOptionsArguments
     var threads: c_size_t
-    var cpu_class: CPUClass
+    var cpu_class_ceiling: CPUClass
 
 
 @fieldwise_init
@@ -879,7 +924,7 @@ struct ExecutorForNvmeArguments(ImplicitlyCopyable):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var nvme: NvmeOptions
     var threads: c_size_t
-    var cpu_class: CPUClass
+    var cpu_class_ceiling: CPUClass
 
 
 @fieldwise_init
@@ -892,7 +937,7 @@ struct ExecutorForVramArguments(ImplicitlyCopyable):
     var stream: Address
     var scratch_limit: c_size_t
     var gds: Gds
-    var gpu_class: GPUClass
+    var gpu_class_ceiling: GPUClass
 
 
 @fieldwise_init
@@ -973,7 +1018,7 @@ struct Executor:
         library: Library,
         ram: RamOptions[ram_origin] = RamOptions(),
         threads: Int = 0,
-        cpu_class: CPUClass = CPUClass.UNKNOWN,
+        cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
         """Creates an executor of host threads for the RAM, RocksDB and LevelDB engines.
         Calls `ustore_executor_for_ram`.
@@ -982,7 +1027,7 @@ struct Executor:
             library: The loaded engine, kept so the shared object stays mapped.
             ram: The memory domains it serves; copied, not borrowed.
             threads: Threads to spawn; zero takes 7/8 of the cores those domains carry.
-            cpu_class: The class its threads confine their waits and atomics to; `UNKNOWN` picks the newest this machine runs.
+            cpu_class_ceiling: The newest class its threads may confine their waits and atomics to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none.
 
         Raises:
             `Error` if the domains cannot be resolved or the OS refuses the threads.
@@ -992,7 +1037,7 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForRamArguments(created, outcome, ram.arguments(), c_size_t(threads), cpu_class),
+            ExecutorForRamArguments(created, outcome, ram.arguments(), c_size_t(threads), cpu_class_ceiling),
             library.symbols().executor_for_ram,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_ram"), vram=False)
@@ -1027,7 +1072,7 @@ struct Executor:
         library: Library,
         nvme: NvmeOptions = NvmeOptions(),
         threads: Int = 0,
-        cpu_class: CPUClass = CPUClass.UNKNOWN,
+        cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
         """Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O ring.
         Calls `ustore_executor_for_nvme`.
@@ -1036,7 +1081,7 @@ struct Executor:
             library: The loaded engine, kept so the shared object stays mapped.
             nvme: How the databases it opens move bytes; copied, not borrowed.
             threads: Threads to spawn; zero derives them from the cores.
-            cpu_class: The class its threads confine their waits and atomics to; `UNKNOWN` picks the newest this machine runs.
+            cpu_class_ceiling: The newest class its threads may confine their waits and atomics to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none.
 
         Raises:
             `Error` if the transport is unknown or the OS refuses the threads.
@@ -1046,7 +1091,7 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForNvmeArguments(created, outcome, nvme, c_size_t(threads), cpu_class),
+            ExecutorForNvmeArguments(created, outcome, nvme, c_size_t(threads), cpu_class_ceiling),
             library.symbols().executor_for_nvme,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_nvme"), vram=False)

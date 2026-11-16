@@ -8,7 +8,7 @@
  *  edits on one page names the page once, and the tasks of a call are agreed across its arguments
  *  as they are gathered. Every verb fills a call the driver keeps on the stack or inside a
  *  @c Deferred, holding the keys, markup and names it borrows until the call finishes, and a read
- *  claims the arena it is given and answers a tape viewing it. An insert answers the key every
+ *  writes into the arena it is given and answers a tape viewing it. An insert answers the key every
  *  element ended up with, copied out of a one-off arena.
  */
 #include "lib.h"
@@ -456,9 +456,9 @@ PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments,
         spread_keys_from_object(keywords.parents, "parents", &call->tasks, &call->parents) != 0 ||
         spread_keys_from_object(keywords.anchors, "anchors", &call->tasks, &call->anchors) != 0)
         return ustore_py_call_discard(&context, &insert_verb, call);
-    // The arena only carries the effective keys out, so it dies with the call that claimed it.
+    // The arena only carries the effective keys out, so it dies with the call that named it.
     PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
-    int const claimed = arena ? ustore_py_arena_claim(arena, &call->call.arena) : -1;
+    int const claimed = arena ? ustore_py_arena_from_object(arena, &call->call.arena) : -1;
     Py_XDECREF(arena);
     if (claimed != 0) return ustore_py_call_discard(&context, &insert_verb, call);
     ustore_pages_insert_t insert = {
@@ -825,7 +825,7 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
     call->tasks.count = 1;
     if (spread_keys_from_object(arguments[0], "pages", &call->tasks, &call->pages) != 0 ||
         spread_keys_from_object(keywords.elements, "elements", &call->tasks, &call->elements) != 0 ||
-        ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &read_verb, call);
     call->call.collection = options.collection;
     ustore_pages_read_t read = {

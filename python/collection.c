@@ -18,7 +18,7 @@
 
 #pragma region Collections
 
-/** A collection a receiver addresses by name, resolved on first use and created by its first write. */
+/** A collection a receiver names, resolved by every verb and created by its first write. */
 typedef struct Collection {
 
     /** The object header every instance carries. */
@@ -27,17 +27,8 @@ typedef struct Collection {
     /** The receiver indexed, which every verb runs through and which this keeps alive. */
     PyObject* view;
 
-    /** The name, a str. */
+    /** The name, a string, which C resolves on every verb, so nothing here goes stale or races. */
     PyObject* name;
-
-    /** The collection the name addresses, once @c resolved. */
-    ustore_collection_id_t id;
-
-    /** What the collection holds, once @c resolved. */
-    ustore_modality_t modality;
-
-    /** Whether the name was resolved, or the collection created under it. */
-    int resolved;
 } Collection;
 
 /** One of the mapping views a collection answers, which all share this shape. */
@@ -114,7 +105,7 @@ static int collection_lookup(Collection const* self, ustore_py_context_t const* 
 }
 
 /**
- *  @brief Resolves @p self once, filling what a verb core runs with, whatever the collection holds.
+ *  @brief Resolves @p self, filling what a verb core runs with, whatever the collection holds.
  *  @param[in] modality What a missing collection is created to hold, when @p missing creates it.
  *  @param[in] missing Whether a missing collection is refused or created to hold @p modality.
  *  @param[out] context What the verb addresses and how it runs, as the receiver indexed names it.
@@ -127,34 +118,17 @@ static int collection_resolve_any(Collection* self, ustore_modality_t modality, 
                                   ustore_modality_t* held) {
     if (ustore_py_context_from_object(self->view, context) != 0) return -1;
     ustore_py_verb_options_init(options);
-    ustore_collection_id_t id = {{{0}}};
-    int resolved = 0;
-    ustore_py_critical_section_begin_((PyObject*)self);
-    id = self->id;
-    *held = self->modality;
-    resolved = self->resolved;
-    ustore_py_critical_section_end_();
-
-    if (!resolved) {
-        if (collection_lookup(self, context, modality, missing, &id, held) != 0) return -1;
-        ustore_py_critical_section_begin_((PyObject*)self);
-        self->id = id;
-        self->modality = *held;
-        self->resolved = 1;
-        ustore_py_critical_section_end_();
-    }
-    options->collection = id;
-    return 0;
+    return collection_lookup(self, context, modality, missing, &options->collection, held);
 }
 
-/** Resolves @p self once, refusing a missing collection, whatever it holds. */
+/** Resolves @p self, refusing a missing collection, whatever it holds. */
 static int collection_found(Collection* self, ustore_py_context_t* context, ustore_py_verb_options_t* options,
                             ustore_modality_t* held) {
     return collection_resolve_any(self, ustore_modality_blobs_k, collection_missing_refused_k, context, options, held);
 }
 
 /**
- *  @brief Resolves @p self once and checks it holds what a view reads, filling what a verb core runs with.
+ *  @brief Resolves @p self and checks it holds what a view reads, filling what a verb runs with.
  *  @param[in] modality What the view reads and writes.
  *  @param[in] missing Whether a missing collection is refused or created to hold @p modality.
  *  @param[out] context What the verb addresses and how it runs, as the receiver indexed names it.
@@ -179,9 +153,6 @@ PyObject* ustore_py_collection_subscript(PyObject* view, PyObject* name) {
     if (!collection) return NULL;
     collection->view = Py_NewRef(view);
     collection->name = Py_NewRef(name);
-    collection->id = (ustore_collection_id_t) {{{0}}};
-    collection->modality = ustore_modality_blobs_k;
-    collection->resolved = 0;
     return (PyObject*)collection;
 }
 
@@ -408,7 +379,7 @@ static PyObject* Collection_scan(Collection* self, PyObject* const* arguments, P
 static char const doc_Collection[] =                                                           //
     "A collection a receiver addresses by name, as `db['movies']` or `snapshot['movies']`.\n"  //
     "\n"                                                                                       //
-    "The name resolves once, on first use, at the snapshot of a snapshot and at the head\n"    //
+    "The name resolves on every call, at the snapshot of a snapshot and at the head\n"         //
     "otherwise, raising NotFoundError on a read when no collection carries it. A write\n"      //
     "through `blobs` or `docs`, or an access of `graph` or `table`, creates a missing\n"       //
     "collection at the head to hold that modality, so a transaction never conflicts with a\n"  //

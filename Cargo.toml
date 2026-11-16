@@ -2,7 +2,7 @@
 name = "ustore"
 version = "1.0.0-rc.1"
 rust-version = "1.100"
-edition = "2021"
+edition = "2024"
 authors = ["Ash Vardanian <info@unum.cloud>"]
 description = "GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass"
 license = "Apache-2.0"

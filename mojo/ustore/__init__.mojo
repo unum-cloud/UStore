@@ -1,9 +1,10 @@
 """A multi-modal transactional database engine, bound over its C ABI.
 
 UStore keeps binary values, keys found by strings, JSON documents, graphs and pages in collections
-of one database, under one transaction and one snapshot. This package binds the whole C interface
-but its Arrow exchange: the database, its snapshots, transactions, collections, change feeds and
-ingests, the verbs of every modality, and the executors and arenas they run on and write into.
+of one database, under one transaction and one snapshot. This package binds the whole C interface:
+the database, its snapshots, transactions, collections, change feeds and ingests, the verbs of every
+modality, the executors and arenas they run on and write into, and the Arrow exchange of keys,
+strings and gathered columns.
 
 The engine is reached by `dlopen`, so a consumer builds with no linker flags at all:
 
@@ -35,6 +36,17 @@ Author: Ash Vardanian
 Date: November 8, 2026
 """
 
+from ustore.arrow import (
+    ArrowArray,
+    ArrowDeviceArray,
+    ArrowExport,
+    ArrowSchema,
+    column_to_arrow,
+    keys_from_arrow,
+    keys_to_arrow,
+    strings_from_arrow,
+    tape_to_arrow,
+)
 from ustore.blobs import (
     BlobsCursor,
     BlobsCursorConfig,
@@ -56,6 +68,7 @@ from ustore.db import (
     CollectionsFound,
     CollectionsView,
     Database,
+    DatabaseCompactPlan,
     DatabaseDescription,
     DatabaseNvmeOptions,
     DataDirectory,
@@ -140,6 +153,8 @@ from ustore.types import (
     NvmeOptions,
     Patterns,
     PatternKind,
+    Phase,
+    PhaseProgress,
     Progress,
     RamOptions,
     Residency,

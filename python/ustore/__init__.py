@@ -5,6 +5,7 @@ Author: Ash Vardanian
 Date: July 25, 2023
 """
 
+import asyncio
 from enum import IntEnum
 
 from ustore import lib as _extension
@@ -16,5 +17,18 @@ for _name, _members in _extension._enumerators.items():
 from ustore.lib import *
 
 __version__ = _extension.__version__
+
+
+async def _settled(deferred: Deferred) -> object:
+    """Answers `deferred` once final, parking no thread, as `Deferred.__await__` drives it.
+
+    The status is polled between sleeps that grow from 1 µs to 1 ms.
+    """
+    delay = 1e-6
+    while deferred.status == Status.DEFERRED:
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 1e-3)
+    return deferred.wait()
+
 
 del IntEnum, _extension, _name, _members

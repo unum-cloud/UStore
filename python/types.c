@@ -48,7 +48,7 @@ static struct {
     {ustore_status_internal_k, "ustore.InternalError", &ErrorType, NULL,
      "The engine failed in a way no other status names, which points at a defect."},
     {ustore_status_uninitialized_k, "ustore.UninitializedError", &ErrorType, NULL,
-     "The call needs a handle that is closed or was never opened, or reads a result a later call rewound."},
+     "The call needs a handle that is closed or was never opened."},
     {ustore_status_contended_k, "ustore.ContendedError", &ErrorType, NULL,
      "An executor, arena or transaction serving another call refused the call instead of waiting."},
     {ustore_status_cancelled_k, "ustore.CancelledError", &ErrorType, NULL,
@@ -175,22 +175,21 @@ int ustore_py_register_errors(PyObject* module) {
 
 #pragma region Arenas
 
-static char const doc_Arena[] =                                                                  //
-    "Arena(executor=None, /)\n"                                                                  //
-    "\n"                                                                                         //
-    "The memory every output whose length scales with a call lands in, from values and keys\n"   //
-    "to columns, edges and names. Every such verb takes one as its last positional argument\n"   //
-    "and rewinds it, so a steady loop allocates once.\n"                                         //
-    "\n"                                                                                         //
-    "The executor makes it where its calls compute, and none makes host pages for calls on\n"    //
-    "the calling thread. Results are zero-copy views over it. Like a `bytearray`, it refuses\n"  //
-    "to rewind with `ContendedError` while a buffer over its outputs is exported, and a\n"       //
-    "result read after a later call rewound it raises `UninitializedError`. A deferred call\n"   //
-    "holds it as a blocking one does, until it is waited on or dropped, so each deferred call\n" //
-    "needs one of its own. Calls `ustore_arena_init`.\n"                                         //
-    "\n"                                                                                         //
-    "Args:\n"                                                                                    //
-    "  executor (Executor, optional): The executor whose calls it serves; None serves the\n"     //
+static char const doc_Arena[] =                                                                //
+    "Arena(executor=None, /)\n"                                                                //
+    "\n"                                                                                       //
+    "The memory every output whose length scales with a call lands in, from values and keys\n" //
+    "to columns, edges and names. Every such verb takes one as its last positional argument\n" //
+    "and rewinds it, so a steady loop allocates once.\n"                                       //
+    "\n"                                                                                       //
+    "The executor makes it where its calls compute, and none makes host pages for calls on\n"  //
+    "the calling thread. Results are zero-copy views over it, valid until the next call\n"     //
+    "naming it rewinds it; a result read after that reads whatever it then holds, which\n"     //
+    "nothing detects. A call naming it while another still fills it raises ContendedError,\n"  //
+    "so each deferred call in flight needs one of its own. Calls `ustore_arena_init`.\n"       //
+    "\n"                                                                                       //
+    "Args:\n"                                                                                  //
+    "  executor (Executor, optional): The executor whose calls it serves; None serves the\n"   //
     "    calling thread.";
 
 /** A new arena of @p type made where @p executor computes, or NULL with an exception set. */
@@ -268,70 +267,26 @@ static int arena_readable(PyObject* arena) {
                            (int)description.device);
 }
 
-int ustore_py_arena_claim(PyObject* object, PyObject** arena) {
+int ustore_py_arena_from_object(PyObject* object, PyObject** arena) {
     if (!PyObject_TypeCheck(object, &ArenaType)) {
         PyErr_Format(PyExc_TypeError, "The arena must be an Arena, got %S", Py_TYPE(object));
         return -1;
     }
     // Every answer reads its outputs on the host, so a device arena is refused before the call.
     if (arena_readable(object) != 0) return -1;
-    Arena* const claimed = (Arena*)object;
-    Py_ssize_t held = 0;
-    ustore_py_critical_section_begin_(object);
-    held = claimed->exports;
-    if (!held) {
-        claimed->exports = 1;
-        ++claimed->generation;
-    }
-    ustore_py_critical_section_end_();
-    if (held)
-        return ustore_py_raise(ustore_status_contended_k,
-                               "The arena serves a call or exports a buffer over its outputs; release it first");
     *arena = Py_NewRef(object);
     return 0;
 }
 
-void ustore_py_arena_unclaim(PyObject* arena) {
-    ustore_py_critical_section_begin_(arena);
-    --((Arena*)arena)->exports;
-    ustore_py_critical_section_end_();
-    Py_DECREF(arena);
-}
-
 ustore_arena_t ustore_py_arena_handle(PyObject* arena) { return ((Arena*)arena)->handle; }
-
-size_t ustore_py_arena_generation(PyObject* arena) {
-    size_t generation = 0;
-    ustore_py_critical_section_begin_(arena);
-    generation = ((Arena*)arena)->generation;
-    ustore_py_critical_section_end_();
-    return generation;
-}
-
-int ustore_py_arena_pin(PyObject* arena, size_t generation) {
-    if (arena_readable(arena) != 0) return -1;
-    Arena* const pinned = (Arena*)arena;
-    int fresh = 0;
-    ustore_py_critical_section_begin_(arena);
-    fresh = pinned->generation == generation;
-    if (fresh) ++pinned->exports;
-    ustore_py_critical_section_end_();
-    if (fresh) return 0;
-    return ustore_py_raise(ustore_status_uninitialized_k, "A later call rewound the arena this output lived in");
-}
-
-void ustore_py_arena_unpin(PyObject* arena) {
-    ustore_py_critical_section_begin_(arena);
-    --((Arena*)arena)->exports;
-    ustore_py_critical_section_end_();
-}
 
 #pragma endregion Arenas
 
 #pragma region DLPack
 
-/** The DLPack device types a batch is taken from: host, CUDA, ROCm and CUDA managed memory. */
-typedef enum { kDLCPU = 1, kDLCUDA = 2, kDLROCM = 10, kDLCUDAManaged = 13 } DLDeviceType;
+/** The DLPack device types a batch is taken from, host, CUDA, ROCm and CUDA managed memory,
+ *  and Metal, which an Apple arena reports. */
+typedef enum { kDLCPU = 1, kDLCUDA = 2, kDLMetal = 8, kDLROCM = 10, kDLCUDAManaged = 13 } DLDeviceType;
 
 /** Where a DLPack tensor lives. */
 typedef struct {
@@ -395,7 +350,7 @@ typedef struct dlpack_export_t {
         DLManagedTensorVersioned versioned;
     } managed;
 
-    /** The buffer the exporter answered, holding it and its arena pin until released. */
+    /** The buffer the exporter answered, held until released. */
     Py_buffer view;
 
     /** Items along every dimension. */
@@ -405,7 +360,7 @@ typedef struct dlpack_export_t {
     int64_t strides[3];
 } dlpack_export_t;
 
-/** Releases the buffer and its pin, taking the interpreter, as a consumer may delete from a thread
+/** Releases the buffer, taking the interpreter, as a consumer may delete from a thread
  *  of its own. */
 static void dlpack_export_free(dlpack_export_t* exported) {
     PyGILState_STATE const state = PyGILState_Ensure();
@@ -437,7 +392,7 @@ char const ustore_py_dlpack_doc[] =                                             
     "__dlpack__(*, stream=None, max_version=None, dl_device=None, copy=None) answers a\n"   //
     "DLPack capsule over the same memory the buffer protocol exports.\n"                    //
     "\n"                                                                                    //
-    "The capsule holds this object and pins its arena until the consumer deletes it, so\n"  //
+    "The capsule holds this object and its arena until the consumer deletes it, so\n"       //
     "`numpy.from_dlpack`, `torch.from_dlpack` and their peers read the outputs in place.\n" //
     "A `max_version` of 1 or above answers a versioned capsule flagged read-only.\n"        //
     "\n"                                                                                    //
@@ -589,7 +544,10 @@ PyObject* ustore_py_dlpack_device(PyObject* arena) {
         return NULL;
     }
     ustore_gpu_device_t const* const device = &devices[description.device];
-    return dlpack_device_pair(device->vendor == ustore_gpu_vendor_amd_k ? kDLROCM : kDLCUDA, device->vendor_ordinal);
+    DLDeviceType const device_type = device->vendor == ustore_gpu_vendor_amd_k     ? kDLROCM
+                                     : device->vendor == ustore_gpu_vendor_apple_k ? kDLMetal
+                                                                                   : kDLCUDA;
+    return dlpack_device_pair(device_type, device->vendor_ordinal);
 }
 
 /**
@@ -1252,12 +1210,11 @@ int ustore_py_buffer_fill(Py_buffer* view, PyObject* owner, void const* data, ch
     return 0;
 }
 
-PyObject* ustore_py_span_view(PyObject* arena, size_t generation, void const* data, char const* format,
-                              Py_ssize_t itemsize, int ndim, Py_ssize_t const* shape) {
+PyObject* ustore_py_span_view(PyObject* arena, void const* data, char const* format, Py_ssize_t itemsize, int ndim,
+                              Py_ssize_t const* shape) {
     Span* const span = PyObject_New(Span, &SpanType);
     if (!span) return NULL;
     span->arena = Py_NewRef(arena);
-    span->generation = generation;
     span->data = data;
     span->format = format;
     span->itemsize = itemsize;
@@ -1279,15 +1236,9 @@ static void Span_dealloc(Span* self) {
 
 static int Span_getbuffer(Span* self, Py_buffer* view, int flags) {
     view->obj = NULL;
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return -1;
-    if (ustore_py_buffer_fill(view, (PyObject*)self, self->data, self->format, self->itemsize, self->ndim, self->shape,
-                              self->strides, flags) == 0)
-        return 0;
-    ustore_py_arena_unpin(self->arena);
-    return -1;
+    return ustore_py_buffer_fill(view, (PyObject*)self, self->data, self->format, self->itemsize, self->ndim,
+                                 self->shape, self->strides, flags);
 }
-
-static void Span_releasebuffer(Span* self, Py_buffer* Py_UNUSED(view)) { ustore_py_arena_unpin(self->arena); }
 
 static PyObject* Span_dlpack_device(Span* self, PyObject* Py_UNUSED(unused)) {
     return ustore_py_dlpack_device(self->arena);
@@ -1301,7 +1252,6 @@ static PyMethodDef Span_methods[] = {
 
 static PyBufferProcs Span_as_buffer = {
     .bf_getbuffer = (getbufferproc)Span_getbuffer,
-    .bf_releasebuffer = (releasebufferproc)Span_releasebuffer,
 };
 
 PyTypeObject SpanType = {
@@ -1324,19 +1274,17 @@ static char const doc_Values[] =                                                
     "The values one batch read wrote into an `Arena`, viewing it until it rewinds.\n"           //
     "\n"                                                                                        //
     "Indexing answers a `memoryview` over the stored bytes, or None where the key was\n"        //
-    "absent; nothing is copied, and the view pins the arena against the next call until it\n"   //
-    "is released. `bytes(values[index])` is where a copy happens, and nowhere before it. The\n" //
+    "absent; nothing is copied, and `bytes(values[index])` is where a copy happens. The\n"      //
     "whole batch exports through the Arrow C data interface as `binary`, or as\n"               //
     "`large_binary` once its bytes outgrow 32-bit offsets, so `pyarrow.array(values)` reads\n"  //
     "the arena in place too, and a write takes it back as the tape it is. Read after a later\n" //
-    "call rewound the arena, it raises `UninitializedError`.";
+    "call rewound the arena, it reads whatever the arena then holds.";
 
 PyObject* ustore_py_values_new(PyObject* arena, ustore_octet_t const* presences, ustore_strings_view_t const* tape,
                                size_t count) {
     Values* const instance = PyObject_New(Values, &ValuesType);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
-    instance->generation = ustore_py_arena_generation(arena);
     instance->presences = presences;
     instance->tape = *tape;
     instance->count = count;
@@ -1371,37 +1319,29 @@ static PyObject* Values_item(Values* self, Py_ssize_t task_index) {
         PyErr_SetString(PyExc_IndexError, "Task index out of range");
         return NULL;
     }
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     PyObject* item = NULL;
     if (!values_present(self, (size_t)task_index)) item = Py_NewRef(Py_None);
     else {
         ustore_bytes_view_t const value = ustore_py_tape_string(&self->tape, (size_t)task_index);
         Py_ssize_t const shape = (Py_ssize_t)value.length;
-        item = ustore_py_span_view(self->arena, self->generation, value.data, "B", 1, 1, &shape);
+        item = ustore_py_span_view(self->arena, value.data, "B", 1, 1, &shape);
     }
-    ustore_py_arena_unpin(self->arena);
     return item;
 }
 
 static int Values_getbuffer(Values* self, Py_buffer* view, int flags) {
     view->obj = NULL;
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return -1;
     // A tape of no values still answers a buffer, so a caller need not special-case an empty read.
     void* const data = values_data(self) ? (void*)values_data(self) : (void*)self;
     Py_ssize_t const bytes = (Py_ssize_t)ustore_py_tape_bytes(&self->tape, self->count);
-    if (PyBuffer_FillInfo(view, (PyObject*)self, data, bytes, 1, flags) == 0) return 0;
-    ustore_py_arena_unpin(self->arena);
-    return -1;
+    return PyBuffer_FillInfo(view, (PyObject*)self, data, bytes, 1, flags);
 }
-
-static void Values_releasebuffer(Values* self, Py_buffer* Py_UNUSED(view)) { ustore_py_arena_unpin(self->arena); }
 
 static PyObject* Values_repr(Values* self) { return PyUnicode_FromFormat("Values(count=%zu)", self->count); }
 
 static char const doc_Values_lengths[] = "The length of every value, with None where the key was absent, as a tuple.";
 
 static PyObject* Values_get_lengths(Values* self, void* Py_UNUSED(closure)) {
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     PyObject* lengths = PyTuple_New((Py_ssize_t)self->count);
     for (size_t task_index = 0; lengths && task_index != self->count; ++task_index) {
         ustore_size_t const length = ustore_py_tape_string(&self->tape, task_index).length;
@@ -1410,11 +1350,10 @@ static PyObject* Values_get_lengths(Values* self, void* Py_UNUSED(closure)) {
         if (!entry) Py_CLEAR(lengths);
         else PyTuple_SET_ITEM(lengths, (Py_ssize_t)task_index, entry);
     }
-    ustore_py_arena_unpin(self->arena);
     return lengths;
 }
 
-/** What one exported array keeps alive until its consumer releases it: the @c Values, its pin and its buffers. */
+/** What one exported array holds until its consumer releases it: the @c Values and its buffers. */
 typedef struct values_export_t {
 
     /** The @c Values viewing the tape and its spans, held by a strong reference, its arena pinned. */
@@ -1429,12 +1368,11 @@ static int64_t const values_export_empty_k[1] = {0};
 
 static void values_schema_release(struct ArrowSchema* schema) { schema->release = NULL; }
 
-/** Lets go of the exported @c Values and its pin, taking the interpreter, as a consumer may release from a thread of
- *  its own. */
+/** Lets go of the exported @c Values, taking the interpreter, as a consumer may release from a
+ *  thread of its own. */
 static void values_array_release(struct ArrowArray* array) {
     values_export_t* const exported = (values_export_t*)array->private_data;
     PyGILState_STATE const state = PyGILState_Ensure();
-    ustore_py_arena_unpin(exported->owner->arena);
     Py_DECREF(exported->owner);
     PyGILState_Release(state);
     PyMem_RawFree(exported);
@@ -1453,15 +1391,15 @@ static void values_array_capsule_free(PyObject* capsule) {
     PyMem_RawFree(array);
 }
 
-static char const doc_Values_arrow_c_array[] =                                              //
-    "__arrow_c_array__(requested_schema=None) answers the schema and array PyCapsules.\n"   //
-    "\n"                                                                                    //
-    "Exports the batch as Arrow `binary` with the 32-bit offsets the read wrote, or as\n"   //
-    "`large_binary` with 64-bit ones once its bytes outgrow 4 GiB, with a value missing\n"  //
-    "where the key was absent. The presence bits, offsets and bytes the read wrote are\n"   //
-    "exported in place, and the array keeps this object alive and pins its arena until\n"   //
-    "Arrow releases it. A requested schema is ignored, and Arrow casts from the exported\n" //
-    "type where it asked for another.";
+static char const doc_Values_arrow_c_array[] =                                             //
+    "__arrow_c_array__(requested_schema=None) answers the schema and array PyCapsules.\n"  //
+    "\n"                                                                                   //
+    "Exports the batch as Arrow `binary` with the 32-bit offsets the read wrote, or as\n"  //
+    "`large_binary` with 64-bit ones once its bytes outgrow 4 GiB, with a value missing\n" //
+    "where the key was absent. The presence bits, offsets and bytes the read wrote are\n"  //
+    "exported in place, and the array keeps this object and its arena alive until Arrow\n" //
+    "releases it. A requested schema is ignored, and Arrow casts from the exported type\n" //
+    "where it asked for another.";
 
 static PyObject* Values_arrow_c_array(Values* self, PyObject* const* Py_UNUSED(arguments),
                                       Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
@@ -1482,12 +1420,6 @@ static PyObject* Values_arrow_c_array(Values* self, PyObject* const* Py_UNUSED(a
         PyMem_RawFree(array);
         PyMem_RawFree(schema);
         PyErr_NoMemory();
-        return NULL;
-    }
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) {
-        PyMem_RawFree(exported);
-        PyMem_RawFree(array);
-        PyMem_RawFree(schema);
         return NULL;
     }
 
@@ -1555,7 +1487,6 @@ static PySequenceMethods Values_as_sequence = {
 
 static PyBufferProcs Values_as_buffer = {
     .bf_getbuffer = (getbufferproc)Values_getbuffer,
-    .bf_releasebuffer = (releasebufferproc)Values_releasebuffer,
 };
 
 PyTypeObject ValuesType = {
@@ -1577,21 +1508,19 @@ PyTypeObject ValuesType = {
 
 #pragma region Key Tapes
 
-static char const doc_Keys[] =                                                                //
-    "The keys one batch scan or sample wrote into an `Arena`, viewing it until it rewinds.\n" //
-    "\n"                                                                                      //
-    "Indexing answers a tuple of `uuid.UUID` keys for one task, which is where a copy\n"      //
-    "happens. The whole tape exports through the buffer protocol as an array of shape\n"      //
-    "(keys, 16) bytes, so `np.asarray(keys)` reads it without copying, and pins the arena\n"  //
-    "against the next call until released. Read after a later call rewound the arena, it\n"   //
-    "raises `UninitializedError`.";
+static char const doc_Keys[] =                                                                 //
+    "The keys one batch scan or sample wrote into an `Arena`, viewing it until it rewinds.\n"  //
+    "\n"                                                                                       //
+    "Indexing answers a tuple of `uuid.UUID` keys for one task, which is where a copy\n"       //
+    "happens. The whole tape exports through the buffer protocol as an array of shape\n"       //
+    "`(keys, 16)` bytes, so `np.asarray(keys)` reads it without copying. Read after a later\n" //
+    "call rewound the arena, it reads whatever the arena then holds.";
 
 PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, ustore_key_t const* tape, size_t count,
                              float const* scores) {
     Keys* const instance = PyObject_New(Keys, &KeysType);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
-    instance->generation = ustore_py_arena_generation(arena);
     instance->offsets = offsets;
     instance->tape = tape;
     instance->scores = scores;
@@ -1616,7 +1545,6 @@ static PyObject* Keys_item(Keys* self, Py_ssize_t task_index) {
         PyErr_SetString(PyExc_IndexError, "Task index out of range");
         return NULL;
     }
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     ustore_key_t const* const run = self->tape + self->offsets[task_index];
     Py_ssize_t const found = (Py_ssize_t)(self->offsets[task_index + 1] - self->offsets[task_index]);
     PyObject* keys = PyTuple_New(found);
@@ -1625,20 +1553,13 @@ static PyObject* Keys_item(Keys* self, Py_ssize_t task_index) {
         if (!key) Py_CLEAR(keys);
         else PyTuple_SET_ITEM(keys, key_index, key);
     }
-    ustore_py_arena_unpin(self->arena);
     return keys;
 }
 
 static int Keys_getbuffer(Keys* self, Py_buffer* view, int flags) {
     view->obj = NULL;
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return -1;
-    if (ustore_py_buffer_fill(view, (PyObject*)self, self->tape, "B", 1, 2, self->shape, self->strides, flags) == 0)
-        return 0;
-    ustore_py_arena_unpin(self->arena);
-    return -1;
+    return ustore_py_buffer_fill(view, (PyObject*)self, self->tape, "B", 1, 2, self->shape, self->strides, flags);
 }
-
-static void Keys_releasebuffer(Keys* self, Py_buffer* Py_UNUSED(view)) { ustore_py_arena_unpin(self->arena); }
 
 static PyObject* Keys_repr(Keys* self) {
     return PyUnicode_FromFormat("Keys(tasks=%zu, keys=%zd)", self->count, self->shape[0]);
@@ -1647,14 +1568,12 @@ static PyObject* Keys_repr(Keys* self) {
 static char const doc_Keys_counts[] = "The number of keys every task found, as a tuple.";
 
 static PyObject* Keys_get_counts(Keys* self, void* Py_UNUSED(closure)) {
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     PyObject* counts = PyTuple_New((Py_ssize_t)self->count);
     for (size_t task_index = 0; counts && task_index != self->count; ++task_index) {
         PyObject* const entry = PyLong_FromUnsignedLongLong(self->offsets[task_index + 1] - self->offsets[task_index]);
         if (!entry) Py_CLEAR(counts);
         else PyTuple_SET_ITEM(counts, (Py_ssize_t)task_index, entry);
     }
-    ustore_py_arena_unpin(self->arena);
     return counts;
 }
 
@@ -1663,14 +1582,12 @@ static char const doc_Keys_scores[] =
 
 static PyObject* Keys_get_scores(Keys* self, void* Py_UNUSED(closure)) {
     if (!self->scores) Py_RETURN_NONE;
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     PyObject* scores = PyTuple_New(self->shape[0]);
     for (Py_ssize_t key_index = 0; scores && key_index != self->shape[0]; ++key_index) {
         PyObject* const score = PyFloat_FromDouble((double)self->scores[key_index]);
         if (!score) Py_CLEAR(scores);
         else PyTuple_SET_ITEM(scores, key_index, score);
     }
-    ustore_py_arena_unpin(self->arena);
     return scores;
 }
 
@@ -1697,7 +1614,6 @@ static PySequenceMethods Keys_as_sequence = {
 
 static PyBufferProcs Keys_as_buffer = {
     .bf_getbuffer = (getbufferproc)Keys_getbuffer,
-    .bf_releasebuffer = (releasebufferproc)Keys_releasebuffer,
 };
 
 PyTypeObject KeysType = {
@@ -1855,6 +1771,7 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
     [ustore_py_enum_modification_k] = "Modification",
     [ustore_py_enum_page_encoding_k] = "PageEncoding",
     [ustore_py_enum_change_kind_k] = "ChangeKind",
+    [ustore_py_enum_phase_k] = "Phase",
 };
 
 /** Every enumerator of every closed set fits a byte, as the C suite checks, so walks find all. */
@@ -1889,6 +1806,7 @@ static char const* enum_spelling(ustore_py_enum_t kind, int value) {
     case ustore_py_enum_modification_k: return ustore_docs_modification_name((ustore_docs_modification_t)value);
     case ustore_py_enum_page_encoding_k: return ustore_page_encoding_name((ustore_page_encoding_t)value);
     case ustore_py_enum_change_kind_k: return ustore_change_kind_name((ustore_change_kind_t)value);
+    case ustore_py_enum_phase_k: return ustore_phase_name((ustore_phase_t)value);
     case ustore_py_enums_count_k: break;
     }
     return enum_unrecognized_k;
@@ -2041,22 +1959,17 @@ void* ustore_py_call_open(ustore_py_context_t const* context, ustore_py_verb_t c
     if (!deferred) return NULL;
     deferred->verb = verb;
     deferred->origin = Py_NewRef(context->origin);
-    deferred->answer = NULL;
-    deferred->raised = NULL;
+    atomic_init(&deferred->answering, 0);
+    atomic_init(&deferred->answer, NULL);
+    atomic_init(&deferred->raised, NULL);
     memset(deferred->call, 0, verb->call_bytes);
     PyObject_GC_Track(deferred);
     return deferred->call;
 }
 
-/** Answers @p call once it is final: what its progress callable raised, else its outcome's failure, else its answer. */
+/** Answers @p call once it is final: its outcome's failure, else its answer. */
 static PyObject* call_answer(ustore_py_verb_t const* verb, void* call) {
     ustore_py_call_t* const header = (ustore_py_call_t*)call;
-    if (header->raised) {
-        PyErr_SetRaisedException(header->raised);
-        header->raised = NULL;
-        return NULL;
-    }
-    if (ustore_py_predicate_raise(&header->predicate) != 0) return NULL;
     return ustore_py_raise_on_outcome(&header->outcome) == 0 ? verb->answer(call) : NULL;
 }
 
@@ -2082,7 +1995,7 @@ PyObject* ustore_py_call_discard(ustore_py_context_t const* context, ustore_py_v
     call_release(verb, call);
     if (context->completion == ustore_completion_blocking_k) return NULL;
     Deferred* const deferred = deferred_of(call);
-    deferred->verb = NULL;
+    atomic_store(&deferred->answering, 1);
     PyObject* const raised = PyErr_GetRaisedException();
     Py_DECREF(deferred);
     PyErr_SetRaisedException(raised);
@@ -2090,12 +2003,11 @@ PyObject* ustore_py_call_discard(ustore_py_context_t const* context, ustore_py_v
 }
 
 void ustore_py_call_release(ustore_py_call_t* call) {
-    if (call->arena) ustore_py_arena_unclaim(call->arena);
+    if (call->arena) Py_DECREF(call->arena);
     call->arena = NULL;
     Py_CLEAR(call->progress);
-    Py_CLEAR(call->raised);
+    Py_CLEAR(call->result);
     Py_CLEAR(call->predicate.callable);
-    Py_CLEAR(call->predicate.raised);
 }
 
 PyObject* ustore_py_call_answer_none(void* Py_UNUSED(call)) { Py_RETURN_NONE; }
@@ -2116,27 +2028,22 @@ int ustore_py_progress_from_object(PyObject* object, PyObject** progress) {
  *
  *  Reports never overlap and never follow the final status, but nothing places them on the calling thread, so the
  *  interpreter is attached here rather than assumed. An answer of None carries on, as does a truthy one, while a
- *  falsy one cancels, and so does a raise, whose exception the header keeps for the answer.
+ *  falsy one cancels, and a raise reports through the unraisable hook and cancels.
  */
 static ustore_continuation_t progress_trampoline(ustore_size_t finished, ustore_size_t total, void* state) {
     ustore_py_call_t* const call = (ustore_py_call_t*)state;
-    if (call->raised) return ustore_cancel_k;
     PyGILState_STATE const interpreter = PyGILState_Ensure();
-    ustore_continuation_t continuation = ustore_cancel_k;
     PyObject* const finished_object = PyLong_FromUnsignedLongLong(finished);
     PyObject* const total_object = finished_object ? PyLong_FromUnsignedLongLong(total) : NULL;
     PyObject* const arguments[2] = {finished_object, total_object};
     PyObject* const verdict = total_object ? PyObject_Vectorcall(call->progress, arguments, 2, NULL) : NULL;
-    if (verdict) {
-        int const truth = verdict == Py_None ? 1 : PyObject_IsTrue(verdict);
-        if (truth > 0) continuation = ustore_continue_k;
-        Py_DECREF(verdict);
-    }
+    int const truth = !verdict ? -1 : verdict == Py_None ? 1 : PyObject_IsTrue(verdict);
+    Py_XDECREF(verdict);
     Py_XDECREF(total_object);
     Py_XDECREF(finished_object);
-    if (PyErr_Occurred()) call->raised = PyErr_GetRaisedException();
+    if (truth < 0) PyErr_WriteUnraisable(call->progress);
     PyGILState_Release(interpreter);
-    return continuation;
+    return truth > 0 ? ustore_continue_k : ustore_cancel_k;
 }
 
 ustore_progress_callback_t ustore_py_progress_callback(ustore_py_call_t const* call) {
@@ -2157,14 +2064,14 @@ int ustore_py_predicate_from_object(PyObject* object, PyObject** callable) {
 /**
  *  @brief Re-enters Python for one page of the scan whose predicate is @p state, from whichever thread runs it.
  *
- *  The callable receives the keys as a tuple of `uuid.UUID` and answers one truthy or falsy item per key. Once it
- *  raised, or answered the wrong number of items, every later key is rejected and the exception resurfaces.
+ *  The callable receives the keys as a tuple of <tt>uuid.UUID</tt> and answers one truthy or falsy
+ *  item per key. One that raises, or answers the wrong number of items, reports through the
+ *  unraisable hook and rejects the whole page.
  */
 static void predicate_trampoline(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count,
                                  void* state) {
     ustore_py_predicate_t* const predicate = (ustore_py_predicate_t*)state;
     for (ustore_size_t index = 0; index != count; ++index) admissions[index] = ustore_reject_k;
-    if (predicate->raised) return;
     PyGILState_STATE const interpreter = PyGILState_Ensure();
     PyObject* asked = PyTuple_New((Py_ssize_t)count);
     for (ustore_size_t index = 0; asked && index != count; ++index) {
@@ -2182,7 +2089,7 @@ static void predicate_trampoline(ustore_key_t const* keys, ustore_admission_t* a
         if (truth > 0) admissions[index] = ustore_admit_k;
     }
     if (PyErr_Occurred()) {
-        predicate->raised = PyErr_GetRaisedException();
+        PyErr_WriteUnraisable(predicate->callable);
         for (ustore_size_t index = 0; index != count; ++index) admissions[index] = ustore_reject_k;
     }
     Py_XDECREF(listed);
@@ -2197,13 +2104,6 @@ ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate, int 
     return predicate->callable ? asked : none;
 }
 
-int ustore_py_predicate_raise(ustore_py_predicate_t* predicate) {
-    if (!predicate->raised) return 0;
-    PyErr_SetRaisedException(predicate->raised);
-    predicate->raised = NULL;
-    return -1;
-}
-
 #pragma endregion Calls
 
 #pragma region Deferred Calls
@@ -2212,12 +2112,12 @@ static char const doc_Deferred[] =                                              
     "A call a deferred view submitted, which answers once it finishes.\n"                         //
     "\n"                                                                                          //
     "Built by the verbs of a DeferredOn, never by name. `await` suspends the coroutine until\n"   //
-    "the call is final, running `wait()` on the event loop's own executor, and `wait()` blocks\n" //
-    "the thread instead. Either answers what the blocking verb would have answered, or raises\n"  //
-    "what it would have raised, as many times as it is asked; `status` polls without waiting.\n"  //
+    "the call is final, polling `status` between sleeps growing from 1 us to 1 ms and parking\n"  //
+    "no thread, and `wait()` blocks the thread instead. Either answers what the blocking verb\n"  //
+    "would have answered, or raises what it would have raised, as many times as it is asked.\n"   //
     "The object holds the outcome, the keys and buffers the call borrows, its output slots and\n" //
-    "its arena until the call finishes, so dropping it waits for that, and another call naming\n" //
-    "the arena raises ContendedError until it is waited on or dropped.\n"                         //
+    "its arena until the call finishes, so dropping it waits for that, and C refuses another\n"   //
+    "call naming the arena with ContendedError until it finishes.\n"                              //
     "\n"                                                                                          //
     "Example:\n"                                                                                  //
     "  >>> async def read(database, executor, keys):\n"                                           //
@@ -2241,45 +2141,30 @@ static void deferred_block(Deferred* deferred) {
     Py_END_ALLOW_THREADS;
 }
 
-/**
- *  @brief Finishes a final @p self exactly once: the thread taking its verb answers, publishes, then lets go of its
- *      inputs and its arena.
- *
- *  Answering may run Python, which lets another thread in even under the GIL, so the verb is taken before answering
- *  and the answer published after it, never one check spanning both.
- */
+/** Finishes a final @p self exactly once: the one thread taking the call answers it, lets go
+ *  of its inputs and its arena, then publishes. */
 static void deferred_finish(Deferred* self) {
-    ustore_py_verb_t const* finishing = NULL;
-    ustore_py_critical_section_begin_((PyObject*)self);
-    finishing = self->verb;
-    self->verb = NULL;
-    ustore_py_critical_section_end_();
-    if (!finishing) return;
-    PyObject* const answer = call_answer(finishing, self->call);
+    if (atomic_exchange(&self->answering, 1)) return;
+    PyObject* const answer = call_answer(self->verb, self->call);
     PyObject* const raised = answer ? NULL : PyErr_GetRaisedException();
-    ustore_py_critical_section_begin_((PyObject*)self);
-    self->answer = answer;
-    self->raised = raised;
-    ustore_py_critical_section_end_();
-    call_release(finishing, self->call);
+    call_release(self->verb, self->call);
+    if (answer) atomic_store_explicit(&self->answer, answer, memory_order_release);
+    else atomic_store_explicit(&self->raised, raised, memory_order_release);
 }
 
-/** Answers what a final @p self finished with, finishing it first when nobody has. */
+/** Answers what a final @p self finished with, finishing it first when nobody has; a thread
+ *  asking while another still answers is refused as contended rather than made to wait. */
 static PyObject* deferred_answer(Deferred* self) {
     deferred_finish(self);
-    for (;;) {
-        PyObject* answer = NULL;
-        int published = 0;
-        ustore_py_critical_section_begin_((PyObject*)self);
-        published = self->answer || self->raised;
-        if (self->raised) PyErr_SetRaisedException(Py_NewRef(self->raised));
-        else if (self->answer) answer = Py_NewRef(self->answer);
-        ustore_py_critical_section_end_();
-        if (published) return answer;
-        // Another thread took the verb and is still answering, so this one yields until it publishes.
-        Py_BEGIN_ALLOW_THREADS;
-        Py_END_ALLOW_THREADS;
+    PyObject* const raised = atomic_load_explicit(&self->raised, memory_order_acquire);
+    if (raised) {
+        PyErr_SetRaisedException(Py_NewRef(raised));
+        return NULL;
     }
+    PyObject* const answer = atomic_load_explicit(&self->answer, memory_order_acquire);
+    if (answer) return Py_NewRef(answer);
+    ustore_py_raise(ustore_status_contended_k, "Another thread is answering this call");
+    return NULL;
 }
 
 static char const doc_Deferred_status[] =                                                        //
@@ -2305,57 +2190,56 @@ static PyObject* Deferred_wait(Deferred* self, PyObject* Py_UNUSED(ignored)) {
     return deferred_answer(self);
 }
 
-/** Answers the iterator of an `asyncio.Future` that `wait()` resolves on the running loop's default executor. */
+/** Answers the iterator of the <tt>ustore._settled</tt> coroutine, which polls the status on the
+ *  running loop with a growing sleep and never parks a thread, then answers the wait. */
 static PyObject* Deferred_await(Deferred* self) {
-    PyObject* const asyncio = PyImport_ImportModule("asyncio");
-    PyObject* const loop = asyncio ? PyObject_CallMethod(asyncio, "get_running_loop", NULL) : NULL;
-    Py_XDECREF(asyncio);
-    PyObject* const wait = loop ? PyObject_GetAttrString((PyObject*)self, "wait") : NULL;
-    PyObject* const future = wait ? PyObject_CallMethod(loop, "run_in_executor", "OO", Py_None, wait) : NULL;
-    Py_XDECREF(wait);
-    Py_XDECREF(loop);
-    PyObject* const awaiting = future ? PyObject_CallMethod(future, "__await__", NULL) : NULL;
-    Py_XDECREF(future);
+    PyObject* const package = PyImport_ImportModule("ustore");
+    PyObject* const settled = package ? PyObject_GetAttrString(package, "_settled") : NULL;
+    Py_XDECREF(package);
+    PyObject* const coroutine = settled ? PyObject_CallOneArg(settled, (PyObject*)self) : NULL;
+    Py_XDECREF(settled);
+    PyObject* const awaiting = coroutine ? PyObject_CallMethod(coroutine, "__await__", NULL) : NULL;
+    Py_XDECREF(coroutine);
     return awaiting;
 }
 
 static void Deferred_dealloc(Deferred* self) {
     PyObject_GC_UnTrack(self);
     // The library writes into the call this object holds, and reads the inputs it borrows, until the call finishes
-    if (self->verb) {
+    if (!atomic_load(&self->answering)) {
         deferred_block(self);
         call_release(self->verb, self->call);
     }
-    Py_XDECREF(self->answer);
-    Py_XDECREF(self->raised);
+    Py_XDECREF(atomic_load(&self->answer));
+    Py_XDECREF(atomic_load(&self->raised));
     Py_XDECREF(self->origin);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-/** Visits what @p self holds; an unfinished call's arena and progress callable stay unvisited, so every cycle through
- *  them waits for a later collection rather than being cleared while the library still uses them. */
+/** Visits what @p self holds; an unfinished call's arena and callables stay unvisited, so every
+ *  cycle through them waits for a later collection rather than being cleared while the library
+ *  still uses them. */
 static int Deferred_traverse(Deferred* self, visitproc visit, void* arg) {
+    PyObject* const answer = atomic_load_explicit(&self->answer, memory_order_relaxed);
+    PyObject* const raised = atomic_load_explicit(&self->raised, memory_order_relaxed);
     Py_VISIT(self->origin);
-    Py_VISIT(self->answer);
-    Py_VISIT(self->raised);
-    if (!self->verb || deferred_status(self) == ustore_status_deferred_k) return 0;
+    Py_VISIT(answer);
+    Py_VISIT(raised);
+    if (atomic_load(&self->answering) || deferred_status(self) == ustore_status_deferred_k) return 0;
     ustore_py_call_t const* const header = (ustore_py_call_t const*)(void const*)self->call;
     Py_VISIT(header->arena);
     Py_VISIT(header->progress);
-    Py_VISIT(header->raised);
+    Py_VISIT(header->result);
     Py_VISIT(header->predicate.callable);
-    Py_VISIT(header->predicate.raised);
     return 0;
 }
 
 /** Breaks a garbage cycle through a final @p self; an unfinished one is left whole, as its traversal hid the cycle. */
 static int Deferred_clear(Deferred* self) {
     if (deferred_status(self) == ustore_status_deferred_k) return 0;
-    ustore_py_verb_t const* const releasing = self->verb;
-    self->verb = NULL;
-    if (releasing) call_release(releasing, self->call);
-    Py_CLEAR(self->answer);
-    Py_CLEAR(self->raised);
+    if (!atomic_exchange(&self->answering, 1)) call_release(self->verb, self->call);
+    Py_XDECREF(atomic_exchange(&self->answer, NULL));
+    Py_XDECREF(atomic_exchange(&self->raised, NULL));
     Py_CLEAR(self->origin);
     return 0;
 }
@@ -2727,11 +2611,8 @@ static PyObject* Executor_for_vram(PyObject* type, PyObject* const* arguments, P
 
 /** Frees the threads of @p executor once its calls finish, leaving the object to refuse further calls. */
 static void executor_close(Executor* executor) {
-    ustore_executor_t handle = NULL;
-    ustore_py_critical_section_begin_((PyObject*)executor);
-    handle = executor->handle;
+    ustore_executor_t const handle = executor->handle;
     executor->handle = NULL;
-    ustore_py_critical_section_end_();
     if (handle) {
         Py_BEGIN_ALLOW_THREADS;
         ustore_executor_free(handle);
@@ -2838,107 +2719,259 @@ PyTypeObject ExecutorType = {
 
 #pragma region Module Types
 
-PyTypeObject* CapabilitiesType = NULL;
+/** Answers <tt>Type(field=value, ...)</tt> over every getter, then every member, of @p self. */
+static PyObject* report_repr(PyObject* self) {
+    PyTypeObject* const type = Py_TYPE(self);
+    PyObject* const parts = PyList_New(0);
+    int failed = !parts;
+    for (PyGetSetDef const* getter = type->tp_getset; !failed && getter && getter->name; ++getter) {
+        PyObject* const value = PyObject_GetAttrString(self, getter->name);
+        PyObject* const part = value ? PyUnicode_FromFormat("%s=%R", getter->name, value) : NULL;
+        failed = !part || PyList_Append(parts, part) != 0;
+        Py_XDECREF(part);
+        Py_XDECREF(value);
+    }
+    for (PyMemberDef const* member = type->tp_members; !failed && member && member->name; ++member) {
+        PyObject* const value = PyObject_GetAttrString(self, member->name);
+        PyObject* const part = value ? PyUnicode_FromFormat("%s=%R", member->name, value) : NULL;
+        failed = !part || PyList_Append(parts, part) != 0;
+        Py_XDECREF(part);
+        Py_XDECREF(value);
+    }
+    PyObject* const separator = failed ? NULL : PyUnicode_FromString(", ");
+    PyObject* const joined = separator ? PyUnicode_Join(separator, parts) : NULL;
+    char const* const dot = strrchr(type->tp_name, '.');
+    PyObject* const repr = joined ? PyUnicode_FromFormat("%s(%U)", dot ? dot + 1 : type->tp_name, joined) : NULL;
+    Py_XDECREF(joined);
+    Py_XDECREF(separator);
+    Py_XDECREF(parts);
+    return repr;
+}
 
-static PyStructSequence_Field capabilities_fields[] = {
-    {"transactions", "Whether the engine groups operations into transactions."},
-    {"snapshots", "Whether the engine pins point-in-time states."},
-    {NULL, NULL},
+PyObject* ustore_py_report_new(PyTypeObject* type) { return type->tp_alloc(type, 0); }
+
+static char const doc_Capabilities[] = "What an engine supports, as `Database.capabilities` reports it.";
+
+PyObject* ustore_py_capabilities_to_object(ustore_capabilities_t flags) {
+    Capabilities* const capabilities = (Capabilities*)ustore_py_report_new(&CapabilitiesType);
+    if (capabilities) capabilities->flags = flags;
+    return (PyObject*)capabilities;
+}
+
+static PyObject* Capabilities_get_flag(Capabilities* self, void* closure) {
+    return PyBool_FromLong((self->flags & (ustore_capabilities_t)(uintptr_t)closure) != 0);
+}
+
+static PyObject* Capabilities_richcompare(PyObject* self, PyObject* other, int operation) {
+    if (!PyObject_TypeCheck(other, &CapabilitiesType) || (operation != Py_EQ && operation != Py_NE))
+        Py_RETURN_NOTIMPLEMENTED;
+    int const same = ((Capabilities*)self)->flags == ((Capabilities*)other)->flags;
+    return PyBool_FromLong(operation == Py_EQ ? same : !same);
+}
+
+static PyGetSetDef Capabilities_getset[] = {
+    {"transactions", (getter)Capabilities_get_flag, NULL, "Whether the engine groups operations into transactions.",
+     (void*)(uintptr_t)ustore_capabilities_transactions_k},
+    {"snapshots", (getter)Capabilities_get_flag, NULL, "Whether the engine pins point-in-time states.",
+     (void*)(uintptr_t)ustore_capabilities_snapshots_k},
+    {NULL, NULL, NULL, NULL, NULL},
 };
 
-static PyStructSequence_Desc capabilities_description = {
-    "ustore.Capabilities",
-    "What an engine supports, as `Database.capabilities` reports it.",
-    capabilities_fields,
-    2,
+PyTypeObject CapabilitiesType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.Capabilities",
+    .tp_doc = doc_Capabilities,
+    .tp_basicsize = sizeof(Capabilities),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_repr = report_repr,
+    .tp_richcompare = Capabilities_richcompare,
+    .tp_getset = Capabilities_getset,
 };
 
-PyTypeObject* MeasurementType = NULL;
+static char const doc_Measurement[] =
+    "The bounds on what a key range holds, as `measure()` estimates them without walking it.";
 
-static PyStructSequence_Field measurement_fields[] = {
-    {"min_cardinality", "The fewest entries the range may hold."},
-    {"max_cardinality", "The most entries the range may hold."},
-    {"min_value_bytes", "The fewest bytes the values in the range may take."},
-    {"max_value_bytes", "The most bytes the values in the range may take."},
-    {"min_space_usage", "The fewest bytes the range may take on disk."},
-    {"max_space_usage", "The most bytes the range may take on disk."},
-    {NULL, NULL},
+void ustore_py_measurement_settle(Measurement* measurement) {
+    for (size_t index = 0; index != ustore_py_table_size_(measurement->slots); ++index)
+        measurement->bounds[index] = measurement->slots[index] ? measurement->slots[index][0] : 0;
+}
+
+static PyMemberDef Measurement_members[] = {
+    {"min_cardinality", Py_T_ULONGLONG, offsetof(Measurement, bounds[0]), Py_READONLY,
+     "The fewest entries the range may hold."},
+    {"max_cardinality", Py_T_ULONGLONG, offsetof(Measurement, bounds[1]), Py_READONLY,
+     "The most entries the range may hold."},
+    {"min_value_bytes", Py_T_ULONGLONG, offsetof(Measurement, bounds[2]), Py_READONLY,
+     "The fewest bytes the values in the range may take."},
+    {"max_value_bytes", Py_T_ULONGLONG, offsetof(Measurement, bounds[3]), Py_READONLY,
+     "The most bytes the values in the range may take."},
+    {"min_space_usage", Py_T_ULONGLONG, offsetof(Measurement, bounds[4]), Py_READONLY,
+     "The fewest bytes the range may take on disk."},
+    {"max_space_usage", Py_T_ULONGLONG, offsetof(Measurement, bounds[5]), Py_READONLY,
+     "The most bytes the range may take on disk."},
+    {NULL, 0, 0, 0, NULL},
 };
 
-static PyStructSequence_Desc measurement_description = {
-    "ustore.Measurement",
-    "The bounds on what a key range holds, as `measure()` estimates them without walking it.",
-    measurement_fields,
-    6,
+PyTypeObject MeasurementType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.Measurement",
+    .tp_doc = doc_Measurement,
+    .tp_basicsize = sizeof(Measurement),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_repr = report_repr,
+    .tp_members = Measurement_members,
 };
 
-PyTypeObject* ChangesType = NULL;
+static char const doc_Changes[] = "The changes one pull of a ChangesCursor answers, oldest first.";
 
-static PyStructSequence_Field changes_fields[] = {
-    {"keys", "The Page of the key of every change, oldest change first."},
-    {"values", "The Values of the bytes every change carries when the pull asked for them, or None."},
-    {"stamps", "The stamp every change was committed at."},
-    {"kinds", "What every change did, as a ChangeKind."},
-    {NULL, NULL},
+static void Changes_dealloc(Changes* self) {
+    Py_XDECREF(self->keys_object);
+    Py_XDECREF(self->values_object);
+    Py_XDECREF(self->stamps_object);
+    Py_XDECREF(self->kinds_object);
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyMemberDef Changes_members[] = {
+    {"keys", Py_T_OBJECT_EX, offsetof(Changes, keys_object), Py_READONLY,
+     "The Page of the key of every change, oldest change first."},
+    {"values", Py_T_OBJECT_EX, offsetof(Changes, values_object), Py_READONLY,
+     "The Values of the bytes every change carries when the pull asked for them, or None."},
+    {"stamps", Py_T_OBJECT_EX, offsetof(Changes, stamps_object), Py_READONLY,
+     "The stamp every change was committed at."},
+    {"kinds", Py_T_OBJECT_EX, offsetof(Changes, kinds_object), Py_READONLY, "What every change did, as a ChangeKind."},
+    {NULL, 0, 0, 0, NULL},
 };
 
-static PyStructSequence_Desc changes_description = {
-    "ustore.Changes",
-    "The changes one pull of a ChangesCursor answers, oldest first.",
-    changes_fields,
-    4,
+PyTypeObject ChangesType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.Changes",
+    .tp_doc = doc_Changes,
+    .tp_basicsize = sizeof(Changes),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_dealloc = (destructor)Changes_dealloc,
+    .tp_repr = report_repr,
+    .tp_members = Changes_members,
 };
 
-PyTypeObject* DescriptionType = NULL;
+static char const doc_Description[] =                                                      //
+    "What an open database reports about itself, as `describe()` answers it, every size\n" //
+    "the engine's estimate.";
 
-static PyStructSequence_Field description_fields[] = {
-    {"capabilities", "What the engine supports, as a Capabilities."},
-    {"engine", "The engine serving the database, an Engine."},
-    {"isolation", "How transactions see each other: what the RAM engine was opened with, and SNAPSHOT elsewhere."},
-    {"cpu_class", "The CPUClass the engine's calls run as, picked at open; UNKNOWN for RocksDB and LevelDB."},
-    {"keys", "Keys across every collection, as the engine estimates them."},
-    {"memory_bytes", "Bytes of memory the engine holds for the data, or zero where it keeps no estimate."},
-    {"disk_bytes", "Bytes the files of the database take on disk."},
-    {"pin_refused_bytes",
+static PyObject* Description_get_capabilities(Description* self, void* Py_UNUSED(closure)) {
+    return ustore_py_capabilities_to_object(self->description.capabilities);
+}
+
+static PyObject* Description_get_engine(Description* self, void* Py_UNUSED(closure)) {
+    return ustore_py_enum_to_object(ustore_py_enum_engine_k, (int)self->description.engine);
+}
+
+static PyObject* Description_get_isolation(Description* self, void* Py_UNUSED(closure)) {
+    return ustore_py_enum_to_object(ustore_py_enum_isolation_k, (int)self->description.isolation);
+}
+
+static PyObject* Description_get_cpu_class(Description* self, void* Py_UNUSED(closure)) {
+    return ustore_py_enum_to_object(ustore_py_enum_cpu_class_k, (int)self->description.cpu_class);
+}
+
+static PyGetSetDef Description_getset[] = {
+    {"capabilities", (getter)Description_get_capabilities, NULL, "What the engine supports, as a Capabilities.", NULL},
+    {"engine", (getter)Description_get_engine, NULL, "The engine serving the database, an Engine.", NULL},
+    {"isolation", (getter)Description_get_isolation, NULL,
+     "How transactions see each other: what the RAM engine was opened with, and SNAPSHOT elsewhere.", NULL},
+    {"cpu_class", (getter)Description_get_cpu_class, NULL,
+     "The CPUClass the engine's calls run as, picked at open; UNKNOWN for RocksDB and LevelDB.", NULL},
+    {NULL, NULL, NULL, NULL, NULL},
+};
+
+static PyMemberDef Description_members[] = {
+    {"keys", Py_T_ULONGLONG, offsetof(Description, description.keys), Py_READONLY,
+     "Keys across every collection, as the engine estimates them."},
+    {"memory_bytes", Py_T_ULONGLONG, offsetof(Description, description.memory_bytes), Py_READONLY,
+     "Bytes of memory the engine holds for the data, or zero where it keeps no estimate."},
+    {"disk_bytes", Py_T_ULONGLONG, offsetof(Description, description.disk_bytes), Py_READONLY,
+     "Bytes the files of the database take on disk."},
+    {"pin_refused_bytes", Py_T_ULONGLONG, offsetof(Description, description.pin_refused_bytes), Py_READONLY,
      "Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request pins its own."},
-    {"crossing_requests",
+    {"crossing_requests", Py_T_ULONGLONG, offsetof(Description, description.crossing_requests), Py_READONLY,
      "Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."},
-    {NULL, NULL},
+    {NULL, 0, 0, 0, NULL},
 };
 
-static PyStructSequence_Desc description_description = {
-    "ustore.Description",
-    "What an open database reports about itself, as `describe()` answers it, every size the engine's estimate.",
-    description_fields,
-    9,
+PyTypeObject DescriptionType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.Description",
+    .tp_doc = doc_Description,
+    .tp_basicsize = sizeof(Description),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_repr = report_repr,
+    .tp_members = Description_members,
+    .tp_getset = Description_getset,
 };
 
-PyTypeObject* GPUDeviceType = NULL;
+/** One GPU this process can drive, as @c ustore_gpu_devices wrote it, and its place there. */
+typedef struct GPUDevice {
 
-static PyStructSequence_Field gpu_device_fields[] = {
-    {"ordinal", "The ordinal `Executor.for_vram()` names the device by, its position in `gpu_devices()`."},
-    {"vendor", "The vendor whose runtime drives the device, a GPUVendor."},
-    {"vendor_ordinal", "The device's ordinal in its vendor's runtime, as `nvidia-smi` or `rocm-smi` list it."},
-    {"gpu_class", "The class of the device, a GPUClass."},
-    {"compute_units", "Streaming multiprocessors or compute units."},
-    {"memory_bytes", "Device memory in bytes."},
-    {"name", "The vendor's own name for the device."},
-    {NULL, NULL},
+    /** The object header every instance carries. */
+    PyObject ob_base;
+
+    /** The ordinal <tt>Executor.for_vram()</tt> names the device by, its position in the listing. */
+    unsigned long long ordinal;
+
+    /** The device as the library reports it. */
+    ustore_gpu_device_t device;
+} GPUDevice;
+
+static char const doc_GPUDevice[] = "One GPU this process can drive, as `gpu_devices()` lists it.";
+
+static PyObject* GPUDevice_get_vendor(GPUDevice* self, void* Py_UNUSED(closure)) {
+    return ustore_py_enum_to_object(ustore_py_enum_gpu_vendor_k, (int)self->device.vendor);
+}
+
+static PyObject* GPUDevice_get_gpu_class(GPUDevice* self, void* Py_UNUSED(closure)) {
+    return ustore_py_enum_to_object(ustore_py_enum_gpu_class_k, (int)self->device.gpu_class);
+}
+
+static PyObject* GPUDevice_get_name(GPUDevice* self, void* Py_UNUSED(closure)) {
+    return PyUnicode_DecodeUTF8(self->device.name, (Py_ssize_t)strnlen(self->device.name, sizeof(self->device.name)),
+                                "replace");
+}
+
+static PyMemberDef GPUDevice_members[] = {
+    {"ordinal", Py_T_ULONGLONG, offsetof(GPUDevice, ordinal), Py_READONLY,
+     "The ordinal `Executor.for_vram()` names the device by, its position in `gpu_devices()`."},
+    {"vendor_ordinal", Py_T_UINT, offsetof(GPUDevice, device.vendor_ordinal), Py_READONLY,
+     "The device's ordinal in its vendor's runtime, as `nvidia-smi` or `rocm-smi` list it."},
+    {"compute_units", Py_T_UINT, offsetof(GPUDevice, device.compute_units), Py_READONLY,
+     "Streaming multiprocessors or compute units."},
+    {"memory_bytes", Py_T_ULONGLONG, offsetof(GPUDevice, device.memory_bytes), Py_READONLY, "Device memory in bytes."},
+    {NULL, 0, 0, 0, NULL},
 };
 
-static PyStructSequence_Desc gpu_device_description = {
-    "ustore.GPUDevice",
-    "One GPU this process can drive, as `gpu_devices()` lists it.",
-    gpu_device_fields,
-    7,
+static PyGetSetDef GPUDevice_getset[] = {
+    {"vendor", (getter)GPUDevice_get_vendor, NULL, "The vendor whose runtime drives the device, a GPUVendor.", NULL},
+    {"gpu_class", (getter)GPUDevice_get_gpu_class, NULL, "The class of the device, a GPUClass.", NULL},
+    {"name", (getter)GPUDevice_get_name, NULL, "The vendor's own name for the device.", NULL},
+    {NULL, NULL, NULL, NULL, NULL},
+};
+
+PyTypeObject GPUDeviceType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.GPUDevice",
+    .tp_doc = doc_GPUDevice,
+    .tp_basicsize = sizeof(GPUDevice),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_repr = report_repr,
+    .tp_members = GPUDevice_members,
+    .tp_getset = GPUDevice_getset,
 };
 
 char const ustore_py_gpu_devices_doc[] =                                                      //
     "gpu_devices() answers a tuple of GPUDevice.\n"                                           //
     "\n"                                                                                      //
-    "Every GPU this process can drive, NVIDIA devices first, then AMD, each at the ordinal\n" //
-    "`Executor.for_vram()` names it by. A vendor whose runtime is absent lists none, so a\n"  //
-    "machine without GPUs answers an empty tuple. Calls `ustore_gpu_devices`.";
+    "Every GPU this process can drive, NVIDIA devices first, then AMD, then Apple, each at\n" //
+    "the ordinal `Executor.for_vram()` names it by. A vendor whose runtime is absent lists\n" //
+    "none, so a machine without GPUs answers an empty tuple. Calls `ustore_gpu_devices`.";
 
 PyObject* ustore_py_gpu_devices(PyObject* Py_UNUSED(module), PyObject* Py_UNUSED(arguments)) {
     ustore_gpu_device_t devices[128];
@@ -2957,38 +2990,16 @@ PyObject* ustore_py_gpu_devices(PyObject* Py_UNUSED(module), PyObject* Py_UNUSED
     if (count > listing.devices_capacity) count = listing.devices_capacity;
     PyObject* const listed = PyTuple_New((Py_ssize_t)count);
     for (ustore_size_t index = 0; listed && index != count; ++index) {
-        ustore_gpu_device_t const* const device = &devices[index];
-        PyObject* fields[7];
-        fields[0] = PyLong_FromUnsignedLongLong(index);
-        fields[1] = ustore_py_enum_to_object(ustore_py_enum_gpu_vendor_k, (int)device->vendor);
-        fields[2] = PyLong_FromUnsignedLong(device->vendor_ordinal);
-        fields[3] = ustore_py_enum_to_object(ustore_py_enum_gpu_class_k, (int)device->gpu_class);
-        fields[4] = PyLong_FromUnsignedLong(device->compute_units);
-        fields[5] = PyLong_FromUnsignedLongLong(device->memory_bytes);
-        fields[6] = PyUnicode_DecodeUTF8(device->name, (Py_ssize_t)strnlen(device->name, sizeof(device->name)),
-                                         "replace");
-        PyObject* const entry = PyStructSequence_New(GPUDeviceType);
-        int complete = entry != NULL;
-        for (size_t field = 0; field != 7; ++field) complete &= fields[field] != NULL;
-        if (!complete) {
-            for (size_t field = 0; field != 7; ++field) Py_XDECREF(fields[field]);
-            Py_XDECREF(entry);
+        GPUDevice* const entry = (GPUDevice*)ustore_py_report_new(&GPUDeviceType);
+        if (!entry) {
             Py_DECREF(listed);
             return NULL;
         }
-        for (size_t field = 0; field != 7; ++field) PyStructSequence_SetItem(entry, (Py_ssize_t)field, fields[field]);
-        PyTuple_SET_ITEM(listed, (Py_ssize_t)index, entry);
+        entry->ordinal = index;
+        entry->device = devices[index];
+        PyTuple_SET_ITEM(listed, (Py_ssize_t)index, (PyObject*)entry);
     }
     return listed;
-}
-
-int ustore_py_types_import(void) {
-    if (!CapabilitiesType) CapabilitiesType = PyStructSequence_NewType(&capabilities_description);
-    if (!MeasurementType) MeasurementType = PyStructSequence_NewType(&measurement_description);
-    if (!ChangesType) ChangesType = PyStructSequence_NewType(&changes_description);
-    if (!DescriptionType) DescriptionType = PyStructSequence_NewType(&description_description);
-    if (!GPUDeviceType) GPUDeviceType = PyStructSequence_NewType(&gpu_device_description);
-    return CapabilitiesType && MeasurementType && ChangesType && DescriptionType && GPUDeviceType ? 0 : -1;
 }
 
 #pragma endregion Module Types

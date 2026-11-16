@@ -15,24 +15,12 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 /// Every CMake option a Cargo feature turns on, paired with that feature.
-const KNOWN_OPTIONS: &[(&str, &str)] = &[
-    ("USTORE_WITH_ROCKSDB", "rocksdb"),
-    ("USTORE_WITH_LEVELDB", "leveldb"),
-    ("USTORE_WITH_NVME", "nvme"),
-];
+const KNOWN_OPTIONS: &[(&str, &str)] =
+    &[("USTORE_WITH_ROCKSDB", "rocksdb"), ("USTORE_WITH_LEVELDB", "leveldb"), ("USTORE_WITH_NVME", "nvme")];
 
 /// The paths whose contents rebuild the libraries.
-const SOURCES: &[&str] = &[
-    "CMakeLists.txt",
-    "VERSION",
-    "c",
-    "cmake",
-    "cpp",
-    "include",
-    "src",
-    "src_oracles/leveldb",
-    "src_oracles/rocksdb",
-];
+const SOURCES: &[&str] =
+    &["CMakeLists.txt", "VERSION", "c", "cmake", "cpp", "include", "src", "src_oracles/leveldb", "src_oracles/rocksdb"];
 
 /// Whether the named Cargo feature is enabled for this build.
 fn feature_enabled(name: &str) -> bool {
@@ -42,9 +30,7 @@ fn feature_enabled(name: &str) -> bool {
 /// The tree a sibling crate reports through its `links` metadata.
 fn sibling_source(links: &str) -> Result<String, String> {
     let variable = format!("DEP_{}_SOURCE", links.to_uppercase());
-    env::var(&variable).map_err(|_| {
-        format!("{variable} is unset: this `{links}` crate predates reporting its tree")
-    })
+    env::var(&variable).map_err(|_| format!("{variable} is unset: this `{links}` crate predates reporting its tree"))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -65,10 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "msvc" => "ustore_static.lib",
                 _ => "libustore_static.a",
             };
-            println!(
-                "cargo:rerun-if-changed={}",
-                directory.join(archive).display()
-            );
+            println!("cargo:rerun-if-changed={}", directory.join(archive).display());
             directory
         }
         None => build_library(&manifest)?.join("lib"),

@@ -1,4 +1,9 @@
-"""Apache Arrow streams through the PyCapsule interface: collection exports, imports and ingests."""
+"""Apache Arrow through the PyCapsule interface: collection exports, imports, ingests and gathered columns.
+
+File: test/arrow.py
+Author: Ash Vardanian
+Date: October 31, 2026
+"""
 
 from uuid import UUID
 
@@ -88,3 +93,16 @@ def test_ingest_lands(database: ustore.Database, engine: str, order: str) -> Non
             assert before.read_stamp < after.read_stamp
             assert before.get(1, collection="copies") is None
     assert [database.get(index, collection="copies") for index in (1, 2, 3)] == [b"a", b"b", b"c"]
+
+
+def test_gathered_columns_export_as_a_struct_array(database: ustore.Database) -> None:
+    """A gather exports as one struct array whose children are named by their fields, absent values as nulls."""
+    database.collection_create("people", modality=ustore.Modality.DOCS)
+    database.docs_write([1, 2], ['{"name": "Ada", "born": 1815}', '{"name": "Alan"}'], collection="people")
+    arena = ustore.Arena()
+    types = (ustore.FieldType.STRING, ustore.FieldType.I64)
+    columns = database.docs_gather([1, 2], ["name", "born"], types, arena, collection="people")
+    exported = pyarrow.array(columns)
+    assert exported.type.names == ["name", "born"]
+    assert exported.field("name").to_pylist() == ["Ada", "Alan"]
+    assert exported.field("born").to_pylist() == [1815, None]

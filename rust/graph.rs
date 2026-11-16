@@ -60,9 +60,8 @@ use crate::db::ffi::{
 };
 use crate::db::sealed::{Accepts, Calling, Writable};
 use crate::db::{
-    check, exported_slice, fail, key_unknown, read_spelling, spelling, Address, Arena, CollectionID, Collections,
-    Deferring, Durability, Error, Key, KeyRange, Matched, Matching, On, Progress, ProgressCallback, Result, ScanMode,
-    Status,
+    Address, Arena, CollectionID, Collections, Deferring, Durability, Error, Key, KeyRange, Matching, On, Progress,
+    ProgressCallback, Result, ScanMode, Status, check, exported_slice, fail, key_unknown, read_spelling, spelling,
 };
 
 // region: Raw Declarations
@@ -236,7 +235,7 @@ pub(crate) mod ffi {
         pub arena: ustore_arena_t,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn ustore_graph_vertices_cursor_init(arguments: *mut ustore_graph_vertices_cursor_init_t);
         pub fn ustore_graph_vertices_cursor_next(arguments: *mut ustore_graph_vertices_cursor_next_t);
         pub fn ustore_graph_vertices_cursor_free(cursor: ustore_graph_vertices_cursor_t);
@@ -327,14 +326,10 @@ impl Roles<'_> {
     /// ABI enum is.
     fn view(&self, count: usize) -> Result<ffi::ustore_vertex_roles_view_t> {
         match self {
-            Roles::Every(role) => Ok(ustore_strided_view_t {
-                data: ptr::from_ref(role).cast(),
-                stride: 0,
-            }),
-            Roles::Each(roles) if roles.len() == count => Ok(ustore_strided_view_t {
-                data: roles.as_ptr().cast(),
-                stride: size_of::<Role>() as ustore_size_t,
-            }),
+            Roles::Every(role) => Ok(ustore_strided_view_t { data: ptr::from_ref(role).cast(), stride: 0 }),
+            Roles::Each(roles) if roles.len() == count => {
+                Ok(ustore_strided_view_t { data: roles.as_ptr().cast(), stride: size_of::<Role>() as ustore_size_t })
+            }
             Roles::Each(_) => Err(fail(Status::InvalidArgument, "the batch holds a role per vertex")),
         }
     }
@@ -355,11 +350,7 @@ pub struct Edge {
 impl Edge {
     /// An edge carrying the default identifier.
     pub fn new(source: Key, target: Key) -> Self {
-        Edge {
-            source,
-            target,
-            id: default_edge_id(),
-        }
+        Edge { source, target, id: default_edge_id() }
     }
 
     /// An edge carrying its own identifier.
@@ -386,17 +377,12 @@ pub struct GraphScanVerticesConfig<'config> {
     /// In what order the vertices come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<&'config mut ProgressCallback<'config>>,
+    pub progress: Option<Box<ProgressCallback<'config>>>,
 }
 
 impl From<usize> for GraphScanVerticesConfig<'_> {
     fn from(wanted: usize) -> Self {
-        GraphScanVerticesConfig {
-            wanted,
-            matching: Matching::default(),
-            mode: ScanMode::Ordered,
-            progress: None,
-        }
+        GraphScanVerticesConfig { wanted, matching: Matching::default(), mode: ScanMode::Ordered, progress: None }
     }
 }
 
@@ -456,14 +442,12 @@ impl<'arena> Neighborhoods<'arena> {
         offsets: Address<ustore_length_t>,
         tape: Address<ustore_key_t>,
     ) -> Self {
-        let offsets = exported_slice(offsets.0, count + 1);
-        let edges_count = offsets.last().map_or(0, |&end| end as usize);
-        // `Edge` is the three keys of an edge in tape order
-        let edges = exported_slice(tape.0.cast::<Edge>(), edges_count);
-        Neighborhoods {
-            degrees: exported_slice(degrees.0, count),
-            offsets,
-            edges,
+        unsafe {
+            let offsets = exported_slice(offsets.0, count + 1);
+            let edges_count = offsets.last().map_or(0, |&end| end as usize);
+            // `Edge` is the three keys of an edge in tape order
+            let edges = exported_slice(tape.0.cast::<Edge>(), edges_count);
+            Neighborhoods { degrees: exported_slice(degrees.0, count), offsets, edges }
         }
     }
 
@@ -485,10 +469,7 @@ impl<'arena> Neighborhoods<'arena> {
 
     /// The edges of every vertex in order, or `None` for a vertex the graph does not hold.
     pub fn iter(&self) -> EdgeRuns<'arena> {
-        EdgeRuns {
-            spans: self.degrees.iter().zip(self.offsets.windows(2)),
-            edges: self.edges,
-        }
+        EdgeRuns { spans: self.degrees.iter().zip(self.offsets.windows(2)), edges: self.edges }
     }
 }
 
@@ -557,11 +538,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Edges>,
     {
-        let verb = GraphWriteEdges {
-            collections: collections.into(),
-            edges,
-            durability,
-        };
+        let verb = GraphWriteEdges { collections: collections.into(), edges, durability };
         Completion::answer(self, verb)
     }
 
@@ -577,11 +554,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Edges>,
     {
-        let verb = GraphRemoveEdges {
-            collections: collections.into(),
-            edges,
-            durability,
-        };
+        let verb = GraphRemoveEdges { collections: collections.into(), edges, durability };
         Completion::answer(self, verb)
     }
 
@@ -598,11 +571,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
     {
-        let verb = GraphWriteVertices {
-            collections: collections.into(),
-            vertices,
-            durability,
-        };
+        let verb = GraphWriteVertices { collections: collections.into(), vertices, durability };
         Completion::answer(self, verb)
     }
 
@@ -620,12 +589,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     where
         Completion: Accepts<Collections<'inputs>> + Accepts<Keys> + Accepts<Roles<'inputs>>,
     {
-        let verb = GraphRemoveVertices {
-            collections: collections.into(),
-            vertices,
-            roles,
-            durability,
-        };
+        let verb = GraphRemoveVertices { collections: collections.into(), vertices, roles, durability };
         Completion::answer(self, verb)
     }
 
@@ -638,12 +602,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
         role: Role,
         durability: Durability,
     ) -> Completion::Answer<GraphRemoveVerticesRange> {
-        let verb = GraphRemoveVerticesRange {
-            collection,
-            range,
-            roles: Roles::Every(role),
-            durability,
-        };
+        let verb = GraphRemoveVerticesRange { collection, range, roles: Roles::Every(role), durability };
         Completion::answer(self, verb)
     }
 }
@@ -662,13 +621,8 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
     where
         Completion: Accepts<Collections<'inputs>> + Accepts<Keys> + Accepts<Roles<'inputs>>,
     {
-        let verb = GraphDegrees {
-            collections: collections.into(),
-            vertices,
-            roles,
-            arena,
-            degrees: Address::default(),
-        };
+        let verb =
+            GraphDegrees { collections: collections.into(), vertices, roles, arena, degrees: Address::default() };
         Completion::answer(self, verb)
     }
 
@@ -713,21 +667,16 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         Completion: Accepts<GraphScanVerticesConfig<'config>>,
     {
         let range = range.into();
-        let GraphScanVerticesConfig {
-            wanted,
-            matching,
-            mode,
-            progress,
-        } = config.into();
+        let GraphScanVerticesConfig { wanted, matching, mode, progress } = config.into();
         let verb = GraphScanVertices {
             collection,
             start: range.start_key(),
             range,
             arena,
             wanted,
-            matched: Matched::new(matching),
+            matched: matching,
             mode,
-            progress: Progress::new(progress),
+            progress: Progress(progress),
             found: Found::default(),
         };
         Completion::answer(self, verb)
@@ -742,12 +691,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         config: impl Into<GraphSampleVerticesConfig>,
         arena: &'arena mut Arena,
     ) -> Completion::Answer<GraphSampleVertices<'arena>> {
-        let verb = GraphSampleVertices {
-            collection,
-            arena,
-            wanted: config.into().wanted,
-            found: Found::default(),
-        };
+        let verb = GraphSampleVertices { collection, arena, wanted: config.into().wanted, found: Found::default() };
         Completion::answer(self, verb)
     }
 
@@ -762,13 +706,8 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
         arena: &'arena mut Arena,
     ) -> Completion::Answer<GraphMeasureVertices<'arena>> {
         let range = range.into();
-        let verb = GraphMeasureVertices {
-            collection,
-            start: range.start_key(),
-            range,
-            arena,
-            bounds: Bounds::default(),
-        };
+        let verb =
+            GraphMeasureVertices { collection, start: range.start_key(), range, arena, bounds: Bounds::default() };
         Completion::answer(self, verb)
     }
 }
@@ -785,10 +724,8 @@ fn edges_arguments<Parent, Completion>(
 ) -> Result<Option<ffi::ustore_graph_write_edges_t>> {
     let stride = size_of::<Edge>() as ustore_size_t;
     let first = edges.as_ptr();
-    let column = |offset: usize| ustore_strided_view_t {
-        data: first.wrapping_byte_add(offset).cast::<ustore_key_t>(),
-        stride,
-    };
+    let column =
+        |offset: usize| ustore_strided_view_t { data: first.wrapping_byte_add(offset).cast::<ustore_key_t>(), stride };
     Ok(Some(ffi::ustore_graph_write_edges_t {
         database: view.database(),
         executor: view.executor(),
@@ -828,7 +765,7 @@ impl<Edges: AsRef<[Edge]>> Calling for GraphWriteEdges<'_, Edges> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_write_edges(arguments)
+        unsafe { ffi::ustore_graph_write_edges(arguments) }
     }
 
     fn finish(self) -> Result<Edges> {
@@ -859,7 +796,7 @@ impl<Edges: AsRef<[Edge]>> Calling for GraphRemoveEdges<'_, Edges> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_remove_edges(arguments)
+        unsafe { ffi::ustore_graph_remove_edges(arguments) }
     }
 
     fn finish(self) -> Result<Edges> {
@@ -901,7 +838,7 @@ impl<Keys: AsRef<[Key]>> Calling for GraphWriteVertices<'_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_write_vertices(arguments)
+        unsafe { ffi::ustore_graph_write_vertices(arguments) }
     }
 
     fn finish(self) -> Result<Keys> {
@@ -946,7 +883,7 @@ impl<Keys: AsRef<[Key]>> Calling for GraphRemoveVertices<'_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_remove_vertices(arguments)
+        unsafe { ffi::ustore_graph_remove_vertices(arguments) }
     }
 
     fn finish(self) -> Result<Keys> {
@@ -990,7 +927,7 @@ impl Calling for GraphRemoveVerticesRange {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_remove_vertices(arguments)
+        unsafe { ffi::ustore_graph_remove_vertices(arguments) }
     }
 
     fn finish(self) -> Result<()> {
@@ -1006,7 +943,7 @@ pub struct GraphScanVertices<'arena, 'config> {
     range: KeyRange,
     arena: &'arena mut Arena,
     wanted: usize,
-    matched: Matched<'config>,
+    matched: Matching<'config>,
     mode: ScanMode,
     progress: Progress<'config>,
     found: Found,
@@ -1034,7 +971,7 @@ impl<'arena> Calling for GraphScanVertices<'arena, '_> {
             start_keys: ustore_strided_view_t::repeated(&self.start),
             end_keys: self.range.end_keys(),
             direction: self.range.direction,
-            predicate: self.matched.predicate(),
+            predicate: self.matched.lowered_predicate(),
             offsets: &mut self.found.offsets.0,
             keys: &mut self.found.keys.0,
             arena: self.arena.handle,
@@ -1046,12 +983,7 @@ impl<'arena> Calling for GraphScanVertices<'arena, '_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_scan_vertices(arguments)
-    }
-
-    fn raise(&mut self) {
-        self.matched.raise();
-        self.progress.raise();
+        unsafe { ffi::ustore_graph_scan_vertices(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
@@ -1096,7 +1028,7 @@ impl<'arena> Calling for GraphSampleVertices<'arena> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_sample_vertices(arguments)
+        unsafe { ffi::ustore_graph_sample_vertices(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Key]> {
@@ -1126,8 +1058,14 @@ impl Calling for GraphMeasureVertices<'_> {
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let [min_cardinalities, max_cardinalities, min_value_bytes, max_value_bytes, min_space_usages, max_space_usages] =
-            &mut self.bounds.0;
+        let [
+            min_cardinalities,
+            max_cardinalities,
+            min_value_bytes,
+            max_value_bytes,
+            min_space_usages,
+            max_space_usages,
+        ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_graph_measure_vertices_t {
             database: view.database(),
             executor: view.executor(),
@@ -1150,7 +1088,7 @@ impl Calling for GraphMeasureVertices<'_> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_measure_vertices(arguments)
+        unsafe { ffi::ustore_graph_measure_vertices(arguments) }
     }
 
     fn finish(self) -> Result<Measurement> {
@@ -1227,7 +1165,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphDegrees<'arena, '_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_read_edges(arguments)
+        unsafe { ffi::ustore_graph_read_edges(arguments) }
     }
 
     fn finish(self) -> Result<&'arena [Degree]> {
@@ -1274,7 +1212,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphReadEdges<'arena, '_, Keys> {
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
-        ffi::ustore_graph_read_edges(arguments)
+        unsafe { ffi::ustore_graph_read_edges(arguments) }
     }
 
     fn finish(self) -> Result<Neighborhoods<'arena>> {
@@ -1301,45 +1239,25 @@ mod tests {
     fn populated() -> (Database, Arena, CollectionID) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let graph = database.collection_create("graph", Modality::Graph).unwrap();
-        let edges = [
-            Edge::new(key(1), key(2)),
-            Edge::new(key(1), key(3)),
-            Edge::new(key(2), key(3)),
-        ];
-        database
-            .head()
-            .graph_write_edges(graph, &edges, Durability::Buffered)
-            .unwrap();
+        let edges = [Edge::new(key(1), key(2)), Edge::new(key(1), key(3)), Edge::new(key(2), key(3))];
+        database.head().graph_write_edges(graph, &edges, Durability::Buffered).unwrap();
         (database, Arena::new().unwrap(), graph)
     }
 
     #[test]
     fn lookups_find_the_edges_of_every_role() {
         let (database, mut arena, graph) = populated();
-        let outgoing = database
-            .head()
-            .graph_read_edges(graph, &keys([1]), Roles::Every(Role::Source), &mut arena)
-            .unwrap();
+        let outgoing =
+            database.head().graph_read_edges(graph, &keys([1]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(outgoing.degrees(), &[2]);
-        assert_eq!(
-            outgoing.edges(),
-            &[Edge::new(key(1), key(2)), Edge::new(key(1), key(3))]
-        );
+        assert_eq!(outgoing.edges(), &[Edge::new(key(1), key(2)), Edge::new(key(1), key(3))]);
 
-        let incoming = database
-            .head()
-            .graph_read_edges(graph, &keys([3]), Roles::Every(Role::Target), &mut arena)
-            .unwrap();
-        assert_eq!(
-            incoming.edges(),
-            &[Edge::new(key(1), key(3)), Edge::new(key(2), key(3))]
-        );
+        let incoming =
+            database.head().graph_read_edges(graph, &keys([3]), Roles::Every(Role::Target), &mut arena).unwrap();
+        assert_eq!(incoming.edges(), &[Edge::new(key(1), key(3)), Edge::new(key(2), key(3))]);
 
         // Both roles list the outgoing edges ahead of the incoming ones.
-        let both = database
-            .head()
-            .graph_read_edges(graph, &keys([2]), Roles::Every(Role::Any), &mut arena)
-            .unwrap();
+        let both = database.head().graph_read_edges(graph, &keys([2]), Roles::Every(Role::Any), &mut arena).unwrap();
         assert_eq!(both.edges(), &[Edge::new(key(2), key(3)), Edge::new(key(1), key(2))]);
     }
 
@@ -1347,22 +1265,14 @@ mod tests {
     fn vertex_ranges_walk_down_sample_measure_and_remove() {
         let (database, mut arena, graph) = populated();
         let head = database.head();
-        let descending = KeyRange {
-            direction: ScanDirection::Descending,
-            ..KeyRange::default()
-        };
-        let mut cursor = head
-            .graph_vertices_cursor(graph, descending, Matching::default())
-            .unwrap();
+        let descending = KeyRange { direction: ScanDirection::Descending, ..KeyRange::default() };
+        let mut cursor = head.graph_vertices_cursor(graph, descending, Matching::default()).unwrap();
         assert_eq!(cursor.next(8, &mut arena).unwrap(), &keys([3, 2, 1]));
         assert_eq!(head.graph_sample_vertices(graph, 8, &mut arena).unwrap().len(), 3);
         let measured = head.graph_measure_vertices(graph, key(1)..key(3), &mut arena).unwrap();
         assert!(measured.max_cardinality >= measured.min_cardinality);
-        head.graph_remove_vertices_range(graph, key(1)..key(3), Role::Any, Durability::Buffered)
-            .unwrap();
-        let degrees = head
-            .graph_degrees(graph, &keys([3]), Roles::Every(Role::Any), &mut arena)
-            .unwrap();
+        head.graph_remove_vertices_range(graph, key(1)..key(3), Role::Any, Durability::Buffered).unwrap();
+        let degrees = head.graph_degrees(graph, &keys([3]), Roles::Every(Role::Any), &mut arena).unwrap();
         assert_eq!(degrees, &[0]);
     }
 
@@ -1370,12 +1280,8 @@ mod tests {
     fn vertex_scans_list_bare_vertices_and_ask_the_predicate() {
         let (database, mut arena, graph) = populated();
         let head = database.head();
-        head.graph_write_vertices(graph, keys([4]), Durability::Buffered)
-            .unwrap();
-        assert_eq!(
-            head.graph_scan_vertices(graph, key(2), 8, &mut arena).unwrap(),
-            &keys([2, 3, 4])
-        );
+        head.graph_write_vertices(graph, keys([4]), Durability::Buffered).unwrap();
+        assert_eq!(head.graph_scan_vertices(graph, key(2), 8, &mut arena).unwrap(), &keys([2, 3, 4]));
 
         let mut odd = |listed: &[Key], admissions: &mut [Admission]| {
             for (admission, listed) in admissions.iter_mut().zip(listed) {
@@ -1385,58 +1291,35 @@ mod tests {
             }
         };
         let config = GraphScanVerticesConfig {
-            matching: Matching {
-                predicate: Some(&mut odd),
-                ..Matching::default()
-            },
+            matching: Matching { predicate: Some(Box::new(&mut odd)), ..Matching::default() },
             ..GraphScanVerticesConfig::from(8)
         };
-        let admitted = head
-            .graph_scan_vertices(graph, KeyRange::default(), config, &mut arena)
-            .unwrap();
+        let admitted = head.graph_scan_vertices(graph, KeyRange::default(), config, &mut arena).unwrap();
         assert_eq!(admitted, &keys([1, 3]));
     }
 
     #[test]
     fn neighborhoods_split_the_tape_by_vertex() {
         let (database, mut arena, graph) = populated();
-        let found = database
-            .head()
-            .graph_read_edges(graph, &keys([3, 42, 1]), Roles::Every(Role::Any), &mut arena)
-            .unwrap();
+        let found =
+            database.head().graph_read_edges(graph, &keys([3, 42, 1]), Roles::Every(Role::Any), &mut arena).unwrap();
         assert_eq!(found.degrees(), &[2, degree_missing(), 2]);
-        assert_eq!(
-            found.offsets(),
-            &[0, 2, 2, 4],
-            "a vertex the graph does not hold spans none"
-        );
+        assert_eq!(found.offsets(), &[0, 2, 2, 4], "a vertex the graph does not hold spans none");
         assert_eq!(found.edges().len(), 4);
         let runs: Vec<Option<&[Edge]>> = found.iter().collect();
-        assert_eq!(
-            runs[0],
-            Some([Edge::new(key(1), key(3)), Edge::new(key(2), key(3))].as_slice())
-        );
+        assert_eq!(runs[0], Some([Edge::new(key(1), key(3)), Edge::new(key(2), key(3))].as_slice()));
         assert_eq!(runs[1], None, "a vertex the graph does not hold is missing");
-        assert_eq!(
-            runs[2],
-            Some([Edge::new(key(1), key(2)), Edge::new(key(1), key(3))].as_slice())
-        );
+        assert_eq!(runs[2], Some([Edge::new(key(1), key(2)), Edge::new(key(1), key(3))].as_slice()));
 
-        let neighbors: Vec<Key> = runs[2]
-            .unwrap()
-            .iter()
-            .filter_map(|edge| edge.neighbor_of(key(1)))
-            .collect();
+        let neighbors: Vec<Key> = runs[2].unwrap().iter().filter_map(|edge| edge.neighbor_of(key(1))).collect();
         assert_eq!(neighbors, keys([2, 3]));
     }
 
     #[test]
     fn degrees_come_without_edges() {
         let (database, mut arena, graph) = populated();
-        let degrees = database
-            .head()
-            .graph_degrees(graph, &keys([1, 2, 3, 4]), Roles::Every(Role::Source), &mut arena)
-            .unwrap();
+        let degrees =
+            database.head().graph_degrees(graph, &keys([1, 2, 3, 4]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(degrees, &[2, 1, 0, degree_missing()]);
     }
 
@@ -1444,16 +1327,11 @@ mod tests {
     fn roles_differ_per_vertex_and_match_the_batch() {
         let (database, mut arena, graph) = populated();
         let roles = [Role::Source, Role::Target];
-        let degrees = database
-            .head()
-            .graph_degrees(graph, &keys([1, 1]), Roles::Each(&roles), &mut arena)
-            .unwrap();
+        let degrees = database.head().graph_degrees(graph, &keys([1, 1]), Roles::Each(&roles), &mut arena).unwrap();
         assert_eq!(degrees, &[2, 0]);
 
-        let failure = database
-            .head()
-            .graph_read_edges(graph, &keys([1, 2, 3]), Roles::Each(&roles), &mut arena)
-            .unwrap_err();
+        let failure =
+            database.head().graph_read_edges(graph, &keys([1, 2, 3]), Roles::Each(&roles), &mut arena).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
         let failure = database
             .head()
@@ -1472,54 +1350,35 @@ mod tests {
             Edge::with_id(key(1), key(2), key(20)),
             Edge::with_id(key(1), key(2), key(10)),
         ];
-        database
-            .head()
-            .graph_write_edges(graph, &edges, Durability::Buffered)
-            .unwrap();
-        let degrees = database
-            .head()
-            .graph_degrees(graph, &keys([1]), Roles::Every(Role::Source), &mut arena)
-            .unwrap();
+        database.head().graph_write_edges(graph, &edges, Durability::Buffered).unwrap();
+        let degrees = database.head().graph_degrees(graph, &keys([1]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(degrees, &[2], "an edge upserted twice is stored once");
 
         database
             .head()
             .graph_remove_edges(graph, &[Edge::with_id(key(1), key(2), key(10))], Durability::Buffered)
             .unwrap();
-        let found = database
-            .head()
-            .graph_read_edges(graph, &keys([2]), Roles::Every(Role::Target), &mut arena)
-            .unwrap();
+        let found =
+            database.head().graph_read_edges(graph, &keys([2]), Roles::Every(Role::Target), &mut arena).unwrap();
         assert_eq!(found.edges(), &[Edge::with_id(key(1), key(2), key(20))]);
 
         // Removing an edge the graph never held changes nothing.
-        database
-            .head()
-            .graph_remove_edges(graph, &[Edge::new(key(5), key(6))], Durability::Buffered)
-            .unwrap();
+        database.head().graph_remove_edges(graph, &[Edge::new(key(5), key(6))], Durability::Buffered).unwrap();
     }
 
     #[test]
     fn vertices_are_upserted_bare_and_removed_with_their_edges() {
         let (database, mut arena, graph) = populated();
-        database
-            .head()
-            .graph_write_vertices(graph, &keys([1, 7]), Durability::Buffered)
-            .unwrap();
-        let degrees = database
-            .head()
-            .graph_degrees(graph, &keys([1, 7]), Roles::Every(Role::Any), &mut arena)
-            .unwrap();
+        database.head().graph_write_vertices(graph, &keys([1, 7]), Durability::Buffered).unwrap();
+        let degrees = database.head().graph_degrees(graph, &keys([1, 7]), Roles::Every(Role::Any), &mut arena).unwrap();
         assert_eq!(degrees, &[2, 0], "an upsert keeps the edges a vertex already has");
 
         database
             .head()
             .graph_remove_vertices(graph, &keys([3]), Roles::Every(Role::Any), Durability::Buffered)
             .unwrap();
-        let degrees = database
-            .head()
-            .graph_degrees(graph, &keys([1, 2, 3]), Roles::Every(Role::Any), &mut arena)
-            .unwrap();
+        let degrees =
+            database.head().graph_degrees(graph, &keys([1, 2, 3]), Roles::Every(Role::Any), &mut arena).unwrap();
         assert_eq!(degrees, &[1, 1, degree_missing()]);
     }
 
@@ -1530,10 +1389,8 @@ mod tests {
             .head()
             .graph_remove_vertices(graph, &keys([1]), Roles::Every(Role::Source), Durability::Buffered)
             .unwrap();
-        let found = database
-            .head()
-            .graph_read_edges(graph, &keys([3]), Roles::Every(Role::Target), &mut arena)
-            .unwrap();
+        let found =
+            database.head().graph_read_edges(graph, &keys([3]), Roles::Every(Role::Target), &mut arena).unwrap();
         assert_eq!(found.edges(), &[Edge::new(key(2), key(3))]);
     }
 
@@ -1542,14 +1399,8 @@ mod tests {
         let (database, mut arena, graph) = populated();
         let mut transaction = database.transaction().unwrap();
         let edges = [Edge::new(key(3), key(1))];
-        transaction
-            .view(Watch::Keys)
-            .graph_write_edges(graph, &edges, Durability::Buffered)
-            .unwrap();
-        let flushed = transaction
-            .view(Watch::Keys)
-            .graph_write_edges(graph, &edges, Durability::Flushed)
-            .unwrap_err();
+        transaction.view(Watch::Keys).graph_write_edges(graph, &edges, Durability::Buffered).unwrap();
+        let flushed = transaction.view(Watch::Keys).graph_write_edges(graph, &edges, Durability::Flushed).unwrap_err();
         assert_eq!(flushed.status, Status::InvalidArgument);
 
         let inside = transaction
@@ -1557,17 +1408,12 @@ mod tests {
             .graph_degrees(graph, &keys([3]), Roles::Every(Role::Source), &mut arena)
             .unwrap();
         assert_eq!(inside, &[1]);
-        let outside = database
-            .head()
-            .graph_degrees(graph, &keys([3]), Roles::Every(Role::Source), &mut arena)
-            .unwrap();
+        let outside = database.head().graph_degrees(graph, &keys([3]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(outside, &[0]);
 
         transaction.commit(Durability::Buffered).unwrap();
-        let committed = database
-            .head()
-            .graph_degrees(graph, &keys([3]), Roles::Every(Role::Source), &mut arena)
-            .unwrap();
+        let committed =
+            database.head().graph_degrees(graph, &keys([3]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(committed, &[1]);
     }
 
@@ -1575,14 +1421,8 @@ mod tests {
     fn snapshots_keep_the_graph_they_were_taken_at() {
         let (database, mut arena, graph) = populated();
         let snapshot = database.snapshot().unwrap();
-        database
-            .head()
-            .graph_remove_edges(graph, &[Edge::new(key(1), key(2))], Durability::Buffered)
-            .unwrap();
-        let pinned = snapshot
-            .view()
-            .graph_degrees(graph, &keys([1]), Roles::Every(Role::Source), &mut arena)
-            .unwrap();
+        database.head().graph_remove_edges(graph, &[Edge::new(key(1), key(2))], Durability::Buffered).unwrap();
+        let pinned = snapshot.view().graph_degrees(graph, &keys([1]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(pinned, &[2]);
     }
 
@@ -1591,16 +1431,11 @@ mod tests {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
         let values = database.collection_create("values", Modality::Blobs).unwrap();
-        let blobs = [
-            Entry::new(key(1), b"abc"),
-            Entry::new(key(2), br#"{"name":"Ada Lovelace","born":1815}"#),
-        ];
+        let blobs = [Entry::new(key(1), b"abc"), Entry::new(key(2), br#"{"name":"Ada Lovelace","born":1815}"#)];
         database.head().write(values, &blobs, Durability::Buffered).unwrap();
         for vertex in keys([1, 2]) {
-            let failure = database
-                .head()
-                .graph_read_edges(values, [vertex], Roles::Every(Role::Any), &mut arena)
-                .unwrap_err();
+            let failure =
+                database.head().graph_read_edges(values, [vertex], Roles::Every(Role::Any), &mut arena).unwrap_err();
             assert_eq!(failure.status, Status::InvalidArgument);
             let failure = database
                 .head()
@@ -1619,35 +1454,20 @@ mod tests {
         let spanned = [follows, blocks];
 
         let edges = [Edge::new(key(1), key(2)), Edge::new(key(1), key(3))];
-        database
-            .head()
-            .graph_write_edges(spanned.as_slice(), &edges, Durability::Buffered)
-            .unwrap();
+        database.head().graph_write_edges(spanned.as_slice(), &edges, Durability::Buffered).unwrap();
 
         let degrees = database
             .head()
-            .graph_degrees(
-                Collections::Each(&spanned),
-                &keys([1, 1]),
-                Roles::Every(Role::Source),
-                &mut arena,
-            )
+            .graph_degrees(Collections::Each(&spanned), &keys([1, 1]), Roles::Every(Role::Source), &mut arena)
             .unwrap();
         assert_eq!(degrees, &[1, 1], "each edge landed in the collection of its own task");
-        let inside = database
-            .head()
-            .graph_read_edges(blocks, &keys([1]), Roles::Every(Role::Source), &mut arena)
-            .unwrap();
+        let inside =
+            database.head().graph_read_edges(blocks, &keys([1]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(inside.edges(), &[Edge::new(key(1), key(3))]);
 
         let failure = database
             .head()
-            .graph_degrees(
-                Collections::Each(&spanned),
-                &keys([1]),
-                Roles::Every(Role::Any),
-                &mut arena,
-            )
+            .graph_degrees(Collections::Each(&spanned), &keys([1]), Roles::Every(Role::Any), &mut arena)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
@@ -1659,15 +1479,9 @@ mod tests {
         head.graph_write_edges(graph, [], Durability::Buffered).unwrap();
         head.graph_remove_edges(graph, [], Durability::Buffered).unwrap();
         head.graph_write_vertices(graph, [], Durability::Buffered).unwrap();
-        head.graph_remove_vertices(graph, &[], Roles::Each(&[]), Durability::Buffered)
-            .unwrap();
-        assert!(head
-            .graph_degrees(graph, &[], Roles::Every(Role::Any), &mut arena)
-            .unwrap()
-            .is_empty());
-        let found = head
-            .graph_read_edges(graph, &[], Roles::Every(Role::Any), &mut arena)
-            .unwrap();
+        head.graph_remove_vertices(graph, &[], Roles::Each(&[]), Durability::Buffered).unwrap();
+        assert!(head.graph_degrees(graph, &[], Roles::Every(Role::Any), &mut arena).unwrap().is_empty());
+        let found = head.graph_read_edges(graph, &[], Roles::Every(Role::Any), &mut arena).unwrap();
         assert!(found.degrees().is_empty() && found.edges().is_empty());
         assert_eq!(found.iter().count(), 0);
     }
@@ -1683,53 +1497,27 @@ mod tests {
         let [source, target, any] = [Role::Source, Role::Target, Role::Any].map(Roles::Every);
 
         // Writes and removals hand their inputs back, whichever way the call finishes.
-        let edges = blocking
-            .graph_write_edges(graph, vec![Edge::new(key(3), key(4))], buffered)
-            .unwrap();
-        let edges = deferred
-            .graph_remove_edges(graph, edges, buffered)
-            .unwrap()
-            .wait()
-            .unwrap();
-        let edges = deferred
-            .graph_write_edges(graph, edges, buffered)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let edges = blocking.graph_write_edges(graph, vec![Edge::new(key(3), key(4))], buffered).unwrap();
+        let edges = deferred.graph_remove_edges(graph, edges, buffered).unwrap().wait().unwrap();
+        let edges = deferred.graph_write_edges(graph, edges, buffered).unwrap().wait().unwrap();
         assert_eq!(edges, [Edge::new(key(3), key(4))]);
         let vertices = blocking.graph_write_vertices(graph, keys([7]), buffered).unwrap();
-        let vertices = deferred
-            .graph_write_vertices(graph, vertices, buffered)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let vertices = deferred.graph_write_vertices(graph, vertices, buffered).unwrap().wait().unwrap();
         assert_eq!(vertices, keys([7]));
 
         // Lookups borrow one arena on either view, and each call rewinds it for the next.
         let found = blocking.graph_read_edges(graph, keys([3]), source, &mut arena).unwrap();
         assert_eq!(found.edges(), &[Edge::new(key(3), key(4))]);
-        let found = deferred
-            .graph_read_edges(graph, vec![key(1), key(7)], any, &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let found = deferred.graph_read_edges(graph, vec![key(1), key(7)], any, &mut arena).unwrap().wait().unwrap();
         assert_eq!(found.degrees(), &[2, 0]);
 
         let counted = blocking.graph_degrees(graph, keys([1, 3]), source, &mut arena).unwrap();
         assert_eq!(counted, &[2, 1]);
-        let counted = deferred
-            .graph_degrees(graph, keys([4]), target, &mut arena)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let counted = deferred.graph_degrees(graph, keys([4]), target, &mut arena).unwrap().wait().unwrap();
         assert_eq!(counted, &[1]);
 
         blocking.graph_remove_vertices(graph, keys([7]), any, buffered).unwrap();
-        deferred
-            .graph_remove_vertices(graph, vec![key(4), key(3)], any, buffered)
-            .unwrap()
-            .wait()
-            .unwrap();
+        deferred.graph_remove_vertices(graph, vec![key(4), key(3)], any, buffered).unwrap().wait().unwrap();
         let counted = blocking.graph_degrees(graph, keys([7, 4, 3]), any, &mut arena).unwrap();
         assert_eq!(counted, &[degree_missing(); 3]);
     }
@@ -1756,7 +1544,7 @@ pub struct GraphVerticesCursor<'view> {
     handle: ffi::ustore_graph_vertices_cursor_t,
     database: ustore_database_t,
     executor: ustore_executor_t,
-    matched: Box<Matched<'view>>,
+    matched: Box<Matching<'view>>,
     marker: PhantomData<&'view ()>,
 }
 
@@ -1776,7 +1564,7 @@ impl<'view, Parent> On<'view, Parent> {
             handle: ptr::null_mut(),
             database: self.database(),
             executor: self.executor(),
-            matched: Box::new(Matched::new(config.into().matching)),
+            matched: Box::new(config.into().matching),
             marker: PhantomData,
         };
         let mut outcome = ustore_outcome_t::default();
@@ -1790,7 +1578,7 @@ impl<'view, Parent> On<'view, Parent> {
             start_key: range.start_key(),
             end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
             direction: range.direction,
-            predicate: cursor.matched.predicate(),
+            predicate: cursor.matched.lowered_predicate(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_graph_vertices_cursor_init(&mut arguments) };
@@ -1826,7 +1614,6 @@ impl GraphVerticesCursor<'_> {
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_graph_vertices_cursor_next(&mut arguments) };
-        self.matched.raise();
         check(outcome)?;
         arena.host()?;
         // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.

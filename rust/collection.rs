@@ -73,7 +73,7 @@ use crate::arrow::{self, ArrowArrayStream, IngestOrder};
 use crate::blobs::{Entry, Values};
 use crate::db::sealed::Writable;
 use crate::db::{
-    fail, Arena, CollectionID, Database, Durability, Error, Key, Modality, On, Result, Status, Transaction, Watch,
+    Arena, CollectionID, Database, Durability, Error, Key, Modality, On, Result, Status, Transaction, Watch, fail,
 };
 use crate::docs::{DocumentEntry, Json, Modification};
 use crate::graph::{Degree, Edge, Role, Roles};
@@ -114,11 +114,7 @@ pub struct Collection<'view, Parent = Database> {
 
 impl<'view, Parent: Writable> Collection<'view, Parent> {
     fn new(view: On<'view, Parent>, name: &str) -> Result<Self> {
-        let mut collection = Collection {
-            view,
-            name: name.to_owned(),
-            resolved: None,
-        };
+        let mut collection = Collection { view, name: name.to_owned(), resolved: None };
         collection.find()?;
         Ok(collection)
     }
@@ -188,8 +184,7 @@ impl<'view, Parent: Writable> Collection<'view, Parent> {
 impl<Parent: Writable> Collection<'_, Parent> {
     /// The collection the name addresses and what it holds, refusing a missing one.
     fn found(&mut self) -> Result<(CollectionID, Modality)> {
-        self.find()?
-            .ok_or(fail(Status::NotFound, "no collection answers to that name"))
+        self.find()?.ok_or(fail(Status::NotFound, "no collection answers to that name"))
     }
 
     /// The whole collection as one Arrow stream through the view, whose batches outlive the stream; a head view
@@ -268,11 +263,7 @@ impl<Parent: Writable> Blobs<'_, '_, Parent> {
     /// Whether the collection holds `key`, exporting no value into the one-off arena it reads through.
     pub fn contains(self, key: Key) -> Result<bool> {
         let collection = self.collection.existing(Modality::Blobs)?;
-        Ok(self
-            .collection
-            .view
-            .contains(collection, &[key], &mut Arena::new()?)?
-            .get(0))
+        Ok(self.collection.view.contains(collection, &[key], &mut Arena::new()?)?.get(0))
     }
 
     /// Stores `value` under `key`, creating the collection to hold blobs when it is missing.
@@ -327,18 +318,14 @@ impl<Parent: Writable> Docs<'_, '_, Parent> {
         let collection = self.collection.writable(Modality::Docs)?;
         let text = document.to_string();
         let entries = [DocumentEntry::<Json>::new(key, &text)];
-        self.collection
-            .view
-            .docs_write(collection, &entries, Modification::Upsert, Durability::Buffered)?;
+        self.collection.view.docs_write(collection, &entries, Modification::Upsert, Durability::Buffered)?;
         Ok(())
     }
 
     /// Removes the document under `key`, whether or not the collection holds one.
     pub fn remove(self, key: Key) -> Result<()> {
         let collection = self.collection.existing(Modality::Docs)?;
-        self.collection
-            .view
-            .docs_remove(collection, [key], Durability::Buffered)?;
+        self.collection.view.docs_remove(collection, [key], Durability::Buffered)?;
         Ok(())
     }
 
@@ -373,9 +360,7 @@ impl<Parent: Writable> Graph<'_, '_, Parent> {
     pub fn add_edge(self, source: Key, target: Key) -> Result<()> {
         let collection = self.collection.writable(Modality::Graph)?;
         let edges = [Edge::new(source, target)];
-        self.collection
-            .view
-            .graph_write_edges(collection, edges, Durability::Buffered)?;
+        self.collection.view.graph_write_edges(collection, edges, Durability::Buffered)?;
         Ok(())
     }
 
@@ -383,9 +368,7 @@ impl<Parent: Writable> Graph<'_, '_, Parent> {
     pub fn remove_edge(self, source: Key, target: Key) -> Result<()> {
         let collection = self.collection.existing(Modality::Graph)?;
         let edges = [Edge::new(source, target)];
-        self.collection
-            .view
-            .graph_remove_edges(collection, edges, Durability::Buffered)?;
+        self.collection.view.graph_remove_edges(collection, edges, Durability::Buffered)?;
         Ok(())
     }
 
@@ -394,10 +377,7 @@ impl<Parent: Writable> Graph<'_, '_, Parent> {
     pub fn read_edges(self, vertices: &[Key], role: Role) -> Result<Vec<Edge>> {
         let collection = self.collection.existing(Modality::Graph)?;
         let mut arena = Arena::new()?;
-        let found = self
-            .collection
-            .view
-            .graph_read_edges(collection, vertices, Roles::Every(role), &mut arena)?;
+        let found = self.collection.view.graph_read_edges(collection, vertices, Roles::Every(role), &mut arena)?;
         Ok(found.edges().to_vec())
     }
 
@@ -405,10 +385,7 @@ impl<Parent: Writable> Graph<'_, '_, Parent> {
     pub fn degrees(self, vertices: &[Key], role: Role) -> Result<Vec<Degree>> {
         let collection = self.collection.existing(Modality::Graph)?;
         let mut arena = Arena::new()?;
-        let degrees = self
-            .collection
-            .view
-            .graph_degrees(collection, vertices, Roles::Every(role), &mut arena)?;
+        let degrees = self.collection.view.graph_degrees(collection, vertices, Roles::Every(role), &mut arena)?;
         Ok(degrees.to_vec())
     }
 }
@@ -462,20 +439,14 @@ mod tests {
         let description = movies.docs().get(avatar).unwrap().unwrap();
         assert_eq!(description["title"].as_str(), Some("Avatar"));
         assert_eq!(description["year"].as_u64(), Some(2009));
-        assert_eq!(
-            movies.docs().get_json(avatar).unwrap().as_deref(),
-            Some(r#"{"title":"Avatar","year":2009}"#)
-        );
+        assert_eq!(movies.docs().get_json(avatar).unwrap().as_deref(), Some(r#"{"title":"Avatar","year":2009}"#));
         assert!(movies.docs().get(key(2)).unwrap().is_none());
 
         movies.docs().remove(avatar).unwrap();
         assert!(movies.docs().get(avatar).unwrap().is_none());
 
         // The first write created the collection to hold documents.
-        let (_, modality) = database
-            .head()
-            .collection_find("movies", &mut Arena::new().unwrap())
-            .unwrap();
+        let (_, modality) = database.head().collection_find("movies", &mut Arena::new().unwrap()).unwrap();
         assert_eq!(modality, Modality::Docs);
     }
 
@@ -542,24 +513,9 @@ mod tests {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let [alice, bob, phone] = keys([1, 2, 3]);
         let mut transaction = database.transaction().unwrap();
-        transaction
-            .collection("payments")
-            .unwrap()
-            .docs()
-            .set(alice, &document(r#"{"amount":10}"#))
-            .unwrap();
-        transaction
-            .collection("connections")
-            .unwrap()
-            .graph()
-            .add_edge(alice, bob)
-            .unwrap();
-        transaction
-            .collection("posters")
-            .unwrap()
-            .blobs()
-            .set(phone, b"\x89PNG")
-            .unwrap();
+        transaction.collection("payments").unwrap().docs().set(alice, &document(r#"{"amount":10}"#)).unwrap();
+        transaction.collection("connections").unwrap().graph().add_edge(alice, bob).unwrap();
+        transaction.collection("posters").unwrap().blobs().set(phone, b"\x89PNG").unwrap();
 
         // The collections exist at the head at once, while their contents land with the commit.
         let mut head_posters = database.collection("posters").unwrap();
@@ -619,6 +575,37 @@ mod tests {
         assert_eq!(fields.get("sequels"), Some(&4));
         let failure = movies.docs().get_as::<Vec<String>>(key(1)).unwrap_err();
         assert_eq!(failure.status, Status::Malformed);
+    }
+
+    /// The Quickstart of `rust/README.md`, line by line, where the README's `main` is this test,
+    /// its imports name `crate` in place of `ustore`, since a crate's own tests reach it by that
+    /// name, and its return type spells `std::result::Result`, since this module's `Result` is the
+    /// crate's own.
+    #[test]
+    fn quickstart() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::{Database, Durability, Edge, Key, RAMOptions, Role, jsontape};
+
+        let database = Database::init_ram(&RAMOptions::default())?;
+        let [avatar, titanic] = [1u64, 2].map(Key::from);
+        let document = jsontape::parse(br#"{"title":"Avatar","year":2009}"#)?;
+
+        // One transaction writes a blob, a document and an edge, and commits all three or none.
+        let mut transaction = database.transaction()?;
+        transaction.collection("posters")?.blobs().set(avatar, b"\x89PNG")?;
+        transaction.collection("movies")?.docs().set(avatar, &document)?;
+        transaction.collection("similar")?.graph().add_edge(avatar, titanic)?;
+        transaction.commit(Durability::Buffered)?;
+
+        // Reads at the head see the commit: the poster, the year and the one edge leaving Avatar.
+        let mut posters = database.collection("posters")?;
+        assert_eq!(posters.blobs().get(avatar)?, Some(b"\x89PNG".to_vec()));
+        let mut movies = database.collection("movies")?;
+        let movie = movies.docs().get(avatar)?.expect("committed above");
+        assert_eq!(movie["year"].as_u64(), Some(2009));
+        let mut similar = database.collection("similar")?;
+        let edges = similar.graph().read_edges(&[avatar], Role::Source)?;
+        assert_eq!(edges, [Edge::new(avatar, titanic)]);
+        Ok(())
     }
 }
 

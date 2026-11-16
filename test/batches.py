@@ -6,6 +6,7 @@ Author: Ash Vardanian
 Date: September 18, 2026
 """
 
+import sys
 import threading
 
 import numpy as np
@@ -71,24 +72,20 @@ def test_a_deferred_scan_batch_answers_once_waited(populated, blobs, later, aren
     assert len(later.scan_batch([], 3, arena, collection=blobs).wait()) == 0
 
 
-def test_an_exported_tape_pins_its_arena(populated, blobs, arena):
-    """An exported tape outlives the calls after it, which another arena serves while this one is pinned."""
+def test_an_exported_tape_outlives_calls_on_other_arenas(populated, blobs, arena):
+    """An exported tape stays valid until a call naming its own arena rewinds it, whatever other arenas serve."""
     exported = memoryview(populated.scan_batch([1, 9], 2, arena, collection=blobs))
-    with pytest.raises(ustore.ContendedError):
-        populated.scan(1, 100, arena, collection=blobs)
     populated.scan(1, 100, ustore.Arena(), collection=blobs)
     assert exported.tobytes() == b"".join(key.bytes for key in keys([1, 2, 9, 10]))
 
 
-def test_a_dlpack_export_pins_its_arena(populated, blobs, arena):
+def test_a_dlpack_export_holds_its_arena(populated, blobs, arena):
     """A tape of keys exports DLPack in place from host pages, holding its arena until the consumer lets go."""
     found = populated.scan_batch([1, 9], 2, arena, collection=blobs)
     assert found.__dlpack_device__() == (1, 0)
     exported = np.from_dlpack(found)
     assert exported.shape == (4, 16)
     assert exported.tobytes() == b"".join(key.bytes for key in keys([1, 2, 9, 10]))
-    with pytest.raises(ustore.ContendedError):
-        populated.scan(1, 100, arena, collection=blobs)
     with pytest.raises(BufferError):
         found.__dlpack__(copy=True)
     del exported
@@ -228,16 +225,21 @@ def test_a_falsy_progress_cancels(populated, blobs, arena, answer: object):
     ]
 
 
-def test_a_raising_progress_raises_from_the_call(populated, blobs, arena):
-    """An exception inside the callable cancels the call and reaches its caller in place of CancelledError."""
-    with pytest.raises(ZeroDivisionError):
+def test_a_raising_progress_reports_unraisable_and_cancels(populated, blobs, arena, monkeypatch):
+    """An exception inside the callable goes to `sys.unraisablehook`, and the call ends cancelled."""
+    reported: list[type[BaseException]] = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda unraisable: reported.append(unraisable.exc_type))
+    with pytest.raises(ustore.CancelledError):
         populated.scan(1, 2, arena, progress=lambda finished, total: finished / 0, collection=blobs)
+    assert reported == [ZeroDivisionError]
 
 
-def test_progress_runs_on_the_executors_threads(populated, blobs):
+def test_progress_runs_on_the_executors_threads(populated, blobs, monkeypatch):
     """A deferred call reports from the executor's threads, where the callable attaches the interpreter itself, and
-    its exception re-raises from `wait`."""
+    one that raises reports there and cancels the call, which `wait` raises as cancelled."""
     reporters: set[int] = set()
+    reported: list[type[BaseException]] = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda unraisable: reported.append(unraisable.exc_type))
 
     def report(finished: int, total: int) -> None:
         reporters.add(threading.get_ident())
@@ -248,9 +250,10 @@ def test_progress_runs_on_the_executors_threads(populated, blobs):
             [key] for key in KEYS
         ]
         failing = later.scan_batch(KEYS, 1, arena, progress=lambda finished, total: finished / 0, collection=blobs)
-        with pytest.raises(ZeroDivisionError):
+        with pytest.raises(ustore.CancelledError):
             failing.wait()
     assert reporters and threading.get_ident() not in reporters
+    assert reported == [ZeroDivisionError]
 
 
 def test_progress_must_be_callable(populated, blobs, arena):

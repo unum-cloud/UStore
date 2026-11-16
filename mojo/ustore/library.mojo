@@ -28,6 +28,7 @@ from ustore.blobs import (
     MeasureArguments,
     SampleArguments,
 )
+from ustore.arrow import ColumnToArrow, KeysFromArrow, KeysToArrow, StringsFromArrow, StringsToArrow
 from ustore.docs import (
     DocsGatherArguments,
     DocsGistArguments,
@@ -81,6 +82,7 @@ from ustore.db import (
     CollectionListArguments,
     DatabaseClearArguments,
     DatabaseCompactArguments,
+    DatabaseCompactPlanFinishArguments,
     DatabaseDescribeArguments,
     DatabaseFlushArguments,
     DatabaseInitRamArguments,
@@ -133,6 +135,7 @@ from ustore.types import (
     Outcome,
     OutcomeStatus,
     PatternKind,
+    Phase,
     Release,
     Status,
     Transport,
@@ -192,7 +195,7 @@ def _version(version: VersionOf) -> Tuple[Int, Int, Int]:
 
 
 struct Symbols:
-    """Every entry point the C ABI exports outside its Arrow header, resolved once when the library loads."""
+    """Every entry point the C ABI exports, resolved once when the library loads."""
 
     var version: VersionOf
     var version_name: StaticText
@@ -249,6 +252,8 @@ struct Symbols:
     var change_kind_from_name: FromName
     var ingest_order_name: NameOf
     var ingest_order_from_name: FromName
+    var phase_name: NameOf
+    var phase_from_name: FromName
     var database_init_ram: Verb[DatabaseInitRamArguments]
     var database_open_ram: Verb[DatabaseOpenRamArguments]
     var database_open_rocksdb: Verb[DatabaseOpenRocksdbArguments]
@@ -258,6 +263,7 @@ struct Symbols:
     var database_describe: Verb[DatabaseDescribeArguments]
     var database_clear: Verb[DatabaseClearArguments]
     var database_compact: Verb[DatabaseCompactArguments]
+    var database_compact_plan_finish: Verb[DatabaseCompactPlanFinishArguments]
     var database_flush: Verb[DatabaseFlushArguments]
     var database_free: Release
     var snapshot_init: Verb[SnapshotInitArguments]
@@ -310,6 +316,11 @@ struct Symbols:
     var docs_read: Verb[DocsReadArguments]
     var docs_gist: Verb[DocsGistArguments]
     var docs_gather: Verb[DocsGatherArguments]
+    var keys_view_from_arrow: KeysFromArrow
+    var strings_view_from_arrow: StringsFromArrow
+    var keys_view_to_arrow: KeysToArrow
+    var strings_view_to_arrow: StringsToArrow
+    var docs_column_view_to_arrow: ColumnToArrow
     var docs_remove: Verb[DocsRemoveArguments]
     var docs_scan: Verb[FilteredScanArguments["ustore_docs_scan"]]
     var docs_cursor_init: Verb[FilteredCursorInitArguments]
@@ -410,6 +421,8 @@ struct Symbols:
         self.change_kind_from_name = _resolve[FromName](handle, "ustore_change_kind_from_name")
         self.ingest_order_name = _resolve[NameOf](handle, "ustore_ingest_order_name")
         self.ingest_order_from_name = _resolve[FromName](handle, "ustore_ingest_order_from_name")
+        self.phase_name = _resolve[NameOf](handle, "ustore_phase_name")
+        self.phase_from_name = _resolve[FromName](handle, "ustore_phase_from_name")
         self.database_init_ram = _resolve[Verb[DatabaseInitRamArguments]](handle, "ustore_database_init_ram")
         self.database_open_ram = _resolve[Verb[DatabaseOpenRamArguments]](handle, "ustore_database_open_ram")
         self.database_open_rocksdb = _resolve[Verb[DatabaseOpenRocksdbArguments]](handle, "ustore_database_open_rocksdb")
@@ -419,6 +432,9 @@ struct Symbols:
         self.database_describe = _resolve[Verb[DatabaseDescribeArguments]](handle, "ustore_database_describe")
         self.database_clear = _resolve[Verb[DatabaseClearArguments]](handle, "ustore_database_clear")
         self.database_compact = _resolve[Verb[DatabaseCompactArguments]](handle, "ustore_database_compact")
+        self.database_compact_plan_finish = _resolve[Verb[DatabaseCompactPlanFinishArguments]](
+            handle, "ustore_database_compact_plan_finish"
+        )
         self.database_flush = _resolve[Verb[DatabaseFlushArguments]](handle, "ustore_database_flush")
         self.database_free = _resolve[Release](handle, "ustore_database_free")
         self.snapshot_init = _resolve[Verb[SnapshotInitArguments]](handle, "ustore_snapshot_init")
@@ -471,6 +487,11 @@ struct Symbols:
         self.docs_read = _resolve[Verb[DocsReadArguments]](handle, "ustore_docs_read")
         self.docs_gist = _resolve[Verb[DocsGistArguments]](handle, "ustore_docs_gist")
         self.docs_gather = _resolve[Verb[DocsGatherArguments]](handle, "ustore_docs_gather")
+        self.keys_view_from_arrow = _resolve[KeysFromArrow](handle, "ustore_keys_view_from_arrow")
+        self.strings_view_from_arrow = _resolve[StringsFromArrow](handle, "ustore_strings_view_from_arrow")
+        self.keys_view_to_arrow = _resolve[KeysToArrow](handle, "ustore_keys_view_to_arrow")
+        self.strings_view_to_arrow = _resolve[StringsToArrow](handle, "ustore_strings_view_to_arrow")
+        self.docs_column_view_to_arrow = _resolve[ColumnToArrow](handle, "ustore_docs_column_view_to_arrow")
         self.docs_remove = _resolve[Verb[DocsRemoveArguments]](handle, "ustore_docs_remove")
         self.docs_scan = _resolve[Verb[FilteredScanArguments["ustore_docs_scan"]]](handle, "ustore_docs_scan")
         self.docs_cursor_init = _resolve[Verb[FilteredCursorInitArguments]](handle, "ustore_docs_cursor_init")
@@ -754,6 +775,14 @@ struct Library(ImplicitlyCopyable):
             self._read_name(self.symbols().ingest_order_from_name, name, "ustore_ingest_order_from_name")
         )
 
+    def phase_name(self, phase: Phase) -> String:
+        """The engine's spelling of a plan's phase, as `MERGE` spells "merge". Calls `ustore_phase_name`."""
+        return text_at(self.symbols().phase_name(phase.code))
+
+    def phase_from_name(self, name: StringSlice) raises Error -> Phase:
+        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_phase_from_name`."""
+        return Phase(self._read_name(self.symbols().phase_from_name, name, "ustore_phase_from_name"))
+
     def docs_field_type_name(self, field_type: FieldType) -> String:
         """The engine's spelling of a field type, as `F64` spells "f64". Calls `ustore_docs_field_type_name`."""
         return text_at(self.symbols().docs_field_type_name(field_type.code))
@@ -795,7 +824,7 @@ struct Library(ImplicitlyCopyable):
     def _read_name(self, from_name: FromName, name: StringSlice, symbol: StaticString) raises Error -> c_int:
         """Reads `name` back through one of the `_from_name` family, raising the status it refuses with."""
         var value = c_int(0)
-        var code = from_name(BytesView.of(name).arguments(), Pointer(to=value))
+        var code = from_name(BytesView.of(name).arguments(), Pointer(to=value).unsafe_origin_cast[MutAnyOrigin]())
         if code != c_int(0):
             var status = Status.of(code)
             raise Error(status, symbol, None, self.symbols().status_name(c_int(status.code)), self)

@@ -34,7 +34,7 @@ char const doc_read[] =                                                         
     "Returns:\n"                                                                            //
     "  Values: One entry per key, in the order they were asked for.\n"                      //
     "Raises:\n"                                                                             //
-    "  ContendedError: The arena serves another call or exports a buffer.\n"                //
+    "  ContendedError: The arena serves another call.\n"                                    //
     "  Error: Whatever the engine reported.";
 
 static void read_submit(void* arguments) { ustore_blobs_read((ustore_blobs_read_t*)arguments); }
@@ -100,7 +100,7 @@ ustore_py_verb_t const ustore_py_read_drawn_verb = {sizeof(ustore_py_read_call_t
 
 PyObject* ustore_py_values_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                 ustore_py_verb_t const* verb, ustore_py_read_call_t* call, PyObject* arena) {
-    if (ustore_py_arena_claim(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, verb, call);
+    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, verb, call);
     call->call.collection = options->collection;
     ustore_blobs_read_t read = {
         .database = context->database_handle,
@@ -235,7 +235,7 @@ PyObject* ustore_py_value_contains(ustore_py_context_t const* context, ustore_py
     ustore_py_read_call_t* const call = one_key_open(context, &contains_verb, key, &stack);
     if (!call) return NULL;
     PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(context));
-    int const claimed = arena ? ustore_py_arena_claim(arena, &call->call.arena) : -1;
+    int const claimed = arena ? ustore_py_arena_from_object(arena, &call->call.arena) : -1;
     Py_XDECREF(arena);
     if (claimed != 0) return ustore_py_call_discard(context, &contains_verb, call);
     call->call.collection = options->collection;
@@ -813,12 +813,13 @@ static ustore_py_verb_t const pages_sample_verb = {sizeof(keys_call_t), pages_sa
 static ustore_py_verb_t const vertices_sample_verb = {sizeof(keys_call_t), vertices_sample_submit, keys_answer,
                                                       keys_release};
 
-/** Runs the scans gathered into @p call through the scan of @p modality, reporting to @p progress and claiming
- *  @p arena for their keys. */
+/** Runs the scans gathered into @p call through the scan of @p modality, reporting to @p progress,
+ *  and writes their keys into @p arena. */
 static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                            ustore_modality_t modality, size_t wanted, ustore_scan_mode_t mode, PyObject* progress,
                            scan_match_t const* match, keys_call_t* call, PyObject* arena) {
-    if (ustore_py_arena_claim(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, &scan_verb, call);
+    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0)
+        return ustore_py_call_discard(context, &scan_verb, call);
     call->call.collection = options->collection;
     call->call.progress = Py_XNewRef(progress);
     call->tasks = call->starts.count;
@@ -1067,14 +1068,14 @@ PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* arguments, P
     return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, &match, call, arguments[2]);
 }
 
-/** Runs @p tasks samples of up to @p wanted keys each through the sample of @p modality, claiming @p arena for their
- *  keys. */
+/** Runs @p tasks samples of up to @p wanted keys each through the sample of @p modality, and
+ *  writes their keys into @p arena. */
 static PyObject* keys_sample(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                              ustore_modality_t modality, size_t tasks, size_t wanted, PyObject* arena) {
     keys_call_t stack;
     keys_call_t* const call = ustore_py_call_open(context, &sample_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_claim(arena, &call->call.arena) != 0)
+    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0)
         return ustore_py_call_discard(context, &sample_verb, call);
     call->call.collection = options->collection;
     call->tasks = tasks;
@@ -1251,9 +1252,6 @@ typedef struct measure_call_t {
 
     /** Which way the range runs from @c start. */
     ustore_scan_direction_t direction;
-
-    /** Output slots for the six bounds, in the order of the fields of @c MeasurementType, inside the arena. */
-    ustore_size_t const* bounds[6];
 } measure_call_t;
 
 static void measure_submit(void* arguments) { ustore_blobs_measure((ustore_blobs_measure_t*)arguments); }
@@ -1264,14 +1262,9 @@ static void vertices_measure_submit(void* arguments) {
 }
 
 static PyObject* measure_answer(void* erased) {
-    measure_call_t const* const call = (measure_call_t const*)erased;
-    PyObject* bounds = PyStructSequence_New(MeasurementType);
-    for (Py_ssize_t index = 0; bounds && index != 6; ++index) {
-        PyObject* const value = PyLong_FromUnsignedLongLong(call->bounds[index] ? call->bounds[index][0] : 0);
-        if (!value) Py_CLEAR(bounds);
-        else PyStructSequence_SetItem(bounds, index, value);
-    }
-    return bounds;
+    Measurement* const bounds = (Measurement*)((ustore_py_call_t*)erased)->result;
+    ustore_py_measurement_settle(bounds);
+    return Py_NewRef((PyObject*)bounds);
 }
 
 static void measure_release(void* call) { ustore_py_call_release(&((measure_call_t*)call)->call); }
@@ -1317,7 +1310,8 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
     measure_call_t stack;
     measure_call_t* const call = ustore_py_call_open(&context, &measure_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_claim(arguments[2], &call->call.arena) != 0)
+    Measurement* const bounds = (Measurement*)(call->call.result = ustore_py_report_new(&MeasurementType));
+    if (!bounds || ustore_py_arena_from_object(arguments[2], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &measure_verb, call);
     call->call.collection = options.collection;
     call->start = start;
@@ -1336,12 +1330,12 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
             .start_keys = {&call->start, 0},
             .end_keys = end_keys,
             .direction = call->direction,
-            .min_cardinalities = &call->bounds[0],
-            .max_cardinalities = &call->bounds[1],
-            .min_value_bytes = &call->bounds[2],
-            .max_value_bytes = &call->bounds[3],
-            .min_space_usages = &call->bounds[4],
-            .max_space_usages = &call->bounds[5],
+            .min_cardinalities = &bounds->slots[0],
+            .max_cardinalities = &bounds->slots[1],
+            .min_value_bytes = &bounds->slots[2],
+            .max_value_bytes = &bounds->slots[3],
+            .min_space_usages = &bounds->slots[4],
+            .max_space_usages = &bounds->slots[5],
             .arena = ustore_py_arena_handle(call->call.arena),
         };
         return ustore_py_call_run(&context, &docs_measure_verb, call, &measure);
@@ -1358,12 +1352,12 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
             .start_keys = {&call->start, 0},
             .end_keys = end_keys,
             .direction = call->direction,
-            .min_cardinalities = &call->bounds[0],
-            .max_cardinalities = &call->bounds[1],
-            .min_value_bytes = &call->bounds[2],
-            .max_value_bytes = &call->bounds[3],
-            .min_space_usages = &call->bounds[4],
-            .max_space_usages = &call->bounds[5],
+            .min_cardinalities = &bounds->slots[0],
+            .max_cardinalities = &bounds->slots[1],
+            .min_value_bytes = &bounds->slots[2],
+            .max_value_bytes = &bounds->slots[3],
+            .min_space_usages = &bounds->slots[4],
+            .max_space_usages = &bounds->slots[5],
             .arena = ustore_py_arena_handle(call->call.arena),
         };
         return ustore_py_call_run(&context, &pages_measure_verb, call, &measure);
@@ -1380,12 +1374,12 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
             .start_keys = {&call->start, 0},
             .end_keys = end_keys,
             .direction = call->direction,
-            .min_cardinalities = &call->bounds[0],
-            .max_cardinalities = &call->bounds[1],
-            .min_value_bytes = &call->bounds[2],
-            .max_value_bytes = &call->bounds[3],
-            .min_space_usages = &call->bounds[4],
-            .max_space_usages = &call->bounds[5],
+            .min_cardinalities = &bounds->slots[0],
+            .max_cardinalities = &bounds->slots[1],
+            .min_value_bytes = &bounds->slots[2],
+            .max_value_bytes = &bounds->slots[3],
+            .min_space_usages = &bounds->slots[4],
+            .max_space_usages = &bounds->slots[5],
             .arena = ustore_py_arena_handle(call->call.arena),
         };
         return ustore_py_call_run(&context, &vertices_measure_verb, call, &measure);
@@ -1401,12 +1395,12 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
         .start_keys = {&call->start, 0},
         .end_keys = end_keys,
         .direction = call->direction,
-        .min_cardinalities = &call->bounds[0],
-        .max_cardinalities = &call->bounds[1],
-        .min_value_bytes = &call->bounds[2],
-        .max_value_bytes = &call->bounds[3],
-        .min_space_usages = &call->bounds[4],
-        .max_space_usages = &call->bounds[5],
+        .min_cardinalities = &bounds->slots[0],
+        .max_cardinalities = &bounds->slots[1],
+        .min_value_bytes = &bounds->slots[2],
+        .max_value_bytes = &bounds->slots[3],
+        .min_space_usages = &bounds->slots[4],
+        .max_space_usages = &bounds->slots[5],
         .arena = ustore_py_arena_handle(call->call.arena),
     };
     return ustore_py_call_run(&context, &measure_verb, call, &measure);
@@ -1429,8 +1423,7 @@ typedef struct Cursor {
     /** The object header every instance carries. */
     PyObject ob_base;
 
-    /** The cursor of the modality @c modality names, NULL once closed, or the address of @c cursor_lent while a pull
-     *  holds it. */
+    /** The cursor of the modality @c modality names, or NULL once closed. */
     void* handle;
 
     /** Which cursor of the ABI @c handle is: blobs, documents, pages or graph vertices. */
@@ -1439,7 +1432,7 @@ typedef struct Cursor {
     /** The encoding every pull of a walk over pages renders them into. */
     ustore_page_encoding_t outputs_encoding;
 
-    /** The predicate the walk compiled at init, which every pull asks, and what it raised. */
+    /** The predicate the walk compiled at init, which every pull asks. */
     ustore_py_predicate_t predicate;
 
     /** The database the cursor was opened on, which the cursor holds open in C. */
@@ -1458,9 +1451,6 @@ typedef struct Page {
     /** The @c Arena the keys live in, kept alive so they outlive every other name for them. */
     PyObject* arena;
 
-    /** The arena's generation when the pull wrote the keys. */
-    size_t generation;
-
     /** The keys, in ascending order. */
     ustore_key_t const* keys;
 
@@ -1477,14 +1467,14 @@ typedef struct Page {
     Py_ssize_t strides[2];
 } Page;
 
-static char const doc_Page[] =                                                                   //
-    "The keys one pull of a Cursor wrote into an `Arena`, viewing it until it rewinds.\n"        //
-    "\n"                                                                                         //
-    "Indexing answers a `uuid.UUID`, and the whole page exports through the buffer protocol\n"   //
-    "as an array of shape (keys, 16) bytes, pinning the arena until released. Its length\n"      //
-    "counts the keys, so the empty page ending a walk is falsy. `values` holds the Values of\n"  //
-    "the keys when the pull asked for them, every one present, and None otherwise. Read after\n" //
-    "a later call rewound the arena, it raises `UninitializedError`.";
+static char const doc_Page[] =                                                                  //
+    "The keys one pull of a Cursor wrote into an `Arena`, viewing it until it rewinds.\n"       //
+    "\n"                                                                                        //
+    "Indexing answers a `uuid.UUID`, and the whole page exports through the buffer protocol\n"  //
+    "as an array of shape `(keys, 16)` bytes. Its length counts the keys, so the empty page\n"  //
+    "ending a walk is falsy. `values` holds the Values of the keys when the pull asked for\n"   //
+    "them, every one present, and None otherwise. Read after a later call rewound the arena,\n" //
+    "it reads whatever the arena then holds.";
 
 /** A new @c Page over the @p count keys a pull wrote into @p arena, taking @p values, their @c Values or None. */
 static PyObject* page_new(PyObject* arena, ustore_key_t const* keys, size_t count, PyObject* values) {
@@ -1494,7 +1484,6 @@ static PyObject* page_new(PyObject* arena, ustore_key_t const* keys, size_t coun
         return NULL;
     }
     page->arena = Py_NewRef(arena);
-    page->generation = ustore_py_arena_generation(arena);
     page->keys = keys;
     page->count = count;
     page->values = values;
@@ -1518,22 +1507,14 @@ static PyObject* Page_item(Page* self, Py_ssize_t key_index) {
         PyErr_SetString(PyExc_IndexError, "Key index out of range");
         return NULL;
     }
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     PyObject* const key = ustore_py_uuid_to_object(&self->keys[key_index].uuid);
-    ustore_py_arena_unpin(self->arena);
     return key;
 }
 
 static int Page_getbuffer(Page* self, Py_buffer* view, int flags) {
     view->obj = NULL;
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return -1;
-    if (ustore_py_buffer_fill(view, (PyObject*)self, self->keys, "B", 1, 2, self->shape, self->strides, flags) == 0)
-        return 0;
-    ustore_py_arena_unpin(self->arena);
-    return -1;
+    return ustore_py_buffer_fill(view, (PyObject*)self, self->keys, "B", 1, 2, self->shape, self->strides, flags);
 }
-
-static void Page_releasebuffer(Page* self, Py_buffer* Py_UNUSED(view)) { ustore_py_arena_unpin(self->arena); }
 
 static PyObject* Page_repr(Page* self) { return PyUnicode_FromFormat("Page(keys=%zu)", self->count); }
 
@@ -1563,7 +1544,6 @@ static PySequenceMethods Page_as_sequence = {
 
 static PyBufferProcs Page_as_buffer = {
     .bf_getbuffer = (getbufferproc)Page_getbuffer,
-    .bf_releasebuffer = (releasebufferproc)Page_releasebuffer,
 };
 
 PyTypeObject PageType = {
@@ -1635,22 +1615,11 @@ static ustore_py_verb_t const pages_pull_pairs_verb = {sizeof(pull_call_t), page
 static ustore_py_verb_t const vertices_pull_keys_verb = {sizeof(pull_call_t), vertices_pull_submit, pull_answer_keys,
                                                          pull_release};
 
-/** Stands in the handle slot of a cursor while one pull holds its handle, refusing another pull or a close. */
-static char cursor_lent;
-
-/**
- *  @brief Frees the cursor of @p self once, fenced against a concurrent close and refused during a pull.
- *  @return 0 on success, -1 with a @c ContendedError set while a pull holds the handle.
- */
-static int cursor_close(Cursor* self) {
-    void* const lent = (void*)&cursor_lent;
-    void* handle = NULL;
-    ustore_py_critical_section_begin_((PyObject*)self);
-    handle = self->handle;
-    if (handle != lent) self->handle = NULL;
-    ustore_py_critical_section_end_();
-    if (handle == lent) return ustore_py_raise(ustore_status_contended_k, "A pull of this cursor is still running");
-    if (!handle) return 0;
+/** Hands the cursor of @p self to its C free once, which waits for a pull still naming it. */
+static void cursor_close(Cursor* self) {
+    void* const handle = self->handle;
+    self->handle = NULL;
+    if (!handle) return;
     ustore_modality_t const modality = self->modality;
     Py_BEGIN_ALLOW_THREADS;
     if (modality == ustore_modality_docs_k) ustore_docs_cursor_free((ustore_docs_cursor_t)handle);
@@ -1659,7 +1628,6 @@ static int cursor_close(Cursor* self) {
         ustore_graph_vertices_cursor_free((ustore_graph_vertices_cursor_t)handle);
     else ustore_blobs_cursor_free((ustore_blobs_cursor_t)handle);
     Py_END_ALLOW_THREADS;
-    return 0;
 }
 
 static void Cursor_dealloc(Cursor* self) {
@@ -1667,7 +1635,6 @@ static void Cursor_dealloc(Cursor* self) {
     cursor_close(self);
     Py_XDECREF((PyObject*)self->executor);
     Py_XDECREF(self->predicate.callable);
-    Py_XDECREF(self->predicate.raised);
     PyObject_Free(self);
 }
 
@@ -1692,7 +1659,7 @@ static PyObject* cursor_pull(Cursor* self, void* handle, size_t wanted, PyObject
     ustore_py_context_t const context = {.executor = self->executor, .completion = ustore_completion_blocking_k};
     pull_call_t stack;
     pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
-    if (ustore_py_arena_claim(arena, &call->call.arena) != 0) return ustore_py_call_discard(&context, verb, call);
+    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0) return ustore_py_call_discard(&context, verb, call);
     call->call.progress = Py_XNewRef(progress);
     PyObject* page = NULL;
     if (self->modality == ustore_modality_docs_k) {
@@ -1759,11 +1726,6 @@ static PyObject* cursor_pull(Cursor* self, void* handle, size_t wanted, PyObject
         };
         page = ustore_py_call_run(&context, verb, call, &next);
     }
-    // What the walk's predicate raised outranks the page the pull answered
-    if (self->predicate.raised) {
-        Py_CLEAR(page);
-        ustore_py_predicate_raise(&self->predicate);
-    }
     return page;
 }
 
@@ -1774,8 +1736,9 @@ static char const doc_Cursor[] =                                                
     "by name. It keeps only the key its next pull starts at, so a key written behind the\n"   //
     "walk never comes and one written ahead of it does. A page shorter than `wanted`\n"       //
     "exhausts the walk for good: every later pull answers an empty page without reading,\n"   //
-    "whatever was written since. One pull runs at a time, and an overlapping pull or\n"       //
-    "`close()` raises ContendedError. Used as a context manager, it closes on exit.";
+    "whatever was written since. One pull runs at a time, an overlapping pull raises\n"       //
+    "ContendedError, and `close()` waits for a pull in flight. Used as a context manager,\n"  //
+    "it closes on exit.";
 
 static char const doc_Cursor_next[] =                                                           //
     "next(wanted, arena, /, *, values=False, progress=None) answers a Page.\n"                  //
@@ -1822,22 +1785,12 @@ static PyObject* Cursor_next(Cursor* self, PyObject* const* arguments, Py_ssize_
     size_t wanted = 0;
     if (ustore_py_size_from_object(arguments[0], "wanted", &wanted) != 0) return NULL;
 
-    void* const lent = (void*)&cursor_lent;
-    void* handle = NULL;
-    ustore_py_critical_section_begin_((PyObject*)self);
-    handle = self->handle;
-    if (handle) self->handle = lent;
-    ustore_py_critical_section_end_();
-    if (!handle || handle == lent) {
-        ustore_py_raise(handle ? ustore_status_contended_k : ustore_status_uninitialized_k,
-                        handle ? "Another pull of this cursor is running" : "The cursor is closed");
+    void* const handle = self->handle;
+    if (!handle) {
+        ustore_py_raise(ustore_status_uninitialized_k, "The cursor is closed");
         return NULL;
     }
-    PyObject* const page = cursor_pull(self, handle, wanted, arguments[1], values, progress);
-    ustore_py_critical_section_begin_((PyObject*)self);
-    self->handle = handle;
-    ustore_py_critical_section_end_();
-    return page;
+    return cursor_pull(self, handle, wanted, arguments[1], values, progress);
 }
 
 static char const doc_Cursor_close[] =                                                       //
@@ -1847,7 +1800,7 @@ static char const doc_Cursor_close[] =                                          
     "or snapshot it reads through. Closing twice is safe. Calls `ustore_blobs_cursor_free`.";
 
 static PyObject* Cursor_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
-    if (cursor_close((Cursor*)self) != 0) return NULL;
+    cursor_close((Cursor*)self);
     Py_RETURN_NONE;
 }
 
@@ -1994,7 +1947,6 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
     cursor->modality = modality;
     cursor->outputs_encoding = (ustore_page_encoding_t)outputs_encoding;
     cursor->predicate.callable = Py_XNewRef(match.predicate);
-    cursor->predicate.raised = NULL;
     cursor->database = context.database_handle;
     cursor->executor = (Executor*)Py_XNewRef((PyObject*)context.executor);
     // The patterns and the filter are compiled at init, so they are borrowed only while it runs
@@ -2011,9 +1963,10 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
         return NULL;
     }
     ustore_outcome_t outcome = {0};
+    void* opened = NULL;
     if (modality == ustore_modality_docs_k) {
         ustore_docs_cursor_init_t init = {
-            .cursor = (ustore_docs_cursor_t*)&cursor->handle,
+            .cursor = (ustore_docs_cursor_t*)&opened,
             .database = context.database_handle,
             .executor = ustore_py_context_executor(&context),
             .outcome = &outcome,
@@ -2031,7 +1984,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
     }
     else if (modality == ustore_modality_pages_k) {
         ustore_pages_cursor_init_t init = {
-            .cursor = (ustore_pages_cursor_t*)&cursor->handle,
+            .cursor = (ustore_pages_cursor_t*)&opened,
             .database = context.database_handle,
             .executor = ustore_py_context_executor(&context),
             .outcome = &outcome,
@@ -2049,7 +2002,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
     }
     else if (modality == ustore_modality_graph_k) {
         ustore_graph_vertices_cursor_init_t init = {
-            .cursor = (ustore_graph_vertices_cursor_t*)&cursor->handle,
+            .cursor = (ustore_graph_vertices_cursor_t*)&opened,
             .database = context.database_handle,
             .executor = ustore_py_context_executor(&context),
             .outcome = &outcome,
@@ -2066,7 +2019,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
     }
     else {
         ustore_blobs_cursor_init_t init = {
-            .cursor = (ustore_blobs_cursor_t*)&cursor->handle,
+            .cursor = (ustore_blobs_cursor_t*)&opened,
             .database = context.database_handle,
             .executor = ustore_py_context_executor(&context),
             .outcome = &outcome,
@@ -2083,6 +2036,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
         Py_END_ALLOW_THREADS;
     }
     keys_release(&gathered);
+    cursor->handle = opened;
     if (ustore_py_raise_on_outcome(&outcome) == 0) return (PyObject*)cursor;
     Py_DECREF(cursor);
     return NULL;
@@ -2119,64 +2073,39 @@ typedef struct ChangesCursor {
     /** The object header every instance carries. */
     PyObject ob_base;
 
-    /** The feed, NULL once closed, or the address of @c cursor_lent while a pull holds it. */
+    /** The feed, or NULL once closed. */
     void* handle;
 } ChangesCursor;
 
 /** One pull of a feed, whose outputs land in the arena its header holds. */
 typedef struct changes_pull_call_t {
 
-    /** What the call keeps until it finishes. */
+    /** What the call keeps until it finishes, the @c Changes it writes into included. */
     ustore_py_call_t call;
-
-    /** Output slot for the changes the pull yielded. */
-    ustore_size_t count;
-
-    /** Output slot for the key of every change, inside the arena. */
-    ustore_key_t const* keys;
-
-    /** Output slot for the stamp of every change, inside the arena. */
-    ustore_stamp_t const* stamps;
-
-    /** Output slot for the kind of every change, inside the arena. */
-    ustore_change_kind_t const* kinds;
-
-    /** Output slot for the tape of each change's bytes in the arena, when the pull asks for it. */
-    ustore_strings_view_t values;
 } changes_pull_call_t;
 
 static void changes_pull_submit(void* arguments) {
     ustore_changes_cursor_next((ustore_changes_cursor_next_t*)arguments);
 }
 
-/** The @c Changes of the pull @p call, carrying @p values, a @c Values or None, which it takes. */
+/** Answers the @c Changes the pull @p call wrote into, once it built the objects over its
+ *  slots, carrying @p values, a @c Values or None, which it takes. */
 static PyObject* changes_answer(changes_pull_call_t const* call, PyObject* values) {
-    size_t const count = (size_t)call->count;
-    PyObject* const changes = PyStructSequence_New(ChangesType);
-    PyObject* const keys = page_new(call->call.arena, call->keys, count, Py_NewRef(Py_None));
-    PyObject* const stamps = PyTuple_New((Py_ssize_t)count);
-    PyObject* const kinds = PyTuple_New((Py_ssize_t)count);
-    int failed = !changes || !keys || !stamps || !kinds;
+    Changes* const changes = (Changes*)call->call.result;
+    size_t const count = (size_t)changes->count;
+    changes->values_object = values;
+    changes->keys_object = page_new(call->call.arena, changes->keys, count, Py_NewRef(Py_None));
+    changes->stamps_object = PyTuple_New((Py_ssize_t)count);
+    changes->kinds_object = PyTuple_New((Py_ssize_t)count);
+    int failed = !values || !changes->keys_object || !changes->stamps_object || !changes->kinds_object;
     for (size_t index = 0; !failed && index != count; ++index) {
-        PyObject* const stamp = PyLong_FromUnsignedLongLong(call->stamps[index]);
-        PyObject* const kind = ustore_py_enum_to_object(ustore_py_enum_change_kind_k, (int)call->kinds[index]);
-        if (stamp) PyTuple_SET_ITEM(stamps, (Py_ssize_t)index, stamp);
-        if (kind) PyTuple_SET_ITEM(kinds, (Py_ssize_t)index, kind);
+        PyObject* const stamp = PyLong_FromUnsignedLongLong(changes->stamps[index]);
+        PyObject* const kind = ustore_py_enum_to_object(ustore_py_enum_change_kind_k, (int)changes->kinds[index]);
+        if (stamp) PyTuple_SET_ITEM(changes->stamps_object, (Py_ssize_t)index, stamp);
+        if (kind) PyTuple_SET_ITEM(changes->kinds_object, (Py_ssize_t)index, kind);
         failed = !stamp || !kind;
     }
-    if (failed) {
-        Py_XDECREF(changes);
-        Py_XDECREF(keys);
-        Py_XDECREF(values);
-        Py_XDECREF(stamps);
-        Py_XDECREF(kinds);
-        return NULL;
-    }
-    PyStructSequence_SetItem(changes, 0, keys);
-    PyStructSequence_SetItem(changes, 1, values);
-    PyStructSequence_SetItem(changes, 2, stamps);
-    PyStructSequence_SetItem(changes, 3, kinds);
-    return changes;
+    return failed ? NULL : Py_NewRef((PyObject*)changes);
 }
 
 static PyObject* changes_answer_keys(void* erased) {
@@ -2185,8 +2114,8 @@ static PyObject* changes_answer_keys(void* erased) {
 
 static PyObject* changes_answer_pairs(void* erased) {
     changes_pull_call_t const* const call = (changes_pull_call_t const*)erased;
-    PyObject* const values = ustore_py_values_new(call->call.arena, NULL, &call->values, (size_t)call->count);
-    return values ? changes_answer(call, values) : NULL;
+    Changes const* const changes = (Changes const*)call->call.result;
+    return changes_answer(call, ustore_py_values_new(call->call.arena, NULL, &changes->values, (size_t)changes->count));
 }
 
 static void changes_pull_release(void* call) { ustore_py_call_release(&((changes_pull_call_t*)call)->call); }
@@ -2196,20 +2125,14 @@ static ustore_py_verb_t const changes_pull_keys_verb = {sizeof(changes_pull_call
 static ustore_py_verb_t const changes_pull_pairs_verb = {sizeof(changes_pull_call_t), changes_pull_submit,
                                                          changes_answer_pairs, changes_pull_release};
 
-/** Frees the feed of @p self once, fenced against a concurrent close and refused during a pull. */
-static int changes_cursor_close(ChangesCursor* self) {
-    void* const lent = (void*)&cursor_lent;
-    void* handle = NULL;
-    ustore_py_critical_section_begin_((PyObject*)self);
-    handle = self->handle;
-    if (handle != lent) self->handle = NULL;
-    ustore_py_critical_section_end_();
-    if (handle == lent) return ustore_py_raise(ustore_status_contended_k, "A pull of this feed is still running");
-    if (!handle) return 0;
+/** Hands the feed of @p self to its C free once, which waits for a pull still naming it. */
+static void changes_cursor_close(ChangesCursor* self) {
+    void* const handle = self->handle;
+    self->handle = NULL;
+    if (!handle) return;
     Py_BEGIN_ALLOW_THREADS;
     ustore_changes_cursor_free((ustore_changes_cursor_t)handle);
     Py_END_ALLOW_THREADS;
-    return 0;
 }
 
 static void ChangesCursor_dealloc(ChangesCursor* self) {
@@ -2222,8 +2145,8 @@ static char const doc_ChangesCursor[] =                                         
     "\n"                                                                                          //
     "Built through `changes_cursor()` on a database, never by name. It pins the stamp it reads\n" //
     "from, as a snapshot does, and every pull resumes past the last change the pull before it\n"  //
-    "handed out. One pull runs at a time, and an overlapping pull or `close()` raises\n"          //
-    "ContendedError. Used as a context manager, it closes on exit.";
+    "handed out. One pull runs at a time, an overlapping pull raises ContendedError, and\n"       //
+    "`close()` waits for a pull in flight. Used as a context manager, it closes on exit.";
 
 static char const doc_ChangesCursor_next[] =                                                   //
     "next(wanted, arena, /, *, values=False) answers a Changes tuple.\n"                       //
@@ -2262,41 +2185,33 @@ static PyObject* ChangesCursor_next(ChangesCursor* self, PyObject* const* argume
     size_t wanted = 0;
     if (ustore_py_size_from_object(arguments[0], "wanted", &wanted) != 0) return NULL;
 
-    void* const lent = (void*)&cursor_lent;
-    void* handle = NULL;
-    ustore_py_critical_section_begin_((PyObject*)self);
-    handle = self->handle;
-    if (handle) self->handle = lent;
-    ustore_py_critical_section_end_();
-    if (!handle || handle == lent) {
-        ustore_py_raise(handle ? ustore_status_contended_k : ustore_status_uninitialized_k,
-                        handle ? "Another pull of this feed is running" : "The feed is closed");
+    void* const handle = self->handle;
+    if (!handle) {
+        ustore_py_raise(ustore_status_uninitialized_k, "The feed is closed");
         return NULL;
     }
     ustore_py_verb_t const* const verb = values ? &changes_pull_pairs_verb : &changes_pull_keys_verb;
     ustore_py_context_t const context = {.completion = ustore_completion_blocking_k};
     changes_pull_call_t stack;
     changes_pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
+    Changes* const pulled = (Changes*)(call->call.result = ustore_py_report_new(&ChangesType));
     PyObject* changes = NULL;
-    if (ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
+    if (!pulled || ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
         changes = ustore_py_call_discard(&context, verb, call);
     else {
         ustore_changes_cursor_next_t next = {
             .cursor = (ustore_changes_cursor_t)handle,
             .outcome = &call->call.outcome,
             .wanted = wanted,
-            .count = &call->count,
-            .keys = &call->keys,
-            .stamps = &call->stamps,
-            .kinds = &call->kinds,
-            .values = values ? &call->values : NULL,
+            .count = &pulled->count,
+            .keys = &pulled->keys,
+            .stamps = &pulled->stamps,
+            .kinds = &pulled->kinds,
+            .values = values ? &pulled->values : NULL,
             .arena = ustore_py_arena_handle(call->call.arena),
         };
         changes = ustore_py_call_run(&context, verb, call, &next);
     }
-    ustore_py_critical_section_begin_((PyObject*)self);
-    self->handle = handle;
-    ustore_py_critical_section_end_();
     return changes;
 }
 
@@ -2307,7 +2222,7 @@ static char const doc_ChangesCursor_close[] =                                   
     "Closing twice is safe.";
 
 static PyObject* ChangesCursor_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
-    if (changes_cursor_close((ChangesCursor*)self) != 0) return NULL;
+    changes_cursor_close((ChangesCursor*)self);
     Py_RETURN_NONE;
 }
 
@@ -2370,18 +2285,19 @@ PyObject* ustore_py_api_changes_cursor(PyObject* self, PyObject* const* argument
 
     ChangesCursor* const cursor = PyObject_New(ChangesCursor, &ChangesCursorType);
     if (!cursor) return NULL;
-    cursor->handle = NULL;
+    void* opened = NULL;
     ustore_outcome_t outcome = {0};
     ustore_changes_cursor_init_t init = {
         .database = context.database_handle,
         .outcome = &outcome,
         .collection = options.collection,
         .since_stamp = (ustore_stamp_t)since,
-        .cursor = (ustore_changes_cursor_t*)&cursor->handle,
+        .cursor = (ustore_changes_cursor_t*)&opened,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_changes_cursor_init(&init);
     Py_END_ALLOW_THREADS;
+    cursor->handle = opened;
     if (ustore_py_raise_on_outcome(&outcome) == 0) return (PyObject*)cursor;
     Py_DECREF(cursor);
     return NULL;

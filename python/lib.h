@@ -29,8 +29,8 @@
  *
  *  The binding starts no threads, keeps no queues and counts no deferred calls: the C executor owns
  *  every thread, freeing a database, transaction, snapshot or arena waits in C for the deferred calls
- *  naming it, `status` polls through @c ustore_outcome_status, and `await` runs `wait()` on the event
- *  loop's own executor.
+ *  naming it, a status poll reads @c ustore_outcome_status, and an await polls it between growing
+ *  sleeps on the running loop, parking no thread.
  *
  *  @section python_enums Statuses and Modes
  *
@@ -51,14 +51,12 @@
  *  @section python_arenas Arenas
  *
  *  Every output whose length scales with the call lands in the @c Arena the caller passes, and the
- *  verb answers results that view it without copying. An arena tracks its @c exports, since a buffer
- *  it exported cannot be revoked before C rewinds the memory under it: a call adds one until it is
- *  waited on or dropped, and an arena exporting a buffer refuses the next call with
- *  @c ContendedError, as a @c bytearray refuses to resize. Each claim advances the arena's
- *  @c generation, and a result reads only while the generation it was written at is current,
- *  raising @c UninitializedError once a later call rewound it. Shorthand with no place for an arena,
- *  such as `get`, `contains` and the mapping views of a collection, makes a one-off arena through
- *  @c ustore_arena_init, copies what it read into Python objects and frees the arena with the call.
+ *  verb answers results that view it without copying. A result stays valid until the next call
+ *  naming the arena rewinds it; after that it reads whatever the arena holds, which is documented
+ *  and never detected, and C refuses a call naming an arena another call still fills. Shorthand
+ *  with no place for an arena, such as a get, a contains or a mapping view of a collection, makes a
+ *  one-off arena through @c ustore_arena_init, copies what it read into Python objects and frees
+ *  the arena with the call.
  *
  *  @section python_strings Ragged Inputs and Outputs
  *
@@ -97,7 +95,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include <stdatomic.h> // the live count of an exported batch
+#include <stdatomic.h> // the thread answering a deferred call, and an Arrow export's live count
 #include <stddef.h>    // `size_t`
 
 #include <yyjson.h> // `yyjson_val`, `yyjson_mut_doc`
@@ -125,22 +123,6 @@ enum {
 
 /** Element count of a statically-sized table, which every naming table asks for. */
 #define ustore_py_table_size_(table) (sizeof(table) / sizeof((table)[0]))
-
-/**
- *  @brief Guards a mutable field of an object against a concurrent verb.
- *
- *  Free-threading, and the critical sections that fence it, arrived in 3.13; on 3.12 the
- *  interpreter lock already serializes what these protect, so they compile to the bare block.
- */
-#if PY_VERSION_HEX >= 0x030D0000
-#define ustore_py_critical_section_begin_(object) Py_BEGIN_CRITICAL_SECTION(object)
-#define ustore_py_critical_section_end_()         Py_END_CRITICAL_SECTION()
-#else
-#define ustore_py_critical_section_begin_(object) do {
-#define ustore_py_critical_section_end_() \
-    }                                     \
-    while (0)
-#endif
 
 #pragma endregion Calling Convention
 
@@ -175,21 +157,98 @@ extern PyTypeObject DocsJSONViewType;
 extern PyTypeObject CursorType;
 extern PyTypeObject PageType;
 extern PyTypeObject ChangesCursorType;
+extern PyTypeObject CompactPlanType;
 
-/** The named tuple of what an engine supports, built at module init as `ustore.Capabilities`. */
-extern PyTypeObject* CapabilitiesType;
+/** A compaction in flight, continued by every compact naming it until its finish frees it. */
+typedef struct CompactPlan {
 
-/** The named tuple of the bounds a measurement answers, built at module init as `ustore.Measurement`. */
-extern PyTypeObject* MeasurementType;
+    /** The object header every instance carries. */
+    PyObject ob_base;
 
-/** The named tuple of one feed pull's changes, built at module init as @c ustore.Changes. */
-extern PyTypeObject* ChangesType;
+    /** The plan, NULL until a call opens it and once its finish took it. */
+    ustore_database_compact_plan_t handle;
 
-/** The named tuple of what an open database reports about itself, built at module init as `ustore.Description`. */
-extern PyTypeObject* DescriptionType;
+    /** Output slot for where the last call naming the plan stopped. */
+    ustore_phase_progress_t progress;
+} CompactPlan;
 
-/** The named tuple of one GPU this process can drive, built at module init as <tt>ustore.GPUDevice</tt>. */
-extern PyTypeObject* GPUDeviceType;
+extern PyTypeObject CapabilitiesType;
+extern PyTypeObject MeasurementType;
+extern PyTypeObject ChangesType;
+extern PyTypeObject DescriptionType;
+extern PyTypeObject GPUDeviceType;
+
+/** What an engine supports, as a database and its description report it. */
+typedef struct Capabilities {
+
+    /** The object header every instance carries. */
+    PyObject ob_base;
+
+    /** The flags the engine reports. */
+    ustore_capabilities_t flags;
+} Capabilities;
+
+/** The bounds one measurement answers: the slots the call points into its arena, and the
+ *  bounds copied out of them once it succeeded, before the arena serves another call. */
+typedef struct Measurement {
+
+    /** The object header every instance carries. */
+    PyObject ob_base;
+
+    /** Output slots for the six bounds inside the arena, in the order of @c bounds. */
+    ustore_size_t const* slots[6];
+
+    /** The fewest and most entries, bytes of values and bytes on disk. */
+    ustore_size_t bounds[6];
+} Measurement;
+
+/** The changes one feed pull answers: the slots the call writes, and the objects over them. */
+typedef struct Changes {
+
+    /** The object header every instance carries. */
+    PyObject ob_base;
+
+    /** Output slot for the changes the pull yielded. */
+    ustore_size_t count;
+
+    /** Output slot for the key of every change, inside the arena. */
+    ustore_key_t const* keys;
+
+    /** Output slot for the stamp of every change, inside the arena. */
+    ustore_stamp_t const* stamps;
+
+    /** Output slot for the kind of every change, inside the arena. */
+    ustore_change_kind_t const* kinds;
+
+    /** Output slot for the tape of each change's bytes in the arena, when the pull asks for it. */
+    ustore_strings_view_t values;
+
+    /** The @c Page of @c keys, the @c Values of @c values or None, and the tuples of
+     *  @c stamps and @c kinds, built once the pull succeeded. */
+    PyObject* keys_object;
+    PyObject* values_object;
+    PyObject* stamps_object;
+    PyObject* kinds_object;
+} Changes;
+
+/** What an open database reports about itself, as @c ustore_database_describe writes it. */
+typedef struct Description {
+
+    /** The object header every instance carries. */
+    PyObject ob_base;
+
+    /** The description the call fills whole. */
+    ustore_database_description_t description;
+} Description;
+
+/** A zeroed @p type, a report or description a call writes into, or NULL with an exception set. */
+PyObject* ustore_py_report_new(PyTypeObject* type);
+
+/** A new @c Capabilities of @p flags, or NULL with an exception set. */
+PyObject* ustore_py_capabilities_to_object(ustore_capabilities_t flags);
+
+/** Copies the bounds a succeeded measurement pointed @c slots at, while its arena holds them. */
+void ustore_py_measurement_settle(Measurement* measurement);
 
 /** Lists every GPU this process can drive as a tuple of <tt>ustore.GPUDevice</tt>, as <tt>ustore.gpu_devices()</tt>
  *  answers it. */
@@ -214,13 +273,6 @@ extern char const ustore_py_dlpack_doc[];
 
 /** The docstring of every @c __dlpack_device__. */
 extern char const ustore_py_dlpack_device_doc[];
-
-/**
- *  @brief Builds @c CapabilitiesType, @c MeasurementType, @c ChangesType,
- *      @c DescriptionType and @c GPUDeviceType.
- *  @return 0 on success, or -1 with an exception set.
- */
-int ustore_py_types_import(void);
 
 /** The C enums a caller meets, each mirrored as the `enum.IntEnum` of `ustore` named in @c types.c. */
 typedef enum ustore_py_enum_t {
@@ -247,6 +299,7 @@ typedef enum ustore_py_enum_t {
     ustore_py_enum_modification_k,
     ustore_py_enum_page_encoding_k,
     ustore_py_enum_change_kind_k,
+    ustore_py_enum_phase_k,
     ustore_py_enums_count_k,
 } ustore_py_enum_t;
 
@@ -333,8 +386,7 @@ typedef struct Executor {
 /**
  *  @brief The memory every output whose length scales with a call lands in, rewound by the next call handed it.
  *
- *  A call is refused while a buffer over the previous outputs is still exported, and every result over them refuses
- *  to be read once a later call rewound it.
+ *  Every result over its outputs stays valid until the next call naming it rewinds it.
  */
 typedef struct Arena {
 
@@ -343,12 +395,6 @@ typedef struct Arena {
 
     /** The arena, freed once the object dies, which waits in C for the deferred calls naming it. */
     ustore_arena_t handle;
-
-    /** Buffers exported over its outputs, plus one while a call holds it. */
-    Py_ssize_t exports;
-
-    /** Calls that claimed it so far, which a result compares against the one it was written by. */
-    size_t generation;
 } Arena;
 
 /** What a call addresses and how it runs, fixed per receiver: the header of every argument struct. */
@@ -401,9 +447,6 @@ typedef struct ustore_py_predicate_t {
 
     /** The callable admitting keys, held, or NULL when the caller passed none. */
     PyObject* callable;
-
-    /** The first exception @c callable raised, which outranks the call's own status; NULL while none has. */
-    PyObject* raised;
 } ustore_py_predicate_t;
 
 /** What every call keeps until it finishes, leading its verb's call: on the stack while it blocks, inside its
@@ -416,16 +459,16 @@ typedef struct ustore_py_call_t {
     /** The collection every task addresses, which the argument struct points into. */
     ustore_collection_id_t collection;
 
-    /** The claimed @c Arena the call's outputs land in, held, or NULL for a verb with none. */
+    /** The @c Arena the call's outputs land in, held, or NULL for a verb with none. */
     PyObject* arena;
 
     /** The callable the progress trampoline re-enters, held, or NULL when the caller passed none. */
     PyObject* progress;
 
-    /** The first exception @c progress raised, which outranks the cancellation it turned into; NULL while none has. */
-    PyObject* raised;
+    /** The object whose slots the call writes into, held, or NULL for a verb writing none. */
+    PyObject* result;
 
-    /** The predicate a scan asks about the keys it lists, and what it raised. */
+    /** The predicate a scan asks about the keys it lists. */
     ustore_py_predicate_t predicate;
 } ustore_py_call_t;
 
@@ -441,7 +484,7 @@ typedef struct ustore_py_verb_t {
     /** Builds the answer of a call that succeeded out of its output slots, or raises. */
     PyObject* (*answer)(void* call);
 
-    /** Lets go of whatever the fill gathered, the arena claim included. */
+    /** Lets go of whatever the fill gathered, the arena included. */
     void (*release)(void* call);
 } ustore_py_verb_t;
 
@@ -452,18 +495,21 @@ typedef struct Deferred {
     /** The object header every instance carries, sized in bytes of the verb's call. */
     PyVarObject ob_base;
 
-    /** How the call answers and lets go; NULL once it let go of its inputs. */
+    /** How the call answers and lets go. */
     ustore_py_verb_t const* verb;
 
     /** The @c Database, @c Transaction or @c Snapshot the call addresses, or the @c Database class an open builds,
      *  held so the handles it names outlive the call. */
     PyObject* origin;
 
+    /** Nonzero once a thread took the call to answer it, and let go of its inputs. */
+    atomic_int answering;
+
     /** The answer, once the call finished without raising. */
-    PyObject* answer;
+    _Atomic(PyObject*) answer;
 
     /** The exception, once the call finished raising it. */
-    PyObject* raised;
+    _Atomic(PyObject*) raised;
 
     /** The verb's call, led by a @c ustore_py_call_t, which the outcome lives in. */
     uint64_t call[];
@@ -578,7 +624,7 @@ typedef int (*ustore_py_text_serializer_t)(PyObject* object, void* state);
  *  @brief One tape of values a read wrote into an arena, with its presences, viewed until it rewinds.
  *
  *  Exports the tape through the buffer protocol and slices one task's bytes out of it without copying, and every
- *  exported buffer pins the arena against the next call until it is released.
+ *  exported buffer stays valid until the next call naming the arena rewinds it.
  */
 typedef struct Values {
 
@@ -587,9 +633,6 @@ typedef struct Values {
 
     /** The @c Arena the outputs live in, kept alive so they outlive every other name for them. */
     PyObject* arena;
-
-    /** The arena's generation when the read wrote the outputs; any later one means a call rewound it. */
-    size_t generation;
 
     /** One bit per task marking the present keys, or NULL for a read of no tasks. */
     ustore_octet_t const* presences;
@@ -614,9 +657,6 @@ typedef struct Keys {
 
     /** The @c Arena the outputs live in, kept alive so they outlive every other name for them. */
     PyObject* arena;
-
-    /** The arena's generation when the call wrote the outputs. */
-    size_t generation;
 
     /** One offset into @c tape per task, plus one closing the last run, or NULL for no tasks. */
     ustore_length_t const* offsets;
@@ -651,9 +691,6 @@ typedef struct Columns {
     /** The @c Arena the columns live in, kept alive so they outlive every other name for them. */
     PyObject* arena;
 
-    /** The arena's generation when the gather wrote the columns. */
-    size_t generation;
-
     /** One view per field, inside the arena, or NULL for a gather of no fields. */
     ustore_docs_column_view_t const* columns;
 
@@ -662,6 +699,9 @@ typedef struct Columns {
 
     /** Documents the gather carried, the rows of every column. */
     size_t docs_count;
+
+    /** A tuple of the field names the gather read, which name the children of an Arrow export. */
+    PyObject* fields;
 
     /** The type every field was converted into, owned by the object. */
     ustore_docs_field_type_t types[];
@@ -682,9 +722,6 @@ typedef struct Neighborhoods {
     /** The @c Arena the tape, the offsets and the degrees live in, kept alive so they outlive every other name for
      *  them. */
     PyObject* arena;
-
-    /** The arena's generation when the read wrote the outputs. */
-    size_t generation;
 
     /** Three keys per edge, laid end to end vertex after vertex. */
     ustore_key_t const* tape;
@@ -709,8 +746,8 @@ typedef struct Neighborhoods {
  *  @brief A read-only window into an arena, which a @c memoryview is built over.
  *
  *  A view of one task carries its own shape and format while keeping the arena alive, so no slice
- *  or cast is needed and an empty run still exports its shape. Each buffer it exports pins the arena
- *  until released, and it refuses to export once a later call rewound the arena.
+ *  or cast is needed and an empty run still exports its shape. Each buffer it exports stays valid
+ *  until the next call naming the arena rewinds it.
  */
 typedef struct Span {
 
@@ -719,9 +756,6 @@ typedef struct Span {
 
     /** The @c Arena the window lies in, kept alive for as long as this window is. */
     PyObject* arena;
-
-    /** The arena's generation when the call wrote the memory. */
-    size_t generation;
 
     /** The first byte of the window. */
     void const* data;
@@ -782,10 +816,10 @@ int ustore_py_register_errors(PyObject* module);
 #pragma region Arenas
 
 /**
- *  @brief A new @c Arena made through @c ustore_arena_init where @p executor computes, unclaimed.
+ *  @brief A new @c Arena made through @c ustore_arena_init where @p executor computes.
  *
  *  Shorthand with no place for an arena passes one of these to its verb and drops its own reference
- *  at once, so the arena dies with the call that claimed it.
+ *  at once, so the arena dies with the call that named it.
  *
  *  @param[in] executor The executor whose calls it serves, or NULL for calls on the calling thread.
  *  @return A new reference, or NULL with an exception set.
@@ -793,31 +827,15 @@ int ustore_py_register_errors(PyObject* module);
 PyObject* ustore_py_arena_new(ustore_executor_t executor);
 
 /**
- *  @brief Claims the @c Arena @p object for one call, rewinding it: every result over its previous
- *      outputs goes stale.
- *  @param[out] arena A new reference to the claimed @c Arena; hand it to @c ustore_py_arena_unclaim.
- *  @return 0 on success, -1 with an exception set when @p object is no @c Arena, serves a call, or
- *      still exports.
+ *  @brief Reads the @c Arena @p object a call writes into, which rewinds it: every result over its
+ *      previous outputs goes stale.
+ *  @param[out] arena A new reference to the @c Arena.
+ *  @return 0 on success, -1 with an exception set for anything but an @c Arena of host pages.
  */
-int ustore_py_arena_claim(PyObject* object, PyObject** arena);
-
-/** Ends the claim @c ustore_py_arena_claim took, and drops its reference. */
-void ustore_py_arena_unclaim(PyObject* arena);
+int ustore_py_arena_from_object(PyObject* object, PyObject** arena);
 
 /** The C handle of the @c Arena @p arena. */
 ustore_arena_t ustore_py_arena_handle(PyObject* arena);
-
-/** The generation of the @c Arena @p arena, which a result built while the arena serves its call records. */
-size_t ustore_py_arena_generation(PyObject* arena);
-
-/**
- *  @brief Holds @p arena against a rewind while memory a call of @p generation wrote is read, as one more export.
- *  @return 0 on success, -1 with an @c UninitializedError set when a later call rewound it.
- */
-int ustore_py_arena_pin(PyObject* arena, size_t generation);
-
-/** Ends the hold @c ustore_py_arena_pin took. */
-void ustore_py_arena_unpin(PyObject* arena);
 
 #pragma endregion Arenas
 
@@ -922,7 +940,7 @@ PyObject* ustore_py_call_run(ustore_py_context_t const* context, ustore_py_verb_
  */
 PyObject* ustore_py_call_discard(ustore_py_context_t const* context, ustore_py_verb_t const* verb, void* call);
 
-/** Ends the arena claim the header of a call holds, and lets go of its progress callable and what that raised. */
+/** Lets go of the arena, the callables and the slots the header of a call holds. */
 void ustore_py_call_release(ustore_py_call_t* call);
 
 /** Answers None, for a call whose only answer is its success. */
@@ -947,9 +965,6 @@ int ustore_py_predicate_from_object(PyObject* object, PyObject** callable);
 
 /** The C predicate re-entering the callable @p predicate holds, asked at @p cost, zeroed when it holds none. */
 ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate, int cost);
-
-/** Raises what the callable of @p predicate raised, answering -1, or answers 0 when it raised nothing. */
-int ustore_py_predicate_raise(ustore_py_predicate_t* predicate);
 
 /**
  *  @brief Reads one UUID from a `uuid.UUID`, 16 raw bytes, canonical UUID text or a non-negative integer.
@@ -1069,7 +1084,7 @@ int ustore_py_texts_from_object(PyObject* object, char const* argument, ustore_p
 void ustore_py_texts_release(ustore_py_texts_t* texts);
 
 /**
- *  @brief A new @c Values over the tape a read of @p count tasks wrote into @p arena, which its call still claims.
+ *  @brief A new @c Values over the tape a read of @p count tasks wrote into @p arena.
  *  @param[in] presences The presence bits, or NULL for a tape whose every value is present, as a cursor writes one.
  *  @return A new reference, or NULL with an exception set.
  */
@@ -1080,16 +1095,15 @@ PyObject* ustore_py_values_new(PyObject* arena, ustore_octet_t const* presences,
 int ustore_py_present(ustore_octet_t const* presences, size_t task_index);
 
 /**
- *  @brief A new @c Keys over the runs a scan or sample of @p count tasks wrote into @p arena, which its call still
- *      claims.
+ *  @brief A new @c Keys over the runs a scan or sample of @p count tasks wrote into @p arena.
  *  @return A new reference, or NULL with an exception set.
  */
 PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, ustore_key_t const* tape, size_t count,
                              float const* scores);
 
 /**
- *  @brief Builds a read-only @c memoryview over memory a call of @p generation wrote into @p arena, which pins the
- *      arena until the view is released.
+ *  @brief Builds a read-only @c memoryview over memory a call wrote into @p arena, valid until
+ *      the next call naming the arena rewinds it.
  *  @param[in] arena The @c Arena holding the memory, which the view holds a reference to.
  *  @param[in] data The first byte of the window, which may be NULL for an empty one.
  *  @param[in] format The struct-module format of one item.
@@ -1098,8 +1112,8 @@ PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, us
  *  @param[in] shape Items along every dimension.
  *  @return A new reference, or NULL with an exception set.
  */
-PyObject* ustore_py_span_view(PyObject* arena, size_t generation, void const* data, char const* format,
-                              Py_ssize_t itemsize, int ndim, Py_ssize_t const* shape);
+PyObject* ustore_py_span_view(PyObject* arena, void const* data, char const* format, Py_ssize_t itemsize, int ndim,
+                              Py_ssize_t const* shape);
 
 /**
  *  @brief Fills a read-only buffer over memory @p owner keeps alive, honouring what @p flags ask for.
@@ -1200,7 +1214,7 @@ int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObjec
  *  @param[in] after The smallest name listed, or NULL to start at the first one.
  *  @param[in] after_length The length of @p after in bytes.
  *  @param[in] limit Most names the walk returns.
- *  @param[in] arena The @c Arena the listing lands in, claimed for the call.
+ *  @param[in] arena The @c Arena the listing lands in, held for the call.
  *  @return A new tuple of names, or NULL with an exception set.
  */
 PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char const* after, size_t after_length,
@@ -1282,7 +1296,7 @@ PyObject* ustore_py_read_answer_copies(void* call);
 /** Answers a dict of every key a read of values or documents was handed onto a copy of what it read or None. */
 PyObject* ustore_py_read_answer_drawn(void* call);
 
-/** Lets go of the keys, the field, the subscript and the arena claim of a read. */
+/** Lets go of the keys, the field, the subscript and the arena of a read. */
 void ustore_py_read_release(void* call);
 
 /**
@@ -1292,7 +1306,7 @@ void ustore_py_read_release(void* call);
  *  @param[in] options The collection and knobs the read carries.
  *  @param[in] verb How the read answers, the verb @p call was opened with.
  *  @param[in,out] call What @c ustore_py_call_open answered, its keys gathered and its subscript set for one key.
- *  @param[in] arena The @c Arena the outputs land in, claimed here.
+ *  @param[in] arena The @c Arena the outputs land in, held here.
  *  @return The answer of @p verb, or its @c Deferred; NULL with an exception set otherwise.
  */
 PyObject* ustore_py_values_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
@@ -1384,7 +1398,7 @@ PyObject* ustore_py_values_remove(ustore_py_context_t const* context, ustore_py_
  *      `docs_scan`, `graph_scan_vertices` and of `Collection.scan`.
  *  @param[in] mode In what order the keys come.
  *  @param[in] progress The callable the scan reports to, borrowed, or NULL for none.
- *  @param[in] arena The @c Arena the keys land in, claimed here.
+ *  @param[in] arena The @c Arena the keys land in, held here.
  *  @return A new @c Keys of one task, or its @c Deferred, or NULL with an exception set.
  */
 PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
@@ -1399,7 +1413,7 @@ PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* arguments, Py_s
 /**
  *  @brief Draws up to @p wanted keys at random through the sample of @p modality: the core of `sample`,
  *      `docs_sample`, `Collection.sample_keys` and `Collection.sample`.
- *  @param[in] arena The @c Arena the keys land in, claimed here.
+ *  @param[in] arena The @c Arena the keys land in, held here.
  *  @return A new @c Keys of one task, or its @c Deferred, or NULL with an exception set.
  */
 PyObject* ustore_py_keys_sample(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
@@ -1445,7 +1459,7 @@ extern ustore_py_verb_t const ustore_py_docs_read_objects_verb;
  *  @param[in] verb How the read answers, the verb @p call was opened with.
  *  @param[in,out] call What @c ustore_py_call_open answered, its keys gathered, and its field and subscript set as the
  *      caller wants them.
- *  @param[in] arena The @c Arena the outputs land in, claimed here.
+ *  @param[in] arena The @c Arena the outputs land in, held here.
  *  @return The answer of @p verb, or its @c Deferred; NULL with an exception set otherwise.
  */
 PyObject* ustore_py_docs_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,

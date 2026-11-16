@@ -15,8 +15,6 @@ from types import GenericAlias, TracebackType
 from typing import Any, Literal, Protocol, Self, final, overload, type_check_only
 from uuid import UUID
 
-from _typeshed import structseq
-
 from ustore.graph_view import DiGraph
 from ustore.table_view import Table
 
@@ -77,8 +75,8 @@ def engines_compiled() -> tuple[str, ...]:
     """The engines this build carries: some of "ram", "rocksdb", "leveldb" and "nvme", in that order."""
 
 def gpu_devices() -> tuple[GPUDevice, ...]:
-    """Every GPU this process can drive, NVIDIA devices first, then AMD, each at the ordinal `Executor.for_vram` names
-    it by; empty on a machine without GPUs or their runtimes. Calls `ustore_gpu_devices`."""
+    """Every GPU this process can drive, NVIDIA devices first, then AMD, then Apple, each at the ordinal
+    `Executor.for_vram` names it by; empty on a machine without GPUs or their runtimes. Calls `ustore_gpu_devices`."""
 
 # region: Statuses and Modes
 
@@ -105,11 +103,13 @@ class Status(IntEnum):
     PHANTOM_CONFLICT = 22
     CAPACITY_EXHAUSTED = 23
 
+
 class Mood(IntEnum):
     """What an executor's threads do once it next goes idle, valued as `ustore_mood_t`."""
 
     PARKED = 0
     SPINNING = 1
+
 
 class Watch(IntEnum):
     """Whether a transaction records the keys a call touches, valued as `ustore_watch_t`."""
@@ -117,11 +117,13 @@ class Watch(IntEnum):
     KEYS = 0
     NONE = 1
 
+
 class Durability(IntEnum):
     """How durable the writes a call publishes are once it finishes, valued as `ustore_durability_t`."""
 
     BUFFERED = 0
     FLUSHED = 1
+
 
 class DropMode(IntEnum):
     """What dropping a collection removes, valued as `ustore_drop_mode_t`."""
@@ -130,17 +132,20 @@ class DropMode(IntEnum):
     PAIRS = 1
     VALUES = 2
 
+
 class ScanMode(IntEnum):
     """In what order a scan hands its keys over, valued as `ustore_scan_mode_t`."""
 
     ORDERED = 0
     UNORDERED = 1
 
+
 class ScanDirection(IntEnum):
     """Which way a scan, a cursor or a measurement walks its range from the start key."""
 
     ASCENDING = 0
     DESCENDING = 1
+
 
 class Modality(IntEnum):
     """What a collection holds, valued as `ustore_modality_t`."""
@@ -151,11 +156,13 @@ class Modality(IntEnum):
     STRINGS = 4
     PAGES = 5
 
+
 class Isolation(IntEnum):
     """How the transactions of the in-memory engine see each other's writes, valued as `ustore_isolation_t`."""
 
     STRICT_SERIALIZABLE = 0
     SNAPSHOT = 1
+
 
 class CPUClass(IntEnum):
     """The CPU generation a database confines its waits, atomics and string kernels to, valued as
@@ -174,6 +181,7 @@ class CPUClass(IntEnum):
     ALIBABA_C930 = 17
     IBM_POWER10 = 18
 
+
 class Transport(IntEnum):
     """How the NVMe engine moves bytes between its files and memory, valued as `ustore_transport_t`."""
 
@@ -183,11 +191,13 @@ class Transport(IntEnum):
     LINUX_AIO = 3
     LINUX_SPDK = 4
 
+
 class PatternKind(IntEnum):
     """What the patterns of a scan or a cursor are matched as, valued as `ustore_pattern_kind_t`."""
 
     REGEX = 0
     SUBSTRINGS = 1
+
 
 class CaseSensitivity(IntEnum):
     """Whether patterns compare bytes as they are or after Unicode case folding, valued as
@@ -196,12 +206,14 @@ class CaseSensitivity(IntEnum):
     CASED = 0
     UNCASED = 1
 
+
 class PredicateCost(IntEnum):
     """Where a scan asks its predicate: before patterns and filters read values, or last, valued as
     `ustore_predicate_cost_t`."""
 
     CHEAP = 0
     EXPENSIVE = 1
+
 
 class Gds(IntEnum):
     """How an executor of `Executor.for_vram` moves bytes between the drives and its device, valued as
@@ -211,11 +223,14 @@ class Gds(IntEnum):
     DIRECT = 1
     COMPATIBILITY = 2
 
+
 class GPUVendor(IntEnum):
     """The vendor whose runtime drives a GPU, valued as `ustore_gpu_vendor_t`."""
 
     NVIDIA = 1
     AMD = 2
+    APPLE = 3
+
 
 class GPUClass(IntEnum):
     """The generation of a GPU, valued as `ustore_gpu_class_t`."""
@@ -228,6 +243,10 @@ class GPUClass(IntEnum):
     AMD_CDNA3 = 7
     AMD_CDNA4 = 8
     AMD_CDNA5 = 9
+    APPLE_METAL7 = 10
+    APPLE_METAL9 = 11
+    APPLE_METAL10 = 12
+
 
 class Engine(IntEnum):
     """The engine serving a database, as `describe()` reports it, valued as `ustore_engine_t`."""
@@ -237,6 +256,7 @@ class Engine(IntEnum):
     LEVELDB = 2
     NVME = 3
 
+
 class Role(IntEnum):
     """The role a vertex plays in an edge, valued as `ustore_vertex_role_t`."""
 
@@ -244,6 +264,7 @@ class Role(IntEnum):
     SOURCE = 1
     TARGET = 2
     ANY = 3
+
 
 class FieldType(IntEnum):
     """How a document or a field is spelled, or what a gather converts it into, valued as `ustore_docs_field_type_t`."""
@@ -266,6 +287,7 @@ class FieldType(IntEnum):
     BINARY = 50
     STRING = 51
 
+
 class Modification(IntEnum):
     """What a document write applies, valued as `ustore_docs_modification_t`."""
 
@@ -274,6 +296,7 @@ class Modification(IntEnum):
     INSERT = 2
     PATCH = 3
     MERGE = 4
+
 
 class PageEncoding(IntEnum):
     """How a page or a fragment is spelled on import or rendered on read, valued as `ustore_page_encoding_t`."""
@@ -284,12 +307,24 @@ class PageEncoding(IntEnum):
     TEXT = 3
     JSON = 4
 
+
 class ChangeKind(IntEnum):
     """What one committed change did to its key."""
 
     WRITE = 0
     REMOVAL = 1
     CHANGE = 2
+
+
+class Phase(IntEnum):
+    """The kind of work a plan is doing, named through `ustore_phase_name`."""
+
+    NONE = 0
+    FLUSH = 1
+    MERGE = 2
+    RECLAIM = 3
+    DONE = 4
+
 
 # endregion: Statuses and Modes
 
@@ -309,8 +344,7 @@ class InvalidArgumentError(Error, ValueError):
     of another modality."""
 
 class UninitializedError(Error):
-    """The call needs a handle that was never opened or is closed, or reads a result whose arena a later call
-    rewound."""
+    """The call needs a handle that was never opened or is closed."""
 
 class UnsupportedError(Error, NotImplementedError):
     """The engine or this build does not implement what the call asks for."""
@@ -366,9 +400,9 @@ class Arena:
     """The memory every output whose length scales with a call lands in, rewound by the next call handed it.
 
     Every verb whose outputs scale with the call takes one as its last positional argument and answers results
-    viewing it. A buffer exported over its outputs pins it, so the next call naming it raises `ContendedError` until
-    the buffer is released, and a result read after a later call rewound it raises `UninitializedError`. A deferred
-    call holds it until it is waited on or dropped.
+    viewing it, valid until the next call naming it rewinds it; a result read after that reads whatever the arena then
+    holds, which nothing detects. A call naming it while another still fills it raises `ContendedError`, so each
+    deferred call in flight needs one of its own.
     """
 
     def __init__(self, executor: Executor | None = None, /) -> None:
@@ -502,6 +536,9 @@ class Columns:
 
     def __len__(self) -> int: ...
     def __getitem__(self, field: int) -> memoryview | tuple[str | bytes | None, ...]: ...
+    def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]:
+        """A struct array with one child per field, named by it, valid until the arena's next call."""
+
     def validities(self, field: int) -> memoryview:
         """The bitmap of documents whose value was found and converted."""
 
@@ -538,7 +575,7 @@ class Neighborhoods:
 # region: Collections
 
 class Collection:
-    """A collection a receiver addresses by name, resolved on first use and created by its first write.
+    """A collection a receiver addresses by name, resolved on every call and created by its first write.
 
     The mapping views and `sample` copy what they read out of a one-off arena each. Through a deferred view,
     `blobs[key]`, `docs[key]`, `docs_json[key]`, `scan`, `sample_keys` and the reads of `graph` that take one call
@@ -643,7 +680,7 @@ class Executor:
         scratch_limit: int = 0,
         gds: Gds = Gds.AUTOMATIC,
     ) -> Self:
-        """One stream on `device`, a `GPUDevice.ordinal` of either vendor, every call queues on, fed by one host thread,
+        """One stream on `device`, a `GPUDevice.ordinal` of any vendor, every call queues on, fed by one host thread,
         which `Database.open_nvme` takes as its `compactions` on an NVIDIA device, refused with `DeviceError` for an
         ordinal no device carries; zero `scratch_limit` lets scratch grow as calls ask. Calls
         `ustore_executor_for_vram`."""
@@ -676,15 +713,38 @@ class Deferred[T]:
         """Blocks the thread until the call finishes, answering or raising what the blocking verb would."""
 
     def __await__(self) -> Generator[Any, None, T]:
-        """Runs `wait()` on the running event loop's default executor, suspending the task meanwhile."""
+        """Polls `status` between sleeps growing from 1 µs to 1 ms on the running loop, parking no thread, then
+        answers `wait()`."""
 
 # endregion: Executors and Deferred Calls
 
 # region: Handles
 
 @final
-class Capabilities(structseq[bool], tuple[bool, bool]):
-    """What an engine supports, as `Database.capabilities` reports it."""
+class CompactPlan:
+    """A compaction in flight, which `compact(plan=...)` opens or continues and `compact_plan_finish` frees; one
+    dropped unfinished leaks and keeps the database from opening another."""
+
+    def __init__(self) -> None: ...
+    @property
+    def phase(self) -> Phase:
+        """Where the last call naming the plan stopped, `Phase.DONE` once it ended."""
+
+    @property
+    def ordinal(self) -> int:
+        """That phase's position among the ones the plan runs."""
+
+    @property
+    def completed(self) -> int:
+        """Units of that phase done: collections, column families, passes or bytes."""
+
+    @property
+    def total(self) -> int:
+        """Units of that phase in all."""
+
+@final
+class Capabilities:
+    """What an engine supports, as `Database.capabilities` reports it; equal when the flags are."""
 
     @property
     def transactions(self) -> bool:
@@ -695,9 +755,7 @@ class Capabilities(structseq[bool], tuple[bool, bool]):
         """Whether the engine pins point-in-time states."""
 
 @final
-class Changes(
-    structseq[Any], tuple[Page, Values | None, tuple[int, ...], tuple[ChangeKind, ...]]
-):
+class Changes:
     """The changes one pull of a ChangesCursor answers, oldest first."""
 
     @property
@@ -717,7 +775,7 @@ class Changes(
         """What every change did."""
 
 @final
-class Measurement(structseq[int], tuple[int, int, int, int, int, int]):
+class Measurement:
     """The bounds on what a key range holds, as `measure()` estimates them without walking it."""
 
     @property
@@ -745,7 +803,7 @@ class Measurement(structseq[int], tuple[int, int, int, int, int, int]):
         """The most bytes the range may take on disk."""
 
 @final
-class GPUDevice(structseq[Any], tuple[int, GPUVendor, int, GPUClass, int, int, str]):
+class GPUDevice:
     """One GPU this process can drive, as `gpu_devices()` lists it."""
 
     @property
@@ -777,7 +835,7 @@ class GPUDevice(structseq[Any], tuple[int, GPUVendor, int, GPUClass, int, int, s
         """The vendor's own name for the device."""
 
 @final
-class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, CPUClass, int, int, int, int, int]):
+class Description:
     """What an open database reports about itself, as `describe()` answers it, every size the engine's estimate."""
 
     @property
@@ -794,7 +852,8 @@ class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, CPUClas
 
     @property
     def cpu_class(self) -> CPUClass:
-        """The class the engine's calls run as, picked at open; `UNKNOWN` for RocksDB and LevelDB."""
+        """The class the engine's calls run as, picked at open under the `cpu_class_ceiling`; `UNKNOWN` for RocksDB and
+        LevelDB."""
 
     @property
     def keys(self) -> int:
@@ -850,7 +909,7 @@ class _Reads:
         Returns:
           Values: One entry per key, in the order they were asked for.
         Raises:
-          ContendedError: The arena serves another call or exports a buffer.
+          ContendedError: The arena serves another call.
           Error: Whatever the engine reported.
         """
     def get(self, key: KeyLike, *, collection: CollectionLike) -> bytes | None:
@@ -1598,10 +1657,10 @@ class Database(_Writes, _Receivers):
         *,
         isolation: Isolation = Isolation.STRICT_SERIALIZABLE,
         executor: Executor | None = None,
-        cpu_class: CPUClass = CPUClass.UNKNOWN,
+        cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
     ) -> Self:
         """An in-memory database, persisted as one image when it names a directory, opened blocking on `executor`
-        and confined to `cpu_class`."""
+        and confined to the newest class the CPU runs at or under `cpu_class_ceiling`."""
 
     @classmethod
     def open_rocksdb(
@@ -1636,7 +1695,7 @@ class Database(_Writes, _Receivers):
         executor: Executor | None = None,
         data_directories: Sequence[DataDirectory] = (),
         compactions: Executor | None = None,
-        cpu_class: CPUClass = CPUClass.UNKNOWN,
+        cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
         memory_limit: int = 0,
         transaction_max_bytes: int = 0,
         transaction_max_deltas: int = 0,
@@ -1651,7 +1710,8 @@ class Database(_Writes, _Receivers):
         """A database on the NVMe engine, named by its `manifest`, `<database>.ustore.json` in an existing directory or
         the raw address of its first slot, where every zero size keeps the engine's default, opened blocking on
         `executor`, which tells it how to move bytes when `Executor.for_nvme` made it, merging on the device of
-        `compactions` when `Executor.for_vram` made it."""
+        `compactions` when `Executor.for_vram` made it, and confined to the newest class the CPU runs at or under
+        `cpu_class_ceiling`."""
     def __enter__(self) -> Self: ...
     def __exit__(
         self,
@@ -1666,9 +1726,13 @@ class Database(_Writes, _Receivers):
     def clear(self, mode: DropMode, /) -> None:
         """Empties every collection at once: its pairs, every collection with its name, or its values."""
 
-    def compact(self, *, progress: Progress | None = None) -> None:
-        """Reclaims the space overwritten and removed data takes, one collection at a time, reporting bytes where the
-        engine measures them and collections elsewhere."""
+    def compact(self, *, progress: Progress | None = None, plan: CompactPlan | None = None) -> None:
+        """Reclaims the space overwritten and removed data takes in phases, one unit at a time, reporting bytes where
+        the engine measures them and units elsewhere; with a `plan`, a stop leaves it live to continue."""
+
+    def compact_plan_finish(self, plan: CompactPlan, /) -> None:
+        """Frees `plan` whatever the call answers, refusing one never opened or already finished with
+        `InvalidArgumentError`."""
 
     def flush(self) -> None:
         """Makes every commit that returned before the call durable, as if each had asked for `Durability.FLUSHED`."""
@@ -1800,8 +1864,11 @@ class On(_Writes, _Receivers):
     def clear(self, mode: DropMode, /) -> None:
         """Clears the database on the executor, refusing a view of a transaction or a snapshot."""
 
-    def compact(self, *, progress: Progress | None = None) -> None:
+    def compact(self, *, progress: Progress | None = None, plan: CompactPlan | None = None) -> None:
         """Compacts the database on the executor, refusing a view of a transaction or a snapshot."""
+
+    def compact_plan_finish(self, plan: CompactPlan, /) -> None:
+        """Frees `plan` on the executor, refusing a view of a transaction or a snapshot."""
 
     def flush(self) -> None:
         """Flushes the database on the executor, refusing a view of a transaction or a snapshot."""
@@ -1880,7 +1947,7 @@ class DeferredOn:
         Returns:
           Values: One entry per key, in the order they were asked for.
         Raises:
-          ContendedError: The arena serves another call or exports a buffer.
+          ContendedError: The arena serves another call.
           Error: Whatever the engine reported.
         """
 
@@ -2397,21 +2464,37 @@ class DeferredOn:
           ReadOnlyError: The database was opened read-only.
         """
 
-    def compact(self, *, progress: Progress | None = None) -> Deferred[None]:
-        """compact(*, progress=None) answers None.
+    def compact(self, *, progress: Progress | None = None, plan: CompactPlan | None = None) -> Deferred[None]:
+        """compact(*, progress=None, plan=None) answers None.
 
-        Reclaims the space overwritten and removed data still takes, one collection at a time:
-        RocksDB and LevelDB flush and compact their trees, and the RAM engine frees the
-        versions no reader needs and rewrites its image. Calls `ustore_database_compact`.
+        Reclaims the space overwritten and removed data still takes, in phases: flush, merge one
+        unit at a time, then reclaim, each engine running the ones it has. With a `plan`, a stop
+        leaves it live and the next call naming it continues from the unit it stopped at;
+        `compact_plan_finish(plan)` frees it. Calls `ustore_database_compact`.
 
         Args:
           progress (Callable[[int, int], bool | None], optional): Called with the units
             compacted and the units in all, bytes where the engine measures them, as RocksDB
-            does, and collections elsewhere. A falsy answer other than None stops between
-            collections, keeping what was compacted.
+            does, and units elsewhere. A falsy answer other than None, or a raise, which goes
+            to `sys.unraisablehook`, stops between units, keeping what was compacted.
+          plan (CompactPlan, optional): The compaction to open or continue, whose phase this
+            call writes; None runs it to its end.
         Raises:
-          CancelledError: The progress callable stopped the compaction.
+          CancelledError: The progress callable stopped the compaction; a plan stays live.
+          ContendedError: Another live plan compacts the database.
+          InvalidArgumentError: The plan was opened on another database or executor.
           ReadOnlyError: The database was opened read-only.
+        """
+
+    def compact_plan_finish(self, plan: CompactPlan, /) -> Deferred[None]:
+        """compact_plan_finish(plan) answers None.
+
+        Frees a CompactPlan on this database and the receiver's executor, the ones it was
+        opened with, whatever the call answers. Calls `ustore_database_compact_plan_finish`.
+
+        Raises:
+          InvalidArgumentError: The plan was never opened, is already finished, or was opened
+            on another database or executor; it is freed all the same.
         """
 
     def flush(self) -> Deferred[None]:

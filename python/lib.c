@@ -62,13 +62,19 @@ static struct {
     {"Cursor", &CursorType},
     {"Page", &PageType},
     {"ChangesCursor", &ChangesCursorType},
+    {"CompactPlan", &CompactPlanType},
+    {"Capabilities", &CapabilitiesType},
+    {"Measurement", &MeasurementType},
+    {"Changes", &ChangesType},
+    {"Description", &DescriptionType},
+    {"GPUDevice", &GPUDeviceType},
     {NULL, &SpanType},
 };
 
-static char const doc_version[] =                                                              //
-    "version() answers the version of the library this module runs against, like \"1.0.0\".\n" //
-    "\n"                                                                                       //
-    "Calls `ustore_version_name`, while `__version__` names the package, pre-release included.";
+static char const doc_version[] =                                                                   //
+    "version() answers the version of the library this module runs against, like \"1.0.0-rc.1\".\n" //
+    "\n"                                                                                            //
+    "Calls `ustore_version_name`, which matches `__version__`, the package's version.";
 
 static PyObject* api_version(PyObject* Py_UNUSED(module), PyObject* Py_UNUSED(arguments)) {
     return PyUnicode_FromString(ustore_version_name());
@@ -126,26 +132,21 @@ PyMODINIT_FUNC PyInit_lib(void) {
     for (size_t type_index = 0; type_index != types_count; ++type_index)
         if (PyType_Ready(module_types[type_index].type) < 0) return NULL;
 
-    if (ustore_py_uuid_import() != 0 || ustore_py_types_import() != 0) return NULL;
+    if (ustore_py_uuid_import() != 0) return NULL;
 
     PyObject* const module = PyModule_Create(&module_definition);
     if (!module) return NULL;
 
 #ifdef Py_GIL_DISABLED
     // Database handles are shareable across threads by contract, receivers never change, every
-    // verb detaches the thread state around its call, a progress callable attaches its own, and an
-    // arena's exports and generation, a cursor's handle and a deferred call's answer change under
-    // critical sections, so nothing here needs that lock to stay correct.
+    // verb detaches the thread state around its call, a progress callable attaches its own, C
+    // refuses what contends, and one atomic exchange picks the thread answering a deferred call,
+    // so nothing here needs that lock.
     PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
 #endif
 
     if (ustore_py_register_errors(module) < 0 || ustore_py_register_enums(module) < 0) goto failed;
     if (PyModule_AddStringConstant(module, "__version__", USTORE_VERSION) < 0) goto failed;
-    if (PyModule_AddObjectRef(module, "Capabilities", (PyObject*)CapabilitiesType) < 0) goto failed;
-    if (PyModule_AddObjectRef(module, "Measurement", (PyObject*)MeasurementType) < 0) goto failed;
-    if (PyModule_AddObjectRef(module, "Changes", (PyObject*)ChangesType) < 0) goto failed;
-    if (PyModule_AddObjectRef(module, "Description", (PyObject*)DescriptionType) < 0) goto failed;
-    if (PyModule_AddObjectRef(module, "GPUDevice", (PyObject*)GPUDeviceType) < 0) goto failed;
     PyObject* const edge_id_default = ustore_py_uuid_to_object(&ustore_edge_id_default_k.uuid);
     int const edge_id_added = edge_id_default ? PyModule_AddObjectRef(module, "edge_id_default", edge_id_default) : -1;
     Py_XDECREF(edge_id_default);

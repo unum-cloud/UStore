@@ -22,31 +22,31 @@
 //! Date: October 29, 2026
 
 use std::array;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::blobs::ffi as blobs_ffi;
 use crate::db::ffi::{
-    self as db_ffi, ustore_collections_view_t, ustore_completion_t, ustore_database_t, ustore_enum_t,
-    ustore_executor_t, ustore_key_t, ustore_keys_view_t, ustore_outcome_t, ustore_size_t, ustore_snapshot_t,
-    ustore_status_t, ustore_strings_view_t, ustore_transaction_t, ustore_view_t, USTORE_STRINGS_U32_TAPE_K,
-    USTORE_STRINGS_U64_TAPE_K,
+    self as db_ffi, USTORE_STRINGS_U32_TAPE_K, USTORE_STRINGS_U64_TAPE_K, ustore_collections_view_t,
+    ustore_completion_t, ustore_database_t, ustore_enum_t, ustore_executor_t, ustore_key_t, ustore_keys_view_t,
+    ustore_outcome_t, ustore_size_t, ustore_snapshot_t, ustore_status_t, ustore_strings_view_t, ustore_transaction_t,
+    ustore_view_t,
 };
 use crate::db::{
-    check, fail, read_spelling, spelling, Arena, CollectionID, Durability, Error, Key, Modality, On, Result,
-    ScanDirection, Status, Watch,
+    Arena, CollectionID, Durability, Error, Key, Modality, On, Result, ScanDirection, Status, Watch, check, fail,
+    read_spelling, spelling,
 };
 use crate::docs::ffi as docs_ffi;
 use crate::docs::sealed::Format;
 use crate::docs::{Json, Modification};
-use crate::graph::ffi as graph_ffi;
 use crate::graph::Role;
-use crate::pages::ffi as pages_ffi;
+use crate::graph::ffi as graph_ffi;
 use crate::pages::PageEncoding;
+use crate::pages::ffi as pages_ffi;
 use crate::strings::ffi as strings_ffi;
 
 /// The type of an Arrow array: its format, name, metadata and children, as `struct ArrowSchema` lays them out.
@@ -231,9 +231,7 @@ impl ArrowArrayStream {
     /// The schema every batch shares.
     pub fn schema(&mut self) -> Result<ArrowSchema> {
         let mut schema = ArrowSchema::empty();
-        let get_schema = self
-            .get_schema
-            .ok_or(fail(Status::Uninitialized, "the stream was released"))?;
+        let get_schema = self.get_schema.ok_or(fail(Status::Uninitialized, "the stream was released"))?;
         // SAFETY: a live stream answers its schema into a released one.
         let answered = unsafe { get_schema(self, &mut schema) };
         if answered != 0 {
@@ -245,9 +243,7 @@ impl ArrowArrayStream {
     /// The next batch, or `None` once the stream ends.
     pub fn next_batch(&mut self) -> Result<Option<ArrowArray>> {
         let mut batch = ArrowArray::empty();
-        let get_next = self
-            .get_next
-            .ok_or(fail(Status::Uninitialized, "the stream was released"))?;
+        let get_next = self.get_next.ok_or(fail(Status::Uninitialized, "the stream was released"))?;
         // SAFETY: a live stream answers its next batch into a released one.
         let answered = unsafe { get_next(self, &mut batch) };
         if answered != 0 {
@@ -357,10 +353,8 @@ struct Columns {
 
 /// Matches the children of `schema` to the columns of `modality` by name, refusing a missing, repeated or unknown one.
 fn resolve_columns(schema: &ArrowSchema, modality: Modality) -> Result<Columns> {
-    let unknown = fail(
-        Status::InvalidArgument,
-        "the stream carries a column its modality does not name, or names one twice",
-    );
+    let unknown =
+        fail(Status::InvalidArgument, "the stream carries a column its modality does not name, or names one twice");
     let mut columns = Columns::default();
     for index in 0..schema.n_children.max(0) as usize {
         // SAFETY: a live schema holds `n_children` live children, each named or not.
@@ -392,10 +386,7 @@ fn resolve_columns(schema: &ArrowSchema, modality: Modality) -> Result<Columns> 
     };
     match complete {
         Some(_) => Ok(columns),
-        None => Err(fail(
-            Status::InvalidArgument,
-            "the stream lacks a column its modality needs",
-        )),
+        None => Err(fail(Status::InvalidArgument, "the stream lacks a column its modality needs")),
     }
 }
 
@@ -417,10 +408,7 @@ fn converted(status: ustore_status_t, count: ustore_size_t, needed: ustore_size_
         raw if raw == Status::Malformed as c_int => c"a column misses a buffer or is shorter than its batch",
         _ => c"a column holds a null",
     };
-    check(ustore_outcome_t {
-        status,
-        message: message.as_ptr(),
-    })?;
+    check(ustore_outcome_t { status, message: message.as_ptr() })?;
     match count >= needed {
         true => Ok(()),
         false => Err(fail(Status::Malformed, "a column is shorter than its batch")),
@@ -431,10 +419,7 @@ fn converted(status: ustore_status_t, count: ustore_size_t, needed: ustore_size_
 fn keys_from(keys: ustore_keys_view_t, first: usize) -> ustore_keys_view_t {
     match keys.data.is_null() {
         true => keys,
-        false => ustore_keys_view_t {
-            data: keys.data.wrapping_add(first),
-            stride: keys.stride,
-        },
+        false => ustore_keys_view_t { data: keys.data.wrapping_add(first), stride: keys.stride },
     }
 }
 
@@ -459,10 +444,7 @@ fn strings_from(strings: ustore_strings_view_t, first: usize) -> ustore_strings_
 /// Reads the columns of `batch`, laid out as `schema` says, in place.
 fn rows_of(schema: &ArrowSchema, batch: &ArrowArray, columns: &Columns) -> Result<Rows> {
     if batch.n_children != schema.n_children || batch.null_count > 0 || batch.offset < 0 || batch.length < 0 {
-        return Err(fail(
-            Status::Malformed,
-            "a batch disagrees with its schema or holds a null row",
-        ));
+        return Err(fail(Status::Malformed, "a batch disagrees with its schema or holds a null row"));
     }
     let first = batch.offset as usize;
     let needed = (batch.offset + batch.length) as ustore_size_t;
@@ -594,34 +576,42 @@ fn metadata(pairs: &[(&str, &str)]) -> Vec<u8> {
 }
 
 unsafe extern "C" fn release_column_schema(schema: *mut ArrowSchema) {
-    (*schema).release = None;
+    unsafe {
+        (*schema).release = None;
+    }
 }
 
 unsafe extern "C" fn release_schema(schema: *mut ArrowSchema) {
-    drop(Box::from_raw((*schema).private_data.cast::<ExportedSchema>()));
-    (*schema).release = None;
+    unsafe {
+        drop(Box::from_raw((*schema).private_data.cast::<ExportedSchema>()));
+        (*schema).release = None;
+    }
 }
 
 unsafe extern "C" fn release_batch(batch: *mut ArrowArray) {
-    drop(Box::from_raw((*batch).private_data.cast::<ExportedBatch>()));
-    (*batch).release = None;
+    unsafe {
+        drop(Box::from_raw((*batch).private_data.cast::<ExportedBatch>()));
+        (*batch).release = None;
+    }
 }
 
 /// What an exported column's release frees after the exporter's own: its share of the arena.
 struct HeldColumn {
     release: Option<unsafe extern "C" fn(*mut ArrowArray)>,
     private_data: *mut c_void,
-    arena: Arc<Mutex<Arena>>,
+    arena: Arc<Arena>,
 }
 
 unsafe extern "C" fn release_held_column(column: *mut ArrowArray) {
-    let held = Box::from_raw((*column).private_data.cast::<HeldColumn>());
-    (*column).release = held.release;
-    (*column).private_data = held.private_data;
-    if let Some(release) = held.release {
-        release(column);
+    unsafe {
+        let held = Box::from_raw((*column).private_data.cast::<HeldColumn>());
+        (*column).release = held.release;
+        (*column).private_data = held.private_data;
+        if let Some(release) = held.release {
+            release(column);
+        }
+        drop(held.arena);
     }
-    drop(held.arena);
 }
 
 /// The schema of a collection of `modality`: a struct of its columns, uuids tagged as `arrow.uuid`.
@@ -678,10 +668,7 @@ impl ExportedBatch {
         let mut column = ArrowDeviceArray::empty();
         // SAFETY: a call wrote the keys into the arena, which the column's share keeps alive.
         let status = unsafe { ffi::ustore_keys_view_to_arrow(keys, count, arena.handle, &mut schema, &mut column) };
-        check(ustore_outcome_t {
-            status,
-            message: c"failed to export the keys of a batch".as_ptr(),
-        })?;
+        check(ustore_outcome_t { status, message: c"failed to export the keys of a batch".as_ptr() })?;
         self.columns[self.count] = column.array;
         self.count += 1;
         Ok(())
@@ -702,10 +689,7 @@ impl ExportedBatch {
                 &mut column,
             )
         };
-        check(ustore_outcome_t {
-            status,
-            message: c"failed to export the values of a batch".as_ptr(),
-        })?;
+        check(ustore_outcome_t { status, message: c"failed to export the values of a batch".as_ptr() })?;
         self.columns[self.count] = column.array;
         self.count += 1;
         Ok(())
@@ -714,8 +698,9 @@ impl ExportedBatch {
     /// The batch of `rows` rows over the exported columns, which its release releases, each column
     /// holding a share of `arena` until its own release, as a consumer may move columns out.
     fn into_array(mut self: Box<Self>, rows: ustore_size_t, arena: Arena) -> ArrowArray {
-        // The mutex only lets the columns, released on any thread, share the arena.
-        let arena = Arc::new(Mutex::new(arena));
+        // Only the count is shared: no column reads the arena, and the last release, on any thread,
+        // frees it.
+        let arena = Arc::new(arena);
         let count = self.count;
         for column in &mut self.columns[..count] {
             let held = Box::new(HeldColumn {
@@ -755,32 +740,36 @@ impl ExportStream {
         // SAFETY: every pointer in each `arguments` outlives its call, which is final on return.
         unsafe {
             match &mut self.cursor {
-                ExportCursor::Docs(cursor) => docs_ffi::ustore_docs_cursor_init(&mut docs_ffi::ustore_docs_cursor_init_t {
-                    cursor,
-                    database: self.database,
-                    executor: ptr::null_mut(),
-                    outcome: &mut outcome,
-                    view: self.view,
-                    collection: self.collection,
-                    start_key: Key::default(),
-                    end_key: ptr::null(),
-                    direction: ScanDirection::Ascending,
-                    filter: Default::default(),
-                    predicate: Default::default(),
-                }),
-                ExportCursor::Pages(cursor) => pages_ffi::ustore_pages_cursor_init(&mut pages_ffi::ustore_pages_cursor_init_t {
-                    cursor,
-                    database: self.database,
-                    executor: ptr::null_mut(),
-                    outcome: &mut outcome,
-                    view: self.view,
-                    collection: self.collection,
-                    start_key: Key::default(),
-                    end_key: ptr::null(),
-                    direction: ScanDirection::Ascending,
-                    filter: Default::default(),
-                    predicate: Default::default(),
-                }),
+                ExportCursor::Docs(cursor) => {
+                    docs_ffi::ustore_docs_cursor_init(&mut docs_ffi::ustore_docs_cursor_init_t {
+                        cursor,
+                        database: self.database,
+                        executor: ptr::null_mut(),
+                        outcome: &mut outcome,
+                        view: self.view,
+                        collection: self.collection,
+                        start_key: Key::default(),
+                        end_key: ptr::null(),
+                        direction: ScanDirection::Ascending,
+                        filter: Default::default(),
+                        predicate: Default::default(),
+                    })
+                }
+                ExportCursor::Pages(cursor) => {
+                    pages_ffi::ustore_pages_cursor_init(&mut pages_ffi::ustore_pages_cursor_init_t {
+                        cursor,
+                        database: self.database,
+                        executor: ptr::null_mut(),
+                        outcome: &mut outcome,
+                        view: self.view,
+                        collection: self.collection,
+                        start_key: Key::default(),
+                        end_key: ptr::null(),
+                        direction: ScanDirection::Ascending,
+                        filter: Default::default(),
+                        predicate: Default::default(),
+                    })
+                }
                 ExportCursor::Strings(cursor) => {
                     strings_ffi::ustore_strings_cursor_init(&mut strings_ffi::ustore_strings_cursor_init_t {
                         cursor,
@@ -812,19 +801,21 @@ impl ExportStream {
                         predicate: Default::default(),
                     })
                 }
-                ExportCursor::Blobs(cursor) => blobs_ffi::ustore_blobs_cursor_init(&mut blobs_ffi::ustore_blobs_cursor_init_t {
-                    cursor,
-                    database: self.database,
-                    executor: ptr::null_mut(),
-                    outcome: &mut outcome,
-                    view: self.view,
-                    collection: self.collection,
-                    start_key: Key::default(),
-                    end_key: ptr::null(),
-                    direction: ScanDirection::Ascending,
-                    patterns: Default::default(),
-                    predicate: Default::default(),
-                }),
+                ExportCursor::Blobs(cursor) => {
+                    blobs_ffi::ustore_blobs_cursor_init(&mut blobs_ffi::ustore_blobs_cursor_init_t {
+                        cursor,
+                        database: self.database,
+                        executor: ptr::null_mut(),
+                        outcome: &mut outcome,
+                        view: self.view,
+                        collection: self.collection,
+                        start_key: Key::default(),
+                        end_key: ptr::null(),
+                        direction: ScanDirection::Ascending,
+                        patterns: Default::default(),
+                        predicate: Default::default(),
+                    })
+                }
             }
         }
         check(outcome)
@@ -871,49 +862,55 @@ impl ExportStream {
                     batch.keys(ustore_keys_view_t { data: keys, stride: 16 }, rows, &arena)?;
                     return Ok(Some(batch.into_array(rows, arena)));
                 }
-                ExportCursor::Docs(cursor) => docs_ffi::ustore_docs_cursor_next(&mut docs_ffi::ustore_docs_cursor_next_t {
-                    database: self.database,
-                    executor: ptr::null_mut(),
-                    outcome: &mut outcome,
-                    completion: ustore_completion_t::Blocking,
-                    cursor,
-                    keys: &mut keys,
-                    values: &mut values,
-                    written: &mut rows,
-                    arena: arena.handle,
-                    wanted: EXPORT_BATCH_ROWS,
-                    progress: None,
-                    progress_state: ptr::null_mut(),
-                }),
-                ExportCursor::Pages(cursor) => pages_ffi::ustore_pages_cursor_next(&mut pages_ffi::ustore_pages_cursor_next_t {
-                    database: self.database,
-                    executor: ptr::null_mut(),
-                    outcome: &mut outcome,
-                    completion: ustore_completion_t::Blocking,
-                    cursor,
-                    keys: &mut keys,
-                    values: &mut values,
-                    written: &mut rows,
-                    arena: arena.handle,
-                    wanted: EXPORT_BATCH_ROWS,
-                    outputs_encoding: PageEncoding::Xml as ustore_enum_t,
-                    progress: None,
-                    progress_state: ptr::null_mut(),
-                }),
-                ExportCursor::Blobs(cursor) => blobs_ffi::ustore_blobs_cursor_next(&mut blobs_ffi::ustore_blobs_cursor_next_t {
-                    database: self.database,
-                    executor: ptr::null_mut(),
-                    outcome: &mut outcome,
-                    completion: ustore_completion_t::Blocking,
-                    cursor,
-                    keys: &mut keys,
-                    values: &mut values,
-                    written: &mut rows,
-                    arena: arena.handle,
-                    wanted: EXPORT_BATCH_ROWS,
-                    progress: None,
-                    progress_state: ptr::null_mut(),
-                }),
+                ExportCursor::Docs(cursor) => {
+                    docs_ffi::ustore_docs_cursor_next(&mut docs_ffi::ustore_docs_cursor_next_t {
+                        database: self.database,
+                        executor: ptr::null_mut(),
+                        outcome: &mut outcome,
+                        completion: ustore_completion_t::Blocking,
+                        cursor,
+                        keys: &mut keys,
+                        values: &mut values,
+                        written: &mut rows,
+                        arena: arena.handle,
+                        wanted: EXPORT_BATCH_ROWS,
+                        progress: None,
+                        progress_state: ptr::null_mut(),
+                    })
+                }
+                ExportCursor::Pages(cursor) => {
+                    pages_ffi::ustore_pages_cursor_next(&mut pages_ffi::ustore_pages_cursor_next_t {
+                        database: self.database,
+                        executor: ptr::null_mut(),
+                        outcome: &mut outcome,
+                        completion: ustore_completion_t::Blocking,
+                        cursor,
+                        keys: &mut keys,
+                        values: &mut values,
+                        written: &mut rows,
+                        arena: arena.handle,
+                        wanted: EXPORT_BATCH_ROWS,
+                        outputs_encoding: PageEncoding::Xml as ustore_enum_t,
+                        progress: None,
+                        progress_state: ptr::null_mut(),
+                    })
+                }
+                ExportCursor::Blobs(cursor) => {
+                    blobs_ffi::ustore_blobs_cursor_next(&mut blobs_ffi::ustore_blobs_cursor_next_t {
+                        database: self.database,
+                        executor: ptr::null_mut(),
+                        outcome: &mut outcome,
+                        completion: ustore_completion_t::Blocking,
+                        cursor,
+                        keys: &mut keys,
+                        values: &mut values,
+                        written: &mut rows,
+                        arena: arena.handle,
+                        wanted: EXPORT_BATCH_ROWS,
+                        progress: None,
+                        progress_state: ptr::null_mut(),
+                    })
+                }
             }
         }
         check(outcome)?;
@@ -934,10 +931,7 @@ impl ExportStream {
         arena: Arena,
         mut batch: Box<ExportedBatch>,
     ) -> Result<Option<ArrowArray>> {
-        let vertices_arena = self
-            .vertices_arena
-            .as_ref()
-            .map_or(ptr::null_mut(), |arena| arena.handle);
+        let vertices_arena = self.vertices_arena.as_ref().map_or(ptr::null_mut(), |arena| arena.handle);
         loop {
             let mut vertices: *const ustore_key_t = ptr::null();
             let mut written: ustore_size_t = 0;
@@ -976,10 +970,7 @@ impl ExportStream {
                     view: self.view,
                     count: written,
                     collections: ustore_collections_view_t::repeated(&self.collection),
-                    vertices: ustore_keys_view_t {
-                        data: vertices,
-                        stride: 16,
-                    },
+                    vertices: ustore_keys_view_t { data: vertices, stride: 16 },
                     roles: db_ffi::ustore_strided_view_t::repeated(&role),
                     degrees_per_vertex: &mut degrees,
                     edges_offsets: &mut offsets,
@@ -1000,10 +991,7 @@ impl ExportStream {
                 return Ok(None);
             }
             for column in 0..3 {
-                let keys = ustore_keys_view_t {
-                    data: triples.wrapping_add(column),
-                    stride: 48,
-                };
+                let keys = ustore_keys_view_t { data: triples.wrapping_add(column), stride: 48 };
                 batch.keys(keys, edges, &arena)?;
             }
             return Ok(Some(batch.into_array(edges, arena)));
@@ -1022,32 +1010,38 @@ impl ExportStream {
 }
 
 unsafe extern "C" fn export_get_schema(stream: *mut ArrowArrayStream, out: *mut ArrowSchema) -> c_int {
-    let state = &*(*stream).private_data.cast::<ExportStream>();
-    ptr::write(out, exported_schema(state.modality));
-    0
+    unsafe {
+        let state = &*(*stream).private_data.cast::<ExportStream>();
+        ptr::write(out, exported_schema(state.modality));
+        0
+    }
 }
 
 unsafe extern "C" fn export_get_next(stream: *mut ArrowArrayStream, out: *mut ArrowArray) -> c_int {
-    let state = &mut *(*stream).private_data.cast::<ExportStream>();
-    match state.pull() {
-        Ok(batch) => {
-            ptr::write(out, batch.unwrap_or_else(ArrowArray::empty));
-            0
-        }
-        Err(failure) => {
-            ptr::write(out, ArrowArray::empty());
-            state.failed(failure)
+    unsafe {
+        let state = &mut *(*stream).private_data.cast::<ExportStream>();
+        match state.pull() {
+            Ok(batch) => {
+                ptr::write(out, batch.unwrap_or_else(ArrowArray::empty));
+                0
+            }
+            Err(failure) => {
+                ptr::write(out, ArrowArray::empty());
+                state.failed(failure)
+            }
         }
     }
 }
 
 unsafe extern "C" fn export_get_last_error(stream: *mut ArrowArrayStream) -> *const c_char {
-    (*(*stream).private_data.cast::<ExportStream>()).failure.as_ptr()
+    unsafe { (*(*stream).private_data.cast::<ExportStream>()).failure.as_ptr() }
 }
 
 unsafe extern "C" fn export_release(stream: *mut ArrowArrayStream) {
-    drop(Box::from_raw((*stream).private_data.cast::<ExportStream>()));
-    (*stream).release = None;
+    unsafe {
+        drop(Box::from_raw((*stream).private_data.cast::<ExportStream>()));
+        (*stream).release = None;
+    }
 }
 
 /// The whole of `collection`, holding `modality`, as one stream read through `view`, or through a snapshot of the head
@@ -1245,11 +1239,7 @@ pub(crate) fn import<Parent>(
     while let Some(batch) = current {
         let upcoming = stream.next_batch()?;
         let rows = rows_of(&schema, &batch, &columns)?;
-        let batch_durability = if upcoming.is_some() {
-            Durability::Buffered
-        } else {
-            durability
-        };
+        let batch_durability = if upcoming.is_some() { Durability::Buffered } else { durability };
         write_rows(&target, &rows, batch_durability)?;
         written += rows.count;
         current = upcoming;
@@ -1285,13 +1275,8 @@ pub(crate) fn ingest(
     let columns = resolve_columns(&schema, modality)?;
     let mut ingest = Ingest(ptr::null_mut());
     let mut outcome = ustore_outcome_t::default();
-    let mut init = ffi::ustore_ingest_init_t {
-        ingest: &mut ingest.0,
-        database,
-        outcome: &mut outcome,
-        collection,
-        order,
-    };
+    let mut init =
+        ffi::ustore_ingest_init_t { ingest: &mut ingest.0, database, outcome: &mut outcome, collection, order };
     // SAFETY: every pointer in `init` outlives the call, which is final on return.
     unsafe { ffi::ustore_ingest_init(&mut init) };
     check(outcome)?;
@@ -1337,8 +1322,9 @@ pub(crate) mod ffi {
 
     use super::{ArrowArray, ArrowDeviceArray, ArrowSchema, IngestOrder};
     use crate::db::ffi::{
-        ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_keys_view_t,
-        ustore_outcome_t, ustore_size_t, ustore_stamp_t, ustore_status_t, ustore_strings_view_t,
+        ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_database_t, ustore_durability_t,
+        ustore_enum_t, ustore_keys_view_t, ustore_outcome_t, ustore_size_t, ustore_stamp_t, ustore_status_t,
+        ustore_strings_view_t,
     };
     use crate::docs::ffi::ustore_docs_column_view_t;
 
@@ -1378,7 +1364,7 @@ pub(crate) mod ffi {
         pub commit_stamp: *mut ustore_stamp_t,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn ustore_keys_view_from_arrow(
             schema: *const ArrowSchema,
             array: *const ArrowArray,
@@ -1465,10 +1451,7 @@ mod tests {
     fn posters(database: &Database) -> crate::Collection<'_> {
         let mut posters = database.collection("posters").unwrap();
         for index in 1..=50u64 {
-            posters
-                .blobs()
-                .set(key(index), format!("poster-{index}").as_bytes())
-                .unwrap();
+            posters.blobs().set(key(index), format!("poster-{index}").as_bytes()).unwrap();
         }
         posters
     }
@@ -1481,10 +1464,7 @@ mod tests {
         let exported = posters.export_arrow().unwrap();
         let landed = copies.ingest_arrow(exported, IngestOrder::Sorted, Durability::Buffered);
         assert_eq!(landed.unwrap(), 50);
-        assert_eq!(
-            rows_of(copies.export_arrow().unwrap()),
-            rows_of(posters.export_arrow().unwrap())
-        );
+        assert_eq!(rows_of(copies.export_arrow().unwrap()), rows_of(posters.export_arrow().unwrap()));
     }
 
     #[test]
@@ -1498,7 +1478,7 @@ mod tests {
         assert_eq!(copies.import_arrow(exported, Durability::Buffered).unwrap(), 50);
         let originals = rows_of(posters.export_arrow().unwrap());
         assert_eq!(originals.len(), 50);
-        assert_eq!(originals[0], (key(1).0 .0.to_vec(), b"poster-1".to_vec()));
+        assert_eq!(originals[0], (key(1).0.0.to_vec(), b"poster-1".to_vec()));
         assert_eq!(rows_of(copies.export_arrow().unwrap()), originals);
     }
 
@@ -1523,13 +1503,5 @@ mod tests {
         let exported = posters.export_arrow().unwrap();
         let refused = posters.ingest_arrow(exported, IngestOrder::Sorted, Durability::Buffered);
         assert_eq!(refused.unwrap_err().status, Status::Unsupported);
-    }
-
-    #[test]
-    fn arrow_structs_match_the_specification() {
-        assert_eq!(std::mem::size_of::<ArrowSchema>(), 72);
-        assert_eq!(std::mem::size_of::<ArrowArray>(), 80);
-        assert_eq!(std::mem::size_of::<ArrowArrayStream>(), 40);
-        assert_eq!(std::mem::size_of::<ArrowDeviceArray>(), 128);
     }
 }

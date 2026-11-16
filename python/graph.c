@@ -7,7 +7,7 @@
  *  A graph collection maps every vertex onto its sorted neighborships, so an edge is three keys,
  *  the source, the target and the edge identifier, and a read answers a tape of such triples. Every
  *  verb fills a call the driver keeps on the stack or inside a @c Deferred, and a read of edges or
- *  degrees claims the arena it is given, answering a tape viewing it or a tuple copied out of it.
+ *  degrees writes into the arena it is given, answering a tape viewing it or a tuple copied out.
  */
 #include "lib.h"
 
@@ -274,13 +274,12 @@ static PyObject* degrees_tuple(ustore_vertex_degree_t const* degrees, size_t cou
     return counted;
 }
 
-/** A new @c Neighborhoods over what a read of @p count vertices wrote into @p arena, which its call still claims. */
+/** A new @c Neighborhoods over what a read of @p count vertices wrote into @p arena. */
 static PyObject* neighborhoods_new(PyObject* arena, ustore_key_t const* tape, ustore_length_t const* offsets,
                                    ustore_vertex_degree_t const* degrees, size_t count) {
     Neighborhoods* const instance = PyObject_New(Neighborhoods, &NeighborhoodsType);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
-    instance->generation = ustore_py_arena_generation(arena);
     instance->tape = tape;
     instance->offsets = offsets;
     instance->degrees = degrees;
@@ -403,7 +402,7 @@ static PyObject* edges_read(PyObject* self, char const* name, ustore_py_verb_t c
     edges_read_call_t* const call = ustore_py_call_open(&context, verb, &stack);
     if (!call) return NULL;
     if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0 ||
-        ustore_py_arena_claim(arguments[1], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, verb, call);
     call->role = role;
     call->call.collection = options.collection;
@@ -464,7 +463,7 @@ PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* argument
     call->vertices.count = 1;
     PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
     if (!arena || ustore_py_key_from_object(arguments[0], call->vertices.inline_keys) != 0 ||
-        ustore_py_arena_claim(arena, &call->call.arena) != 0) {
+        ustore_py_arena_from_object(arena, &call->call.arena) != 0) {
         Py_XDECREF(arena);
         return ustore_py_call_discard(&context, &contains_verb, call);
     }
@@ -683,8 +682,8 @@ static char const doc_Neighborhoods[] =                                         
     "Indexing answers a tuple of (source, target, edge) triples of `uuid.UUID` for one\n"         //
     "vertex, or None where the vertex is absent, which is where a copy happens. The whole\n"      //
     "tape exports through the buffer protocol as an array of shape (edges, 3, 16) bytes,\n"       //
-    "copying nothing and pinning the arena against the next call until released. Read after\n"    //
-    "a later call rewound the arena, it raises `UninitializedError`.";
+    "copying nothing. Read after a later call rewound the arena, it reads whatever the\n"         //
+    "arena then holds.";
 
 static void Neighborhoods_dealloc(Neighborhoods* self) {
     Py_XDECREF(self->arena);
@@ -719,23 +718,13 @@ static PyObject* Neighborhoods_item(Neighborhoods* self, Py_ssize_t vertex_index
         PyErr_SetString(PyExc_IndexError, "Vertex index out of range");
         return NULL;
     }
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     PyObject* const triples = neighborhood_triples(self, (size_t)vertex_index);
-    ustore_py_arena_unpin(self->arena);
     return triples;
 }
 
 static int Neighborhoods_getbuffer(Neighborhoods* self, Py_buffer* view, int flags) {
     view->obj = NULL;
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return -1;
-    if (ustore_py_buffer_fill(view, (PyObject*)self, self->tape, "B", 1, 3, self->shape, self->strides, flags) == 0)
-        return 0;
-    ustore_py_arena_unpin(self->arena);
-    return -1;
-}
-
-static void Neighborhoods_releasebuffer(Neighborhoods* self, Py_buffer* Py_UNUSED(view)) {
-    ustore_py_arena_unpin(self->arena);
+    return ustore_py_buffer_fill(view, (PyObject*)self, self->tape, "B", 1, 3, self->shape, self->strides, flags);
 }
 
 static PyObject* Neighborhoods_repr(Neighborhoods* self) {
@@ -745,9 +734,7 @@ static PyObject* Neighborhoods_repr(Neighborhoods* self) {
 static char const doc_Neighborhoods_degrees[] = "The degree of every vertex, with None where it is absent, as a tuple.";
 
 static PyObject* Neighborhoods_get_degrees(Neighborhoods* self, void* Py_UNUSED(closure)) {
-    if (ustore_py_arena_pin(self->arena, self->generation) != 0) return NULL;
     PyObject* const degrees = degrees_tuple(self->degrees, self->count);
-    ustore_py_arena_unpin(self->arena);
     return degrees;
 }
 
@@ -773,7 +760,6 @@ static PySequenceMethods Neighborhoods_as_sequence = {
 
 static PyBufferProcs Neighborhoods_as_buffer = {
     .bf_getbuffer = (getbufferproc)Neighborhoods_getbuffer,
-    .bf_releasebuffer = (releasebufferproc)Neighborhoods_releasebuffer,
 };
 
 PyTypeObject NeighborhoodsType = {

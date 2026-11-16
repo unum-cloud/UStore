@@ -40,6 +40,7 @@ from ustore.types import (
     Executor,
     NULL_ADDRESS,
     Outcome,
+    PhaseProgress,
     Progress,
     StringsView,
     StringsViewArguments,
@@ -551,8 +552,8 @@ struct DatabaseNvmeOptions(Defaultable, ImplicitlyCopyable):
     """Bytes of every value of a collection whose values share one size, or zero."""
     var collection_value_max_size: c_size_t
     """Bytes of the largest value of a collection whose values vary in size."""
-    var cpu_class: CPUClass
-    """The class the database confines its waits, atomics and string kernels to; `UNKNOWN` picks the newest this machine runs."""
+    var cpu_class_ceiling: CPUClass
+    """The newest class the database may confine its waits, atomics and string kernels to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none."""
 
     def __init__(out self):
         """Every engine default."""
@@ -568,7 +569,7 @@ struct DatabaseInitRamArguments(ImplicitlyCopyable):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var completion: Completion
     var isolation: Isolation
-    var cpu_class: CPUClass
+    var cpu_class_ceiling: CPUClass
 
 
 @fieldwise_init
@@ -581,7 +582,7 @@ struct DatabaseOpenRamArguments(ImplicitlyCopyable):
     var completion: Completion
     var directory: BytesViewArguments
     var isolation: Isolation
-    var cpu_class: CPUClass
+    var cpu_class_ceiling: CPUClass
 
 
 @fieldwise_init
@@ -630,7 +631,7 @@ struct DatabaseOpenNvmeArguments(ImplicitlyCopyable):
     var collection_level_enlarge_factor: c_size_t
     var collection_value_size: c_size_t
     var collection_value_max_size: c_size_t
-    var cpu_class: CPUClass
+    var cpu_class_ceiling: CPUClass
 
 
 @fieldwise_init
@@ -661,7 +662,7 @@ struct DatabaseDescription(Answer, Defaultable, ImplicitlyCopyable):
     var isolation: Isolation
     """How transactions see each other."""
     var cpu_class: CPUClass
-    """The CPU class the engine's calls run as, picked at open; `UNKNOWN` for RocksDB and LevelDB."""
+    """The CPU class the engine's calls run as, picked at open under the ceiling; `UNKNOWN` for RocksDB and LevelDB."""
     var keys: c_size_t
     """Keys across every collection, the engine's estimate."""
     var memory_bytes: c_size_t
@@ -733,13 +734,69 @@ struct DatabaseCompactArguments(Arguments):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var completion: Completion
     var progress: Progress
+    var plan: Optional[Pointer[Address, MutUntrackedOrigin]]
+    var phase: Optional[Pointer[PhaseProgress, MutUntrackedOrigin]]
 
     def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
-        self = Self(scope.database, scope.executor, outcome, completion, self.progress)
+        self = Self(scope.database, scope.executor, outcome, completion, self.progress, self.plan, self.phase)
 
     @staticmethod
     def verb(library: Library) -> Verb[Self]:
         return library.symbols().database_compact
+
+    @staticmethod
+    def of[
+        plan_origin: MutOrigin, phase_origin: MutOrigin, //
+    ](
+        completion: Completion,
+        progress: Progress,
+        plan: Optional[Pointer[DatabaseCompactPlan, plan_origin]],
+        phase: Optional[Pointer[PhaseProgress, phase_origin]],
+    ) -> Self:
+        """The arguments with the plan's handle slot and the phase slot lent, either one absent."""
+        var plan_slot: Optional[Pointer[Address, MutUntrackedOrigin]] = None
+        if plan:
+            plan_slot = Pointer(to=plan.value()[].address).unsafe_origin_cast[MutUntrackedOrigin]()
+        var phase_slot: Optional[Pointer[PhaseProgress, MutUntrackedOrigin]] = None
+        if phase:
+            phase_slot = phase.value().unsafe_origin_cast[MutUntrackedOrigin]()
+        return Self(NULL_ADDRESS, NULL_ADDRESS, None, completion, progress, plan_slot, phase_slot)
+
+
+struct DatabaseCompactPlan(Movable):
+    """One compaction in flight, `ustore_database_compact_plan_t`. Binding-only.
+
+    Lent to `compact`, it opens on the first call, stays live past a cancel, continues from the unit
+    it stopped at on every later call, and closes with `compact_plan_finish`. The database and the
+    executor it was opened with must outlive that finish.
+    """
+
+    var address: Address
+    """The opaque handle, `NULL_ADDRESS` until a compaction opens it."""
+
+    def __init__(out self):
+        """A plan no compaction opened yet."""
+        self.address = NULL_ADDRESS
+
+
+@fieldwise_init
+struct DatabaseCompactPlanFinishArguments(Arguments):
+    """`ustore_database_compact_plan_finish_t`."""
+
+    comptime Written = Unwritten
+    comptime symbol: StaticString = "ustore_database_compact_plan_finish"
+    var database: Address
+    var executor: Address
+    var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
+    var plan: Address
+
+    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+        self = Self(scope.database, scope.executor, outcome, completion, self.plan)
+
+    @staticmethod
+    def verb(library: Library) -> Verb[Self]:
+        return library.symbols().database_compact_plan_finish
 
 
 @fieldwise_init
@@ -1404,24 +1461,27 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
 
     @staticmethod
     def init_ram(
-        executor: Executor, isolation: Isolation = Isolation.STRICT_SERIALIZABLE, cpu_class: CPUClass = CPUClass.UNKNOWN
+        executor: Executor,
+        isolation: Isolation = Isolation.STRICT_SERIALIZABLE,
+        cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
         """Starts an empty database of the in-memory engine, which persists nowhere. Calls `ustore_database_init_ram`.
 
         Args:
             executor: The executor the open runs on; it also lends its engine.
             isolation: How transactions see each other.
-            cpu_class: The class the database confines its kernels to; `UNKNOWN` picks the newest this machine runs.
+            cpu_class_ceiling: The newest class the database may confine its kernels to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none.
 
         Raises:
-            `Error` if the class is not one the CPU runs.
+            `Error` with `INVALID_ARGUMENT` if no class takes the ceiling, or `UNSUPPORTED` if the build compiled
+            no class under it on this CPU.
         """
         var created = stack_allocation[1, Address]().unsafe_origin_cast[MutUntrackedOrigin]()
         created[] = NULL_ADDRESS
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            DatabaseInitRamArguments(created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class),
+            DatabaseInitRamArguments(created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class_ceiling),
             executor.library.symbols().database_init_ram,
         )
         return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_init_ram"))
@@ -1433,7 +1493,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         executor: Executor,
         directory: StringSlice[directory_origin],
         isolation: Isolation = Isolation.STRICT_SERIALIZABLE,
-        cpu_class: CPUClass = CPUClass.UNKNOWN,
+        cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
         """Serves a directory through the in-memory engine, loading its image and rewriting it on flushed
         commits and on close. Calls `ustore_database_open_ram`.
@@ -1447,7 +1507,8 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         outcome[] = Outcome()
         _cross(
             DatabaseOpenRamArguments(
-                created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments(), isolation, cpu_class
+                created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments(), isolation,
+                cpu_class_ceiling,
             ),
             executor.library.symbols().database_open_ram,
         )
@@ -1554,7 +1615,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
                 options.collection_concurrency_limit, options.collection_cache_limit,
                 options.collection_memory_runs_max_bytes, options.collection_memory_runs_max_deltas,
                 options.collection_level_enlarge_factor, options.collection_value_size,
-                options.collection_value_max_size, options.cpu_class,
+                options.collection_value_max_size, options.cpu_class_ceiling,
             ),
             executor.library.symbols().database_open_nvme,
         )
@@ -1802,16 +1863,51 @@ trait DatabaseVerbs:
             ),
         )
 
-    def compact(self, progress: Progress = Progress()) raises Error:
-        """Reclaims the space overwritten and removed data still takes. Calls `ustore_database_compact`.
+    def compact[
+        plan_origin: MutOrigin = MutUntrackedOrigin, phase_origin: MutOrigin = MutUntrackedOrigin, //
+    ](
+        self,
+        progress: Progress = Progress(),
+        plan: Optional[Pointer[DatabaseCompactPlan, plan_origin]] = None,
+        phase: Optional[Pointer[PhaseProgress, phase_origin]] = None,
+    ) raises Error:
+        """Reclaims the space overwritten and removed data still takes, phase by phase and one unit at a
+        time. Calls `ustore_database_compact`.
+
+        Parameters:
+            plan_origin: The lent plan's origin, inferred where one is lent.
+            phase_origin: The lent phase slot's origin, inferred where one is lent.
+
+        Args:
+            progress: Hears each unit; a cancel stops between units, keeping what it compacted.
+            plan: The plan this call opens or continues; absent runs the compaction to its end.
+            phase: Receives where this call stopped, `Phase.DONE` once the compaction ended.
 
         Raises:
-            `Error` with `CANCELLED` once `progress` stops it, keeping what it compacted.
+            `Error` with `CANCELLED` once `progress` stops it, leaving a lent plan live, or
+            `CONTENDED` while another live plan compacts the database.
         """
         _ = _block(
             self._scope(),
             _Crossing[DatabaseCompactArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
-                DatabaseCompactArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, progress), None, 0
+                DatabaseCompactArguments.of(Completion.BLOCKING, progress, plan, phase), None, 0
+            ),
+        )
+
+    def compact_plan_finish(self, var plan: DatabaseCompactPlan) raises Error:
+        """Frees a compaction plan whatever the call answers. Calls `ustore_database_compact_plan_finish`.
+
+        Args:
+            plan: The plan a compaction on this database and executor opened, consumed by the call.
+
+        Raises:
+            `Error` with `INVALID_ARGUMENT` for a plan no compaction opened, or one opened on another
+            database or executor.
+        """
+        _ = _block(
+            self._scope(),
+            _Crossing[DatabaseCompactPlanFinishArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
+                DatabaseCompactPlanFinishArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, plan.address), None, 0
             ),
         )
 
@@ -1981,12 +2077,41 @@ trait DatabaseDeferredVerbs:
             ),
         }
 
-    def compact(self, progress: Progress = Progress()) -> Deferred[_Crossing[DatabaseCompactArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin]]:
-        """Submits `DatabaseVerbs.compact`. Calls `ustore_database_compact`."""
+    def compact[
+        plan_origin: MutOrigin = MutUntrackedOrigin, phase_origin: MutOrigin = MutUntrackedOrigin, //
+    ](
+        self,
+        progress: Progress = Progress(),
+        plan: Optional[Pointer[DatabaseCompactPlan, plan_origin]] = None,
+        phase: Optional[Pointer[PhaseProgress, phase_origin]] = None,
+    ) -> Deferred[
+        _Crossing[
+            DatabaseCompactArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(origin_of(_anchor[plan_origin](), _anchor[phase_origin]())),
+        ]
+    ]:
+        """Submits `DatabaseVerbs.compact`; the plan and phase slots stay borrowed until final.
+        Calls `ustore_database_compact`."""
         return {
             self._scope(),
-            _Crossing[DatabaseCompactArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
-                DatabaseCompactArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, progress), None, 0
+            _Crossing[
+                DatabaseCompactArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(origin_of(_anchor[plan_origin](), _anchor[phase_origin]())),
+            ](DatabaseCompactArguments.of(Completion.DEFERRED, progress, plan, phase), None, 0),
+        }
+
+    def compact_plan_finish(self, var plan: DatabaseCompactPlan) -> Deferred[
+        _Crossing[DatabaseCompactPlanFinishArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin]
+    ]:
+        """Submits `DatabaseVerbs.compact_plan_finish`. Calls `ustore_database_compact_plan_finish`."""
+        return {
+            self._scope(),
+            _Crossing[DatabaseCompactPlanFinishArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
+                DatabaseCompactPlanFinishArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, plan.address), None, 0
             ),
         }
 

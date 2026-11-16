@@ -149,8 +149,9 @@
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let executor = Executor::for_ram(&[], 2)?;
 //! let mut counting = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Continue(()) };
-//! let progress = Some(&mut counting as &mut ustore::ProgressCallback);
-//! let compaction = database.head().deferred(&executor).compact(CompactConfig { progress })?;
+//! let progress: Option<Box<ustore::ProgressCallback>> = Some(Box::new(&mut counting));
+//! let config = CompactConfig { progress, ..CompactConfig::default() };
+//! let compaction = database.head().deferred(&executor).compact(config)?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
@@ -220,13 +221,13 @@ pub use blobs::{
 };
 pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{
-    gpu_devices, key_unknown, version, Admission, Arena, ArenaDescription, Blocking, CPUClass, CaseSensitivity,
-    ChangeKind, Changes, ChangesCursor, ChangesCursorConfig, CollectionID, Collections, CommitStamp, CompactConfig,
-    DataDirectory, Database, Deferred, DeferredOn, Deferring, Description, DropMode, Durability, Engine, Error,
-    Executor, GPUClass, GPUDevice, GPUVendor, Gds, IOOptions, Isolation, Key, KeyRange, LevelDBOptions, Matching,
-    Modality, Mood, NVMEOptions, On, PatternKind, PredicateCallback, PredicateCost, ProgressCallback, RAMOptions,
-    ReadStamp, Residency, Result, RocksDBOptions, SaveConfig, ScanDirection, ScanMode, Snapshot, Status, Tape,
-    Transaction, Transport, Wait, Watch, UUID,
+    Admission, Arena, ArenaDescription, Blocking, CPUClass, CaseSensitivity, ChangeKind, Changes, ChangesCursor,
+    ChangesCursorConfig, CollectionID, Collections, CommitStamp, CompactConfig, CompactPlan, DataDirectory, Database,
+    Deferred, DeferredOn, Deferring, Description, DropMode, Durability, Engine, Error, Executor, GPUClass, GPUDevice,
+    GPUVendor, Gds, IOOptions, Isolation, Key, KeyRange, LevelDBOptions, Matching, Modality, Mood, NVMEOptions, On,
+    PatternKind, Phase, PhaseProgress, PredicateCallback, PredicateCost, ProgressCallback, RAMOptions, ReadStamp,
+    Residency, Result, RocksDBOptions, SaveConfig, ScanDirection, ScanMode, Snapshot, Status, Tape, Transaction,
+    Transport, UUID, Wait, Watch, gpu_devices, key_unknown, version,
 };
 pub use docs::{
     Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, DocsCursorConfig, DocsGatherConfig, DocsSampleConfig,
@@ -234,8 +235,8 @@ pub use docs::{
     Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
 };
 pub use graph::{
-    default_edge_id, degree_missing, Degree, Edge, GraphSampleVerticesConfig, GraphScanVerticesConfig,
-    GraphVerticesCursor, GraphVerticesCursorConfig, Neighborhoods, Role, Roles,
+    Degree, Edge, GraphSampleVerticesConfig, GraphScanVerticesConfig, GraphVerticesCursor, GraphVerticesCursorConfig,
+    Neighborhoods, Role, Roles, default_edge_id, degree_missing,
 };
 pub use pages::{
     PageEncoding, PagesCursor, PagesCursorConfig, PagesImportConfig, PagesInsertConfig, PagesReadConfig,
