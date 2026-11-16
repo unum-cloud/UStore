@@ -14,9 +14,10 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 
-#include <span> // `std::span`
+#include <span>        // `std::span`
+#include <type_traits> // `std::is_constructible_v`
 
-#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `kernel_table`, `cuda_executor_t`, `hip_executor_t`
+#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `kernel_table`, `cuda_executor_t`, `metal_executor_t`
 
 namespace unum::ustore {
 
@@ -32,8 +33,11 @@ using utilities::gpu_vendor_t;
 using utilities::hip_executor_t;
 using utilities::hip_module_t;
 using utilities::kernel_table;
+using utilities::metal_executor_t;
+using utilities::metal_module_t;
 using utilities::status_code_t;
 using utilities::status_t;
+using utilities::vram_apple_kernel_names_k;
 using utilities::vram_kernel_names_k;
 
 /** The GPU generations UStore tells apart, the device twin of its CPU classes: a class implies its
@@ -66,17 +70,28 @@ enum class gpu_class_t : std::uint32_t {
 
     /** CDNA5 AMD - MI400: gfx1250, 32-wide waves. */
     amd_cdna5_k = ustore_gpu_class_amd_cdna5_k,
+
+    /** Apple7-family GPUs and every Apple GPU without a class of its own - M1 & M2. */
+    apple_metal7_k = ustore_gpu_class_apple_metal7_k,
+
+    /** Apple9-family GPUs - M3 & M4. */
+    apple_metal9_k = ustore_gpu_class_apple_metal9_k,
+
+    /** Apple10-family GPUs - M5. */
+    apple_metal10_k = ustore_gpu_class_apple_metal10_k,
 };
 
 /** Values a GPU class takes, @c unknown_k included, so a table keyed by class is an array. */
-inline constexpr std::size_t gpu_classes_count_k = static_cast<std::size_t>(gpu_class_t::amd_cdna5_k) + 1;
+inline constexpr std::size_t gpu_classes_count_k = static_cast<std::size_t>(gpu_class_t::apple_metal10_k) + 1;
 
 /** The bundle of kernels the library embeds for @p gpu_class, empty for a class left out. */
 std::span<byte_t const> gpu_class_bundle(gpu_class_t gpu_class) noexcept;
 
 /** Whether @p gpu_class, a class of @p device 's vendor, runs there, as its driver answers by
  *  loading the class's bundle: an NVIDIA device's into the primary context @p drivers retains, an
- *  AMD device's by its ordinal. No device loads the empty bundle of a class the build left out. */
+ *  AMD device's by its ordinal, while an Apple device runs a class of its family or an older one,
+ *  as Metal compiles the bundle's source on the device. No device loads the empty bundle of a
+ *  class the build left out. */
 bool gpu_class_serves(gpu_drivers_t& drivers, gpu_class_t gpu_class, gpu_device_t const& device) noexcept;
 
 /** The class @p gpu_class degrades to, whose code its devices also run, or @c unknown_k for its
@@ -89,14 +104,16 @@ constexpr gpu_class_t parent_class_of(gpu_class_t gpu_class) noexcept {
     case gpu_class_t::nvidia_ada_k: return gpu_class_t::nvidia_ampere_k;
     case gpu_class_t::amd_cdna5_k: return gpu_class_t::amd_cdna4_k;
     case gpu_class_t::amd_cdna4_k: return gpu_class_t::amd_cdna3_k;
+    case gpu_class_t::apple_metal10_k: return gpu_class_t::apple_metal9_k;
+    case gpu_class_t::apple_metal9_k: return gpu_class_t::apple_metal7_k;
     default: return gpu_class_t::unknown_k;
     }
 }
 
-/** Whether @p gpu_class is @p pinned or one it degrades to, every class when nothing is pinned. */
-constexpr bool gpu_class_under_pin(gpu_class_t gpu_class, gpu_class_t pinned) noexcept {
-    if (pinned == gpu_class_t::unknown_k) return true;
-    for (gpu_class_t rung = pinned; rung != gpu_class_t::unknown_k; rung = parent_class_of(rung))
+/** Whether @p gpu_class is the @p gpu_class_ceiling or a class it degrades to, any under none. */
+constexpr bool gpu_class_under_ceiling(gpu_class_t gpu_class, gpu_class_t gpu_class_ceiling) noexcept {
+    if (gpu_class_ceiling == gpu_class_t::unknown_k) return true;
+    for (gpu_class_t rung = gpu_class_ceiling; rung != gpu_class_t::unknown_k; rung = parent_class_of(rung))
         if (rung == gpu_class) return true;
     return false;
 }
@@ -113,23 +130,30 @@ using nvidia_ladder_t =
 /** AMD classes newest first. */
 using amd_ladder_t = gpu_ladder<gpu_class_t::amd_cdna5_k, gpu_class_t::amd_cdna4_k, gpu_class_t::amd_cdna3_k>;
 
-/** The newest class of @p ladder at or under @p pinned serving @p device, or @c unknown_k where
- *  none of them does. */
+/** Apple classes newest first. */
+using apple_ladder_t =
+    gpu_ladder<gpu_class_t::apple_metal10_k, gpu_class_t::apple_metal9_k, gpu_class_t::apple_metal7_k>;
+
+/** The newest class of @p ladder at or under @p gpu_class_ceiling serving @p device, or
+ *  @c unknown_k where none of them does. */
 template <gpu_class_t... classes_>
 gpu_class_t pick_gpu_class(gpu_ladder<classes_...>, gpu_drivers_t& drivers, gpu_device_t const& device,
-                           gpu_class_t pinned) noexcept {
+                           gpu_class_t gpu_class_ceiling) noexcept {
     for (gpu_class_t const gpu_class : {classes_...})
-        if (gpu_class_under_pin(gpu_class, pinned) && gpu_class_serves(drivers, gpu_class, device)) return gpu_class;
+        if (gpu_class_under_ceiling(gpu_class, gpu_class_ceiling) && gpu_class_serves(drivers, gpu_class, device))
+            return gpu_class;
     return gpu_class_t::unknown_k;
 }
 
-/** The class @p device takes under @p pinned, @c unknown_k for nothing pinned, walking its own
+/** The class @p device takes under @p gpu_class_ceiling, @c unknown_k setting none, walking its own
  *  vendor's ladder; @c unknown_k where no class this build carries runs on it, or none at or under
- *  the pin does. */
-inline gpu_class_t pick_gpu_class(gpu_drivers_t& drivers, gpu_device_t const& device, gpu_class_t pinned) noexcept {
+ *  the ceiling does. */
+inline gpu_class_t pick_gpu_class(gpu_drivers_t& drivers, gpu_device_t const& device,
+                                  gpu_class_t gpu_class_ceiling) noexcept {
     switch (device.vendor) {
-    case gpu_vendor_t::nvidia_k: return pick_gpu_class(nvidia_ladder_t {}, drivers, device, pinned);
-    case gpu_vendor_t::amd_k: return pick_gpu_class(amd_ladder_t {}, drivers, device, pinned);
+    case gpu_vendor_t::nvidia_k: return pick_gpu_class(nvidia_ladder_t {}, drivers, device, gpu_class_ceiling);
+    case gpu_vendor_t::amd_k: return pick_gpu_class(amd_ladder_t {}, drivers, device, gpu_class_ceiling);
+    case gpu_vendor_t::apple_k: return pick_gpu_class(apple_ladder_t {}, drivers, device, gpu_class_ceiling);
     default: return gpu_class_t::unknown_k;
     }
 }
@@ -145,8 +169,8 @@ class kernel_tables {
      *  @brief Loads the bundle of @p gpu_class onto @p device through @p api and resolves @p names,
      *      unless its table holds it already.
      *  @param[in] api The vendor's driver table.
-     *  @param[in] place Where the module loads: an NVIDIA device's primary context, or an
-     *      AMD device's ordinal.
+     *  @param[in] place Where the module loads: an NVIDIA device's primary context, an AMD
+     *      device's ordinal, or an Apple device's @c id<MTLDevice>.
      *  @param[in] device The vendor's ordinal of the device.
      *  @param[in] gpu_class The class whose bundle loads.
      *  @param[in] names The C names of the kernels to resolve, which outlive the tables.
@@ -190,8 +214,8 @@ class kernel_tables {
 
 /**
  *  @brief Opens @p device through @p drivers for @p gpu_class: retains an NVIDIA device's primary
- *      context, then loads the library's bundle of the class into @p cuda_kernels or
- *      @p hip_kernels, each once.
+ *      context, then loads the library's bundle of the class into @p cuda_kernels, @p hip_kernels
+ *      or @p metal_kernels, each once.
  *
  *  A device the bundle carries no code for keeps moving memory and refuses launches alone. No
  *  other open of the same device runs meanwhile.
@@ -201,8 +225,8 @@ class kernel_tables {
  *    no such vendor.
  */
 inline status_t open_gpu_device(gpu_drivers_t& drivers, gpu_device_t const& device, gpu_class_t gpu_class,
-                                kernel_tables<cuda_module_t>& cuda_kernels,
-                                kernel_tables<hip_module_t>& hip_kernels) noexcept {
+                                kernel_tables<cuda_module_t>& cuda_kernels, kernel_tables<hip_module_t>& hip_kernels,
+                                kernel_tables<metal_module_t>& metal_kernels) noexcept {
     int const ordinal = static_cast<int>(device.vendor_ordinal);
     if (device.vendor == gpu_vendor_t::nvidia_k) {
         cuda_context_handle_t const context = drivers.retain_context(ordinal);
@@ -216,6 +240,13 @@ inline status_t open_gpu_device(gpu_drivers_t& drivers, gpu_device_t const& devi
                                                                   vram_kernel_names_k);
         return {};
     }
+    if (device.vendor == gpu_vendor_t::apple_k) {
+        void* const handle = drivers.metal_devices.device(ordinal);
+        if (!handle) return {status_code_t::device_k, "Metal lists no device of the ordinal"};
+        [[maybe_unused]] status_t const loaded = metal_kernels.load(drivers.metal, handle, ordinal, gpu_class,
+                                                                    vram_apple_kernel_names_k);
+        return {};
+    }
     return {status_code_t::device_k, "No driver serves the device's vendor"};
 }
 
@@ -223,11 +254,12 @@ inline status_t open_gpu_device(gpu_drivers_t& drivers, gpu_device_t const& devi
  *  @p gpu_class, over its vendor's driver in @p drivers, queueing on @p stream, the caller's
  *  stream of that vendor or null for one of its own, its scratch capped at @p scratch_limit bytes,
  *  zero for no ceiling, moving bytes between the drives and an NVIDIA device as @p gds asks, and
- *  launching the library's kernels from the table of its device and class in @p cuda_kernels or
- *  @p hip_kernels, if one loaded. */
+ *  launching the library's kernels from the table of its device and class in @p cuda_kernels,
+ *  @p hip_kernels or @p metal_kernels, if one loaded. */
 template <typename variant_type_>
 status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_module_t> const& cuda_kernels,
-                            kernel_tables<hip_module_t> const& hip_kernels, gpu_device_t const& device,
+                            kernel_tables<hip_module_t> const& hip_kernels,
+                            kernel_tables<metal_module_t> const& metal_kernels, gpu_device_t const& device,
                             gpu_class_t gpu_class, void* stream, std::size_t scratch_limit, ustore_gds_t gds,
                             variant_type_& into) noexcept {
     int const ordinal = static_cast<int>(device.vendor_ordinal);
@@ -247,6 +279,19 @@ status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_mod
         if (!spawned) return spawned.status();
         into.template emplace<hip_executor_t>(std::move(*spawned));
         return {};
+    }
+    if (device.vendor == gpu_vendor_t::apple_k) {
+        // The NVMe compactor holds an NVIDIA or an AMD executor alone, as no Apple device compacts
+        if constexpr (!std::is_constructible_v<variant_type_, metal_executor_t>)
+            return {status_code_t::unsupported_k, "No compactor runs on an Apple device"};
+        else {
+            expected<metal_executor_t> spawned = metal_executor_t::spawn(
+                drivers.metal, drivers.metal_devices.device(ordinal), ordinal, stream, scratch_limit,
+                metal_kernels.table_of(ordinal, gpu_class));
+            if (!spawned) return spawned.status();
+            into.template emplace<metal_executor_t>(std::move(*spawned));
+            return {};
+        }
     }
     return {status_code_t::device_k, "No driver serves the device's vendor"};
 }

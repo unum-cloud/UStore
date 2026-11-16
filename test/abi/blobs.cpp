@@ -91,9 +91,9 @@ std::size_t database_open_clear_close(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     failures += check_binary_collection(collection);
     return failures;
@@ -106,9 +106,9 @@ std::size_t database_clear_collection_by_clearing_database(config_t const& confi
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     triplet_t triplet;
     auto reference = collection[triplet.keys];
@@ -117,10 +117,10 @@ std::size_t database_clear_collection_by_clearing_database(config_t const& confi
     failures += expect(collection.keys().size() == 3u);
     failures += expect(collection.pairs().size() == 3u);
 
-    failures += expect(database.clear(ustore_drop_pairs_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_pairs_k).succeeded());
     failures += check_length(reference, missing_length_k);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    failures += expect(!*database.contains("blobs"));
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    failures += expect(!*database.on().contains("blobs"));
     return failures;
 }
 
@@ -133,7 +133,7 @@ std::size_t database_describe(config_t const& config) {
     failures += expect(open_status.succeeded() && executor_status.succeeded());
     if (failures != 0) return failures;
 
-    auto [description, describe_status] = database.describe();
+    auto [description, describe_status] = database.on().describe();
     auto [deferred_description, deferred_status] = database.deferred(executor).describe().wait();
     failures += expect(describe_status.succeeded() && deferred_status.succeeded());
     failures += expect_eq(std::string_view {ustore_engine_name(description.engine)}, config.engine());
@@ -149,18 +149,18 @@ case_result_t database_clear_modes(config_t const& config) {
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
     failures += expect(open_status.succeeded() && executor_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [kept, create_status] = database.create("kept");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [kept, create_status] = database.on().create("kept");
     failures += expect(create_status.succeeded());
     if (failures != 0) return failures;
     failures += expect(kept[key_from_integer(5)].assign("value").succeeded());
 
-    failures += expect(database.clear(ustore_drop_pairs_k).succeeded());
-    failures += expect(*database.contains("kept"));
+    failures += expect(database.on().clear(ustore_drop_pairs_k).succeeded());
+    failures += expect(*database.on().contains("kept"));
     failures += expect(kept.keys().size() == 0u);
 
     failures += expect(database.deferred(executor).clear(ustore_drop_collection_k).wait().succeeded());
-    failures += expect(!*database.contains("kept"));
+    failures += expect(!*database.on().contains("kept"));
     return failures;
 }
 
@@ -172,8 +172,8 @@ std::size_t database_compact(config_t const& config) {
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
     failures += expect(open_status.succeeded() && executor_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [collection, create_status] = database.create("blobs");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     failures += expect(collection[key_from_integer(11)].assign("compacted").succeeded());
 
@@ -182,10 +182,10 @@ std::size_t database_compact(config_t const& config) {
         ++reports;
         return ustore_cancel_k;
     };
-    failures += expect_status(database.compact(cancelling), status_code_t::cancelled_k);
+    failures += expect_status(database.on().compact(cancelling), status_code_t::cancelled_k);
     failures += expect_status(database.deferred(executor).compact(cancelling).wait(), status_code_t::cancelled_k);
     failures += expect_eq(reports, 2u);
-    failures += expect(database.compact().succeeded());
+    failures += expect(database.on().compact().succeeded());
     failures += expect(collection[key_from_integer(11)].value() == "compacted");
     return failures;
 }
@@ -197,9 +197,9 @@ std::size_t database_overwrite_with_step(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
 
     for (std::uint64_t key = 1000; key != 1100; ++key)
@@ -231,18 +231,18 @@ std::size_t database_persistency(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     triplet_t triplet;
     {
-        auto [kept_collection, kept_status] = database.create("kept");
+        auto [kept_collection, kept_status] = database.on().create("kept");
         failures += expect(kept_status.succeeded());
         auto kept_reference = kept_collection[triplet.keys];
         failures += check_length(kept_reference, missing_length_k);
         failures += round_trip(kept_reference, triplet);
         failures += check_length(kept_reference, triplet_t::value_size_k);
 
-        auto [emptied_collection, emptied_status] = database.create("emptied");
+        auto [emptied_collection, emptied_status] = database.on().create("emptied");
         failures += expect(emptied_status.succeeded());
         auto emptied_reference = emptied_collection[triplet.keys];
         failures += check_length(emptied_reference, missing_length_k);
@@ -258,7 +258,7 @@ std::size_t database_persistency(config_t const& config) {
         if (failures != 0) return failures;
         database = std::move(reopened);
 
-        auto [kept_collection, kept_status] = database.find("kept");
+        auto [kept_collection, kept_status] = database.on().find("kept");
         failures += expect(kept_status.succeeded());
         auto kept_reference = kept_collection[triplet.keys];
         failures += check_equalities(kept_reference, triplet);
@@ -266,9 +266,9 @@ std::size_t database_persistency(config_t const& config) {
         failures += expect(kept_collection.keys().size() == 3u);
         failures += expect(kept_collection.pairs().size() == 3u);
 
-        failures += expect(database.contains("emptied"));
-        failures += expect(*database.contains("emptied"));
-        auto [emptied_collection, emptied_status] = database.find("emptied");
+        failures += expect(database.on().contains("emptied"));
+        failures += expect(*database.on().contains("emptied"));
+        auto [emptied_collection, emptied_status] = database.on().find("emptied");
         failures += expect(emptied_status.succeeded());
         auto emptied_reference = emptied_collection[triplet.keys];
         failures += check_length(emptied_reference, 0);
@@ -284,32 +284,32 @@ std::size_t database_named_collections(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     // A missing collection can't be dropped, and the empty name carries none
-    failures += expect(!*database.contains("unknown"));
-    failures += expect(database.drop("unknown").failed());
-    failures += expect(database.drop("").failed());
+    failures += expect(!*database.on().contains("unknown"));
+    failures += expect(database.on().drop("unknown").failed());
+    failures += expect(database.on().drop("").failed());
 
-    failures += expect(database["col1"]);
-    failures += expect(database["col2"]);
+    failures += expect(database.on().find_or_create("col1"));
+    failures += expect(database.on().find_or_create("col2"));
 
-    failures += expect(!database.create("col1"));
-    blobs_collection_t first_collection = *database["col1"];
-    failures += expect(!database.create("col2"));
-    blobs_collection_t second_collection = *database["col2"];
+    failures += expect(!database.on().create("col1"));
+    blobs_collection_t first_collection = *database.on().find_or_create("col1");
+    failures += expect(!database.on().create("col2"));
+    blobs_collection_t second_collection = *database.on().find_or_create("col2");
 
     failures += check_binary_collection(first_collection);
     failures += check_binary_collection(second_collection);
 
-    failures += expect(database.drop("col1").succeeded());
-    failures += expect(database.drop("col2").succeeded());
-    failures += expect(!*database.contains(""));
-    failures += expect(!*database.contains("col1"));
-    failures += expect(!*database.contains("col2"));
+    failures += expect(database.on().drop("col1").succeeded());
+    failures += expect(database.on().drop("col2").succeeded());
+    failures += expect(!*database.on().contains(""));
+    failures += expect(!*database.on().contains("col1"));
+    failures += expect(!*database.on().contains("col2"));
 
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    failures += expect(!*database.contains(""));
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    failures += expect(!*database.on().contains(""));
     return failures;
 }
 
@@ -320,13 +320,13 @@ case_result_t database_named_collections_race(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     constexpr std::size_t threads_count = 8;
     std::size_t created = 0;
     std::size_t refused = 0;
     auto task = [&](std::size_t) noexcept {
-        auto [collection, create_status] = database.create("contested");
+        auto [collection, create_status] = database.on().create("contested");
         if (create_status.succeeded())
             fu::standard_atomic_ref<std::size_t> {created}.store_add(1, std::memory_order_relaxed);
         else if (create_status == status_code_t::already_exists_k)
@@ -342,12 +342,12 @@ case_result_t database_named_collections_race(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
-    auto [collections, list_status] = database.collections(arena);
-    auto [found, find_status] = database.find("contested");
+    auto [collections, list_status] = database.on().collections(arena);
+    auto [found, find_status] = database.on().find("contested");
     failures += expect(list_status.succeeded() && find_status.succeeded());
     failures += expect_eq(collections.size(), 1u);
     failures += expect(collections.size() == 1 && ustore_collection_id_t(found) == collections[0]);
-    failures += expect(database.drop("contested").succeeded());
+    failures += expect(database.on().drop("contested").succeeded());
     return failures;
 }
 
@@ -358,15 +358,15 @@ case_result_t database_named_collections_list(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     // Every kind of collection handle creates a collection of its own modality
     std::array<std::string_view, 3> const names {"col1", "col2", "col3"};
     std::array<ustore_modality_t, 3> const modalities {ustore_modality_blobs_k, ustore_modality_docs_k,
                                                        ustore_modality_graph_k};
-    failures += expect(database.create<blobs_collection_t>(names[0]).has_value());
-    failures += expect(database.create<docs_collection_t>(names[1]).has_value());
-    failures += expect(database.create<graph_collection_t>(names[2]).has_value());
+    failures += expect(database.on().create<blobs_collection_t>(names[0]).has_value());
+    failures += expect(database.on().create<docs_collection_t>(names[1]).has_value());
+    failures += expect(database.on().create<graph_collection_t>(names[2]).has_value());
     ustore_outcome_t outcome {};
     ustore_collection_id_t unnamed {};
     ustore_collection_create_t create {};
@@ -415,14 +415,14 @@ case_result_t database_named_collections_list(config_t const& config) {
 
     // A typed lookup refuses a collection of another modality, and a typed creation makes one the
     // graph calls serve
-    failures += expect(database.find<docs_collection_t>("col3") == status_code_t::invalid_argument_k);
-    failures += expect(database.find<graph_collection_t>("col3").has_value());
-    auto friends = database.find_or_create<graph_collection_t>("friends");
+    failures += expect(database.on().find<docs_collection_t>("col3") == status_code_t::invalid_argument_k);
+    failures += expect(database.on().find<graph_collection_t>("col3").has_value());
+    auto friends = database.on().find_or_create<graph_collection_t>("friends");
     failures += expect(friends && friends->write_edge(edge_t {key_from_integer(1), key_from_integer(2)}).succeeded());
 
-    failures += expect(database.drop("col1").succeeded());
-    failures += expect(!*database.contains("col1"));
-    failures += expect(database.drop("").failed());
+    failures += expect(database.on().drop("col1").succeeded());
+    failures += expect(!*database.on().contains("col1"));
+    failures += expect(database.on().drop("").failed());
     return failures;
 }
 
@@ -433,7 +433,7 @@ case_result_t database_collections_resolve(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     // Nothing reaches an identifier the engine never handed out, the nil UUID among them, whatever
     // it keeps there itself
@@ -449,8 +449,8 @@ case_result_t database_collections_resolve(config_t const& config) {
     }
 
     // A modality fixes how a collection is keyed, and calls keyed the other way are refused
-    auto maybe_words = database.create<strings_collection_t>("words");
-    auto maybe_numbers = database.create("numbers");
+    auto maybe_words = database.on().create<strings_collection_t>("words");
+    auto maybe_numbers = database.on().create("numbers");
     failures += expect(maybe_words && maybe_numbers);
     if (!maybe_words || !maybe_numbers) return failures;
     ustore_collection_id_t const words = *maybe_words;
@@ -464,7 +464,7 @@ case_result_t database_collections_resolve(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
-    auto [listed, list_status] = database.collections(arena);
+    auto [listed, list_status] = database.on().collections(arena);
     failures += expect(list_status.succeeded());
     failures += expect_eq(listed.size(), 2u);
     ustore_outcome_t outcome {};
@@ -475,8 +475,8 @@ case_result_t database_collections_resolve(config_t const& config) {
     drop.mode = ustore_drop_collection_k;
     ustore_collection_drop(&drop);
     failures += expect_success(outcome);
-    failures += expect(!*database.contains("words"));
-    failures += expect(database.drop("numbers").succeeded());
+    failures += expect(!*database.on().contains("words"));
+    failures += expect(database.on().drop("numbers").succeeded());
     return failures;
 }
 
@@ -486,10 +486,10 @@ std::size_t database_clear_values(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     triplet_t triplet;
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     auto reference = collection[triplet.keys];
 
@@ -510,8 +510,8 @@ std::size_t database_presences(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [collection, create_status] = database.create("blobs");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
 
     constexpr std::size_t keys_count = 1000;
@@ -556,9 +556,9 @@ std::size_t database_batched_read_matches_single(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [first, first_status] = database.create("first");
-    auto [second, second_status] = database.create("second");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [first, first_status] = database.on().create("first");
+    auto [second, second_status] = database.on().create("second");
     failures += expect(first_status.succeeded() && second_status.succeeded());
     if (failures != 0) return failures;
 
@@ -630,7 +630,7 @@ std::size_t database_batched_read_matches_single(config_t const& config) {
         failures += expect_eq(mismatches, std::size_t {0});
     };
     compare();
-    failures += expect(database.compact().succeeded());
+    failures += expect(database.on().compact().succeeded());
     compare();
     return failures;
 }
@@ -642,10 +642,10 @@ case_result_t database_arena_reuse(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [first, first_status] = database.create("first");
-    auto [second, second_status] = database.create("second");
+    auto [first, first_status] = database.on().create("first");
+    auto [second, second_status] = database.on().create("second");
     failures += expect(first_status.succeeded() && second_status.succeeded());
     if (failures != 0) return failures;
     std::array<ustore_key_t, 2> const keys {key_from_integer(1), key_from_integer(2)};
@@ -677,7 +677,7 @@ case_result_t database_arena_reuse(config_t const& config) {
     second = blobs_collection_t {};
     failures += expect(kept == first_values[0]);
     failures += expect(kept_batch && kept_batch->size() == 2 && (*kept_batch)[1] == second_values[1]);
-    failures += expect(database.drop("first").succeeded() && database.drop("second").succeeded());
+    failures += expect(database.on().drop("first").succeeded() && database.on().drop("second").succeeded());
     return failures;
 }
 
@@ -687,8 +687,8 @@ std::size_t database_scan(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [collection, create_status] = database.create("blobs");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
 
     constexpr std::size_t keys_count = 1000;
@@ -714,8 +714,8 @@ std::size_t database_batch_scan(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [collection, create_status] = database.create("blobs");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
 
     std::array<ustore_key_t, 512> keys;
@@ -754,11 +754,12 @@ case_result_t database_transaction_read_committed(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    failures += expect(database.transaction());
-    transaction_t transaction = *database.transaction();
-    auto [collection, create_status] = database.create("blobs");
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().transaction());
+    transaction_t transaction = *database.on().transaction();
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
 
     triplet_t triplet;
@@ -768,8 +769,8 @@ case_result_t database_transaction_read_committed(config_t const& config) {
     auto collection_reference = collection[triplet.keys];
 
     failures += check_length(collection_reference, missing_length_k);
-    failures += expect(transaction.commit().has_value());
-    failures += expect(transaction.reset().succeeded());
+    failures += expect(transaction.on().commit().has_value());
+    failures += expect(transaction.on().reset().has_value());
 
     failures += check_equalities(collection_reference, triplet);
     return failures;
@@ -785,21 +786,21 @@ case_result_t database_transaction_snapshot_isolation(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     triplet_t triplet;
     triplet_t same_values_triplet;
     same_values_triplet.values = {'D', 'D', 'D'};
 
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     auto collection_reference = collection[triplet.keys];
 
     failures += check_length(collection_reference, missing_length_k);
     failures += round_trip(collection_reference, triplet);
 
-    auto snapshot = *database.snapshot();
+    auto snapshot = *database.on().snapshot();
     auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
     failures += check_equalities(snapshot_reference, triplet);
     failures += round_trip(collection_reference, same_values_triplet);
@@ -816,7 +817,7 @@ case_result_t database_transaction_snapshot_isolation(config_t const& config) {
         ++iterator;
     }
 
-    snapshot = *database.snapshot();
+    snapshot = *database.on().snapshot();
     auto reference = blobs_read_collection_t {snapshot.receiver(), collection}[same_values_triplet.keys];
     failures += check_equalities(reference, same_values_triplet);
     return failures;
@@ -828,34 +829,35 @@ case_result_t database_transaction_with_snapshot(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     triplet_t triplet;
     triplet_t same_values_triplet;
     same_values_triplet.values = {'D', 'D', 'D'};
 
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     auto collection_reference = collection[triplet.keys];
 
     failures += check_length(collection_reference, missing_length_k);
     failures += round_trip(collection_reference, triplet);
 
-    auto snapshot = *database.snapshot();
+    auto snapshot = *database.on().snapshot();
     auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
     failures += check_equalities(snapshot_reference, triplet);
 
     failures += round_trip(collection_reference, same_values_triplet);
 
-    transaction_t transaction = *database.transaction();
+    transaction_t transaction = *database.on().transaction();
     auto head_reference = blobs_collection_t {transaction.receiver(), collection}[triplet.keys];
     failures += check_equalities(head_reference, same_values_triplet);
     auto older_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
     failures += check_equalities(older_reference, triplet);
 
-    snapshot = *database.snapshot();
+    snapshot = *database.on().snapshot();
     auto newer_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
     failures += check_equalities(newer_reference, same_values_triplet);
     return failures;
@@ -875,42 +877,42 @@ case_result_t database_save_snapshot(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(original_config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     triplet_t triplet;
     triplet_t same_values_triplet;
     same_values_triplet.values = {'D', 'D', 'D'};
 
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     auto collection_reference = collection[triplet.keys];
     failures += round_trip(collection_reference, triplet);
 
-    auto first_snapshot = *database.snapshot();
-    failures += expect(first_snapshot.save(save_target(config, first_saved_directory).c_str()).succeeded());
+    auto first_snapshot = *database.on().snapshot();
+    failures += expect(first_snapshot.on().save(save_target(config, first_saved_directory).c_str()).succeeded());
     failures += check_equalities(collection_reference, triplet);
 
     config_t const first_config {config.options(), first_saved_directory.c_str()};
     auto [first_saved, first_saved_status] = open_database<database_t>(first_config);
     failures += expect(first_saved_status.succeeded());
     if (failures != 0) return failures;
-    auto [first_collection, first_find_status] = first_saved.find("blobs");
+    auto [first_collection, first_find_status] = first_saved.on().find("blobs");
     failures += expect(first_find_status.succeeded());
     auto first_reference = first_collection[triplet.keys];
     failures += check_equalities(first_reference, triplet);
 
     failures += round_trip(collection_reference, same_values_triplet);
 
-    auto second_snapshot = *database.snapshot();
-    failures += expect(second_snapshot.save(save_target(config, second_saved_directory).c_str()).succeeded());
+    auto second_snapshot = *database.on().snapshot();
+    failures += expect(second_snapshot.on().save(save_target(config, second_saved_directory).c_str()).succeeded());
     failures += check_equalities(collection_reference, same_values_triplet);
 
     config_t const second_config {config.options(), second_saved_directory.c_str()};
     auto [second_saved, second_saved_status] = open_database<database_t>(second_config);
     failures += expect(second_saved_status.succeeded());
     if (failures != 0) return failures;
-    auto [second_collection, second_find_status] = second_saved.find("blobs");
+    auto [second_collection, second_find_status] = second_saved.on().find("blobs");
     failures += expect(second_find_status.succeeded());
     auto second_reference = second_collection[same_values_triplet.keys];
     failures += check_equalities(second_reference, same_values_triplet);
@@ -937,17 +939,17 @@ case_result_t database_save_progress(config_t const& config) {
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
     failures += expect(open_status.succeeded() && executor_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     triplet_t triplet;
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     auto reference = collection[triplet.keys];
     failures += round_trip(reference, triplet);
 
     // Engines reporting per collection then report before the end, where the order of
     // the counts shows
-    auto [named, named_status] = database.create("saved");
+    auto [named, named_status] = database.on().create("saved");
     failures += expect(named_status.succeeded());
     if (failures != 0) return failures;
     auto named_reference = named[triplet.keys];
@@ -962,8 +964,8 @@ case_result_t database_save_progress(config_t const& config) {
         last_total = total;
         return ustore_continue_k;
     };
-    auto snapshot = *database.snapshot();
-    failures += expect(snapshot.save(save_target(config, blocking_directory).c_str(), recording).succeeded());
+    auto snapshot = *database.on().snapshot();
+    failures += expect(snapshot.on().save(save_target(config, blocking_directory).c_str(), recording).succeeded());
     failures += expect(last_total != 0 && last_finished == last_total);
 
     last_finished = 0;
@@ -981,19 +983,19 @@ case_result_t database_snapshot_with_threads(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
     triplet_t triplet;
     triplet_t same_values_triplet;
     same_values_triplet.values = {'D', 'D', 'D'};
 
-    auto [collection, create_status] = database.create("blobs");
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     auto reference = collection[triplet.keys];
     failures += round_trip(reference, triplet);
 
-    auto snapshot = *database.snapshot();
+    auto snapshot = *database.on().snapshot();
     auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
 
     failures += round_trip(reference, same_values_triplet);
@@ -1025,7 +1027,7 @@ case_result_t database_snapshot_with_threads(config_t const& config) {
             }
         }
         else if (acquire()) {
-            snapshot = *database.snapshot();
+            snapshot = *database.on().snapshot();
             is_reset = true;
             fu::standard_atomic_ref<bool> {snapshot_locked}.store(false, std::memory_order_release);
         }
@@ -1047,20 +1049,21 @@ case_result_t database_transaction_erase_missing(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    failures += expect(database.transaction());
-    auto [collection, create_status] = database.create("blobs");
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().transaction());
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
-    transaction_t first_transaction = *database.transaction();
-    transaction_t second_transaction = *database.transaction();
+    transaction_t first_transaction = *database.on().transaction();
+    transaction_t second_transaction = *database.on().transaction();
     blobs_collection_t first_inside {first_transaction.receiver(), collection};
     blobs_collection_t second_inside {second_transaction.receiver(), collection};
 
     failures += expect(second_inside.at(key_from_integer(7297309151944849401)).remove().succeeded());
     failures += expect(first_inside.at(key_from_integer(8640850744835793378)).remove().succeeded());
-    failures += expect(first_transaction.commit().has_value());
-    failures += expect(second_transaction.commit().has_value());
+    failures += expect(first_transaction.on().commit().has_value());
+    failures += expect(second_transaction.on().commit().has_value());
 
     failures += expect(collection.at(key_from_integer(8640850744835793378)).value() == value_view_t {});
     failures += expect(collection.at(key_from_integer(7297309151944849401)).value() == value_view_t {});
@@ -1074,20 +1077,21 @@ case_result_t database_transaction_write_conflicting(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    failures += expect(database.transaction());
-    auto [collection, create_status] = database.create("blobs");
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().transaction());
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
-    transaction_t first_transaction = *database.transaction();
-    transaction_t second_transaction = *database.transaction();
+    transaction_t first_transaction = *database.on().transaction();
+    transaction_t second_transaction = *database.on().transaction();
 
     failures += expect(
         blobs_collection_t {second_transaction.receiver(), collection}.at(key_from_integer(6)).assign("a").succeeded());
     failures += expect(
         blobs_collection_t {first_transaction.receiver(), collection}.at(key_from_integer(6)).assign("b").succeeded());
-    failures += expect(first_transaction.commit().has_value());
-    failures += expect(second_transaction.commit().failed());
+    failures += expect(first_transaction.on().commit().has_value());
+    failures += expect(second_transaction.on().commit().failed());
     return failures;
 }
 
@@ -1098,28 +1102,29 @@ case_result_t database_transaction_stamps(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    failures += expect(database.transaction());
-    transaction_t transaction = *database.transaction();
-    auto [collection, create_status] = database.create("blobs");
+    failures += expect(database.on().transaction());
+    transaction_t transaction = *database.on().transaction();
+    auto [collection, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
 
     triplet_t triplet;
     auto transaction_reference = blobs_collection_t {transaction.receiver(), collection}[triplet.keys];
 
     failures += expect(transaction_reference.assign(triplet.u64_layout()).succeeded());
-    auto [read_stamp, stage_status] = transaction.stage();
+    auto [read_stamp, stage_status] = transaction.on().stage();
     failures += expect(stage_status.succeeded());
-    auto [commit_stamp, commit_status] = transaction.commit();
+    auto [commit_stamp, commit_status] = transaction.on().commit();
     failures += expect(commit_status.succeeded());
     failures += expect(static_cast<ustore_stamp_t>(commit_stamp) > 0);
     failures += expect(static_cast<ustore_stamp_t>(read_stamp) <= static_cast<ustore_stamp_t>(commit_stamp));
-    failures += expect(transaction.reset().succeeded());
+    failures += expect(transaction.on().reset().has_value());
 
-    if (!database.supports_snapshots()) return failures;
-    auto [snapshot, snapshot_status] = database.snapshot();
+    if (!database.on().supports_snapshots()) return failures;
+    auto [snapshot, snapshot_status] = database.on().snapshot();
     failures += expect(snapshot_status.succeeded());
     failures += expect(static_cast<ustore_stamp_t>(commit_stamp) <= static_cast<ustore_stamp_t>(snapshot.read_stamp()));
     return failures;
@@ -1133,22 +1138,22 @@ case_result_t database_freed_first(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions() && !database.supports_snapshots())
+    if (!database.on().supports_transactions() && !database.on().supports_snapshots())
         return case_result_t::skipped("the engine keeps neither transactions nor snapshots", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     ustore_key_t const key = key_from_integer(91);
-    auto [head, create_status] = database.create("blobs");
+    auto [head, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
     failures += expect(head[key].assign("before").succeeded());
 
     expected<transaction_t> transaction = status_code_t::unsupported_k;
     expected<snapshot_t> snapshot = status_code_t::unsupported_k;
-    if (database.supports_transactions()) {
-        transaction = database.transaction();
+    if (database.on().supports_transactions()) {
+        transaction = database.on().transaction();
         failures += expect(transaction.has_value());
     }
-    if (database.supports_snapshots()) {
-        snapshot = database.snapshot();
+    if (database.on().supports_snapshots()) {
+        snapshot = database.on().snapshot();
         failures += expect(snapshot.has_value());
     }
     { database_t const freed = std::move(database); }
@@ -1156,8 +1161,8 @@ case_result_t database_freed_first(config_t const& config) {
     if (transaction) {
         blobs_collection_t inside {transaction->receiver(), head};
         failures += expect(inside[key].assign("after").succeeded());
-        failures += expect(transaction->commit().has_value());
-        failures += expect(transaction->reset().succeeded());
+        failures += expect(transaction->on().commit().has_value());
+        failures += expect(transaction->on().reset().has_value());
         failures += expect(inside[key].value() == "after");
     }
     if (snapshot) {
@@ -1383,7 +1388,8 @@ case_result_t blobs_filtered_scan_one_stamp_under_swaps(config_t const& config) 
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && writing_thread.has_value() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
     auto [collection, collection_status] = create_collection(database, "swaps.blobs", ustore_modality_blobs_k);
     failures += expect(collection_status.succeeded());
     if (failures != 0) return failures;

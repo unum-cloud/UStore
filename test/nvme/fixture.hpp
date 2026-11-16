@@ -231,7 +231,7 @@ struct test_environment_t {
         environment.device = options.device;
         environment.spdk_address = options.spdk_address;
         environment.transports = options.transports;
-        environment.seed = options.seed.value;
+        environment.seed = options.seed;
         return environment;
     }
 

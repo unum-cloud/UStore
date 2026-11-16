@@ -95,9 +95,9 @@ std::size_t database_docs_flat(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
     failures += expect(collection_status.succeeded());
     if (failures != 0) return failures;
     failures += expect(collection[key_from_integer(1)].assign(flat_documents_k[0]).succeeded());
@@ -111,7 +111,8 @@ std::size_t database_docs_flat(config_t const& config) {
 
     auto maybe_person = collection[collection_key_field_t {key_from_integer(1), "person"}].value(
         ustore_docs_field_type_string_k);
-    failures += expect_eq(std::string_view(maybe_person->c_str(), maybe_person->size()), std::string_view("Alice"));
+    failures += expect_eq(std::string_view(maybe_person->view().c_str(), maybe_person->size()),
+                          std::string_view("Alice"));
     return failures;
 }
 
@@ -121,8 +122,8 @@ std::size_t database_docs_nested_batch(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
     failures += expect(collection_status.succeeded());
     if (failures != 0) return failures;
 
@@ -177,8 +178,8 @@ std::size_t database_docs_modify(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
     failures += expect(collection_status.succeeded());
     if (failures != 0) return failures;
     failures += expect(collection[key_from_integer(1)].assign(nested_documents_k[0].data()).succeeded());
@@ -245,8 +246,8 @@ std::size_t database_docs_repeated_document(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
     failures += expect(collection_status.succeeded());
     if (failures != 0) return failures;
     failures += expect(collection[key_from_integer(1)].assign(R"({"a":1,"b":1})").succeeded());
@@ -405,8 +406,8 @@ std::size_t database_docs_merge_and_patch(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
     failures += expect(collection_status.succeeded());
     if (failures != 0) return failures;
 
@@ -422,9 +423,9 @@ std::size_t database_docs_table(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
     failures += expect(collection_status.succeeded());
     if (failures != 0) return failures;
     char const* const alice = R"({"person":"Alice","age":27,"height":1})";
@@ -557,15 +558,12 @@ std::size_t database_docs_table(config_t const& config) {
 
     // Multiple type-punned columns
     {
-        std::array<field_type_t, 6> const columns {{
-            field_type_t {"age", ustore_docs_field_type_i32_k},
-            field_type_t {"age", ustore_docs_field_type_string_k},
-            field_type_t {"person", ustore_docs_field_type_string_k},
-            field_type_t {"person", ustore_docs_field_type_f32_k},
-            field_type_t {"height", ustore_docs_field_type_i32_k},
-            field_type_t {"weight", ustore_docs_field_type_u64_k},
-        }};
-        table_header_view_t const header = make_table_header(columns);
+        std::array<std::string_view, 6> const fields {"age", "age", "person", "person", "height", "weight"};
+        std::array<ustore_docs_field_type_t, 6> const types {
+            ustore_docs_field_type_i32_k, ustore_docs_field_type_string_k, ustore_docs_field_type_string_k,
+            ustore_docs_field_type_f32_k, ustore_docs_field_type_i32_k,    ustore_docs_field_type_u64_k,
+        };
+        table_header_view_t const header = make_table_header(fields, types);
 
         auto maybe_table = collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3),
                                        key_from_integer(123456), key_from_integer(654321)}]

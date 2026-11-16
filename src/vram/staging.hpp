@@ -19,6 +19,8 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 #include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `gpu_executor_concept`, `on_another_vendor`
 
+#include "utilities/arguments.hpp" // `takes_keys_concept`, `takes_strings_concept`, `takes_fields_concept`
+
 namespace unum::ustore {
 
 using utilities::gpu_drivers_t;
@@ -123,29 +125,29 @@ status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor, ar
     input_stager<executor_type_> stager {drivers, executor};
     std::size_t const count = static_cast<std::size_t>(arguments.count);
     stager.stage(arguments.collections.data, arguments.collections.stride, count);
-    if constexpr (requires { arguments.keys.stride; }) stager.stage(arguments.keys.data, arguments.keys.stride, count);
-    if constexpr (requires { arguments.start_keys.stride; })
+    if constexpr (takes_keys_concept<arguments_type_>) stager.stage(arguments.keys.data, arguments.keys.stride, count);
+    if constexpr (takes_start_keys_concept<arguments_type_>)
         stager.stage(arguments.start_keys.data, arguments.start_keys.stride, count);
-    if constexpr (requires { arguments.vertices.stride; })
+    if constexpr (takes_vertices_concept<arguments_type_>)
         stager.stage(arguments.vertices.data, arguments.vertices.stride, count);
-    if constexpr (requires { arguments.roles.stride; })
+    if constexpr (takes_roles_concept<arguments_type_>)
         stager.stage(arguments.roles.data, arguments.roles.stride, count);
-    if constexpr (requires { arguments.elements.stride; })
+    if constexpr (takes_elements_concept<arguments_type_>)
         stager.stage(arguments.elements.data, arguments.elements.stride, count);
-    if constexpr (requires { arguments.offsets.stride; })
+    if constexpr (takes_offsets_concept<arguments_type_>)
         stager.stage(arguments.offsets.data, arguments.offsets.stride, count);
-    if constexpr (requires { arguments.limits.stride; })
+    if constexpr (takes_limits_concept<arguments_type_>)
         stager.stage(arguments.limits.data, arguments.limits.stride, count);
-    if constexpr (requires { arguments.strings.layout; }) stager.stage(arguments.strings, count);
-    if constexpr (requires { arguments.prefixes.layout; }) stager.stage(arguments.prefixes, count);
-    if constexpr (requires { arguments.start_strings.layout; }) stager.stage(arguments.start_strings, count);
-    if constexpr (requires { arguments.end_strings.layout; }) stager.stage(arguments.end_strings, count);
-    if constexpr (requires { arguments.fields_count; }) {
+    if constexpr (takes_strings_concept<arguments_type_>) stager.stage(arguments.strings, count);
+    if constexpr (takes_prefixes_concept<arguments_type_>) stager.stage(arguments.prefixes, count);
+    if constexpr (takes_start_strings_concept<arguments_type_>) stager.stage(arguments.start_strings, count);
+    if constexpr (takes_end_strings_concept<arguments_type_>) stager.stage(arguments.end_strings, count);
+    if constexpr (takes_typed_fields_concept<arguments_type_>) {
         std::size_t const fields_count = static_cast<std::size_t>(arguments.fields_count);
         stager.stage(arguments.fields, fields_count);
         stager.stage(arguments.outputs_types, fields_count * sizeof(*arguments.outputs_types));
     }
-    else if constexpr (requires { arguments.fields.layout; }) stager.stage(arguments.fields, count);
+    else if constexpr (takes_fields_concept<arguments_type_>) stager.stage(arguments.fields, count);
     return stager.finish();
 }
 

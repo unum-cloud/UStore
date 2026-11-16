@@ -59,9 +59,9 @@ std::size_t database_graph_write_vertices(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     std::array<ustore_key_t, 4> const vertices {key_from_integer(1), key_from_integer(4), key_from_integer(5),
                                                 key_from_integer(2)};
@@ -80,9 +80,9 @@ std::size_t database_graph_write_edge(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     edge_t const edge = edge_of(1, 2, 9);
     failures += expect(graph.write_edge(edge).succeeded());
@@ -189,9 +189,9 @@ std::size_t database_graph_triangle(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     std::array<edge_t, 3> triangle {edge_of(1, 2, 9), edge_of(2, 3, 10), edge_of(3, 1, 11)};
     failures += expect(graph.write_edge(triangle[0]).succeeded());
@@ -219,9 +219,9 @@ std::size_t database_graph_triangle_batch(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     std::array<edge_t, 3> triangle {edge_of(1, 2, 9), edge_of(2, 3, 10), edge_of(3, 1, 11)};
     failures += expect(graph.write_edges(edges(triangle)).succeeded());
@@ -240,24 +240,25 @@ case_result_t database_graph_transaction_watch(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     edge_t const edge_ab = edge_of('A', 'B', 19);
     edge_t const edge_bc = edge_of('B', 'C', 31);
     failures += expect(graph.write_edge(edge_ab).succeeded());
     failures += expect(graph.write_edge(edge_bc).succeeded());
 
-    transaction_t transaction = *database.transaction();
-    auto [transaction_graph, transaction_graph_status] = transaction.find<graph_collection_t>("graph");
+    transaction_t transaction = *database.on().transaction();
+    auto [transaction_graph, transaction_graph_status] = transaction.on().find<graph_collection_t>("graph");
     failures += expect(transaction_graph_status.succeeded());
     failures += expect(transaction_graph.degree(key_from_integer('B')) == 2);
     failures += expect(transaction_graph.remove_edge(edge_bc).succeeded());
     failures += expect(graph.remove_edge(edge_ab).succeeded());
 
-    failures += expect(transaction.commit().failed());
+    failures += expect(transaction.on().commit().failed());
     return failures;
 }
 
@@ -267,9 +268,9 @@ std::size_t database_graph_random_fill(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     st::vector<edge_t> generated;
     failures += expect(fill_edges(generated));
@@ -290,14 +291,15 @@ case_result_t database_graph_conflicting_transactions(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    failures += expect(database.create<graph_collection_t>("graph").has_value());
-    transaction_t first_transaction = *database.transaction();
-    auto [first_graph, first_graph_status] = first_transaction.find<graph_collection_t>("graph");
-    transaction_t second_transaction = *database.transaction();
-    auto [second_graph, second_graph_status] = second_transaction.find<graph_collection_t>("graph");
+    failures += expect(database.on().create<graph_collection_t>("graph").has_value());
+    transaction_t first_transaction = *database.on().transaction();
+    auto [first_graph, first_graph_status] = first_transaction.on().find<graph_collection_t>("graph");
+    transaction_t second_transaction = *database.on().transaction();
+    auto [second_graph, second_graph_status] = second_transaction.on().find<graph_collection_t>("graph");
     failures += expect(first_graph_status.succeeded() && second_graph_status.succeeded());
 
     edge_t const first_edge = edge_of(4, 5, 15);
@@ -305,8 +307,8 @@ case_result_t database_graph_conflicting_transactions(config_t const& config) {
 
     failures += expect(first_graph.write_edge(first_edge).succeeded());
     failures += expect(second_graph.write_edge(second_edge).succeeded());
-    failures += expect(first_transaction.commit().has_value());
-    failures += expect(second_transaction.commit().failed());
+    failures += expect(first_transaction.on().commit().has_value());
+    failures += expect(second_transaction.on().commit().failed());
     return failures;
 }
 
@@ -316,9 +318,9 @@ std::size_t database_graph_layering_shapes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
 
     std::array<ustore_key_t, 5> const vertices {key_from_integer(1), key_from_integer(2), key_from_integer(3),
@@ -371,9 +373,9 @@ std::size_t database_graph_remove_vertices(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     st::vector<edge_t> generated;
     failures += expect(fill_edges(generated));
@@ -406,9 +408,9 @@ std::size_t database_graph_remove_edges_keep_vertices(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     st::vector<edge_t> generated;
     failures += expect(fill_edges(generated));
@@ -429,9 +431,9 @@ std::size_t database_graph_get_vertex_edges(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     st::vector<edge_t> generated;
     failures += expect(fill_edges(generated));
@@ -467,9 +469,9 @@ std::size_t database_graph_degrees(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     std::array<ustore_key_t, graph_vertices_count_k> vertices;
     for (std::size_t index = 0; index != vertices.size(); ++index) vertices[index] = key_from_integer(index);
@@ -492,9 +494,9 @@ std::size_t database_graph_neighbors(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     failures += expect(graph.write_edge(edge_of(1, 1, 17)).succeeded());
     failures += expect(graph.write_edge(edge_of(1, 2, 15)).succeeded());

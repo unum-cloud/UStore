@@ -2,9 +2,9 @@
  *  @file test/nvme/compaction_device.cpp
  *  @author Ash Vardanian
  *  @date October 16, 2026
- *  @brief The compaction suite's device build: device zero's table of the library's kernels, which
- *      the library this build links embeds, its device compactor instantiated there for the
- *      engine's key slots the suite merges.
+ *  @brief The compaction suite's device build: the table of the library's kernels on device zero of
+ *      either vendor, which the library this build links embeds, its device compactors instantiated
+ *      there for the engine's key slots the suite merges.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -21,5 +21,13 @@ kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t& drivers,
     if (!list_nvidia_gpu_devices(drivers.cuda, {&device, 1})) return nullptr;
     gpu_class_t const gpu_class = pick_gpu_class(drivers, device, gpu_class_t::unknown_k);
     if (tables.load(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class, vram_kernel_names_k).failed()) return nullptr;
+    return tables.table_of(0, gpu_class);
+}
+
+kernel_table<hip_module_t> const* suite_kernels(gpu_drivers_t& drivers, kernel_tables<hip_module_t>& tables) noexcept {
+    gpu_device_t device;
+    if (!list_amd_gpu_devices(drivers.hip, {&device, 1})) return nullptr;
+    gpu_class_t const gpu_class = pick_gpu_class(drivers, device, gpu_class_t::unknown_k);
+    if (tables.load(drivers.hip, 0, 0, gpu_class, vram_kernel_names_k).failed()) return nullptr;
     return tables.table_of(0, gpu_class);
 }

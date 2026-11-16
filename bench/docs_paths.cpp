@@ -118,15 +118,24 @@ std::size_t write_tweet(splitmix64_t& random, std::uint64_t id, char* buffer, st
         text_length += chosen.size();
     }
     std::uint64_t const user = random.next() % 1'000'000;
-    auto const
-        written =
-            fmt::format_to_n(
-                buffer, capacity,
-                R"({{"id":{0},"id_str":"{0}","created_at":"Fri Oct 16 12:{1:02}:{2:02} +0000 2026","text":"{3}",)" R"("source":"<a href=\"https://ustore.example\" rel=\"nofollow\">UStore</a>","truncated":false,)" R"("lang":"{4}","retweet_count":{5},"favorite_count":{6},"possibly_sensitive":{7},"score":{8},)" R"("user":{{"id":{9},"id_str":"{9}","screen_name":"user_{9}","name":"User {9}","followers_count":{10},)" R"("friends_count":{11},"statuses_count":{12},"verified":{7},"location":"London, UK",)" R"("description":"Writes about databases, storage engines and the occasional JSON parser.",)" R"("url":"https://t.co/u{9}","created_at":"Mon Jan 01 00:00:00 +0000 2018","time_zone":null,)" R"("profile_image_url_https":"https://pbs.twimg.com/profile_images/{9}/photo_normal.jpg",)" R"("default_profile":true,"protected":false}},"entities":{{"hashtags":[{{"text":"tag{5}","indices":[3,9]}},)" R"({{"text":"ustore","indices":[12,19]}}],"user_mentions":[{{"screen_name":"user_{11}","id":{11},)" R"("indices":[20,30]}}],"urls":[{{"url":"https://t.co/{13:x}","expanded_url":"https://example.com/{9}/{0}",)" R"("indices":[40,63]}}]}},"coordinates":null,"place":null,"in_reply_to_status_id":null)",
-                id, draw % 60, (draw >> 6) % 60, std::string_view {text, text_length},
-                languages_k[(draw >> 12) % std::size(languages_k)], (draw >> 16) % 5000, (draw >> 28) % 20000,
-                (draw >> 40) % 2 ? "true" : "false", static_cast<double>(draw % 100'000) / 1000.0, user,
-                random.next() % 10'000'000, random.next() % 5000, random.next() % 100'000, random.next());
+    auto const written = fmt::format_to_n(
+        buffer, capacity,
+        R"({{"id":{0},"id_str":"{0}","created_at":"Fri Oct 16 12:{1:02}:{2:02} +0000 2026","text":"{3}",)"            //
+        R"("source":"<a href=\"https://ustore.example\" rel=\"nofollow\">UStore</a>","truncated":false,)"             //
+        R"("lang":"{4}","retweet_count":{5},"favorite_count":{6},"possibly_sensitive":{7},"score":{8},)"              //
+        R"("user":{{"id":{9},"id_str":"{9}","screen_name":"user_{9}","name":"User {9}","followers_count":{10},)"      //
+        R"("friends_count":{11},"statuses_count":{12},"verified":{7},"location":"London, UK",)"                       //
+        R"("description":"Writes about databases, storage engines and the occasional JSON parser.",)"                 //
+        R"("url":"https://t.co/u{9}","created_at":"Mon Jan 01 00:00:00 +0000 2018","time_zone":null,)"                //
+        R"("profile_image_url_https":"https://pbs.twimg.com/profile_images/{9}/photo_normal.jpg",)"                   //
+        R"("default_profile":true,"protected":false}},"entities":{{"hashtags":[{{"text":"tag{5}","indices":[3,9]}},)" //
+        R"({{"text":"ustore","indices":[12,19]}}],"user_mentions":[{{"screen_name":"user_{11}","id":{11},)"           //
+        R"("indices":[20,30]}}],"urls":[{{"url":"https://t.co/{13:x}","expanded_url":"https://example.com/{9}/{0}",)" //
+        R"("indices":[40,63]}}]}},"coordinates":null,"place":null,"in_reply_to_status_id":null)",
+        id, draw % 60, (draw >> 6) % 60, std::string_view {text, text_length},
+        languages_k[(draw >> 12) % std::size(languages_k)], (draw >> 16) % 5000, (draw >> 28) % 20000,
+        (draw >> 40) % 2 ? "true" : "false", static_cast<double>(draw % 100'000) / 1000.0, user,
+        random.next() % 10'000'000, random.next() % 5000, random.next() % 100'000, random.next());
     return written.size < capacity ? written.size : 0;
 }
 
@@ -318,7 +327,7 @@ int main(int argc, char** argv) {
     }
     executor_t& executor = *maybe_executor;
     corpus_t corpus;
-    if (!generate_corpus(settings.documents.value, settings.seed.value, corpus)) {
+    if (!generate_corpus(settings.documents.value, settings.seed, corpus)) {
         fmt::println(stderr, "Failed to generate the documents");
         return 1;
     }

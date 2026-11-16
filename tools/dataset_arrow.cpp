@@ -18,7 +18,7 @@
 
 #if USTORE_OS_WINDOWS_
 #include <fcntl.h>    // `_O_RDONLY`, `_O_BINARY`
-#include <io.h>       // `_read`, `_write`, `_open`, `_close`
+#include <io.h>       // `_read`, `_write`, `_open`, `_close`, `_commit`
 #include <sys/stat.h> // `_S_IREAD`, `_S_IWRITE`
 #else
 #include <fcntl.h>   // `open`
@@ -48,7 +48,7 @@
 
 #include "arrow_ipc.hpp" // `ipc_read_prefix`, `ipc_write_batch`, `ipc_batch_to_arrow`
 #include "dataset.h"     // `ustore_dataset_import_t`, `ustore_dataset_export_t`
-#include "dataset.hpp"   // `format_of`, `failed`, `copy_path`, `task_arena_t`
+#include "dataset.hpp"   // `format_of`, `failed`, `copy_path`, `task_arena_t`, `staged_output_t`
 
 namespace unum::ustore::tools {
 
@@ -129,6 +129,7 @@ struct output_piece_t {
 [[nodiscard]] int create_for_writing(char const* path) noexcept {
     return ::_open(path, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
 }
+[[nodiscard]] bool flush_descriptor(int descriptor) noexcept { return ::_commit(descriptor) == 0; }
 [[nodiscard]] bool close_descriptor(int descriptor) noexcept { return ::_close(descriptor) == 0; }
 
 #else
@@ -169,7 +170,11 @@ struct output_piece_t {
 
 [[nodiscard]] int open_for_reading(char const* path) noexcept { return ::open(path, O_RDONLY | O_CLOEXEC); }
 [[nodiscard]] int create_for_writing(char const* path) noexcept {
-    return ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    // A link at the temporary's name is refused, not followed, as the library's temporaries are
+    return ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+}
+[[nodiscard]] bool flush_descriptor(int descriptor) noexcept {
+    return utilities::flush_native_file(descriptor).succeeded();
 }
 [[nodiscard]] bool close_descriptor(int descriptor) noexcept { return ::close(descriptor) == 0; }
 
@@ -213,6 +218,9 @@ class input_bytes_t {
 
     /** The descriptor this input opened, none for standard input and mappings. */
     owned_descriptor_t owned_;
+
+    /** Bytes @c take handed out off the descriptor, which a progress report counts. */
+    std::size_t taken_off_descriptor_ = 0;
 
     /** Bytes @c peek read ahead off the descriptor, which @c take hands out first. */
     std::array<std::byte, 8> peeked_ {};
@@ -288,8 +296,16 @@ class input_bytes_t {
             *outcome = {ustore_status_out_of_memory_k, "Failed to buffer the Arrow input"};
             return {};
         }
-        return {storage.data(), read_into(storage.data(), count, outcome)};
+        std::size_t const filled = read_into(storage.data(), count, outcome);
+        taken_off_descriptor_ += filled;
+        return {storage.data(), filled};
     }
+
+    /** Bytes taken so far, which a progress report counts. */
+    [[nodiscard]] std::size_t taken() const noexcept { return descriptor_ < 0 ? cursor_ : taken_off_descriptor_; }
+
+    /** Bytes of a mapped input, or zero for one read in order, whose end is unknown. */
+    [[nodiscard]] std::size_t size() const noexcept { return whole_.size(); }
 };
 
 /** One batch handed out of an input stream, which owns its body when it was read off a descriptor,
@@ -606,22 +622,32 @@ class output_descriptor_t {
     /** The file this output created, none for standard output. */
     owned_descriptor_t owned_;
 
+    /** The target and the temporary a file output writes first, unused for standard output. */
+    staged_output_t staged_;
+
   public:
 
-    /** Creates or truncates @p path, or takes standard output for @c -. */
+    /** Creates the temporary beside @p path, or takes standard output for @c -. */
     void open(char const* path, ustore_outcome_t* outcome) noexcept {
         if (std::string_view {path} == "-") {
             descriptor_ = 1;
             return;
         }
-        owned_ = owned_descriptor_t {create_for_writing(path)};
+        staged_.stage(path, outcome);
+        if (failed(outcome)) return;
+        owned_ = owned_descriptor_t {create_for_writing(staged_.temporary())};
         descriptor_ = owned_.get();
         if (descriptor_ < 0) *outcome = {ustore_status_io_k, "Failed to create the Arrow output"};
     }
 
-    /** Closes a created file, reporting a failure the destructor would ignore. */
+    /** Makes a created temporary durable and closes it, reporting a failure the destructor would
+     *  ignore, then lands it over the target while @p outcome holds success and removes it
+     *  otherwise, so a file already at the target never holds a partial export. */
     void close(ustore_outcome_t* outcome) noexcept {
+        if (owned_.get() >= 0 && !failed(outcome) && !flush_descriptor(owned_.get()))
+            *outcome = {ustore_status_io_k, "Failed to flush the Arrow output"};
         if (!owned_.close() && !failed(outcome)) *outcome = {ustore_status_io_k, "Failed to close the Arrow output"};
+        staged_.land(outcome);
     }
 
     [[nodiscard]] int get() const noexcept { return descriptor_; }
@@ -1202,6 +1228,8 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
             if (!failed(task.outcome)) written += rows.count;
             current.release(&current);
             current = upcoming, upcoming = {};
+            if (!failed(task.outcome) && current.release) [[maybe_unused]]
+                bool const goes_on = advance(task, input.taken(), input.size());
         }
         if (current.release) current.release(&current);
     }
@@ -1223,6 +1251,8 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
             if (rows_of(schema, batch, columns, rows, task.outcome)) append_rows(ingest, rows, task.outcome);
             if (!failed(task.outcome)) written += rows.count;
             batch.release(&batch);
+            if (!failed(task.outcome)) [[maybe_unused]]
+                bool const goes_on = advance(task, input.taken(), input.size());
         }
         if (!failed(task.outcome)) {
             ustore_ingest_finish_t finish {.ingest = ingest, .outcome = task.outcome, .durability = task.durability};
@@ -1322,6 +1352,8 @@ void ustore_dataset_export(ustore_dataset_export_t* task_pointer) {
                 *task.outcome = outcome_of(status);
             else writer.append(schema, decoded, task.outcome);
             rows += count;
+            if (!failed(task.outcome)) [[maybe_unused]]
+                bool const goes_on = advance(task, rows, 0);
         }
     }
     if (!failed(task.outcome)) writer.finish(schema, task.outcome);

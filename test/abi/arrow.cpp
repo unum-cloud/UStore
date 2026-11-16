@@ -974,6 +974,62 @@ case_result_t arrow_ingest_contends_a_second_append(config_t const& config) {
     return failures;
 }
 
+/** A clear, a create, a drop, a flush or a compaction an open ingest would outlast answers
+ *  contended at once, changing nothing, and serves once the ingest finished; an engine that
+ *  ingests nothing never holds one open. */
+case_result_t arrow_ingest_contends_a_clear(config_t const& config) {
+    if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
+    std::size_t failures = 0;
+    fixture_t fixture {config};
+    if (!fixture.database) return failures + 1;
+    ustore_collection_id_t const collection = fixture.create("cleared", ustore_modality_blobs_k);
+    modality_rows_t const rows {ustore_modality_blobs_k, 2};
+    failures += fill(fixture.database, collection, ustore_modality_blobs_k, rows);
+    std::optional<std::string> const before = stored_value(fixture.database, collection, key_from_integer(1));
+    ingest_t ingest {fixture.database, collection, ustore_ingest_unsorted_k};
+    failures += expect_succeeded(ingest.outcome);
+    failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
+    for (ustore_drop_mode_t const mode : {ustore_drop_collection_k, ustore_drop_pairs_k, ustore_drop_values_k}) {
+        ustore_outcome_t cleared {};
+        ustore_database_clear_t clear {.database = fixture.database, .outcome = &cleared, .mode = mode};
+        ustore_database_clear(&clear);
+        failures += expect_status(status_t {cleared}, status_code_t::contended_k);
+    }
+    ustore_outcome_t created {};
+    ustore_collection_id_t made {};
+    ustore_collection_create_t create {.database = fixture.database,
+                                       .outcome = &created,
+                                       .modality = ustore_modality_blobs_k,
+                                       .name = {reinterpret_cast<uint8_t const*>("later"), 5},
+                                       .collection = &made};
+    ustore_collection_create(&create);
+    failures += expect_status(status_t {created}, status_code_t::contended_k);
+    ustore_outcome_t dropped {};
+    ustore_collection_drop_t drop {.database = fixture.database,
+                                   .outcome = &dropped,
+                                   .collection = collection,
+                                   .mode = ustore_drop_pairs_k};
+    ustore_collection_drop(&drop);
+    failures += expect_status(status_t {dropped}, status_code_t::contended_k);
+    ustore_outcome_t flushed {};
+    ustore_database_flush_t flush {.database = fixture.database, .outcome = &flushed};
+    ustore_database_flush(&flush);
+    failures += expect_status(status_t {flushed}, status_code_t::contended_k);
+    ustore_outcome_t compacted {};
+    ustore_database_compact_t compact {.database = fixture.database, .outcome = &compacted};
+    ustore_database_compact(&compact);
+    failures += expect_status(status_t {compacted}, status_code_t::contended_k);
+    failures += expect(stored_value(fixture.database, collection, key_from_integer(1)) == before);
+    failures += expect_succeeded(ingest.finish());
+    ustore_database_flush(&flush);
+    failures += expect_succeeded(flushed);
+    ustore_outcome_t cleared {};
+    ustore_database_clear_t clear {.database = fixture.database, .outcome = &cleared, .mode = ustore_drop_pairs_k};
+    ustore_database_clear(&clear);
+    failures += expect_succeeded(cleared);
+    return failures;
+}
+
 /** A freed ingest that never finished lands nothing. */
 case_result_t arrow_ingest_freed_lands_nothing(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
@@ -1088,6 +1144,7 @@ int main(int argc, char** argv) {
     report(totals, "arrow.ingest_last_repeat_wins", arrow_ingest_last_repeat_wins, config);
     report(totals, "arrow.ingest_refuses_a_descending_key", arrow_ingest_refuses_a_descending_key, config);
     report(totals, "arrow.ingest_contends_a_second_append", arrow_ingest_contends_a_second_append, config);
+    report(totals, "arrow.ingest_contends_a_clear", arrow_ingest_contends_a_clear, config);
     report(totals, "arrow.ingest_freed_lands_nothing", arrow_ingest_freed_lands_nothing, config);
     report(totals, "arrow.ingest_spares_older_snapshots", arrow_ingest_spares_older_snapshots, config);
     report(totals, "arrow.ingest_conflicts_older_transactions", arrow_ingest_conflicts_older_transactions, config);

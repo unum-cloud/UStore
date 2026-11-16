@@ -301,9 +301,10 @@ typedef struct ustore_database_init_ram_t {
     /** How transactions see each other. */
     ustore_isolation_t isolation;
 
-    /** The CPU class the database confines its waits, atomics and string kernels to, where zero takes what the CPU
-     *  offers. */
-    ustore_cpu_class_t cpu_class;
+    /** The newest CPU class the database may confine its waits, atomics and string kernels to,
+     *  intersected with what the CPU runs, so a class the CPU lacks narrows the pick rather than
+     *  refusing it; zero sets none. The description reports the class picked. */
+    ustore_cpu_class_t cpu_class_ceiling;
 
 } ustore_database_init_ram_t;
 
@@ -315,8 +316,9 @@ typedef struct ustore_database_init_ram_t {
  *  - @c ustore_status_device_k The executor computes on a device.
  *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, or the isolation or the
- *    CPU class is unknown.
- *  - @c ustore_status_unsupported_k The CPU does not run the @c cpu_class.
+ *    CPU class ceiling is unknown.
+ *  - @c ustore_status_unsupported_k No class this build compiled fits under the ceiling on this
+ *    CPU, as when a monoversioned build targets a newer one.
  */
 USTORE_EXPORT void ustore_database_init_ram(ustore_database_init_ram_t* arguments);
 
@@ -341,9 +343,10 @@ typedef struct ustore_database_open_ram_t {
     /** How transactions see each other. */
     ustore_isolation_t isolation;
 
-    /** The CPU class the database confines its waits, atomics and string kernels to, where zero takes what the CPU
-     *  offers. */
-    ustore_cpu_class_t cpu_class;
+    /** The newest CPU class the database may confine its waits, atomics and string kernels to,
+     *  intersected with what the CPU runs, so a class the CPU lacks narrows the pick rather than
+     *  refusing it; zero sets none. The description reports the class picked. */
+    ustore_cpu_class_t cpu_class_ceiling;
 
 } ustore_database_open_ram_t;
 
@@ -356,8 +359,9 @@ typedef struct ustore_database_open_ram_t {
  *  - @c ustore_status_device_k The executor computes on a device.
  *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c directory is empty, the @c database output
- *    is @c NULL, or the isolation or the CPU class is unknown.
- *  - @c ustore_status_unsupported_k The CPU does not run the @c cpu_class.
+ *    is @c NULL, or the isolation or the CPU class ceiling is unknown.
+ *  - @c ustore_status_unsupported_k No class this build compiled fits under the ceiling on this
+ *    CPU, as when a monoversioned build targets a newer one.
  *  - @c ustore_status_not_found_k The directory does not exist.
  *  - @c ustore_status_malformed_k The image has an unknown format, is truncated or names an unknown
  *    modality.
@@ -513,8 +517,9 @@ typedef struct ustore_database_open_nvme_t {
     /** Entries of @c data_directories. */
     ustore_size_t data_directories_count;
 
-    /** Executor of @c ustore_executor_for_vram whose device, scratch budget and GPUDirect Storage mode every merge of
-     *  the database takes, read once here, so it may be freed afterwards; @c NULL merges on host threads. */
+    /** Executor of @c ustore_executor_for_vram on an NVIDIA or AMD device, whose device, scratch
+     *  budget and, on NVIDIA, GPUDirect Storage mode every merge of the database takes, read once
+     *  here, so it may be freed afterwards; @c NULL merges on host threads. */
     ustore_executor_t compactions;
 
     /** Bytes of host memory the engine may pin and cache. */
@@ -547,9 +552,10 @@ typedef struct ustore_database_open_nvme_t {
     /** Bytes of the largest value of a collection whose values vary in size. */
     ustore_size_t collection_value_max_size;
 
-    /** The CPU class the database confines its waits, atomics and string kernels to, where zero takes what the CPU
-     *  offers. */
-    ustore_cpu_class_t cpu_class;
+    /** The newest CPU class the database may confine its waits, atomics and string kernels to,
+     *  intersected with what the CPU runs, so a class the CPU lacks narrows the pick rather than
+     *  refusing it; zero sets none. The description reports the class picked. */
+    ustore_cpu_class_t cpu_class_ceiling;
 
 } ustore_database_open_nvme_t;
 
@@ -559,9 +565,9 @@ typedef struct ustore_database_open_nvme_t {
  *
  *  @par Statuses:
  *  @c ustore_status_unsupported_k means the library was built without the engine, SPDK is asked
- *  for, the manifest or a slot has another format version, the @c compactions executor is given
- *  to a library built without a CUDA compiler or drives an AMD device, the CPU does not run the
- *  @c cpu_class, or the io_uring transport was named on a kernel without one.
+ *  for, the manifest or a slot has another format version, the @c compactions executor drives an
+ *  NVIDIA or AMD device that loaded no bundle of the library's kernels, the io_uring transport was
+ *  named on a kernel without one, or no compiled class fits under the @c cpu_class_ceiling.
  *
  *  - @c ustore_status_device_k The executor computes on a device, or the @c compactions executor is
  *    no VRAM one.
@@ -569,7 +575,7 @@ typedef struct ustore_database_open_nvme_t {
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory is
  *    empty or names no @c .ustore.json file nor raw address, the counted @c data_directories are
  *    @c NULL, one has an empty path or a path past the platform's limit, the transport or the CPU
- *    class is unknown, or a size or count is out of range.
+ *    class ceiling is unknown, or a size or count is out of range.
  *  - @c ustore_status_out_of_memory_k The @c memory_limit refuses the arena or the channels.
  *  - @c ustore_status_not_found_k The manifest's directory does not exist.
  *  - @c ustore_status_already_exists_k The first slot of a raw medium belongs to something else.
@@ -594,8 +600,8 @@ typedef struct ustore_database_description_t {
      *  elsewhere. */
     ustore_isolation_t isolation;
 
-    /** The CPU class the engine's calls run as, picked at open; @c ustore_cpu_class_unknown_k for
-     *  the RocksDB and LevelDB engines, which run no class's kernels. */
+    /** The CPU class the engine's calls run as, picked at open under the @c cpu_class_ceiling, or
+     *  @c ustore_cpu_class_unknown_k for RocksDB and LevelDB, which run no class's kernels. */
     ustore_cpu_class_t cpu_class;
 
     /** Keys across every collection. */
@@ -679,7 +685,8 @@ typedef struct ustore_database_clear_t {
  *  to its holder.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor serves another call.
+ *  - @c ustore_status_contended_k The executor serves another call, or an ingest of the database is
+ *    open, which holds what a clear rewrites until its finish or free; nothing changes.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
@@ -691,6 +698,18 @@ typedef struct ustore_database_clear_t {
  *    engines.
  */
 USTORE_EXPORT void ustore_database_clear(ustore_database_clear_t* arguments);
+
+/**
+ *  @brief One compaction in flight: the phase it reached, and the list of collections it opened
+ *      with, which it owns.
+ *
+ *  A @c ustore_database_compact holding it continues where a cancel stopped it;
+ *  @c ustore_database_compact_plan_finish frees it. A plan opens only with an executor, and each
+ *  call names the database and the executor the plan was opened with, both of which must outlive
+ *  the call and the plan's finish, and the plan's finish waits for a call still continuing it.
+ *  A database admits one live plan at a time.
+ */
+typedef struct ustore_database_compact_plan_handle_t* ustore_database_compact_plan_t;
 
 /** The arguments of @c ustore_database_compact. */
 typedef struct ustore_database_compact_t {
@@ -707,30 +726,86 @@ typedef struct ustore_database_compact_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Optional callback reporting the compaction's advance. */
+    /** The @b optional handler, called at every barrier of every phase with that phase's units; a
+     *  cancel stops at that barrier and answers @c ustore_status_cancelled_k. */
     ustore_progress_callback_t progress;
 
     /** Opaque pointer passed to @c progress. */
     void* progress_state;
 
+    /** The @b optional plan: @c NULL runs the compaction to its end, and a cancel keeps what it
+     *  compacted; with an @c executor, a @c NULL pointee opens one that a cancel leaves live, and a
+     *  live one continues from the phase it stopped at. */
+    ustore_database_compact_plan_t* plan;
+
+    /** The @b optional output for where this call stopped, @c ustore_phase_done_k once the
+     *  compaction ended. */
+    ustore_phase_progress_t* phase;
+
 } ustore_database_compact_t;
 
 /**
- *  @brief Reclaims the space overwritten and removed data still takes: RocksDB and LevelDB flush and compact their
- *      trees, and the RAM engine frees the versions no reader needs and rewrites its image.
+ *  @brief Reclaims the space overwritten and removed data still takes: RocksDB and LevelDB flush
+ *      and compact their trees, the NVMe engine flushes its memory runs and merges its levels, and
+ *      the RAM engine frees the versions no reader needs and rewrites its image.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  The work runs one collection at a time, and its progress counts the bytes of the collections compacted where the
- *  engine measures them, as RocksDB does, and one unit per collection elsewhere. A cancelled compaction stops between
- *  collections, keeping what it compacted.
+ *  The work runs in phases, @c ustore_phase_flush_k, @c ustore_phase_merge_k and
+ *  @c ustore_phase_reclaim_k, each engine running the ones it has, in tasks: a collection on RAM
+ *  and a column family on RocksDB, while the NVMe and LevelDB merges repeat in passes of one task,
+ *  over the levels due and over each collection's key range. With an @c executor, the tasks of one
+ *  phase run at once on its threads. Each barrier reports its phase's units: the bytes of its tasks
+ *  where the engine measures them, as RocksDB does, and one per task elsewhere. A cancel starts no
+ *  further phase, keeping what the phases run compacted; with a @c plan, the next call naming it
+ *  continues from the phase it stopped at, and @c ustore_database_compact_plan_finish frees it. A
+ *  call naming no plan runs one of its own to its end, freeing it after.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
+ *  - @c ustore_status_invalid_argument_k A @c plan without an @c executor, or a live @c plan
+ *    opened on another database or executor.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_contended_k The executor serves another call, another live plan compacts
+ *    the database, or an ingest of the database is open; the call changes nothing.
+ *  - @c ustore_status_cancelled_k The @c progress callback stopped the call; a plan stays live.
  */
 USTORE_EXPORT void ustore_database_compact(ustore_database_compact_t* arguments);
+
+/** The arguments of @c ustore_database_compact_plan_finish, which has no report: the plan's
+ *  progress is the whole account of a compaction. */
+typedef struct ustore_database_compact_plan_finish_t {
+
+    /** The database the plan was opened on. */
+    ustore_database_t database;
+
+    /** The executor the plan was opened with. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** The plan to close; freed by the call, whatever it answers. */
+    ustore_database_compact_plan_t plan;
+
+} ustore_database_compact_plan_finish_t;
+
+/**
+ *  @brief Frees @c plan whatever the call answers, so another compaction may open on the database.
+ *
+ *  A plan a cancel stopped keeps what it compacted, as a cancelled call without a plan does; one
+ *  that ran to its end has nothing left to close.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_uninitialized_k The @c database is @c NULL; the plan is still freed.
+ *  - @c ustore_status_invalid_argument_k A @c NULL @c plan, or one opened on another database or
+ *    executor; the plan is still freed.
+ *  - @c ustore_status_contended_k The executor serves another call; the plan is still freed.
+ */
+USTORE_EXPORT void ustore_database_compact_plan_finish(ustore_database_compact_plan_finish_t* arguments);
 
 /** The arguments of @c ustore_database_flush. */
 typedef struct ustore_database_flush_t {
@@ -758,7 +833,8 @@ typedef struct ustore_database_flush_t {
  *  until its compaction lands.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor serves another call.
+ *  - @c ustore_status_contended_k The executor serves another call, or an ingest of the database is
+ *    open, which holds what this call rewrites until its finish or free; the call changes nothing.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
@@ -1059,7 +1135,8 @@ typedef struct ustore_collection_create_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor serves another call.
+ *  - @c ustore_status_contended_k The executor serves another call, or an ingest of the database is
+ *    open, which holds what this call rewrites until its finish or free; the call changes nothing.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_invalid_argument_k The @c modality is unknown, the @c name starts with @c _ or
@@ -1164,7 +1241,8 @@ typedef struct ustore_collection_drop_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_contended_k The executor serves another call.
+ *  - @c ustore_status_contended_k The executor serves another call, or an ingest of the database is
+ *    open, which holds what this call rewrites until its finish or free; the call changes nothing.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device.

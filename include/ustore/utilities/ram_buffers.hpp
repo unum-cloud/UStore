@@ -118,6 +118,16 @@ struct ustore_arena_handle_t {
         device_blocks_t blocks;
     };
 
+    /** The memory of an arena on one Apple device, which a VRAM executor makes and its towers
+     *  carve; every run is unified memory, addressed by its host address. */
+    struct metal_blocks_t {
+
+        /** The Apple ordinal of the device every run lives on. */
+        std::int32_t device = 0;
+
+        device_blocks_t blocks;
+    };
+
     /** Whether a call fills the arena, so a second call naming it finds it contended. */
     claim_t claim = claim_t::free_k;
 
@@ -125,7 +135,7 @@ struct ustore_arena_handle_t {
     std::uint32_t named_calls = 0;
 
     /** Host pages for the calls of a host executor, or one device's memory for those of a VRAM executor. */
-    std::variant<host_blocks_t, cuda_blocks_t, hip_blocks_t> memory;
+    std::variant<host_blocks_t, cuda_blocks_t, hip_blocks_t, metal_blocks_t> memory;
 };
 
 namespace unum::ustore::utilities {
@@ -148,6 +158,9 @@ using cuda_blocks_t = ustore_arena_handle_t::cuda_blocks_t;
 
 /** The memory of an arena on one AMD device. */
 using hip_blocks_t = ustore_arena_handle_t::hip_blocks_t;
+
+/** The memory of an arena on one Apple device. */
+using metal_blocks_t = ustore_arena_handle_t::metal_blocks_t;
 
 /** Where every allocation in an arena starts, as Apache Arrow aligns its buffers, so typed outputs read in place. */
 constexpr std::size_t arena_alignment_k = 64;

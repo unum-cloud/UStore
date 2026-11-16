@@ -3,7 +3,8 @@
  *  @author Ash Vardanian
  *  @date October 31, 2026
  *  @brief The bundles of kernels the library embeds, one per kept GPU class, linked in as raw bytes
- *      beside this unit by the stubs of @c ustore_gpu_bundle, and whether a device loads one.
+ *      beside this unit by the stubs of @c ustore_gpu_bundle, or, for an Apple class, as the MSL
+ *      source its class unit embeds, and whether a device loads one.
  */
 #include "vram/classes.hpp" // `gpu_class_bundle`, `gpu_class_serves`
 
@@ -33,9 +34,26 @@ extern "C" byte_t const vram_amd_cdna4_bundle_start[], vram_amd_cdna4_bundle_end
 #if USTORE_TARGET_AMD_CDNA5
 extern "C" byte_t const vram_amd_cdna5_bundle_start[], vram_amd_cdna5_bundle_end[];
 #endif
+#if USTORE_TARGET_APPLE_METAL7
+extern "C" unsigned char const* const vram_apple_metal7_bundle_start;
+extern "C" std::size_t const vram_apple_metal7_bundle_bytes;
+#endif
+#if USTORE_TARGET_APPLE_METAL9
+extern "C" unsigned char const* const vram_apple_metal9_bundle_start;
+extern "C" std::size_t const vram_apple_metal9_bundle_bytes;
+#endif
+#if USTORE_TARGET_APPLE_METAL10
+extern "C" unsigned char const* const vram_apple_metal10_bundle_start;
+extern "C" std::size_t const vram_apple_metal10_bundle_bytes;
+#endif
 
 [[maybe_unused]] static std::span<byte_t const> bundle_between(byte_t const* start, byte_t const* end) noexcept {
     return {start, static_cast<std::size_t>(end - start)};
+}
+
+/** The MSL source an Apple class unit embeds: @p bytes from @p start, its null byte included. */
+[[maybe_unused]] static std::span<byte_t const> source_bundle(unsigned char const* start, std::size_t bytes) noexcept {
+    return {reinterpret_cast<byte_t const*>(start), bytes};
 }
 
 std::span<byte_t const> gpu_class_bundle(gpu_class_t gpu_class) noexcept {
@@ -68,7 +86,29 @@ std::span<byte_t const> gpu_class_bundle(gpu_class_t gpu_class) noexcept {
 #if USTORE_TARGET_AMD_CDNA5
     case gpu_class_t::amd_cdna5_k: return bundle_between(vram_amd_cdna5_bundle_start, vram_amd_cdna5_bundle_end);
 #endif
+#if USTORE_TARGET_APPLE_METAL7
+    case gpu_class_t::apple_metal7_k:
+        return source_bundle(vram_apple_metal7_bundle_start, vram_apple_metal7_bundle_bytes);
+#endif
+#if USTORE_TARGET_APPLE_METAL9
+    case gpu_class_t::apple_metal9_k:
+        return source_bundle(vram_apple_metal9_bundle_start, vram_apple_metal9_bundle_bytes);
+#endif
+#if USTORE_TARGET_APPLE_METAL10
+    case gpu_class_t::apple_metal10_k:
+        return source_bundle(vram_apple_metal10_bundle_start, vram_apple_metal10_bundle_bytes);
+#endif
     default: return {};
+    }
+}
+
+/** The Apple GPU family @p gpu_class compiles for, zero for a class of another vendor. */
+static std::uint32_t family_of_apple_class(gpu_class_t gpu_class) noexcept {
+    switch (gpu_class) {
+    case gpu_class_t::apple_metal7_k: return 7;
+    case gpu_class_t::apple_metal9_k: return 9;
+    case gpu_class_t::apple_metal10_k: return 10;
+    default: return 0;
     }
 }
 
@@ -80,6 +120,8 @@ bool gpu_class_serves(gpu_drivers_t& drivers, gpu_class_t gpu_class, gpu_device_
     case gpu_vendor_t::nvidia_k:
         return cuda_module_t::load(drivers.cuda, drivers.retain_context(ordinal), bundle).has_value();
     case gpu_vendor_t::amd_k: return hip_module_t::load(drivers.hip, ordinal, bundle).has_value();
+    // Metal compiles the source at the class's first spawn, so the family the device lists decides
+    case gpu_vendor_t::apple_k: return device.architecture_major >= family_of_apple_class(gpu_class);
     default: return false;
     }
 }

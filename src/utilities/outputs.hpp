@@ -25,6 +25,8 @@
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`, `export_strings`
 
+#include "utilities/arguments.hpp" // `takes_limits_concept`
+
 namespace unum::ustore::utilities {
 
 /** The bytes of a value one task of a read asks for: from an offset, at most a limit. */
@@ -92,7 +94,7 @@ class read_outputs_t {
         outputs.presences_ = presences.data();
         outputs.lengths_ = lengths.data();
         outputs.found_ = found.data();
-        if constexpr (requires { arguments.limits; }) {
+        if constexpr (takes_limits_concept<arguments_type_>) {
             outputs.offsets_ = strided(arguments.offsets);
             outputs.limits_ = strided(arguments.limits);
         }

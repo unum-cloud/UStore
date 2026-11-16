@@ -32,7 +32,8 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_rewind`
 #include "ustore/utilities/types.hpp"       // `stringzilla_refusal`
 
-#include "engine.hpp"             // `vendored_residency_t`, `residency_tables`, `view_t`
+#include "engine.hpp"              // `vendored_residency_t`, `residency_tables`, `view_t`
+#include "utilities/arguments.hpp" // `matches_patterns_concept`, `matches_filter_concept`, `answers_scores_concept`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `validate_scan`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
@@ -213,8 +214,8 @@ inline bool matches_everything(ustore_patterns_t const& patterns) noexcept {
 /** Whether the patterns or the filter of @p arguments read the values of the keys they narrow. */
 template <typename arguments_type_>
 bool reads_values(arguments_type_ const& arguments) noexcept {
-    if constexpr (requires { arguments.patterns; }) return !matches_everything(arguments.patterns);
-    else if constexpr (requires { arguments.filter; }) return arguments.filter.length != 0;
+    if constexpr (matches_patterns_concept<arguments_type_>) return !matches_everything(arguments.patterns);
+    else if constexpr (matches_filter_concept<arguments_type_>) return arguments.filter.length != 0;
     else return false;
 }
 
@@ -322,12 +323,12 @@ inline status_t compile_filter(ustore_bytes_view_t filter, sz_subdocuments_forma
 template <typename arguments_type_>
 status_t compile_values(arguments_type_ const& arguments, ustore_arena_t into, sz_capability_t capabilities,
                         sz_allocator_t engine_memory, value_matcher_t& matcher) noexcept {
-    if constexpr (requires { arguments.patterns; })
+    if constexpr (matches_patterns_concept<arguments_type_>)
         return compile_patterns(arguments.patterns, into, capabilities, engine_memory, matcher);
     else if constexpr (std::is_same_v<arguments_type_, ustore_docs_scan_t> ||
                        std::is_same_v<arguments_type_, ustore_docs_cursor_init_t>)
         return compile_filter(arguments.filter, sz_subdocuments_json_k, into, capabilities, engine_memory, matcher);
-    else if constexpr (requires { arguments.filter; })
+    else if constexpr (matches_filter_concept<arguments_type_>)
         return compile_filter(arguments.filter, sz_subdocuments_xml_k, into, capabilities, engine_memory, matcher);
     else return {};
 }
@@ -343,7 +344,7 @@ expected<compiled_match<vendored_residency_t::host_k>> compile_match(arguments_t
                                                match.matcher);
         status.failed())
         return status;
-    if constexpr (requires { arguments.patterns; })
+    if constexpr (matches_patterns_concept<arguments_type_>)
         if (arguments.patterns.weights)
             match.scorer = std::get<sz_substrings_engine_t*>(match.matcher), match.weights = arguments.patterns.weights;
     if (arguments.predicate.cost != ustore_predicate_cheap_k &&
@@ -566,7 +567,7 @@ status_t scan_matched(residency_tables<vendored_residency_t::host_k> const& engi
     keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
     scores_sink_t scores {arena_allocator<float> {view.scratch}};
     bool const scored = [&]() noexcept {
-        if constexpr (requires { arguments.scores; }) return arguments.scores && match.scores();
+        if constexpr (answers_scores_concept<scan_type_>) return arguments.scores && match.scores();
         else return false;
     }();
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
@@ -580,7 +581,7 @@ status_t scan_matched(residency_tables<vendored_residency_t::host_k> const& engi
     if (copied_offsets_status.failed()) return copied_offsets_status;
     auto [keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, survivors);
     if (keys_status.failed()) return keys_status;
-    if constexpr (requires { arguments.scores; })
+    if constexpr (answers_scores_concept<scan_type_>)
         if (scored) {
             auto [copied_scores, scores_status] = arena_copy<float>(arguments.arena, scores);
             if (scores_status.failed()) return scores_status;

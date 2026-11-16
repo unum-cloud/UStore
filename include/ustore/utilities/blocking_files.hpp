@@ -31,7 +31,7 @@
 #include <sys/mman.h>    // `mmap`, `madvise`, `munmap`
 #include <sys/stat.h>    // `stat`, `fstat`, `S_ISDIR`, `S_ISBLK`, `mkdir`
 #include <sys/statvfs.h> // `statvfs`
-#include <unistd.h>      // `close`, `rmdir`, `unlink`, `link`, `pread`, `pwrite`, `ftruncate`, `fdatasync`, `fsync`
+#include <unistd.h>      // `close`, `rmdir`, `unlink`, `link`, `pread`, `pwrite`, `ftruncate`, `fsync`, `getcwd`
 #endif
 
 #include <memory>      // `std::unique_ptr`
@@ -82,6 +82,46 @@ inline status_t join_path(char const* directory, char const* name, std::span<cha
     std::size_t written = directory_bytes;
     if (written != 0 && into[written - 1] != '/' && into[written - 1] != '\\') into[written++] = '/';
     std::memcpy(into.data() + written, name, name_bytes + 1);
+    return {};
+}
+
+/** Whether @p path names its file from the root, a drive or a share, rather than from the working
+ *  directory. */
+inline bool path_is_absolute(std::string_view path) noexcept {
+#if USTORE_OS_WINDOWS_
+    bool const drive = path.size() >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+    return drive || (!path.empty() && (path[0] == '\\' || path[0] == '/'));
+#else
+    return !path.empty() && path[0] == '/';
+#endif
+}
+
+/** Writes @p path into @p into from the root, prefixing a relative one with the working directory
+ *  once, so a handle keeping it reaches the same files after the process changes directory;
+ *  @p length receives the bytes written before the terminator. */
+inline status_t absolute_path_of(std::string_view path, std::span<char> into, std::size_t& length) noexcept {
+    length = 0;
+    if (path_is_absolute(path)) {
+        if (path.size() + 1 > into.size()) return {status_code_t::invalid_argument_k, "A path outgrew the limit"};
+        std::memcpy(into.data(), path.data(), path.size());
+        into[path.size()] = '\0';
+        length = path.size();
+        return {};
+    }
+#if USTORE_OS_WINDOWS_
+    DWORD const written = ::GetCurrentDirectoryA(static_cast<DWORD>(into.size()), into.data());
+    if (written == 0 || written >= into.size()) return {status_code_t::io_k, "Failed to read the working directory"};
+    std::size_t prefix = written;
+#else
+    if (!::getcwd(into.data(), into.size())) return {status_code_t::io_k, "Failed to read the working directory"};
+    std::size_t prefix = std::strlen(into.data());
+#endif
+    if (prefix + 1 + path.size() + 1 > into.size())
+        return {status_code_t::invalid_argument_k, "A path outgrew the limit"};
+    if (prefix == 0 || (into[prefix - 1] != '/' && into[prefix - 1] != '\\')) into[prefix++] = '/';
+    std::memcpy(into.data() + prefix, path.data(), path.size());
+    into[prefix + path.size()] = '\0';
+    length = prefix + path.size();
     return {};
 }
 

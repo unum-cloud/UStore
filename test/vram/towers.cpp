@@ -70,13 +70,14 @@ fake_hip_counters_t const* fake_hip_counters() noexcept {
     return counters;
 }
 
-/** Hands @p body the executor a mover holds, of either vendor, and nothing for none. */
+/** Hands @p body the executor a mover holds, of any vendor, and nothing for none. */
 template <typename body_type_>
 struct device_visitor {
     body_type_& body;
     void operator()(std::monostate) const noexcept {}
     void operator()(cuda_executor_t& executor) const noexcept { body(executor); }
     void operator()(hip_executor_t& executor) const noexcept { body(executor); }
+    void operator()(metal_executor_t& executor) const noexcept { body(executor); }
 };
 
 /** The suite's own executor on one listed device, which places inputs there and fetches outputs back. */
@@ -87,10 +88,11 @@ class mover_t {
         device.vendor = static_cast<gpu_vendor_t>(listed.vendor);
         device.vendor_ordinal = listed.vendor_ordinal;
         gpu_class_t const gpu_class = static_cast<gpu_class_t>(listed.gpu_class);
-        if (status_t const opened = open_gpu_device(drivers_, device, gpu_class, cuda_kernels_, hip_kernels_);
+        if (status_t const opened = open_gpu_device(drivers_, device, gpu_class, cuda_kernels_, hip_kernels_,
+                                                    metal_kernels_);
             opened.failed())
             return opened;
-        return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, device, gpu_class, nullptr, 0,
+        return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, metal_kernels_, device, gpu_class, nullptr, 0,
                                   ustore_gds_automatic_k, executor_);
     }
 
@@ -163,7 +165,8 @@ class mover_t {
     gpu_drivers_t drivers_;
     kernel_tables<cuda_module_t> cuda_kernels_;
     kernel_tables<hip_module_t> hip_kernels_;
-    std::variant<std::monostate, cuda_executor_t, hip_executor_t> executor_;
+    kernel_tables<metal_module_t> metal_kernels_;
+    std::variant<std::monostate, cuda_executor_t, hip_executor_t, metal_executor_t> executor_;
     std::vector<std::uintptr_t> placed_;
     status_t status_;
 };
@@ -342,6 +345,30 @@ std::size_t vram_listing(ustore_gpu_device_t listed) {
     failures += expect(listed.gpu_class != ustore_gpu_class_unknown_k);
     if (listed.vendor == ustore_gpu_vendor_amd_k && fake_hip_counters())
         failures += expect(listed.gpu_class == ustore_gpu_class_amd_cdna3_k);
+    return failures;
+}
+
+/** The GPU class ceiling caps the class the device loads: its own class serves, one of the other
+ *  vendor's ladder leaves it nothing to load and is unsupported, and a value no class takes is
+ *  refused as an invalid argument before either. */
+std::size_t vram_class_ceiling(std::size_t ordinal, ustore_gpu_device_t listed) {
+    std::size_t failures = 0;
+    auto spawned_under = [ordinal](ustore_gpu_class_t gpu_class_ceiling) noexcept {
+        ustore_outcome_t outcome {};
+        ustore_executor_t executor = nullptr;
+        ustore_executor_for_vram_t spawn {.executor = &executor,
+                                          .outcome = &outcome,
+                                          .device = static_cast<std::int32_t>(ordinal),
+                                          .gpu_class_ceiling = gpu_class_ceiling};
+        ustore_executor_for_vram(&spawn);
+        ustore_executor_free(executor);
+        return outcome.status;
+    };
+    failures += expect(spawned_under(listed.gpu_class) == ustore_status_success_k);
+    ustore_gpu_class_t const foreign = listed.vendor == ustore_gpu_vendor_amd_k ? ustore_gpu_class_nvidia_blackwell_k
+                                                                                : ustore_gpu_class_amd_cdna5_k;
+    failures += expect(spawned_under(foreign) == ustore_status_unsupported_k);
+    failures += expect(spawned_under(static_cast<ustore_gpu_class_t>(6)) == ustore_status_invalid_argument_k);
     return failures;
 }
 
@@ -1064,6 +1091,7 @@ int main(int argc, char** argv) {
         fmt::println("device {}: {}, vendor ordinal {}", ordinal, listed.name, listed.vendor_ordinal);
         std::string const prefix = fmt::format("vram.{}{}.", ustore_gpu_vendor_name(listed.vendor), ordinal);
         report(totals, (prefix + "listing").c_str(), vram_listing, listed);
+        report(totals, (prefix + "class_ceiling").c_str(), vram_class_ceiling, ordinal, listed);
         report(totals, (prefix + "arenas").c_str(), vram_arenas, ordinal, config);
         report(totals, (prefix + "cursors").c_str(), vram_cursors, ordinal, listed, config);
         report(totals, (prefix + "exports").c_str(), vram_exports, ordinal, listed, config);

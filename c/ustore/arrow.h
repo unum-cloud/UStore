@@ -248,8 +248,8 @@ USTORE_EXPORT ustore_status_t ustore_strings_view_from_arrow(struct ArrowSchema 
  *
  *  The array reads @p arena's outputs until the arena's next call or free, like every other output
  *  view, and its @c release frees only the array's own nodes. Arenas on host pages export as
- *  @c ARROW_DEVICE_CPU, and those of a VRAM executor as @c ARROW_DEVICE_CUDA or
- *  @c ARROW_DEVICE_ROCM with the vendor's ordinal of their device and no @c sync_event, as the
+ *  @c ARROW_DEVICE_CPU, and those of a VRAM executor as @c ARROW_DEVICE_CUDA, @c ARROW_DEVICE_ROCM
+ *  or @c ARROW_DEVICE_METAL with the vendor's ordinal of their device and no @c sync_event, as the
  *  call that filled one waited for its device. The schema's @c name is empty, for the caller to
  *  point at its own.
  *

@@ -248,6 +248,9 @@ struct ram_variant {
      *  router refuses a handle of another. */
     static engine_t const engine_k;
 
+    /** One compaction of a database of this class and isolation in flight. */
+    struct compact_plan_t;
+
     /** Opens a database of this class and isolation into @p database, persisting in @p directory unless it is empty. */
     static status_t open(ustore_database_t* database, std::string_view directory) noexcept;
 };
@@ -770,6 +773,10 @@ store_status_t scan_descending(view_type_ const& view, scan_task_t const& scan, 
         st::descending);
 }
 
+/** Whether a view walks its entries partition by partition, handing each to @p take_type_. */
+template <typename view_type_, typename take_type_>
+concept walks_partitions_concept = requires(view_type_ const& view, take_type_& take) { view.for_each(take); };
+
 /** Appends up to the limit of @p scan keys of a collection of @p entry_type_ in any order,
  *  partition by partition, halting with @p outcome when the scratch refuses. A view offering no
  *  such walk merges the partitions, which is one order an unordered scan may take. */
@@ -784,7 +791,7 @@ store_status_t scan_unordered(view_type_ const& view, scan_task_t const& scan, s
         if (outcome.failed()) return walk_control_t::halt_k;
         return outputs.size() - first == scan.limit ? walk_control_t::halt_k : walk_control_t::resume_k;
     };
-    if constexpr (requires { view.for_each(take); }) return view.for_each(take);
+    if constexpr (walks_partitions_concept<view_type_, decltype(take)>) return view.for_each(take);
     else return scan_ascending<entry_type_>(view, scan, outputs, outcome);
 }
 
@@ -2004,35 +2011,34 @@ status_t measure_keys(database_state<cpu_class_, isolation_>& state, arguments_t
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
+        auto const measure_run = [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
+                                                             std::size_t end) noexcept -> store_status_t {
+            auto measure_slice = [&](std::size_t first_task, std::size_t length, view_t const&) noexcept -> status_t {
+                auto store = source.view(entries);
+                if (!store) return translate(store.status());
+                std::size_t const end_task = first + first_task + length;
+                for (std::size_t task = first + first_task; task != end_task; ++task) {
+                    scan_task_t const range = measures[task];
+                    window_measure_t measured;
+                    if (range.limit != 0)
+                        if (store_status_t const measuring = measure_window<entry_type_>(*store, range.keys, measured);
+                            st::failed(measuring))
+                            return translate(measuring);
+                    outputs.assign(task, measured.cardinality, measured.value_bytes, measured.space_bytes);
+                }
+                return status_t {};
+            };
+            if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
+                outcome = for_task_slices(view, end - first, measure_slice);
+            else outcome = measure_slice(0, end - first, view);
+            return store_status_t::success_k;
+        };
         return for_each_run(source, measures.collections, measures.size(), outcome,
                             [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
                                                         std::size_t end) noexcept -> store_status_t {
                                 if constexpr (!std::is_same_v<entry_of<entries_type_>, entry_type_>)
                                     return refused_modality(outcome);
-                                else {
-                                    auto measure_slice = [&](std::size_t first_task, std::size_t length,
-                                                             view_t const&) noexcept -> status_t {
-                                        auto store = source.view(entries);
-                                        if (!store) return translate(store.status());
-                                        std::size_t const end_task = first + first_task + length;
-                                        for (std::size_t task = first + first_task; task != end_task; ++task) {
-                                            scan_task_t const range = measures[task];
-                                            window_measure_t measured;
-                                            if (range.limit != 0)
-                                                if (store_status_t const measuring = measure_window<entry_type_>(
-                                                        *store, range.keys, measured);
-                                                    st::failed(measuring))
-                                                    return translate(measuring);
-                                            outputs.assign(task, measured.cardinality, measured.value_bytes,
-                                                           measured.space_bytes);
-                                        }
-                                        return status_t {};
-                                    };
-                                    if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
-                                        outcome = for_task_slices(view, end - first, measure_slice);
-                                    else outcome = measure_slice(0, end - first, view);
-                                    return store_status_t::success_k;
-                                }
+                                else return measure_run(entries, first, end);
                             });
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
@@ -2082,42 +2088,122 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_cl
     return persist(state);
 }
 
-/** Implements @c ustore_database_compact, reclaiming unreachable versions of every store, freeing
- *  unreachable retired stores and rewriting the image, reporting one unit per collection, as the
- *  versions it frees carry no byte count. */
+/**
+ *  @brief One compaction of an in-memory database in flight: a merge vacuuming the store of every
+ *      collection the open listed, one task per collection, then a reclaim of one task, vacuuming
+ *      both system collections, freeing the stores no reader reaches and rewriting the image.
+ *
+ *  The merge's tasks touch disjoint stores, so any number of threads may @ref run them at once,
+ *  and each vacuums its store as a fresh stamp lists it, skipping one dropped since the open, so a
+ *  task run again changes nothing. Each task weighs one, as the versions a vacuum frees carry no
+ *  byte count. The open reserves the collections, so neither @ref run, @ref advance nor
+ *  @ref finish allocates.
+ */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_compact_t const& arguments,
-               view_t const& view) noexcept {
-    claim_t claim;
-    reader_source<cpu_class_, isolation_> source {state, state.order.take_snapshot(claim)};
-    listed_collections<cpu_class_, isolation_> listed;
-    auto collections = source.view(state.collections_by_id);
-    if (store_status_t const collected = collect_collections<cpu_class_, isolation_>(*collections, listed);
-        st::failed(collected))
-        return translate(collected);
-    progress_t progress {arguments.progress, arguments.progress_state, listed.size()};
-    auto [statuses, statuses_status] = arena_allocate<status_t>(view.scratch, listed.size());
-    if (statuses_status.failed()) return statuses_status;
-    // Each collection's store locks only its own partitions, so collections vacuum on any threads
-    auto vacuum_collection = [&](std::size_t index, std::size_t) noexcept {
-        store_status_t const vacuumed = std::visit([](auto& entries) noexcept { return entries.vacuum().status(); },
-                                                   listed[index].store->entries);
-        statuses[index] = translate(vacuumed);
-        if (statuses[index].succeeded() && !progress.advance(1)) statuses[index] = progress_cancelled_k;
+struct ram_variant<cpu_class_, isolation_>::compact_plan_t {
+
+    /** A merge task's collection, the nil ID for the reclaim. */
+    struct task_t {
+        ustore_collection_id_t collection {};
     };
-    if (!view.executor)
-        for (std::size_t index = 0; index != listed.size(); ++index) vacuum_collection(index, 0);
-    else if (st::failed(view_of(view.executor->pool).for_n_dynamic(listed.size(), vacuum_collection)))
-        return {status_code_t::contended_k, "The lent pool runs its lender's dispatch"};
-    for (status_t const& status : statuses)
-        if (status.failed()) return status;
-    if (store_status_t const vacuumed = state.collections_by_id.vacuum().status(); st::failed(vacuumed))
-        return translate(vacuumed);
-    if (store_status_t const vacuumed = state.collection_ids_by_name.vacuum().status(); st::failed(vacuumed))
-        return translate(vacuumed);
-    claim.retire();
-    free_unreachable(state);
-    return persist(state);
+
+    /** The database the plan compacts, which outlives the plan. */
+    database_state<cpu_class_, isolation_>* database = nullptr;
+
+    /** The collections the newest stamp listed at the open, one merge task each. */
+    st::vector<ustore_collection_id_t> collections;
+
+    compact_plan_t() noexcept = default;
+    compact_plan_t(compact_plan_t const&) = delete;
+    compact_plan_t& operator=(compact_plan_t const&) = delete;
+
+    /** Task @p position of the current phase, an empty one past the end. */
+    task_t operator[](std::size_t position) const noexcept {
+        if (phase_ != phase_t::merge_k || position >= collections.size()) return {};
+        return {collections[position]};
+    }
+
+    /** The current phase's tasks, positionally; none once the plan is over. */
+    indexed_range<compact_plan_t> tasks() const noexcept {
+        if (phase_ == phase_t::merge_k) return {this, collections.size()};
+        return {this, phase_ == phase_t::reclaim_k ? 1u : 0u};
+    }
+
+    /** Runs @p task of the current phase on the calling thread, safe for merge tasks at once. */
+    status_t run(task_t const& task, view_t const&) noexcept {
+        if (phase_ == phase_t::merge_k) {
+            claim_t claim;
+            reader_source<cpu_class_, isolation_> source {*database, database->order.take_snapshot(claim)};
+            resolved_collection<cpu_class_, isolation_> resolved;
+            store_status_t const listed = resolve(source, task.collection, resolved);
+            if (listed == store_status_t::key_not_found_k) return {};
+            if (st::failed(listed)) return translate(listed);
+            return translate(
+                std::visit([](auto& entries) noexcept { return entries.vacuum().status(); }, resolved.store->entries));
+        }
+        if (phase_ != phase_t::reclaim_k) return {};
+        if (store_status_t const vacuumed = database->collections_by_id.vacuum().status(); st::failed(vacuumed))
+            return translate(vacuumed);
+        if (store_status_t const vacuumed = database->collection_ids_by_name.vacuum().status(); st::failed(vacuumed))
+            return translate(vacuumed);
+        free_unreachable(*database);
+        return persist(*database);
+    }
+
+    /** The barrier between phases, one caller after every task of the current one ran: picks the
+     *  next phase, and answers whether one follows. */
+    bool advance() noexcept {
+        phase_ = phase_ == phase_t::merge_k ? phase_t::reclaim_k : phase_t::done_k;
+        return phase_ != phase_t::done_k;
+    }
+
+    /** Skips what is left of the plan, keeping what its phases compacted. */
+    void stop() noexcept { phase_ = phase_t::done_k; }
+
+    /** Success, as no barrier fails; a failed task answers its own call. */
+    status_t status() const noexcept { return {}; }
+
+    phase_t phase() const noexcept { return phase_; }
+
+    /** The position of the phase in hand, the merge first, and the count of phases once done. */
+    std::size_t ordinal() const noexcept {
+        return static_cast<std::size_t>(phase_) - static_cast<std::size_t>(phase_t::merge_k);
+    }
+
+    /** Units of the phase in hand done at its barrier: all, as each phase runs to its end. */
+    std::size_t completed() const noexcept { return total(); }
+
+    /** Units of the phase in hand: one per merged collection, or one for the reclaim. */
+    std::size_t total() const noexcept { return tasks().size(); }
+
+    /** Stops the plan where it stands, keeping what its phases compacted. */
+    status_t finish() noexcept {
+        stop();
+        return status();
+    }
+
+  private:
+    phase_t phase_ = phase_t::merge_k;
+};
+
+/** Opens the plan of @c ustore_database_compact, listing the collections the newest stamp lists. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+expected<void*> compact_plan_open(ustore_database_compact_t const& arguments, view_t const&) noexcept {
+    using compact_plan_t = typename ram_variant<cpu_class_, isolation_>::compact_plan_t;
+    std::unique_ptr<compact_plan_t> plan {new (std::nothrow) compact_plan_t {}};
+    if (!plan) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the plan"};
+    plan->database = state_of<database_state<cpu_class_, isolation_>>(arguments.database);
+    claim_t claim;
+    reader_source<cpu_class_, isolation_> source {*plan->database, plan->database->order.take_snapshot(claim)};
+    store_status_t listed = store_status_t::success_k;
+    store_status_t const walked = source.collections().range_from(
+        ustore_collection_id_t {}, [&](collections_pair_of<cpu_class_, isolation_> const& pair) noexcept {
+            listed = plan->collections.push_back(ustore_collection_id_t {pair.key});
+            return st::failed(listed) ? walk_control_t::halt_k : walk_control_t::resume_k;
+        });
+    if (st::failed(walked)) return translate(walked);
+    if (st::failed(listed)) return translate(listed);
+    return static_cast<void*>(plan.release());
 }
 
 /** Implements @c ustore_database_flush, rewriting the image as a flushed commit does. */

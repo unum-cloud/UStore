@@ -489,10 +489,59 @@ typedef enum ustore_continuation_t {
  *  Counts are in the units the verb consumes: tasks for a scan, one pull for a cursor, bytes of
  *  keys and values for a save, and bytes or collections for a compaction. The callback never runs
  *  concurrently with itself, however many threads do the work, and never after the call stores its
- *  final status. Its arguments are the units finished so far, never decreasing within one call, the
- *  units the call finishes if it runs to the end, and the @c progress_state registered beside it.
+ *  final status. Its arguments are the units finished so far, never decreasing within one call, or
+ *  within one phase for a plan's call, which reports at every barrier with that phase's units; the
+ *  units the call or the phase finishes if it runs to the end; and its @c progress_state.
  */
 typedef ustore_continuation_t (*ustore_progress_callback_t)(ustore_size_t finished, ustore_size_t total, void* state);
+
+/** The kind of work a plan is doing, shared by every long operation: a compaction's flush, its
+ *  merges one unit at a time, then its reclaim. */
+typedef enum ustore_phase_t {
+
+    /** No plan, or one that has not started. */
+    ustore_phase_none_k = 0,
+
+    /** Writing what memory holds to storage: memory runs on NVMe, memtables on RocksDB. */
+    ustore_phase_flush_k = 1,
+
+    /** Merging or vacuuming the stored versions one unit at a time: a collection, a column family
+     *  or an NVMe round. */
+    ustore_phase_merge_k = 2,
+
+    /** Freeing what no reader reaches any more and rewriting the image that names the rest. */
+    ustore_phase_reclaim_k = 3,
+
+    /** The plan ran to its end, and nothing is pending. */
+    ustore_phase_done_k = 4,
+
+} ustore_phase_t;
+
+/** The canonical spelling of a plan's phase, as @c ustore_phase_merge_k spells "merge", or
+ *  "unrecognized" for a value no phase carries. */
+USTORE_EXPORT char const* ustore_phase_name(ustore_phase_t phase);
+
+/** Reads a plan's phase back from its canonical spelling, or fails with
+ *  @c ustore_status_invalid_argument_k. */
+USTORE_EXPORT ustore_status_t ustore_phase_from_name(ustore_bytes_view_t name, ustore_phase_t* phase);
+
+/** Where a plan stands: its phase, that phase's position in the plan, and its own count. */
+typedef struct ustore_phase_progress_t {
+
+    /** The kind of work in hand. */
+    ustore_phase_t phase;
+
+    /** This phase's position among the ones the plan runs, from zero. */
+    ustore_size_t ordinal;
+
+    /** Units of this phase done: collections, column families, rounds or bytes, as the engine
+     *  counts them. */
+    ustore_size_t completed;
+
+    /** Units of this phase in all. */
+    ustore_size_t total;
+
+} ustore_phase_progress_t;
 
 /** What the strings of a @c ustore_patterns_t are matched as. */
 typedef enum ustore_pattern_kind_t {
@@ -702,8 +751,9 @@ typedef struct ustore_executor_for_ram_t {
      *  those domains carry, rounded down and at least one. */
     ustore_size_t threads;
 
-    /** The CPU class the threads confine their waits and atomics to, where zero takes what the CPU offers. */
-    ustore_cpu_class_t cpu_class;
+    /** The newest CPU class the threads may confine their waits and atomics to; a class the CPU
+     *  lacks narrows the pick rather than refusing it, and zero sets no ceiling. */
+    ustore_cpu_class_t cpu_class_ceiling;
 
 } ustore_executor_for_ram_t;
 
@@ -719,10 +769,10 @@ typedef struct ustore_executor_for_ram_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, a memory domain
- *    identifier names no domain, the CPU class is unknown, or ForkUnion refuses an argument.
+ *    identifier names no domain, the ceiling names no CPU class, or ForkUnion refuses an argument.
  *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
- *    are asked of a build without them, the CPU does not run the @c cpu_class, or the operating
- *    system denies ForkUnion an operation.
+ *    are asked of a build without them, no class this build compiled fits under the
+ *    @c cpu_class_ceiling on this CPU, or the operating system denies ForkUnion an operation.
  */
 USTORE_EXPORT void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments);
 
@@ -838,8 +888,9 @@ typedef struct ustore_executor_for_nvme_t {
     /** Threads to spawn, each owning one submission ring, where zero derives them from the cores. */
     ustore_size_t threads;
 
-    /** The CPU class the threads confine their waits and atomics to, where zero takes what the CPU offers. */
-    ustore_cpu_class_t cpu_class;
+    /** The newest CPU class the threads may confine their waits and atomics to; a class the CPU
+     *  lacks narrows the pick rather than refusing it, and zero sets no ceiling. */
+    ustore_cpu_class_t cpu_class_ceiling;
 
 } ustore_executor_for_nvme_t;
 
@@ -851,11 +902,11 @@ typedef struct ustore_executor_for_nvme_t {
  *  executor may be freed before the databases it opened. Where its merges run is the open's own @c compactions.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the transport or the
- *    CPU class is unknown, or ForkUnion refuses an argument.
+ *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the transport is
+ *    unknown, the ceiling names no CPU class, or ForkUnion refuses an argument.
  *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
- *    are asked of a build without them, the CPU does not run the @c cpu_class, or the operating
- *    system denies ForkUnion an operation.
+ *    are asked of a build without them, no class this build compiled fits under the
+ *    @c cpu_class_ceiling on this CPU, or the operating system denies ForkUnion an operation.
  */
 USTORE_EXPORT void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments);
 
@@ -892,6 +943,9 @@ typedef enum ustore_gpu_vendor_t {
 
     /** AMD, through the HIP runtime when one is installed. */
     ustore_gpu_vendor_amd_k = 2,
+
+    /** Apple, through Metal, present on every Apple silicon Mac. */
+    ustore_gpu_vendor_apple_k = 3,
 
 } ustore_gpu_vendor_t;
 
@@ -937,6 +991,17 @@ typedef enum ustore_gpu_class_t {
     /** CDNA5 AMD - MI400, gfx1250. */
     ustore_gpu_class_amd_cdna5_k = 9,
 
+    // Apple
+
+    /** Apple7-family GPUs and every Apple GPU without a class of its own - M1 & M2. */
+    ustore_gpu_class_apple_metal7_k = 10,
+
+    /** Apple9-family GPUs - M3 & M4. */
+    ustore_gpu_class_apple_metal9_k = 11,
+
+    /** Apple10-family GPUs - M5. */
+    ustore_gpu_class_apple_metal10_k = 12,
+
 } ustore_gpu_class_t;
 
 /** The canonical spelling of a GPU class, as @c ustore_gpu_class_amd_cdna3_k spells "amd-cdna3", or "unrecognized". */
@@ -959,10 +1024,10 @@ typedef struct ustore_gpu_device_t {
     /** The class of the device. */
     ustore_gpu_class_t gpu_class;
 
-    /** Streaming multiprocessors or compute units. */
+    /** Streaming multiprocessors, compute units or GPU cores. */
     uint32_t compute_units;
 
-    /** Device memory in bytes. */
+    /** Device memory in bytes, or the working set Metal recommends for unified memory. */
     uint64_t memory_bytes;
 
     /** The vendor's own name for the device, null-terminated and truncated to fit. */
@@ -988,8 +1053,8 @@ typedef struct ustore_gpu_devices_t {
 } ustore_gpu_devices_t;
 
 /**
- *  @brief Lists every GPU this process can drive, NVIDIA devices first, then AMD, so the position of a device is the
- *      ordinal @c ustore_executor_for_vram_t::device names it by.
+ *  @brief Lists every GPU this process can drive, NVIDIA devices first, then AMD, then Apple, so
+ *      the position of a device is the ordinal @c ustore_executor_for_vram_t::device names it by.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  Each vendor's runtime opens on the first call, and a vendor whose runtime is absent lists no
@@ -1012,8 +1077,9 @@ typedef struct ustore_executor_for_vram_t {
      *  @c ustore_gpu_devices; an ordinal no device carries is refused with @c ustore_status_device_k. */
     int32_t device;
 
-    /** The @b optional borrowed stream on @c device, a @c cudaStream_t on NVIDIA and a @c hipStream_t on AMD, which
-     *  must outlive the executor; @c NULL creates one. One stream per device is the whole design. */
+    /** The @b optional borrowed stream on @c device, a @c cudaStream_t on NVIDIA, a @c hipStream_t
+     *  on AMD and an @c id<MTLCommandQueue> on Apple, which must outlive the executor; @c NULL
+     *  creates one. One stream per device is the whole design. */
     void* stream;
 
     /** The @b optional ceiling on the device scratch a call or a merge takes; zero lets scratch grow as calls ask. */
@@ -1022,9 +1088,9 @@ typedef struct ustore_executor_for_vram_t {
     /** How reads and compactions move bytes between the drives and the device. */
     ustore_gds_t gds;
 
-    /** The @b optional pinned class: the executor takes the newest class at or under it that serves
-     *  @c device, and @c ustore_gpu_class_unknown_k pins none. */
-    ustore_gpu_class_t gpu_class;
+    /** The @b optional newest class dispatch may pick, capping the best class @c device loads; a
+     *  ceiling under which the device loads none is refused, and zero sets no ceiling. */
+    ustore_gpu_class_t gpu_class_ceiling;
 
 } ustore_executor_for_vram_t;
 
@@ -1042,9 +1108,9 @@ typedef struct ustore_executor_for_vram_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the @c gds mode or the
- *    @c gpu_class is unknown, or ForkUnion refuses an argument.
+ *    @c gpu_class_ceiling is unknown, or ForkUnion refuses an argument.
  *  - @c ustore_status_unsupported_k No class this build compiled serves the device at or under
- *    the pinned @c gpu_class, the process may allocate on no memory domain, or the operating
+ *    the @c gpu_class_ceiling, the process may allocate on no memory domain, or the operating
  *    system denies ForkUnion an operation.
  *  - @c ustore_status_device_k No device carries the ordinal, its driver refuses a stream or an
  *    event, or @c ustore_gds_direct_k names a device other than NVIDIA.
@@ -1204,7 +1270,8 @@ USTORE_EXPORT void ustore_arena_describe(ustore_arena_describe_t* arguments);
  */
 USTORE_EXPORT void ustore_version(int* major, int* minor, int* patch);
 
-/** The version of the library the program runs against as a static string, like "1.0.0". */
+/** The version of the library the program runs against as a static string, pre-release suffix
+ *  included, like "1.0.0-rc.1". */
 USTORE_EXPORT char const* ustore_version_name(void);
 
 #ifdef __cplusplus

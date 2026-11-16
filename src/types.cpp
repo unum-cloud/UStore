@@ -66,6 +66,7 @@ constexpr enumerator_spelling<ustore_gds_t> gds_names_k[] {
 constexpr enumerator_spelling<ustore_gpu_vendor_t> gpu_vendor_names_k[] {
     {ustore_gpu_vendor_nvidia_k, "nvidia"},
     {ustore_gpu_vendor_amd_k, "amd"},
+    {ustore_gpu_vendor_apple_k, "apple"},
 };
 
 /** The canonical spelling of every GPU class. */
@@ -78,10 +79,15 @@ constexpr enumerator_spelling<ustore_gpu_class_t> gpu_class_names_k[] {
     {ustore_gpu_class_amd_cdna3_k, "amd-cdna3"},
     {ustore_gpu_class_amd_cdna4_k, "amd-cdna4"},
     {ustore_gpu_class_amd_cdna5_k, "amd-cdna5"},
+    {ustore_gpu_class_apple_metal7_k, "apple-metal7"},
+    {ustore_gpu_class_apple_metal9_k, "apple-metal9"},
+    {ustore_gpu_class_apple_metal10_k, "apple-metal10"},
 };
 
 static_assert(static_cast<std::uint32_t>(gpu_class_t::amd_cdna5_k) == ustore_gpu_class_amd_cdna5_k);
+static_assert(static_cast<std::uint32_t>(gpu_class_t::apple_metal10_k) == ustore_gpu_class_apple_metal10_k);
 static_assert(static_cast<std::uint32_t>(gpu_vendor_t::amd_k) == ustore_gpu_vendor_amd_k);
+static_assert(static_cast<std::uint32_t>(gpu_vendor_t::apple_k) == ustore_gpu_vendor_apple_k);
 
 /** The canonical spelling of every pattern kind. */
 constexpr enumerator_spelling<ustore_pattern_kind_t> pattern_kind_names_k[] {
@@ -124,19 +130,11 @@ constexpr enumerator_spelling<ustore_transport_t> transport_names_k[] {
     {ustore_transport_linux_spdk_k, "linux-spdk"},
 };
 
-/** The version as "major.minor.patch", spelled from the version macros at compile time. */
-constexpr auto version_name_k = [] {
-    std::array<char, 3 * 11 + 3> text {};
-    std::size_t length = 0;
-    for (int part : {USTORE_VERSION_MAJOR, USTORE_VERSION_MINOR, USTORE_VERSION_PATCH}) {
-        if (length) text[length++] = '.';
-        std::size_t const first = length;
-        do text[length++] = static_cast<char>('0' + part % 10);
-        while (part /= 10);
-        std::reverse(text.begin() + first, text.begin() + length);
-    }
-    return text;
-}();
+/** The canonical spelling of every phase a plan runs. */
+constexpr enumerator_spelling<ustore_phase_t> phase_names_k[] {
+    {ustore_phase_none_k, "none"},       {ustore_phase_flush_k, "flush"}, {ustore_phase_merge_k, "merge"},
+    {ustore_phase_reclaim_k, "reclaim"}, {ustore_phase_done_k, "done"},
+};
 
 /** How a pool spawned here treats the thread spawning it: apart from its workers, or as its only thread in a build
  *  without OS threads. */
@@ -287,20 +285,27 @@ ustore_status_t ustore_transport_from_name(ustore_bytes_view_t name, ustore_tran
     return value_in(transport_names_k, name, transport);
 }
 
+char const* ustore_phase_name(ustore_phase_t phase) { return name_in(phase_names_k, phase); }
+ustore_status_t ustore_phase_from_name(ustore_bytes_view_t name, ustore_phase_t* phase) {
+    return value_in(phase_names_k, name, phase);
+}
+
 void ustore_version(int* major, int* minor, int* patch) {
     *major = USTORE_VERSION_MAJOR;
     *minor = USTORE_VERSION_MINOR;
     *patch = USTORE_VERSION_PATCH;
 }
 
-char const* ustore_version_name(void) { return version_name_k.data(); }
+/** The first line of @c VERSION, pre-release suffix included, which CMake hands every unit as
+ *  @c USTORE_VERSION. */
+char const* ustore_version_name(void) { return USTORE_VERSION; }
 
 void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
     ustore_outcome_t& outcome = *arguments->outcome;
     if (!arguments->executor)
         return finish(outcome, {status_code_t::invalid_argument_k, "The call needs an output for the executor"});
     *arguments->executor = nullptr;
-    auto const [ceiling, pick_status] = pick_cpu_ceiling(arguments->cpu_class);
+    auto const [ceiling, pick_status] = pick_cpu_ceiling(arguments->cpu_class_ceiling);
     if (pick_status.failed()) return finish(outcome, pick_status);
     fu_capabilities_t const allowed = forkunion_allowed_of(ceiling);
     st::expected<topology_t> topology = topology_t::make();
@@ -363,7 +368,7 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
     *arguments->executor = nullptr;
     if (arguments->nvme.transport > ustore_transport_linux_spdk_k)
         return finish(outcome, {status_code_t::invalid_argument_k, "Unknown transport"});
-    auto const [ceiling, pick_status] = pick_cpu_ceiling(arguments->cpu_class);
+    auto const [ceiling, pick_status] = pick_cpu_ceiling(arguments->cpu_class_ceiling);
     if (pick_status.failed()) return finish(outcome, pick_status);
     std::size_t threads = arguments->threads;
     // Every thread pins a channel of 12 MB by default, so the derived count stays as low as the NVMe mount keeps its
@@ -394,14 +399,15 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     gpu_device_t const& device = devices[static_cast<std::size_t>(arguments->device)];
     if (device.vendor != gpu_vendor_t::nvidia_k && arguments->gds == ustore_gds_direct_k)
         return finish(outcome, {status_code_t::device_k, "GPUDirect Storage reaches NVIDIA devices alone"});
-    if (arguments->gpu_class != ustore_gpu_class_unknown_k &&
-        std::string_view {ustore_gpu_class_name(arguments->gpu_class)} == "unrecognized")
-        return finish(outcome, {status_code_t::invalid_argument_k, "Unknown GPU class"});
+    if (arguments->gpu_class_ceiling != ustore_gpu_class_unknown_k &&
+        std::string_view {ustore_gpu_class_name(arguments->gpu_class_ceiling)} == "unrecognized")
+        return finish(outcome, {status_code_t::invalid_argument_k, "Unknown GPU class ceiling"});
     gpu_runtime_t& runtime = gpu_runtime();
     gpu_class_t const gpu_class = pick_gpu_class(runtime.drivers, device,
-                                                 static_cast<gpu_class_t>(arguments->gpu_class));
+                                                 static_cast<gpu_class_t>(arguments->gpu_class_ceiling));
     if (gpu_class == gpu_class_t::unknown_k)
-        return finish(outcome, {status_code_t::unsupported_k, "No class this build compiled runs on the device"});
+        return finish(outcome,
+                      {status_code_t::unsupported_k, "No compiled class runs on the device under the ceiling"});
     // The caller is the one host thread: it stages, feeds the device and waits on it
     ustore_executor_t made = nullptr;
     if (status_t const status = spawn_across_machine(1, caller_exclusivity_t::caller_inclusive_k, fu_capabilities_all_k,
@@ -502,6 +508,10 @@ void ustore_arena_describe(ustore_arena_describe_t* arguments) {
     if (hip_blocks_t const* const hip = std::get_if<hip_blocks_t>(&arena->memory)) {
         vendor = gpu_vendor_t::amd_k;
         vendor_ordinal = hip->device;
+    }
+    if (metal_blocks_t const* const metal = std::get_if<metal_blocks_t>(&arena->memory)) {
+        vendor = gpu_vendor_t::apple_k;
+        vendor_ordinal = metal->device;
     }
     if (vendor_ordinal < 0) return finish(outcome, {});
     description.residency = ustore_residency_vram_k;

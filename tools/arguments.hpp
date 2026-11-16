@@ -2,43 +2,44 @@
  *  @file tools/arguments.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
- *  @brief Command-line flags for every UStore binary: one table parses the arguments, echoes them and prints the usage.
+ *  @brief Command-line flags for every UStore binary: one table parses the arguments, reads their
+ *      variables, prints the usage and echoes the values.
  *
- *  Flags are long kebab-case words whose value follows as the next argument or after @c =. Sizes
- *  carry binary suffixes of any case, durations carry @c ms or @c s, counts are positive integers,
- *  and lists are comma-separated. A text value views the tail of its @c argv entry, so it is
+ *  Flags are long kebab-case words whose value follows as the next argument or after @c =. Byte
+ *  counts carry a binary suffix, durations carry @c ms or @c s, counts are plain integers, and
+ *  lists are comma-separated. A text value views the tail of its @c argv entry, so it is
  *  null-terminated; list items are not. A value that does not parse prints @c --flag="value"
  *  @c does @c not @c parse, @c expected @c <grammar>.
  *
  *  @code{.cpp}
- *  bytes_t memory_limit {64 << 20};
+ *  bytes_t memory_limit;
  *  std::string_view directory;
  *  std::array<std::string_view, 2> const formats {"ndjson", "csv"};
  *  choice_t format {formats};
  *  std::array<flag_t, 3> const flags {{
  *      {"--directory", "path", "database directory", &directory},
- *      {"--memory-limit", "size", "arena budget, like 64MB", &memory_limit},
- *      {"--format", "name", "export format", &format},
+ *      {"--memory-limit", "bytes", "bytes a batch buffers, like 64M", &memory_limit},
+ *      {"--format", "name", "export format: ndjson or csv", &format},
  *  }};
  *  arguments_t const parsed = parse_arguments(argc, argv, flags, {});
  *  @endcode
  */
 #pragma once
 
-#include <cctype>  // `std::tolower`, `std::toupper`
+#include <cctype> // `std::toupper`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstdio>  // `stderr`
+#include <cstdlib> // `std::exit`, `std::strtod`, `std::getenv`
 #include <cstring> // `std::strlen`
 
-#include <algorithm>    // `std::any_of`, `std::equal`
 #include <array>        // `std::array`
 #include <charconv>     // `std::from_chars`
-#include <chrono>       // `std::chrono::nanoseconds`
+#include <chrono>       // `std::chrono::milliseconds`
 #include <limits>       // `std::numeric_limits`
 #include <optional>     // `std::optional`
 #include <random>       // `std::random_device`
-#include <regex>        // `std::regex`, `std::regex_search`
+#include <regex>        // `std::regex`, `std::regex_search` - the filter
 #include <span>         // `std::span`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
@@ -48,10 +49,46 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h> // `fmt::join`
 
-#include "ustore/db.h"                      // the init call of every engine and its arguments
+#include <stringzilla/stringzilla.hpp> // `sz::string_t`
+
+#include "ustore/db.h"                      // the init call of every engine and the spellings flags name
 #include "ustore/utilities/nvme_volume.hpp" // `parse_data_address`, `manifest_suffix_k`
+#include "ustore/utilities/types.hpp"       // `sz`
+
+/** Prints an owning StringZilla string as the text it holds, never as a range of characters. */
+template <>
+struct fmt::formatter<ashvardanian::stringzilla::string_t> : fmt::formatter<std::string_view> {
+    fmt::format_context::iterator format(ashvardanian::stringzilla::string_t const& text,
+                                         fmt::format_context& context) const {
+        return fmt::formatter<std::string_view>::format(text, context);
+    }
+};
 
 namespace unum::ustore::tools {
+
+/** Exits with status 1 after printing that @p what could not be allocated. */
+[[noreturn]] inline void exit_out_of_memory(std::string_view what) noexcept {
+    fmt::println(stderr, "out of memory for {}", what);
+    std::exit(1);
+}
+
+/** Appends @p format over @p args to @p text, exiting with status 1 when it cannot grow. */
+template <typename... args_types_>
+void append_formatted(sz::string_t& text, fmt::format_string<args_types_ const&...> format,
+                      args_types_ const&... args) noexcept {
+    std::size_t const length = text.size();
+    if (text.resize(length + fmt::formatted_size(format, args...)) != sz::status_t::success_k)
+        exit_out_of_memory("a text");
+    fmt::format_to(text.data() + length, format, args...);
+}
+
+/** @p format over @p args as an owning string, exiting with status 1 when it cannot allocate. */
+template <typename... args_types_>
+sz::string_t formatted(fmt::format_string<args_types_ const&...> format, args_types_ const&... args) noexcept {
+    sz::string_t text;
+    append_formatted(text, format, args...);
+    return text;
+}
 
 /** Outcome of parsing one value or a whole argument list. */
 enum class argument_status_t {
@@ -59,26 +96,20 @@ enum class argument_status_t {
     /** Every argument matched its flag. */
     parsed_k,
 
-    /** `--help` was given, so the caller prints the usage and exits. */
+    /** <tt>--help</tt> was given, so the caller prints the usage and exits. */
     help_k,
 
-    /** An argument starting with `--` names no flag. */
+    /** An argument starting with <tt>--</tt> names no flag. */
     unknown_flag_k,
 
     /** A flag taking a value ended the argument list. */
     missing_value_k,
 
-    /** A switch was given a value through `=`. */
+    /** A switch was given a value through @c =. */
     unexpected_value_k,
 
     /** The digits do not form a non-negative integer. */
     invalid_number_k,
-
-    /** The suffix names no unit of the flag's kind. */
-    invalid_unit_k,
-
-    /** The value names none of the flag's choices. */
-    invalid_choice_k,
 
     /** The value overflows its destination or falls outside its bounds. */
     out_of_range_k,
@@ -88,14 +119,12 @@ enum class argument_status_t {
 
     /** A list holds fewer items than it requires. */
     too_few_items_k,
+
+    /** The value names no enumerator of its destination. */
+    unknown_name_k,
 };
 
-/** A positive size in bytes, written @c 64MB or @c 1gb; a bare number is bytes. */
-struct bytes_t {
-    std::size_t value = 0;
-};
-
-/** A plain integer, accepted only within @b [minimum,maximum]. */
+/** A plain non-negative integer, accepted only within @b [minimum,maximum]. */
 struct count_t {
     std::size_t value = 0;
     std::size_t minimum = 1;
@@ -103,18 +132,59 @@ struct count_t {
 };
 
 /** Comma-separated counts like @c 16,256,4096, each within @b [minimum,maximum].
- *  Between @c min_size and @c max_size of them are accepted. */
+ *  Between @c minimum_size and @c maximum_size of them are accepted. */
 struct counts_t {
     static constexpr std::size_t capacity_k = 16;
     std::array<std::size_t, capacity_k> values {};
     std::size_t size = 0;
     std::size_t minimum = 1;
     std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
-    std::size_t min_size = 1;
-    std::size_t max_size = capacity_k;
+    std::size_t minimum_size = 1;
+    std::size_t maximum_size = capacity_k;
 
     [[nodiscard]] std::span<std::size_t const> view() const noexcept { return {values.data(), size}; }
 };
+
+/** A byte count: an integer, or one suffixed K, M, G or T for its binary multiple, like 24G. */
+struct bytes_t {
+    std::size_t value = 0;
+};
+
+/** Whether a flag without a value appeared. */
+enum class switch_t : bool {
+    absent_k,
+    present_k,
+};
+
+/** Which named checks run: every one for an empty pattern, else those the pattern finds as an
+ *  ECMAScript regex, or as a substring when it is no valid regex. */
+struct filter_t {
+    std::string_view pattern;
+    std::optional<std::regex> regex;
+
+    /** Whether @p name passes the filter. */
+    bool selects(std::string_view name) const noexcept {
+        if (pattern.empty()) return true;
+        if (regex) return std::regex_search(name.begin(), name.end(), *regex);
+        return name.find(pattern) != std::string_view::npos;
+    }
+};
+
+/** The filter @p pattern spells, compiled once. */
+inline filter_t filter_of(std::string_view pattern) {
+    filter_t filter {pattern, std::nullopt};
+    if (pattern.empty()) return filter;
+#if defined(__cpp_exceptions) && __cpp_exceptions
+    try {
+        filter.regex.emplace(pattern.begin(), pattern.end());
+    }
+    catch (std::regex_error const&) {
+    }
+#else
+    filter.regex.emplace(pattern.begin(), pattern.end());
+#endif
+    return filter;
+}
 
 /** Comma-separated text items like @c /mnt/a,/mnt/b, viewing into @c argv without null terminators. */
 struct texts_t {
@@ -125,95 +195,41 @@ struct texts_t {
     [[nodiscard]] std::span<std::string_view const> view() const noexcept { return {values.data(), size}; }
 };
 
-/** One name out of @c names, like @c ndjson|csv; @c selected indexes the chosen one. */
+/** One name out of @c names, for a selection the C interface spells nowhere, like a benchmark's
+ *  @c cpu|gpu; @c selected indexes the chosen one. */
 struct choice_t {
     std::span<std::string_view const> names;
     std::size_t selected = 0;
 };
 
-/** A 32-bit seed, or @c random to draw one from the machine. */
-struct seed_t {
-    std::uint32_t value = 42;
-};
-
-/** A regex over names, found as a plain substring when it does not compile; empty selects everything. */
-struct filter_t {
-    std::string_view text;
-    std::optional<std::regex> pattern;
-
-    [[nodiscard]] bool selects(std::string_view name) const noexcept {
-        if (text.empty()) return true;
-        if (pattern) return std::regex_search(name.begin(), name.end(), *pattern);
-        return name.find(text) != std::string_view::npos;
-    }
-};
-
-/** Whether a flag without a value appeared. */
-enum class switch_t : bool {
-    absent_k,
-    present_k,
-};
-
-/** One flag: its name with both dashes, the usage placeholder, one help line, the value it writes, and the label
- *  its echo takes, derived from the name when empty. */
+/** One flag: its name with both dashes, the usage placeholder, one help line, and the value it
+ *  writes. */
 struct flag_t {
     std::string_view name;
     std::string_view placeholder;
     std::string_view help;
-    std::variant<std::string_view*, count_t*, counts_t*, bytes_t*, std::chrono::nanoseconds*, texts_t*, choice_t*,
-                 switch_t*, seed_t*, filter_t*>
+    std::variant<std::string_view*, count_t*, counts_t*, switch_t*, std::chrono::milliseconds*, std::uint32_t*, double*,
+                 filter_t*, texts_t*, choice_t*, bytes_t*>
         destination;
-    std::string_view label;
 };
 
-/** Result of @c parse_arguments: the status, the argument it concerns, the flag that argument named and the value
- *  it gave, and how many positionals were collected. */
+/** Result of @c parse_arguments: the status, the argument and flag it concerns, the value that
+ *  failed, and how many positionals were collected. */
 struct arguments_t {
     argument_status_t status = argument_status_t::parsed_k;
     std::string_view argument;
-    flag_t const* flag = nullptr;
     std::string_view value;
+    flag_t const* flag = nullptr;
     std::size_t positionals_count = 0;
 };
 
-#pragma region Values
-
-/** A suffix and the multiplier it applies to the digits before it. */
-struct unit_t {
-    std::string_view suffix;
-    std::uint64_t multiplier = 1;
-};
-
-inline constexpr std::array<unit_t, 2> duration_units_k {{
-    {"ms", 1'000'000},
-    {"s", 1'000'000'000},
-}};
-
 [[nodiscard]] inline argument_status_t parse_integer_(std::string_view digits, std::uint64_t& value) noexcept {
     if (digits.empty()) return argument_status_t::invalid_number_k;
-    auto const [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), value);
-    if (error == std::errc::result_out_of_range) return argument_status_t::out_of_range_k;
-    if (error != std::errc {} || end != digits.data() + digits.size()) return argument_status_t::invalid_number_k;
+    auto const [end, parse_status] = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+    if (parse_status == std::errc::result_out_of_range) return argument_status_t::out_of_range_k;
+    if (parse_status != std::errc {} || end != digits.data() + digits.size())
+        return argument_status_t::invalid_number_k;
     return argument_status_t::parsed_k;
-}
-
-[[nodiscard]] inline argument_status_t parse_with_units_(std::string_view text, std::span<unit_t const> units,
-                                                         std::uint64_t& value) noexcept {
-    std::size_t digits_length = 0;
-    while (digits_length != text.size() && text[digits_length] >= '0' && text[digits_length] <= '9') ++digits_length;
-    std::uint64_t number = 0;
-    argument_status_t const status = parse_integer_(text.substr(0, digits_length), number);
-    if (status != argument_status_t::parsed_k) return status;
-
-    std::string_view const suffix = text.substr(digits_length);
-    for (unit_t const& unit : units) {
-        if (unit.suffix != suffix) continue;
-        if (number != 0 && unit.multiplier > (std::numeric_limits<std::uint64_t>::max)() / number)
-            return argument_status_t::out_of_range_k;
-        value = number * unit.multiplier;
-        return argument_status_t::parsed_k;
-    }
-    return argument_status_t::invalid_unit_k;
 }
 
 [[nodiscard]] inline argument_status_t parse_bounded_(std::string_view text, std::size_t minimum, std::size_t maximum,
@@ -226,55 +242,20 @@ inline constexpr std::array<unit_t, 2> duration_units_k {{
     return argument_status_t::parsed_k;
 }
 
-/** A positive size in whole bytes or binary units of any case, like "4096", "64KB" or "1GB". */
-inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
-    std::size_t bytes = 0;
-    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), bytes);
-    if (error != std::errc {} || !bytes) return std::nullopt;
-    std::string_view const unit = text.substr(end - text.data());
-    auto const same_letter = [](char given, char lower) noexcept {
-        return std::tolower(static_cast<unsigned char>(given)) == lower;
-    };
-    for (std::string_view const known : std::array<std::string_view, 5> {"", "kb", "mb", "gb", "tb"}) {
-        if (std::equal(unit.begin(), unit.end(), known.begin(), known.end(), same_letter)) return bytes;
-        if (bytes > (std::numeric_limits<std::size_t>::max)() / 1024) return std::nullopt;
-        bytes *= 1024;
-    }
-    return std::nullopt;
-}
-
-/** Parses a size such as @c 64MB into bytes; zero is rejected. */
-[[nodiscard]] inline argument_status_t parse_bytes(std::string_view text, bytes_t& bytes) noexcept {
-    std::optional<std::size_t> const size = parse_size(text);
-    if (!size) return argument_status_t::invalid_unit_k;
-    bytes.value = *size;
-    return argument_status_t::parsed_k;
-}
-
-/** Parses a duration such as @c 500ms or @c 10s; a bare number, a fraction or zero is rejected. */
-[[nodiscard]] inline argument_status_t parse_duration(std::string_view text,
-                                                      std::chrono::nanoseconds& duration) noexcept {
-    std::uint64_t value = 0;
-    argument_status_t const status = parse_with_units_(text, duration_units_k, value);
-    if (status != argument_status_t::parsed_k) return status;
-    if (value == 0 || value > static_cast<std::uint64_t>((std::numeric_limits<std::chrono::nanoseconds::rep>::max)()))
-        return argument_status_t::out_of_range_k;
-    duration = std::chrono::nanoseconds {static_cast<std::chrono::nanoseconds::rep>(value)};
-    return argument_status_t::parsed_k;
-}
-
 /** Parses a plain integer within the bounds @p count already carries. */
 [[nodiscard]] inline argument_status_t parse_count(std::string_view text, count_t& count) noexcept {
     return parse_bounded_(text, count.minimum, count.maximum, count.value);
 }
 
-/** Parses comma-separated counts within the bounds @p counts carries, replacing the items it held. */
+/** Parses comma-separated counts within the bounds @p counts carries, replacing the items it
+ *  held. */
 [[nodiscard]] inline argument_status_t parse_counts(std::string_view text, counts_t& counts) noexcept {
-    std::size_t const max_size = counts.max_size < counts_t::capacity_k ? counts.max_size : counts_t::capacity_k;
+    std::size_t const maximum_size = counts.maximum_size < counts_t::capacity_k ? counts.maximum_size
+                                                                                : counts_t::capacity_k;
     counts.size = 0;
     while (true) {
         std::size_t const comma = text.find(',');
-        if (counts.size == max_size) return argument_status_t::too_many_items_k;
+        if (counts.size == maximum_size) return argument_status_t::too_many_items_k;
         argument_status_t const status = parse_bounded_(text.substr(0, comma), counts.minimum, counts.maximum,
                                                         counts.values[counts.size]);
         if (status != argument_status_t::parsed_k) return status;
@@ -282,7 +263,55 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
     }
-    return counts.size < counts.min_size ? argument_status_t::too_few_items_k : argument_status_t::parsed_k;
+    return counts.size < counts.minimum_size ? argument_status_t::too_few_items_k : argument_status_t::parsed_k;
+}
+
+/** Parses a byte count into @p bytes: digits, then an optional K, M, G or T. */
+[[nodiscard]] inline argument_status_t parse_bytes(std::string_view text, bytes_t& bytes) noexcept {
+    std::size_t shift = 0;
+    if (!text.empty()) switch (text.back()) {
+        case 'K': shift = 10; break;
+        case 'M': shift = 20; break;
+        case 'G': shift = 30; break;
+        case 'T': shift = 40; break;
+        default: break;
+        }
+    if (shift) text.remove_suffix(1);
+    std::uint64_t parsed = 0;
+    if (argument_status_t const status = parse_integer_(text, parsed); status != argument_status_t::parsed_k)
+        return status;
+    if (parsed > ((std::numeric_limits<std::size_t>::max)() >> shift)) return argument_status_t::out_of_range_k;
+    bytes.value = static_cast<std::size_t>(parsed) << shift;
+    return argument_status_t::parsed_k;
+}
+
+/** A positive duration in whole milliseconds or seconds, like "200ms" or "10s". */
+inline std::optional<std::chrono::milliseconds> parse_duration(std::string_view text) noexcept {
+    std::uint32_t count = 0;
+    auto const [end, parse_status] = std::from_chars(text.data(), text.data() + text.size(), count);
+    if (parse_status != std::errc {} || !count) return std::nullopt;
+    std::string_view const unit = text.substr(end - text.data());
+    if (unit == "ms") return std::chrono::milliseconds(count);
+    if (unit == "s") return std::chrono::seconds(count);
+    return std::nullopt;
+}
+
+/** A 32-bit seed, or "random" for a fresh draw from @c std::random_device. */
+inline std::optional<std::uint32_t> parse_seed(std::string_view text) noexcept {
+    if (text == "random") return static_cast<std::uint32_t>(std::random_device {}());
+    std::uint32_t seed = 0;
+    auto const [end, parse_status] = std::from_chars(text.data(), text.data() + text.size(), seed);
+    if (parse_status != std::errc {} || end != text.data() + text.size()) return std::nullopt;
+    return seed;
+}
+
+/** A non-negative real, like "0.125" or "1e-3". */
+inline std::optional<double> parse_real(std::string_view text) noexcept {
+    // Text values view the tail of their `argv` entry, so `strtod` stops at its terminator.
+    char* end = nullptr;
+    double const real = std::strtod(text.data(), &end);
+    if (text.empty() || end != text.data() + text.size() || !(real >= 0)) return std::nullopt;
+    return real;
 }
 
 /** Splits comma-separated text into @p texts, rejecting empty items. */
@@ -299,31 +328,6 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
     }
 }
 
-/** Parses a seed: an unsigned 32-bit integer, or @c random for a fresh draw from @c std::random_device. */
-[[nodiscard]] inline argument_status_t parse_seed(std::string_view text, seed_t& seed) noexcept {
-    if (text == "random") {
-        seed.value = static_cast<std::uint32_t>(std::random_device {}());
-        return argument_status_t::parsed_k;
-    }
-    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), seed.value);
-    if (error == std::errc::result_out_of_range) return argument_status_t::out_of_range_k;
-    if (error != std::errc {} || end != text.data() + text.size()) return argument_status_t::invalid_number_k;
-    return argument_status_t::parsed_k;
-}
-
-/** Keeps @p text as the filter, compiled once as an ECMAScript regex when it compiles; any text parses. */
-[[nodiscard]] inline argument_status_t parse_filter(std::string_view text, filter_t& filter) noexcept {
-    filter.text = text;
-    filter.pattern.reset();
-    try {
-        filter.pattern.emplace(text.begin(), text.end());
-    }
-    catch (std::regex_error const&) {
-        // Left empty, so `selects` finds the filter as a plain substring instead.
-    }
-    return argument_status_t::parsed_k;
-}
-
 /** Selects the name in @p choice equal to @p text. */
 [[nodiscard]] inline argument_status_t parse_choice(std::string_view text, choice_t& choice) noexcept {
     for (std::size_t index = 0; index != choice.names.size(); ++index) {
@@ -331,34 +335,78 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
         choice.selected = index;
         return argument_status_t::parsed_k;
     }
-    return argument_status_t::invalid_choice_k;
+    return argument_status_t::unknown_name_k;
 }
 
-#pragma endregion Values
+/** The bytes of @p text as the C interface borrows a path or a name. */
+inline ustore_bytes_view_t bytes_view(std::string_view text) noexcept {
+    return {reinterpret_cast<ustore_byte_t const*>(text.data()), text.size()};
+}
 
-#pragma region Arguments
+/** Writes the enumerator @p value spells into @p destination, read back by @p from_name and
+ *  accepted only when @p name spells it the same way; the unknown enumerator at zero is no value a
+ *  flag names, since leaving the flag out derives it. */
+template <typename enumeration_type_>
+[[nodiscard]] argument_status_t assign_named_(std::string_view value, enumeration_type_& destination,
+                                              enumeration_type_ (*from_name)(ustore_bytes_view_t),
+                                              char const* (*name)(enumeration_type_)) noexcept {
+    enumeration_type_ const parsed = from_name(bytes_view(value));
+    if (parsed == enumeration_type_ {} || value != name(parsed)) return argument_status_t::unknown_name_k;
+    destination = parsed;
+    return argument_status_t::parsed_k;
+}
+
+/** Writes the enumerator a status-answering @p from_name reads @p value as into @p destination. */
+template <typename enumeration_type_>
+[[nodiscard]] argument_status_t assign_named_(std::string_view value, enumeration_type_& destination,
+                                              ustore_status_t (*from_name)(ustore_bytes_view_t,
+                                                                           enumeration_type_*)) noexcept {
+    enumeration_type_ parsed {};
+    if (from_name(bytes_view(value), &parsed) != ustore_status_success_k) return argument_status_t::unknown_name_k;
+    destination = parsed;
+    return argument_status_t::parsed_k;
+}
 
 [[nodiscard]] inline argument_status_t assign_(flag_t const& flag, std::string_view value) noexcept {
-    if (auto const* text = std::get_if<std::string_view*>(&flag.destination)) {
+    if (std::string_view* const* text = std::get_if<std::string_view*>(&flag.destination)) {
         **text = value;
         return argument_status_t::parsed_k;
     }
-    if (auto const* count = std::get_if<count_t*>(&flag.destination)) return parse_count(value, **count);
-    if (auto const* counts = std::get_if<counts_t*>(&flag.destination)) return parse_counts(value, **counts);
-    if (auto const* bytes = std::get_if<bytes_t*>(&flag.destination)) return parse_bytes(value, **bytes);
-    if (auto const* duration = std::get_if<std::chrono::nanoseconds*>(&flag.destination))
-        return parse_duration(value, **duration);
-    if (auto const* texts = std::get_if<texts_t*>(&flag.destination)) return parse_texts(value, **texts);
-    if (auto const* choice = std::get_if<choice_t*>(&flag.destination)) return parse_choice(value, **choice);
-    if (auto const* seed = std::get_if<seed_t*>(&flag.destination)) return parse_seed(value, **seed);
-    if (auto const* filter = std::get_if<filter_t*>(&flag.destination)) return parse_filter(value, **filter);
+    if (count_t* const* count = std::get_if<count_t*>(&flag.destination)) return parse_count(value, **count);
+    if (counts_t* const* counts = std::get_if<counts_t*>(&flag.destination)) return parse_counts(value, **counts);
+    if (std::chrono::milliseconds* const* duration = std::get_if<std::chrono::milliseconds*>(&flag.destination)) {
+        std::optional<std::chrono::milliseconds> const parsed = parse_duration(value);
+        if (!parsed) return argument_status_t::invalid_number_k;
+        **duration = *parsed;
+        return argument_status_t::parsed_k;
+    }
+    if (std::uint32_t* const* seed = std::get_if<std::uint32_t*>(&flag.destination)) {
+        std::optional<std::uint32_t> const parsed = parse_seed(value);
+        if (!parsed) return argument_status_t::invalid_number_k;
+        **seed = *parsed;
+        return argument_status_t::parsed_k;
+    }
+    if (double* const* real = std::get_if<double*>(&flag.destination)) {
+        std::optional<double> const parsed = parse_real(value);
+        if (!parsed) return argument_status_t::invalid_number_k;
+        **real = *parsed;
+        return argument_status_t::parsed_k;
+    }
+    if (filter_t* const* filter = std::get_if<filter_t*>(&flag.destination)) {
+        **filter = filter_of(value);
+        return argument_status_t::parsed_k;
+    }
+    if (texts_t* const* texts = std::get_if<texts_t*>(&flag.destination)) return parse_texts(value, **texts);
+    if (choice_t* const* choice = std::get_if<choice_t*>(&flag.destination)) return parse_choice(value, **choice);
+    if (bytes_t* const* bytes = std::get_if<bytes_t*>(&flag.destination)) return parse_bytes(value, **bytes);
     return argument_status_t::unexpected_value_k;
 }
 
 /**
- *  @brief Parses @p argv against @p flags, collecting arguments without leading dashes into @p positionals.
+ *  @brief Parses @p argv against @p flags, collecting undashed arguments into @p positionals.
  *
  *  Parsing stops at the first failure, leaving earlier destinations written.
+ *
  *  @param[in] argc Entries of @p argv, the first of which is the program name and is skipped.
  *  @param[in] argv The arguments, which every text destination and list item goes on viewing.
  *  @param[in] flags Every flag the binary accepts; @c --help is always accepted and never listed.
@@ -369,7 +417,7 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
     arguments_t result;
     for (int index = 1; index < argc; ++index) {
         std::string_view const argument = argv[index];
-        result.argument = argument;
+        result.argument = argument, result.value = {}, result.flag = nullptr;
 
         if (!argument.starts_with("--")) {
             if (result.positionals_count == positionals.size()) {
@@ -393,9 +441,11 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
             result.status = argument_status_t::unknown_flag_k;
             return result;
         }
+        result.flag = flag;
 
-        auto const* toggle = std::get_if<switch_t*>(&flag->destination);
+        switch_t* const* toggle = std::get_if<switch_t*>(&flag->destination);
         if (toggle && equals != std::string_view::npos) {
+            result.value = argument.substr(equals + 1);
             result.status = argument_status_t::unexpected_value_k;
             return result;
         }
@@ -408,34 +458,51 @@ inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
             return result;
         }
 
-        std::string_view const value = equals != std::string_view::npos ? argument.substr(equals + 1) : argv[++index];
-        result.status = assign_(*flag, value);
-        if (result.status != argument_status_t::parsed_k) {
-            result.flag = flag;
-            result.value = value;
-            return result;
-        }
+        result.value = equals != std::string_view::npos ? argument.substr(equals + 1) : argv[++index];
+        result.status = assign_(*flag, result.value);
+        if (result.status != argument_status_t::parsed_k) return result;
     }
-    result.argument = {};
+    result = {.positionals_count = result.positionals_count};
     return result;
 }
 
-/** A one-line explanation of @p status for error messages. */
-[[nodiscard]] constexpr std::string_view describe(argument_status_t status) noexcept {
-    switch (status) {
-    case argument_status_t::parsed_k: return "parsed";
-    case argument_status_t::help_k: return "help requested";
-    case argument_status_t::unknown_flag_k: return "unknown flag";
-    case argument_status_t::missing_value_k: return "missing value";
-    case argument_status_t::unexpected_value_k: return "this flag takes no value";
-    case argument_status_t::invalid_number_k: return "not a non-negative integer";
-    case argument_status_t::invalid_unit_k: return "unknown unit";
-    case argument_status_t::invalid_choice_k: return "not one of the accepted names";
-    case argument_status_t::out_of_range_k: return "value out of range";
-    case argument_status_t::too_many_items_k: return "too many values";
-    case argument_status_t::too_few_items_k: return "too few values";
-    }
-    return "unknown status";
+/** The grammar a value of @p flag parses in, as the error line names it. */
+[[nodiscard]] inline std::string_view grammar(flag_t const& flag) noexcept {
+    if (count_t* const* count = std::get_if<count_t*>(&flag.destination))
+        return (*count)->minimum ? "a positive count" : "an unsigned integer";
+    if (counts_t* const* counts = std::get_if<counts_t*>(&flag.destination))
+        return (*counts)->minimum ? "positive counts like 64,128" : "unsigned integers like 0,1";
+    if (std::holds_alternative<std::chrono::milliseconds*>(flag.destination)) return "a duration like 200ms or 10s";
+    if (std::holds_alternative<std::uint32_t*>(flag.destination)) return "an unsigned integer or random";
+    if (std::holds_alternative<double*>(flag.destination)) return "a non-negative real";
+    if (std::holds_alternative<filter_t*>(flag.destination)) return "an ECMAScript regex or a substring";
+    if (std::holds_alternative<texts_t*>(flag.destination)) return "names separated by commas";
+    if (std::holds_alternative<choice_t*>(flag.destination)) return "one of the names --help lists";
+    if (std::holds_alternative<switch_t*>(flag.destination)) return "no value";
+    if (std::holds_alternative<bytes_t*>(flag.destination)) return "bytes like 4096 or 24G";
+    return "a value";
+}
+
+/** The variable that sets @p flag's default, the name the Python suites read too: <tt>--seed</tt>
+ *  reads @c USTORE_SEED. */
+[[nodiscard]] inline sz::string_t ustore_variable(flag_t const& flag) noexcept {
+    sz::string_t variable = formatted("USTORE_{}", flag.name.substr(2));
+    for (std::size_t letter = std::string_view {"USTORE_"}.size(); letter != variable.size(); ++letter)
+        variable[letter] = variable[letter] == '-'
+                               ? '_'
+                               : static_cast<char>(std::toupper(static_cast<unsigned char>(variable[letter])));
+    return variable;
+}
+
+/** Writes @p value, a variable's text, into @p flag: a switch takes 1, 0, true or false, the rest
+ *  parse as on the command line. */
+[[nodiscard]] inline argument_status_t assign_variable_(flag_t const& flag, std::string_view value) noexcept {
+    switch_t* const* toggle = std::get_if<switch_t*>(&flag.destination);
+    if (!toggle) return assign_(flag, value);
+    bool const present = value == "1" || value == "true";
+    if (!present && value != "0" && value != "false") return argument_status_t::unexpected_value_k;
+    **toggle = present ? switch_t::present_k : switch_t::absent_k;
+    return argument_status_t::parsed_k;
 }
 
 /** Prints @p synopsis and one aligned line per flag, generated from the same table that parses. */
@@ -445,19 +512,45 @@ inline void print_usage(std::string_view synopsis, std::span<flag_t const> flags
     for (flag_t const& flag : flags) {
         std::size_t const width = flag.name.size() + (flag.placeholder.empty() ? 0 : flag.placeholder.size() + 3);
         std::size_t const padding = width < column_k ? column_k - width : 1;
-        std::span<std::string_view const> names;
-        if (auto const* choice = std::get_if<choice_t*>(&flag.destination)) names = (*choice)->names;
-        std::string_view const separator = names.empty() ? "" : ": ";
         if (flag.placeholder.empty())
-            fmt::println("  {}{:{}}{}{}{}", flag.name, "", padding, flag.help, separator, fmt::join(names, "|"));
+            fmt::println("  {}{:{}}{} [env: {}]", flag.name, "", padding, flag.help, ustore_variable(flag));
         else
-            fmt::println("  {} <{}>{:{}}{}{}{}", flag.name, flag.placeholder, "", padding, flag.help, separator,
-                         fmt::join(names, "|"));
+            fmt::println("  {} <{}>{:{}}{} [env: {}]", flag.name, flag.placeholder, "", padding, flag.help,
+                         ustore_variable(flag));
     }
     fmt::println("  --help{:{}}print this message", "", column_k - 6);
 }
 
-/** A flag value or grammar spelled into a buffer of its own, so a whole line prints in one call. */
+/** Parses @p argv against @p flags, each defaulting to its @ref ustore_variable when set, so one
+ *  environment drives these binaries and the Python suites alike. On <tt>--help</tt> prints the usage
+ *  and exits with status 0; on the first variable or argument that fails prints one line, like
+ *  <tt>--threads="0" does not parse, expected a positive count</tt>, and exits with status 1. */
+inline void parse_or_exit(int argc, char const* const* argv, std::string_view synopsis, std::span<flag_t const> flags) {
+    for (flag_t const& flag : flags) {
+        sz::string_t const variable = ustore_variable(flag);
+        char const* const value = std::getenv(variable.c_str());
+        if (!value || !*value || assign_variable_(flag, value) == argument_status_t::parsed_k) continue;
+        bool const toggle = std::holds_alternative<switch_t*>(flag.destination);
+        fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", variable, value,
+                     toggle ? "1, 0, true or false" : grammar(flag));
+        std::exit(1);
+    }
+    arguments_t const parsed = parse_arguments(argc, argv, flags, {});
+    if (parsed.status == argument_status_t::parsed_k) return;
+    if (parsed.status == argument_status_t::help_k) {
+        print_usage(synopsis, flags);
+        std::exit(0);
+    }
+    if (!parsed.flag) fmt::println(stderr, "{} is not a flag, see --help", parsed.argument);
+    else
+        fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", parsed.flag->name, parsed.value,
+                     grammar(*parsed.flag));
+    std::exit(1);
+}
+
+#pragma region Echo
+
+/** A flag value spelled into a buffer of its own, so a whole line prints in one call. */
 struct spelling_t {
     std::array<char, 256> text {};
     std::size_t size = 0;
@@ -477,91 +570,58 @@ inline spelling_t spell_duration_(std::chrono::milliseconds duration) noexcept {
     return count % 1000 ? spelling_t {"{}ms", count} : spelling_t {"{}s", count / 1000};
 }
 
-/** Spells @p bytes as a user types it, in the largest binary unit dividing it, like "256MB". */
-inline spelling_t spell_size_(std::size_t bytes) noexcept {
-    constexpr std::array<char const*, 5> units {"", "KB", "MB", "GB", "TB"};
+/** Spells @p bytes as a user types it, in the largest binary suffix dividing it, like "256M". */
+inline spelling_t spell_bytes_(std::size_t bytes) noexcept {
+    constexpr std::array<char const*, 5> suffixes {"", "K", "M", "G", "T"};
     std::size_t power = 0;
-    while (power + 1 != units.size() && bytes && bytes % 1024 == 0) bytes /= 1024, ++power;
-    return {"{}{}", bytes, units[power]};
-}
-
-/** Spells the grammar the value of @p flag takes, which a failure line ends with. */
-inline spelling_t spell_expected_(flag_t const& flag) noexcept {
-    if (auto const* count = std::get_if<count_t*>(&flag.destination)) {
-        std::size_t const minimum = (*count)->minimum, maximum = (*count)->maximum;
-        if (maximum != (std::numeric_limits<std::size_t>::max)()) return {"a count from {} to {}", minimum, maximum};
-        if (minimum == 1) return {"a positive count"};
-        return {"a count of at least {}", minimum};
-    }
-    if (auto const* counts = std::get_if<counts_t*>(&flag.destination)) {
-        if ((*counts)->min_size == (*counts)->max_size)
-            return {"{} positive counts like 32,64,128", (*counts)->min_size};
-        return {"positive counts like 64,128"};
-    }
-    if (std::holds_alternative<bytes_t*>(flag.destination)) return {"a size like 4096, 64KB or 1GB"};
-    if (std::holds_alternative<std::chrono::nanoseconds*>(flag.destination)) return {"a duration like 200ms or 10s"};
-    if (std::holds_alternative<seed_t*>(flag.destination)) return {"an unsigned integer or random"};
-    if (auto const* choice = std::get_if<choice_t*>(&flag.destination))
-        return {"one of {}", fmt::join((*choice)->names, ", ")};
-    return {"names separated by commas"};
-}
-
-/** Prints why @p parsed failed as one line, like @c --threads="0" @c does @c not @c parse, @c expected @c a @c positive
- *  @c count, when a value failed, or as the argument and the reason otherwise. */
-inline void print_error(arguments_t const& parsed) {
-    if (!parsed.flag) return fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
-    fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", parsed.flag->name, parsed.value,
-                 spell_expected_(*parsed.flag).view());
+    while (power + 1 != suffixes.size() && bytes && bytes % 1024 == 0) bytes /= 1024, ++power;
+    return {"{}{}", bytes, suffixes[power]};
 }
 
 /** Spells the value of @p flag as a user types it, or "none" for empty text. */
 inline spelling_t spell_value_(flag_t const& flag) noexcept {
-    if (auto const* text = std::get_if<std::string_view*>(&flag.destination))
+    if (std::string_view* const* text = std::get_if<std::string_view*>(&flag.destination))
         return {"{}", (*text)->empty() ? std::string_view {"none"} : **text};
-    if (auto const* count = std::get_if<count_t*>(&flag.destination)) return {"{}", (*count)->value};
-    if (auto const* counts = std::get_if<counts_t*>(&flag.destination))
+    if (count_t* const* count = std::get_if<count_t*>(&flag.destination)) return {"{}", (*count)->value};
+    if (counts_t* const* counts = std::get_if<counts_t*>(&flag.destination))
         return {"{}", fmt::join((*counts)->view(), ",")};
-    if (auto const* bytes = std::get_if<bytes_t*>(&flag.destination)) return spell_size_((*bytes)->value);
-    if (auto const* duration = std::get_if<std::chrono::nanoseconds*>(&flag.destination))
-        return spell_duration_(std::chrono::duration_cast<std::chrono::milliseconds>(**duration));
-    if (auto const* texts = std::get_if<texts_t*>(&flag.destination)) {
+    if (switch_t* const* toggle = std::get_if<switch_t*>(&flag.destination))
+        return {"{}", **toggle == switch_t::present_k ? "true" : "false"};
+    if (std::chrono::milliseconds* const* duration = std::get_if<std::chrono::milliseconds*>(&flag.destination))
+        return spell_duration_(**duration);
+    if (std::uint32_t* const* seed = std::get_if<std::uint32_t*>(&flag.destination)) return {"{}", **seed};
+    if (double* const* real = std::get_if<double*>(&flag.destination)) return {"{}", **real};
+    if (filter_t* const* filter = std::get_if<filter_t*>(&flag.destination))
+        return {"{}", (*filter)->pattern.empty() ? std::string_view {"none"} : (*filter)->pattern};
+    if (texts_t* const* texts = std::get_if<texts_t*>(&flag.destination)) {
         if ((*texts)->size) return {"{}", fmt::join((*texts)->view(), ",")};
         return {"none"};
     }
-    if (auto const* choice = std::get_if<choice_t*>(&flag.destination))
+    if (choice_t* const* choice = std::get_if<choice_t*>(&flag.destination))
         return {"{}", (*choice)->names[(*choice)->selected]};
-    if (auto const* toggle = std::get_if<switch_t*>(&flag.destination))
-        return {"{}", **toggle == switch_t::present_k ? "true" : "false"};
-    if (auto const* seed = std::get_if<seed_t*>(&flag.destination)) return {"{}", (*seed)->value};
-    filter_t const& filter = **std::get_if<filter_t*>(&flag.destination);
-    return {"{}", filter.text.empty() ? std::string_view {"none"} : std::string_view {filter.text}};
+    return spell_bytes_((*std::get_if<bytes_t*>(&flag.destination))->value);
 }
 
-/** Prints every flag as "- Label: value" in the grammar it parses from, labelled like "--time-limit" as "Time limit",
- *  skipping a flag that a later one of the same name shadows. */
+/** Prints every flag as "- Label: value" in the grammar it parses from, labelled like
+ *  "--time-limit" as "Time limit", skipping a flag that a later one of the same name shadows, so a
+ *  suite's log names every setting it ran with. */
 inline void print_flags(std::span<flag_t const> flags) {
     for (std::size_t index = 0; index != flags.size(); ++index) {
         flag_t const& flag = flags[index];
-        auto const shadows = [&](flag_t const& later) noexcept { return later.name == flag.name; };
-        if (std::any_of(flags.begin() + index + 1, flags.end(), shadows)) continue;
-        spelling_t label {"{}", flag.label.empty() ? flag.name.substr(2) : flag.label};
+        bool shadowed = false;
+        for (flag_t const& later : flags.subspan(index + 1)) shadowed = shadowed || later.name == flag.name;
+        if (shadowed) continue;
+        spelling_t label {"{}", flag.name.substr(2)};
         for (char& character : label.text)
-            if (character == '-' && flag.label.empty()) character = ' ';
+            if (character == '-') character = ' ';
         label.text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(label.text[0])));
         fmt::println("- {}: {}", label.view(), spell_value_(flag).view());
     }
 }
 
-#pragma endregion Arguments
+#pragma endregion Echo
 
 #pragma region Engines
-
-/** The names @c --isolation accepts, in the order of @c ustore_isolation_t. */
-inline constexpr std::array<std::string_view, 2> isolation_names_k {"strict-serializable", "snapshot"};
-
-/** The names @c --engine-transport accepts, in the order of @c ustore_transport_t. */
-inline constexpr std::array<std::string_view, 5> transport_names_k {"automatic", "blocking", "linux-uring", "linux-aio",
-                                                                    "linux-spdk"};
 
 /** The database name @c nvme gives the manifest it opens in @c engine_options_t::directory. */
 inline constexpr std::string_view nvme_database_name_k = "ustore";
@@ -583,20 +643,26 @@ inline std::string_view nvme_manifest_in(std::string_view directory, std::span<c
     return std::string_view {into.data(), static_cast<std::size_t>(written.out - into.data())};
 }
 
-/** The engine a binary opens and the options its flags give the engine's init call. */
+/**
+ *  @brief The engine a binary opens and the options its flags give the engine's init call.
+ *
+ *  The engine, the isolation and the transport stay text until @c open_engine reads them through
+ *  the C interface's own spellings, so a suite built against the headers alone parses the same
+ *  flags without linking the library.
+ */
 struct engine_options_t {
 
     /** The engine's name: @c ram, @c rocksdb, @c leveldb or @c nvme. */
     std::string_view name = "ram";
 
+    /** How the transactions of @c ram see each other, as @c ustore_isolation_name spells it. */
+    std::string_view isolation = "strict-serializable";
+
+    /** How @c nvme moves bytes between files and memory, as @c ustore_transport_name spells it. */
+    std::string_view transport = "automatic";
+
     /** The null-terminated database directory, or null for an in-memory database. */
     char const* directory = nullptr;
-
-    /** How the transactions of @c ram see each other. */
-    choice_t isolation {isolation_names_k};
-
-    /** How @c nvme moves bytes between its files and memory. */
-    choice_t transport {transport_names_k};
 
     /** Directories the runs of @c nvme or the table files of @c rocksdb fill, one per drive;
      *  none keeps them in @c directory. */
@@ -615,43 +681,74 @@ struct engine_options_t {
     }
 };
 
+/** The engine, isolation and transport an @c engine_options_t names, read through C's spellings. */
+struct engine_names_t {
+    ustore_engine_t engine {};
+    ustore_isolation_t isolation {};
+    ustore_transport_t transport {};
+};
+
+/** The flag of an @c engine_options_t whose text names nothing, with the grammar it expects. */
+struct unnamed_flag_t {
+    std::string_view flag;
+    std::string_view value;
+    std::string_view grammar;
+};
+
+/** Reads the names @p options carries into @p names through the C interface's own spellings,
+ *  answering the first that names nothing, or an empty flag when every one parses. */
+[[nodiscard]] inline unnamed_flag_t read_engine_names(engine_options_t const& options, engine_names_t& names) noexcept {
+    if (assign_named_(options.name, names.engine, &ustore_engine_from_name) != argument_status_t::parsed_k)
+        return {"--engine", options.name, "ram, rocksdb, leveldb or nvme"};
+    if (assign_named_(options.isolation, names.isolation, &ustore_isolation_from_name) != argument_status_t::parsed_k)
+        return {"--isolation", options.isolation, "strict-serializable or snapshot"};
+    if (assign_named_(options.transport, names.transport, &ustore_transport_from_name) != argument_status_t::parsed_k)
+        return {"--engine-transport", options.transport, "automatic, blocking, linux-uring, linux-aio or linux-spdk"};
+    return {};
+}
+
 /** Opens the engine @p options name into @p database, running the open on @p executor with @p completion as every
  *  call does, where NVMe borrows @p executor until close; the one place binaries tell the engines apart. The in-memory
  *  engine starts empty without a directory, and persists in one otherwise. */
 inline void open_engine(engine_options_t const& options, ustore_database_t* database, ustore_outcome_t* outcome,
                         ustore_executor_t executor = nullptr,
                         ustore_completion_t completion = ustore_completion_blocking_k) noexcept {
+    engine_names_t names;
+    if (unnamed_flag_t const unnamed = read_engine_names(options, names); !unnamed.flag.empty()) {
+        *outcome = {ustore_status_invalid_argument_k, "An engine, isolation or transport has no such name"};
+        return;
+    }
     ustore_bytes_view_t const directory {reinterpret_cast<ustore_byte_t const*>(options.directory),
                                          options.directory ? std::strlen(options.directory) : 0};
-    ustore_isolation_t const isolation = static_cast<ustore_isolation_t>(options.isolation.selected);
     std::array<ustore_data_directory_t, texts_t::capacity_k> data_directories {};
     for (std::size_t index = 0; index != options.directories.size; ++index) {
         std::string_view const path = options.directories.values[index];
         data_directories[index].path = {reinterpret_cast<ustore_byte_t const*>(path.data()), path.size()};
     }
     ustore_data_directory_t const* const listed = options.directories.size ? data_directories.data() : nullptr;
-    if (listed && options.name != "nvme" && options.name != "rocksdb") {
+    if (listed && names.engine != ustore_engine_nvme_k && names.engine != ustore_engine_rocksdb_k) {
         *outcome = {ustore_status_invalid_argument_k, "Only nvme and rocksdb fill data directories"};
         return;
     }
-    if (options.name == "ram" && !directory.length) {
-        ustore_database_init_ram_t init {.database = database,
-                                         .executor = executor,
-                                         .outcome = outcome,
-                                         .completion = completion,
-                                         .isolation = isolation};
-        return ustore_database_init_ram(&init);
-    }
-    if (options.name == "ram") {
+    switch (names.engine) {
+    case ustore_engine_ram_k: {
+        if (!directory.length) {
+            ustore_database_init_ram_t init {.database = database,
+                                             .executor = executor,
+                                             .outcome = outcome,
+                                             .completion = completion,
+                                             .isolation = names.isolation};
+            return ustore_database_init_ram(&init);
+        }
         ustore_database_open_ram_t open {.database = database,
                                          .executor = executor,
                                          .outcome = outcome,
                                          .completion = completion,
                                          .directory = directory,
-                                         .isolation = isolation};
+                                         .isolation = names.isolation};
         return ustore_database_open_ram(&open);
     }
-    if (options.name == "rocksdb") {
+    case ustore_engine_rocksdb_k: {
         ustore_database_open_rocksdb_t open {.database = database,
                                              .executor = executor,
                                              .outcome = outcome,
@@ -661,7 +758,7 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                              .data_directories_count = options.directories.size};
         return ustore_database_open_rocksdb(&open);
     }
-    if (options.name == "leveldb") {
+    case ustore_engine_leveldb_k: {
         ustore_database_open_leveldb_t open {.database = database,
                                              .executor = executor,
                                              .outcome = outcome,
@@ -669,26 +766,23 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                              .directory = directory};
         return ustore_database_open_leveldb(&open);
     }
-    if (options.name == "nvme") {
+    case ustore_engine_nvme_k: {
         std::string_view const located = directory.length ? std::string_view {options.nvme_manifest.data()} : "";
-        ustore_bytes_view_t const manifest_path {reinterpret_cast<ustore_byte_t const*>(located.data()),
-                                                 located.size()};
         ustore_database_open_nvme_t open {.database = database,
                                           .executor = executor,
                                           .outcome = outcome,
                                           .completion = completion,
-                                          .directory = manifest_path,
+                                          .directory = bytes_view(located),
                                           .data_directories = listed,
                                           .data_directories_count = options.directories.size};
-        auto const transport = static_cast<ustore_transport_t>(options.transport.selected);
-        if (executor || transport == ustore_transport_automatic_k) return ustore_database_open_nvme(&open);
+        if (executor || names.transport == ustore_transport_automatic_k) return ustore_database_open_nvme(&open);
 
         // The transport is the placement of an NVMe executor, which the open reads once, so one made for it alone
         // may go as soon as the open is final
         ustore_executor_t moving = nullptr;
         ustore_executor_for_nvme_t spawn {.executor = &moving,
                                           .outcome = outcome,
-                                          .nvme = {.transport = transport},
+                                          .nvme = {.transport = names.transport},
                                           .threads = 1};
         ustore_executor_for_nvme(&spawn);
         if (outcome->status != ustore_status_success_k) return;
@@ -698,7 +792,8 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
         ustore_executor_free(moving);
         return;
     }
-    *outcome = {ustore_status_invalid_argument_k, "No engine has that name"};
+    default: *outcome = {ustore_status_invalid_argument_k, "No engine has that name"};
+    }
 }
 
 #pragma endregion Engines

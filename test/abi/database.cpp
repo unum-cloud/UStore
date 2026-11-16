@@ -63,7 +63,7 @@ std::size_t database_validation(config_t const& config) {
     if (failures != 0) return failures;
     auto [blobs, blobs_status] = create_collection(database, "database_validation.blobs", ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    expected<transaction_t> maybe_transaction = database.transaction();
+    expected<transaction_t> maybe_transaction = database.on().transaction();
     ustore_transaction_t const transaction = maybe_transaction ? maybe_transaction->transaction() : nullptr;
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
@@ -209,7 +209,7 @@ std::size_t database_validation(config_t const& config) {
         .outcome = &outcome,
     };
     ustore_transaction_init(&transaction_init);
-    failures += expect((outcome.status == ustore_status_success_k) == database.supports_transactions());
+    failures += expect((outcome.status == ustore_status_success_k) == database.on().supports_transactions());
     outcome = {};
 
     transaction_init.transaction = nullptr;
@@ -293,7 +293,7 @@ std::size_t database_forged_views(config_t const& config) {
     ustore_blobs_read(&read);
     failures += expect_status(outcome, status_code_t::invalid_argument_k);
 
-    expected<transaction_t> maybe_transaction = database.transaction();
+    expected<transaction_t> maybe_transaction = database.on().transaction();
     if (!maybe_transaction) return failures;
     read.view = reinterpret_cast<ustore_view_t>(maybe_transaction->transaction());
     ustore_blobs_read(&read);
@@ -332,8 +332,8 @@ case_result_t database_foreign_handles(config_t const& config) {
     else return case_result_t::skipped(needs_directory_k, failures);
     if (!other) return case_result_t::skipped("only one engine is built", failures);
 
-    expected<transaction_t> maybe_transaction = other.transaction();
-    expected<snapshot_t> maybe_snapshot = other.snapshot();
+    expected<transaction_t> maybe_transaction = other.on().transaction();
+    expected<snapshot_t> maybe_snapshot = other.on().snapshot();
     // A transaction is tried first, since it is refused both as a view and as the transaction
     // of a write
     ustore_view_t foreign = nullptr;
@@ -464,15 +464,62 @@ std::size_t database_failed_reports_zeroed(config_t const& config) {
     failures += expect_failure(outcome);
     failures += expect(collection == ustore_collection_id_t {});
 
-    // An executor pinned to a CPU class UStore lacks, here amd-genoa's id, is never made
+    // An executor capped at a value no CPU class takes, here amd-genoa's retired id, is never made
     ustore_executor_t executor = reinterpret_cast<ustore_executor_t>(stale_handle);
     ustore_executor_for_ram_t spawn {.executor = &executor,
                                      .outcome = &outcome,
                                      .threads = 1,
-                                     .cpu_class = static_cast<ustore_cpu_class_t>(7)};
+                                     .cpu_class_ceiling = static_cast<ustore_cpu_class_t>(7)};
     ustore_executor_for_ram(&spawn);
     failures += expect_status(outcome, status_code_t::invalid_argument_k);
     failures += expect(executor == nullptr);
+    return failures;
+}
+
+/** A CPU class the machine lacks caps the pick rather than refusing it: the database opens and
+ *  describes a class other than the ceiling, while a ceiling at the machine's own pick keeps it. */
+case_result_t database_cpu_class_ceiling(config_t const& config) {
+    std::size_t failures = 0;
+    if (config.engine() != "ram")
+        return case_result_t::skipped("the RAM engine alone opens without a directory", failures);
+    ustore_outcome_t outcome {};
+    auto picked_under = [&](ustore_cpu_class_t cpu_class_ceiling) noexcept {
+        ustore_database_t database = nullptr;
+        ustore_database_init_ram_t init {.database = &database,
+                                         .outcome = &outcome,
+                                         .cpu_class_ceiling = cpu_class_ceiling};
+        ustore_database_init_ram(&init);
+        ustore_database_description_t description {};
+        if (outcome.status != ustore_status_success_k) return description.cpu_class;
+        ustore_database_describe_t describe {.database = database, .outcome = &outcome, .description = &description};
+        ustore_database_describe(&describe);
+        ustore_database_free(database);
+        return description.cpu_class;
+    };
+    ustore_cpu_class_t const machine = picked_under(ustore_cpu_class_unknown_k);
+    failures += expect_success(outcome);
+    // A monoversioned build compiles no class under any other, so it refuses a lower ceiling
+    if (failures != 0 || machine == ustore_cpu_class_monoversioned_k)
+        return case_result_t::skipped("a monoversioned build picks no class under a foreign ceiling", failures);
+    failures += expect(picked_under(machine) == machine);
+    failures += expect_success(outcome);
+
+    // Power10 and AWS G5 share no architecture, so one of them is foreign to every machine
+    ustore_cpu_class_t const foreign = machine == ustore_cpu_class_ibm_power10_k ? ustore_cpu_class_aws_g5_k
+                                                                                 : ustore_cpu_class_ibm_power10_k;
+    ustore_cpu_class_t const narrowed = picked_under(foreign);
+    failures += expect_success(outcome);
+    failures += expect(narrowed != foreign && narrowed != ustore_cpu_class_unknown_k);
+
+    ustore_executor_t executor = nullptr;
+    ustore_executor_for_ram_t spawn {.executor = &executor,
+                                     .outcome = &outcome,
+                                     .threads = 1,
+                                     .cpu_class_ceiling = foreign};
+    ustore_executor_for_ram(&spawn);
+    failures += expect_success(outcome);
+    failures += expect(executor != nullptr);
+    ustore_executor_free(executor);
     return failures;
 }
 
@@ -483,7 +530,8 @@ case_result_t database_transaction_reset_elsewhere(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
 
     // The in-memory engine opens a second database without a directory, and a disk engine in a
     // directory of its own
@@ -1104,8 +1152,9 @@ case_result_t database_rollback(config_t const& config) {
     if (failures != 0) return failures;
     auto [blobs, blobs_status] = create_collection(database, "database_rollback.blobs", ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    expected<transaction_t> maybe_transaction = database.transaction();
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    expected<transaction_t> maybe_transaction = database.on().transaction();
     failures += expect(maybe_transaction.has_value());
     if (failures != 0) return failures;
     ustore_transaction_t const transaction = maybe_transaction->transaction();
@@ -1142,14 +1191,14 @@ case_result_t database_stamps(config_t const& config) {
     if (failures != 0) return failures;
     auto [blobs, blobs_status] = create_collection(database, "database_stamps.blobs", ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    if (!database.supports_transactions() || !database.supports_snapshots())
+    if (!database.on().supports_transactions() || !database.on().supports_snapshots())
         return case_result_t::skipped("the engine keeps no transactions or no snapshots", failures);
 
     // A commit at the head first, so the stage reads above zero and a commit reporting nothing
     // reads below it
     ustore_key_t const key = key_from_integer(62);
     failures += write_text(database, blobs, {&key, 1}, "head");
-    expected<transaction_t> maybe_transaction = database.transaction();
+    expected<transaction_t> maybe_transaction = database.on().transaction();
     failures += expect(maybe_transaction.has_value());
     if (failures != 0) return failures;
     ustore_transaction_t const transaction = maybe_transaction->transaction();
@@ -1311,7 +1360,7 @@ case_result_t database_fresh_collections(config_t const& config) {
     failures += expect(fresh.has_value() && arena_status.succeeded());
     if (failures != 0) return failures;
 
-    auto [listed, list_status] = fresh->collections(arena);
+    auto [listed, list_status] = fresh->on().collections(arena);
     failures += expect(list_status.succeeded());
     failures += expect_eq(listed.size(), 0u);
     failures += expect_status(collection_named(fresh->receiver(), "_names"), status_code_t::not_found_k);
@@ -1327,9 +1376,9 @@ case_result_t database_find_at_snapshot(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
 
-    expected<snapshot_t> snapshot = database.snapshot();
+    expected<snapshot_t> snapshot = database.on().snapshot();
     failures += expect(snapshot.has_value());
     if (failures != 0) return failures;
     failures += expect(create_collection(database, "later", ustore_modality_blobs_k).has_value());
@@ -1400,8 +1449,8 @@ std::size_t status_names(config_t const&) {
 std::size_t closed_set_names(config_t const&) {
     std::size_t failures = 0;
     failures += expect_spellings(ustore_cpu_class_name, ustore_cpu_class_from_name, 12);
-    failures += expect_spellings(ustore_gpu_vendor_name, ustore_gpu_vendor_from_name, 2);
-    failures += expect_spellings(ustore_gpu_class_name, ustore_gpu_class_from_name, 8);
+    failures += expect_spellings(ustore_gpu_vendor_name, ustore_gpu_vendor_from_name, 3);
+    failures += expect_spellings(ustore_gpu_class_name, ustore_gpu_class_from_name, 11);
     failures += expect_spellings(ustore_mood_name, ustore_mood_from_name, 2);
     failures += expect_spellings(ustore_durability_name, ustore_durability_from_name, 2);
     failures += expect_spellings(ustore_watch_name, ustore_watch_from_name, 2);
@@ -1447,8 +1496,8 @@ std::size_t database_describe_compact(config_t const& config) {
     failures += expect_success(outcome);
     failures += expect(std::string_view {ustore_engine_name(description.engine)} == config.engine());
     if (config.engine() == "ram") {
-        failures += expect(description.isolation ==
-                           static_cast<ustore_isolation_t>(config.options().isolation.selected));
+        failures += expect(std::string_view {ustore_isolation_name(description.isolation)} ==
+                           config.options().isolation);
         failures += expect(description.keys >= keys.size());
     }
 
@@ -1598,6 +1647,17 @@ case_result_t database_view_refusals(config_t const& config) {
     ustore_database_compact_t compact {.database = database, .outcome = &outcome};
     ustore_database_compact(&compact);
     failures += expect_status(status_t {outcome}, status_code_t::read_only_k);
+    auto [executor, spawn_status] = spawn_executor();
+    failures += expect(spawn_status.succeeded());
+    ustore_database_compact_plan_t plan = nullptr;
+    ustore_phase_progress_t phase {.phase = ustore_phase_done_k};
+    compact.executor = executor;
+    compact.plan = &plan;
+    compact.phase = &phase;
+    ustore_database_compact(&compact);
+    failures += expect_status(status_t {outcome}, status_code_t::read_only_k);
+    failures += expect(plan == nullptr && phase.phase == ustore_phase_none_k);
+    ustore_executor_free(executor);
     ustore_database_free(database);
     return failures;
 }
@@ -1814,6 +1874,50 @@ case_result_t database_flush_durable(config_t const& config) {
     return failures;
 }
 
+/** A relative directory reaches the files of its absolute spelling for the life of the handle,
+ *  even after the process changes directory, on every engine that keeps its directory. */
+case_result_t database_relative_directory(config_t const& config) {
+    std::size_t failures = 0;
+    if (!config.directory()) return case_result_t::skipped(needs_directory_k, failures);
+    if (config.engine() == "nvme") return case_result_t::skipped("an NVMe open names a manifest, not a directory");
+    std::error_code error;
+    std::filesystem::path const parent = std::filesystem::absolute(config.directory(), error);
+    std::filesystem::path const absolute = parent / "relative";
+    std::filesystem::path const started = std::filesystem::current_path(error);
+    failures += expect(!error && recreate_directory(absolute.c_str()));
+    if (failures != 0) return failures;
+    std::filesystem::current_path(parent, error);
+    auto [database, open_status] = open_saved(config, "relative");
+    // The handle outlives the directory it was opened from
+    std::filesystem::current_path(started, error);
+    failures += expect(open_status.succeeded() && !error);
+    if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "rooted", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
+    ustore_key_t const key = key_from_integer(9);
+    failures += write_text(database, blobs, {&key, 1}, "rooted");
+    ustore_outcome_t outcome {};
+    ustore_database_flush_t flush {.database = database, .outcome = &outcome};
+    ustore_database_flush(&flush);
+    failures += expect_success(outcome);
+    ustore_database_free(database);
+
+    auto [reopened, reopen_status] = open_saved(config, absolute.c_str());
+    failures += expect(reopen_status.succeeded());
+    if (failures != 0) return failures;
+    auto [kept, kept_status] = collection_named(receiver_t {reopened}, "rooted");
+    failures += expect(kept_status.succeeded());
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(arena_status.succeeded());
+    read_columns_t columns;
+    ustore_blobs_read_t read = read_of(reopened, kept, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read(&read);
+    failures += expect_success(outcome);
+    failures += expect(columns.presences && (columns.presences[0] & 1) != 0 && columns.value(0) == "rooted");
+    ustore_database_free(reopened);
+    return failures;
+}
+
 /** A RAM image that exists but does not open fails the open, rather than opening an empty
  *  database over it. */
 case_result_t database_unreadable_image(config_t const& config) {
@@ -1822,9 +1926,10 @@ case_result_t database_unreadable_image(config_t const& config) {
     path_t const directory {config.directory(), "unreadable.image"};
     path_t const image {directory.c_str(), "ram.image"};
     std::size_t failures = expect(recreate_directory(directory.c_str()));
-    // A link to itself answers ELOOP to every open, even a privileged one
+    // A link to itself answers ELOOP to every open, even a privileged one; its target is its own
+    // name, which a link reads from its own directory, so a relative directory loops alike
     std::error_code error;
-    std::filesystem::create_symlink(image.c_str(), image.c_str(), error);
+    std::filesystem::create_symlink("ram.image", image.c_str(), error);
     failures += expect(!error);
     failures += expect_status(open_saved(config, directory.c_str()), status_code_t::io_k);
     return failures;
@@ -1840,7 +1945,7 @@ case_result_t progress_cancel_save(config_t const& config) {
     if (failures != 0) return failures;
     auto [blobs, blobs_status] = create_collection(database, "progress_cancel_save.blobs", ustore_modality_blobs_k);
     failures += expect(blobs_status.succeeded());
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     ustore_key_t const key = key_from_integer(9);
     failures += write_text(database, blobs, {&key, 1}, "saved");
     path_t const saved {config.directory(), "progress.saved"};
@@ -1884,8 +1989,8 @@ case_result_t progress_cancel_save(config_t const& config) {
     return failures;
 }
 
-/** A compaction its callback cancels at the first report stops between collections, and the
- *  data stays readable. */
+/** A compaction its callback cancels at the first report stops at that barrier, and the data
+ *  stays readable. */
 case_result_t progress_cancel_compact(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -1916,9 +2021,196 @@ case_result_t progress_cancel_compact(config_t const& config) {
     return failures;
 }
 
+/** Finishes @p plan on @p database with @p executor, expecting @p wanted, and leaves it null, as
+ *  the finish frees it whatever it answers. */
+std::size_t finish_compact_plan(ustore_database_t database, ustore_executor_t executor,
+                                ustore_database_compact_plan_t& plan, status_code_t wanted) {
+    ustore_outcome_t outcome {};
+    ustore_database_compact_plan_finish_t finish {.database = database,
+                                                  .executor = executor,
+                                                  .outcome = &outcome,
+                                                  .plan = plan};
+    ustore_database_compact_plan_finish(&finish);
+    plan = nullptr;
+    return expect_status(status_t {outcome}, wanted);
+}
+
+/** A plan a cancel leaves live continues at least one phase per call to its end, each barrier
+ *  ticking that phase's own units, the phase output naming where each call stopped, and a finish
+ *  frees it after its end as after a stop. Meanwhile the database admits no second compaction,
+ *  and a plan without an executor, or one named with another database or executor, is refused
+ *  before anything runs. */
+case_result_t compact_plan_resumes(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [executor, spawn_status] = spawn_executor();
+    auto [other_executor, other_spawn_status] = spawn_executor();
+    failures += expect(open_status.succeeded() && spawn_status.succeeded() && other_spawn_status.succeeded());
+    if (failures != 0) return failures;
+    std::array<ustore_collection_id_t, 2> collections {};
+    for (std::size_t index = 0; index != collections.size(); ++index) {
+        auto [created, created_status] = create_collection(database, fmt::format("compact_plan.{}", index),
+                                                           ustore_modality_blobs_k);
+        failures += expect(created_status.succeeded());
+        collections[index] = created;
+        ustore_key_t const key = key_from_integer(index);
+        failures += write_text(database, created, {&key, 1}, "first");
+        failures += write_text(database, created, {&key, 1}, "second");
+    }
+    if (failures != 0) return failures;
+
+    ustore_outcome_t outcome {};
+    ustore_database_compact_plan_t plan = nullptr;
+    ustore_phase_progress_t phase {};
+    progress_record_t record {.cancelling_report = 1};
+    ustore_database_compact_t compact {.database = database,
+                                       .executor = executor,
+                                       .outcome = &outcome,
+                                       .progress = &record_progress,
+                                       .progress_state = &record,
+                                       .plan = &plan,
+                                       .phase = &phase};
+
+    // A plan opens only with an executor to outlive it, refused before anything runs
+    ustore_database_compact_t unexecuted = compact;
+    unexecuted.executor = nullptr;
+    ustore_database_compact(&unexecuted);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+    failures += expect(plan == nullptr && record.calls == 0 && phase.phase == ustore_phase_none_k);
+
+    ustore_database_compact(&compact);
+    failures += expect_status(status_t {outcome}, status_code_t::cancelled_k);
+    failures += expect(plan != nullptr);
+    failures += expect(phase.phase == ustore_phase_flush_k || phase.phase == ustore_phase_merge_k ||
+                       phase.phase == ustore_phase_reclaim_k);
+    failures += expect(phase.completed <= phase.total);
+    failures += expect_eq(record.calls, 1u);
+    failures += expect(record.finished <= record.total);
+    if (failures != 0) return failures;
+
+    // The live plan holds the database, so neither a second plan nor a call naming none opens
+    ustore_database_compact_plan_t second = nullptr;
+    ustore_database_compact_t contending {.database = database,
+                                          .executor = executor,
+                                          .outcome = &outcome,
+                                          .plan = &second};
+    ustore_database_compact(&contending);
+    failures += expect_status(status_t {outcome}, status_code_t::contended_k);
+    failures += expect(second == nullptr);
+    ustore_database_compact_t one_shot {.database = database, .outcome = &outcome, .phase = &phase};
+    ustore_database_compact(&one_shot);
+    failures += expect_status(status_t {outcome}, status_code_t::contended_k);
+    failures += expect(phase.phase == ustore_phase_none_k);
+
+    // A plan names the database and the executor it was opened with, checked before the database
+    ustore_database_t other = nullptr;
+    ustore_database_init_ram_t init_other {.database = &other, .outcome = &outcome};
+    ustore_database_init_ram(&init_other);
+    failures += expect_success(outcome);
+    ustore_database_compact_t elsewhere = compact;
+    elsewhere.database = other;
+    ustore_database_compact(&elsewhere);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+    elsewhere.database = database;
+    elsewhere.executor = other_executor;
+    ustore_database_compact(&elsewhere);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+    elsewhere.database = nullptr;
+    ustore_database_compact(&elsewhere);
+    failures += expect_status(status_t {outcome}, status_code_t::uninitialized_k);
+
+    // Each call runs at least one more phase, and a cancel at the closing barrier succeeds
+    ustore_size_t calls = 1;
+    for (; calls != 4096 && status_t {outcome}.code != status_code_t::success_k; ++calls) {
+        record.calls = 0;
+        ustore_database_compact(&compact);
+        failures += expect(status_t {outcome}.code == status_code_t::cancelled_k ||
+                           status_t {outcome}.code == status_code_t::success_k);
+        failures += expect_eq(record.calls, 1u);
+        failures += expect(record.finished <= record.total);
+    }
+    failures += expect_success(outcome);
+    failures += expect(calls > 1);
+    failures += expect_eq(record.finished, record.total);
+    failures += expect(phase.phase == ustore_phase_done_k && phase.ordinal != 0);
+    record.calls = 0;
+    ustore_database_compact(&compact);
+    failures += expect_success(outcome);
+    failures += expect(record.calls == 0 && phase.phase == ustore_phase_done_k);
+    failures += finish_compact_plan(database, executor, plan, status_code_t::success_k);
+
+    // Once finished, the database admits a call naming no plan, which runs to its end
+    ustore_database_compact(&one_shot);
+    failures += expect_success(outcome);
+    failures += expect(phase.phase == ustore_phase_done_k);
+
+    // A plan finished after a stop frees the database too, as does one finished naming another
+    record = {.cancelling_report = 1};
+    ustore_database_compact(&compact);
+    failures += expect_status(status_t {outcome}, status_code_t::cancelled_k);
+    failures += finish_compact_plan(database, executor, plan, status_code_t::success_k);
+    record = {.cancelling_report = 1};
+    ustore_database_compact(&compact);
+    failures += expect_status(status_t {outcome}, status_code_t::cancelled_k);
+    failures += finish_compact_plan(other, executor, plan, status_code_t::invalid_argument_k);
+    record = {.cancelling_report = 1};
+    ustore_database_compact(&compact);
+    failures += expect_status(status_t {outcome}, status_code_t::cancelled_k);
+    failures += finish_compact_plan(database, other_executor, plan, status_code_t::invalid_argument_k);
+    failures += finish_compact_plan(database, nullptr, plan, status_code_t::invalid_argument_k);
+    failures += finish_compact_plan(nullptr, nullptr, plan, status_code_t::uninitialized_k);
+    ustore_database_compact(&one_shot);
+    failures += expect_success(outcome);
+
+    // A deferred plan stops, continues to its end and finishes on its executor too
+    record = {.outcome = &outcome, .cancelling_report = 1};
+    ustore_database_compact_t deferred = compact;
+    deferred.completion = ustore_completion_deferred_k;
+    ustore_database_compact(&deferred);
+    failures += expect(ustore_outcome_wait(&outcome) == ustore_status_cancelled_k);
+    failures += expect(plan != nullptr && record.after_final == 0);
+    record.cancelling_report = 0;
+    ustore_database_compact(&deferred);
+    failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+    failures += expect(phase.phase == ustore_phase_done_k && record.finished == record.total);
+    ustore_database_compact_plan_finish_t finish {.database = database,
+                                                  .executor = executor,
+                                                  .outcome = &outcome,
+                                                  .completion = ustore_completion_deferred_k,
+                                                  .plan = plan};
+    ustore_database_compact_plan_finish(&finish);
+    failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
+    plan = nullptr;
+
+    for (std::size_t index = 0; index != collections.size(); ++index) {
+        ustore_key_t const key = key_from_integer(index);
+        auto [arena, arena_status] = arena_t::make();
+        failures += expect(arena_status.succeeded());
+        read_columns_t columns;
+        ustore_blobs_read_t read = read_of(database, collections[index], {&key, 1}, columns, arena, outcome);
+        ustore_blobs_read(&read);
+        failures += expect_success(outcome);
+        failures += expect(tape_written(columns.values) && columns.value(0) == "second");
+    }
+    ustore_database_free(other);
+    ustore_executor_free(other_executor);
+    ustore_executor_free(executor);
+    return failures;
+}
+
+/** Every phase a plan runs spells its name and reads it back, while a name no phase carries is
+ *  refused. */
+std::size_t compact_phase_names(config_t const&) {
+    std::size_t failures = expect_spellings(ustore_phase_name, ustore_phase_from_name, 5);
+    failures += expect(std::string_view {ustore_phase_name(ustore_phase_merge_k)} == "merge");
+    failures += expect(std::string_view {ustore_phase_name(static_cast<ustore_phase_t>(5))} == "unrecognized");
+    return failures;
+}
+
 /** The callbacks of a deferred scan, pull, compaction and save each run one at a time, before their
- *  call is final, with counts that never decrease and end at the total. The record counts without
- *  atomics, so ThreadSanitizer flags two callbacks of one call running at once. */
+ *  call is final, with counts that end at the total and never decrease, except where a phase of a
+ *  compaction ends. The record counts without atomics, so ThreadSanitizer flags two callbacks of
+ *  one call running at once. */
 std::size_t progress_serialized(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -1985,9 +2277,11 @@ std::size_t progress_serialized(config_t const& config) {
     ustore_database_compact(&compact);
     failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
     failures += expect(compacted.calls != 0);
-    failures += expect_clean(compacted, compacted.calls);
+    // Each barrier ticks its own phase's units, so the count drops where a phase ends
+    failures += expect(compacted.overlaps == 0 && compacted.after_final == 0);
+    failures += expect_eq(compacted.finished, compacted.total);
 
-    if (config.directory() && database.supports_snapshots()) {
+    if (config.directory() && database.on().supports_snapshots()) {
         path_t const saved {config.directory(), "progress.serialized"};
         failures += expect(ready_save_path(config, saved.c_str()));
         ustore_snapshot_t snapshot = nullptr;
@@ -2028,7 +2322,7 @@ case_result_t snapshot_save_recorded(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     auto [dropped, dropped_status] = create_collection(database, "save.dropped", ustore_modality_blobs_k);
     failures += expect(dropped_status.succeeded());
     ustore_key_t const key = key_from_integer(21);
@@ -2160,7 +2454,8 @@ case_result_t changes_randomized_history(config_t const& config) {
     auto [beside, beside_status] = create_collection(database, "changes_history.beside", ustore_modality_blobs_k);
     failures += expect(watched_status.succeeded() && beside_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
 
     ustore_outcome_t outcome {};
     ustore_snapshot_t snapshot = nullptr;
@@ -2186,7 +2481,7 @@ case_result_t changes_randomized_history(config_t const& config) {
     for (std::size_t round = 1; round <= rounds_k && failures == 0; ++round) {
         std::size_t const action = draw(22);
         if (action < 10) {
-            expected<transaction_t> maybe_transaction = database.transaction();
+            expected<transaction_t> maybe_transaction = database.on().transaction();
             failures += expect(maybe_transaction.has_value());
             if (failures != 0) break;
             ustore_transaction_t const transaction = maybe_transaction->transaction();
@@ -2329,6 +2624,7 @@ int main(int argc, char** argv) {
     report(totals, "database.forged_views", database_forged_views, config);
     report(totals, "database.foreign_handles", database_foreign_handles, config);
     report(totals, "database.failed_reports_zeroed", database_failed_reports_zeroed, config);
+    report(totals, "database.cpu_class_ceiling", database_cpu_class_ceiling, config);
     report(totals, "database.transaction_reset_elsewhere", database_transaction_reset_elsewhere, config);
     report(totals, "database.read_offsets", database_read_offsets, config);
     report(totals, "database.write_layouts", database_write_layouts, config);
@@ -2355,9 +2651,12 @@ int main(int argc, char** argv) {
     report(totals, "database.view_refusals", database_view_refusals, config);
     report(totals, "progress.cancel_scans", progress_cancel_scans, config);
     report(totals, "progress.cancel_cursor", progress_cancel_cursor, config);
+    report(totals, "database.relative_directory", database_relative_directory, config);
     report(totals, "database.unreadable_image", database_unreadable_image, config);
     report(totals, "progress.cancel_save", progress_cancel_save, config);
     report(totals, "progress.cancel_compact", progress_cancel_compact, config);
+    report(totals, "compact.plan_resumes", compact_plan_resumes, config);
+    report(totals, "compact.phase_names", compact_phase_names, config);
     report(totals, "progress.serialized", progress_serialized, config);
     report(totals, "snapshot.save_recorded", snapshot_save_recorded, config);
     report(totals, "changes.randomized_history", changes_randomized_history, config);

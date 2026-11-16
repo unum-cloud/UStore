@@ -39,7 +39,7 @@ using namespace unum;
 struct linearizability_options_t {
 
     /** Wall-clock bound of the whole run, shared evenly by every configuration. */
-    std::chrono::nanoseconds time_limit = std::chrono::seconds {10};
+    std::chrono::milliseconds time_limit = std::chrono::seconds {10};
 
     /** Most rounds, each ending at a replayed checkpoint, one configuration runs. */
     count_t checkpoints {.value = 1'000, .minimum = 1};
@@ -185,7 +185,7 @@ struct linearizability_run_t {
 
 /** Begins the transaction a slot resets before every commit. */
 [[nodiscard]] std::size_t begin_transaction(database_t& database, transaction_t& transaction) {
-    auto maybe_transaction = database.transaction();
+    auto maybe_transaction = database.on().transaction();
     std::size_t const failures = expect(maybe_transaction);
     if (failures) return failures;
     transaction = *std::move(maybe_transaction);
@@ -223,7 +223,7 @@ struct linearizability_run_t {
     std::size_t failures = expect(open_status.succeeded());
     if (failures) return failures;
     run.database = std::move(database);
-    auto [collection, create_status] = run.database.find_or_create("linearizability");
+    auto [collection, create_status] = run.database.on().find_or_create("linearizability");
     failures += expect(create_status.succeeded());
     run.collection = collection;
     for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
@@ -239,7 +239,7 @@ struct linearizability_run_t {
  *  the commit's outcome. */
 std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collection, std::span<operation_t> batch,
                               operations_mix_t mix, std::uniform_int_distribution<std::uint64_t>& key_distribution) {
-    std::size_t failures = expect(slot.transaction.reset().succeeded());
+    std::size_t failures = expect(slot.transaction.on().reset().has_value());
     blobs_collection_t inside {slot.transaction.receiver(), collection};
     for (operation_t& operation : batch) {
         operation.code = slot.random_generator() % mix.parts() < mix.inserts ? operation_code_t::insert_k
@@ -257,7 +257,7 @@ std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collec
         failures += expect(staged.succeeded());
     }
 
-    auto maybe_stamp = slot.transaction.commit();
+    auto maybe_stamp = slot.transaction.on().commit();
     bool const committed = maybe_stamp.has_value();
     commit_stamp_t const stamp = committed ? *maybe_stamp
                                            : commit_stamp_t {(std::numeric_limits<ustore_stamp_t>::max)()};
@@ -340,7 +340,7 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
     std::span<operation_t const*> const latest {run.latest.data(), static_cast<std::size_t>(workload.max_key) + 1};
     replay_round(operations, latest);
     failures += verify_round(run, latest);
-    failures += expect(run.database.clear(ustore_drop_pairs_k).succeeded());
+    failures += expect(run.database.on().clear(ustore_drop_pairs_k).succeeded());
     return failures;
 }
 
@@ -438,7 +438,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     run.database = std::move(database);
-    if (!run.database.supports_transactions()) {
+    if (!run.database.on().supports_transactions()) {
         report(totals, "linear_writes", case_result_t::skipped("the engine does not support transactions"));
         return suite_exit_code(totals);
     }

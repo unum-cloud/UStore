@@ -2,72 +2,201 @@
  *  @file cpp/ustore/strings_collection.hpp
  *  @author Ash Vardanian
  *  @date September 17, 2026
- *  @brief Handles to one collection keyed by variable-length strings, with ordered prefix walks, and their deferred
- *      twins, whose verbs submit to an executor.
+ *  @brief Handles to one collection keyed by variable-length strings, with ordered prefix walks,
+ *      whose verbs block or answer deferred calls as their receiver chose.
  */
 
 #pragma once
 
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 
-#include <iterator>    // `std::forward_iterator_tag`
+#include <iterator>    // `std::forward_iterator_tag`, `std::size`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`, `std::swap`, `std::exchange`
 
-#include "ustore/blobs_range.hpp" // `match_t`, `narrow`
-#include "ustore/ranges.hpp"      // `strings_of`, `range`, `keys_view_t`, `bits_view_t`, `values_tape_t`
-#include "ustore/status.hpp"      // `status_t`, `expected`, `deferred`
+#include "ustore/blobs_range.hpp" // `match_t`, `narrow`, `size_estimates_t`, `measure_outputs_`
+#include "ustore/ranges.hpp"      // `strings_of`, `range`, `keys_view_t`, `bits_view_t`, `strings_batch_concept`
+#include "ustore/status.hpp"      // `status_t`, `expected`, `answer`, `called_`, `refused_`, `defers`
 #include "ustore/strings.h"
-#include "ustore/types.hpp" // `arena_t`, `receiver_t`, `value_view_t`
+#include "ustore/types.hpp" // `arena_t`, `receiver_t`, `value_view_t`, `collection_access_t`, `collection_drop_`
 
 namespace unum::ustore {
 
-class deferred_strings_read_collection_t;
-class deferred_strings_collection_t;
+#pragma region Verbs
 
-#pragma region Streams
+/** What a scan hands over: the strings every prefix found, page after page, inside the arena. */
+struct strings_pages_t {
 
-/** Scans one page of up to @p limit strings of @p prefix from @p start into @p arena, keeping the strings @p match
- *  admits and writing one BM25 score per string into @p scores when it is not null and the patterns carry weights. */
-inline expected<sz::strings_view_t> scan_strings_page( //
-    receiver_t const& receiver, ustore_watch_t watch, ustore_collection_id_t const& collection,
-    value_view_t const& prefix, value_view_t const& start, std::size_t limit, ustore_arena_t arena,
-    match_t const& match = {}, float const** scores = nullptr) noexcept {
+    /** Every string found, in the order of the prefixes and then of their text. */
+    sz::strings_view_t strings {strings_of({}, 0)};
 
-    strided_strings<value_view_t> const prefixes {{&prefix, 0}};
-    strided_strings<value_view_t> const starts {{&start, 0}};
-    ustore_length_t const* offsets = nullptr;
-    ustore_strings_view_t found_strings {};
-    ustore_outcome_t outcome {};
-    ustore_strings_scan_t scan {};
-    scan.database = receiver.database;
-    scan.executor = receiver.executor;
-    scan.outcome = &outcome;
-    scan.view = receiver.view(watch);
-    scan.count = 1;
-    scan.collections = {&collection, 0};
-    scan.prefixes = prefixes.view();
-    scan.start_strings = starts.view();
-    scan.offsets = &offsets;
-    scan.strings = &found_strings;
-    scan.arena = arena;
-    scan.wanted = limit;
-    narrow(scan, match);
-    scan.scores = scores;
+    /** Where the page of every prefix starts among @c strings, with one more closing
+     *  the last page. */
+    std::span<ustore_length_t const> pages;
 
-    ustore_strings_scan(&scan);
-    if (status_t const status {outcome}; status.failed()) return status;
-    if (!offsets) return strings_of({}, 0);
-    return strings_of(tape_slice(found_strings, offsets[0]), offsets[1] - offsets[0]);
+    /** One BM25 score per string when the patterns carry weights, or @c nullptr. */
+    float const* scores = nullptr;
+};
+
+/** Where a scan writes its pages, their strings and their scores. */
+template <>
+struct outputs<strings_pages_t> {
+
+    /** Prefixes scanned, the pages of the answer. */
+    ustore_size_t count = 0;
+
+    /** Output for the offsets of the pages, inside the arena. */
+    ustore_length_t const* pages = nullptr;
+
+    /** Output for the tape of strings, inside the arena. */
+    ustore_strings_view_t strings {};
+
+    /** Output for one score per string, inside the arena. */
+    float const* scores = nullptr;
+
+    strings_pages_t answer() const noexcept {
+        if (!pages) return {};
+        return {strings_of(tape_slice(strings, pages[0]), pages[count] - pages[0]), {pages, count + 1}, scores};
+    }
+};
+
+/** Where a strings read writes presence bits: nowhere, unless it answers them. */
+template <typename answer_type_>
+ustore_octet_t const** strings_presences_output_(outputs<answer_type_>&) noexcept {
+    return nullptr;
+}
+
+inline ustore_octet_t const** strings_presences_output_(outputs<bits_view_t>& written) noexcept {
+    return &written.presences;
+}
+
+/** Where a strings read writes keys: nowhere, unless it answers them. */
+template <typename answer_type_>
+ustore_key_t const** strings_keys_output_(outputs<answer_type_>&) noexcept {
+    return nullptr;
+}
+
+inline ustore_key_t const** strings_keys_output_(outputs<keys_view_t>& written) noexcept { return &written.keys; }
+
+/**
+ *  @brief Reads what @p answer_type_ asks of the @p count strings @p texts lends: the key each maps
+ *      onto, the nil UUID for a missing one, or whether each is present.
+ *  @param[in] collection Collection every string lives in, borrowed until the call is final.
+ *  @param[in] texts Strings to read, borrowed until the call is final.
+ *  @param[in] arena Memory the answer lands in, borrowed until the call is final, which
+ *      the answer views.
+ */
+template <ustore_completion_t completion_, typename answer_type_>
+answer<completion_, answer_type_> strings_read_(receiver_t const& receiver, ustore_collection_id_t const& collection,
+                                                ustore_strings_view_t texts, std::size_t count, arena_t& arena,
+                                                ustore_watch_t watch) noexcept {
+    return called_<completion_, answer_type_>([&](ustore_outcome_t* outcome, outputs<answer_type_>* written) noexcept {
+        written->count = count;
+        ustore_strings_read_t read {};
+        read.database = receiver.database;
+        read.executor = receiver.executor;
+        read.outcome = outcome;
+        read.completion = completion_;
+        read.view = receiver.view(watch);
+        read.count = count;
+        read.collections = {&collection, 0};
+        read.strings = texts;
+        read.presences = strings_presences_output_(*written);
+        read.values = strings_keys_output_(*written);
+        read.arena = arena;
+        ustore_strings_read(&read);
+    });
+}
+
+/** Upserts the @p count keys @p keys lends onto the strings @p texts lends, pairwise. */
+template <ustore_completion_t completion_>
+answer<completion_, void> strings_write_(receiver_t const& receiver, ustore_collection_id_t const& collection,
+                                         ustore_strings_view_t texts, ustore_key_t const* keys, std::size_t count,
+                                         ustore_durability_t durability) noexcept {
+    return called_<completion_, void>([&](ustore_outcome_t* outcome, outputs<void>*) noexcept {
+        ustore_strings_write_t write {};
+        write.database = receiver.database;
+        write.executor = receiver.executor;
+        write.outcome = outcome;
+        write.completion = completion_;
+        write.transaction = receiver.transaction;
+        write.count = count;
+        write.collections = {&collection, 0};
+        write.strings = texts;
+        write.values = {keys, sizeof(ustore_key_t)};
+        write.durability = durability;
+        ustore_strings_write(&write);
+    });
+}
+
+/** Removes the @p count strings @p texts lends together with their keys. */
+template <ustore_completion_t completion_>
+answer<completion_, void> strings_remove_(receiver_t const& receiver, ustore_collection_id_t const& collection,
+                                          ustore_strings_view_t texts, std::size_t count,
+                                          ustore_durability_t durability) noexcept {
+    return called_<completion_, void>([&](ustore_outcome_t* outcome, outputs<void>*) noexcept {
+        ustore_strings_remove_t remove {};
+        remove.database = receiver.database;
+        remove.executor = receiver.executor;
+        remove.outcome = outcome;
+        remove.completion = completion_;
+        remove.transaction = receiver.transaction;
+        remove.count = count;
+        remove.collections = {&collection, 0};
+        remove.strings = texts;
+        remove.durability = durability;
+        ustore_strings_remove(&remove);
+    });
 }
 
 /**
- *  @brief Owns a walk over the strings of one prefix from its open until its destruction, which every pull resumes
- *      past the last string the pull before it handed out, at the view its receiver read at the open.
+ *  @brief Lists up to @p limit strings of each of the @p count prefixes @p prefixes lends into @p
+ *      arena, in the order of their text, each page from its start in @p starts, keeping the
+ *      strings @p match admits.
+ *  @param[in] starts None to start every page at its prefix, or the smallest string of every page,
+ *      which the page holds too when the collection does, borrowed until the call is final.
+ */
+template <ustore_completion_t completion_>
+answer<completion_, strings_pages_t> strings_scan_(receiver_t const& receiver, ustore_collection_id_t const& collection,
+                                                   ustore_strings_view_t prefixes, ustore_strings_view_t starts,
+                                                   std::size_t count, std::size_t limit, arena_t& arena,
+                                                   match_t const& match, ustore_watch_t watch) noexcept {
+    return called_<completion_, strings_pages_t>(
+        [&](ustore_outcome_t* outcome, outputs<strings_pages_t>* written) noexcept {
+            written->count = count;
+            ustore_strings_scan_t scan {};
+            scan.database = receiver.database;
+            scan.executor = receiver.executor;
+            scan.outcome = outcome;
+            scan.completion = completion_;
+            scan.view = receiver.view(watch);
+            scan.count = count;
+            scan.collections = {&collection, 0};
+            scan.prefixes = prefixes;
+            scan.start_strings = starts;
+            scan.offsets = &written->pages;
+            scan.strings = &written->strings;
+            scan.scores = &written->scores;
+            scan.arena = arena;
+            scan.wanted = limit;
+            narrow(scan, match);
+            ustore_strings_scan(&scan);
+        });
+}
+
+#pragma endregion Verbs
+
+#pragma region Streams
+
+/**
+ *  @brief Owns a walk over the strings of one prefix from its open until its destruction, which
+ *      every pull resumes past the last string the pull before it handed out, at the view its
+ *      receiver read at the open.
  *
- *  The explicit form of @c strings_stream_t: every pull takes the caller's arena, which holds the page until its next
- *  call. The cursor copies its prefix and start, and moves but never copies itself.
+ *  The explicit form of @c strings_stream_t: every pull takes the caller's arena, which
+ *  holds the page until its next call. The cursor copies its prefix and start, and moves but
+ *  never copies itself.
  */
 class strings_cursor_t {
 
@@ -92,8 +221,8 @@ class strings_cursor_t {
         return *this;
     }
 
-    /** Opens a walk over the strings of @p prefix in @p collection from @p start, at the view @p receiver reads,
-     *  keeping the strings @p match admits, compiled once here. */
+    /** Opens a walk over the strings of @p prefix in @p collection from @p start, at the view @p
+     *  receiver reads, keeping the strings @p match admits, compiled once here. */
     static expected<strings_cursor_t> make(receiver_t receiver, ustore_collection_id_t collection,
                                            value_view_t prefix = value_view_t::make_empty(),
                                            value_view_t start = value_view_t::make_empty(),
@@ -115,8 +244,8 @@ class strings_cursor_t {
         return strings_cursor_t {receiver, cursor};
     }
 
-    /** Pulls up to @p wanted strings into @p arena in the order of their text, fewer once the walk nears its end and
-     *  none past it. */
+    /** Pulls up to @p wanted strings into @p arena in the order of their text, fewer once the walk
+     *  nears its end and none past it. */
     expected<sz::strings_view_t> next(std::size_t wanted, arena_t& arena) noexcept {
         ustore_strings_view_t strings {};
         ustore_size_t written = 0;
@@ -137,7 +266,8 @@ class strings_cursor_t {
 };
 
 /**
- *  @brief A stream over the strings of one prefix that pulls them in pages from a cursor, in the order of their text.
+ *  @brief A stream over the strings of one prefix that pulls them in pages from a cursor, in the
+ *      order of their text.
  *
  *  As shorthand for a range-based loop, which has no place for an arena, it owns one arena for its
  *  lifetime, where @c strings_cursor_t takes the caller's per pull. The prefix it walks is
@@ -184,8 +314,8 @@ class strings_stream_t {
     strings_stream_t(strings_stream_t const&) = delete;
     strings_stream_t& operator=(strings_stream_t const&) = delete;
 
-    /** Opens a walk over the strings of @p prefix in @p collection, pulling @p read_ahead of them a page into an arena
-     *  made where the executor of @p receiver computes. */
+    /** Opens a walk over the strings of @p prefix in @p collection, pulling @p read_ahead of them a
+     *  page into an arena made where the executor of @p receiver computes. */
     static expected<strings_stream_t> make(receiver_t receiver, ustore_collection_id_t collection, value_view_t prefix,
                                            std::size_t read_ahead = default_read_ahead_k) noexcept {
         auto [arena, arena_status] = arena_t::make(receiver.executor);
@@ -195,8 +325,8 @@ class strings_stream_t {
         return stream;
     }
 
-    /** Restarts the walk at @p start, which is returned too when the collection holds it, through a cursor opened
-     *  there. */
+    /** Restarts the walk at @p start, which is returned too when the collection holds it, through a
+     *  cursor opened there. */
     status_t seek(value_view_t start) noexcept {
         auto [cursor, cursor_status] = strings_cursor_t::make(receiver_, collection_, prefix_, start);
         if (cursor_status.failed()) return cursor_status;
@@ -214,7 +344,8 @@ class strings_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed pull ends the walk since a reference carries no status. */
+    /** Advances like @c advance, but a failed pull ends the walk since a reference carries no
+     *  status. */
     strings_stream_t& operator++() noexcept {
         if (advance().succeeded()) return *this;
         fetched_ = strings_of({}, 0);
@@ -242,116 +373,300 @@ class strings_stream_t {
 
 #pragma endregion Streams
 
-#pragma region Collections
-
 /**
- *  @brief A handle to one collection mapping variable-length strings onto keys that only reads, cheap to construct and
- *      to copy.
+ *  @brief A handle to one collection mapping variable-length strings onto keys, cheap to construct
+ *      and to copy, whose verbs answer as @p completion_ says.
  *
- *  It addresses either the latest state or the view of a transaction or snapshot, holds no state of its own, so any
- *  number of threads share it, and never outlives its database. Strings carry explicit lengths, so a zero byte inside
- *  one is stored like any other, and the empty string is an ordinary key.
+ *  It addresses the head or the view of a transaction or snapshot, holds no state of its own, so
+ *  any number of threads share it, and never outlives its database. A blocking handle answers an
+ *  @c outcome, while a deferred one answers a
+ *
+ *  @c deferred call, borrowing the handle, its inputs and its arena until the call is final. A
+ *  handle with @c collection_access_t::read_only_k only reads, as a snapshot hands out. Strings
+ *  carry explicit lengths, so a zero byte inside one is stored like any other, and the empty string
+ *  is an ordinary key.
  */
-class strings_read_collection_t {
-  protected:
+template <ustore_completion_t completion_, collection_access_t access_>
+class strings_collection_on {
     receiver_t receiver_ {};
     ustore_collection_id_t collection_ {};
+
+    static constexpr bool blocks_k = !defers<completion_>;
+    static constexpr bool writes_k = access_ == collection_access_t::read_write_k;
 
   public:
     using prefix_range_t = range<strings_stream_t>;
 
     /** The handle a snapshot hands out for this kind of collection, which only reads. */
-    using read_only_t = strings_read_collection_t;
+    using read_only_t = strings_collection_on<completion_, collection_access_t::read_only_k>;
 
-    /** The twin a deferred receiver hands out, whose verbs answer deferred calls. */
-    using deferred_t = deferred_strings_read_collection_t;
+    /** The same kind of handle, completing its verbs as @p other_completion_ says. */
+    template <ustore_completion_t other_completion_>
+    using completed_as = strings_collection_on<other_completion_, access_>;
 
-    /** What the collections this kind of handle addresses hold, which a creation records and a lookup checks. */
+    /** What the collections this kind of handle addresses hold, which a creation records and a
+     *  lookup checks. */
     static constexpr ustore_modality_t modality_k = ustore_modality_strings_k;
 
-    strings_read_collection_t() noexcept = default;
-    strings_read_collection_t(receiver_t receiver, ustore_collection_id_t collection) noexcept
+    strings_collection_on() noexcept = default;
+    strings_collection_on(receiver_t receiver, ustore_collection_id_t collection) noexcept
         : receiver_(receiver), collection_(collection) {}
 
     operator ustore_collection_id_t() const noexcept { return collection_; }
     ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
+    receiver_t receiver() const noexcept { return receiver_; }
 
-    /** Reads the keys a batch of strings map onto into @p arena, where a missing string reads as the nil UUID, and
-     *  marks the present strings in @p presences when asked. */
-    expected<keys_view_t> read(std::span<value_view_t const> texts, arena_t& arena,
-                               ustore_watch_t watch = ustore_watch_keys_k, bits_view_t* presences = nullptr) noexcept {
-        if (texts.empty()) return keys_view_t {};
-
-        strided_strings<value_view_t> const strings {strided(texts).begin()};
-        ustore_octet_t const* found_presences = nullptr;
-        ustore_key_t const* keys = nullptr;
-        ustore_outcome_t outcome {};
-        ustore_strings_read_t read {};
-        read.database = receiver_.database;
-        read.executor = receiver_.executor;
-        read.outcome = &outcome;
-        read.view = receiver_.view(watch);
-        read.count = texts.size();
-        read.collections = {&collection_, 0};
-        read.strings = strings.view();
-        read.presences = presences ? &found_presences : nullptr;
-        read.values = &keys;
-        read.arena = arena;
-
-        ustore_strings_read(&read);
-        if (status_t const status {outcome}; status.failed()) return status;
-        if (presences) *presences = bits_view_t {found_presences};
-        return keys_view_t {{keys, sizeof(ustore_key_t)}, texts.size()};
+    /** The same collection, whose verbs block on @p executor, or on the calling
+     *  thread without one. */
+    completed_as<ustore_completion_blocking_k> on(ustore_executor_t executor) const noexcept {
+        return {receiver_.on(executor), collection_};
     }
 
-    /** Reads the key @p text maps onto through a one-off arena, the nil UUID when the collection lacks the string. */
-    expected<ustore_key_t> value(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+    /** The same collection, whose verbs submit to @p executor and answer deferred calls. */
+    completed_as<ustore_completion_deferred_k> deferred(ustore_executor_t executor) const noexcept {
+        return {receiver_.on(executor), collection_};
+    }
+
+#pragma region Verbs
+
+    /**
+     *  @brief Reads the keys @p texts map onto into @p arena, where a missing string reads as
+     *      the nil UUID.
+     *  @param[in] texts Strings to read, borrowed until the call is final.
+     *  @param[in] arena Memory the keys land in, borrowed until the call is final, which
+     *      the answer views.
+     *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
+     */
+    template <strings_batch_concept texts_type_>
+    answer<completion_, keys_view_t> read(texts_type_ const& texts, arena_t& arena,
+                                          ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
+        return strings_read_<completion_, keys_view_t>(receiver_, collection_, strings_view_of(texts), std::size(texts),
+                                                       arena, watch);
+    }
+
+    /**
+     *  @brief Upserts the keys of @p keys onto the strings of @p texts pairwise.
+     *  @param[in] texts Strings to write, borrowed until the call is final.
+     *  @param[in] keys One key per string, borrowed until the call is final.
+     *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p texts and @p keys differ in count.
+     */
+    template <strings_batch_concept texts_type_>
+    answer<completion_, void> write(texts_type_ const& texts, std::span<ustore_key_t const> keys,
+                                    ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
+        requires writes_k
+    {
+        // The call has one count, so only this side sees the strings and the keys disagree
+        if (std::size(texts) != keys.size())
+            return refused_<completion_, void>({status_code_t::invalid_argument_k, "Every string needs its own key"});
+        return strings_write_<completion_>(receiver_, collection_, strings_view_of(texts), keys.data(), keys.size(),
+                                           durability);
+    }
+
+    /**
+     *  @brief Removes the strings of @p texts together with their keys.
+     *  @param[in] texts Strings to remove, borrowed until the call is final.
+     *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     */
+    template <strings_batch_concept texts_type_>
+    answer<completion_, void> remove(texts_type_ const& texts,
+                                     ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
+        requires writes_k
+    {
+        return strings_remove_<completion_>(receiver_, collection_, strings_view_of(texts), std::size(texts),
+                                            durability);
+    }
+
+    /**
+     *  @brief Lists up to @p limit strings of every prefix of @p prefixes into @p arena, in the
+     *      order of their text.
+     *  @param[in] prefixes Prefixes to walk, a page each, borrowed until the call is final.
+     *  @param[in] limit Most strings a page holds.
+     *  @param[in] arena Memory the strings land in, borrowed until the call is final, which
+     *      the answer views.
+     *  @param[in] starts None to start every page at its prefix, or the smallest string of
+     *      every page, which the page holds too when the collection does, borrowed until the
+     *      call is final.
+     *  @param[in] match What the strings are narrowed by, borrowed until the call is final.
+     *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k The @p starts are neither empty nor one per prefix.
+     */
+    template <strings_batch_concept prefixes_type_, strings_batch_concept starts_type_ = values_tape_t>
+    answer<completion_, strings_pages_t> scan(prefixes_type_ const& prefixes, std::size_t limit, arena_t& arena,
+                                              starts_type_ const& starts = {}, match_t const& match = {},
+                                              ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
+        // A zeroed view starts every page at its prefix, so only this side sees one start missing
+        std::size_t const count = std::size(prefixes), started = std::size(starts);
+        if (started != 0 && started != count)
+            return refused_<completion_, strings_pages_t>(
+                {status_code_t::invalid_argument_k, "Every prefix needs its own start, or none"});
+        return strings_scan_<completion_>(receiver_, collection_, strings_view_of(prefixes), strings_view_of(starts),
+                                          count, limit, arena, match, watch);
+    }
+
+    /**
+     *  @brief Draws up to @p wanted strings at random into @p arena, as one page.
+     *  @param[in] arena Memory the strings land in, which the answer views, borrowed until the
+     *      call is final.
+     *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
+     */
+    answer<completion_, strings_pages_t> sample(std::size_t wanted, arena_t& arena,
+                                                ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
+        return called_<completion_, strings_pages_t>(
+            [&](ustore_outcome_t* outcome, outputs<strings_pages_t>* written) noexcept {
+                written->count = 1;
+                ustore_strings_sample_t sample {};
+                sample.database = receiver_.database;
+                sample.executor = receiver_.executor;
+                sample.outcome = outcome;
+                sample.completion = completion_;
+                sample.view = receiver_.view(watch);
+                sample.count = 1;
+                sample.collections = {&collection_, 0};
+                sample.offsets = &written->pages;
+                sample.strings = &written->strings;
+                sample.arena = arena;
+                sample.wanted = wanted;
+                ustore_strings_sample(&sample);
+            });
+    }
+
+    /**
+     *  @brief Estimates the strings and the space from @p start, inclusive, to @p end, exclusive,
+     *      into @p arena.
+     *  @param[in] start First string of the range, or an empty one to start at the first string,
+     *      borrowed until the call is final.
+     *  @param[in] end String the range stops before, or an empty one to bound nothing, borrowed
+     *      until the call is final.
+     *  @param[in] arena Memory the bounds land in, borrowed until the call is final.
+     *  @param[in] watch Whether a read inside a transaction records the range for conflicts.
+     */
+    answer<completion_, size_estimates_t> measure(value_view_t const& start, value_view_t const& end, arena_t& arena,
+                                                  ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
+        return called_<completion_, size_estimates_t>(
+            [&](ustore_outcome_t* outcome, outputs<size_estimates_t>* written) noexcept {
+                // An empty bound is the zeroed view, so it never borrows the caller's text
+                std::span<value_view_t const> const starts {&start, start.empty() ? 0u : 1u};
+                std::span<value_view_t const> const ends {&end, end.empty() ? 0u : 1u};
+                ustore_strings_measure_t measure {};
+                measure.database = receiver_.database;
+                measure.executor = receiver_.executor;
+                measure.outcome = outcome;
+                measure.completion = completion_;
+                measure.view = receiver_.view(watch);
+                measure.count = 1;
+                measure.collections = {&collection_, 0};
+                measure.start_strings = strings_view_of(starts);
+                measure.end_strings = strings_view_of(ends);
+                measure_outputs_(measure, *written);
+                measure.arena = arena;
+                ustore_strings_measure(&measure);
+            });
+    }
+
+    /** Removes every string, keeping the collection. */
+    answer<completion_, void> clear() const noexcept
+        requires writes_k
+    {
+        return collection_drop_<completion_>(receiver_, collection_, ustore_drop_pairs_k);
+    }
+
+    /** Removes the collection with all its strings. */
+    answer<completion_, void> drop() const noexcept
+        requires writes_k
+    {
+        return collection_drop_<completion_>(receiver_, collection_, ustore_drop_collection_k);
+    }
+
+#pragma endregion Verbs
+
+#pragma region Shorthand
+
+    /** Reads the key @p text maps onto through a one-off arena, the nil UUID when the collection
+     *  lacks the string. */
+    expected<ustore_key_t> value(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) const noexcept
+        requires blocks_k
+    {
         auto [arena, arena_status] = arena_t::make(receiver_.executor);
         if (arena_status.failed()) return arena_status;
-        auto [keys, read_status] = read({&text, 1}, arena, watch);
+        auto [keys, read_status] = read(std::span<value_view_t const> {&text, 1}, arena, watch);
         if (read_status.failed()) return read_status;
         return keys[0];
     }
 
     /** Checks whether the collection holds @p text through a one-off arena. */
-    expected<bool> present(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        auto [arena, arena_status] = arena_t::make(receiver_.executor);
-        if (arena_status.failed()) return arena_status;
-        bits_view_t presences;
-        expected<keys_view_t> const found = read({&text, 1}, arena, watch, &presences);
-        if (found.failed()) return found.status();
-        return presences && presences[0];
+    expected<bool> present(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) const noexcept
+        requires blocks_k
+    {
+        return in_one_off_arena(receiver_.executor, [&](arena_t& arena) noexcept -> expected<bool> {
+            std::span<value_view_t const> const texts {&text, 1};
+            auto [presences, read_status] = strings_read_<completion_, bits_view_t>(
+                receiver_, collection_, strings_view_of(texts), texts.size(), arena, watch);
+            if (read_status.failed()) return read_status;
+            return presences && presences[0];
+        });
+    }
+
+    /** Upserts the key one string maps onto. */
+    status_t assign(value_view_t text, ustore_key_t key,
+                    ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
+        requires(blocks_k && writes_k)
+    {
+        return write(std::span<value_view_t const> {&text, 1}, {&key, 1}, durability);
+    }
+
+    /** Removes one string together with its key. */
+    status_t remove(value_view_t text, ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
+        requires(blocks_k && writes_k)
+    {
+        return remove(std::span<value_view_t const> {&text, 1}, durability);
     }
 
     /**
      *  @brief Lists up to @p limit strings of @p prefix into @p arena, in the order of their text.
      *
-     *  The page starts at @p start, which it returns too when the collection holds it, so a walk that pages by hand
-     *  skips the string it resumed from, and @c prefixed streams the pages instead.
+     *  The page starts at @p start, which it returns too when the collection holds it, so a
+     *  walk that pages by hand skips the string it resumed from, and @c prefixed streams
+     *  the pages instead.
      */
     expected<sz::strings_view_t> prefixed_page(value_view_t prefix, std::size_t limit, arena_t& arena,
                                                value_view_t start = value_view_t::make_empty(),
-                                               ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        return scan_strings_page(receiver_, watch, collection_, prefix, start, limit, arena);
+                                               ustore_watch_t watch = ustore_watch_keys_k) const noexcept
+        requires blocks_k
+    {
+        auto [pages, scan_status] = scan(std::span<value_view_t const> {&prefix, 1}, limit, arena,
+                                         std::span<value_view_t const> {&start, 1}, {}, watch);
+        if (scan_status.failed()) return scan_status;
+        return pages.strings;
     }
 
     /** Opens a stream over the strings of @p prefix, which outlives the stream. */
     expected<strings_stream_t> prefix_begin(
         value_view_t prefix = value_view_t::make_empty(),
-        std::size_t read_ahead = strings_stream_t::default_read_ahead_k) const noexcept {
+        std::size_t read_ahead = strings_stream_t::default_read_ahead_k) const noexcept
+        requires blocks_k
+    {
         return strings_stream_t::make(receiver_, collection_, prefix, read_ahead);
     }
 
     /** Walks every string of @p prefix, which outlives the range, in the order of their text. */
     expected<prefix_range_t> prefixed(value_view_t prefix = value_view_t::make_empty(),
-                                      std::size_t read_ahead = strings_stream_t::default_read_ahead_k) const noexcept {
+                                      std::size_t read_ahead = strings_stream_t::default_read_ahead_k) const noexcept
+        requires blocks_k
+    {
         auto [begin, prefix_begin_status] = prefix_begin(prefix, read_ahead);
         if (prefix_begin_status.failed()) return prefix_begin_status;
         return prefix_range_t {std::move(begin), strings_stream_t {}};
     }
 
     /** Counts the strings of @p prefix by streaming through all of them. */
-    expected<std::size_t> size(value_view_t prefix = value_view_t::make_empty()) const noexcept {
+    expected<std::size_t> size(value_view_t prefix = value_view_t::make_empty()) const noexcept
+        requires blocks_k
+    {
         auto [begin, prefix_begin_status] = prefix_begin(prefix);
         if (prefix_begin_status.failed()) return prefix_begin_status;
 
@@ -359,321 +674,15 @@ class strings_read_collection_t {
         for (strings_stream_t& stream = begin; !stream.is_end(); ++stream) ++count;
         return count;
     }
+
+#pragma endregion Shorthand
 };
 
-/** A handle to one collection mapping variable-length strings onto keys, cheap to construct, which reads and writes the
- *  head or the view of a transaction. */
-class strings_collection_t : public strings_read_collection_t {
+/** A collection keyed by strings whose verbs block, reading and writing the head
+ *  or a transaction. */
+using strings_collection_t = strings_collection_on<ustore_completion_blocking_k, collection_access_t::read_write_k>;
 
-    status_t drop_with_(ustore_drop_mode_t mode) noexcept {
-        ustore_outcome_t outcome {};
-        ustore_collection_drop_t collection_drop {};
-        collection_drop.database = receiver_.database;
-        collection_drop.executor = receiver_.executor;
-        collection_drop.outcome = &outcome;
-        collection_drop.collection = collection_;
-        collection_drop.mode = mode;
-        ustore_collection_drop(&collection_drop);
-        return status_t {outcome};
-    }
-
-  public:
-    using strings_read_collection_t::strings_read_collection_t;
-
-    /** The twin a deferred receiver hands out, whose verbs answer deferred calls. */
-    using deferred_t = deferred_strings_collection_t;
-
-    /** Upserts the key one string maps onto. */
-    status_t assign(value_view_t text, ustore_key_t key,
-                    ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
-        return assign({&text, 1}, {&key, 1}, durability);
-    }
-
-    /**
-     *  Upserts the keys a batch of strings map onto, one per string.
-     *
-     *  @par Statuses:
-     *  - @c status_code_t::invalid_argument_k The @p texts and @p keys differ in count.
-     */
-    status_t assign(std::span<value_view_t const> texts, std::span<ustore_key_t const> keys,
-                    ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
-        if (texts.size() != keys.size())
-            return status_t {status_code_t::invalid_argument_k, "Every string of a batch needs its own key"};
-        if (texts.empty()) return {};
-
-        strided_strings<value_view_t> const strings {strided(texts).begin()};
-        ustore_outcome_t outcome {};
-        ustore_strings_write_t write {};
-        write.database = receiver_.database;
-        write.executor = receiver_.executor;
-        write.outcome = &outcome;
-        write.transaction = receiver_.transaction;
-        write.count = texts.size();
-        write.collections = {&collection_, 0};
-        write.strings = strings.view();
-        write.values = {keys.data(), sizeof(ustore_key_t)};
-        write.durability = durability;
-
-        ustore_strings_write(&write);
-        return status_t {outcome};
-    }
-
-    status_t remove(value_view_t text, ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
-        return remove({&text, 1}, durability);
-    }
-
-    status_t remove(std::span<value_view_t const> texts,
-                    ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
-        if (texts.empty()) return {};
-
-        strided_strings<value_view_t> const strings {strided(texts).begin()};
-        ustore_outcome_t outcome {};
-        ustore_strings_remove_t remove {};
-        remove.database = receiver_.database;
-        remove.executor = receiver_.executor;
-        remove.outcome = &outcome;
-        remove.transaction = receiver_.transaction;
-        remove.count = texts.size();
-        remove.collections = {&collection_, 0};
-        remove.strings = strings.view();
-        remove.durability = durability;
-
-        ustore_strings_remove(&remove);
-        return status_t {outcome};
-    }
-
-    /** Removes every string, keeping the collection. */
-    status_t clear() noexcept { return drop_with_(ustore_drop_pairs_k); }
-
-    /** Removes the collection with all its strings. */
-    status_t drop() noexcept { return drop_with_(ustore_drop_collection_k); }
-};
-
-#pragma endregion Collections
-
-#pragma region Deferred Verbs
-
-/** What a deferred @c ustore_strings_read keeps beside its strings: the collection the arguments point to, and the
- *  keys the call writes into the arena it borrows. */
-struct strings_read_t {
-    using arguments_t = ustore_strings_read_t;
-    using answer_t = expected<keys_view_t>;
-
-    /** Collection every string lives in. */
-    ustore_collection_id_t collection {};
-
-    /** Number of strings, the length of the output. */
-    ustore_size_t count = 0;
-
-    /** Output for the key of every string inside the arena, where a missing string reads as the nil UUID. */
-    ustore_key_t const* keys = nullptr;
-
-    static void submit(arguments_t& arguments) noexcept { ustore_strings_read(&arguments); }
-    answer_t finish() && noexcept { return keys_view_t {{keys, sizeof(ustore_key_t)}, count}; }
-};
-
-/** What a deferred @c ustore_strings_write keeps beside its strings and keys: the collection. */
-struct strings_write_t {
-    using arguments_t = ustore_strings_write_t;
-    using answer_t = status_t;
-
-    /** Collection every string lives in. */
-    ustore_collection_id_t collection {};
-
-    static void submit(arguments_t& arguments) noexcept { ustore_strings_write(&arguments); }
-    answer_t finish() && noexcept { return {}; }
-};
-
-/** What a deferred @c ustore_strings_remove keeps beside its strings: the collection. */
-struct strings_remove_t {
-    using arguments_t = ustore_strings_remove_t;
-    using answer_t = status_t;
-
-    /** Collection every string lives in. */
-    ustore_collection_id_t collection {};
-
-    static void submit(arguments_t& arguments) noexcept { ustore_strings_remove(&arguments); }
-    answer_t finish() && noexcept { return {}; }
-};
-
-/** What a deferred @c ustore_strings_scan keeps beside its prefixes and starts: the collection the arguments point to,
- *  and the outputs the call writes into the arena it borrows. */
-struct strings_scan_t {
-
-    /** What a finished scan hands over: the strings every prefix found, page after page, inside the arena. */
-    struct finished_t {
-
-        /** Every string found, in the order of the prefixes and then of their text. */
-        sz::strings_view_t strings {strings_of({}, 0)};
-
-        /** Where the page of every prefix starts among @c strings, with one more closing the last page. */
-        std::span<ustore_length_t const> pages;
-    };
-
-    using arguments_t = ustore_strings_scan_t;
-    using answer_t = expected<finished_t>;
-
-    /** Collection every prefix is walked in. */
-    ustore_collection_id_t collection {};
-
-    /** Number of prefixes, the pages of the answer. */
-    ustore_size_t count = 0;
-
-    /** Outputs for the offsets of the pages and the tape of strings, inside the arena. */
-    ustore_length_t const* pages = nullptr;
-    ustore_strings_view_t strings {};
-
-    static void submit(arguments_t& arguments) noexcept { ustore_strings_scan(&arguments); }
-
-    answer_t finish() && noexcept {
-        if (!pages) return finished_t {};
-        return finished_t {strings_of(tape_slice(strings, pages[0]), pages[count] - pages[0]), {pages, count + 1}};
-    }
-};
-
-#pragma endregion Deferred Verbs
-
-#pragma region Deferred Collections
-
-/** A collection keyed by strings that only reads, whose verbs submit to an executor and answer deferred calls, as a
- *  snapshot offers it. Every plain input a verb reads moves into the call, so nothing it borrowed can go before the
- *  call is final, while an arena is borrowed, since freeing it waits for the call. */
-class deferred_strings_read_collection_t {
-  protected:
-    receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {};
-
-  public:
-    deferred_strings_read_collection_t() noexcept = default;
-    explicit deferred_strings_read_collection_t(receiver_t receiver, ustore_collection_id_t collection) noexcept
-        : receiver_(receiver), collection_(collection) {}
-
-    operator ustore_collection_id_t() const noexcept { return collection_; }
-
-    /**
-     *  @brief Reads the keys @p texts map onto into @p arena, where a missing string reads as the nil UUID.
-     *  @param[in] texts Strings to read, owned by the call until it is final.
-     *  @param[in] arena Memory the keys land in, borrowed until the call is final, which the answer views.
-     *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
-     */
-    deferred<strings_read_t> read(values_tape_t texts, arena_t& arena,
-                                  ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
-        return deferred<strings_read_t>::submit(
-            [&](strings_read_t& verb, ustore_strings_read_t& arguments, values_tape_t const& owned) noexcept {
-                verb.collection = collection_;
-                verb.count = owned.size();
-                arguments.database = receiver_.database;
-                arguments.executor = receiver_.executor;
-                arguments.view = receiver_.view(watch);
-                arguments.count = owned.size();
-                arguments.collections = {&verb.collection, 0};
-                arguments.strings = tape_of(owned);
-                arguments.values = &verb.keys;
-                arguments.arena = arena;
-                return status_t {};
-            },
-            std::move(texts));
-    }
-
-    /**
-     *  @brief Lists up to @p limit strings of every prefix of @p prefixes into @p arena, in the order of their text.
-     *  @param[in] prefixes Prefixes to walk, a page each, owned by the call until it is final.
-     *  @param[in] limit Most strings a page holds.
-     *  @param[in] arena Memory the strings land in, borrowed until the call is final, which the answer views.
-     *  @param[in] starts None to start every page at its prefix, or the smallest string of every page, which the page
-     *      holds too when the collection does.
-     *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
-     *
-     *  @par Statuses:
-     *  - @c status_code_t::invalid_argument_k The @p starts are neither empty nor one per prefix.
-     */
-    deferred<strings_scan_t> scan(values_tape_t prefixes, std::size_t limit, arena_t& arena, values_tape_t starts = {},
-                                  ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
-        return deferred<strings_scan_t>::submit(
-            [&](strings_scan_t& verb, ustore_strings_scan_t& arguments, values_tape_t const& owned_prefixes,
-                values_tape_t const& owned_starts) noexcept {
-                std::size_t const count = owned_prefixes.size();
-                if (owned_starts.size() != 0 && owned_starts.size() != count)
-                    return status_t {status_code_t::invalid_argument_k, "Every prefix needs its own start, or none"};
-                verb.collection = collection_;
-                verb.count = count;
-                arguments.database = receiver_.database;
-                arguments.executor = receiver_.executor;
-                arguments.view = receiver_.view(watch);
-                arguments.count = count;
-                arguments.collections = {&verb.collection, 0};
-                arguments.prefixes = tape_of(owned_prefixes);
-                arguments.start_strings = tape_of(owned_starts);
-                arguments.offsets = &verb.pages;
-                arguments.strings = &verb.strings;
-                arguments.arena = arena;
-                arguments.wanted = limit;
-                return status_t {};
-            },
-            std::move(prefixes), std::move(starts));
-    }
-};
-
-/** A collection keyed by strings whose verbs submit to an executor and answer deferred calls, reading and writing the
- *  head or a transaction. */
-class deferred_strings_collection_t : public deferred_strings_read_collection_t {
-  public:
-    using deferred_strings_read_collection_t::deferred_strings_read_collection_t;
-
-    /**
-     *  @brief Upserts the keys of @p keys onto the strings of @p texts pairwise.
-     *  @param[in] texts Strings to write, owned by the call until it is final.
-     *  @param[in] keys One key per string, owned by the call until it is final.
-     *  @param[in] durability Whether the call finishes only after the data reaches the disk.
-     *
-     *  @par Statuses:
-     *  - @c status_code_t::invalid_argument_k The @p texts and @p keys differ in count.
-     */
-    template <owned_array_concept<ustore_key_t> keys_type_>
-    deferred<strings_write_t> write(values_tape_t texts, keys_type_ keys,
-                                    ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
-        return deferred<strings_write_t>::submit(
-            [&](strings_write_t& verb, ustore_strings_write_t& arguments, values_tape_t const& owned_texts,
-                keys_type_ const& owned_keys) noexcept {
-                if (owned_texts.size() != owned_keys.size())
-                    return status_t {status_code_t::invalid_argument_k, "Every string of a write needs its own key"};
-                verb.collection = collection_;
-                arguments.database = receiver_.database;
-                arguments.executor = receiver_.executor;
-                arguments.transaction = receiver_.transaction;
-                arguments.count = owned_texts.size();
-                arguments.collections = {&verb.collection, 0};
-                arguments.strings = tape_of(owned_texts);
-                arguments.values = {owned_keys.data(), sizeof(ustore_key_t)};
-                arguments.durability = durability;
-                return status_t {};
-            },
-            std::move(texts), std::move(keys));
-    }
-
-    /**
-     *  @brief Removes the strings of @p texts together with their keys.
-     *  @param[in] texts Strings to remove, owned by the call until it is final.
-     *  @param[in] durability Whether the call finishes only after the data reaches the disk.
-     */
-    deferred<strings_remove_t> remove(values_tape_t texts,
-                                      ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
-        return deferred<strings_remove_t>::submit(
-            [&](strings_remove_t& verb, ustore_strings_remove_t& arguments, values_tape_t const& owned) noexcept {
-                verb.collection = collection_;
-                arguments.database = receiver_.database;
-                arguments.executor = receiver_.executor;
-                arguments.transaction = receiver_.transaction;
-                arguments.count = owned.size();
-                arguments.collections = {&verb.collection, 0};
-                arguments.strings = tape_of(owned);
-                arguments.durability = durability;
-                return status_t {};
-            },
-            std::move(texts));
-    }
-};
-
-#pragma endregion Deferred Collections
+/** A collection keyed by strings whose verbs block and only read, as a snapshot hands out. */
+using strings_read_collection_t = strings_collection_on<ustore_completion_blocking_k, collection_access_t::read_only_k>;
 
 } // namespace unum::ustore

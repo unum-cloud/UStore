@@ -170,7 +170,7 @@ case_result_t cursor_snapshot_view(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    if (!database.on().supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     auto [collection, create_status] = create_collection(database, "cursor.snapshot", ustore_modality_blobs_k);
     failures += expect(create_status.succeeded());
     if (failures != 0) return failures;

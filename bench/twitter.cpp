@@ -88,7 +88,7 @@ struct settings_t : shared_settings_t {
     count_t connectivity {4};
 
     /** The three sampling batch sizes, smallest first; construction takes the last. */
-    counts_t batch_sizes {.values = {32, 64, 128}, .size = 3, .minimum = 1, .min_size = 3, .max_size = 3};
+    counts_t batch_sizes {.values = {32, 64, 128}, .size = 3, .minimum = 1, .minimum_size = 3, .maximum_size = 3};
 };
 
 #pragma endregion Settings
@@ -192,9 +192,28 @@ struct twitter_t {
 }
 
 /** The tweet @c append_tweet fills with an id, a text, an author and mentions. */
-constexpr std::string_view
-    tweet_template_k =
-        R"json({"created_at":"Sat Jan 01 00:59:05 +0000 2022","id":%1$d,"id_str":"%1$d","text":"%2$s",)json" R"json("source":"<a href=\"https://twitter.com/settings/download\" rel=\"nofollow\">Twitter for DEVICE</a>",)json" R"json("truncated":false,"in_reply_to_status_id":null,"in_reply_to_status_id_str":null,)json" R"json("in_reply_to_user_id":null,"in_reply_to_user_id_str":null,"in_reply_to_screen_name":null,)json" R"json("user":{"id":%3$d,"id_str":"%3$d","name":"USER_NAME","screen_name":"SCREEN_NAME",)json" R"json("location":"USER_LOCATION","url":null,"description":"USER_DESCRIPTION","translator_type":"none",)json" R"json("protected":false,"verified":false,"followers_count":54,"friends_count":62,"listed_count":3,)json" R"json("favourites_count":2636,"statuses_count":3297,"created_at":"Mon Jul 16 10:50:37 +0000 2018",)json" R"json("utc_offset":null,"time_zone":null,"geo_enabled":false,"lang":null,"contributors_enabled":false,)json" R"json("is_translator":false,"profile_background_color":"F5F8FA","profile_background_image_url":"",)json" R"json("profile_background_image_url_https":"","profile_background_tile":false,"profile_link_color":"1DA1F2",)json" R"json("profile_sidebar_border_color":"C0DEED","profile_sidebar_fill_color":"DDEEF6",)json" R"json("profile_text_color":"333333","profile_use_background_image":true,)json" R"json("profile_image_url":"http://pbs.twimg.com/profile_images/",)json" R"json("profile_image_url_https":"https://pbs.twimg.com/profile_images/",)json" R"json("profile_banner_url":"https://pbs.twimg.com/profile_banners/","default_profile":true,)json" R"json("default_profile_image":false,"following":null,"follow_request_sent":null,"notifications":null,)json" R"json("withheld_in_countries":[]},"geo":null,"coordinates":null,"place":null,"contributors":null,)json" R"json("is_quote_status":false,"quote_count":0,"reply_count":0,"retweet_count":0,"favorite_count":0,)json" R"json("entities":{"hashtags":[],"urls":[],"user_mentions":[%4$s],"symbols":[]},"favorited":false,)json" R"json("retweeted":false,"filter_level":"low","lang":"ja","timestamp_ms":"1640998745659"})json";
+constexpr std::string_view tweet_template_k =
+    R"json({"created_at":"Sat Jan 01 00:59:05 +0000 2022","id":%1$d,"id_str":"%1$d","text":"%2$s",)json" //
+    R"json("source":"<a href=\"https://twitter.com/settings/download\" rel=\"nofollow\">Twitter for DEVICE</a>",)json" //
+    R"json("truncated":false,"in_reply_to_status_id":null,"in_reply_to_status_id_str":null,)json"                 //
+    R"json("in_reply_to_user_id":null,"in_reply_to_user_id_str":null,"in_reply_to_screen_name":null,)json"        //
+    R"json("user":{"id":%3$d,"id_str":"%3$d","name":"USER_NAME","screen_name":"SCREEN_NAME",)json"                //
+    R"json("location":"USER_LOCATION","url":null,"description":"USER_DESCRIPTION","translator_type":"none",)json" //
+    R"json("protected":false,"verified":false,"followers_count":54,"friends_count":62,"listed_count":3,)json"     //
+    R"json("favourites_count":2636,"statuses_count":3297,"created_at":"Mon Jul 16 10:50:37 +0000 2018",)json"     //
+    R"json("utc_offset":null,"time_zone":null,"geo_enabled":false,"lang":null,"contributors_enabled":false,)json" //
+    R"json("is_translator":false,"profile_background_color":"F5F8FA","profile_background_image_url":"",)json"     //
+    R"json("profile_background_image_url_https":"","profile_background_tile":false,"profile_link_color":"1DA1F2",)json" //
+    R"json("profile_sidebar_border_color":"C0DEED","profile_sidebar_fill_color":"DDEEF6",)json"                  //
+    R"json("profile_text_color":"333333","profile_use_background_image":true,)json"                              //
+    R"json("profile_image_url":"http://pbs.twimg.com/profile_images/",)json"                                     //
+    R"json("profile_image_url_https":"https://pbs.twimg.com/profile_images/",)json"                              //
+    R"json("profile_banner_url":"https://pbs.twimg.com/profile_banners/","default_profile":true,)json"           //
+    R"json("default_profile_image":false,"following":null,"follow_request_sent":null,"notifications":null,)json" //
+    R"json("withheld_in_countries":[]},"geo":null,"coordinates":null,"place":null,"contributors":null,)json"     //
+    R"json("is_quote_status":false,"quote_count":0,"reply_count":0,"retweet_count":0,"favorite_count":0,)json"   //
+    R"json("entities":{"hashtags":[],"urls":[],"user_mentions":[%4$s],"symbols":[]},"favorited":false,)json"     //
+    R"json("retweeted":false,"filter_level":"low","lang":"ja","timestamp_ms":"1640998745659"})json";
 
 /** Appends one tweet, filling the @c %1$d id, @c %2$s text, @c %3$d author and @c %4$s mentions of the template. */
 [[nodiscard]] bool append_tweet(sz::string_t& output, std::int64_t tweet_id, std::size_t text_length,
@@ -237,7 +256,7 @@ constexpr std::string_view
 [[nodiscard]] bool generate_dataset(settings_t const& settings, twitter_t& twitter) noexcept {
     fmt::println("Will generate tweets...");
     std::size_t const tweets_count = settings.max_tweets.value;
-    splitmix64_t random {stream_key(settings.seed.value, "tweets", 0)};
+    splitmix64_t random {stream_key(settings.seed, "tweets", 0)};
     st::vector<std::int64_t> user_ids;
     st::vector<std::int64_t> mentioned_user_ids;
     if (st::failed(user_ids.reserve(tweets_count))) return false;
@@ -475,7 +494,7 @@ void sample(executor_t& executor, settings_t const& settings, twitter_t const& t
         if (!settings.selects(name)) continue;
         print(run_threads(executor, settings, name, [&](loop_t& loop, std::size_t thread) noexcept {
             tweet_batches_t batches;
-            if (!batches.draw(twitter, batch_size, stream_key(settings.seed.value, name, thread)))
+            if (!batches.draw(twitter, batch_size, stream_key(settings.seed, name, thread)))
                 return loop.skip("no memory for keys");
             for (std::size_t call : loop) read(twitter, batches, loop, call);
         }));

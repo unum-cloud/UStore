@@ -1134,6 +1134,8 @@ struct edge_hash_t {
 /** The GPU vendors UStore drives, each through a runtime opened on first use, so one binary addresses every vendor's
  *  devices at once and loads where none is installed. */
 enum class gpu_vendor_t : std::uint32_t {
+
+    /** No vendor, as a device no driver reports carries. */
     unknown_k = ustore_gpu_vendor_unknown_k,
 
     /** NVIDIA, through the CUDA driver. */
@@ -1141,6 +1143,9 @@ enum class gpu_vendor_t : std::uint32_t {
 
     /** AMD, through the HIP runtime. */
     amd_k = ustore_gpu_vendor_amd_k,
+
+    /** Apple, through Metal. */
+    apple_k = ustore_gpu_vendor_apple_k,
 };
 
 /** One GPU as its vendor's driver reports it: the vendor, that vendor's own ordinal, its raw architecture, and what a

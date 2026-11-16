@@ -34,7 +34,7 @@ status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const&
     status_t const validated = validate_write(view.transaction, places, values, arguments.durability, view.watch);
     if (validated.failed() || !arguments.count) return validated;
     status_t const resolved = resolve_collections(database, places.collections_begin, arguments.count,
-                                                  entry_layout_t::uuids_to_bytes_k);
+                                                  entry_layout_t::uuids_to_bytes_k, view);
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteOptions const options = write_options_for(arguments.durability);
@@ -49,7 +49,7 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
     status_t const validated = validate_remove(view.transaction, places, arguments.durability, view.watch);
     if (validated.failed() || !arguments.count) return validated;
     status_t const resolved = resolve_collections(database, places.collections_begin, arguments.count,
-                                                  entry_layout_t::uuids_to_bytes_k);
+                                                  entry_layout_t::uuids_to_bytes_k, view);
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteBatch batch;
@@ -83,7 +83,7 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
 
     if (status_t const status = validate_read(places); status.failed()) return status;
     status_t const resolved = resolve_collections(database, places.collections_begin, arguments.count,
-                                                  entry_layout_t::uuids_to_bytes_k);
+                                                  entry_layout_t::uuids_to_bytes_k, view);
     if (resolved.failed()) return resolved;
 
     ::leveldb::ReadOptions options;
@@ -110,7 +110,7 @@ status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) {
 
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
     status_t const resolved = resolve_collections(database, collections, arguments.count,
-                                                  entry_layout_t::uuids_to_bytes_k);
+                                                  entry_layout_t::uuids_to_bytes_k, view);
     if (resolved.failed()) return resolved;
 
     ::leveldb::ReadOptions options;
@@ -149,7 +149,7 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     sample_batch_t const samples {collections, arguments.wanted, arguments.count};
     status_t const resolved = resolve_collections(database, collections, arguments.count,
-                                                  entry_layout_t::uuids_to_bytes_k);
+                                                  entry_layout_t::uuids_to_bytes_k, view);
     if (resolved.failed()) return resolved;
 
     ::leveldb::ReadOptions options;
@@ -181,7 +181,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     scan_batch_t const tasks = measures_of(arguments);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
-                                                  entry_layout_t::uuids_to_bytes_k);
+                                                  entry_layout_t::uuids_to_bytes_k, view);
     if (resolved.failed()) return resolved;
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;

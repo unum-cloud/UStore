@@ -2,7 +2,8 @@
  *  @file cpp/ustore/graph_stream.hpp
  *  @author Ash Vardanian
  *  @date June 30, 2022
- *  @brief A paginated stream over every edge of a graph collection.
+ *  @brief The one body of the graph read, and a paginated stream over every edge of a graph
+ *      collection through it.
  */
 
 #pragma once
@@ -10,20 +11,112 @@
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 
 #include <iterator> // `std::forward_iterator_tag`
+#include <span>     // `std::span`
 #include <utility>  // `std::move`
 
 #include "ustore/blobs_range.hpp" // `keys_stream_t`
 #include "ustore/graph.h"
 #include "ustore/ranges.hpp" // `strided`, `edges_view_t`, `exported_edges`
-#include "ustore/status.hpp" // `status_t`, `expected`
+#include "ustore/status.hpp" // `status_t`, `expected`, `answer`, `called_`, `outputs`
 #include "ustore/types.hpp"  // `arena_t`, `edge_t`, `receiver_t`
 
 namespace unum::ustore {
 
-/** A stream of every edge in a graph, pulled one page of vertices at a time from the vertex scans of its stream and
- *  in no particular order, the vertices into the arena of that stream and their edges into an arena of its own, as a
- *  read never takes its inputs from the arena it rewinds. It owns both for its lifetime as shorthand for a range-based
- *  loop, with no place for an arena. A default-constructed stream is at the end. */
+/** Degrees a read writes into its arena, one per vertex. */
+using degrees_view_t = std::span<ustore_vertex_degree_t const>;
+
+/** Where a read of edges writes the degree of every vertex. */
+template <>
+struct outputs<degrees_view_t> {
+
+    /** Vertices read, the length of the output. */
+    ustore_size_t count = 0;
+
+    /** Output for one degree per vertex, inside the arena. */
+    ustore_vertex_degree_t const* degrees = nullptr;
+
+    degrees_view_t answer() const noexcept { return {degrees, degrees ? count : 0}; }
+};
+
+/** Where a read of edges writes the edges of every vertex, split by their offsets, beside the
+ *  degrees. */
+template <>
+struct outputs<edges_view_t> {
+
+    /** Vertices read, one offset each plus one closing the last. */
+    ustore_size_t count = 0;
+
+    /** Output for one degree per vertex, inside the arena. */
+    ustore_vertex_degree_t const* degrees = nullptr;
+
+    /** Output for where the edges of every vertex start, inside the arena. */
+    ustore_length_t const* offsets = nullptr;
+
+    /** Output for the tape of edges, three keys per edge, inside the arena. */
+    ustore_key_t const* edges = nullptr;
+
+    edges_view_t answer() const noexcept { return exported_edges(edges, offsets, count); }
+};
+
+/** Where a read of edges asks for offsets and edges: nowhere, unless it answers them. */
+template <typename answer_type_>
+ustore_length_t const** edges_offsets_output_(outputs<answer_type_>&) noexcept {
+    return nullptr;
+}
+
+inline ustore_length_t const** edges_offsets_output_(outputs<edges_view_t>& written) noexcept {
+    return &written.offsets;
+}
+
+template <typename answer_type_>
+ustore_key_t const** edges_output_(outputs<answer_type_>&) noexcept {
+    return nullptr;
+}
+
+inline ustore_key_t const** edges_output_(outputs<edges_view_t>& written) noexcept { return &written.edges; }
+
+/**
+ *  @brief Reads the degrees of @p vertices in @p roles into @p arena, and their edges too when
+ *      @p answer_type_ asks.
+ *  @param[in] collection Collection every vertex lives in, borrowed until the call is final.
+ *  @param[in] vertices Vertices to read, borrowed until the call is final.
+ *  @param[in] roles Role every vertex plays in the wanted edges, empty for any, borrowed until the
+ *      call is final.
+ *  @param[in] arena Memory the answer lands in, borrowed until the call is final, which
+ *      the answer views.
+ *  @param[in] watch Whether a read inside a transaction records the vertices for conflicts.
+ */
+template <ustore_completion_t completion_, typename answer_type_>
+answer<completion_, answer_type_> graph_read_edges_(receiver_t const& receiver,
+                                                    ustore_collection_id_t const& collection,
+                                                    strided_span<ustore_key_t const> vertices,
+                                                    strided_span<ustore_vertex_role_t const> roles, arena_t& arena,
+                                                    ustore_watch_t watch) noexcept {
+    return called_<completion_, answer_type_>([&](ustore_outcome_t* outcome, outputs<answer_type_>* written) noexcept {
+        written->count = vertices.count();
+        ustore_graph_read_edges_t read {};
+        read.database = receiver.database;
+        read.executor = receiver.executor;
+        read.outcome = outcome;
+        read.completion = completion_;
+        read.view = receiver.view(watch);
+        read.count = vertices.count();
+        read.collections = {&collection, 0};
+        read.vertices = {vertices.data(), vertices.stride()};
+        read.roles = {roles.data(), roles.stride()};
+        read.degrees_per_vertex = &written->degrees;
+        read.edges_offsets = edges_offsets_output_(*written);
+        read.edges_per_vertex = edges_output_(*written);
+        read.arena = arena;
+        ustore_graph_read_edges(&read);
+    });
+}
+
+/** A stream of every edge in a graph, pulled one page of vertices at a time from the vertex scans
+ *  of its stream and in no particular order, the vertices into the arena of that stream and their
+ *  edges into an arena of its own, as a read never takes its inputs from the arena it rewinds. It
+ *  owns both for its lifetime as shorthand for a range-based loop, with no place for an arena. A
+ *  default-constructed stream is at the end. */
 class graph_stream_t {
 
     ustore_vertex_role_t role_ = ustore_vertex_role_any_k;
@@ -37,33 +130,17 @@ class graph_stream_t {
     graph_stream_t(keys_stream_t vertex_stream, arena_t arena, ustore_vertex_role_t role) noexcept
         : role_(role), arena_(std::move(arena)), vertex_stream_(std::move(vertex_stream)) {}
 
-    /** Reads the edges of the page of vertices in hand, then of the pages after it until one has edges or the vertices
-     *  run out. */
+    /** Reads the edges of the page of vertices in hand, then of the pages after it until one has
+     *  edges or the vertices run out. */
     status_t prefetch_gather() noexcept {
         for (;;) {
             strided_span<ustore_key_t const> const vertices = strided(vertex_stream_.keys_batch());
-            ustore_vertex_degree_t const* degrees = nullptr;
-            ustore_length_t const* edges_offsets = nullptr;
-            ustore_key_t const* edges_per_vertex = nullptr;
-            ustore_outcome_t outcome {};
-            ustore_graph_read_edges_t graph_read_edges {};
-            graph_read_edges.database = vertex_stream_.receiver_.database;
-            graph_read_edges.executor = vertex_stream_.receiver_.executor;
-            graph_read_edges.outcome = &outcome;
-            graph_read_edges.view = vertex_stream_.receiver_.view(ustore_watch_keys_k);
-            graph_read_edges.count = vertices.count();
-            graph_read_edges.collections = {&vertex_stream_.collection_, 0};
-            graph_read_edges.vertices = {vertices.data(), vertices.stride()};
-            graph_read_edges.roles = {&role_, 0};
-            graph_read_edges.degrees_per_vertex = &degrees;
-            graph_read_edges.edges_offsets = &edges_offsets;
-            graph_read_edges.edges_per_vertex = &edges_per_vertex;
-            graph_read_edges.arena = arena_;
-
-            ustore_graph_read_edges(&graph_read_edges);
-            if (status_t const status {outcome}; status.failed()) return status;
+            strided_span<ustore_vertex_role_t const> const roles {{&role_, 0}, vertices.size()};
+            auto [edges, read_status] = graph_read_edges_<ustore_completion_blocking_k, edges_view_t>(
+                vertex_stream_.receiver_, vertex_stream_.collection_, vertices, roles, arena_, ustore_watch_keys_k);
+            if (read_status.failed()) return read_status;
             fetched_offset_ = 0;
-            fetched_edges_ = exported_edges(edges_per_vertex, edges_offsets, vertices.size());
+            fetched_edges_ = edges;
             if (fetched_edges_.size() || vertex_stream_.is_end()) return {};
             if (status_t const pulled = vertex_stream_.seek_to_next_batch(); pulled.failed()) return pulled;
         }
@@ -82,8 +159,8 @@ class graph_stream_t {
     graph_stream_t(graph_stream_t const&) = delete;
     graph_stream_t& operator=(graph_stream_t const&) = delete;
 
-    /** Opens a stream over the edges of @p collection in @p role, from the vertex @p start onwards, fetching the edges
-     *  of @p read_ahead vertices a page. */
+    /** Opens a stream over the edges of @p collection in @p role, from the vertex @p start onwards,
+     *  fetching the edges of @p read_ahead vertices a page. */
     static expected<graph_stream_t> make(receiver_t receiver, ustore_collection_id_t collection,
                                          ustore_vertex_role_t role, ustore_key_t start,
                                          std::size_t read_ahead = keys_stream_t::default_read_ahead_k) noexcept {
@@ -109,7 +186,8 @@ class graph_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed fetch ends the stream since a reference carries no status. */
+    /** Advances like @c advance, but a failed fetch ends the stream since a reference carries no
+     *  status. */
     graph_stream_t& operator++() noexcept {
         if (advance().succeeded()) return *this;
         fetched_edges_ = {};
@@ -125,7 +203,8 @@ class graph_stream_t {
         return prefetch_gather();
     }
 
-    /** Exposes the whole fetched page, passed edges included, for use with @c seek_to_next_batch. */
+    /** Exposes the whole fetched page, passed edges included, for use
+     *  with @c seek_to_next_batch. */
     edges_view_t edges_batch() noexcept {
         fetched_offset_ = fetched_edges_.size();
         return fetched_edges_;

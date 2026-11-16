@@ -3,7 +3,8 @@
  *  @author Ash Vardanian
  *  @date April 16, 2023
  *  @brief Tests importing and exporting documents and graph edges through NDJSON and CSV files,
- *      collections of every modality through Arrow streams and files, and the CLI on top.
+ *      collections of every modality through Arrow streams and files, and the CLI on top: its
+ *      usage, its one-line flag errors, its variables, and its stop on SIGINT.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -36,6 +37,15 @@
 #include "ustore/db.h"
 #include "ustore/ranges.hpp" // `strided_strings`, `u64_tape`
 #include "ustore/strings.h"
+
+#if !USTORE_OS_WINDOWS_
+#include <csignal>    // `SIGINT`, `SIGPIPE`, `std::signal`
+#include <fcntl.h>    // `open`, `fcntl`, `O_NONBLOCK`
+#include <poll.h>     // `poll`, `pollfd`
+#include <sys/stat.h> // `mkfifo`, `stat`
+#include <sys/wait.h> // `waitpid`, `WIFEXITED`, `WEXITSTATUS`
+#include <unistd.h>   // `fork`, `execv`, `pipe`, `dup2`, `read`, `write`
+#endif
 
 #include "arrow_ipc.hpp" // `ipc_read_prefix`, `ipc_write_batch`, `ipc_read_footer`
 #include "dataset.h"
@@ -837,10 +847,10 @@ template <typename... arguments_type_>
 
     failures += expect_eq(
         run_command(executable, "--engine", engine, "--directory", directory, "collection", "import", "--input", input,
-                    "--id-field", "id", "--memory-limit", "1MB", "--collection", collection),
+                    "--id-field", "id", "--memory-limit", "1M", "--collection", collection),
         0);
     failures += expect_eq(run_command(executable, "--engine", engine, "--directory", directory, "collection", "export",
-                                      "--output", output, "--memory-limit", "1MB", "--collection", collection),
+                                      "--output", output, "--memory-limit", "1M", "--collection", collection),
                           0);
     failures += check_documents(output, input, field_selection_t::whole_k);
     [[maybe_unused]] int const removed_named = std::remove(output);
@@ -855,7 +865,7 @@ template <typename... arguments_type_>
 
     // Documents live only in collections of documents, so an import naming none is refused
     failures += expect(run_command(executable, "--engine", engine, "--directory", directory, "collection", "import",
-                                   "--input", input, "--id-field", "id", "--memory-limit", "1MB") != 0);
+                                   "--input", input, "--id-field", "id", "--memory-limit", "1M") != 0);
     return failures;
 }
 
@@ -1225,7 +1235,7 @@ struct arrow_read_t {
     }
     else {
         // The ingest created the collection, so its refusal drops it again
-        failures += expect(error_text.view().find("ingests no stream") != sz::string_view_t::npos);
+        failures += expect(error_text.view().find("ingests nothing") != sz::string_view_t::npos);
         test_database_t database;
         failures += expect(database.open(config) && !lists_collection(database.get(), "bulk"));
     }
@@ -1474,6 +1484,263 @@ struct arrow_read_t {
 
 #pragma endregion Manifests
 
+#pragma region CLI Conventions
+#if !USTORE_OS_WINDOWS_
+
+/** A CLI process with its standard streams on pipes: what the test writes, and what it reads. */
+struct cli_process_t {
+    pid_t pid = -1;
+    int input = -1;
+    int output = -1;
+    int errors = -1;
+};
+
+/** Starts @p arguments, the executable first, with every @c NAME=value of @p variables added to its
+ *  environment and its three standard streams on pipes. */
+[[nodiscard]] cli_process_t start_cli(std::vector<std::string> const& arguments,
+                                      std::vector<std::string> const& variables = {}) {
+    int input[2], output[2], errors[2];
+    if (::pipe(input) != 0 || ::pipe(output) != 0 || ::pipe(errors) != 0) return {};
+    pid_t const pid = ::fork();
+    if (pid == 0) {
+        ::dup2(input[0], 0), ::dup2(output[1], 1), ::dup2(errors[1], 2);
+        for (int descriptor : {input[0], input[1], output[0], output[1], errors[0], errors[1]}) ::close(descriptor);
+        for (std::string const& variable : variables) ::putenv(const_cast<char*>(variable.c_str()));
+        std::vector<char*> words;
+        for (std::string const& argument : arguments) words.push_back(const_cast<char*>(argument.c_str()));
+        words.push_back(nullptr);
+        ::execv(words[0], words.data());
+        ::_exit(127);
+    }
+    ::close(input[0]), ::close(output[1]), ::close(errors[1]);
+    return {pid, input[1], output[0], errors[0]};
+}
+
+/** Appends what @p descriptor holds now to @p into, answering false once it reached its end. */
+[[nodiscard]] bool drain_some(int descriptor, std::string& into) {
+    char buffer[4096];
+    ssize_t const got = ::read(descriptor, buffer, sizeof(buffer));
+    if (got <= 0) return false;
+    into.append(buffer, static_cast<std::size_t>(got));
+    return true;
+}
+
+/** What a finished CLI run left: its exit status, or 128 plus the signal that ended it, and its two
+ *  output streams. */
+struct cli_run_t {
+    int status = -1;
+    std::string output;
+    std::string errors;
+};
+
+/** Closes the input of @p process, reads both of its outputs to their ends and waits for it. */
+[[nodiscard]] cli_run_t finish_cli(cli_process_t process, std::string errors_so_far = {}) {
+    cli_run_t run;
+    run.errors = std::move(errors_so_far);
+    ::close(process.input);
+    pollfd streams[2] {{process.output, POLLIN, 0}, {process.errors, POLLIN, 0}};
+    std::size_t open = 2;
+    while (open && ::poll(streams, 2, -1) > 0)
+        for (pollfd& stream : streams) {
+            if (stream.fd < 0 || !(stream.revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            if (drain_some(stream.fd, stream.fd == process.output ? run.output : run.errors)) continue;
+            ::close(stream.fd);
+            stream.fd = -1;
+            --open;
+        }
+    int status = 0;
+    ::waitpid(process.pid, &status, 0);
+    run.status = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1;
+    return run;
+}
+
+/** Runs @p arguments to its end with @p variables in its environment and nothing on its input. */
+[[nodiscard]] cli_run_t run_cli(std::vector<std::string> const& arguments,
+                                std::vector<std::string> const& variables = {}) {
+    cli_process_t const process = start_cli(arguments, variables);
+    if (process.pid < 0) return {};
+    return finish_cli(process);
+}
+
+/** @c --help prints the usage, each flag beside its default's variable, and exits with status 0. */
+[[nodiscard]] std::size_t cli_help_lists_variables(char const* executable) {
+    cli_run_t const run = run_cli({executable, "--help"});
+    std::size_t failures = expect_eq(run.status, 0);
+    failures += expect(run.output.find("Usage: ") == 0);
+    failures += expect(run.output.find("--directory <path>") != std::string::npos);
+    failures += expect(run.output.find("[env: USTORE_DIRECTORY]") != std::string::npos);
+    failures += expect(run.output.find("[env: USTORE_MEMORY_LIMIT]") != std::string::npos);
+    failures += expect(run.errors.empty());
+    return failures;
+}
+
+/** A value that does not parse, given as a flag or a variable, prints one line naming the grammar
+ *  and exits with 1 before anything opens. */
+[[nodiscard]] std::size_t cli_bad_value_one_line(char const* executable) {
+    cli_run_t const flag = run_cli({executable, "--batch-rows", "0", "collection", "list"});
+    std::size_t failures = expect_eq(flag.status, 1);
+    failures += expect_eq(flag.errors, std::string("--batch-rows=\"0\" does not parse, expected a positive count\n"));
+
+    cli_run_t const bytes = run_cli({executable, "--memory-limit=64MB", "collection", "list"});
+    failures += expect_eq(bytes.status, 1);
+    failures += expect_eq(bytes.errors,
+                          std::string("--memory-limit=\"64MB\" does not parse, expected bytes like 4096 or 24G\n"));
+
+    cli_run_t const named = run_cli({executable, "--engine", "mongo", "collection", "list"});
+    failures += expect_eq(named.status, 1);
+    failures += expect_eq(named.errors,
+                          std::string("--engine=\"mongo\" does not parse, expected ram, rocksdb, leveldb or nvme\n"));
+
+    cli_run_t const variable = run_cli({executable, "collection", "list"}, {"USTORE_BATCH_ROWS=many"});
+    failures += expect_eq(variable.status, 1);
+    failures += expect_eq(variable.errors,
+                          std::string("USTORE_BATCH_ROWS=\"many\" does not parse, expected a positive count\n"));
+    return failures;
+}
+
+/** The engine and the directory come from @c USTORE_ENGINE and @c USTORE_DIRECTORY when no flag
+ *  names them, and a flag overrides its variable. */
+[[nodiscard]] std::size_t cli_reads_variables(fixture_paths_t const& paths, config_t const& config,
+                                              char const* executable) {
+    std::string const engine = "USTORE_ENGINE=" + std::string(config.engine());
+    std::string const directory = std::string("USTORE_DIRECTORY=") + paths.directory;
+    cli_run_t const created = run_cli({executable, "collection", "create", "--collection", "from_variables"},
+                                      {engine, directory});
+    std::size_t failures = expect_eq(created.status, 0);
+    {
+        test_database_t database;
+        failures += expect(database.open(config) && lists_collection(database.get(), "from_variables"));
+    }
+    cli_run_t const overridden = run_cli({executable, "--collection", "from_variables", "collection", "drop"},
+                                         {engine, directory, "USTORE_COLLECTION=missing"});
+    failures += expect_eq(overridden.status, 0);
+    {
+        test_database_t database;
+        failures += expect(database.open(config) && !lists_collection(database.get(), "from_variables"));
+    }
+    return failures;
+}
+
+/** Waits up to a minute for @p process to print a line holding @p marker to standard error,
+ *  collecting what it printed into @p errors. */
+[[nodiscard]] bool await_errors(cli_process_t const& process, std::string_view marker, std::string& errors) {
+    for (int waited = 0; waited != 600 && errors.find(marker) == std::string::npos; ++waited) {
+        pollfd stream {process.errors, POLLIN, 0};
+        if (::poll(&stream, 1, 100) > 0 && !drain_some(process.errors, errors)) return false;
+    }
+    return errors.find(marker) != std::string::npos;
+}
+
+/** Writes all of @p bytes to @p descriptor, answering false once the reader went away. */
+[[nodiscard]] bool write_all(int descriptor, std::string_view bytes) {
+    while (!bytes.empty()) {
+        ssize_t const put = ::write(descriptor, bytes.data(), bytes.size());
+        if (put <= 0) return false;
+        bytes.remove_prefix(static_cast<std::size_t>(put));
+    }
+    return true;
+}
+
+/** An import from standard input that SIGINT interrupts after its first progress line stops at the
+ *  next batch, prints "stopped in import" and exits with 130; a stream of one row per batch, fed in
+ *  two halves, holds it at a barrier until the signal lands. */
+[[nodiscard]] std::size_t cli_stops_on_sigint(fixture_paths_t const& paths, config_t const& config,
+                                              char const* executable) {
+    std::size_t failures = 0;
+    path_t const table_path {paths.files.c_str(), "stopping.in.arrows"};
+    path_t const batches_path {paths.files.c_str(), "stopping.batches.arrows"};
+    if (!write_arrow_stream(table_path.c_str(), modality_table(ustore_modality_blobs_k)))
+        return expect(!"the Arrow input is written");
+    std::string const engine(config.engine());
+    failures += expect_eq(run_cli({executable, "--engine", engine, "--directory", paths.directory, "collection",
+                                   "import", "--collection", "stopping_source", "--input", table_path.c_str()})
+                              .status,
+                          0);
+    failures += expect_eq(
+        run_cli({executable, "--engine", engine, "--directory", paths.directory, "collection", "export", "--collection",
+                 "stopping_source", "--output", batches_path.c_str(), "--batch-rows", "1"})
+            .status,
+        0);
+    sz::string_t stream;
+    if (failures || !read_file(batches_path.c_str(), stream)) return failures + expect(!"the batches are written");
+    std::string_view const bytes = stream.view();
+
+    // The CLI exits once it stops, so the second half may find no reader
+    auto const previous_pipe = std::signal(SIGPIPE, SIG_IGN);
+    cli_process_t const process = start_cli({executable, "--engine", engine, "--directory", paths.directory,
+                                             "collection", "import", "--collection", "stopping_target", "--input",
+                                             "-"});
+    std::string errors;
+    bool const fed = process.pid > 0 && write_all(process.input, bytes.substr(0, bytes.size() / 2));
+    failures += expect(fed && await_errors(process, "import: ", errors));
+    if (process.pid > 0) ::kill(process.pid, SIGINT);
+    [[maybe_unused]] bool const rest = process.pid > 0 && write_all(process.input, bytes.substr(bytes.size() / 2));
+    cli_run_t const run = process.pid > 0 ? finish_cli(process, std::move(errors)) : cli_run_t {};
+    std::signal(SIGPIPE, previous_pipe);
+
+    failures += expect_eq(run.status, 130);
+    failures += expect(run.errors.find("stopped in import\n") != std::string::npos);
+    failures += expect(run.errors.find("Imported") == std::string::npos);
+    [[maybe_unused]] int const removed_table = std::remove(table_path.c_str());
+    [[maybe_unused]] int const removed_batches = std::remove(batches_path.c_str());
+    return failures;
+}
+
+/** An export SIGINT stops leaves a file already at its target as it was, byte for byte, and no
+ *  temporary beside it: a FIFO at the temporary's name holds the export at a barrier once the pipe
+ *  fills, until the signal lands. */
+[[nodiscard]] std::size_t cli_stop_keeps_existing_target(fixture_paths_t const& paths, config_t const& config,
+                                                         char const* executable) {
+    std::size_t failures = 0;
+    path_t const input {paths.files.c_str(), "keeping.in.arrows"};
+    path_t const target {paths.files.c_str(), "keeping.out.arrows"};
+    path_t const temporary {paths.files.c_str(), "keeping.out.arrows.tmp"};
+    if (!write_arrow_stream(input.c_str(), modality_table(ustore_modality_blobs_k)))
+        return expect(!"the Arrow input is written");
+    std::string const engine(config.engine());
+    failures += expect_eq(run_cli({executable, "--engine", engine, "--directory", paths.directory, "collection",
+                                   "import", "--collection", "keeping_source", "--input", input.c_str()})
+                              .status,
+                          0);
+
+    std::string const existing = "bytes an earlier export left, which a stopped one must keep\n";
+    std::FILE* const file = std::fopen(target.c_str(), "wb");
+    failures += expect(file && std::fwrite(existing.data(), 1, existing.size(), file) == existing.size());
+    if (file) failures += expect_eq(std::fclose(file), 0);
+    failures += expect_eq(::mkfifo(temporary.c_str(), 0600), 0);
+    if (failures) return failures;
+
+    cli_process_t const process = start_cli({executable, "--engine", engine, "--directory", paths.directory,
+                                             "collection", "export", "--collection", "keeping_source", "--output",
+                                             target.c_str(), "--batch-rows", "1"});
+    int const reader = ::open(temporary.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    std::string errors;
+    failures += expect(process.pid > 0 && reader >= 0 && await_errors(process, "export: ", errors));
+    if (process.pid > 0) ::kill(process.pid, SIGINT);
+    if (reader >= 0) {
+        // Draining lets the blocked write finish, so the export reaches its next barrier and stops
+        ::fcntl(reader, F_SETFL, ::fcntl(reader, F_GETFL) & ~O_NONBLOCK);
+        std::string drained;
+        while (drain_some(reader, drained)) {}
+        ::close(reader);
+    }
+    cli_run_t const run = process.pid > 0 ? finish_cli(process, std::move(errors)) : cli_run_t {};
+
+    failures += expect_eq(run.status, 130);
+    failures += expect(run.errors.find("stopped in export\n") != std::string::npos);
+    sz::string_t kept;
+    failures += expect(read_file(target.c_str(), kept) && kept.view() == sz::string_view_t {existing});
+    struct ::stat left {};
+    failures += expect(::stat(temporary.c_str(), &left) != 0);
+    [[maybe_unused]] int const removed_input = std::remove(input.c_str());
+    [[maybe_unused]] int const removed_target = std::remove(target.c_str());
+    [[maybe_unused]] int const removed_temporary = std::remove(temporary.c_str());
+    return failures;
+}
+
+#endif
+#pragma endregion CLI Conventions
+
 /** Runs every case against the fixtures written under the directory of @p config, and the CLI at
  *  @p executable unless it is empty. */
 void run_cases(suite_totals_t& totals, config_t const& config, std::string_view executable) noexcept {
@@ -1522,6 +1789,23 @@ void run_cases(suite_totals_t& totals, config_t const& config, std::string_view 
     // The CLI path views into `argv`, so it ends in a null terminator
     if (executable.empty()) report(totals, "tools.cli", case_result_t::skipped("needs --cli"));
     else report(totals, "tools.cli", cli_round_trip, paths, config, executable.data());
+#if !USTORE_OS_WINDOWS_
+    if (executable.empty()) {
+        report(totals, "cli.help_lists_variables", case_result_t::skipped("needs --cli"));
+        report(totals, "cli.bad_value_one_line", case_result_t::skipped("needs --cli"));
+        report(totals, "cli.reads_variables", case_result_t::skipped("needs --cli"));
+        report(totals, "cli.stops_on_sigint", case_result_t::skipped("needs --cli"));
+        report(totals, "cli.stop_keeps_existing_target", case_result_t::skipped("needs --cli"));
+    }
+    else {
+        report(totals, "cli.help_lists_variables", cli_help_lists_variables, executable.data());
+        report(totals, "cli.bad_value_one_line", cli_bad_value_one_line, executable.data());
+        report(totals, "cli.reads_variables", cli_reads_variables, paths, config, executable.data());
+        report(totals, "cli.stops_on_sigint", cli_stops_on_sigint, paths, config, executable.data());
+        report(totals, "cli.stop_keeps_existing_target", cli_stop_keeps_existing_target, paths, config,
+               executable.data());
+    }
+#endif
 
     constexpr ustore_modality_t modalities[] {ustore_modality_blobs_k, ustore_modality_docs_k,
                                               ustore_modality_strings_k, ustore_modality_graph_k,

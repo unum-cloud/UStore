@@ -196,30 +196,41 @@ expected<collections_entry_t> look_up(database_t& database, ustore_collection_id
     return read_collections_entry(held);
 }
 
-/** Refuses a batch addressing a collection the collections system collection does not list or one keyed otherwise
- *  than @p layout, looking each run of tasks on one collection up once. */
+/** Points @p options at the snapshot @p view names, leaving them at the head for any other view. */
+void use_snapshot(view_t const& view, ::leveldb::ReadOptions& options) noexcept {
+    if (view.snapshot) options.snapshot = state_of<snapshot_t>(view.snapshot)->native;
+}
+
+/** Refuses a batch addressing a collection the collections system collection does not list as
+ *  @p view sees it, so a snapshot still reaches a collection dropped after it, or one keyed
+ *  otherwise than @p layout, looking each run of tasks on one collection up once. */
 status_t resolve_collections(database_t& database, strided_iterator<ustore_collection_id_t const> collections,
-                             std::size_t count, entry_layout_t layout) {
+                             std::size_t count, entry_layout_t layout, view_t const& view) {
+    ::leveldb::ReadOptions options;
+    use_snapshot(view, options);
     std::string held;
     for (std::size_t task_index = 0; task_index != count; ++task_index) {
         if (task_index != 0 && collections[task_index] == collections[task_index - 1]) continue;
-        auto [entry, look_up_status] = look_up(database, collections[task_index], held);
+        auto [entry, look_up_status] = look_up(database, collections[task_index], held, options);
         if (look_up_status.failed()) return look_up_status;
         if (entry_layout_of(entry.modality) != layout) return collection_holds_another_modality();
     }
     return {};
 }
 
-/** Refuses a batch addressing a collection the collections system collection does not list or one
+/** Refuses a batch addressing a collection the collections system collection does not list as
+ *  @p view sees it, so a snapshot still reaches a collection dropped after it, or one
  *  @c admit_modality refuses for @p modality, looking each run of tasks on one collection up once. */
 status_t refuse_modalities(ustore_database_t handle, ustore_collections_view_t collections, ustore_size_t count,
-                           ustore_modality_t modality) {
+                           ustore_modality_t modality, view_t const& view) {
     database_t& database = *state_of<database_t>(handle);
     strided_iterator<ustore_collection_id_t const> const tasks = strided(collections);
+    ::leveldb::ReadOptions options;
+    use_snapshot(view, options);
     std::string held;
     for (std::size_t task_index = 0; task_index != count; ++task_index) {
         if (task_index != 0 && tasks[task_index] == tasks[task_index - 1]) continue;
-        auto [entry, look_up_status] = look_up(database, tasks[task_index], held);
+        auto [entry, look_up_status] = look_up(database, tasks[task_index], held, options);
         if (look_up_status.failed()) return look_up_status;
         if (status_t const admitted = admit_modality(entry.modality, modality); admitted.failed()) return admitted;
     }
@@ -228,13 +239,8 @@ status_t refuse_modalities(ustore_database_t handle, ustore_collections_view_t c
 
 /** The resolver of this engine, which every checked verb and every layer over blobs runs first. */
 status_t resolve_modality(ustore_database_t database, ustore_collections_view_t collections, ustore_size_t count,
-                          ustore_modality_t modality, view_t const&) noexcept {
-    return guarded<&refuse_modalities>(database, collections, count, modality);
-}
-
-/** Points @p options at the snapshot @p view names, leaving them at the head for any other view. */
-void use_snapshot(view_t const& view, ::leveldb::ReadOptions& options) noexcept {
-    if (view.snapshot) options.snapshot = state_of<snapshot_t>(view.snapshot)->native;
+                          ustore_modality_t modality, view_t const& view) noexcept {
+    return guarded<&refuse_modalities>(database, collections, count, modality, view);
 }
 
 /** The bytes of memory LevelDB estimates the database holds. */
@@ -670,37 +676,117 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const&)
     return status_of(status);
 }
 
-/** Compacts the whole keyspace one collection at a time, in key order up to the names and the collections system
- *  collections, each flushing the memtable ahead of it, and reports one unit per collection, as LevelDB measures no
- *  memtable. */
-status_t database_compact(ustore_database_compact_t const& arguments, view_t const&) {
-    database_t& database = *state_of<database_t>(arguments.database);
-    // The collections system collection lists every collection in the order of their identifiers, which is key order
-    st::vector<ustore_collection_id_t> bounds;
-    st::status_t grown = st::status_t::success_k;
-    ::leveldb::Slice const collections = prefix_of(collections_collection_k);
-    iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
-    for (iterator->Seek(collections);
-         st::succeeded(grown) && iterator->Valid() && iterator->key().starts_with(collections); iterator->Next())
-        grown = bounds.emplace_back(ustore_collection_id_t {tail_uuid_of(iterator->key())});
-    if (!iterator->status().ok()) return status_of(iterator->status());
-    iterator.reset();
-    if (st::succeeded(grown)) grown = bounds.emplace_back(names_collection_k);
-    if (st::succeeded(grown)) grown = bounds.emplace_back(collections_collection_k);
-    if (st::failed(grown)) return growth_status(grown);
+/**
+ *  @brief One compaction of a LevelDB database in flight: a merge repeating once per collection's
+ *      key range, in key order, each pass of one task compacting the run from its collection's
+ *      prefix to the next one's, the first from the start of the keyspace and the last to its end.
+ *
+ *  The ranges are the collections the collections system collection listed at the open, then the
+ *  names and the collections system collections, so a merge always makes two passes or more. Each
+ *  pass weighs one, as LevelDB measures no memtable, and runs alone, as LevelDB runs one manual
+ *  compaction at a time; a dropped collection's run compacts as empty, so a pass run again changes
+ *  nothing. The open reserves the ranges, so no @ref run, @ref advance or @ref finish allocates.
+ */
+struct compact_plan_t {
 
-    // A run spans from the prefix of its collection to the prefix of the next one, the first from the keyspace's start
-    // and the last to its end
-    progress_t progress {arguments.progress, arguments.progress_state, bounds.size()};
-    for (std::size_t index = 0; index != bounds.size(); ++index) {
-        bool const first = index == 0;
-        bool const last = index + 1 == bounds.size();
-        ::leveldb::Slice const begin = prefix_of(bounds[index]);
-        ::leveldb::Slice const end = last ? ::leveldb::Slice() : prefix_of(bounds[index + 1]);
-        database.native->CompactRange(first ? nullptr : &begin, last ? nullptr : &end);
-        if (!progress.advance(1)) return progress_cancelled_k;
+    /** The prefixes a pass compacts between, null for the start or the end of the keyspace. */
+    struct task_t {
+        ustore_collection_id_t const* begin = nullptr;
+        ustore_collection_id_t const* end = nullptr;
+    };
+
+    /** The database the plan compacts, which outlives the plan. */
+    database_t* database = nullptr;
+
+    /** The collection each pass's range starts at, in key order. */
+    st::vector<ustore_collection_id_t> ranges;
+
+    compact_plan_t() noexcept = default;
+    compact_plan_t(compact_plan_t const&) = delete;
+    compact_plan_t& operator=(compact_plan_t const&) = delete;
+
+    /** The current pass's task at @p position zero, an empty one past the end. */
+    task_t operator[](std::size_t position) const noexcept {
+        if (phase_ != phase_t::merge_k || position != 0) return {};
+        bool const last = merged_passes_ + 1 == ranges.size();
+        return {merged_passes_ ? &ranges[merged_passes_] : nullptr, last ? nullptr : &ranges[merged_passes_ + 1]};
     }
-    return {};
+
+    /** The current pass's one task; none once the plan is over. */
+    indexed_range<compact_plan_t> tasks() const noexcept { return {this, phase_ == phase_t::merge_k ? 1u : 0u}; }
+
+    /** Runs @p task on the calling thread. */
+    status_t run(task_t const& task, view_t const&) noexcept { return guarded<&compact_plan_t::run_>(*this, task); }
+
+    /** The barrier between passes, one caller after the task ran: picks the next range, and answers
+     *  whether one follows. */
+    bool advance() noexcept {
+        if (phase_ == phase_t::merge_k && ++merged_passes_ == ranges.size()) phase_ = phase_t::done_k;
+        return phase_ != phase_t::done_k;
+    }
+
+    /** Skips what is left of the plan, keeping what its passes compacted. */
+    void stop() noexcept { phase_ = phase_t::done_k; }
+
+    /** Success, as no barrier fails; a failed task answers its own call. */
+    status_t status() const noexcept { return {}; }
+
+    phase_t phase() const noexcept { return phase_; }
+
+    /** The position of the pass in hand, and the count of passes run once done. */
+    std::size_t ordinal() const noexcept { return merged_passes_; }
+
+    /** Units of the pass in hand done at its barrier: all, as each pass runs to its end. */
+    std::size_t completed() const noexcept { return total(); }
+
+    /** Units of the pass in hand: one, or none once the plan is over. */
+    std::size_t total() const noexcept { return tasks().size(); }
+
+    /** Stops the plan where it stands, keeping what its passes compacted. */
+    status_t finish() noexcept {
+        stop();
+        return status();
+    }
+
+  private:
+    friend expected<void*> database_compact_plan_open(ustore_database_compact_t const&, view_t const&) noexcept;
+
+    phase_t phase_ = phase_t::merge_k;
+
+    /** Merge passes whose barrier the plan crossed, the position of the pass in hand. */
+    std::size_t merged_passes_ = 0;
+
+    /** Lists the ranges at the open: each collection the collections system collection lists, in
+     *  the order of their IDs, which is key order, then the names and collections system ones. */
+    static status_t list_(compact_plan_t& plan) {
+        st::status_t grown = st::status_t::success_k;
+        ::leveldb::Slice const collections = prefix_of(collections_collection_k);
+        iterator_pointer_t iterator {plan.database->native->NewIterator(::leveldb::ReadOptions())};
+        for (iterator->Seek(collections);
+             st::succeeded(grown) && iterator->Valid() && iterator->key().starts_with(collections); iterator->Next())
+            grown = plan.ranges.push_back(ustore_collection_id_t {tail_uuid_of(iterator->key())});
+        if (!iterator->status().ok()) return status_of(iterator->status());
+        if (st::succeeded(grown)) grown = plan.ranges.push_back(ustore_collection_id_t {names_collection_k});
+        if (st::succeeded(grown)) grown = plan.ranges.push_back(ustore_collection_id_t {collections_collection_k});
+        return st::failed(grown) ? growth_status(grown) : status_t {};
+    }
+
+    /** Compacts the run between the prefixes @p task names. */
+    static status_t run_(compact_plan_t& plan, task_t const& task) {
+        ::leveldb::Slice const begin = task.begin ? prefix_of(*task.begin) : ::leveldb::Slice();
+        ::leveldb::Slice const end = task.end ? prefix_of(*task.end) : ::leveldb::Slice();
+        plan.database->native->CompactRange(task.begin ? &begin : nullptr, task.end ? &end : nullptr);
+        return {};
+    }
+};
+
+/** Opens the plan of @c ustore_database_compact, listing every collection's key range. */
+expected<void*> database_compact_plan_open(ustore_database_compact_t const& arguments, view_t const&) noexcept {
+    std::unique_ptr<compact_plan_t> plan {new (std::nothrow) compact_plan_t {}};
+    if (!plan) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the plan"};
+    plan->database = state_of<database_t>(arguments.database);
+    if (status_t const listed = guarded<&compact_plan_t::list_>(*plan); listed.failed()) return listed;
+    return static_cast<void*>(plan.release());
 }
 
 /** Syncs the log through an empty batch, the only sync LevelDB offers. */

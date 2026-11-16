@@ -51,7 +51,8 @@ using strings_kit_t = strings_kit_of<cpu_ladder_floor_k>;
 database_verbs_t const database_verbs_k {
     .describe = &guarded<&database_describe>,
     .clear = &guarded<&database_clear>,
-    .compact = &guarded<&database_compact>,
+    .compact_plan_open = &database_compact_plan_open,
+    .compact_plan = plan_verbs_for<compact_plan_t>(),
     .flush = &guarded<&database_flush>,
     .snapshot_init = &guarded<&snapshot_init>,
     .snapshot_save = &guarded<&snapshot_save>,
@@ -72,7 +73,7 @@ database_verbs_t const database_verbs_k {
 };
 
 /** The unchecked whole-value verbs of every collection keyed by UUIDs, which the layers over blobs reach. */
-constexpr blobs_verbs<home_t::host_k> values_verbs_k {
+constexpr blobs_verbs<vendored_residency_t::host_k> values_verbs_k {
     .write = &guarded<&blobs_write>,
     .remove = &guarded<&blobs_remove>,
     .read = &guarded<&blobs_read>,
@@ -82,7 +83,7 @@ constexpr blobs_verbs<home_t::host_k> values_verbs_k {
 };
 
 /** The verbs of this engine's blobs collections. */
-blobs_verbs<home_t::host_k> const blobs_verbs_k {
+blobs_verbs<vendored_residency_t::host_k> const blobs_verbs_k {
     .write = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.write>,
     .remove = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.remove>,
     .read = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.read>,
@@ -92,7 +93,7 @@ blobs_verbs<home_t::host_k> const blobs_verbs_k {
 };
 
 /** The verbs of this engine's strings collections. */
-strings_verbs<home_t::host_k> const strings_verbs_k {
+strings_verbs<vendored_residency_t::host_k> const strings_verbs_k {
     .write = &guarded<&strings_write>,
     .remove = &guarded<&strings_remove>,
     .read = &guarded<&strings_read>,
@@ -102,7 +103,7 @@ strings_verbs<home_t::host_k> const strings_verbs_k {
 };
 
 /** The verbs of this engine's documents collections. */
-docs_verbs<home_t::host_k> const docs_verbs_k {
+docs_verbs<vendored_residency_t::host_k> const docs_verbs_k {
     .write = &docs_write_over_blobs<values_verbs_k, &resolve_modality>,
     .read = &docs_read_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality>,
     .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality>,
@@ -114,7 +115,7 @@ docs_verbs<home_t::host_k> const docs_verbs_k {
 };
 
 /** The verbs of this engine's graph collections. */
-graph_verbs<home_t::host_k> const graph_verbs_k {
+graph_verbs<vendored_residency_t::host_k> const graph_verbs_k {
     .read_edges = &graph_read_edges_over_blobs<values_verbs_k, &resolve_modality>,
     .write_edges = &graph_write_edges_over_blobs<values_verbs_k, &resolve_modality>,
     .remove_edges = &graph_remove_edges_over_blobs<values_verbs_k, &resolve_modality>,
@@ -126,7 +127,7 @@ graph_verbs<home_t::host_k> const graph_verbs_k {
 };
 
 /** The verbs of this engine's pages collections. */
-pages_verbs<home_t::host_k> const pages_verbs_k {
+pages_verbs<vendored_residency_t::host_k> const pages_verbs_k {
     .import = &pages_import_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality>,
     .insert = &pages_insert_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality>,
     .remove = &pages_remove_over_blobs<values_verbs_k, &resolve_modality>,
@@ -147,8 +148,9 @@ engine_t const engine_k {
              .docs = &docs_verbs_k,
              .graph = &graph_verbs_k,
              .pages = &pages_verbs_k},
-    .vram_nvidia = uploading_vram_tables<home_t::vram_nvidia_k>,
-    .vram_amd = uploading_vram_tables<home_t::vram_amd_k>,
+    .vram_nvidia = uploading_vram_tables<vendored_residency_t::vram_nvidia_k>,
+    .vram_amd = uploading_vram_tables<vendored_residency_t::vram_amd_k>,
+    .vram_apple = uploading_vram_tables<vendored_residency_t::vram_apple_k>,
 };
 
 } // namespace unum::ustore::oracles::rocksdb
@@ -164,9 +166,11 @@ extern "C" bool RocksDbIOUringEnable() { return true; }
 #endif
 
 void ustore_database_open_rocksdb(ustore_database_open_rocksdb_t* arguments) {
-    route_init<&guarded<&database_open, ustore_database_open_rocksdb_t, cpu_ceiling_t, view_t>>(arguments);
+    route_init<&guarded<&database_open, ustore_database_open_rocksdb_t const, cpu_ceiling_t const, view_t const>>(
+        arguments);
 }
 
 void ustore_database_view_rocksdb(ustore_database_view_rocksdb_t* arguments) {
-    route_init<&guarded<&database_view, ustore_database_view_rocksdb_t, cpu_ceiling_t, view_t>>(arguments);
+    route_init<&guarded<&database_view, ustore_database_view_rocksdb_t const, cpu_ceiling_t const, view_t const>>(
+        arguments);
 }

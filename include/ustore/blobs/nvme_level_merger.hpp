@@ -18,7 +18,7 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
-#include <variant>     // `std::get_if`
+#include <variant>     // `std::holds_alternative`, `std::visit`
 
 #include <smashtable/basic_hash_table.hpp> // `st::assume_reserved`
 #include <smashtable/basic_vector.hpp>     // `st::vector`, `st::assume_uninitialized`
@@ -28,7 +28,7 @@
 #include "ustore/blobs/nvme_lsm_level.hpp"         // `lsm_level`
 #include "ustore/blobs/nvme_schemas.hpp"           // `cancellation_state_t`
 #include "ustore/blobs/nvme_sorted_run.hpp"        // `sorted_run_header_t`, `sorted_run_layout`
-#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`, `hip_compactor_t`
 #include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
 #include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`
 #include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
@@ -66,7 +66,7 @@ enum class compactor_choice_t : std::uint8_t {
     /** @c host_compactor_t, on the calling thread. */
     host_k,
 
-    /** @c cuda_compactor_t, on the device of the executor the database owns. */
+    /** @c cuda_compactor_t or @c hip_compactor_t, on the device of the database's own executor. */
     device_k,
 };
 
@@ -190,6 +190,13 @@ class compaction_fan_out_t {
     return devices != 0 && key_slots_count > storage_limits_t::cuda_compaction_threshold_k
                ? compactor_choice_t::device_k
                : compactor_choice_t::host_k;
+}
+
+/** Devices @p compactor merges on: one for an NVIDIA or AMD compactor, none for the host's. */
+[[nodiscard]] inline std::size_t devices_of(compactor_ref_t const& compactor) noexcept {
+    bool const device = std::holds_alternative<cuda_compactor_t*>(compactor) ||
+                        std::holds_alternative<hip_compactor_t*>(compactor);
+    return device ? 1 : 0;
 }
 
 /** The engine's status for the @p status a compactor reported. */
@@ -772,13 +779,12 @@ class lsm_level_merger {
         compaction_kind_t const kind = kind_of_(request.upper_order, request.depth);
         std::uint64_t records = 0;
         for (run_handle_t const source : sources) records += runs[source.index].population_count();
-        cuda_compactor_t* const* const device = std::get_if<cuda_compactor_t*>(&request.compactor);
+        std::size_t const devices = devices_of(request.compactor);
         bool tombstoned = false;
         for (run_handle_t const source : sources) tombstoned |= !runs[source.index].range_tombstones().empty();
         // No device compaction reads range tombstones, so a merge carrying one runs here.
-        if (!tombstoned &&
-            choose_compactor(request.placement, device != nullptr ? 1 : 0, records) == compactor_choice_t::device_k) {
-            if (device == nullptr) return {status_code_t::unsupported_k, "No device compactor serves this database"};
+        if (!tombstoned && choose_compactor(request.placement, devices, records) == compactor_choice_t::device_k) {
+            if (devices == 0) return {status_code_t::unsupported_k, "No device compactor serves this database"};
             // The device reads every run's heads by position, as no kit searches them.
             st::vector<st::immutable_splus_tree_view<st::key128_t>> heads;
             st::vector<strings_run_view> views;
@@ -794,8 +800,15 @@ class lsm_level_merger {
                     &heads[index], runs[sources[index].index].key_offsets(), runs[sources[index].index].key_tape(),
                     &runs[sources[index].index].stamps(), &runs[sources[index].index].kinds()};
             }
-            st::status_t const ranked = (*device)->merge_strings(kind, std::span<strings_run_view const> {views},
-                                                                 upper_count, request.stamps, survivors);
+            st::status_t const ranked = std::visit(
+                [&]<typename compactor_type_>(compactor_type_ const& device) noexcept {
+                    if constexpr (std::same_as<compactor_type_, host_compactor_t>)
+                        return st::status_t::invalid_argument_k;
+                    else
+                        return device->merge_strings(kind, std::span<strings_run_view const> {views}, upper_count,
+                                                     request.stamps, survivors);
+                },
+                request.compactor);
             if (ranked != st::status_t::invalid_argument_k && ranked != st::status_t::out_of_memory_heap_k)
                 return compaction_status(ranked);
         }
@@ -1167,12 +1180,11 @@ class lsm_level_merger {
         constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
         bool changes = false;
         std::uint64_t const merged = merged_count_(upper, lower, changes);
-        cuda_compactor_t* const* const device = std::get_if<cuda_compactor_t*>(&compactor);
+        std::size_t const devices = devices_of(compactor);
         // No device compaction reads range tombstones, so a merge carrying one runs here.
         bool const on_device = !carries_range_tombstones(upper, lower) &&
-                               choose_compactor(placement, device != nullptr ? 1 : 0, merged) ==
-                                   compactor_choice_t::device_k;
-        if (on_device && device == nullptr)
+                               choose_compactor(placement, devices, merged) == compactor_choice_t::device_k;
+        if (on_device && devices == 0)
             return {status_code_t::unsupported_k, "No device compactor serves this database"};
         // Without a device fold, only a merge holding no change runs the last-write compaction.
         if (on_device && (device_folds_k || !changes)) {
@@ -1182,8 +1194,8 @@ class lsm_level_merger {
             for (std::size_t index = 0; index != sources.size(); ++index)
                 extents[index] = extents_of_(runs[sources[index].index]);
             st::status_t compacted = st::status_t::invalid_argument_k;
-            if (status_t const tracked = compact_on_device_(kind, upper, lower, extents, bounds, stamps, *device, fold,
-                                                            device_fold, read_value, output, compacted);
+            if (status_t const tracked = compact_on_device_(kind, upper, lower, extents, bounds, stamps, compactor,
+                                                            fold, device_fold, read_value, output, compacted);
                 tracked.failed())
                 return tracked;
             if (compacted != st::status_t::invalid_argument_k && compacted != st::status_t::out_of_memory_heap_k)
@@ -1199,7 +1211,7 @@ class lsm_level_merger {
     static status_t compact_on_device_(compaction_kind_t, std::span<sorted_run_index_view<key_slot_t> const>,
                                        std::span<sorted_run_index_view<key_slot_t> const>,
                                        std::span<sorted_run_extents_t const>, sorted_run_bounds_t const&,
-                                       compaction_stamps_t const&, cuda_compactor_t*, fold_type_ const&,
+                                       compaction_stamps_t const&, compactor_ref_t const&, fold_type_ const&,
                                        device_fold_type_ const&, value_reader_type_&, compaction_output_t&,
                                        st::status_t&) noexcept
         requires tailed_key_slot_concept<key_slot_t>
@@ -1207,24 +1219,30 @@ class lsm_level_merger {
         return {};
     }
 
-    /** Compacts on @p device into @p compacted, through @p device_fold where it composes changes
-     *  and through the last-write fold otherwise; fails only when it cannot track the runs. */
+    /** Compacts on the device compactor @p compactor names into @p compacted, through
+     *  @p device_fold where it composes changes and through the last-write fold otherwise;
+     *  fails only when it cannot track the runs. */
     template <typename fold_type_, typename device_fold_type_, typename value_reader_type_>
     static status_t compact_on_device_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                        std::span<sorted_run_index_view<key_slot_t> const> lower,
                                        std::span<sorted_run_extents_t const> extents, sorted_run_bounds_t const& bounds,
-                                       compaction_stamps_t const& stamps, cuda_compactor_t* device,
+                                       compaction_stamps_t const& stamps, compactor_ref_t const& compactor,
                                        fold_type_ const& fold, device_fold_type_ const& device_fold,
                                        value_reader_type_& read_value, compaction_output_t& output,
                                        st::status_t& compacted) noexcept {
         constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
-        if constexpr (device_folds_k)
-            compacted = device->compact(kind, upper, lower, extents, bounds, stamps, fold, device_fold, read_value,
-                                        output);
-        // No run holds a change here, so the compaction built for the last write serves every fold
-        else
-            compacted = device->compact(kind, upper, lower, extents, bounds, stamps, utilities::last_write_fold_t {},
-                                        no_device_fold_t {}, located_value_reader<key_slot_t> {}, output);
+        compacted = std::visit(
+            [&]<typename compactor_type_>(compactor_type_ const& device) noexcept {
+                if constexpr (std::same_as<compactor_type_, host_compactor_t>) return st::status_t::invalid_argument_k;
+                else if constexpr (device_folds_k)
+                    return device->compact(kind, upper, lower, extents, bounds, stamps, fold, device_fold, read_value,
+                                           output);
+                // No run holds a change here, so the last-write compaction serves every fold
+                else
+                    return device->compact(kind, upper, lower, extents, bounds, stamps, utilities::last_write_fold_t {},
+                                           no_device_fold_t {}, located_value_reader<key_slot_t> {}, output);
+            },
+            compactor);
         return {};
     }
 
@@ -1300,7 +1318,7 @@ class lsm_level_merger {
         if (offered < 2 || request.buffers.size() < offered) return 1;
         bool changes = false;
         std::uint64_t const merged = merged_count_(upper, lower, changes);
-        std::size_t const devices = std::holds_alternative<cuda_compactor_t*>(request.compactor) ? 1 : 0;
+        std::size_t const devices = devices_of(request.compactor);
         if (!carries_range_tombstones(upper, lower) &&
             choose_compactor(request.placement, devices, merged) == compactor_choice_t::device_k)
             return 1;

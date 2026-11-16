@@ -30,7 +30,8 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 database_verbs_t const ram_variant<cpu_class_, isolation_>::database_verbs_k {
     .describe = &serve_database<cpu_class_, isolation_, ustore_database_describe_t>,
     .clear = &serve_database<cpu_class_, isolation_, ustore_database_clear_t>,
-    .compact = &serve_database<cpu_class_, isolation_, ustore_database_compact_t>,
+    .compact_plan_open = &compact_plan_open<cpu_class_, isolation_>,
+    .compact_plan = plan_verbs_for<compact_plan_t>(),
     .flush = &serve_database<cpu_class_, isolation_, ustore_database_flush_t>,
     .snapshot_init = &serve_database<cpu_class_, isolation_, ustore_snapshot_init_t>,
     .snapshot_save = &serve_database<cpu_class_, isolation_, ustore_snapshot_save_t>,
@@ -65,6 +66,7 @@ engine_t const ram_variant<cpu_class_, isolation_>::engine_k {
              .pages = &pages_verbs_k},
     .vram_nvidia = uploading_vram_tables<vendored_residency_t::vram_nvidia_k>,
     .vram_amd = uploading_vram_tables<vendored_residency_t::vram_amd_k>,
+    .vram_apple = uploading_vram_tables<vendored_residency_t::vram_apple_k>,
 };
 
 #pragma endregion Table

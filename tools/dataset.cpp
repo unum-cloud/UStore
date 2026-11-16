@@ -9,7 +9,6 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int64_t`, `std::uint64_t`
-#include <cstdio>  // `std::fopen`, `std::fwrite`, `std::fclose`
 #include <cstdlib> // `std::free`
 
 #include <algorithm>    // `std::find`
@@ -18,6 +17,7 @@
 #include <span>         // `std::span`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
+#include <utility>      // `std::move`, `std::exchange`
 
 #include <yyjson.h> // `yyjson_read`, `yyjson_mut_doc`
 
@@ -29,10 +29,10 @@
 #include "ustore/ranges.hpp" // `bits_view_t`, `tape_string`, `u64_tape`
 #include "ustore/types.hpp"  // `sz`, `st`
 
-#include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`
+#include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`, `open_native_file`, `write_native_file`
 
 #include "dataset.h"   // `ustore_docs_import_t`, `ustore_graph_export_t`
-#include "dataset.hpp" // `format_of`, `failed`, `copy_path`, `place`, `task_arena_t`
+#include "dataset.hpp" // `format_of`, `failed`, `copy_path`, `place`, `task_arena_t`, `staged_output_t`
 
 namespace unum::ustore::tools {
 
@@ -62,9 +62,14 @@ using namespace unum::ustore::utilities;
     return outcome->status != ustore_status_success_k;
 }
 
-/** A file written through a buffer that is flushed whenever it reaches a byte threshold. */
+/** A file written through a buffer that is flushed whenever it reaches a byte threshold, into a
+ *  temporary that lands over the target only once the task succeeds, so a failure or a cancel
+ *  leaves a file already at the target as it was. */
 class output_file_t {
-    std::FILE* file_ = nullptr;
+    staged_output_t staged_;
+    native_file_t file_ = invalid_native_file_k;
+    native_file_event_t event_;
+    std::uint64_t offset_ = 0;
     std::size_t threshold_ = 0;
     sz::string_t buffer_;
 
@@ -73,14 +78,27 @@ class output_file_t {
     output_file_t(output_file_t const&) = delete;
     output_file_t& operator=(output_file_t const&) = delete;
     ~output_file_t() noexcept {
-        if (file_) { [[maybe_unused]] int const closed = std::fclose(file_); }
+        if (file_ == invalid_native_file_k) return;
+        [[maybe_unused]] status_t const closed = close_native_file(file_);
+        ustore_outcome_t abandoned {ustore_status_cancelled_k, "The export ended before it finished"};
+        staged_.land(&abandoned);
     }
 
-    /** Creates or truncates @p path, reporting a failure into @p outcome. */
+    /** Creates the temporary beside @p path, reporting a failure into @p outcome. */
     void create(char const* path, std::size_t threshold, ustore_outcome_t* outcome) noexcept {
-        file_ = std::fopen(path, "wb");
         threshold_ = threshold;
-        if (!file_) *outcome = {ustore_status_io_k, "Failed to create the output file"};
+        staged_.stage(path, outcome);
+        if (failed(outcome)) return;
+        auto [event, event_status] = native_file_event_t::make();
+        if (event_status.failed()) {
+            *outcome = event_status;
+            return;
+        }
+        event_ = std::move(event);
+        auto [file, open_status] = open_native_file(staged_.temporary(), file_access_t::truncate_read_write_k,
+                                                    file_buffering_t::buffered_k);
+        if (open_status.failed()) *outcome = {ustore_status_io_k, "Failed to create the output file"};
+        else file_ = file;
     }
 
     /** Buffers @p text, writing the buffer out once it reaches the threshold; does nothing after a failure. */
@@ -110,21 +128,32 @@ class output_file_t {
 
     /** Writes the whole buffer out and empties it, reporting a short or failed write into @p outcome. */
     void flush(ustore_outcome_t* outcome) noexcept {
-        if (std::fwrite(buffer_.data(), 1, buffer_.size(), file_) != buffer_.size()) {
+        std::span<byte_t const> const pending {reinterpret_cast<byte_t const*>(buffer_.data()), buffer_.size()};
+        auto [landed, write_status] = write_native_file(file_, offset_, pending, event_);
+        if (write_status.failed() || landed != pending.size()) {
             *outcome = {ustore_status_io_k, "Failed to write the output file"};
             return;
         }
+        offset_ += landed;
         buffer_.clear();
     }
 
-    /** Flushes the buffer and closes the file, reporting either failure into @p outcome. */
+    /** Flushes the buffer, makes the temporary durable and closes it, then lands it over the target
+     *  while @p outcome holds success and removes it otherwise. */
     void finish(ustore_outcome_t* outcome) noexcept {
         if (!failed(outcome)) flush(outcome);
-        int const closed = std::fclose(file_);
-        file_ = nullptr;
-        if (closed != 0 && !failed(outcome)) *outcome = {ustore_status_io_k, "Failed to close the output file"};
+        if (!failed(outcome))
+            if (status_t const flushed = flush_native_file(file_); flushed.failed()) *outcome = flushed;
+        status_t const closed = close_native_file(std::exchange(file_, invalid_native_file_k));
+        if (closed.failed() && !failed(outcome)) *outcome = {ustore_status_io_k, "Failed to close the output file"};
+        staged_.land(outcome);
     }
 };
+
+/** Bytes of @p text up to the end of @p line, one of its lines, which a progress report counts. */
+[[nodiscard]] std::size_t read_through(sz::string_view_t text, sz::string_view_t line) noexcept {
+    return static_cast<std::size_t>(line.data() + line.size() - text.data());
+}
 
 /** Drops a trailing carriage return, so CRLF files read as LF files. */
 [[nodiscard]] std::string_view without_carriage_return(sz::string_view_t line) noexcept {
@@ -288,6 +317,9 @@ class csv_reader_t {
 
   public:
     explicit csv_reader_t(sz::string_view_t text) noexcept : text_(text) {}
+
+    /** Bytes of the text read so far, which a progress report counts. */
+    [[nodiscard]] std::size_t position() const noexcept { return position_; }
 
     /** Skips empty lines and answers whether any record remains. */
     [[nodiscard]] bool has_record() noexcept {
@@ -535,8 +567,9 @@ void import_ndjson_documents(ustore_docs_import_t const& task, field_list_t fiel
 
         batch.commit(task.outcome);
         if (failed(task.outcome)) return;
-        if (batch.bytes() >= task.max_batch_size) batch.flush(task);
-        if (failed(task.outcome)) return;
+        if (batch.bytes() < task.max_batch_size) continue;
+        batch.flush(task);
+        if (failed(task.outcome) || !advance(task, read_through(text, line), text.size())) return;
     }
     batch.flush(task);
 }
@@ -581,8 +614,9 @@ void import_csv_documents(ustore_docs_import_t const& task, field_list_t fields,
         if (failed(task.outcome)) return;
         batch.commit(task.outcome);
         if (failed(task.outcome)) return;
-        if (batch.bytes() >= task.max_batch_size) batch.flush(task);
-        if (failed(task.outcome)) return;
+        if (batch.bytes() < task.max_batch_size) continue;
+        batch.flush(task);
+        if (failed(task.outcome) || !advance(task, reader.position(), text.size())) return;
     }
     batch.flush(task);
 }
@@ -602,6 +636,7 @@ void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&
     task_arena_t const keys_arena {nullptr, task.outcome};
     if (failed(task.outcome)) return;
     ustore_key_t start = smallest_key_k;
+    ustore_size_t scanned = 0;
     while (true) {
         ustore_length_t const* offsets = nullptr;
         ustore_key_t const* page = nullptr;
@@ -623,7 +658,9 @@ void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&
         ustore_key_t const* const keys = page + offsets[0];
         ustore_key_t const last = keys[count - 1];
         consume(std::span<ustore_key_t const>(keys, count));
+        scanned += count;
         if (failed(task.outcome) || count < batch_size || last == largest_key_k) return;
+        if (!advance(task, scanned, 0)) return;
         start = key_after(last);
     }
 }
@@ -664,13 +701,18 @@ void upsert_edges(ustore_graph_import_t const& task, st::vector<edge_row_t>& edg
     edges.clear();
 }
 
-/** Stages @p edge and upserts the batch once it fills the byte budget of @p task. */
-void stage_edge(ustore_graph_import_t const& task, st::vector<edge_row_t>& edges, edge_row_t edge) noexcept {
+/** Stages @p edge and upserts the batch once it fills the byte budget of @p task, then reports
+ *  @p read of the @p total bytes of the file. */
+void stage_edge(ustore_graph_import_t const& task, st::vector<edge_row_t>& edges, edge_row_t edge, std::size_t read,
+                std::size_t total) noexcept {
     if (st::failed(edges.push_back(edge_row_t {edge}))) {
         *task.outcome = {ustore_status_out_of_memory_k, "Failed to stage an edge"};
         return;
     }
-    if (edges.size() >= items_in(task.max_batch_size, sizeof(edge_row_t))) upsert_edges(task, edges);
+    if (edges.size() < items_in(task.max_batch_size, sizeof(edge_row_t))) return;
+    upsert_edges(task, edges);
+    if (!failed(task.outcome)) [[maybe_unused]]
+        bool const goes_on = advance(task, read, total);
 }
 
 /** Imports one edge per NDJSON line, reading its vertices and edge from integer fields. */
@@ -690,7 +732,7 @@ void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t te
                              "The input file holds a line without integer or UUID vertex or edge fields"};
             return;
         }
-        stage_edge(task, edges, edge);
+        stage_edge(task, edges, edge, read_through(text, line), text.size());
         if (failed(task.outcome)) return;
     }
     upsert_edges(task, edges);
@@ -735,7 +777,7 @@ void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text)
                              "The CSV file holds a record without integer vertex or edge fields"};
             return;
         }
-        stage_edge(task, edges, edge);
+        stage_edge(task, edges, edge, reader.position(), text.size());
         if (failed(task.outcome)) return;
     }
     upsert_edges(task, edges);

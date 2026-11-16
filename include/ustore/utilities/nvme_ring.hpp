@@ -919,6 +919,23 @@ concept ring_concept = requires(disk_type_& disk, disk_type_ const& constant, qu
     { constant.capabilities() } -> std::same_as<ring_capabilities_t>;
 };
 
+/** Whether a disk parks the caller in the kernel until a completion lands. */
+template <typename disk_type_>
+concept sleeping_ring_concept = requires(disk_type_& disk, queue_pair_t const& queue_pair,
+                                         std::span<completion_t> into) { disk.wait_completions(queue_pair, into); };
+
+/** Whether a disk may need the memory it transfers from pages its DMA engine reaches. */
+template <typename disk_type_>
+concept dma_memory_ring_concept = requires(disk_type_& disk) { disk.needs_dma_memory(); };
+
+/** Whether a disk names the memory domain its transfers prefer. */
+template <typename disk_type_>
+concept memory_domain_ring_concept = requires(disk_type_& disk) { disk.memory_domain(); };
+
+/** Whether a disk holds a share of the process's transport to give back on unmount. */
+template <typename disk_type_>
+concept releasing_ring_concept = requires(disk_type_& disk) { disk.release(); };
+
 /** Spins over a ring that never blocks, so a bounded wait needs no fiber and no interrupt. */
 inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
 
@@ -962,7 +979,7 @@ template <typename waiter_type_, typename disk_type_>
     requires ring_concept<disk_type_>
 expected<std::size_t> wait_completions(disk_type_& disk, queue_pair_t const& queue_pair,
                                        std::span<completion_t> into) noexcept {
-    if constexpr (requires { disk.wait_completions(queue_pair, into); }) return disk.wait_completions(queue_pair, into);
+    if constexpr (sleeping_ring_concept<disk_type_>) return disk.wait_completions(queue_pair, into);
     else
         for (std::size_t spins = 0;; ++spins) {
             auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, into);

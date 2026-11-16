@@ -163,7 +163,7 @@ status_t generate_edge_list(settings_t const& settings, st::vector<input_edge_t>
     std::size_t const drawn_per_vertex = settings.inner_degree.value + settings.outer_degree.value;
     if (st::failed(edges.reserve(planted * drawn_per_vertex))) return status_code_t::out_of_memory_k;
 
-    splitmix64_t random {stream_key(settings.seed.value, "edges", 0)};
+    splitmix64_t random {stream_key(settings.seed, "edges", 0)};
     for (std::size_t vertex = 0; vertex != planted; ++vertex) {
         std::size_t const community_begin = (vertex / community_size) * community_size;
         ustore_key_t const source = key_from_integer(vertex);
@@ -682,11 +682,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     database_t database {handle};
-    if (status_t const cleared = database.clear(ustore_drop_collection_k); cleared.failed()) {
+    if (status_t const cleared = database.on().clear(ustore_drop_collection_k); cleared.failed()) {
         fmt::println(stderr, "Failed to clear the database: {}", cleared.message ? cleared.message : "unknown");
         return 1;
     }
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
     if (graph_status.failed()) {
         fmt::println(stderr, "Failed to create the graph: {}", graph_status.message ? graph_status.message : "unknown");
         return 1;

@@ -58,11 +58,11 @@ struct fixture_t {
             return;
         }
         database = std::move(opened);
-        if (status_t const cleared = database.clear(ustore_drop_collection_k); cleared.failed()) {
+        if (status_t const cleared = database.on().clear(ustore_drop_collection_k); cleared.failed()) {
             fmt::println(stderr, "  failed to clear the database: {}", cleared.message);
             return;
         }
-        auto maybe_strings = database.create<strings_collection_t>(name_k);
+        auto maybe_strings = database.on().create<strings_collection_t>(name_k);
         if (!maybe_strings) {
             fmt::println(stderr, "  failed to create a strings collection: {}", maybe_strings.status().message);
             return;
@@ -124,7 +124,7 @@ std::size_t strings_collection_prefix_walk(config_t const& config) {
     std::array<value_view_t, 4> const texts {"user:2", "team:1", "user:10", "user:1"};
     std::array<ustore_key_t, 4> const values {key_from_integer(2), key_from_integer(100), key_from_integer(10),
                                               key_from_integer(1)};
-    failures += expect(fixture.strings.assign(texts, values).succeeded());
+    failures += expect(fixture.strings.write(texts, values).succeeded());
 
     std::array<std::string_view, 3> const users {"user:1", "user:10", "user:2"};
     failures += expect_walk(fixture.strings, "user:", users);
@@ -160,7 +160,7 @@ std::size_t strings_collection_paged_walk(config_t const& config) {
 
     std::array<value_view_t, 3> const texts {"page:a", "page:b", "page:c"};
     std::array<ustore_key_t, 3> const values {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
-    failures += expect(fixture.strings.assign(texts, values).succeeded());
+    failures += expect(fixture.strings.write(texts, values).succeeded());
 
     auto [first_arena, first_arena_status] = arena_t::make();
     auto [second_arena, second_arena_status] = arena_t::make();
@@ -252,7 +252,7 @@ std::size_t strings_collection_survives_maintenance(config_t const& config) {
                 failures += expect(fixture.strings.remove(std::string_view {texts[index]}).succeeded());
                 model.erase(texts[index]);
             }
-            failures += expect(fixture.database.compact().succeeded());
+            failures += expect(fixture.database.on().compact().succeeded());
             failures += expect_model(fixture.strings, texts, model, shared_k);
             failures += expect_model(fixture.strings, texts, model, "");
         }
@@ -262,7 +262,7 @@ std::size_t strings_collection_survives_maintenance(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    auto maybe_strings = database.find<strings_collection_t>(fixture_t::name_k);
+    auto maybe_strings = database.on().find<strings_collection_t>(fixture_t::name_k);
     if (!maybe_strings) return failures + expect(maybe_strings.has_value());
     failures += expect_model(*maybe_strings, texts, model, shared_k);
     constexpr ustore_key_t reopened_k = key_from_integer(1'000'000);
@@ -280,17 +280,17 @@ std::size_t strings_collection_in_transaction(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
-    if (!fixture.database.supports_transactions()) return failures;
+    if (!fixture.database.on().supports_transactions()) return failures;
 
-    auto maybe_transaction = fixture.database.transaction();
+    auto maybe_transaction = fixture.database.on().transaction();
     if (!maybe_transaction) return failures + expect(maybe_transaction.has_value());
 
-    auto maybe_inside = maybe_transaction->find<strings_collection_t>(fixture_t::name_k);
+    auto maybe_inside = maybe_transaction->on().find<strings_collection_t>(fixture_t::name_k);
     if (!maybe_inside) return failures + expect(maybe_inside.has_value());
     constexpr ustore_key_t staged_k = key_from_integer(1);
     failures += expect(maybe_inside->assign("staged", staged_k).succeeded());
     failures += expect_missing(fixture.strings, "staged");
-    failures += expect(maybe_transaction->commit().has_value());
+    failures += expect(maybe_transaction->on().commit().has_value());
     failures += expect_value(fixture.strings, "staged", staged_k);
     return failures;
 }

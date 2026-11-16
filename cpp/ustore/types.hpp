@@ -2,19 +2,23 @@
  *  @file cpp/ustore/types.hpp
  *  @author Ash Vardanian
  *  @date July 4, 2022
- *  @brief Locations, arenas, stamps, receivers, executors and progress callables shared by every C++ wrapper, beside
- *      the identifiers, edges and value views it re-exports from <tt>ustore/utilities/types.hpp</tt>.
+ *  @brief Locations, arenas, stamps, receivers, executors and progress callables shared by every
+ *      C++ wrapper, beside the identifiers, edges and value views it re-exports from
+ *      <tt>ustore/utilities/types.hpp</tt>.
  */
 
 #pragma once
 
-#include <concepts>    // `std::same_as`
+#include <cstddef> // `std::size_t`
+
+#include <concepts>    // `std::same_as`, `std::convertible_to`
 #include <ranges>      // `std::ranges::contiguous_range`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::remove_cvref_t`, `std::is_scalar_v`, `std::invoke_result_t`, `std::conditional_t`
 #include <utility>     // `std::exchange`, `std::move`, `std::swap`
 
-#include "ustore/status.hpp"          // `expected`, `status_t`
+#include "ustore/status.hpp"          // `expected`, `status_t`, `outputs`, `answer`, `called_`
 #include "ustore/ustore.h"            // `ustore_arena_t`, `ustore_executor_t`, `ustore_progress_callback_t`
 #include "ustore/utilities/types.hpp" // `value_view_t`, `collection_key_t`, `edge_t`, `uuid_from_integer`
 
@@ -108,7 +112,8 @@ value_view_t value_view(container_type_&& container) noexcept {
 
 #pragma region Memory Management
 
-/** Owns an arena made where an executor computes, which the C ABI fills with results, freeing it on destruction. */
+/** Owns an arena made where an executor computes, which the C ABI fills with results, freeing it on
+ *  destruction. */
 class arena_t {
 
     ustore_arena_t arena_ = nullptr;
@@ -126,7 +131,8 @@ class arena_t {
         return *this;
     }
 
-    /** Makes an arena where @p executor computes, or on host pages for calls on the calling thread. */
+    /** Makes an arena where @p executor computes, or on host pages for calls on
+     *  the calling thread. */
     static expected<arena_t> make(ustore_executor_t executor = nullptr) noexcept {
         arena_t made;
         ustore_outcome_t outcome {};
@@ -149,28 +155,52 @@ class arena_t {
     operator ustore_arena_t() const noexcept { return arena_; }
 };
 
-/** A view of what one call wrote into an arena made for that call alone, which it frees on destruction, as shorthand
- *  with no place for an arena answers. It moves but never copies, and @c view slices off the plain view. */
+/** Whether @p view_type_ compares with @p other_type_ as a value, as a value view does with a
+ *  string. */
+template <typename view_type_, typename other_type_>
+concept compares_with_concept = requires(view_type_ const& view, other_type_ const& other) {
+    { view == other } -> std::convertible_to<bool>;
+};
+
+/** A view of what one call wrote into an arena made for that call alone, which it frees on
+ *  destruction, as shorthand with no place for an arena answers. It moves but never copies, and
+ *  reads as the view it holds. */
 template <typename view_type_>
-class owned : public view_type_ {
+class owned {
+    view_type_ view_ {};
     arena_t arena_;
 
   public:
     owned() noexcept = default;
-    owned(view_type_ const& view, arena_t arena) noexcept : view_type_(view), arena_(std::move(arena)) {}
+    owned(view_type_ const& view, arena_t arena) noexcept : view_(view), arena_(std::move(arena)) {}
 
-    view_type_ const& view() const noexcept { return *this; }
+    view_type_ const& view() const noexcept { return view_; }
+    operator view_type_ const&() const noexcept { return view_; }
+    view_type_ const* operator->() const noexcept { return &view_; }
+
+    explicit operator bool() const noexcept { return static_cast<bool>(view_); }
+    auto size() const noexcept { return view_.size(); }
+    auto begin() const noexcept { return view_.begin(); }
+    auto end() const noexcept { return view_.end(); }
+    decltype(auto) operator[](std::size_t index) const noexcept { return view_[index]; }
+
+    /** Compares the view with anything it compares with, as the view itself would. */
+    template <typename other_type_>
+        requires compares_with_concept<view_type_, other_type_>
+    bool operator==(other_type_ const& other) const noexcept {
+        return view_ == other;
+    }
 };
 
 using owned_value_t = owned<value_view_t>;
 
-/** What shorthand answers for a call answering @p answer_type_: a scalar copied out of its one-off arena, or a view
- *  owning that arena. */
+/** What shorthand answers for a call answering @p answer_type_: a scalar copied out of its one-off
+ *  arena, or a view owning that arena. */
 template <typename answer_type_>
 using one_off_answer_of = std::conditional_t<std::is_scalar_v<answer_type_>, answer_type_, owned<answer_type_>>;
 
-/** Runs @p verb on an arena made for it alone where @p executor computes, as shorthand with no place for an arena
- *  does, answering a scalar copied out of that arena or a view that owns it. */
+/** Runs @p verb on an arena made for it alone where @p executor computes, as shorthand with no
+ *  place for an arena does, answering a scalar copied out of that arena or a view that owns it. */
 template <typename verb_type_>
 auto in_one_off_arena(ustore_executor_t executor, verb_type_&& verb) noexcept {
     using answer_t = typename std::invoke_result_t<verb_type_&, arena_t&>::value_type;
@@ -193,8 +223,34 @@ enum class read_stamp_t : ustore_stamp_t {};
 /** A commit's position in commit order, visible to every snapshot reading at or above it. */
 enum class commit_stamp_t : ustore_stamp_t {};
 
-/** What every call made through one receiver names before its inputs: the database, the executor that runs it, and
- *  the transaction or snapshot its reads see and its writes go through. */
+/** Where a stage writes the stamp the transaction reads at. */
+template <>
+struct outputs<read_stamp_t> {
+
+    /** The stamp, as the C ABI spells it. */
+    ustore_stamp_t stamp = 0;
+
+    read_stamp_t answer() const noexcept { return read_stamp_t {stamp}; }
+};
+
+/** Where a commit writes its position in commit order. */
+template <>
+struct outputs<commit_stamp_t> {
+
+    /** The stamp, as the C ABI spells it. */
+    ustore_stamp_t stamp = 0;
+
+    commit_stamp_t answer() const noexcept { return commit_stamp_t {stamp}; }
+};
+
+/** What a collection handle may do with the collection it names: a snapshot's handles only read. */
+enum class collection_access_t : bool {
+    read_only_k = false,
+    read_write_k = true,
+};
+
+/** What every call made through one receiver names before its inputs: the database, the executor
+ *  that runs it, and the transaction or snapshot its reads see and its writes go through. */
 struct receiver_t {
 
     /** An open database. */
@@ -209,7 +265,8 @@ struct receiver_t {
     /** Snapshot the reads see when no transaction is named, or @c nullptr for the head. */
     ustore_snapshot_t snapshot = nullptr;
 
-    /** The view a read sees, which inside a transaction records the keys it reads unless @p watch says otherwise. */
+    /** The view a read sees, which inside a transaction records the keys it reads unless @p watch
+     *  says otherwise. */
     ustore_view_t view(ustore_watch_t watch) const noexcept {
         return transaction ? ustore_transaction_view(transaction, watch) : ustore_snapshot_view(snapshot);
     }
@@ -217,6 +274,41 @@ struct receiver_t {
     /** The same receiver, running its calls on @p runner. */
     receiver_t on(ustore_executor_t runner) const noexcept { return {database, runner, transaction, snapshot}; }
 };
+
+/** Drops what @p mode names of @p collection: its values, its pairs, or the collection with its
+ *  name, the one body every collection handle and every database receiver drops through. */
+template <ustore_completion_t completion_>
+answer<completion_, void> collection_drop_(receiver_t const& receiver, ustore_collection_id_t collection,
+                                           ustore_drop_mode_t mode) noexcept {
+    return called_<completion_, void>([&](ustore_outcome_t* outcome, outputs<void>*) noexcept {
+        ustore_collection_drop_t drop {};
+        drop.database = receiver.database;
+        drop.executor = receiver.executor;
+        drop.outcome = outcome;
+        drop.completion = completion_;
+        drop.collection = collection;
+        drop.mode = mode;
+        ustore_collection_drop(&drop);
+    });
+}
+
+/** Where @p key lives inside @p collection. */
+inline collection_key_field_t location_in(ustore_collection_id_t collection, ustore_key_t key) noexcept {
+    return {collection, key};
+}
+
+/** Where @p located lives once moved into @p collection, which wins over its own, keeping the field
+ *  it names. */
+template <has_field_concept location_type_>
+collection_key_field_t location_in(ustore_collection_id_t collection, location_type_ const& located) noexcept {
+    return {collection, located.key, located.field};
+}
+
+/** Where @p located lives once moved into @p collection, which wins over its own. */
+template <typename location_type_>
+collection_key_field_t location_in(ustore_collection_id_t collection, location_type_ const& located) noexcept {
+    return {collection, located.key};
+}
 
 /** Owns an executor, the threads or I/O rings that run calls on any number of databases, one at a
  *  time. It frees the executor once no call holds it, never copies, and outlives every call. */
@@ -265,6 +357,26 @@ class executor_handle_t {
         return make_(ustore_executor_for_nvme, options);
     }
 
+    /**
+     *  @brief Lists the GPUs this process can drive into @p devices, NVIDIA first, then AMD, then
+     *      Apple, so the position of a device is the ordinal @c for_vram names it by, answering how
+     *      many there are, which may exceed what @p devices holds.
+     *
+     *  A machine without GPUs lists none and answers zero. @c ustore_gpu_vendor_name and
+     *  @c ustore_gpu_class_name spell the vendor and the class of every device.
+     */
+    static expected<std::size_t> gpu_devices(std::span<ustore_gpu_device_t> devices = {}) noexcept {
+        ustore_size_t count = 0;
+        ustore_outcome_t outcome {};
+        ustore_gpu_devices_t arguments {.outcome = &outcome,
+                                        .devices = devices.data(),
+                                        .devices_capacity = devices.size(),
+                                        .devices_count = &count};
+        ustore_gpu_devices(&arguments);
+        if (status_t const status {outcome}; status.failed()) return status;
+        return static_cast<std::size_t>(count);
+    }
+
     /** Opens one submission stream on the NVIDIA or AMD device @p options name by its UStore
      *  ordinal, fed by the calling thread; an NVMe database compacts on it on an NVIDIA device. */
     static expected<executor_handle_t> for_vram(ustore_executor_for_vram_t options = {}) noexcept {
@@ -280,15 +392,15 @@ class executor_handle_t {
     }
 };
 
-/** Whether @p progress_type_ can watch a long call: given the units finished and the units in total, it answers
- *  whether the call carries on, and never throws. */
+/** Whether @p progress_type_ can watch a long call: given the units finished and the units in
+ *  total, it answers whether the call carries on, and never throws. */
 template <typename progress_type_>
 concept progress_concept = requires(progress_type_& progress, ustore_size_t finished, ustore_size_t total) {
     { progress(finished, total) } noexcept -> std::same_as<ustore_continuation_t>;
 };
 
-/** A callable lent to a long call as the C ABI receives it, a callback and the state it reads, or neither for a call
- *  nothing watches. The call borrows the callable until it is final. */
+/** A callable lent to a long call as the C ABI receives it, a callback and the state it reads, or
+ *  neither for a call nothing watches. The call borrows the callable until it is final. */
 class progress_arg_t {
 
     template <progress_concept progress_type_>

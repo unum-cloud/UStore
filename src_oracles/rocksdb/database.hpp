@@ -18,7 +18,6 @@
 #include <iterator>     // `std::back_inserter`
 #include <memory>       // `std::unique_ptr`
 #include <mutex>        // `std::lock_guard`, `std::mutex`
-#include <numeric>      // `std::accumulate`
 #include <shared_mutex> // `std::shared_lock`, `std::shared_mutex`
 #include <new>          // `std::nothrow`
 #include <span>         // `std::span`
@@ -1097,31 +1096,162 @@ ustore_size_t column_bytes(database_t& database, column_t* column) {
     return memory_bytes + disk_bytes;
 }
 
-/** Flushes every memtable and compacts every column family, the main and the system ones included, reporting the bytes
- *  each column family held before. */
-status_t database_compact(ustore_database_compact_t const& arguments, view_t const&) {
-    database_t& database = *state_of<database_t>(arguments.database);
-    ::rocksdb::FlushOptions const flush_options;
-    ::rocksdb::CompactRangeOptions const compact_options;
-    std::shared_lock lock {database.columns_mutex};
-    st::vector<column_t*> families;
-    if (status_t const status = gather_families(database, database.columns, families); status.failed()) return status;
-    st::vector<ustore_size_t> bytes;
-    if (st::failed(bytes.resize(families.size())))
-        return {status_code_t::out_of_memory_k, "Failed to measure the families"};
-    for (std::size_t index = 0; index != families.size(); ++index)
-        bytes[index] = column_bytes(database, families[index]);
-    progress_t progress {arguments.progress, arguments.progress_state,
-                         std::accumulate(bytes.begin(), bytes.end(), ustore_size_t {0})};
-    for (std::size_t index = 0; index != families.size(); ++index) {
-        native_status_t const flushed = database.native->Flush(flush_options, families[index]);
-        if (!flushed.ok()) return status_of(flushed);
-        native_status_t const compacted = database.native->CompactRange(compact_options, families[index], nullptr,
-                                                                        nullptr);
-        if (!compacted.ok()) return status_of(compacted);
-        if (!progress.advance(bytes[index])) return progress_cancelled_k;
+/** The ID a compaction's unit gives the column family of the collections system collection, all
+ *  bytes <tt>0xFF</tt>, which no minted UUIDv7 reaches, as its byte 6 is <tt>0x7X</tt>. */
+constexpr ustore_collection_id_t collections_collection_k {
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
+
+/** The ID a compaction's unit gives the column family of the names system collection, all bytes
+ *  <tt>0xFF</tt> but the last <tt>0xFE</tt>, which no minted UUIDv7 reaches either. */
+constexpr ustore_collection_id_t names_collection_k {
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}}};
+
+/** The column family the unit naming @p collection compacts: a system one by its reserved ID, or
+ *  the one a caller created, null once dropped. The caller holds @c columns_mutex. */
+column_t* compacted_column_of(database_t& database, ustore_collection_id_t const& collection) noexcept {
+    if (collection == names_collection_k) return database.names;
+    if (collection == collections_collection_k) return database.collections;
+    return column_of(database, collection);
+}
+
+/** The bytes RocksDB estimates @p column holds in its memtables, which a flush writes out. */
+ustore_size_t memtable_bytes(database_t& database, column_t* column) {
+    std::uint64_t memory_bytes = 0;
+    database.native->GetIntProperty(column, ::rocksdb::DB::Properties::kCurSizeAllMemTables, &memory_bytes);
+    return memory_bytes;
+}
+
+/**
+ *  @brief One compaction of a RocksDB database in flight: a flush of every column family the open
+ *      listed, the system ones first, then a merge compacting each family's whole key range, one
+ *      task per family in each phase.
+ *
+ *  The tasks of a phase name distinct families, so any number of threads may @ref run them at
+ *  once, RocksDB running one exclusive manual compaction at a time on its own, and each skips a
+ *  family dropped since the open, so a task run again changes nothing. A phase's units are its
+ *  families' bytes, at least one each, as RocksDB estimates them when the phase is listed: a
+ *  flush's memtables at the open, and a merge's memtables and table files at the flush's barrier.
+ *  The open reserves the families, so neither @ref run, @ref advance nor @ref finish allocates.
+ */
+struct compact_plan_t {
+
+    /** The family a task flushes or compacts, by its collection's ID or a system one's own. */
+    struct task_t {
+        ustore_collection_id_t collection {};
+    };
+
+    /** The database the plan compacts, which outlives the plan. */
+    database_t* database = nullptr;
+
+    /** The families the open listed, the system ones first, one task each per phase. */
+    st::vector<ustore_collection_id_t> families;
+
+    compact_plan_t() noexcept = default;
+    compact_plan_t(compact_plan_t const&) = delete;
+    compact_plan_t& operator=(compact_plan_t const&) = delete;
+
+    /** Task @p position of the current phase, an empty one past the end. */
+    task_t operator[](std::size_t position) const noexcept {
+        if (phase_ == phase_t::done_k || position >= families.size()) return {};
+        return {families[position]};
     }
-    return {};
+
+    /** The current phase's tasks, positionally; none once the plan is over. */
+    indexed_range<compact_plan_t> tasks() const noexcept {
+        return {this, phase_ == phase_t::done_k ? 0u : families.size()};
+    }
+
+    /** Runs @p task of the current phase on the calling thread, safe for distinct tasks at once. */
+    status_t run(task_t const& task, view_t const&) noexcept { return guarded<&compact_plan_t::run_>(*this, task); }
+
+    /** The barrier between phases, one caller after every task of the current one ran: measures the
+     *  merge's families once the flush ran, and answers whether another phase follows. */
+    bool advance() noexcept {
+        if (failed_.failed()) return false;
+        if (phase_ != phase_t::flush_k) return phase_ = phase_t::done_k, false;
+        phase_ = phase_t::merge_k;
+        failed_ = guarded<&compact_plan_t::list_>(*this);
+        return failed_.succeeded();
+    }
+
+    /** Skips what is left of the plan, keeping what its phases compacted. */
+    void stop() noexcept { phase_ = phase_t::done_k; }
+
+    /** The first failure the plan met measuring its families, which ended it; success otherwise. */
+    status_t status() const noexcept { return failed_; }
+
+    phase_t phase() const noexcept { return phase_; }
+
+    /** The position of the phase in hand, the flush first, and the count of phases once done. */
+    std::size_t ordinal() const noexcept {
+        return static_cast<std::size_t>(phase_) - static_cast<std::size_t>(phase_t::flush_k);
+    }
+
+    /** Units of the phase in hand done at its barrier: all, as each phase runs to its end. */
+    std::size_t completed() const noexcept { return total(); }
+
+    /** Units of the phase in hand: its families' bytes as listed, or none once the plan is over. */
+    std::size_t total() const noexcept { return phase_ == phase_t::done_k ? 0 : listed_bytes_; }
+
+    /** Stops the plan where it stands, keeping what its phases compacted. */
+    status_t finish() noexcept {
+        stop();
+        return status();
+    }
+
+  private:
+    friend expected<void*> database_compact_plan_open(ustore_database_compact_t const&, view_t const&) noexcept;
+
+    phase_t phase_ = phase_t::flush_k;
+    status_t failed_;
+
+    /** The bytes of the phase in hand's families, as its listing measured them. */
+    std::size_t listed_bytes_ = 0;
+
+    /** Lists the phase in hand: the flush, at the open, names every family and weighs its
+     *  memtables, and the merge weighs each family's memtables and table files. */
+    static status_t list_(compact_plan_t& plan) {
+        database_t& database = *plan.database;
+        std::shared_lock lock {database.columns_mutex};
+        if (plan.phase_ == phase_t::flush_k) {
+            if (st::failed(plan.families.reserve(database.columns.size() + 2)))
+                return {status_code_t::out_of_memory_k, "Failed to list the compaction's families"};
+            for (ustore_collection_id_t const& system : {names_collection_k, collections_collection_k}) [[maybe_unused]]
+                auto const listed = plan.families.push_back(st::assume_reserved, ustore_collection_id_t {system});
+            for (auto const& [id, family] : database.columns) [[maybe_unused]]
+                auto const listed = plan.families.push_back(st::assume_reserved, ustore_collection_id_t {id});
+        }
+        plan.listed_bytes_ = 0;
+        for (ustore_collection_id_t const& collection : plan.families) {
+            column_t* const column = compacted_column_of(database, collection);
+            if (!column) continue;
+            ustore_size_t const bytes = plan.phase_ == phase_t::flush_k ? memtable_bytes(database, column)
+                                                                        : column_bytes(database, column);
+            plan.listed_bytes_ += bytes ? bytes : 1;
+        }
+        return {};
+    }
+
+    /** Flushes or compacts the family @p task names, skipping one dropped since the open. */
+    static status_t run_(compact_plan_t& plan, task_t const& task) {
+        database_t& database = *plan.database;
+        std::shared_lock lock {database.columns_mutex};
+        column_t* const column = compacted_column_of(database, task.collection);
+        if (!column) return {};
+        if (plan.phase_ == phase_t::flush_k)
+            return status_of(database.native->Flush(::rocksdb::FlushOptions {}, column));
+        return status_of(database.native->CompactRange(::rocksdb::CompactRangeOptions {}, column, nullptr, nullptr));
+    }
+};
+
+/** Opens the plan of @c ustore_database_compact, listing every column family and weighing its
+ *  memtables. */
+expected<void*> database_compact_plan_open(ustore_database_compact_t const& arguments, view_t const&) noexcept {
+    std::unique_ptr<compact_plan_t> plan {new (std::nothrow) compact_plan_t {}};
+    if (!plan) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the plan"};
+    plan->database = state_of<database_t>(arguments.database);
+    if (status_t const listed = guarded<&compact_plan_t::list_>(*plan); listed.failed()) return listed;
+    return static_cast<void*>(plan.release());
 }
 
 /** Syncs the write-ahead log, which every commit since the last memtable flush sits in. */

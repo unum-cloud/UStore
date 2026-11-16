@@ -2,8 +2,9 @@
  *  @file cpp/ustore/ranges.hpp
  *  @author Ash Vardanian
  *  @date July 4, 2022
- *  @brief Strided iterators, spans and tapes that view the batched arguments and results of the C ABI, the
- *      adapters that turn C++ locations and values into them, and the owned batches deferred calls take.
+ *  @brief Strided iterators, spans and tapes that view the batched arguments and results of the
+ *      C ABI, the adapters that turn C++ locations and values into them, and where a call
+ *      writes each result.
  *
  *  A strided layout advances by a byte stride instead of @c sizeof, so a zero stride repeats one
  *  value. A tape indexes variable-length values by a base pointer and N+1 gapless offsets of 32 or
@@ -27,7 +28,7 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::remove_cvref_t`, `std::conditional_t`, `std::remove_reference_t`
-#include <utility>     // `std::move`
+#include <utility>     // `std::move`, `std::declval`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <stringzilla/stringzilla.hpp> // `sz::strings_t`, `sz::strings_view_t`, `sz::indexed_container_iterator`
@@ -38,7 +39,8 @@ namespace unum::ustore {
 
 #pragma region Batches
 
-/** A batch of locations or values rather than a single one, recognized by its nested @c value_type. */
+/** A batch of locations or values rather than a single one, recognized by its
+ *  nested @c value_type. */
 template <typename batch_type_>
 concept batch_concept = requires { typename std::remove_cvref_t<batch_type_>::value_type; };
 
@@ -62,14 +64,8 @@ struct batch_element<batch_type_> {
 template <typename batch_type_>
 using batch_element_of = typename batch_element<batch_type_>::type;
 
-/** Elements a deferred call can own, moved into it whole: a vector of them, or a fixed array, which spans exactly the
- *  bytes of its elements. */
-template <typename array_type_, typename element_type_>
-concept owned_array_concept =
-    std::same_as<array_type_, st::vector<element_type_>> ||
-    std::same_as<array_type_, std::array<element_type_, sizeof(array_type_) / sizeof(element_type_)>>;
-
-/** Values, strings or fields a deferred call owns and passes to the C ABI as a tape. */
+/** Values, strings or fields owned in one block behind their offsets, which the C ABI reads as a
+ *  tape. */
 using values_tape_t = sz::strings_t;
 
 #pragma endregion Batches
@@ -144,7 +140,8 @@ class strided_iterator {
         return *this;
     }
 
-    /** The number of strides between two iterators, meaningful only for a stride that is a multiple of the element. */
+    /** The number of strides between two iterators, meaningful only for a stride that is a multiple
+     *  of the element. */
     std::ptrdiff_t operator-(strided_iterator other) const noexcept {
         if (!stride_) return 0;
         return (pointer_ - other.pointer_) * static_cast<std::ptrdiff_t>(sizeof(element_type_)) / signed_stride();
@@ -241,8 +238,16 @@ class bits_view_t {
     bool operator==(bits_view_t const& other) const noexcept { return begin_ == other.begin_; }
 };
 
-/** A counted run of strided elements, writable unless @p element_type_ is @c const, like
- *  @c std::span. */
+/** Whether @p container_type_ lays out elements a pointer to @p element_type_ addresses, back to
+ *  back. */
+template <typename container_type_, typename element_type_>
+concept contiguous_of_concept =
+    std::ranges::contiguous_range<container_type_> && std::ranges::sized_range<container_type_> &&
+    std::same_as<std::ranges::range_value_t<container_type_>, std::remove_cv_t<element_type_>> &&
+    std::convertible_to<decltype(std::ranges::data(std::declval<container_type_&>())), element_type_*>;
+
+/** A counted run of strided elements, writable unless @p element_type_ is @c const,
+ *  like @c std::span. */
 template <typename element_type_>
 class strided_span {
   public:
@@ -258,6 +263,13 @@ class strided_span {
   public:
     strided_span() = default;
     strided_span(iterator_t begin, ustore_size_t count) noexcept : begin_(begin), count_(count) {}
+
+    /** Views a contiguous container of the same elements, stepping by their size, as @c std::span
+     *  does. */
+    template <typename container_type_>
+        requires contiguous_of_concept<container_type_, element_type_>
+    strided_span(container_type_&& container) noexcept
+        : begin_(std::ranges::data(container), sizeof(element_type_)), count_(std::ranges::size(container)) {}
 
     element_type_* data() const noexcept { return begin_.get(); }
     iterator_t begin() const noexcept { return begin_; }
@@ -284,7 +296,8 @@ class strided_span {
         return strided_span<member_t> {member_begin, count_};
     }
 
-    /** Whether every element equals the first one, which a null or repeating span satisfies trivially. */
+    /** Whether every element equals the first one, which a null or repeating span satisfies
+     *  trivially. */
     bool same_elements() const noexcept {
         if (!begin_ || begin_.repeats()) return true;
         for (std::ptrdiff_t index = 1; index < static_cast<std::ptrdiff_t>(count_); ++index)
@@ -308,8 +321,8 @@ strided_span<element_type_> strided(element_type_* begin, element_type_* end) no
     return {{begin, sizeof(element_type_)}, static_cast<std::size_t>(end - begin)};
 }
 
-/** Iterates the strided run @p view of the C ABI describes, such as a @c ustore_keys_view_t, null when it has no
- *  data. */
+/** Iterates the strided run @p view of the C ABI describes, such as a @c ustore_keys_view_t, null
+ *  when it has no data. */
 template <typename view_type_>
     requires requires(view_type_ view) {
         { *view.data };
@@ -382,21 +395,20 @@ struct place_batch_t {
     ustore_keys_view_t keys() const noexcept { return {keys_begin.get(), keys_begin.stride()}; }
 };
 
-/** Edges as three strided columns of sources, targets and edge identifiers, which the offsets of the read that
- *  exported them split by vertex. */
+/** Edges as three strided columns of sources, targets and edge identifiers, which the offsets of
+ *  the read that exported them split by vertex. */
 template <typename id_type_>
 struct edges_span {
 
     using id_t = id_type_;
     using tuple_t = std::conditional_t<std::is_const_v<id_type_>, edge_t const, edge_t>;
-    static_assert(sizeof(tuple_t) == 3 * sizeof(id_type_));
 
     strided_span<id_type_> sources;
     strided_span<id_type_> targets;
     strided_span<id_type_> ids;
 
-    /** One offset per vertex of the read plus one, counted in edges, where a missing vertex spans none; empty for edges
-     *  no read exported. */
+    /** One offset per vertex of the read plus one, counted in edges, where a missing vertex spans
+     *  none; empty for edges no read exported. */
     std::span<ustore_length_t const> offsets;
 
     edges_span() = default;
@@ -419,6 +431,12 @@ struct edges_span {
         targets = tuples.members(&edge_t::target);
         ids = tuples.members(&edge_t::id);
     }
+
+    /** Views a contiguous container of edges as strided edge columns. */
+    template <typename tuples_type_>
+        requires contiguous_of_concept<tuples_type_, tuple_t>
+    edges_span(tuples_type_&& tuples) noexcept
+        : edges_span(std::ranges::data(tuples), std::ranges::data(tuples) + std::ranges::size(tuples)) {}
 
     std::size_t size() const noexcept { return fu::min_of(sources.count(), targets.count()); }
 
@@ -446,7 +464,8 @@ struct edges_span {
 
 using edges_view_t = edges_span<ustore_key_t const>;
 
-/** The edges a read of @p count vertices exported into its arena, split by vertex through its @p offsets. */
+/** The edges a read of @p count vertices exported into its arena, split by vertex through its @p
+ *  offsets. */
 inline edges_view_t exported_edges(ustore_key_t const* edges, ustore_length_t const* offsets,
                                    std::size_t count) noexcept {
     if (!offsets) return {};
@@ -488,9 +507,20 @@ class location_store {
 
 /** Widens a single key into a full location stored by value. */
 template <key_location_concept location_type_>
-class location_store<location_type_> : public location_store<collection_key_field_t> {
+class location_store<location_type_> {
   public:
-    using location_store<collection_key_field_t>::location_store;
+    using plain_t = collection_key_field_t;
+    using store_t = collection_key_field_t;
+
+  private:
+    store_t store_ {};
+
+  public:
+    location_store() = default;
+    location_store(plain_t location) noexcept : store_(std::move(location)) {}
+
+    plain_t& ref() noexcept { return store_; }
+    plain_t const& ref() const noexcept { return store_; }
 };
 
 /** Stores a caller-owned location by pointer, so a batch is never copied. */
@@ -523,7 +553,8 @@ struct locations_in_collection {
     ustore_collection_id_t collection;
 };
 
-/** Resolves a location or a batch of locations into the strided keys, collections and fields of the C ABI. */
+/** Resolves a location or a batch of locations into the strided keys, collections and fields of the
+ *  C ABI. */
 template <typename locations_type_>
 struct places_arg_extractor {
 
@@ -552,10 +583,25 @@ struct places_arg_extractor {
     }
 
   private:
-    static strided_iterator<element_t const> elements(location_t const& locations) noexcept {
-        if constexpr (is_one_k) return {&locations, 0};
-        else if constexpr (strided_batch_concept<location_t>) return {std::data(locations), locations.stride()};
-        else return {std::data(locations), sizeof(element_t)};
+    /** A single location repeats itself. */
+    static strided_iterator<element_t const> elements(location_t const& locations) noexcept
+        requires is_one_k
+    {
+        return {&locations, 0};
+    }
+
+    /** A batch that carries its stride steps by it. */
+    static strided_iterator<element_t const> elements(location_t const& locations) noexcept
+        requires(!is_one_k && strided_batch_concept<location_t>)
+    {
+        return {std::data(locations), locations.stride()};
+    }
+
+    /** Any other batch steps by the size of its elements. */
+    static strided_iterator<element_t const> elements(location_t const& locations) noexcept
+        requires(!is_one_k && !strided_batch_concept<location_t>)
+    {
+        return {std::data(locations), sizeof(element_t)};
     }
 };
 
@@ -596,34 +642,63 @@ struct places_arg_extractor<locations_in_collection<locations_type_>> {
     }
 };
 
+/** The places of the C ABI that @p locations resolve into, viewing them where they lie. */
 template <typename locations_type_>
-struct places_arg_extractor<locations_type_&> : public places_arg_extractor<locations_type_> {};
+place_batch_t locations_places_(locations_type_ const& locations) noexcept {
+    places_arg_extractor<locations_type_> extractor;
+    place_batch_t places;
+    places.collections_begin = extractor.collections(locations);
+    places.keys_begin = extractor.keys(locations);
+    places.fields_begin = extractor.fields(locations);
+    places.count = extractor.count(locations);
+    return places;
+}
+
+/** The places of @p keys inside the one @p collection, which outlives every call given them. */
+inline place_batch_t places_in(ustore_collection_id_t const& collection, keys_view_t keys) noexcept {
+    place_batch_t places;
+    places.collections_begin = {&collection, 0};
+    places.keys_begin = keys.begin();
+    places.count = keys.size();
+    return places;
+}
 
 #pragma endregion Location Adapters
 
 #pragma region Strings
 
-/** An element a batch of strings may hold: a value view, a null-terminated string, or anything that converts into a
- *  string view. */
+/** An element a batch of strings may hold: a value view, a null-terminated string, or anything that
+ *  converts into a string view. */
 template <typename element_type_>
 concept string_like_concept = std::same_as<element_type_, value_view_t> ||
                               std::is_convertible_v<element_type_ const&, std::string_view>;
 
-/** The bytes @p text spells as an element of a batch, where a missing value and a null string spell empty ones. */
+/** Whether @p text_type_ is a null-terminated string, which may be null. */
+template <typename text_type_>
+concept c_string_concept = std::is_convertible_v<text_type_ const&, char const*>;
+
+/** The bytes @p text spells as an element of a batch, where a missing value spells an empty one. */
+inline ustore_bytes_view_t bytes_of(value_view_t const& text) noexcept { return text.bytes(); }
+
+/** The bytes @p text spells as an element of a batch, where a null string spells an empty one. */
+template <string_like_concept text_type_>
+    requires c_string_concept<text_type_>
+ustore_bytes_view_t bytes_of(text_type_ const& text) noexcept {
+    char const* const string = text;
+    return string ? bytes_of(std::string_view {string}) : ustore_bytes_view_t {};
+}
+
+/** The bytes @p text spells as an element of a batch, through the string view it converts into. */
 template <string_like_concept text_type_>
 ustore_bytes_view_t bytes_of(text_type_ const& text) noexcept {
-    if constexpr (std::same_as<text_type_, value_view_t>) return text.bytes();
-    else if constexpr (std::is_convertible_v<text_type_ const&, char const*>) {
-        char const* const string = text;
-        return string ? bytes_of(std::string_view {string}) : ustore_bytes_view_t {};
-    }
-    else return bytes_of(std::string_view {text});
+    return bytes_of(std::string_view {text});
 }
 
 using utilities::u32_tape;
 using utilities::u64_tape;
 
-/** The tape @p strings pass to the C ABI as, or a zeroed view, the input's default, when they hold none. */
+/** The tape @p strings pass to the C ABI as, or a zeroed view, the input's default, when they hold
+ *  none. */
 inline ustore_strings_view_t tape_of(values_tape_t const& strings) noexcept {
     sz_strings_span_t const& span = strings.raw;
     if (!span.count) return {};
@@ -650,7 +725,8 @@ inline ustore_bytes_view_t tape_string(ustore_strings_view_t const& tape, std::s
     return {tape.data.u32_tape.data + offsets[index], offsets[index + 1] - offsets[index]};
 }
 
-/** The strings of an output @p tape from @p first on, viewing the same bytes, as a slice keeps its parent's offsets. */
+/** The strings of an output @p tape from @p first on, viewing the same bytes, as a slice keeps its
+ *  parent's offsets. */
 inline ustore_strings_view_t tape_slice(ustore_strings_view_t tape, std::size_t first) noexcept {
     if (tape.layout == ustore_strings_u64_tape_k) {
         if (tape.data.u64_tape.offsets) tape.data.u64_tape.offsets += first;
@@ -660,10 +736,12 @@ inline ustore_strings_view_t tape_slice(ustore_strings_view_t tape, std::size_t 
 }
 
 /**
- *  @brief Lends a strided run of string-like elements to the C ABI through a @c ustore_strings_view_t accessor, where
- *      a zero stride repeats the first element for every task.
+ *  @brief Lends a strided run of string-like elements to the C ABI through a
+ *      @c ustore_strings_view_t accessor, where a zero stride repeats the first element
+ *      for every task.
  *
- *  The view it hands out points at the object itself, so the object outlives every call given the view.
+ *  The view it hands out points at the object itself, so the object outlives every call
+ *  given the view.
  */
 template <string_like_concept element_type_>
 class strided_strings {
@@ -690,12 +768,86 @@ class strided_strings {
     }
 };
 
+/** Answers the string at every index of a contiguous run of @p element_type_ that
+ *  @p handle starts. */
+template <string_like_concept element_type_>
+void contiguous_strings_get_(void const* handle, ustore_size_t const* indices, ustore_size_t count,
+                             ustore_bytes_view_t* views) noexcept {
+    element_type_ const* const elements = static_cast<element_type_ const*>(handle);
+    for (ustore_size_t index = 0; index != count; ++index) views[index] = bytes_of(elements[indices[index]]);
+}
+
+/** Answers the first string of a contiguous run of @p element_type_ that @p handle starts, for
+ *  every index. */
+template <string_like_concept element_type_>
+void repeated_strings_get_(void const* handle, ustore_size_t const*, ustore_size_t count,
+                           ustore_bytes_view_t* views) noexcept {
+    element_type_ const& element = *static_cast<element_type_ const*>(handle);
+    for (ustore_size_t index = 0; index != count; ++index) views[index] = bytes_of(element);
+}
+
+/** Answers the first string of the tape @p handle points to, for every index. */
+inline void repeated_tape_get_(void const* handle, ustore_size_t const*, ustore_size_t count,
+                               ustore_bytes_view_t* views) noexcept {
+    ustore_bytes_view_t const first = tape_string(tape_of(*static_cast<values_tape_t const*>(handle)), 0);
+    for (ustore_size_t index = 0; index != count; ++index) views[index] = first;
+}
+
+/** Whether @p strings_type_ lays out string-like elements back to back. */
+template <typename strings_type_>
+concept contiguous_strings_concept = std::ranges::contiguous_range<strings_type_> &&
+                                     std::ranges::sized_range<strings_type_> &&
+                                     string_like_concept<std::ranges::range_value_t<strings_type_>>;
+
+/** The tape a batch of values already is, read where it lies. */
+inline ustore_strings_view_t strings_view_of(values_tape_t const& strings) noexcept { return tape_of(strings); }
+
+/** An accessor whose handle is the first element of @p strings itself, so the view needs no object
+ *  of its own and stays valid while @p strings does. */
+template <contiguous_strings_concept strings_type_>
+ustore_strings_view_t strings_view_of(strings_type_ const& strings) noexcept {
+    using element_t = std::ranges::range_value_t<strings_type_>;
+    ustore_strings_view_t view {};
+    if (std::ranges::empty(strings)) return view;
+    view.layout = ustore_strings_accessor_k;
+    view.data.accessor = {&contiguous_strings_get_<element_t>, std::ranges::data(strings)};
+    return view;
+}
+
+/** The first string of a tape, repeated for every task, through an accessor whose handle is the
+ *  tape. */
+inline ustore_strings_view_t repeated_view_of(values_tape_t const& strings) noexcept {
+    ustore_strings_view_t view {};
+    view.layout = ustore_strings_accessor_k;
+    view.data.accessor = {&repeated_tape_get_, &strings};
+    return view;
+}
+
+/** The first string of a contiguous batch, repeated for every task, through an accessor whose
+ *  handle is it. */
+template <contiguous_strings_concept strings_type_>
+ustore_strings_view_t repeated_view_of(strings_type_ const& strings) noexcept {
+    using element_t = std::ranges::range_value_t<strings_type_>;
+    ustore_strings_view_t view {};
+    view.layout = ustore_strings_accessor_k;
+    view.data.accessor = {&repeated_strings_get_<element_t>, std::ranges::data(strings)};
+    return view;
+}
+
+/** A batch of strings a verb reads where it lies, so a deferred call borrows it: a tape, or values
+ *  laid out back to back. */
+template <typename strings_type_>
+concept strings_batch_concept = requires(strings_type_ const& strings) {
+    { strings_view_of(strings) } -> std::same_as<ustore_strings_view_t>;
+    { std::size(strings) } -> std::convertible_to<std::size_t>;
+};
+
 #pragma endregion Strings
 
 #pragma region Read Results
 
-/** The lengths a read exports into an arena beside its presence bits, where an absent value reads as
- *  @c missing_length_k, and a read that left its presences out reports every value present. */
+/** The lengths a read exports into an arena beside its presence bits, where an absent value reads
+ *  as @c missing_length_k, and a read that left its presences out reports every value present. */
 class lengths_view_t {
     ustore_size_t count_ {0};
     ustore_octet_t const* presences_ {nullptr};
@@ -723,8 +875,8 @@ class lengths_view_t {
     ustore_length_t const* lengths() const noexcept { return lengths_; }
 };
 
-/** The values a read exports into an arena as Apache Arrow does: presence bits and the tape of values, of either
- *  offset width, where an absent value reads as a missing view. */
+/** The values a read exports into an arena as Apache Arrow does: presence bits and the tape of
+ *  values, of either offset width, where an absent value reads as a missing view. */
 class values_view_t {
     ustore_octet_t const* presences_ {nullptr};
     sz::strings_view_t strings_ {strings_of({}, 0)};
@@ -749,7 +901,8 @@ class values_view_t {
 
     bits_view_t presences() const noexcept { return {presences_}; }
 
-    /** The tape the values live in, where a missing value is an empty one, which a write takes back as it is. */
+    /** The tape the values live in, where a missing value is an empty one, which a write takes back
+     *  as it is. */
     ustore_strings_view_t tape() const noexcept {
         sz_strings_view_t const& view = strings_.raw;
         if (view.layout == sz_strings_u64_tape_k) return u64_tape(view.data.u64_tape.data, view.data.u64_tape.offsets);
@@ -757,12 +910,111 @@ class values_view_t {
     }
 };
 
+/** The tape a read exported, written back as it arrived. */
+inline ustore_strings_view_t strings_view_of(values_view_t const& strings) noexcept { return strings.tape(); }
+
+/** Where a read writes the presence bits it answers. */
+template <>
+struct outputs<bits_view_t> {
+
+    /** Keys read, which the bits span. */
+    ustore_size_t count = 0;
+
+    /** Output for one bit per key, inside the arena. */
+    ustore_octet_t const* presences = nullptr;
+
+    bits_view_t answer() const noexcept { return bits_view_t {presences}; }
+};
+
+/** Where a read writes the lengths it answers beside their presence bits. */
+template <>
+struct outputs<lengths_view_t> {
+
+    /** Keys read, the length of every output. */
+    ustore_size_t count = 0;
+
+    /** Output for one bit per key, inside the arena. */
+    ustore_octet_t const* presences = nullptr;
+
+    /** Output for one length per key, inside the arena. */
+    ustore_length_t const* lengths = nullptr;
+
+    lengths_view_t answer() const noexcept { return {count, presences, lengths}; }
+};
+
+/** Where a read writes the values it answers beside their presence bits. */
+template <>
+struct outputs<values_view_t> {
+
+    /** Keys read, the length of every output. */
+    ustore_size_t count = 0;
+
+    /** Output for one bit per key, inside the arena. */
+    ustore_octet_t const* presences = nullptr;
+
+    /** Output for the tape of values, inside the arena. */
+    ustore_strings_view_t values {};
+
+    values_view_t answer() const noexcept { return {count, presences, values}; }
+};
+
+/** The answer for a batch as @p answer_type_ asks, which is either the batch or its only element,
+ *  as a proxy over one location answers. */
+template <typename answer_type_, typename batch_type_>
+expected<answer_type_> first_or_all_(expected<batch_type_> found) noexcept {
+    if (found.failed()) return found.status();
+    if constexpr (std::same_as<answer_type_, batch_type_>) return found;
+    else return (*found)[0];
+}
+
+/** Where a read of a batch asks for lengths: nowhere, unless it answers them. */
+template <typename answer_type_>
+ustore_length_t const** lengths_output_(outputs<answer_type_>&) noexcept {
+    return nullptr;
+}
+
+inline ustore_length_t const** lengths_output_(outputs<lengths_view_t>& written) noexcept { return &written.lengths; }
+
+/** Where a read of a batch asks for values: nowhere, unless it answers them. */
+template <typename answer_type_>
+ustore_strings_view_t* values_output_(outputs<answer_type_>&) noexcept {
+    return nullptr;
+}
+
+inline ustore_strings_view_t* values_output_(outputs<values_view_t>& written) noexcept { return &written.values; }
+
+/** Where a read writes the key of every string it was asked for. */
+template <>
+struct outputs<keys_view_t> {
+
+    /** Strings read, the length of the output. */
+    ustore_size_t count = 0;
+
+    /** Output for one key per string, inside the arena. */
+    ustore_key_t const* keys = nullptr;
+
+    keys_view_t answer() const noexcept { return {{keys, sizeof(ustore_key_t)}, keys ? count : 0}; }
+};
+
+/** Where a call writes a tape of strings and how many it holds. */
+template <>
+struct outputs<sz::strings_view_t> {
+
+    /** Output for the number of strings. */
+    ustore_size_t written = 0;
+
+    /** Output for the tape of strings, inside the arena. */
+    ustore_strings_view_t strings {};
+
+    sz::strings_view_t answer() const noexcept { return strings_of(strings, written); }
+};
+
 #pragma endregion Read Results
 
 #pragma region Value Adapters
 
-/** Resolves values into the @c ustore_strings_view_t of the C ABI, specialized per decayed value type, keeping what
- *  an accessor reads for as long as the extractor lives. */
+/** Resolves values into the @c ustore_strings_view_t of the C ABI, specialized per decayed value
+ *  type, keeping what an accessor reads for as long as the extractor lives. */
 template <typename values_type_>
 struct values_arg_extractor {};
 

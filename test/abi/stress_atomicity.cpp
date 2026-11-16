@@ -36,7 +36,7 @@ using namespace unum;
 struct atomicity_options_t {
 
     /** Wall-clock bound of the whole run, shared evenly by every configuration. */
-    std::chrono::nanoseconds time_limit = std::chrono::seconds {10};
+    std::chrono::milliseconds time_limit = std::chrono::seconds {10};
 
     /** Most write-and-verify rounds one configuration runs. */
     count_t checkpoints {.value = 1'000, .minimum = 1};
@@ -132,7 +132,7 @@ struct batches_t {
 
 /** Begins the transaction a slot resets before every attempt. */
 [[nodiscard]] std::size_t begin_transaction(database_t& database, transaction_t& transaction) {
-    auto maybe_transaction = database.transaction();
+    auto maybe_transaction = database.on().transaction();
     std::size_t const failures = expect(maybe_transaction);
     if (failures) return failures;
     transaction = *std::move(maybe_transaction);
@@ -150,7 +150,7 @@ struct batches_t {
     for (std::size_t index = 0; index != run.keys.size(); ++index) run.keys[index] = key_from_integer(index);
     for (std::size_t index = 0; index != run.slots.size(); ++index)
         run.slots[index].random_generator.seed(static_cast<std::uint32_t>(random.fork(index).next()));
-    if (failures || !run.database.supports_transactions()) return failures;
+    if (failures || !run.database.on().supports_transactions()) return failures;
     for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
         failures += begin_transaction(run.database, run.slots[thread].transaction);
     return failures;
@@ -165,13 +165,13 @@ struct batches_t {
 std::size_t commit_batch(transaction_t& transaction, ustore_collection_id_t target, keys_view_t keys,
                          value_view_t value, batch_operation_t operation) {
     while (true) {
-        std::size_t const failures = expect(transaction.reset().succeeded());
+        std::size_t const failures = expect(transaction.on().reset().has_value());
         if (failures) return failures;
         blobs_collection_t collection {transaction.receiver(), target};
         bool const staged = operation == batch_operation_t::erase_k ? collection[keys].remove().succeeded()
                                                                     : collection[keys].assign(value).succeeded();
         if (!staged) continue;
-        if (transaction.commit()) return 0;
+        if (transaction.on().commit()) return 0;
     }
 }
 
@@ -206,7 +206,7 @@ std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t cons
     for (writer_slot_t& slot : slots) failures += std::exchange(slot.failures, 0);
     for (std::size_t batch = 0; batch != batches.count(); ++batch)
         failures += verify_batch(run.collection, run.arena, batches[batch]);
-    failures += expect(run.database.clear(ustore_drop_pairs_k).succeeded());
+    failures += expect(run.database.on().clear(ustore_drop_pairs_k).succeeded());
     return failures;
 }
 
@@ -256,7 +256,7 @@ std::size_t inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& 
 /** Runs every thread count against every batch size, erasing batches when @p deletes
  *  asks for it. */
 std::size_t database_inserts(atomicity_run_t& run, atomicity_options_t const& options, round_deletes_t deletes) {
-    if (!run.database.supports_transactions()) return 0;
+    if (!run.database.on().supports_transactions()) return 0;
     std::size_t const configurations_count = 2 * options.threads.size * options.batch_sizes.size;
     std::chrono::nanoseconds const slice = options.time_limit / configurations_count;
     std::size_t failures = 0;
@@ -295,7 +295,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto [collection, create_status] = database.find_or_create("atomicity");
+    auto [collection, create_status] = database.on().find_or_create("atomicity");
     if (create_status.failed()) {
         fmt::println(stderr, "Cannot create the collection");
         return 1;

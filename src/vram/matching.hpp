@@ -37,8 +37,9 @@
 #include "ustore/utilities/vram_matching.cuh" // `matching_page_t`, `matching_chunks_t`, `matching_walkers_t`
 #include "ustore/utilities/vram_matching.hpp" // `matching_kits_of`
 
-#include "match.hpp"        // `compiled_match`, `candidates_t`, `scan_matched`, `compile_values`
-#include "vram/columns.hpp" // `upload_output_columns`
+#include "match.hpp"               // `compiled_match`, `candidates_t`, `scan_matched`, `compile_values`
+#include "utilities/arguments.hpp" // `matches_patterns_concept`, `takes_start_keys_concept`
+#include "vram/columns.hpp"        // `upload_output_columns`
 
 namespace unum::ustore {
 
@@ -145,7 +146,7 @@ expected<compiled_match<vendored_residency_of<executor_type_>>> compile_match(ar
         status.failed())
         return status;
     if (status_t const status = rebase_on_device(match, executor); status.failed()) return status;
-    if constexpr (requires { arguments.patterns; })
+    if constexpr (matches_patterns_concept<arguments_type_>)
         if (arguments.patterns.weights) {
             value_matcher_t scorer;
             if (status_t const status = compile_patterns(arguments.patterns, into, host_capabilities,
@@ -572,7 +573,7 @@ status_t scan_matched_on_device(residency_tables<vendored_residency_t::host_k> c
     if (status_t const status = settle(hosted.collections.data, hosted.collections.stride, count, view.scratch);
         status.failed())
         return status;
-    if constexpr (requires { hosted.start_keys.stride; })
+    if constexpr (takes_start_keys_concept<arguments_type_>)
         if (status_t const status = settle(hosted.start_keys.data, hosted.start_keys.stride, count, view.scratch);
             status.failed())
             return status;

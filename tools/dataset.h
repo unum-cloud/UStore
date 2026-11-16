@@ -83,6 +83,14 @@ typedef struct ustore_dataset_import_t {
 
     /** Optional output for the rows written. */
     ustore_size_t* written;
+
+    /** Optional callback reporting the bytes of the input read so far, of the input's bytes, or
+     *  of zero when the input is read in order and its size is unknown; a cancel stops between
+     *  batches, keeping the batches written and dropping an ingest whole. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
 } ustore_dataset_import_t;
 
 void ustore_dataset_import(ustore_dataset_import_t*);
@@ -121,6 +129,14 @@ typedef struct ustore_dataset_export_t {
 
     /** Optional output for the rows written. */
     ustore_size_t* written;
+
+    /** Optional callback reporting the rows written so far, of zero since the count is unknown up
+     *  front; a cancel stops between batches and removes the temporary the export wrote, leaving
+     *  a file already at @c path as it was. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
 } ustore_dataset_export_t;
 
 void ustore_dataset_export(ustore_dataset_export_t*);
@@ -154,6 +170,13 @@ typedef struct ustore_docs_import_t {
 
     /** Field holding each document's key, which @c fields must include. */
     ustore_bytes_view_t id_field;
+
+    /** Optional callback reporting the bytes of the file read so far, of its bytes; a cancel stops
+     *  between batches, keeping the batches written. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
 } ustore_docs_import_t;
 
 void ustore_docs_import(ustore_docs_import_t*);
@@ -187,6 +210,14 @@ typedef struct ustore_docs_export_t {
 
     /** Field names or JSON pointers to keep, @c fields_count of them. */
     ustore_strings_view_t fields;
+
+    /** Optional callback reporting the documents scanned so far, of zero since the count is unknown
+     *  up front; a cancel stops between batches and removes the temporary the export wrote, leaving
+     *  a file already at @c path as it was. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
 } ustore_docs_export_t;
 
 void ustore_docs_export(ustore_docs_export_t*);
@@ -220,6 +251,13 @@ typedef struct ustore_graph_import_t {
 
     /** Integer field or JSON pointer holding the edge, or empty for the default edge. */
     ustore_bytes_view_t edge_id_field;
+
+    /** Optional callback reporting the bytes of the file read so far, of its bytes; a cancel stops
+     *  between batches, keeping the batches written. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
 } ustore_graph_import_t;
 
 void ustore_graph_import(ustore_graph_import_t*);
@@ -256,6 +294,14 @@ typedef struct ustore_graph_export_t {
 
     /** Name written for the edge column, or empty to omit edges. */
     ustore_bytes_view_t edge_id_field;
+
+    /** Optional callback reporting the vertices scanned so far, of zero since the count is unknown
+     *  up front; a cancel stops between batches and removes the temporary the export wrote, leaving
+     *  a file already at @c path as it was. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
 } ustore_graph_export_t;
 
 void ustore_graph_export(ustore_graph_export_t*);

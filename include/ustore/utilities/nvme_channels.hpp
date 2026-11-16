@@ -120,7 +120,7 @@ class registered_memory_arena {
         if (!constraint.acquire(bytes)) return status_t {status_code_t::out_of_memory_k, "The budget refused an arena"};
         arena.constraint_ = &constraint;
         arena.charged_ = bytes;
-        if constexpr (requires { disk.needs_dma_memory(); })
+        if constexpr (dma_memory_ring_concept<disk_type_>)
             if (disk.needs_dma_memory())
                 arena.storage_.template emplace<dma_storage_t>(dma_allocator_t {config.memory_domain});
         if (dma_storage_t* const dma = std::get_if<dma_storage_t>(&arena.storage_)) {
@@ -1072,9 +1072,7 @@ class basic_read_pipeline {
 
     /** Waits for at least one completion where the disk offers a sleeping wait, or polls once. */
     expected<std::size_t> wait_on_disk_() noexcept {
-        if constexpr (requires(disk_type_& disk, queue_pair_t const& queue_pair, std::span<completion_t> into) {
-                          disk.wait_completions(queue_pair, into);
-                      })
+        if constexpr (sleeping_ring_concept<disk_type_>)
             return disk_.wait_completions(channel_.queue_pair(), channel_.completion_buffer());
         else return disk_.poll_completions(channel_.queue_pair(), channel_.completion_buffer());
     }

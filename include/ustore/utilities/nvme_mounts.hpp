@@ -501,7 +501,7 @@ class basic_storage_mount {
 
         memory_arena_config_t arena;
         arena.bytes = channels.arena_bytes() * (threads + config.shared_io_channels);
-        if constexpr (requires { disk_.memory_domain(); }) arena.memory_domain = disk_.memory_domain();
+        if constexpr (memory_domain_ring_concept<disk_type_>) arena.memory_domain = disk_.memory_domain();
         auto [pinned, make_arena_status] = arena_t::make(disk_, constraint, arena);
         if (make_arena_status.failed()) return make_arena_status;
         arena_ = std::move(pinned);
@@ -537,7 +537,7 @@ class basic_storage_mount {
         arena_ = arena_t {};
 
         if (status_t const closed = volume_.unmount(); closed.failed() && first.succeeded()) first = closed;
-        if constexpr (requires { disk_.release(); }) disk_.release();
+        if constexpr (releasing_ring_concept<disk_type_>) disk_.release();
         return first;
     }
 

@@ -6,7 +6,7 @@
  *      fails to build, and a shape the library misreads fails the run.
  */
 #include <stdio.h>  // `fprintf`, `stderr`
-#include <string.h> // `memcmp`, `memset`, `strlen`
+#include <string.h> // `memcmp`, `memset`, `strcmp`, `strlen`
 
 #include <stddef.h> // `size_t`, `NULL`
 #include <stdint.h> // `uint32_t`, `uint64_t`
@@ -92,8 +92,128 @@ static ustore_strings_view_t accessor_of(char const* const* texts) {
     return view;
 }
 
-int main(void) {
+/** Counts each report in the @c size_t behind @p state and cancels the call at a sound one, so a
+ *  compaction holding a plan stops after one unit. */
+static ustore_continuation_t cancel_at_first(ustore_size_t finished, ustore_size_t total, void* state) {
+    ++*(size_t*)state;
+    return finished <= total ? ustore_cancel_k : ustore_continue_k;
+}
+
+/** The Quickstart of c/README.md, line by line. The README's @c main is this function, counting
+ *  failures where it returns zero; its @c assert calls are @c expect calls, since a Release build
+ *  drops asserts, and each also tests the pointer it reads, since a failed call leaves its outputs
+ *  null; every call's outcome is checked as it lands, where the README checks the commit. */
+static size_t quickstart(void) {
     size_t failures = 0;
+    ustore_outcome_t outcome = {0};
+    ustore_database_t db = NULL;
+    ustore_arena_t arena = NULL;
+    ustore_transaction_t txn = NULL;
+    ustore_database_init_ram(&(ustore_database_init_ram_t) {.database = &db, .outcome = &outcome});
+    failures += expect_success(&outcome, __LINE__);
+    ustore_arena_init(&(ustore_arena_init_t) {.arena = &arena, .outcome = &outcome});
+    failures += expect_success(&outcome, __LINE__);
+    ustore_collection_id_t posters = {0}, movies = {0}, similar = {0};
+    ustore_collection_create(&(ustore_collection_create_t) {.database = db,
+                                                            .outcome = &outcome,
+                                                            .modality = ustore_modality_blobs_k,
+                                                            .collection = &posters});
+    failures += expect_success(&outcome, __LINE__);
+    ustore_collection_create(&(ustore_collection_create_t) {.database = db,
+                                                            .outcome = &outcome,
+                                                            .modality = ustore_modality_docs_k,
+                                                            .collection = &movies});
+    failures += expect_success(&outcome, __LINE__);
+    ustore_collection_create(&(ustore_collection_create_t) {.database = db,
+                                                            .outcome = &outcome,
+                                                            .modality = ustore_modality_graph_k,
+                                                            .collection = &similar});
+    failures += expect_success(&outcome, __LINE__);
+
+    // One transaction writes a blob, a document and an edge, and commits all three or none
+    ustore_key_t const avatar = {.uuid.bytes[15] = 1}, titanic = {.uuid.bytes[15] = 2};
+    char const poster[] = "\x89PNG", movie[] = "{\"title\":\"Avatar\",\"year\":2009}";
+    uint32_t const poster_offsets[2] = {0, sizeof(poster) - 1}, movie_offsets[2] = {0, sizeof(movie) - 1};
+    ustore_transaction_init(&(ustore_transaction_init_t) {.transaction = &txn, .database = db, .outcome = &outcome});
+    failures += expect_success(&outcome, __LINE__);
+    ustore_blobs_write(&(ustore_blobs_write_t) {
+        .database = db,
+        .outcome = &outcome,
+        .transaction = txn,
+        .count = 1,
+        .collections = {&posters, 0},
+        .keys = {&avatar, 0},
+        .values = {.layout = ustore_strings_u32_tape_k, .data.u32_tape = {(uint8_t const*)poster, poster_offsets}}});
+    failures += expect_success(&outcome, __LINE__);
+    ustore_docs_write(&(ustore_docs_write_t) {
+        .database = db,
+        .outcome = &outcome,
+        .transaction = txn,
+        .count = 1,
+        .collections = {&movies, 0},
+        .keys = {&avatar, 0},
+        .values = {.layout = ustore_strings_u32_tape_k, .data.u32_tape = {(uint8_t const*)movie, movie_offsets}}});
+    failures += expect_success(&outcome, __LINE__);
+    ustore_graph_write_edges(&(ustore_graph_write_edges_t) {.database = db,
+                                                            .outcome = &outcome,
+                                                            .transaction = txn,
+                                                            .count = 1,
+                                                            .collections = {&similar, 0},
+                                                            .sources = {&avatar, 0},
+                                                            .targets = {&titanic, 0}});
+    failures += expect_success(&outcome, __LINE__);
+    ustore_transaction_commit(&(ustore_transaction_commit_t) {.database = db, .outcome = &outcome, .transaction = txn});
+    failures += expect_success(&outcome, __LINE__);
+
+    // Reads at the head see the commit: the poster, the title and the one edge leaving Avatar
+    ustore_strings_view_t read = {0};
+    ustore_blobs_read(&(ustore_blobs_read_t) {.database = db,
+                                              .outcome = &outcome,
+                                              .count = 1,
+                                              .collections = {&posters, 0},
+                                              .keys = {&avatar, 0},
+                                              .values = &read,
+                                              .arena = arena});
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(read.data.u32_tape.offsets && read.data.u32_tape.offsets[1] == 4 &&
+                           memcmp(read.data.u32_tape.data, poster, 4) == 0,
+                       __LINE__);
+    uint32_t const title_offsets[2] = {0, 5};
+    ustore_docs_read(&(ustore_docs_read_t) {
+        .database = db,
+        .outcome = &outcome,
+        .count = 1,
+        .collections = {&movies, 0},
+        .keys = {&avatar, 0},
+        .fields = {.layout = ustore_strings_u32_tape_k, .data.u32_tape = {(uint8_t const*)"title", title_offsets}},
+        .values = &read,
+        .arena = arena,
+        .outputs_type = ustore_docs_field_type_string_k});
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(read.data.u32_tape.data && strcmp((char const*)read.data.u32_tape.data, "Avatar") == 0,
+                       __LINE__);
+    ustore_vertex_degree_t const* degrees = NULL;
+    ustore_length_t const* edges_offsets = NULL;
+    ustore_key_t const* edges = NULL;
+    ustore_graph_read_edges(&(ustore_graph_read_edges_t) {.database = db,
+                                                          .outcome = &outcome,
+                                                          .count = 1,
+                                                          .collections = {&similar, 0},
+                                                          .vertices = {&avatar, 0},
+                                                          .degrees_per_vertex = &degrees,
+                                                          .edges_offsets = &edges_offsets,
+                                                          .edges_per_vertex = &edges,
+                                                          .arena = arena});
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(degrees && degrees[0] == 1 && memcmp(&edges[1], &titanic, sizeof(titanic)) == 0, __LINE__);
+    ustore_transaction_free(txn);
+    ustore_arena_free(arena);
+    ustore_database_free(db);
+    return failures;
+}
+
+int main(void) {
+    size_t failures = quickstart();
     ustore_outcome_t outcome = {0};
 
     // The in-memory engine starts empty and persists nowhere
@@ -479,6 +599,42 @@ int main(void) {
     ustore_database_compact_t compact = {.database = database, .outcome = &outcome};
     ustore_database_compact(&compact);
     failures += expect_success(&outcome, __LINE__);
+
+    // A plan opens only with an executor; a cancel leaves it live, it continues to its end, reading
+    // done, and its finish frees it
+    ustore_executor_t compactor = NULL;
+    ustore_executor_for_ram_t spawn_compactor = {.executor = &compactor, .outcome = &outcome, .threads = 2};
+    ustore_executor_for_ram(&spawn_compactor);
+    failures += expect_success(&outcome, __LINE__);
+    ustore_database_compact_plan_t plan = NULL;
+    ustore_phase_progress_t phase = {.phase = ustore_phase_none_k};
+    size_t reports = 0;
+    ustore_database_compact_t planned = {.database = database,
+                                         .outcome = &outcome,
+                                         .progress = &cancel_at_first,
+                                         .progress_state = &reports,
+                                         .plan = &plan,
+                                         .phase = &phase};
+    ustore_database_compact(&planned);
+    failures += expect(outcome.status == ustore_status_invalid_argument_k && plan == NULL && reports == 0, __LINE__);
+    planned.executor = compactor;
+    ustore_database_compact(&planned);
+    failures += expect(outcome.status == ustore_status_cancelled_k && plan != NULL && reports == 1, __LINE__);
+    failures += expect(phase.phase != ustore_phase_none_k && phase.completed <= phase.total, __LINE__);
+    planned.progress = NULL;
+    ustore_database_compact(&planned);
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(phase.phase == ustore_phase_done_k, __LINE__);
+    ustore_database_compact_plan_finish_t finish_plan = {.database = database,
+                                                         .executor = compactor,
+                                                         .outcome = &outcome,
+                                                         .plan = plan};
+    ustore_database_compact_plan_finish(&finish_plan);
+    failures += expect_success(&outcome, __LINE__);
+    finish_plan.plan = NULL;
+    ustore_database_compact_plan_finish(&finish_plan);
+    failures += expect(outcome.status == ustore_status_invalid_argument_k, __LINE__);
+    ustore_executor_free(compactor);
     ustore_database_clear_t clear = {.database = database, .outcome = &outcome, .mode = ustore_drop_pairs_k};
     ustore_database_clear(&clear);
     failures += expect_success(&outcome, __LINE__);
@@ -493,6 +649,34 @@ int main(void) {
     failures += expect(modality == ustore_modality_graph_k, __LINE__);
     failures += expect(ustore_modality_from_name(bytes_of("bogus"), &modality) == ustore_status_invalid_argument_k,
                        __LINE__);
+    ustore_phase_t read_phase = ustore_phase_none_k;
+    failures += expect(ustore_phase_from_name(bytes_of(ustore_phase_name(ustore_phase_reclaim_k)), &read_phase) ==
+                           ustore_status_success_k,
+                       __LINE__);
+    failures += expect(read_phase == ustore_phase_reclaim_k, __LINE__);
+    failures += expect(strcmp(ustore_phase_name((ustore_phase_t)99), "unrecognized") == 0, __LINE__);
+    ustore_gpu_vendor_t read_vendor = ustore_gpu_vendor_unknown_k;
+    failures += expect(strcmp(ustore_gpu_vendor_name(ustore_gpu_vendor_apple_k), "apple") == 0, __LINE__);
+    failures += expect(ustore_gpu_vendor_from_name(bytes_of("apple"), &read_vendor) == ustore_status_success_k &&
+                           read_vendor == ustore_gpu_vendor_apple_k,
+                       __LINE__);
+    ustore_gpu_class_t const apple_classes[] = {ustore_gpu_class_apple_metal7_k, ustore_gpu_class_apple_metal9_k,
+                                                ustore_gpu_class_apple_metal10_k};
+    char const* const apple_class_names[] = {"apple-metal7", "apple-metal9", "apple-metal10"};
+    for (int index = 0; index != 3; ++index) {
+        ustore_gpu_class_t read_class = ustore_gpu_class_unknown_k;
+        failures += expect(strcmp(ustore_gpu_class_name(apple_classes[index]), apple_class_names[index]) == 0,
+                           __LINE__);
+        failures += expect(
+            ustore_gpu_class_from_name(bytes_of(apple_class_names[index]), &read_class) == ustore_status_success_k &&
+                read_class == apple_classes[index],
+            __LINE__);
+    }
+    ustore_gpu_class_t kept_class = ustore_gpu_class_apple_metal9_k;
+    failures += expect(
+        ustore_gpu_class_from_name(bytes_of("apple-metal8"), &kept_class) == ustore_status_invalid_argument_k &&
+            kept_class == ustore_gpu_class_apple_metal9_k,
+        __LINE__);
 
     ustore_arena_free(arena);
     ustore_database_free(database);

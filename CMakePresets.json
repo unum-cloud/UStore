@@ -31,6 +31,11 @@
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
     {
+      "name": "darwin",
+      "hidden": true,
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
       "name": "clang",
       "hidden": true,
       "inherits": "base",
@@ -175,6 +180,21 @@
         "CMAKE_CXX_COMPILER": "/opt/rocm/lib/llvm/bin/clang++",
         "USTORE_WITH_NVME": "ON",
         "USTORE_ROCM_ARCH": "native"
+      }
+    },
+    {
+      "name": "metal",
+      "inherits": ["clang", "darwin"],
+      "displayName": "Metal - the Apple GPU classes",
+      "description": "Every CPU target and every Apple class, whose kernels travel as MSL source and compile on the device at the first spawn of a class, so no Metal toolchain is needed. AppleClang links with ld64, as Xcode ships no lld.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -gline-tables-only -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -gline-tables-only -DNDEBUG",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_BUILD_TOOLS": "ON",
+        "USTORE_BUILD_SHARED": "ON",
+        "USTORE_METAL_ARCH": "all"
       }
     },
     {
@@ -465,6 +485,11 @@
       "jobs": 0
     },
     {
+      "name": "metal",
+      "configurePreset": "metal",
+      "jobs": 0
+    },
+    {
       "name": "linux_cuda_rocm",
       "configurePreset": "linux_cuda_rocm",
       "jobs": 0
@@ -546,6 +571,11 @@
       "name": "rocm",
       "inherits": "base",
       "configurePreset": "rocm"
+    },
+    {
+      "name": "metal",
+      "inherits": "base",
+      "configurePreset": "metal"
     },
     { "name": "linux_arm64", "inherits": "base", "configurePreset": "linux_arm64" },
     { "name": "linux_riscv64", "inherits": "base", "configurePreset": "linux_riscv64" },

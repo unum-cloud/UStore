@@ -63,15 +63,17 @@
 
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
+#include "ustore/utilities/blocking_files.hpp" // `absolute_path_of`, `path_max_bytes_k`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_rewind`, `arena_page_bytes_k`
 #include "ustore/utilities/ram_device.hpp"  // `executor_t`, `lent_pool_t`, `claim_t`
 
-#include "engine.hpp"            // `engine_t`, `ustore_*_handle_t`, `view_t`, `host_verbs`, `floor_atomic_ref`
-#include "match.hpp"             // `compiled_match`, `compile_match`, `scan_matched`, `exhausted_t`
-#include "utilities/batches.hpp" // `strings_arg_t`
-#include "vram/classes.hpp"      // `gpu_class_t`, `pick_gpu_class`, `kernel_tables`, `spawn_gpu_executor`
-#include "vram/matching.hpp"     // `compile_match`, `scan_matched_on_device`
-#include "vram/staging.hpp"      // `stage_inputs`
+#include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `view_t`, `host_verbs`, `floor_atomic_ref`
+#include "match.hpp"              // `compiled_match`, `compile_match`, `scan_matched`, `exhausted_t`
+#include "utilities/batches.hpp"  // `strings_arg_t`
+#include "utilities/progress.hpp" // `progress_ticks_t`
+#include "vram/classes.hpp"       // `gpu_class_t`, `pick_gpu_class`, `kernel_tables`, `spawn_gpu_executor`
+#include "vram/matching.hpp"      // `compile_match`, `scan_matched_on_device`
+#include "vram/staging.hpp"       // `stage_inputs`
 
 namespace unum::ustore {
 using namespace unum::ustore::utilities;
@@ -112,7 +114,8 @@ struct cursor_engine {
 template <template <vendored_residency_t> typename verbs_type_>
 using cursor_engines = std::variant<cursor_engine<verbs_type_, vendored_residency_t::host_k>,
                                     cursor_engine<verbs_type_, vendored_residency_t::vram_nvidia_k>,
-                                    cursor_engine<verbs_type_, vendored_residency_t::vram_amd_k>>;
+                                    cursor_engine<verbs_type_, vendored_residency_t::vram_amd_k>,
+                                    cursor_engine<verbs_type_, vendored_residency_t::vram_apple_k>>;
 
 #pragma region Names
 
@@ -177,6 +180,15 @@ constexpr bool gpu_class_compiled(gpu_class_t gpu_class) noexcept {
 #if USTORE_TARGET_AMD_CDNA5
     case gpu_class_t::amd_cdna5_k: return true;
 #endif
+#if USTORE_TARGET_APPLE_METAL7
+    case gpu_class_t::apple_metal7_k: return true;
+#endif
+#if USTORE_TARGET_APPLE_METAL9
+    case gpu_class_t::apple_metal9_k: return true;
+#endif
+#if USTORE_TARGET_APPLE_METAL10
+    case gpu_class_t::apple_metal10_k: return true;
+#endif
     default: return false;
     }
 }
@@ -190,23 +202,28 @@ consteval std::size_t compiled_rungs(gpu_ladder<classes_...>) noexcept {
 #if USTORE_TARGET_MONOVERSIONED
 static_assert(compiled_rungs(nvidia_ladder_t {}) <= 1);
 static_assert(compiled_rungs(amd_ladder_t {}) <= 1);
+static_assert(compiled_rungs(apple_ladder_t {}) <= 1);
 #endif
 
+/** Vendors one process drives, each listing at most @c gpu_devices_capacity_k devices. */
+inline constexpr std::size_t gpu_vendors_count_k = 3;
+
 /** The GPU side of the process, built at its first VRAM call: every vendor's driver, and every
- *  device, NVIDIA first, then AMD, each with the class picked for it when nothing is pinned. */
+ *  device, NVIDIA first, then AMD, then Apple, each with the class picked under no ceiling. */
 struct gpu_runtime_t {
     gpu_drivers_t drivers;
     kernel_tables<cuda_module_t> cuda_kernels;
     kernel_tables<hip_module_t> hip_kernels;
-    gpu_device_t devices[2 * gpu_devices_capacity_k];
+    kernel_tables<metal_module_t> metal_kernels;
+    gpu_device_t devices[gpu_vendors_count_k * gpu_devices_capacity_k];
     std::size_t devices_count = 0;
 
     /** The class picked for each of @c devices with no pin, @c unknown_k where none runs. */
-    gpu_class_t classes[2 * gpu_devices_capacity_k] = {};
+    gpu_class_t classes[gpu_vendors_count_k * gpu_devices_capacity_k] = {};
 
     /** Held by the spawn opening a device for its class, NVIDIA devices by CUDA ordinal, then AMD
-     *  ones by HIP ordinal. */
-    claim_t opening[2 * gpu_devices_capacity_k] = {};
+     *  ones by HIP ordinal, then Apple ones by their position in Metal's listing. */
+    claim_t opening[gpu_vendors_count_k * gpu_devices_capacity_k] = {};
 
     gpu_runtime_t() noexcept {
         std::size_t const reported = list_gpu_devices(drivers, devices);
@@ -223,18 +240,23 @@ struct gpu_runtime_t {
     template <typename variant_type_>
     status_t spawn(gpu_device_t const& device, gpu_class_t gpu_class, void* stream, std::size_t scratch_limit,
                    ustore_gds_t gds, variant_type_& into) noexcept {
-        if ((device.vendor != gpu_vendor_t::nvidia_k && device.vendor != gpu_vendor_t::amd_k) ||
-            device.vendor_ordinal >= gpu_devices_capacity_k)
+        std::size_t vendor_index = gpu_vendors_count_k;
+        switch (device.vendor) {
+        case gpu_vendor_t::nvidia_k: vendor_index = 0; break;
+        case gpu_vendor_t::amd_k: vendor_index = 1; break;
+        case gpu_vendor_t::apple_k: vendor_index = 2; break;
+        default: break;
+        }
+        if (vendor_index == gpu_vendors_count_k || device.vendor_ordinal >= gpu_devices_capacity_k)
             return {status_code_t::device_k, "No driver serves the device"};
-        std::size_t const slot = (device.vendor == gpu_vendor_t::amd_k ? gpu_devices_capacity_k : 0) +
-                                 device.vendor_ordinal;
+        std::size_t const slot = vendor_index * gpu_devices_capacity_k + device.vendor_ordinal;
         class_verbs_t const& verbs = host_verbs();
         while (!verbs.take(&opening[slot])) verbs.wait_while_claimed(&opening[slot]);
-        status_t const opened = open_gpu_device(drivers, device, gpu_class, cuda_kernels, hip_kernels);
+        status_t const opened = open_gpu_device(drivers, device, gpu_class, cuda_kernels, hip_kernels, metal_kernels);
         verbs.release(&opening[slot]);
         if (opened.failed()) return opened;
-        return spawn_gpu_executor(drivers, cuda_kernels, hip_kernels, device, gpu_class, stream, scratch_limit, gds,
-                                  into);
+        return spawn_gpu_executor(drivers, cuda_kernels, hip_kernels, metal_kernels, device, gpu_class, stream,
+                                  scratch_limit, gds, into);
     }
 };
 
@@ -260,6 +282,8 @@ inline void destroy_arena(ustore_arena_t arena) noexcept {
     }
     else if (hip_blocks_t* const memory = std::get_if<hip_blocks_t>(&arena->memory))
         free_hip_blocks(gpu_runtime().drivers.hip, memory->device, memory->blocks);
+    else if (metal_blocks_t* const memory = std::get_if<metal_blocks_t>(&arena->memory))
+        free_metal_blocks(memory->blocks);
     else arena_free_blocks(*arena);
     delete arena;
 }
@@ -315,19 +339,31 @@ inline ustore_transaction_t carried(ustore_transaction_t const* transaction) noe
 /** The snapshot a call reads, or null, which an output for a new snapshot never matches. */
 inline ustore_snapshot_t viewed(ustore_snapshot_t snapshot) noexcept { return snapshot; }
 
+/** Whether a call reads through or reuses a transaction. */
+template <typename arguments_type_>
+concept carries_transaction_concept = requires(arguments_type_ const& arguments) { carried(arguments.transaction); };
+
+/** Whether a call reads through a snapshot, or answers a new one. */
+template <typename arguments_type_>
+concept reads_snapshot_concept = requires(arguments_type_ const& arguments) { viewed(arguments.snapshot); };
+
 /** Decodes what @p arguments read through into @p view, answering false for a view neither view
- *  constructor made. A pull reads through the view its cursor opened with. */
+ *  constructor made. */
 template <typename arguments_type_>
 bool decode_call(arguments_type_ const& arguments, view_t& view) noexcept {
-    if constexpr (requires { arguments.cursor->cursor.view; }) return decode_view(arguments.cursor->cursor.view, view);
-    else {
-        if constexpr (requires { arguments.view; })
-            if (!decode_view(arguments.view, view)) return false;
-        if constexpr (requires { carried(arguments.transaction); }) view.transaction = carried(arguments.transaction);
-        if constexpr (requires { arguments.watch; }) view.watch = arguments.watch;
-        if constexpr (requires { viewed(arguments.snapshot); }) view.snapshot = viewed(arguments.snapshot);
-        return true;
-    }
+    if constexpr (reads_view_concept<arguments_type_>)
+        if (!decode_view(arguments.view, view)) return false;
+    if constexpr (carries_transaction_concept<arguments_type_>) view.transaction = carried(arguments.transaction);
+    if constexpr (names_watch_concept<arguments_type_>) view.watch = arguments.watch;
+    if constexpr (reads_snapshot_concept<arguments_type_>) view.snapshot = viewed(arguments.snapshot);
+    return true;
+}
+
+/** A pull reads through the view its cursor opened with. */
+template <typename arguments_type_>
+    requires walks_cursor_concept<arguments_type_>
+bool decode_call(arguments_type_ const& arguments, view_t& view) noexcept {
+    return decode_view(arguments.cursor->cursor.view, view);
 }
 
 /** Takes one more hold on @p handle, a database, a transaction or a snapshot, so it outlives the caller's free. */
@@ -373,6 +409,21 @@ void release_parent(handle_type_* parent) noexcept {
 /** Whether @p candidate_type_ is one of @p listed_types_. */
 template <typename candidate_type_, typename... listed_types_>
 constexpr bool one_of = (std::is_same_v<candidate_type_, listed_types_> || ...);
+
+/** Whether a call rewrites the schema or the trees an open ingest holds until its finish, which
+ *  this very caller may own, so the call refuses rather than waits for it. */
+template <typename arguments_type_>
+constexpr bool outlasted_by_ingests =
+    one_of<arguments_type_, ustore_collection_create_t, ustore_collection_drop_t, ustore_database_clear_t,
+           ustore_database_compact_t, ustore_database_flush_t>;
+
+/** Refuses with @c contended_k while an ingest is open on @p database, changing nothing. */
+inline status_t refuse_open_ingests(ustore_database_handle_t const& database) noexcept {
+    std::uint32_t& open_ingests = const_cast<std::uint32_t&>(database.open_ingests);
+    if (floor_atomic_ref<std::uint32_t> {open_ingests}.load(std::memory_order_acquire))
+        return {status_code_t::contended_k, "An ingest is open on the database"};
+    return {};
+}
 
 /** Whether a call changes its database, which one opened read-only refuses: every call naming a
  *  transaction, as reads name views instead, and the calls on whole collections. */
@@ -513,6 +564,10 @@ inline void clear_outputs(ustore_changes_cursor_next_t const& arguments) noexcep
     clear(arguments.values);
 }
 
+/** Whether a call has outputs to leave null or zero before it runs and after it fails. */
+template <typename arguments_type_>
+concept clears_outputs_concept = requires(arguments_type_ const& arguments) { clear_outputs(arguments); };
+
 #pragma endregion Outputs
 
 #pragma region Ragged Inputs
@@ -588,6 +643,10 @@ inline std::array<ragged_input_t, 3> ragged_inputs(ustore_strings_scan_t const& 
 inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_measure_t const& arguments) noexcept {
     return {{{arguments.start_strings, arguments.count}, {arguments.end_strings, arguments.count}}};
 }
+
+/** Whether a call takes ragged inputs, which the engines read gathered on the host. */
+template <typename arguments_type_>
+concept gathers_ragged_inputs_concept = requires(arguments_type_ const& arguments) { ragged_inputs(arguments); };
 
 /** Strings an accessor writes per block, so the indices it reads fit on the stack of the thread running the call. */
 constexpr std::size_t accessor_block_k = 64;
@@ -761,7 +820,8 @@ template <typename arguments_type_, typename cursor_type_, gpu_executor_concept 
 status_t pull(engine_t const& engine, arguments_type_ const& arguments, cursor_type_& cursor, view_t const& view,
               executor_type_& executor) noexcept {
     constexpr vendored_residency_t residency_k = vendored_residency_of<executor_type_>;
-    constexpr std::size_t residency_index_k = residency_k == vendored_residency_t::vram_nvidia_k ? 1 : 2;
+    // The walks' engines list the residencies in their own order, the host's first
+    constexpr std::size_t residency_index_k = static_cast<std::size_t>(residency_k);
     auto const* const walker = std::get_if<residency_index_k>(&cursor.engine);
     if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
     device_blocks_t* const blocks = device_blocks_of(arguments.arena, executor);
@@ -842,7 +902,7 @@ inline void wait_while_claimed(claim_t const& word) noexcept { host_verbs().wait
 /** The arena @p arguments fill, or null for a call without outputs in one. */
 template <typename arguments_type_>
 ustore_arena_t arena_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (requires { arguments.arena; }) return arguments.arena;
+    if constexpr (fills_arena_concept<arguments_type_>) return arguments.arena;
     else return nullptr;
 }
 
@@ -853,16 +913,18 @@ ustore_transaction_t transaction_of(arguments_type_ const& arguments) noexcept {
     return decode_call(arguments, view) ? view.transaction : nullptr;
 }
 
-/** The named-call counts of the database, of the cursor @p arguments pull or the transaction or
- *  snapshot they read through, and of their arena, each null when absent; a cursor's own holds keep
- *  what it reads through alive. */
+/** The named-call counts of the database, of the cursor @p arguments pull, the live plan they
+ *  continue or the transaction or snapshot they read through, and of their arena, each null when
+ *  absent; a cursor's own holds keep what it reads through alive. */
 template <typename arguments_type_>
 std::array<std::uint32_t*, 3> named_calls_of(arguments_type_ const& arguments) noexcept {
     ustore_arena_t const arena = arena_of(arguments);
     ustore_database_t const database = database_of(arguments);
     std::uint32_t* viewed = nullptr;
-    if constexpr (requires { arguments.cursor->cursor; }) viewed = &arguments.cursor->cursor.named_calls;
-    else if constexpr (requires { arguments.ingest->named_calls; }) viewed = &arguments.ingest->named_calls;
+    if constexpr (walks_cursor_concept<arguments_type_>) viewed = &arguments.cursor->cursor.named_calls;
+    else if constexpr (feeds_ingest_concept<arguments_type_>) viewed = &arguments.ingest->named_calls;
+    else if constexpr (std::is_same_v<arguments_type_, ustore_database_compact_t>)
+        viewed = arguments.plan && *arguments.plan ? &(*arguments.plan)->named_calls : nullptr;
     else {
         view_t view;
         decode_call(arguments, view);
@@ -899,8 +961,8 @@ inline void lower_named_calls(std::array<std::uint32_t*, 3> const& counts) noexc
 
 /** The claim of the cursor @p arguments pull, or null for a call naming none. */
 template <typename arguments_type_>
-claim_t* cursor_claim_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (requires { arguments.cursor->cursor; }) return &arguments.cursor->cursor.claim;
+claim_t* handle_claim_of(arguments_type_ const& arguments) noexcept {
+    if constexpr (walks_cursor_concept<arguments_type_>) return &arguments.cursor->cursor.claim;
     else return nullptr;
 }
 
@@ -909,6 +971,7 @@ inline vendored_residency_t residency_of(ustore_executor_handle_t const* executo
     if (!executor) return vendored_residency_t::host_k;
     if (std::holds_alternative<cuda_executor_t>(executor->device)) return vendored_residency_t::vram_nvidia_k;
     if (std::holds_alternative<hip_executor_t>(executor->device)) return vendored_residency_t::vram_amd_k;
+    if (std::holds_alternative<metal_executor_t>(executor->device)) return vendored_residency_t::vram_apple_k;
     return vendored_residency_t::host_k;
 }
 
@@ -925,29 +988,33 @@ inline bool arena_serves(ustore_executor_handle_t const* executor, ustore_arena_
         executor->device);
 }
 
-/** Claims the arena, the cursor and the transaction of @p arguments, holding none when one serves
- *  another call, and refusing a call that needs an arena or a cursor and names none, or whose arena
- *  lives where its executor does not compute. */
+/** Whether @p arguments_type_ pulls a cursor, whose claim a contended call names. */
+template <typename arguments_type_>
+concept pulls_cursor_concept = requires(arguments_type_ const& arguments) { arguments.cursor; };
+
+/** Claims the arena, the cursor and the transaction of @p arguments, holding none when one
+ *  serves another call, and refusing a call that needs an arena or a cursor and names none, or
+ *  whose arena lives where its executor does not compute. */
 template <typename arguments_type_>
 status_t take_claims(arguments_type_ const& arguments) noexcept {
-    if constexpr (requires { arguments.cursor; })
+    if constexpr (pulls_cursor_concept<arguments_type_>)
         if (!arguments.cursor) return {status_code_t::invalid_argument_k, "The call needs a cursor"};
     ustore_arena_t const arena = arena_of(arguments);
-    if constexpr (requires { arguments.arena; }) {
+    if constexpr (fills_arena_concept<arguments_type_>) {
         if (!arena) return {status_code_t::invalid_argument_k, "The call needs an arena for its outputs"};
         if (!arena_serves(arguments.executor, arena))
             return {status_code_t::device_k, "The arena lives where another executor computes"};
         if (!take(arena->claim)) return {status_code_t::contended_k, "The arena serves another call"};
     }
-    claim_t* const cursor = cursor_claim_of(arguments);
-    if (cursor && !take(*cursor)) {
+    claim_t* const handle = handle_claim_of(arguments);
+    if (handle && !take(*handle)) {
         if (arena) release(arena->claim);
         return {status_code_t::contended_k, "The cursor serves another pull"};
     }
     ustore_transaction_t const transaction = transaction_of(arguments);
     if (transaction && !take(transaction->claim)) {
         if (arena) release(arena->claim);
-        if (cursor) release(*cursor);
+        if (handle) release(*handle);
         return {status_code_t::contended_k, "The transaction serves another call"};
     }
     return {};
@@ -959,7 +1026,7 @@ template <typename arguments_type_>
 std::array<claim_t*, 3> claims_of(arguments_type_ const& arguments) noexcept {
     ustore_arena_t const arena = arena_of(arguments);
     ustore_transaction_t const transaction = transaction_of(arguments);
-    return {arena ? &arena->claim : nullptr, cursor_claim_of(arguments), transaction ? &transaction->claim : nullptr};
+    return {arena ? &arena->claim : nullptr, handle_claim_of(arguments), transaction ? &transaction->claim : nullptr};
 }
 
 /** Hands every one of @p claims that is not null back to the next call. */
@@ -989,6 +1056,23 @@ inline void wait_named_calls(std::uint32_t& calls) noexcept {
         host_verbs().await_change(&calls, seen);
 }
 
+/** Frees @p plan and its engine plan once no call naming it is in flight, so another compaction may
+ *  open on its database; null is safe. */
+inline void free_compact_plan(ustore_database_compact_plan_t plan) noexcept {
+    if (!plan) return;
+    wait_named_calls(plan->named_calls);
+    ustore_database_t const database = plan->opened_on;
+    if (plan->engine_plan) engine_of(database).database->compact_plan.free(plan->engine_plan);
+    release(database->compaction);
+    delete plan;
+}
+
+/** Finishes a plan's finish with @p status without serving it, freeing the plan all the same. */
+inline void refuse(ustore_database_compact_plan_finish_t& arguments, status_t status) noexcept {
+    free_compact_plan(arguments.plan);
+    finish(*arguments.outcome, status);
+}
+
 #pragma endregion Claims
 
 #pragma region Verb Slots
@@ -1010,10 +1094,6 @@ struct verb_slot<ustore_database_describe_t> {
 template <>
 struct verb_slot<ustore_database_clear_t> {
     static constexpr auto database = &database_verbs_t::clear;
-};
-template <>
-struct verb_slot<ustore_database_compact_t> {
-    static constexpr auto database = &database_verbs_t::compact;
 };
 template <>
 struct verb_slot<ustore_database_flush_t> {
@@ -1376,6 +1456,14 @@ struct verb_slot<ustore_pages_measure_t> {
     static constexpr auto verb = &pages_verbs<residency_>::measure;
 };
 
+/** Whether a call's verb sits in the control plane's table, served on host executors alone. */
+template <typename arguments_type_>
+concept control_verb_concept = requires { verb_slot<arguments_type_>::database; };
+
+/** Whether a call's verb sits in its modality's table at @p residency_. */
+template <typename arguments_type_, vendored_residency_t residency_>
+concept residency_verb_concept = requires { verb_slot<arguments_type_>::template verb<residency_>; };
+
 #pragma endregion Verb Slots
 
 #pragma region Serving
@@ -1390,6 +1478,8 @@ status_t visit_residency(view_t const& view, visitor_type_&& visitor) noexcept {
         return visitor(*device);
     if (hip_executor_t* const device = executor ? std::get_if<hip_executor_t>(&executor->device) : nullptr)
         return visitor(*device);
+    if (metal_executor_t* const device = executor ? std::get_if<metal_executor_t>(&executor->device) : nullptr)
+        return visitor(*device);
     return visitor();
 }
 
@@ -1398,7 +1488,7 @@ status_t visit_residency(view_t const& view, visitor_type_&& visitor) noexcept {
 template <typename verb_type_, typename arguments_type_, typename... executors_types_>
 status_t call_gathered(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
                        executors_types_&... executor) noexcept {
-    if constexpr (requires { ragged_inputs(arguments); }) {
+    if constexpr (gathers_ragged_inputs_concept<arguments_type_>) {
         auto const inputs = ragged_inputs(arguments);
         std::array<strings_arg_t, inputs.size()> strings;
         for (std::size_t index = 0; index != inputs.size(); ++index)
@@ -1431,10 +1521,76 @@ status_t open_device_call(arguments_type_ const& arguments, executor_type_& exec
     if (status_t const status = executor.bind(); status.failed()) return status;
     executor.rewind_bounce();
     utilities::rewind(executor.managed(), executor);
-    if constexpr (requires { arguments.arena; })
+    if constexpr (fills_arena_concept<arguments_type_>)
         if (device_blocks_t* const blocks = utilities::device_blocks_of(arguments.arena, executor))
             utilities::rewind(*blocks, executor);
     return {};
+}
+
+/** Rewinds every scratch the call @p runner serves may fill: each pool thread's and the call's own,
+ *  as slices keep their scratch from one fork to the next, or the one made for a call alone. */
+inline void rewind_scratches(view_t const& runner) noexcept {
+    if (runner.executor)
+        for (ustore_arena_handle_t& scratch : runner.executor->scratches) arena_rewind(&scratch);
+    else arena_rewind(runner.scratch);
+}
+
+/** Scans what @p match narrows for @p arguments at @p residency_, on the host or on a device. */
+template <vendored_residency_t residency_, typename match_type_, typename arguments_type_, typename... rest_types_>
+status_t scan_matched_on(residency_tables<vendored_residency_t::host_k> const& host, match_type_ const& match,
+                         arguments_type_ const& arguments, rest_types_&... rest) noexcept {
+    if constexpr (residency_ == vendored_residency_t::host_k) return scan_matched(host, match, arguments, rest...);
+    else return scan_matched_on_device(host, match, arguments, rest...);
+}
+
+/** Serves @p arguments on the control-plane verb of @p engine in @p view, holding the database for
+ *  the transaction or snapshot an init opens. */
+template <typename arguments_type_>
+status_t serve_control(engine_t const& engine, arguments_type_ const& arguments, view_t const& view) noexcept {
+    auto const verb = engine.database->*verb_slot<arguments_type_>::database;
+    if (!verb) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
+    if constexpr (std::is_same_v<arguments_type_, ustore_transaction_init_t>) {
+        ustore_transaction_t const reused = arguments.transaction ? *arguments.transaction : nullptr;
+        if (reused && reused->database != arguments.database)
+            return status_t {status_code_t::invalid_argument_k, "The transaction belongs to another database"};
+        status_t const status = call_staged(verb, arguments, view);
+        if (!status.failed() && !reused) hold(arguments.database, *arguments.transaction);
+        return status;
+    }
+    else if constexpr (std::is_same_v<arguments_type_, ustore_snapshot_init_t>) {
+        status_t const status = call_staged(verb, arguments, view);
+        if (!status.failed()) hold(arguments.database, *arguments.snapshot);
+        return status;
+    }
+    else if constexpr (std::is_same_v<arguments_type_, ustore_changes_cursor_init_t>)
+        return open_changes_cursor(engine, arguments, view);
+    else return call_staged(verb, arguments, view);
+}
+
+/** Serves @p arguments on the verb of their modality's table at @p residency_ in @p view, scanning
+ *  through their match in the scratch @p runner names wherever it narrows the keys. */
+template <vendored_residency_t residency_, typename arguments_type_, typename... executors_types_>
+status_t serve_modality(engine_t const& engine, ustore_database_t database, arguments_type_ const& arguments,
+                        view_t const& view, view_t const& runner, executors_types_&... executor) noexcept {
+    auto const* const verbs = engine.template tables<residency_>().*
+                              verb_slot<arguments_type_>::template table<residency_>;
+    if (!verbs) return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
+    auto const verb = verbs->*verb_slot<arguments_type_>::template verb<residency_>;
+    if (!verb) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
+    if constexpr (carries_match<arguments_type_>) {
+        auto [match, match_status] = compile_match(arguments, runner.scratch, database->ceiling.strings, executor...);
+        if (match_status.failed()) return match_status;
+        if (!match.matches_everything())
+            return with_call_stamp(engine, database, one_collection(arguments), view,
+                                   [&](view_t const& pinned) noexcept {
+                                       return call_staged(
+                                           [&](arguments_type_ const& matched, auto&... rest) noexcept {
+                                               return scan_matched_on<residency_>(engine.host, match, matched, rest...);
+                                           },
+                                           arguments, pinned, executor...);
+                                   });
+    }
+    return call_staged(verb, arguments, view, executor...);
 }
 
 /** Serves @p arguments on the engine of their database, in the scratch and on the executor thread
@@ -1449,12 +1605,17 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
     if constexpr (changes_database<arguments_type_>)
         if (database->access == access_t::read_only_k)
             return {status_code_t::read_only_k, "The database was opened read-only"};
-    if constexpr (requires { arguments.cursor->cursor; })
+    if constexpr (walks_cursor_concept<arguments_type_>)
         if (arguments.cursor->cursor.database != database)
             return {status_code_t::invalid_argument_k, "The cursor walks another database"};
-    if constexpr (requires { arguments.collections.data; })
+    if constexpr (names_collections_concept<arguments_type_>)
         if (arguments.count && !arguments.collections.data)
             return {status_code_t::invalid_argument_k, "No collections were named"};
+    if constexpr (std::is_same_v<arguments_type_, ustore_database_clear_t>)
+        if (arguments.mode < ustore_drop_collection_k || arguments.mode > ustore_drop_values_k)
+            return {status_code_t::invalid_argument_k, "Unknown drop mode"};
+    if constexpr (outlasted_by_ingests<arguments_type_>)
+        if (status_t const refused = refuse_open_ingests(*database); refused.failed()) return refused;
     if constexpr (std::is_same_v<arguments_type_, ustore_collection_create_t>) {
         if (arguments.modality < ustore_modality_blobs_k || arguments.modality > ustore_modality_pages_k)
             return {status_code_t::invalid_argument_k, "Unknown modality"};
@@ -1471,68 +1632,22 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
         (view.snapshot && view.snapshot->database != database))
         return {status_code_t::invalid_argument_k, "The view reads another database"};
 
-    if constexpr (requires { arguments.arena; }) arena_rewind(arguments.arena);
-    // Slices keep their scratch from one fork to the next, so every scratch rewinds once per call
-    if (runner.executor)
-        for (ustore_arena_handle_t& scratch : runner.executor->scratches) arena_rewind(&scratch);
-    else arena_rewind(runner.scratch);
+    if constexpr (fills_arena_concept<arguments_type_>) arena_rewind(arguments.arena);
+    rewind_scratches(runner);
     return visit_residency(view, [&]<typename... executors_types_>(executors_types_&... executor) noexcept -> status_t {
         constexpr vendored_residency_t residency_k = vendored_residency_of<executors_types_...>;
         if constexpr (residency_k != vendored_residency_t::host_k)
             if (status_t const opened = open_device_call(arguments, executor...); opened.failed()) return opened;
-        if constexpr (requires { arguments.cursor->cursor; })
+        if constexpr (walks_cursor_concept<arguments_type_>)
             return with_call_stamp(engine, database, &arguments.cursor->cursor.collection, view,
                                    [&](view_t const& pinned) noexcept {
                                        return pull(engine, arguments, *arguments.cursor, pinned, executor...);
                                    });
         else if constexpr (residency_k != vendored_residency_t::host_k &&
-                           !requires { verb_slot<arguments_type_>::template verb<residency_k>; })
+                           !residency_verb_concept<arguments_type_, residency_k>)
             return status_t {status_code_t::unsupported_k, "Changes and the control plane run on host executors"};
-        else if constexpr (requires { verb_slot<arguments_type_>::database; }) {
-            auto const verb = engine.database->*verb_slot<arguments_type_>::database;
-            if (!verb) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
-            if constexpr (std::is_same_v<arguments_type_, ustore_transaction_init_t>) {
-                ustore_transaction_t const reused = arguments.transaction ? *arguments.transaction : nullptr;
-                if (reused && reused->database != arguments.database)
-                    return status_t {status_code_t::invalid_argument_k, "The transaction belongs to another database"};
-                status_t const status = call_staged(verb, arguments, view);
-                if (!status.failed() && !reused) hold(arguments.database, *arguments.transaction);
-                return status;
-            }
-            else if constexpr (std::is_same_v<arguments_type_, ustore_snapshot_init_t>) {
-                status_t const status = call_staged(verb, arguments, view);
-                if (!status.failed()) hold(arguments.database, *arguments.snapshot);
-                return status;
-            }
-            else if constexpr (std::is_same_v<arguments_type_, ustore_changes_cursor_init_t>)
-                return open_changes_cursor(engine, arguments, view);
-            else return call_staged(verb, arguments, view);
-        }
-        else {
-            auto const* const verbs = engine.template tables<residency_k>().*
-                                      verb_slot<arguments_type_>::template table<residency_k>;
-            if (!verbs)
-                return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
-            auto const verb = verbs->*verb_slot<arguments_type_>::template verb<residency_k>;
-            if (!verb) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
-            if constexpr (carries_match<arguments_type_>) {
-                auto [match, match_status] = compile_match(arguments, runner.scratch, database->ceiling.strings,
-                                                           executor...);
-                if (match_status.failed()) return match_status;
-                if (!match.matches_everything())
-                    return with_call_stamp(
-                        engine, database, one_collection(arguments), view, [&](view_t const& pinned) noexcept {
-                            return call_staged(
-                                [&](arguments_type_ const& matched, auto&... rest) noexcept {
-                                    if constexpr (residency_k == vendored_residency_t::host_k)
-                                        return scan_matched(engine.host, match, matched, rest...);
-                                    else return scan_matched_on_device(engine.host, match, matched, rest...);
-                                },
-                                arguments, pinned, executor...);
-                        });
-            }
-            return call_staged(verb, arguments, view, executor...);
-        }
+        else if constexpr (control_verb_concept<arguments_type_>) return serve_control(engine, arguments, view);
+        else return serve_modality<residency_k>(engine, database, arguments, view, runner, executor...);
     });
 }
 
@@ -1588,20 +1703,47 @@ template <typename arguments_type_>
 status_t serve_deferred(arguments_type_& arguments, view_t const& runner) noexcept {
     status_t const status = serve(arguments, runner);
     // A landed commit keeps its stamp beside a failed flush; the router zeroed it beforehand
-    if constexpr (requires { clear_outputs(arguments); } && !requires { arguments.commit_stamp; })
+    if constexpr (clears_outputs_concept<arguments_type_> && !stamps_commit_concept<arguments_type_>)
         if (status.failed()) clear_outputs(arguments);
     return status;
 }
 
-/** Opens the database @p call names through @p open_, its engine's open, which claims nothing, under the ceiling its
- *  pinned class sets, which the opened handle keeps for every later call. */
+/** Whether an open of @p arguments_type_ caps the CPU class, as the RAM and NVMe opens do. */
+template <typename arguments_type_>
+concept caps_cpu_class_concept = requires(arguments_type_ const& arguments) { arguments.cpu_class_ceiling; };
+
+/** Whether an open keeps the directory it names for later calls, as the RAM image and the RocksDB
+ *  and LevelDB files are reopened by path; an NVMe open names a manifest or a raw medium. */
+template <typename arguments_type_>
+constexpr bool keeps_directory = one_of<arguments_type_, ustore_database_open_ram_t, ustore_database_open_rocksdb_t,
+                                        ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t>;
+
+/** Opens through @p open_ with the directory of @p call resolved from the root once, so a relative
+ *  one reaches the same files as its absolute spelling for the life of the handle. */
+template <auto open_, typename arguments_type_>
+status_t open_from_root(arguments_type_& call, cpu_ceiling_t const& ceiling, view_t const& runner) noexcept {
+    if constexpr (!keeps_directory<arguments_type_>) return open_(call, ceiling, runner);
+    else {
+        if (!call.directory.length) return open_(call, ceiling, runner);
+        char absolute[path_max_bytes_k];
+        std::size_t length = 0;
+        std::string_view const named {reinterpret_cast<char const*>(call.directory.data), call.directory.length};
+        if (status_t const resolved = absolute_path_of(named, absolute, length); resolved.failed()) return resolved;
+        arguments_type_ rooted = call;
+        rooted.directory = {reinterpret_cast<std::uint8_t const*>(absolute), length};
+        return open_(rooted, ceiling, runner);
+    }
+}
+
+/** Opens the database @p call names through @p open_, its engine's open, which claims nothing,
+ *  under the ceiling its @c cpu_class_ceiling narrows, kept by the handle for every later call. */
 template <typename arguments_type_, auto open_>
 status_t serve_open(arguments_type_& call, view_t const& runner) noexcept {
-    ustore_cpu_class_t pinned = ustore_cpu_class_unknown_k;
-    if constexpr (requires { call.cpu_class; }) pinned = call.cpu_class;
-    auto const [ceiling, pick_status] = pick_cpu_ceiling(pinned);
+    ustore_cpu_class_t cpu_class_ceiling = ustore_cpu_class_unknown_k;
+    if constexpr (caps_cpu_class_concept<arguments_type_>) cpu_class_ceiling = call.cpu_class_ceiling;
+    auto const [ceiling, pick_status] = pick_cpu_ceiling(cpu_class_ceiling);
     if (pick_status.failed()) return pick_status;
-    if (status_t const opened = open_(call, ceiling, runner); opened.failed()) return opened;
+    if (status_t const opened = open_from_root<open_>(call, ceiling, runner); opened.failed()) return opened;
     (*call.database)->ceiling = ceiling;
     return {};
 }
@@ -1673,7 +1815,7 @@ void dispatch(call_type_* call) noexcept {
  *  to the verb their type names. */
 template <typename arguments_type_>
 void route(arguments_type_* arguments) noexcept {
-    if constexpr (requires { clear_outputs(*arguments); }) clear_outputs(*arguments);
+    if constexpr (clears_outputs_concept<arguments_type_>) clear_outputs(*arguments);
     if (status_t const claimed = take_claims(*arguments); claimed.failed()) return finish(*arguments->outcome, claimed);
     dispatch<arguments_type_, &serve_deferred<arguments_type_>>(arguments);
 }
@@ -1690,7 +1832,7 @@ void route_init(arguments_type_* arguments) noexcept {
     if (arguments->database) *arguments->database = nullptr;
     if (residency_of(arguments->executor) != vendored_residency_t::host_k)
         return finish(*arguments->outcome, {status_code_t::device_k, "Databases open on host executors"});
-    if constexpr (requires { arguments->directory.length; })
+    if constexpr (names_directory_concept<arguments_type_>)
         if (arguments->directory.length && !arguments->directory.data)
             return finish(*arguments->outcome,
                           {status_code_t::invalid_argument_k, "A directory with a length needs its bytes"});
@@ -1698,6 +1840,114 @@ void route_init(arguments_type_* arguments) noexcept {
 }
 
 #pragma endregion Routing
+
+#pragma region Compaction Plans
+
+/**
+ *  @brief Refuses the compaction or the plan's finish @p arguments describe in the ruled order,
+ *      before the router claims anything.
+ *
+ *  The order is no database, a plan slot without an executor to outlive it, a plan opened on
+ *  another database or with another executor, a database opened read-only, then an executor
+ *  computing on a device. A finish naming no plan is refused once its database is known.
+ */
+template <typename arguments_type_>
+status_t admit_compaction(arguments_type_ const& arguments, ustore_database_compact_plan_t plan) noexcept {
+    if (!arguments.database) return {status_code_t::uninitialized_k, "The database is uninitialized"};
+    if constexpr (std::is_same_v<arguments_type_, ustore_database_compact_plan_finish_t>)
+        if (!plan) return {status_code_t::invalid_argument_k, "The plan must not be null"};
+    if constexpr (std::is_same_v<arguments_type_, ustore_database_compact_t>)
+        if (arguments.plan && !arguments.executor)
+            return {status_code_t::invalid_argument_k, "A plan needs an executor that outlives it"};
+    if (plan && plan->opened_on != arguments.database)
+        return {status_code_t::invalid_argument_k, "The plan was opened on another database"};
+    if (plan && plan->opened_with != arguments.executor)
+        return {status_code_t::invalid_argument_k, "The plan was opened with another executor"};
+    if (arguments.database->access == access_t::read_only_k)
+        return {status_code_t::read_only_k, "The database was opened read-only"};
+    if (residency_of(arguments.executor) != vendored_residency_t::host_k)
+        return {status_code_t::unsupported_k, "Compactions run on host executors"};
+    if constexpr (outlasted_by_ingests<arguments_type_>) return refuse_open_ingests(*arguments.database);
+    return {};
+}
+
+/**
+ *  @brief Serves a compaction admitted and claimed by the router: continues the live plan it names,
+ *      opens one into the empty slot it names, or runs a plan of its own to the end and frees it,
+ *      writing the phase where the call stopped.
+ *
+ *  Opening takes the database's compaction claim, which a live plan keeps until its finish and a
+ *  call naming no plan until it returns, so a database admits one compaction at a time. A cancel
+ *  heard at the barrier closing the plan answers success, since the plan had ended.
+ */
+inline status_t serve_compaction(ustore_database_compact_t& arguments, view_t const& runner) noexcept {
+    ustore_database_t const database = arguments.database;
+    database_verbs_t const& verbs = *engine_of(database).database;
+    if (!verbs.compact_plan_open) return {status_code_t::unsupported_k, "The engine does not implement this call"};
+    void* engine_plan = arguments.plan && *arguments.plan ? (*arguments.plan)->engine_plan : nullptr;
+    if (!engine_plan) {
+        if (!take(database->compaction)) return {status_code_t::contended_k, "Another compaction holds the database"};
+        rewind_scratches(runner);
+        expected<void*> const opened = verbs.compact_plan_open(arguments, runner);
+        if (!opened) return release(database->compaction), opened.status();
+        engine_plan = *opened;
+        if (arguments.plan) {
+            ustore_database_compact_plan_handle_t* const held = new (std::nothrow)
+                ustore_database_compact_plan_handle_t {};
+            if (!held) {
+                verbs.compact_plan.free(engine_plan);
+                release(database->compaction);
+                return {status_code_t::out_of_memory_k, "Failed to allocate the plan"};
+            }
+            held->engine_plan = engine_plan;
+            held->opened_on = database;
+            held->opened_with = arguments.executor;
+            *arguments.plan = held;
+        }
+    }
+    progress_ticks_t ticks {.callback = arguments.progress, .state = arguments.progress_state};
+    status_t ran = verbs.compact_plan.run(engine_plan, runner, ticks);
+    ustore_phase_progress_t const reached = verbs.compact_plan.phase(engine_plan);
+    if (ran.code == status_code_t::cancelled_k && reached.phase == ustore_phase_done_k) ran = {};
+    if (arguments.phase) *arguments.phase = reached;
+    if (arguments.plan) return ran;
+    status_t const finished = ran.succeeded() || ran.code == status_code_t::cancelled_k
+                                  ? verbs.compact_plan.finish(engine_plan)
+                                  : ran;
+    verbs.compact_plan.free(engine_plan);
+    release(database->compaction);
+    return finished.failed() ? finished : ran;
+}
+
+/** Serves a plan's finish admitted by the router: once no call naming the plan is in flight, closes
+ *  its engine plan and frees it, whatever the close answers. */
+inline status_t serve_compaction_finish(ustore_database_compact_plan_finish_t& arguments, view_t const&) noexcept {
+    ustore_database_compact_plan_t const plan = arguments.plan;
+    wait_named_calls(plan->named_calls);
+    status_t const finished = engine_of(plan->opened_on).database->compact_plan.finish(plan->engine_plan);
+    free_compact_plan(plan);
+    return finished;
+}
+
+/** Routes a compaction: clears its phase output, refuses it in the ruled order before any claim,
+ *  then dispatches it as every call is dispatched, counting the call on the live plan it names. */
+inline void route_compaction(ustore_database_compact_t* arguments) noexcept {
+    if (arguments->phase) *arguments->phase = {};
+    ustore_database_compact_plan_t const plan = arguments->plan ? *arguments->plan : nullptr;
+    if (status_t const refused = admit_compaction(*arguments, plan); refused.failed())
+        return finish(*arguments->outcome, refused);
+    if (status_t const claimed = take_claims(*arguments); claimed.failed()) return finish(*arguments->outcome, claimed);
+    dispatch<ustore_database_compact_t, &serve_compaction>(arguments);
+}
+
+/** Routes a plan's finish as a compaction is routed, freeing the plan whatever the call answers. */
+inline void route_compaction_finish(ustore_database_compact_plan_finish_t* arguments) noexcept {
+    if (status_t const refused = admit_compaction(*arguments, arguments->plan); refused.failed())
+        return refuse(*arguments, refused);
+    dispatch<ustore_database_compact_plan_finish_t, &serve_compaction_finish>(arguments);
+}
+
+#pragma endregion Compaction Plans
 
 #pragma region Cursor Lifetimes
 
@@ -1737,6 +1987,9 @@ expected<cursor_engines<verbs_type_>> open_cursor_engine(engine_t const& engine,
     case vendored_residency_t::vram_amd_k:
         return open_cursor_residency<vendored_residency_t::vram_amd_k, verbs_type_, scan_type_>(engine, arguments,
                                                                                                 compiled);
+    case vendored_residency_t::vram_apple_k:
+        return open_cursor_residency<vendored_residency_t::vram_apple_k, verbs_type_, scan_type_>(engine, arguments,
+                                                                                                  compiled);
     default:
         return open_cursor_residency<vendored_residency_t::host_k, verbs_type_, scan_type_>(engine, arguments,
                                                                                             compiled);
@@ -1777,7 +2030,7 @@ expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noexcept {
     cursor->cursor.view = arguments.view;
     cursor->cursor.collection = arguments.collection;
     cursor->cursor.direction = arguments.direction;
-    if constexpr (requires { arguments.end_key; })
+    if constexpr (ends_at_key_concept<arguments_type_>)
         if (arguments.end_key) cursor->end_key = *arguments.end_key;
     take_hold(database);
     if (view.transaction) take_hold(view.transaction);

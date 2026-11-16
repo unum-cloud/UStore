@@ -489,7 +489,7 @@ int main(int argc, char const* argv[]) {
             ustore_arena_init(&init);
             st::vector<ustore_key_t> keys;
             if (st::failed(keys.resize(batch))) return loop.skip("no room for keys");
-            splitmix64_t random {stream_key(settings.seed.value, name, thread)};
+            splitmix64_t random {stream_key(settings.seed, name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
                 for (ustore_key_t& key : keys) key = molecules.keys[random.next() % rows];
                 ustore_strings_view_t values {};
@@ -528,7 +528,7 @@ int main(int argc, char const* argv[]) {
                 st::vector<std::uint32_t> offsets;
                 st::vector<std::uint8_t> tape;
                 if (st::failed(offsets.resize(depth + 1))) return loop.skip("no room for strings");
-                splitmix64_t random {stream_key(settings.seed.value, strings_name, thread)};
+                splitmix64_t random {stream_key(settings.seed, strings_name, thread)};
                 for ([[maybe_unused]] std::size_t call : loop) {
                     tape.clear();
                     for (std::size_t index = 0; index != depth; ++index) {

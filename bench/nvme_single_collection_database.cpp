@@ -217,7 +217,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
     // its line out
     std::string const insert_name = name_of("insert");
     row_t const inserted = run_pass(executor, insert_name, population, [&](loop_t& loop, std::size_t thread) noexcept {
-        splitmix64_t random {stream_key(settings.seed.value, insert_name, thread)};
+        splitmix64_t random {stream_key(settings.seed, insert_name, thread)};
         for (std::size_t call : loop) {
             std::size_t const width = layout_ == value_layout_t::variable_width_k
                                           ? 1 + static_cast<std::size_t>(random.below(value_max_size))
@@ -232,7 +232,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
     std::string const find_name = name_of("find");
     if (settings.selects(find_name))
         print(run_threads(executor, settings, find_name, [&](loop_t& loop, std::size_t thread) noexcept {
-            splitmix64_t random {stream_key(settings.seed.value, find_name, thread)};
+            splitmix64_t random {stream_key(settings.seed, find_name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
                 stored_value_size_t size = 0;
                 lookup_result_t const found = database->find(random.below(population), size);
@@ -248,7 +248,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
             st::vector<byte_t> value;
             if (reading_status.failed() || st::failed(value.resize(value_max_size)))
                 return loop.skip("no channel or no memory for a value");
-            splitmix64_t random {stream_key(settings.seed.value, select_name, thread)};
+            splitmix64_t random {stream_key(settings.seed, select_name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
                 stored_value_size_t size = 0;
                 status_t const completed = database->select(reading.channel(), random.below(population),
@@ -265,7 +265,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
             std::array<stored_key_t, batch_keys_k> keys {};
             std::array<lookup_result_t, batch_keys_k> results {};
             if (reading_status.failed()) return loop.skip("no channel");
-            splitmix64_t random {stream_key(settings.seed.value, batch_name, thread)};
+            splitmix64_t random {stream_key(settings.seed, batch_name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
                 for (stored_key_t& key : keys) key = random.below(population);
                 std::size_t bytes = 0;

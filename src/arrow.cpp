@@ -107,6 +107,8 @@ device_arena_t device_arena_of(ustore_arena_t arena) noexcept {
         return {&cuda->blocks, ARROW_DEVICE_CUDA, cuda->device};
     if (hip_blocks_t const* const hip = std::get_if<hip_blocks_t>(&arena->memory))
         return {&hip->blocks, ARROW_DEVICE_ROCM, hip->device};
+    if (metal_blocks_t const* const metal = std::get_if<metal_blocks_t>(&arena->memory))
+        return {&metal->blocks, ARROW_DEVICE_METAL, metal->device};
     return {};
 }
 
@@ -225,7 +227,9 @@ ustore_status_t convert_through(executor_type_& executor, device_blocks_t& block
 template <typename visitor_type_>
 ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visitor) noexcept {
     device_arena_t const device = device_arena_of(arena);
-    gpu_vendor_t const vendor = device.type == ARROW_DEVICE_CUDA ? gpu_vendor_t::nvidia_k : gpu_vendor_t::amd_k;
+    gpu_vendor_t const vendor = device.type == ARROW_DEVICE_CUDA   ? gpu_vendor_t::nvidia_k
+                                : device.type == ARROW_DEVICE_ROCM ? gpu_vendor_t::amd_k
+                                                                   : gpu_vendor_t::apple_k;
     gpu_runtime_t& runtime = gpu_runtime();
     std::size_t listed = runtime.devices_count;
     for (std::size_t position = 0; position != runtime.devices_count; ++position)
@@ -235,10 +239,10 @@ ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visi
     if (listed == runtime.devices_count) return ustore_status_device_k;
     gpu_class_t const gpu_class = runtime.classes[listed];
     if (gpu_class == gpu_class_t::unknown_k) return ustore_status_unsupported_k;
-    std::variant<std::monostate, cuda_executor_t, hip_executor_t> spawned;
+    std::variant<std::monostate, cuda_executor_t, hip_executor_t, metal_executor_t> spawned;
     if (status_t const status = spawn_gpu_executor(runtime.drivers, runtime.cuda_kernels, runtime.hip_kernels,
-                                                   runtime.devices[listed], gpu_class, nullptr, 0,
-                                                   ustore_gds_compatibility_k, spawned);
+                                                   runtime.metal_kernels, runtime.devices[listed], gpu_class, nullptr,
+                                                   0, ustore_gds_compatibility_k, spawned);
         status.failed())
         return static_cast<ustore_status_t>(status.code);
     return std::visit(

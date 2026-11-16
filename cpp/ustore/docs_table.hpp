@@ -26,7 +26,8 @@ namespace unum::ustore {
 
 #pragma region Cells and Columns
 
-/** Whether a gathered column of @p type holds strings, which offsets address, rather than scalars. */
+/** Whether a gathered column of @p type holds strings, which offsets address,
+ *  rather than scalars. */
 constexpr bool is_variable_length(ustore_docs_field_type_t type) noexcept {
     return type == ustore_docs_field_type_string_k || type == ustore_docs_field_type_binary_k;
 }
@@ -138,6 +139,9 @@ class dynamic_column_view_t {
 
     ustore_octet_t const* validities() const noexcept { return arrays_.validities; }
 
+    /** The column as the gather wrote it, which an Arrow export reads. */
+    ustore_docs_column_view_t const& arrays() const noexcept { return arrays_; }
+
     /** The scalars of a scalar column, or null for a string column. */
     ustore_byte_t const* scalars() const noexcept { return arrays_.scalars; }
 
@@ -149,16 +153,6 @@ class dynamic_column_view_t {
 
 #pragma region Headers
 
-/** A column of a table header: the field to gather and the type to convert it into. */
-struct field_type_t {
-
-    /** Field inside every document. */
-    std::string_view field {};
-
-    /** Type the field converts into. */
-    ustore_docs_field_type_t type {ustore_docs_field_type_json_k};
-};
-
 /** The first column of a table, naming the document of every row. */
 struct table_index_view_t {
     strided_iterator<ustore_collection_id_t const> collections_begin;
@@ -169,47 +163,53 @@ struct table_index_view_t {
     strided_span<ustore_key_t const> keys() const noexcept { return {keys_begin, count}; }
 };
 
-/** The header row of a table, naming the field and type of every column. */
+/** The header row of a table, naming the field and type of every column, each back to back, as a
+ *  gather borrows them. */
 struct table_header_view_t {
-    strided_iterator<std::string_view const> fields_begin;
-    strided_iterator<ustore_docs_field_type_t const> types_begin;
+    std::string_view const* fields_begin {nullptr};
+    ustore_docs_field_type_t const* types_begin {nullptr};
     std::size_t count {0};
 
-    strided_span<std::string_view const> fields() const noexcept { return {fields_begin, count}; }
-    strided_span<ustore_docs_field_type_t const> types() const noexcept { return {types_begin, count}; }
+    strided_span<std::string_view const> fields() const noexcept {
+        return {{fields_begin, sizeof(std::string_view)}, count};
+    }
+    strided_span<ustore_docs_field_type_t const> types() const noexcept {
+        return {{types_begin, sizeof(ustore_docs_field_type_t)}, count};
+    }
 };
 
-/** Header of a table whose column types are known at compile time, built column by column through @c with. */
+/** Header of a table whose column types are known at compile time, built column by column
+ *  through @c with. */
 template <typename... column_types_>
 struct table_header {
 
-    /** Field and type of every column, in order. */
-    std::array<field_type_t, sizeof...(column_types_)> columns;
+    /** Field of every column, in order. */
+    std::array<std::string_view, sizeof...(column_types_)> names;
+
+    /** Type every column converts its field into, in order, back to back as the C
+     *  ABI reads them. */
+    std::array<ustore_docs_field_type_t, sizeof...(column_types_)> types_of {docs_field_type<column_types_>()...};
 
     template <typename element_type_>
     table_header<column_types_..., element_type_> with(std::string_view name) && noexcept {
         table_header<column_types_..., element_type_> extended;
-        std::copy_n(columns.begin(), columns.size(), extended.columns.begin());
-        extended.columns.back() = field_type_t {name, docs_field_type<element_type_>()};
+        std::copy_n(names.begin(), names.size(), extended.names.begin());
+        extended.names.back() = name;
         return extended;
     }
 
-    strided_span<std::string_view const> fields() const noexcept {
-        return strided(columns).members(&field_type_t::field);
-    }
-
-    strided_span<ustore_docs_field_type_t const> types() const noexcept {
-        return strided(columns).members(&field_type_t::type);
-    }
+    table_header_view_t view() const noexcept { return {names.data(), types_of.data(), names.size()}; }
+    strided_span<std::string_view const> fields() const noexcept { return view().fields(); }
+    strided_span<ustore_docs_field_type_t const> types() const noexcept { return view().types(); }
 };
 
 /** Starts a header whose column types are known at compile time. */
 inline table_header<> make_table_header() noexcept { return {}; }
 
-/** Views @p columns, whose types are known only at runtime, as a table header. */
-inline table_header_view_t make_table_header(std::span<field_type_t const> columns) noexcept {
-    auto const range = strided(columns.data(), columns.data() + columns.size());
-    return {range.members(&field_type_t::field).begin(), range.members(&field_type_t::type).begin(), columns.size()};
+/** Views @p fields, whose types @p types name only at runtime, one per field, as a table header. */
+inline table_header_view_t make_table_header(std::span<std::string_view const> fields,
+                                             std::span<ustore_docs_field_type_t const> types) noexcept {
+    return {fields.data(), types.data(), fields.size()};
 }
 
 #pragma endregion Headers
@@ -219,10 +219,11 @@ inline table_header_view_t make_table_header(std::span<field_type_t const> colum
 /**
  *  @brief Results of @c ustore_docs_gather, with documents as rows and fields as columns.
  *
- *  A view that copies cheaply: its columns live in the arena of the gather, while its index and header view the keys
- *  and fields the gather was asked for.
+ *  A view that copies cheaply: its columns live in the arena of the gather, while its index and
+ *  header view the keys and fields the gather was asked for.
  *
- *  @tparam column_types_ Types of the columns, or @c std::monostate alone when they are known only at runtime.
+ *  @tparam column_types_ Types of the columns, or @c std::monostate alone when they are known
+ *      only at runtime.
  */
 template <typename... column_types_>
 class docs_table {
@@ -256,7 +257,7 @@ class docs_table {
           types_(types), columns_(columns) {}
 
     table_index_view_t index() const noexcept { return {collections_, keys_, docs_count_}; }
-    table_header_view_t header() const noexcept { return {fields_, types_, fields_count_}; }
+    table_header_view_t header() const noexcept { return {fields_.get(), types_.get(), fields_count_}; }
 
     template <typename element_type_ = std::monostate>
     auto column(std::size_t index) const noexcept {
@@ -277,6 +278,34 @@ class docs_table {
 };
 
 using docs_table_t = docs_table<std::monostate>;
+
+/** Where a gather writes its columns, beside the rows and the header its table views. */
+template <typename... column_types_>
+struct outputs<docs_table<column_types_...>> {
+
+    /** Documents gathered, one per row. */
+    ustore_size_t rows = 0;
+
+    /** The collection and key of every row, as the gather was asked for them. */
+    strided_iterator<ustore_collection_id_t const> collections;
+    strided_iterator<ustore_key_t const> keys;
+
+    /** The field and type of every column, as the gather was asked for them. */
+    table_header_view_t header {};
+
+    /** Output for one column per field, inside the arena. */
+    ustore_docs_column_view_t const* columns = nullptr;
+
+    docs_table<column_types_...> answer() const noexcept {
+        return {rows,
+                header.count,
+                collections,
+                keys,
+                {header.fields_begin, sizeof(std::string_view)},
+                {header.types_begin, sizeof(ustore_docs_field_type_t)},
+                columns};
+    }
+};
 
 #pragma endregion Tables
 

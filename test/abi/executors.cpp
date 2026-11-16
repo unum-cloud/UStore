@@ -1796,7 +1796,7 @@ std::size_t executor_on_receivers(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
     failures += expect(executor_status.succeeded());
     if (failures != 0) return failures;
@@ -1807,7 +1807,7 @@ std::size_t executor_on_receivers(config_t const& config) {
     auto reference = collection[triplet.keys];
     failures += round_trip(reference, triplet);
 
-    if (database.supports_transactions()) {
+    if (database.on().supports_transactions()) {
         transaction_t transaction = *database.on(executor).transaction();
         transaction_ref_t transaction_on_executor = transaction.on(executor);
         blobs_collection_t inside {transaction_on_executor.receiver(), collection};
@@ -1817,7 +1817,7 @@ std::size_t executor_on_receivers(config_t const& config) {
         failures += expect(transaction_on_executor.commit().has_value());
         failures += check_length(reference, missing_length_k);
     }
-    if (database.supports_snapshots()) {
+    if (database.on().supports_snapshots()) {
         failures += round_trip(reference, triplet);
         snapshot_t snapshot = *database.on(executor).snapshot();
         snapshot_ref_t snapshot_on_executor = snapshot.on(executor);
@@ -1835,8 +1835,9 @@ case_result_t executor_deferred_commit(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
     failures += expect(executor_status.succeeded());
     if (failures != 0) return failures;
@@ -1845,12 +1846,13 @@ case_result_t executor_deferred_commit(config_t const& config) {
     values_tape_t values;
     failures += fill_tape(values, {"left", "right"});
 
-    auto [head, create_status] = database.create("blobs");
+    auto [head, create_status] = database.on().create("blobs");
     failures += expect(create_status.succeeded());
-    transaction_t transaction = *database.transaction();
-    deferred_transaction_t deferred_transaction = transaction.deferred(executor);
-    deferred_blobs_collection_t inside {transaction.receiver().on(executor), head};
-    failures += expect(inside.write(keys, std::move(values)).wait().succeeded());
+    transaction_t transaction = *database.on().transaction();
+    transaction_on<ustore_completion_deferred_k> const deferred_transaction = transaction.deferred(executor);
+    blobs_collection_on<ustore_completion_deferred_k, collection_access_t::read_write_k> const inside {
+        transaction.receiver().on(executor), head};
+    failures += expect(inside.write(keys, values).wait().succeeded());
     failures += expect(!*head[keys[0]].present());
 
     auto [read_stamp, stage_status] = deferred_transaction.stage().wait();
@@ -1863,14 +1865,14 @@ case_result_t executor_deferred_commit(config_t const& config) {
 }
 
 /** A deferred document write and then deferred reads hand back the documents whole, one field of
- *  each as text, and a gathered column whose table outlives every move of its answer, and a
- *  deferred removal leaves the keys missing. */
+ *  each as text, and a gathered column whose table views the keys and the header it borrowed, and
+ *  a deferred removal leaves the keys missing. */
 std::size_t executor_deferred_docs(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
     failures += expect(executor_status.succeeded());
     if (failures != 0) return failures;
@@ -1878,7 +1880,7 @@ std::size_t executor_deferred_docs(config_t const& config) {
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
 
-    failures += expect(database.create<docs_collection_t>("docs").has_value());
+    failures += expect(database.on().create<docs_collection_t>("docs").has_value());
     auto [collection, collection_status] = database.deferred(executor).find<docs_collection_t>("docs");
     failures += expect(collection_status.succeeded());
     if (failures != 0) return failures;
@@ -1886,7 +1888,7 @@ std::size_t executor_deferred_docs(config_t const& config) {
     std::array<ustore_key_t, 2> const keys {key_from_integer(81), key_from_integer(82)};
     values_tape_t documents;
     failures += fill_tape(documents, {flat_documents_k[0], flat_documents_k[1]});
-    failures += expect(collection.write(keys, std::move(documents)).wait().succeeded());
+    failures += expect(collection.write(keys, documents).wait().succeeded());
 
     auto [read, read_status] = collection.read(keys, arena).wait();
     failures += expect(read_status.succeeded());
@@ -1896,8 +1898,7 @@ std::size_t executor_deferred_docs(config_t const& config) {
 
     values_tape_t person;
     failures += fill_tape(person, {"person"});
-    auto [people,
-          people_status] = collection.read(keys, arena, std::move(person), ustore_docs_field_type_string_k).wait();
+    auto [people, people_status] = collection.read(keys, arena, person, ustore_docs_field_type_string_k).wait();
     failures += expect(people_status.succeeded());
     failures += expect_eq(people.size(), keys.size());
     if (people.size() == keys.size()) {
@@ -1905,18 +1906,15 @@ std::size_t executor_deferred_docs(config_t const& config) {
         failures += expect_eq(as_text(people[1]), std::string_view("Bob"));
     }
 
-    values_tape_t age;
-    failures += fill_tape(age, {"age"});
-    auto [gathered, gather_status] =
-        collection.gather(keys, std::move(age), std::array {ustore_docs_field_type_i32_k}, arena).wait();
+    auto const header = make_table_header().with<i32_t>("age");
+    auto [table, gather_status] = collection.gather(keys, header, arena).wait();
     failures += expect(gather_status.succeeded());
-    docs_gather_t::finished_t const moved = std::move(gathered);
-    failures += expect_eq(moved.table.rows(), keys.size());
-    failures += expect_eq(moved.table.columns(), 1u);
-    if (moved.table.rows() == keys.size() && moved.table.columns() == 1) {
-        auto const ages = moved.table.column(0).as<i32_t>();
-        strided_span<std::string_view const> const names = moved.table.header().fields();
-        strided_span<ustore_key_t const> const rows = moved.table.index().keys();
+    failures += expect_eq(table.rows(), keys.size());
+    failures += expect_eq(table.columns(), 1u);
+    if (table.rows() == keys.size() && table.columns() == 1) {
+        auto const ages = table.column<0>();
+        strided_span<std::string_view const> const names = table.header().fields();
+        strided_span<ustore_key_t const> const rows = table.index().keys();
         failures += expect(ages[0].valid && ages[1].valid);
         failures += expect_eq(ages[0].value, 24);
         failures += expect_eq(ages[1].value, 25);
@@ -1940,10 +1938,10 @@ case_result_t executor_deferred_graph(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
     failures += expect(executor_status.succeeded());
-    failures += expect(database.create<graph_collection_t>("graph").has_value());
+    failures += expect(database.on().create<graph_collection_t>("graph").has_value());
     auto [graph, graph_status] = database.deferred(executor).find<graph_collection_t>("graph");
     failures += expect(graph_status.succeeded());
     if (failures != 0) return failures;
@@ -1955,7 +1953,9 @@ case_result_t executor_deferred_graph(config_t const& config) {
     failures += expect(graph.write_edges(triangle).wait().succeeded());
 
     std::array<ustore_key_t, 3> const vertices {key_from_integer(1), key_from_integer(4), key_from_integer(2)};
-    auto [read, read_status] = graph.read_edges(vertices, arena, ustore_vertex_role_source_k).wait();
+    ustore_vertex_role_t const leaving = ustore_vertex_role_source_k;
+    strided_span<ustore_vertex_role_t const> const roles {{&leaving, 0}, vertices.size()};
+    auto [read, read_status] = graph.read_edges(vertices, arena, roles).wait();
     failures += expect(read_status.succeeded());
     failures += expect_eq(read.size(), 2u);
     failures += expect_eq(read.offsets.size(), vertices.size() + 1);
@@ -1983,10 +1983,10 @@ case_result_t executor_deferred_strings(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
     failures += expect(executor_status.succeeded());
-    failures += expect(database.create<strings_collection_t>("words").has_value());
+    failures += expect(database.on().create<strings_collection_t>("words").has_value());
     auto [words, words_status] = database.deferred(executor).find<strings_collection_t>("words");
     failures += expect(words_status.succeeded());
     if (failures != 0) return failures;
@@ -2042,7 +2042,7 @@ case_result_t executor_deferred_open(config_t const& config) {
         failures += expect_success(outcome);
         if (failures != 0) return failures;
         database_t database {opened};
-        auto [head, head_status] = database["blobs"];
+        auto [head, head_status] = database.on().find_or_create("blobs");
         failures += expect(head_status.succeeded());
         failures += expect(head[key].assign("opened").succeeded());
     }
@@ -2054,7 +2054,7 @@ case_result_t executor_deferred_open(config_t const& config) {
     failures += expect_success(outcome);
     if (failures != 0) return failures;
     database_t database {reopened};
-    auto [head, find_status] = database.find("blobs");
+    auto [head, find_status] = database.on().find("blobs");
     failures += expect(find_status.succeeded());
     failures += expect(head[key].value() == "opened");
     return failures;
@@ -2075,15 +2075,16 @@ std::size_t executor_contended(config_t const& config) {
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
     std::array<ustore_key_t, 1> const keys {key_from_integer(77)};
-    auto [head, head_status] = database["blobs"];
+    auto [head, head_status] = database.on().find_or_create("blobs");
     failures += expect(head_status.succeeded());
-    deferred_database_t const deferred_database = database.deferred(executor);
-    deferred_blobs_collection_t collection = deferred_database[head];
+    database_on<ustore_completion_deferred_k> const deferred_head = database.deferred(executor);
+    blobs_collection_on<ustore_completion_deferred_k, collection_access_t::read_write_k> const collection =
+        deferred_head[head];
     held_scan_t held;
     failures += submit_held(held, executor);
-    deferred<blobs_read_t> refused = collection.read(keys, arena);
+    deferred<values_view_t> refused = collection.read(keys, arena);
     failures += expect(refused.status() == status_code_t::contended_k);
-    failures += expect_status(std::move(refused).wait(), status_code_t::contended_k);
+    failures += expect_status(refused.wait(), status_code_t::contended_k);
     failures += release_held(held);
     failures += expect(executor.drain().succeeded());
     failures += expect(collection.read(keys, arena).wait().has_value());

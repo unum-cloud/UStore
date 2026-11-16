@@ -802,14 +802,14 @@ std::size_t json_fold_own_changes(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
-    if (failures || !database.supports_transactions()) return failures;
+    if (failures || !database.on().supports_transactions()) return failures;
     auto [collection, create_status] = create_docs_collection(database, "own");
     failures += expect(create_status.succeeded());
     if (failures) return failures;
     reference_t head {database, collection};
     failures += expect(head.reset(R"({"a":1})").succeeded());
 
-    auto [transaction, transaction_status] = database.transaction();
+    auto [transaction, transaction_status] = database.on().transaction();
     failures += expect(transaction_status.succeeded());
     if (failures) return failures;
     reference_t uncommitted {database, collection};
@@ -825,7 +825,7 @@ std::size_t json_fold_own_changes(config_t const& config) {
         status_code_t::invalid_argument_k);
     failures += expect_document(uncommitted, R"({"b":2,"c":3})", "a merge and a patch over it");
     failures += expect_document(head, R"({"a":1})", "the head before the commit");
-    failures += expect(transaction.commit().has_value());
+    failures += expect(transaction.on().commit().has_value());
     failures += expect_document(head, R"({"b":2,"c":3})", "the head after the commit");
     return failures;
 }
@@ -921,13 +921,13 @@ case_result_t json_fold_maintenance(config_t const& config, std::uint64_t seed) 
             }
             landed += wanted.succeeded();
             // A compaction flushes the memory runs first, so the records land in runs over bases in older ones
-            if (call % flush_k == 0) failures += expect(drive.compact().succeeded());
+            if (call % flush_k == 0) failures += expect(drive.on().compact().succeeded());
             if (call % checkpoint_k == 0) failures += compare_all("after a checkpoint");
         }
         fmt::println("  {} of {} modifications landed", landed, calls_k);
         failures += expect(landed * 3 > calls_k);
         failures += compare_all("after every call");
-        failures += expect(drive.compact().succeeded());
+        failures += expect(drive.on().compact().succeeded());
         failures += compare_all("after a compaction");
     }
     auto [reopened, reopen_status] = open_small_nvme(home.c_str());
@@ -957,10 +957,10 @@ int main(int argc, char** argv) {
 
     report(totals, "json_fold.codec", json_fold_codec);
     report(totals, "json_fold.shapes", json_fold_shapes);
-    report(totals, "json_fold.reference", json_fold_reference, config, std::uint64_t {options.seed.value});
-    report(totals, "json_fold.compose", json_fold_compose, std::uint64_t {options.seed.value});
+    report(totals, "json_fold.reference", json_fold_reference, config, std::uint64_t {options.seed});
+    report(totals, "json_fold.compose", json_fold_compose, std::uint64_t {options.seed});
     report(totals, "json_fold.own_changes", json_fold_own_changes, config);
-    report(totals, "json_fold.maintenance", json_fold_maintenance, config, std::uint64_t {options.seed.value});
+    report(totals, "json_fold.maintenance", json_fold_maintenance, config, std::uint64_t {options.seed});
 
     return suite_exit_code(totals);
 }

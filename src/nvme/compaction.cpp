@@ -2,28 +2,33 @@
  *  @file src/nvme/compaction.cpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief The compiled part of GPU compaction: binding a compactor to an executor whose device
- *      loaded the library's kernels, freeing its device runs, and compacting every key slot.
+ *  @brief The compiled part of GPU compaction: binding a compactor to a CUDA or HIP executor
+ *      whose device loaded the library's kernels, freeing its device runs, and compacting each of
+ *      the key slots the engine stores.
  *
  *  The graph's device fold for the graph's key slot is instantiated here as well, so the host TUs
  *  of the engine call it.
  */
 
-#include "ustore/blobs/vram_nvidia_compaction.cuh"     // `cuda_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.cuh"     // `device_compactor`
 #include "ustore/graph/vram_nvidia_adjacency_fold.cuh" // the fold's device definitions
 
 namespace unum::ustore::blobs {
 
-expected<cuda_compactor_t> cuda_compactor_t::make(utilities::cuda_executor_t& executor,
-                                                  device_sections_reader_t sections) noexcept {
+template <typename executor_type_>
+expected<device_compactor<executor_type_>> device_compactor<executor_type_>::make(
+    executor_type_& executor, device_sections_reader_t sections) noexcept {
     if (!executor.kernels())
         return status_t {status_code_t::unsupported_k, "The device loaded no bundle of the library's kernels"};
-    return cuda_compactor_t(executor, sections);
+    return device_compactor(executor, sections);
 }
 
-st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<strings_run_view const> views,
-                                             std::uint32_t upper_runs, compaction_stamps_t const& stamps,
-                                             st::vector<strings_version_t>& survivors) noexcept {
+template <typename executor_type_>
+st::status_t device_compactor<executor_type_>::merge_strings(compaction_kind_t kind,
+                                                             std::span<strings_run_view const> views,
+                                                             std::uint32_t upper_runs,
+                                                             compaction_stamps_t const& stamps,
+                                                             st::vector<strings_version_t>& survivors) noexcept {
     using st::status_t;
     if (!executor_->kernels() || views.size() > (std::numeric_limits<std::uint32_t>::max)() ||
         upper_runs > views.size())
@@ -120,13 +125,17 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
     return status_t::success_k;
 }
 
-cuda_compactor_t::~cuda_compactor_t() noexcept {
+template <typename executor_type_>
+device_compactor<executor_type_>::~device_compactor() noexcept {
     if (!blocks_.count) return;
     sections_.release();
     if (executor_->bind().failed()) return;
     utilities::rewind(blocks_, *executor_);
     executor_->free_async(blocks_.blocks[0].address);
 }
+
+template class device_compactor<utilities::cuda_executor_t>;
+template class device_compactor<utilities::hip_executor_t>;
 
 } // namespace unum::ustore::blobs
 

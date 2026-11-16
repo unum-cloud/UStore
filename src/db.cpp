@@ -162,7 +162,16 @@ status_t open_ingest(ustore_ingest_init_t const& arguments) noexcept {
         return opened;
     }
     take_hold(database);
+    floor_atomic_ref<std::uint32_t> {database->open_ingests}.fetch_add(1, std::memory_order_acq_rel);
     return {};
+}
+
+/** Lets the engine drop what @p ingest never published, and stops counting it open on its
+ *  database. */
+void close_ingest(ustore_ingest_t ingest) noexcept {
+    ingest->engine->database->ingest_free(ingest);
+    ingest->state = nullptr;
+    floor_atomic_ref<std::uint32_t> {ingest->database->open_ingests}.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 status_t append_ingest(ustore_ingest_append_t const& arguments) noexcept {
@@ -184,8 +193,7 @@ status_t finish_ingest(ustore_ingest_finish_t const& arguments) noexcept {
     arena_rewind(&ingest->scratch);
     if (arguments.durability == ustore_durability_buffered_k || arguments.durability == ustore_durability_flushed_k)
         landed = ingest->engine->database->ingest_finish(arguments, view_t {.scratch = &ingest->scratch});
-    ingest->engine->database->ingest_free(ingest);
-    ingest->state = nullptr;
+    close_ingest(ingest);
     return landed;
 }
 
@@ -204,7 +212,10 @@ status_t on_ingest(arguments_type_ const& arguments) noexcept {
 
 void ustore_database_describe(ustore_database_describe_t* arguments) { route(arguments); }
 void ustore_database_clear(ustore_database_clear_t* arguments) { route(arguments); }
-void ustore_database_compact(ustore_database_compact_t* arguments) { route(arguments); }
+void ustore_database_compact(ustore_database_compact_t* arguments) { route_compaction(arguments); }
+void ustore_database_compact_plan_finish(ustore_database_compact_plan_finish_t* arguments) {
+    route_compaction_finish(arguments);
+}
 void ustore_database_flush(ustore_database_flush_t* arguments) { route(arguments); }
 void ustore_snapshot_init(ustore_snapshot_init_t* arguments) { route(arguments); }
 void ustore_snapshot_save(ustore_snapshot_save_t* arguments) { route(arguments); }
@@ -285,7 +296,7 @@ void ustore_transaction_free(ustore_transaction_t transaction) {
 void ustore_ingest_free(ustore_ingest_t ingest) {
     if (!ingest) return;
     wait_named_calls(ingest->named_calls);
-    if (ingest->state) ingest->engine->database->ingest_free(ingest);
+    if (ingest->state) close_ingest(ingest);
     ustore_database_t const database = ingest->database;
     arena_free_blocks(ingest->scratch);
     delete ingest;

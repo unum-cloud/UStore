@@ -348,10 +348,24 @@ status_t ingest_init(ustore_ingest_init_t const& arguments, view_t const& view) 
     return {};
 }
 
+/** Appends the keyed or string rows of @p arguments to @p ingest along @p path, writing a sorted
+ *  append as runs and holding any other until the finish. */
+template <cpu_class_t cpu_class_, typename path_type_>
+status_t append_rows(ingest_state<cpu_class_>& ingest, path_type_& path, ustore_ingest_append_t const& arguments,
+                     strings_arg_t const& values) noexcept {
+    using strings_kit_t = typename nvme_variant<cpu_class_>::strings_kit_t;
+    auto [rows, rows_status] = utilities::keyed_rows_of(arguments, values);
+    if (rows_status.failed() || !rows.size()) return rows_status;
+    if constexpr (std::is_same_v<path_type_, sorted_keyed_ingest<strings_kit_t>>)
+        return write_deltas(ingest, path, rows);
+    else if constexpr (std::is_same_v<path_type_, held_keyed_ingest<strings_kit_t>>) return hold_deltas(path, rows);
+    else if constexpr (std::is_same_v<path_type_, sorted_strings_ingest_t>) return write_strings(ingest, path, rows);
+    else return hold_strings(path, rows);
+}
+
 /** Implements @c ustore_ingest_append, writing a sorted append as runs and holding any other until the finish. */
 template <cpu_class_t cpu_class_>
 status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t const& values, view_t const&) noexcept {
-    using strings_kit_t = typename nvme_variant<cpu_class_>::strings_kit_t;
     ingest_state<cpu_class_>& ingest = *state_of<ingest_state<cpu_class_>>(arguments.ingest);
     return std::visit(
         [&]<typename path_type_>(path_type_& path) noexcept -> status_t {
@@ -360,17 +374,7 @@ status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t co
                 if (edges_status.failed()) return edges_status;
                 return hold_edges(path, ingest.collection, edges);
             }
-            else {
-                auto [rows, rows_status] = utilities::keyed_rows_of(arguments, values);
-                if (rows_status.failed() || !rows.size()) return rows_status;
-                if constexpr (std::is_same_v<path_type_, sorted_keyed_ingest<strings_kit_t>>)
-                    return write_deltas(ingest, path, rows);
-                else if constexpr (std::is_same_v<path_type_, held_keyed_ingest<strings_kit_t>>)
-                    return hold_deltas(path, rows);
-                else if constexpr (std::is_same_v<path_type_, sorted_strings_ingest_t>)
-                    return write_strings(ingest, path, rows);
-                else return hold_strings(path, rows);
-            }
+            else return append_rows(ingest, path, arguments, values);
         },
         ingest.path);
 }

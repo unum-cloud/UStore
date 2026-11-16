@@ -603,6 +603,18 @@ struct ingest_outcome_t {
     status_t status;
 };
 
+/** Whether a store lays rows of @p row_type_ out as the runs of an ingest. */
+template <typename store_type_, typename row_type_>
+concept ingests_rows_concept = requires(
+    store_type_& store, utilities::io_channel_t& channel, std::span<row_type_ const> rows,
+    typename store_type_::ingest_runs_t& ingested) { store.write_ingest(channel, rows, ingested); };
+
+/** Whether a store weighs the memory a sealed commit of @p sealed_type_ leaves its memory runs. */
+template <typename store_type_, typename sealed_type_>
+concept weighs_memory_pressure_concept = requires(store_type_ const& store, sealed_type_ const& sealed) {
+    store.memory_pressure(sealed);
+};
+
 /**
  *  @brief Named collections of one database, the manifest that names them and the
  *      transactions they share.
@@ -1562,7 +1574,7 @@ class basic_database {
         io_channel_t& channel = guard.channel();
         return with_ingest_<status_t>(
             ingest, [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
-                if constexpr (requires { held.write_ingest(channel, rows, ingested); })
+                if constexpr (ingests_rows_concept<held_type_, row_type_>)
                     return held.write_ingest(channel, rows, ingested);
                 else return status_t {status_code_t::unsupported_k, "This collection's store ingests no such rows"};
             });
@@ -2431,8 +2443,8 @@ class basic_database {
                 collection_entry_t const* const found = entry_with_id_(collection_id);
                 if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
                 memory_pressure_t const pressure = std::visit(
-                    [&](auto const& collection) noexcept {
-                        if constexpr (requires { collection.memory_pressure(sealed); })
+                    [&]<typename collection_type_>(collection_type_ const& collection) noexcept {
+                        if constexpr (weighs_memory_pressure_concept<collection_type_, sealed_type_>)
                             return collection.memory_pressure(sealed);
                         else return memory_pressure_t::fits_k;
                     },

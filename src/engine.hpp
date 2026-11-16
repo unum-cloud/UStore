@@ -40,12 +40,13 @@
 
 #include "ustore/status.hpp" // `expected`, `status_t`
 
-#include "ustore/utilities/ram_buffers.hpp" // `host_blocks_t`, `cuda_blocks_t`, `hip_blocks_t`
+#include "ustore/utilities/ram_buffers.hpp" // `host_blocks_t`, `cuda_blocks_t`, `hip_blocks_t`, `metal_blocks_t`
 #include "ustore/utilities/ram_device.hpp"  // `claim_t`
-#include "ustore/utilities/vram_device.hpp" // `cuda_executor_t`, `hip_executor_t`
+#include "ustore/utilities/vram_device.hpp" // `cuda_executor_t`, `hip_executor_t`, `metal_executor_t`
 
-#include "utilities/batches.hpp" // `strings_arg_t`
-#include "vram/classes.hpp"      // `gpu_class_t`
+#include "utilities/arguments.hpp" // `names_database_concept`, `walks_cursor_concept`, `feeds_ingest_concept`
+#include "utilities/batches.hpp"   // `strings_arg_t`
+#include "vram/classes.hpp"        // `gpu_class_t`
 
 namespace unum::ustore {
 
@@ -56,6 +57,8 @@ using utilities::hip_blocks_t;
 using utilities::hip_executor_t;
 using utilities::host_blocks_t;
 using utilities::lent_pool_t;
+using utilities::metal_blocks_t;
+using utilities::metal_executor_t;
 using utilities::strings_arg_t;
 
 /** What a call reads through, decoded once by the router from its view, or from the transaction a write carries, and
@@ -129,6 +132,9 @@ enum class vendored_residency_t : std::uint8_t {
 
     /** One AMD device, fed by the host thread of a VRAM executor. */
     vram_amd_k,
+
+    /** One Apple device, fed by the host thread of a VRAM executor. */
+    vram_apple_k,
 };
 
 /** The executor the verbs of one device residency take. */
@@ -145,6 +151,11 @@ struct vendored_residency_executor<vendored_residency_t::vram_amd_k> {
     using type = hip_executor_t;
 };
 
+template <>
+struct vendored_residency_executor<vendored_residency_t::vram_apple_k> {
+    using type = metal_executor_t;
+};
+
 /** The executor the verbs of device residency @p residency_ take as their last argument. */
 template <vendored_residency_t residency_>
 using residency_executor = typename vendored_residency_executor<residency_>::type;
@@ -159,11 +170,49 @@ inline constexpr vendored_residency_t vendored_residency_of<cuda_executor_t> = v
 template <>
 inline constexpr vendored_residency_t vendored_residency_of<hip_executor_t> = vendored_residency_t::vram_amd_k;
 
+template <>
+inline constexpr vendored_residency_t vendored_residency_of<metal_executor_t> = vendored_residency_t::vram_apple_k;
+
+/** The kind of work a compaction does, valued as the C phases the router publishes. */
+enum class phase_t : std::uint8_t {
+    none_k = 0,
+    flush_k = 1,
+    merge_k = 2,
+    reclaim_k = 3,
+    done_k = 4,
+};
+
+namespace utilities {
+struct progress_ticks_t;
+} // namespace utilities
+
+using utilities::progress_ticks_t;
+
+/** The entries an engine's table gives every plan of one operation, over its engine plan behind a
+ *  @c void*. */
+struct plan_verbs {
+
+    /** Runs the plan's phases until it ends or @p ticks cancels at a barrier. */
+    status_t (*run)(void* plan, view_t const& runner, progress_ticks_t& ticks) noexcept;
+    ustore_phase_progress_t (*phase)(void const* plan) noexcept;
+
+    /** Stops the plan where it stands, keeping what its phases did, and answers the first failure
+     *  it met. */
+    status_t (*finish)(void* plan) noexcept;
+    void (*free)(void* plan) noexcept;
+};
+
 /** The database, snapshot, collection and transaction verbs every engine serves, on host threads alone. */
 struct database_verbs_t {
     status_t (*describe)(ustore_database_describe_t const&, view_t const&) noexcept;
     status_t (*clear)(ustore_database_clear_t const&, view_t const&) noexcept;
-    status_t (*compact)(ustore_database_compact_t const&, view_t const&) noexcept;
+
+    /** Opens the engine's compaction plan, reserving everything it keeps, the only allocation a
+     *  compaction makes. */
+    expected<void*> (*compact_plan_open)(ustore_database_compact_t const&, view_t const&) noexcept;
+
+    /** The entries every compaction plan of the engine runs through. */
+    plan_verbs compact_plan;
     status_t (*flush)(ustore_database_flush_t const&, view_t const&) noexcept;
     status_t (*snapshot_init)(ustore_snapshot_init_t const&, view_t const&) noexcept;
     status_t (*snapshot_save)(ustore_snapshot_save_t const&, view_t const&) noexcept;
@@ -416,12 +465,17 @@ struct engine_t {
     residency_tables<vendored_residency_t::vram_amd_k> vram_amd =
         unsupported_vram_tables<vendored_residency_t::vram_amd_k>;
 
+    /** The modality verbs on one Apple device. */
+    residency_tables<vendored_residency_t::vram_apple_k> vram_apple =
+        unsupported_vram_tables<vendored_residency_t::vram_apple_k>;
+
     /** The tables of the verbs served at @p residency_. */
     template <vendored_residency_t residency_>
     residency_tables<residency_> const& tables() const noexcept {
         if constexpr (residency_ == vendored_residency_t::host_k) return host;
         else if constexpr (residency_ == vendored_residency_t::vram_nvidia_k) return vram_nvidia;
-        else return vram_amd;
+        else if constexpr (residency_ == vendored_residency_t::vram_amd_k) return vram_amd;
+        else return vram_apple;
     }
 };
 
@@ -492,10 +546,10 @@ expected<made_handle<handle_type_, state_type_>> make_handle(engine_t const& eng
 /** The database a call addresses: the one it names, or the one its snapshot holds open. */
 template <typename arguments_type_>
 ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (requires { arguments.database; }) return arguments.database;
-    else if constexpr (requires { arguments.cursor->cursor.database; })
+    if constexpr (names_database_concept<arguments_type_>) return arguments.database;
+    else if constexpr (walks_cursor_concept<arguments_type_>)
         return arguments.cursor ? arguments.cursor->cursor.database : nullptr;
-    else if constexpr (requires { arguments.ingest->database; })
+    else if constexpr (feeds_ingest_concept<arguments_type_>)
         return arguments.ingest ? arguments.ingest->database : nullptr;
     else return arguments.snapshot ? arguments.snapshot->database : nullptr;
 }
@@ -658,9 +712,10 @@ struct nvme_placement_t {
  *  none. */
 nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept;
 
-/** Serves @p serve_ of an oracle, whose library may throw, turning whatever it throws into a status. */
+/** Serves @p serve_ of an oracle, whose library may throw, turning whatever it throws into a
+ *  status; each argument binds as the verb takes it, so a plan the verb fills stays writable. */
 template <auto serve_, typename... arguments_types_>
-status_t guarded(arguments_types_ const&... arguments) noexcept {
+status_t guarded(arguments_types_&... arguments) noexcept {
     try {
         return serve_(arguments...);
     }
@@ -693,23 +748,24 @@ constexpr entry_layout_t entry_layout_of(ustore_modality_t modality) noexcept {
 /** Every argument struct that names an executor, the inits, opens and views of the engines
  *  included, so a delegated call keeps its arguments by value. */
 using deferred_arguments_t = std::variant<
-    ustore_database_describe_t, ustore_database_clear_t, ustore_database_compact_t, ustore_database_flush_t,
-    ustore_snapshot_init_t, ustore_snapshot_save_t, ustore_collection_list_t, ustore_collection_create_t,
-    ustore_collection_find_t, ustore_collection_drop_t, ustore_transaction_init_t, ustore_transaction_stage_t,
-    ustore_transaction_commit_t, ustore_transaction_rollback_t, ustore_blobs_write_t, ustore_blobs_remove_t,
-    ustore_blobs_read_t, ustore_blobs_scan_t, ustore_blobs_sample_t, ustore_blobs_measure_t, ustore_strings_sample_t,
-    ustore_strings_measure_t, ustore_docs_measure_t, ustore_graph_sample_vertices_t, ustore_graph_measure_vertices_t,
-    ustore_pages_sample_t, ustore_pages_measure_t, ustore_docs_write_t, ustore_docs_read_t, ustore_docs_gist_t,
-    ustore_docs_gather_t, ustore_docs_remove_t, ustore_docs_scan_t, ustore_docs_sample_t, ustore_graph_read_edges_t,
-    ustore_graph_write_edges_t, ustore_graph_remove_edges_t, ustore_graph_write_vertices_t,
-    ustore_graph_remove_vertices_t, ustore_graph_scan_vertices_t, ustore_pages_import_t, ustore_pages_insert_t,
-    ustore_pages_remove_t, ustore_pages_move_t, ustore_pages_splice_t, ustore_pages_set_attributes_t,
-    ustore_pages_remove_attributes_t, ustore_pages_read_t, ustore_pages_scan_t, ustore_strings_write_t,
-    ustore_strings_remove_t, ustore_strings_read_t, ustore_strings_scan_t, ustore_blobs_cursor_next_t,
-    ustore_strings_cursor_next_t, ustore_docs_cursor_next_t, ustore_pages_cursor_next_t,
-    ustore_graph_vertices_cursor_next_t, ustore_changes_cursor_init_t, ustore_changes_cursor_next_t,
-    ustore_database_init_ram_t, ustore_database_open_ram_t, ustore_database_open_rocksdb_t,
-    ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t, ustore_database_open_nvme_t>;
+    ustore_database_describe_t, ustore_database_clear_t, ustore_database_compact_t,
+    ustore_database_compact_plan_finish_t, ustore_database_flush_t, ustore_snapshot_init_t, ustore_snapshot_save_t,
+    ustore_collection_list_t, ustore_collection_create_t, ustore_collection_find_t, ustore_collection_drop_t,
+    ustore_transaction_init_t, ustore_transaction_stage_t, ustore_transaction_commit_t, ustore_transaction_rollback_t,
+    ustore_blobs_write_t, ustore_blobs_remove_t, ustore_blobs_read_t, ustore_blobs_scan_t, ustore_blobs_sample_t,
+    ustore_blobs_measure_t, ustore_strings_sample_t, ustore_strings_measure_t, ustore_docs_measure_t,
+    ustore_graph_sample_vertices_t, ustore_graph_measure_vertices_t, ustore_pages_sample_t, ustore_pages_measure_t,
+    ustore_docs_write_t, ustore_docs_read_t, ustore_docs_gist_t, ustore_docs_gather_t, ustore_docs_remove_t,
+    ustore_docs_scan_t, ustore_docs_sample_t, ustore_graph_read_edges_t, ustore_graph_write_edges_t,
+    ustore_graph_remove_edges_t, ustore_graph_write_vertices_t, ustore_graph_remove_vertices_t,
+    ustore_graph_scan_vertices_t, ustore_pages_import_t, ustore_pages_insert_t, ustore_pages_remove_t,
+    ustore_pages_move_t, ustore_pages_splice_t, ustore_pages_set_attributes_t, ustore_pages_remove_attributes_t,
+    ustore_pages_read_t, ustore_pages_scan_t, ustore_strings_write_t, ustore_strings_remove_t, ustore_strings_read_t,
+    ustore_strings_scan_t, ustore_blobs_cursor_next_t, ustore_strings_cursor_next_t, ustore_docs_cursor_next_t,
+    ustore_pages_cursor_next_t, ustore_graph_vertices_cursor_next_t, ustore_changes_cursor_init_t,
+    ustore_changes_cursor_next_t, ustore_database_init_ram_t, ustore_database_open_ram_t,
+    ustore_database_open_rocksdb_t, ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t,
+    ustore_database_open_nvme_t>;
 
 /** The one call that holds a UStore executor, from its claim to its end. */
 struct holding_call_t {
@@ -744,8 +800,8 @@ inline utilities::pool_view_t view_of(
     return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
 }
 
-/** What one handle may use: the masks this machine runs when nothing is pinned, the pinned class's masks when it runs
- *  them, as @c pick_cpu_ceiling picks them once at open. */
+/** What one handle may use: the masks this machine runs, narrowed by a requested ceiling's, as
+ *  @c pick_cpu_ceiling picks them once at open. */
 struct cpu_ceiling_t {
     sz_capability_t strings = sz_cap_serial_k;
     fu::capabilities_t sync = fu::capabilities_unknown_k;
@@ -1153,27 +1209,26 @@ consteval std::size_t compiled_rungs(cpu_ladder<classes_...>) noexcept {
 static_assert(compiled_rungs(cpu_ladder_t {}) <= 1);
 #endif
 
-/** What a handle may use: the masks this machine runs when nothing is pinned, the pinned class's
- *  masks when it runs them, refusing an unknown class, one this machine does not run, or a ceiling
- *  the build compiled no class under, as a monoversioned build on an older CPU or under a pin below
- *  its one class. The one caller of StringZilla's and ForkUnion's detection. */
-inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t pinned) noexcept {
-    if (std::string_view {ustore_cpu_class_name(pinned)} == "unrecognized")
-        return status_t {status_code_t::invalid_argument_k, "Unknown CPU class"};
+/** What a handle may use: the masks this machine runs, intersected with the masks of
+ *  @p cpu_class_ceiling unless it is unknown, so a class the machine lacks narrows the pick rather
+ *  than refusing it. Refuses a value no class takes, or an intersection the build compiled no class
+ *  under, as a monoversioned build on an older CPU or under a ceiling below its one class. The one
+ *  caller of StringZilla's and ForkUnion's detection. */
+inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t cpu_class_ceiling) noexcept {
+    if (std::string_view {ustore_cpu_class_name(cpu_class_ceiling)} == "unrecognized")
+        return status_t {status_code_t::invalid_argument_k, "Unknown CPU class ceiling"};
     cpu_ceiling_t ceiling;
     if (sz_capabilities_detected_cpu(&ceiling.strings) != sz_success_k) ceiling.strings = sz_cap_serial_k;
     ceiling.sync = fu::cpu_capabilities();
-    if (pinned != ustore_cpu_class_unknown_k) {
-        cpu_class_t const pinned_class = static_cast<cpu_class_t>(pinned);
-        cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
-        if ((ceiling.strings & wanted.strings) != wanted.strings || (ceiling.sync & wanted.sync) != wanted.sync)
-            return status_t {status_code_t::unsupported_k, "The CPU does not run the pinned class"};
-        ceiling = wanted;
+    if (cpu_class_ceiling != ustore_cpu_class_unknown_k) {
+        cpu_class_t const capping_class = static_cast<cpu_class_t>(cpu_class_ceiling);
+        ceiling.strings = static_cast<sz_capability_t>(ceiling.strings & stringzilla_capabilities_of(capping_class));
+        ceiling.sync = static_cast<fu::capabilities_t>(ceiling.sync & forkunion_capabilities_of(capping_class));
     }
     bool const compiled = []<cpu_class_t... classes_>(cpu_ladder<classes_...>, cpu_ceiling_t under) noexcept {
         return ((cpu_class_compiled(classes_) && cpu_rung_fits(classes_, under)) || ...);
     }(cpu_ladder_t {}, ceiling);
-    if (!compiled) return status_t {status_code_t::unsupported_k, "The build compiled no class the CPU runs"};
+    if (!compiled) return status_t {status_code_t::unsupported_k, "The build compiled no class under the ceiling"};
     return ceiling;
 }
 
@@ -1308,6 +1363,32 @@ struct ustore_database_handle_t {
     /** The caller's hold plus one per transaction, snapshot or cursor keeping the database open,
      *  through the floor class's reference. */
     std::uint32_t holds = 1;
+
+    /** Held by the one compaction the database admits: a plan from its open to its finish, or a
+     *  call naming no plan while it runs. */
+    claim_t compaction = claim_t::free_k;
+
+    /** Ingests open on the database, from their init until their finish or free, through the floor
+     *  reference, so a clear they would outlast refuses rather than waits. */
+    std::uint32_t open_ingests = 0;
+};
+
+/** What @c ustore_database_compact_plan_t points to: the engine plan, the database and executor
+ *  every call naming it must name, and the count of those calls, which its free waits out. */
+struct ustore_database_compact_plan_handle_t {
+
+    /** The engine's plan, opened by the call that made the handle and freed with it. */
+    void* engine_plan = nullptr;
+
+    /** The database the plan compacts, whose compaction claim it holds until its finish, only ever
+     *  compared with the one each call passes. */
+    ustore_database_t opened_on = nullptr;
+
+    /** The executor the plan was opened with, which every call naming the plan names. */
+    ustore_executor_t opened_with = nullptr;
+
+    /** Executor calls naming the plan that have not ended, through the floor reference. */
+    std::uint32_t named_calls = 0;
 };
 
 /** What @c ustore_transaction_t points to: its engine and state, the database it keeps open, and the claim a call on
@@ -1370,9 +1451,9 @@ struct ustore_executor_handle_t {
     /** The memory domain of pool thread 0, holding the call's scratch and every arena made here. */
     fu_memory_domain_id_t memory_domain = 0;
 
-    /** Nothing beyond the pool on RAM, the rings' options on NVMe, the device's stream on VRAM of either vendor; the
-     *  variant is the kind tag, so no second word can disagree. */
-    std::variant<std::monostate, ustore_nvme_options_t, cuda_executor_t, hip_executor_t> device;
+    /** Nothing beyond the pool on RAM, the rings' options on NVMe, the device's stream on VRAM of
+     *  any vendor; the variant is the kind tag, so no second word can disagree. */
+    std::variant<std::monostate, ustore_nvme_options_t, cuda_executor_t, hip_executor_t, metal_executor_t> device;
 
     /** The class a VRAM executor's device was opened for, which every executor an engine spawns
      *  there takes too; @c unknown_k on RAM and NVMe. */

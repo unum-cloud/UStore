@@ -22,7 +22,7 @@
 #pragma once
 
 #include "ustore/blobs/nvme_compaction.hpp"        // `compaction_kind_t`, `compaction_output`
-#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `device_compactor`
 
 #include "ustore/utilities/vram_scan.cuh" // `chain_ticket`, `chain_offset`, `block_scanned_t`
 
@@ -483,8 +483,6 @@ __device__ inline void merge_strings_rank(strings_merge_run const* runs, std::ui
 
 #pragma region Sections
 
-using utilities::cuda_executor_t;
-
 /** A failure of the executor as a compaction's status. */
 inline st::status_t executor_status(status_t status) noexcept {
     return status.failed() ? st::status_t::unknown_k : st::status_t::success_k;
@@ -492,15 +490,15 @@ inline st::status_t executor_status(status_t status) noexcept {
 
 /** Carves @p count elements off @p executor's bounce for one merge, which the
  *  next merge rewinds. */
-template <typename element_type_>
-element_type_* carve_bounce(cuda_executor_t& executor, std::size_t count) noexcept {
+template <typename element_type_, utilities::gpu_executor_concept executor_type_>
+element_type_* carve_bounce(executor_type_& executor, std::size_t count) noexcept {
     auto [carved, status] = utilities::arena_allocate<element_type_>(executor.bounce(), count);
     return status.failed() ? nullptr : carved.data();
 }
 
 /** Queues uploading @p count elements from host @p source to device @p target on @p executor. */
-template <typename element_type_>
-st::status_t upload(cuda_executor_t& executor, element_type_* target, element_type_ const* source,
+template <typename element_type_, utilities::gpu_executor_concept executor_type_>
+st::status_t upload(executor_type_& executor, element_type_* target, element_type_ const* source,
                     std::size_t count) noexcept {
     if (count == 0) return st::status_t::success_k;
     std::span<element_type_ const> const host {source, count};
@@ -508,8 +506,8 @@ st::status_t upload(cuda_executor_t& executor, element_type_* target, element_ty
 }
 
 /** Queues downloading @p count elements from device @p source to host @p target on @p executor. */
-template <typename element_type_>
-st::status_t download(cuda_executor_t& executor, element_type_* target, element_type_ const* source,
+template <typename element_type_, utilities::gpu_executor_concept executor_type_>
+st::status_t download(executor_type_& executor, element_type_* target, element_type_ const* source,
                       std::size_t count) noexcept {
     if (count == 0) return st::status_t::success_k;
     std::span<element_type_> const host {target, count};
@@ -519,8 +517,8 @@ st::status_t download(cuda_executor_t& executor, element_type_* target, element_
 
 /** Queues kernel @p name of @p executor's bundle over @p items items, one thread each, as
  *  many blocks of @c merge_block_threads_k as cover them up to @p blocks_limit. */
-template <typename... argument_types_>
-st::status_t launch_over(cuda_executor_t& executor, char const* name, std::uint64_t items, std::uint64_t blocks_limit,
+template <utilities::gpu_executor_concept executor_type_, typename... argument_types_>
+st::status_t launch_over(executor_type_& executor, char const* name, std::uint64_t items, std::uint64_t blocks_limit,
                          argument_types_... arguments) noexcept {
     std::uint64_t const blocks = fu::min_of(divide_round_up(items, std::uint64_t {merge_block_threads_k}),
                                             blocks_limit);
@@ -617,8 +615,9 @@ constexpr std::size_t saved_words(sorted_run_index_view<key_slot_type_> const& v
 
 #pragma region Merge
 
+template <typename executor_type_>
 template <typename element_type_>
-element_type_* cuda_compactor_t::carve_(std::size_t count) noexcept {
+element_type_* device_compactor<executor_type_>::carve_(std::size_t count) noexcept {
     std::uint32_t const held = blocks_.count;
     expected<std::span<element_type_>> const carved = utilities::carve_runs<element_type_>(
         blocks_, *executor_, count, [&](std::size_t bytes) noexcept { return executor_->allocate_async(bytes); });
@@ -638,8 +637,9 @@ element_type_* cuda_compactor_t::carve_(std::size_t count) noexcept {
  *  changes, and which the bottom level does not apply onto its empty base, becomes one chain that @p device_fold
  *  composes with every other such chain at once. Every other chain folds on the host through @c fold_versions.
  */
-template <typename key_slot_type_, typename fold_type_, typename device_fold_type_, typename allocator_type_>
-st::status_t fold_survivors(cuda_executor_t& executor, utilities::device_blocks_t& blocks, compaction_kind_t kind,
+template <typename key_slot_type_, typename fold_type_, typename device_fold_type_, typename allocator_type_,
+          utilities::gpu_executor_concept executor_type_>
+st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t& blocks, compaction_kind_t kind,
                             compaction_stamps_t const& stamps, std::uint64_t sorted_runs_count,
                             std::uint64_t value_stride, located_key_slot<key_slot_type_> const* merged,
                             std::uint8_t const* flags, std::uint64_t merged_count, fold_type_ const& fold,
@@ -742,27 +742,27 @@ st::status_t fold_survivors(cuda_executor_t& executor, utilities::device_blocks_
     return status_t::success_k;
 }
 
+template <typename executor_type_>
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
           typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
-                                       std::span<sorted_run_index_view<key_slot_type_> const> upper,
-                                       std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                                       std::span<sorted_run_extents_t const> extents, sorted_run_bounds_t const& bounds,
-                                       compaction_stamps_t const& stamps, fold_type_ const& fold,
-                                       device_fold_type_ const& device_fold,
-                                       std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
-                                       compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
+st::status_t device_compactor<executor_type_>::compact(
+    compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
+    std::span<sorted_run_index_view<key_slot_type_> const> lower, std::span<sorted_run_extents_t const> extents,
+    sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, fold_type_ const& fold,
+    device_fold_type_ const& device_fold, std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
+    compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
     // A key slot the bundles carry no kernels for merges on the host.
     if constexpr (merge_kernel_names<key_slot_type_>::exported_k)
         return compact_on_device_(kind, upper, lower, extents, bounds, stamps, fold, device_fold, read_value, output);
     else return st::status_t::invalid_argument_k;
 }
 
+template <typename executor_type_>
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
           typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t cuda_compactor_t::compact_on_device_(
+st::status_t device_compactor<executor_type_>::compact_on_device_(
     compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
     std::span<sorted_run_index_view<key_slot_type_> const> lower, std::span<sorted_run_extents_t const> extents,
     sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, [[maybe_unused]] fold_type_ const& fold,

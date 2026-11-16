@@ -9,11 +9,18 @@
  *  The @c manifest and @c recover commands read the files of an NVMe database directly and open
  *  no engine: one prints the manifest a database is opened by, the other writes a fresh one from
  *  the runs alone.
+ *
+ *  Every flag defaults to its @c USTORE_<FLAG> variable. Each step of a long command prints at most
+ *  once a second how far it got. The first SIGINT or SIGTERM stops the command at its next barrier,
+ *  which keeps what it landed, removes what it was writing, and exits with 130; a second ends the
+ *  process at once.
  */
 
+#include <csignal> // `std::signal`, `std::sig_atomic_t`, `SIGINT`, `SIGTERM`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
-#include <cstdio>  // `stderr`
+#include <cstdio>  // `stderr`, `std::remove`
+#include <cstdlib> // `std::getenv`
 #include <cstring> // `std::memcpy`
 
 #include "ustore/types.h" // `USTORE_OS_WINDOWS_`
@@ -25,6 +32,7 @@
 #endif
 
 #include <array>        // `std::array`
+#include <chrono>       // `std::chrono::steady_clock`, `std::chrono::seconds`
 #include <filesystem>   // `std::filesystem::directory_iterator`, `std::filesystem::is_empty`
 #include <span>         // `std::span`
 #include <string_view>  // `std::string_view`
@@ -47,7 +55,7 @@
 #include "ustore/utilities/nvme_slots.hpp"     // `slot_owner_block_t`, `slot_bytes_k`, `slot_payload_offset_k`
 #include "ustore/utilities/nvme_volume.hpp"    // `parse_data_address`, `manifest_suffix_k`, `basic_slotted_volume`
 
-#include "arguments.hpp" // `parse_arguments`, `print_error`
+#include "arguments.hpp" // `parse_arguments`, `grammar`, `ustore_variable`, `read_engine_names`
 #include "dataset.h"     // `ustore_docs_import`, `ustore_docs_export`
 
 namespace unum::ustore::tools {
@@ -82,12 +90,64 @@ inline fmt::text_style style_of(tone_t tone, std::FILE* stream) noexcept {
     return {};
 }
 
+#pragma region Stopping and Progress
+
+/** Set by the first SIGINT or SIGTERM: every long command stops at its next barrier, keeps what it
+ *  landed, removes what it was writing, and the process exits with @ref exit_stopped_k. */
+inline volatile std::sig_atomic_t stop_requested = 0;
+
+/** The exit status of a command a signal stopped, as shells report a command SIGINT ended. */
+inline constexpr int exit_stopped_k = 130;
+
+/** Asks the command in hand to stop at its next barrier; only a flag is safe to touch here. */
+inline void request_stop(int) noexcept {
+    stop_requested = 1;
+    std::signal(SIGINT, SIG_DFL); // a second signal ends the process at once
+    std::signal(SIGTERM, SIG_DFL);
+}
+
+using phase_clock_t = std::chrono::steady_clock;
+
+/** The phase a command is in: what the shared progress handler prints, and what a stop names. */
+struct verb_phase_t {
+    std::string_view name;
+    std::string_view unit;
+    std::FILE* stream = stderr;
+    phase_clock_t::time_point printed {};
+};
+
+/** The handler every long command passes, the library's progress callback included: prints the
+ *  phase's advance at most once a second, without a total when the call knows none, and answers
+ *  cancel once a signal asked the process to stop. */
+inline ustore_continuation_t verb_progress(ustore_size_t completed, ustore_size_t total, void* state) noexcept {
+    verb_phase_t& phase = *static_cast<verb_phase_t*>(state);
+    phase_clock_t::time_point const now = phase_clock_t::now();
+    if (now - phase.printed >= std::chrono::seconds(1)) {
+        phase.printed = now;
+        if (total) fmt::println(phase.stream, "{}: {} of {} {}", phase.name, completed, total, phase.unit);
+        else fmt::println(phase.stream, "{}: {} {}", phase.name, completed, phase.unit);
+    }
+    return stop_requested ? ustore_cancel_k : ustore_continue_k;
+}
+
+/** Prints in which phase a signal stopped the command. */
+inline void verb_stopped(verb_phase_t const& phase) noexcept {
+    fmt::println(phase.stream, "stopped in {}", phase.name);
+}
+
+/** Whether @p outcome is the cancel a signal asked for, which ends a command without failing it. */
+[[nodiscard]] bool stopped(ustore_outcome_t const& outcome) noexcept {
+    return outcome.status == ustore_status_cancelled_k && stop_requested;
+}
+
+#pragma endregion Stopping and Progress
+
 /** The command words, printed between the synopsis and the flags. */
 constexpr std::string_view commands_k = R"(Commands:
   collection create --collection <name> [--modality <name>]
   collection drop --collection <name>
   collection list
-  collection import --input <file|-> --collection <name> [--modality <name>] [--ingest sorted|unsorted]
+  collection import --input <file|-> --collection <name> [--modality <name>] [--ingest <order>]
   collection import --input <file> --id-field <field> --memory-limit <size> --collection <name>
   collection export --output <file|-> --collection <name> [--alignment 64|4096] [--batch-rows <count>]
   collection export --output <file> --memory-limit <size> --collection <name>
@@ -102,7 +162,10 @@ import creates a missing collection, of the --modality given, the schema's ustor
 and '-' reads standard input or writes standard output. A snapshot export writes one <name>.arrow per collection into an
 empty directory, all at one snapshot, and a snapshot import recreates them on any engine. The manifest and recover
 commands read an NVMe database's files without opening it: manifest prints <database>.ustore.json, or the copy a raw
-address's manifest slot points at, and recover writes a fresh manifest naming every run found, each on level 0.)";
+address's manifest slot points at, and recover writes a fresh manifest naming every run found, each on level 0.
+
+Each step of a long command prints "<phase>: <completed> of <total> <unit>" at most once a second. The first SIGINT or
+SIGTERM stops it at its next barrier with "stopped in <phase>" and exit status 130; a second ends it at once.)";
 
 /** The names @c --format accepts, in the order of @c dataset_formats_k. */
 inline constexpr std::array<std::string_view, 5> format_names_k {"automatic", "ndjson", "csv", "arrows", "arrow"};
@@ -117,6 +180,9 @@ inline constexpr std::array<std::string_view, 2> alignment_names_k {"64", "4096"
 
 /** The alignment each name of @c alignment_names_k selects. */
 inline constexpr std::array<ustore_size_t, 2> alignments_k {64, 4096};
+
+/** The names @c --ingest accepts, in the order of @c ustore_dataset_ingestion_t. */
+inline constexpr std::array<std::string_view, 3> ingestion_names_k {"batched", "sorted", "unsorted"};
 
 #pragma region Parsing
 
@@ -171,8 +237,9 @@ struct command_line_t {
     /** How the input or output is spelled, one of @c format_names_k. */
     choice_t format {format_names_k};
 
-    /** Ingest an Arrow import as one commit of @c sorted or @c unsorted keys, or batch it when empty. */
-    std::string_view ingest;
+    /** How an Arrow import lands, one of @c ingestion_names_k: in batches, or as one commit of
+     *  sorted or unsorted keys. */
+    choice_t ingest {ingestion_names_k};
 
     /** Arrow buffer alignment of an export, one of @c alignment_names_k. */
     choice_t alignment {alignment_names_k};
@@ -210,12 +277,6 @@ struct command_line_t {
 
     if (object == "collection") {
         if (!argument.empty()) return "Too many arguments";
-        ustore_modality_t modality {};
-        if (!line.modality.empty() &&
-            ustore_modality_from_name(bytes_of(line.modality), &modality) != ustore_status_success_k)
-            return "The modality is none of blobs, docs, graph, strings or pages";
-        if (!line.ingest.empty() && line.ingest != "sorted" && line.ingest != "unsorted")
-            return "The ingest order is neither sorted nor unsorted";
         if (action == "create" || action == "drop") {
             if (line.collection.empty()) return "The collection name is missing";
             line.command = action == "create" ? command_t::collection_create_k : command_t::collection_drop_k;
@@ -229,7 +290,8 @@ struct command_line_t {
             if (line.input.empty() || line.collection.empty()) return "An import needs --input and --collection";
             if (is_text(line.format_of(line.input)) && (line.id_field.empty() || line.memory_limit.value == 0))
                 return "An NDJSON or CSV import also needs --id-field and --memory-limit";
-            if (is_text(line.format_of(line.input)) && !line.ingest.empty()) return "Only an Arrow import ingests";
+            if (is_text(line.format_of(line.input)) && line.ingest.selected != ustore_dataset_ingestion_batched_k)
+                return "Only an Arrow import ingests";
             line.command = command_t::collection_import_k;
             return nullptr;
         }
@@ -267,6 +329,20 @@ struct command_line_t {
         return nullptr;
     }
     return object.empty() ? "The command is missing" : "Unknown command";
+}
+
+/** Prints the one-line error of the first named flag of @p line whose text the C interface spells
+ *  nowhere, answering whether every one parses. */
+[[nodiscard]] bool names_parse(command_line_t const& line) noexcept {
+    engine_names_t names;
+    unnamed_flag_t unnamed = read_engine_names(line.engine, names);
+    ustore_modality_t modality {};
+    if (unnamed.flag.empty() && !line.modality.empty() &&
+        assign_named_(line.modality, modality, &ustore_modality_from_name) != argument_status_t::parsed_k)
+        unnamed = {"--modality", line.modality, "blobs, docs, graph, strings or pages"};
+    if (unnamed.flag.empty()) return true;
+    fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", unnamed.flag, unnamed.value, unnamed.grammar);
+    return false;
 }
 
 #pragma endregion Parsing
@@ -389,11 +465,16 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     if (!line.modality.empty()) ustore_modality_from_name(bytes_of(line.modality), &importing.modality);
     importing.path = bytes_of(line.input);
     importing.format = dataset_formats_k[line.format.selected];
-    importing.ingestion = line.ingest.empty()       ? ustore_dataset_ingestion_batched_k
-                          : line.ingest == "sorted" ? ustore_dataset_ingestion_sorted_k
-                                                    : ustore_dataset_ingestion_unsorted_k;
+    importing.ingestion = static_cast<ustore_dataset_ingestion_t>(line.ingest.selected);
     importing.written = &written;
+    verb_phase_t phase {.name = "import", .unit = "bytes"};
+    importing.progress = verb_progress;
+    importing.progress_state = &phase;
     ustore_dataset_import(&importing);
+    if (stopped(outcome)) {
+        verb_stopped(phase);
+        return true;
+    }
     if (failed(outcome)) {
         print_failure("Failed to import", outcome);
         return false;
@@ -406,6 +487,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 [[nodiscard]] bool export_arrow(ustore_database_t database, command_line_t const& line) noexcept {
     ustore_outcome_t outcome {};
     ustore_size_t written = 0;
+    verb_phase_t phase {.name = "export", .unit = "rows"};
     ustore_collection_id_t collection {};
     find_collection(database, line.collection, collection, &outcome);
     if (!failed(outcome)) {
@@ -418,7 +500,13 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
         exporting.alignment = alignments_k[line.alignment.selected];
         exporting.batch_rows = line.batch_rows.value;
         exporting.written = &written;
+        exporting.progress = verb_progress;
+        exporting.progress_state = &phase;
         ustore_dataset_export(&exporting);
+    }
+    if (stopped(outcome)) {
+        verb_stopped(phase);
+        return true;
     }
     if (failed(outcome)) {
         print_failure("Failed to export", outcome);
@@ -431,6 +519,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 /** Imports the documents of the file @p line names into the collection it names. */
 [[nodiscard]] bool import_documents(ustore_database_t database, command_line_t const& line) noexcept {
     ustore_outcome_t outcome {};
+    verb_phase_t phase {.name = "import", .unit = "bytes"};
     ustore_collection_id_t collection {};
     find_collection(database, line.collection, collection, &outcome);
     if (!failed(outcome)) {
@@ -441,7 +530,13 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
         importing.path = bytes_of(line.input);
         importing.max_batch_size = line.memory_limit.value;
         importing.id_field = bytes_of(line.id_field);
+        importing.progress = verb_progress;
+        importing.progress_state = &phase;
         ustore_docs_import(&importing);
+    }
+    if (stopped(outcome)) {
+        verb_stopped(phase);
+        return true;
     }
     if (failed(outcome)) {
         print_failure("Failed to import", outcome);
@@ -454,6 +549,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 /** Exports the collection @p line names into the file it names. */
 [[nodiscard]] bool export_documents(ustore_database_t database, command_line_t const& line) noexcept {
     ustore_outcome_t outcome {};
+    verb_phase_t phase {.name = "export", .unit = "documents"};
     ustore_collection_id_t collection {};
     find_collection(database, line.collection, collection, &outcome);
     if (!failed(outcome)) {
@@ -463,7 +559,13 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
         exporting.collection = collection;
         exporting.path = bytes_of(line.output);
         exporting.max_batch_size = line.memory_limit.value;
+        exporting.progress = verb_progress;
+        exporting.progress_state = &phase;
         ustore_docs_export(&exporting);
+    }
+    if (stopped(outcome)) {
+        verb_stopped(phase);
+        return true;
     }
     if (failed(outcome)) {
         print_failure("Failed to export", outcome);
@@ -482,14 +584,21 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     init.outcome = &outcome;
     init.snapshot = &snapshot;
     ustore_snapshot_init(&init);
+    verb_phase_t phase {.name = "save", .unit = "bytes"};
     if (!failed(outcome)) {
         ustore_snapshot_save_t saving {};
         saving.snapshot = snapshot;
         saving.outcome = &outcome;
         saving.path = bytes_of(path);
+        saving.progress = verb_progress;
+        saving.progress_state = &phase;
         ustore_snapshot_save(&saving);
     }
     ustore_snapshot_free(snapshot);
+    if (stopped(outcome)) {
+        verb_stopped(phase);
+        return true;
+    }
     if (failed(outcome)) {
         print_failure("Failed to save the snapshot", outcome);
         return false;
@@ -518,6 +627,9 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
  *
  *  A name that cannot stand as a file name, or that clashes on a case-insensitive filesystem, takes the collection's
  *  identifier instead; the schema keeps the name either way.
+ *
+ *  Each file lands whole from a temporary beside it, and a stop or a failure removes every file
+ *  the export landed, so no partial export stays behind.
  */
 [[nodiscard]] bool export_snapshot(ustore_database_t database, std::string_view path) noexcept {
     std::error_code error;
@@ -550,8 +662,15 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     list.arena = arena;
     if (!failed(outcome)) ustore_collection_list(&list);
 
+    verb_phase_t collections {.name = "export", .unit = "collections"};
+    verb_phase_t rows {.name = "export", .unit = "rows"};
+    st::vector<sz::string_t> written;
     std::size_t exported = 0, unnamed = 0;
     for (std::size_t index = 0; !failed(outcome) && index != listed; ++index) {
+        if (verb_progress(index, listed, &collections) == ustore_cancel_k) {
+            outcome = {ustore_status_cancelled_k, "Stopped between collections"};
+            break;
+        }
         std::string_view const name = string_of(tape_string(names, index));
         if (name.empty()) {
             ++unnamed;
@@ -575,10 +694,27 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
         exporting.collection_name = bytes_of(name);
         exporting.path = bytes_of(std::string_view {file});
         exporting.format = ustore_dataset_format_arrow_file_k;
+        exporting.progress = verb_progress;
+        exporting.progress_state = &rows;
         ustore_dataset_export(&exporting);
-        exported += !failed(outcome);
+        if (failed(outcome)) break;
+        ++exported;
+        // Only a landed file joins the ones a later stop or failure removes, as a refused export
+        // removed its own temporary and left the target alone
+        if (!st::succeeded(written.push_back(sz::string_t {})) ||
+            written.back().assign(sz::string_view_t {file.view()}) != sz::status_t::success_k) {
+            [[maybe_unused]] int const removed = std::remove(file.c_str());
+            outcome = {ustore_status_out_of_memory_k, "Failed to record the path of a collection's file"};
+        }
     }
     ustore_snapshot_free(snapshot);
+    if (failed(outcome))
+        for (sz::string_t const& file : written) [[maybe_unused]]
+            int const removed = std::remove(file.c_str());
+    if (stopped(outcome)) {
+        verb_stopped(collections);
+        return true;
+    }
     if (failed(outcome)) {
         print_failure("Failed to export the snapshot", outcome);
         return false;
@@ -590,7 +726,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 
 /** Imports every <tt>.arrow</tt> file of the directory @p path into the collection its schema names, created when
  *  missing, as one sorted ingest where the engine ingests, since an export writes keys in order, and in batches
- *  otherwise. */
+ *  otherwise. A stop keeps the collections imported before it. */
 [[nodiscard]] bool import_snapshot(ustore_database_t database, std::string_view path) noexcept {
     std::error_code error;
     st::vector<sz::string_t> files;
@@ -610,7 +746,13 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     }
     ustore_outcome_t outcome {};
     std::size_t imported = 0;
+    verb_phase_t collections {.name = "import", .unit = "files"};
+    verb_phase_t bytes {.name = "import", .unit = "bytes"};
     for (sz_size_t const position : order) {
+        if (verb_progress(imported, files.size(), &collections) == ustore_cancel_k) {
+            verb_stopped(collections);
+            return true;
+        }
         sz::string_t const& file = files[position];
         ustore_dataset_import_t importing {};
         importing.database = database;
@@ -618,12 +760,18 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
         importing.path = bytes_of(std::string_view {file});
         importing.format = ustore_dataset_format_arrow_file_k;
         importing.ingestion = ustore_dataset_ingestion_sorted_k;
+        importing.progress = verb_progress;
+        importing.progress_state = &bytes;
         ustore_dataset_import(&importing);
         // An engine that ingests no stream refuses before landing anything, so the file goes in batches instead
         if (outcome.status == ustore_status_unsupported_k) {
             outcome = {};
             importing.ingestion = ustore_dataset_ingestion_batched_k;
             ustore_dataset_import(&importing);
+        }
+        if (stopped(outcome)) {
+            verb_stopped(bytes);
+            return true;
         }
         if (failed(outcome)) {
             fmt::println(stderr, style_of(tone_t::failure_k, stderr), "Failed to import {}: {}",
@@ -826,14 +974,18 @@ expected<bool> read_run_header(native_file_t file, std::uint64_t offset, blobs::
     return header.magic == blobs::sorted_run_magic_k && header.format_version == blobs::sorted_run_format_version_k;
 }
 
+/** The status a recovery answers once a signal asked it to stop, which writes no manifest. */
+inline status_t stopped_recovery() noexcept { return {status_code_t::cancelled_k, "Stopped before the manifest"}; }
+
 /** Adds every run file of the database in the directory @p location, data directory @p medium,
- *  to @p recovery. */
+ *  to @p recovery, stopping between files once a signal asks. */
 status_t recover_directory(recovery_t& recovery, std::string_view location, std::uint16_t medium) noexcept {
     char directory[path_max_bytes_k];
     if (status_t const copied = terminated(location, directory); copied.failed()) return copied;
     status_t first;
     status_t const listed = list_directory(directory, [&](std::string_view name) noexcept {
         uuid128_t const run = recovery.manifest.run_of(name);
+        if (stop_requested && first.succeeded()) first = stopped_recovery();
         if (!run.is_valid() || first.failed()) return;
         char file_name[path_max_bytes_k], path[path_max_bytes_k];
         if (status_t const copied = terminated(name, file_name); copied.failed()) {
@@ -869,7 +1021,8 @@ status_t recover_directory(recovery_t& recovery, std::string_view location, std:
 }
 
 /** Adds every run in the slots the database holds on the raw medium at @p address to @p recovery,
- *  reading the database's ID from data directory 0's manifest slot when @p medium is zero. */
+ *  reading the database's ID from data directory 0's manifest slot when @p medium is zero, and
+ *  stopping between slots once a signal asks. */
 status_t recover_raw(recovery_t& recovery, data_address_t const& address, std::uint16_t medium) noexcept {
     char path[path_max_bytes_k];
     if (status_t const copied = terminated(address.location, path); copied.failed()) return copied;
@@ -880,6 +1033,10 @@ status_t recover_raw(recovery_t& recovery, data_address_t const& address, std::u
     if (address.byte_limit != 0 && address.byte_limit < usable) usable = address.byte_limit;
     status_t result;
     for (std::uint64_t slot = 0; result.succeeded() && slot != usable / slot_bytes_k; ++slot) {
+        if (stop_requested) {
+            result = stopped_recovery();
+            break;
+        }
         std::uint64_t const base = address.byte_base + slot * slot_bytes_k;
         auto [owner, owner_status] = read_owner_block(file, base);
         if (owner_status.failed()) {
@@ -982,9 +1139,9 @@ status_t read_collections_run(recovery_volume_t& volume, io_channel_t& channel, 
 
 /** Reads the newest record of every collection from the runs of the collections system collection
  *  @p recovery found, registering each run's file, or the raw medium holding it, on one blocking
- *  disk in turn. */
+ *  disk in turn, reporting each run into @p phase and stopping between runs once a signal asks. */
 status_t read_collections_records(recovery_t const& recovery, std::span<data_address_t const> addresses,
-                                  st::vector<collections_version_t>& newest) noexcept {
+                                  st::vector<collections_version_t>& newest, verb_phase_t& phase) noexcept {
     resource_constraint<fu::standard_atomic_ref> budget {unlimited_resource_k};
     auto [device, device_status] = blocking_files_device_t::make(file_buffering_t::buffered_k);
     if (device_status.failed()) return device_status;
@@ -1003,6 +1160,10 @@ status_t read_collections_records(recovery_t const& recovery, std::span<data_add
     status_t result = channels_status;
     recovery_volume_t volume {&disk};
     for (std::size_t index = 0; result.succeeded() && index != recovery.runs.size(); ++index) {
+        if (verb_progress(index, recovery.runs.size(), &phase) == ustore_cancel_k) {
+            result = stopped_recovery();
+            break;
+        }
         found_run_t const& found = recovery.runs[index];
         if (found.header.collection != collections_collection_uuid_k) continue;
         char path[path_max_bytes_k];
@@ -1056,11 +1217,12 @@ status_t read_collections_records(recovery_t const& recovery, std::span<data_add
  *
  *  The two system collections take the records the engine opens them with, when runs of theirs were
  *  found. A run of a collection the records list as dropped, which a crash left behind, or never
- *  list at all is left out with a note.
+ *  list at all is left out with a note. Each run read is reported into @p phase.
  */
-status_t assign_collections(recovery_t& recovery, std::span<data_address_t const> addresses) noexcept {
+status_t assign_collections(recovery_t& recovery, std::span<data_address_t const> addresses,
+                            verb_phase_t& phase) noexcept {
     st::vector<collections_version_t> newest;
-    if (status_t const read = read_collections_records(recovery, addresses, newest); read.failed()) return read;
+    if (status_t const read = read_collections_records(recovery, addresses, newest, phase); read.failed()) return read;
     manifest_t& manifest = recovery.manifest;
     for (found_run_t const& found : recovery.runs) {
         uuid128_t const& id = found.header.collection;
@@ -1149,7 +1311,7 @@ status_t publish_raw_manifest(data_address_t const& address, std::span<char cons
 }
 
 /** Rebuilds the manifest of the database @p line names from its runs, every one on level 0,
- *  and publishes it. */
+ *  and publishes it; a stop before the publication writes nothing. */
 [[nodiscard]] bool recover_database(command_line_t const& line) noexcept {
     recovery_t recovery;
     manifest_t& manifest = recovery.manifest;
@@ -1183,10 +1345,22 @@ status_t publish_raw_manifest(data_address_t const& address, std::span<char cons
                                                 "The database has a manifest; move it away to recover"};
         manifest.id = uuid_generator();
     }
-    for (std::size_t index = 0; status.succeeded() && index != addresses.size(); ++index)
-        status = raw ? recover_raw(recovery, addresses[index], static_cast<std::uint16_t>(index))
-                     : recover_directory(recovery, addresses[index].location, static_cast<std::uint16_t>(index));
-    if (status.succeeded()) status = assign_collections(recovery, std::span<data_address_t const> {addresses});
+    verb_phase_t scan {.name = "scan", .unit = "data directories"};
+    verb_phase_t read {.name = "read", .unit = "runs"};
+    for (std::size_t index = 0; status.succeeded() && index != addresses.size(); ++index) {
+        if (verb_progress(index, addresses.size(), &scan) == ustore_cancel_k) status = stopped_recovery();
+        else if (raw) status = recover_raw(recovery, addresses[index], static_cast<std::uint16_t>(index));
+        else status = recover_directory(recovery, addresses[index].location, static_cast<std::uint16_t>(index));
+    }
+    if (status == status_code_t::cancelled_k) {
+        verb_stopped(scan);
+        return true;
+    }
+    if (status.succeeded()) status = assign_collections(recovery, std::span<data_address_t const> {addresses}, read);
+    if (status == status_code_t::cancelled_k) {
+        verb_stopped(read);
+        return true;
+    }
 
     st::vector<char> json;
     if (status.succeeded()) status = manifest.print(st::default_allocator<byte_t> {}, json);
@@ -1237,57 +1411,72 @@ int main(int argc, char* argv[]) {
     std::array<flag_t, 15> const flags {{
         {"--directory", "path", "database directory, required", &line.directory},
         {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &line.engine.name},
-        {"--isolation", "name", "isolation of the transactions of ram", &line.engine.isolation},
-        {"--engine-transport", "name", "transport of nvme", &line.engine.transport},
+        {"--isolation", "name", "isolation of ram: strict-serializable or snapshot", &line.engine.isolation},
+        {"--engine-transport", "name", "transport of nvme, like blocking or linux-uring", &line.engine.transport},
         {"--collection", "name", "collection a command acts on", &line.collection},
         {"--input", "file", "file a collection import reads, or '-' for standard input", &line.input},
         {"--output", "file", "file a collection export writes, or '-' for standard output", &line.output},
         {"--id-field", "field", "field holding the keys of imported documents", &line.id_field},
-        {"--memory-limit", "size", "bytes an import or export buffers per batch, like 64MB", &line.memory_limit},
+        {"--memory-limit", "bytes", "bytes an import or export buffers per batch, like 64M", &line.memory_limit},
         {"--modality", "name", "what a created collection holds: blobs, docs, graph, strings or pages", &line.modality},
-        {"--format", "name", "how the input or output is spelled, where '-' is sniffed", &line.format},
-        {"--ingest", "order", "ingest as one commit: sorted or unsorted keys", &line.ingest},
-        {"--alignment", "bytes", "Arrow buffer alignment of an export", &line.alignment},
+        {"--format", "name", "automatic, ndjson, csv, arrows or arrow, where '-' is sniffed", &line.format},
+        {"--ingest", "order", "how an Arrow import lands: batched, sorted or unsorted", &line.ingest},
+        {"--alignment", "bytes", "Arrow buffer alignment of an export: 64 or 4096", &line.alignment},
         {"--batch-rows", "count", "most rows per Arrow batch of an export", &line.batch_rows},
         {"--database", "name", "NVMe database a manifest or a recovery names", &line.database},
     }};
-    // A recovery takes every data directory as a positional, so there is room for every argument
-    st::vector<std::string_view> positionals;
-    if (positionals.resize(static_cast<std::size_t>(argc)) != st::status_t::success_k) return 1;
-    arguments_t const parsed = parse_arguments(argc, argv, flags, std::span<std::string_view> {positionals});
 
     char synopsis[4096 + commands_k.size()];
     auto const written = fmt::format_to_n(synopsis, sizeof(synopsis) - 1,
                                           "{} --directory <path> <command> [flags]\n\n{}", argv[0], commands_k);
     *written.out = '\0';
 
+    for (flag_t const& flag : flags) {
+        sz::string_t const variable = ustore_variable(flag);
+        char const* const value = std::getenv(variable.c_str());
+        if (!value || !*value || assign_variable_(flag, value) == argument_status_t::parsed_k) continue;
+        fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", variable, value, grammar(flag));
+        return 1;
+    }
+    // A recovery takes every data directory as a positional, so there is room for every argument
+    st::vector<std::string_view> positionals;
+    if (positionals.resize(static_cast<std::size_t>(argc)) != st::status_t::success_k) return 1;
+    arguments_t const parsed = parse_arguments(argc, argv, flags, std::span<std::string_view> {positionals});
     if (parsed.status == argument_status_t::help_k) {
         print_usage(synopsis, flags);
         return 0;
     }
     if (parsed.status != argument_status_t::parsed_k) {
-        print_error(parsed);
+        if (!parsed.flag) fmt::println(stderr, "{} is not a flag, see --help", parsed.argument);
+        else
+            fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", parsed.flag->name, parsed.value,
+                         grammar(*parsed.flag));
         return 1;
     }
+    if (!names_parse(line)) return 1;
     char const* problem = parse_command({positionals.data(), parsed.positionals_count}, line);
     if (!problem && line.directory.empty() && !line.opens_no_engine()) problem = "The --directory flag is required";
     if (problem) {
-        fmt::println(stderr, "{}\n", problem);
-        print_usage(synopsis, flags);
-        return 1;
-    }
-    if (line.opens_no_engine()) return execute(nullptr, line) ? 0 : 1;
-
-    ustore_database_t database = nullptr;
-    ustore_outcome_t outcome {};
-    line.engine.locate(line.directory.data());
-    open_engine(line.engine, &database, &outcome);
-    if (failed(outcome)) {
-        print_failure("Failed to open the database", outcome);
+        fmt::println(stderr, "{}, see --help", problem);
         return 1;
     }
 
-    bool const succeeded = execute(database, line);
-    ustore_database_free(database);
-    return succeeded ? 0 : 1;
+    std::signal(SIGINT, request_stop);
+    std::signal(SIGTERM, request_stop);
+    bool succeeded = false;
+    if (line.opens_no_engine()) succeeded = execute(nullptr, line);
+    else {
+        ustore_database_t database = nullptr;
+        ustore_outcome_t outcome {};
+        line.engine.locate(line.directory.data());
+        open_engine(line.engine, &database, &outcome);
+        if (failed(outcome)) {
+            print_failure("Failed to open the database", outcome);
+            return 1;
+        }
+        succeeded = execute(database, line);
+        ustore_database_free(database);
+    }
+    if (!succeeded) return 1;
+    return stop_requested ? exit_stopped_k : 0;
 }

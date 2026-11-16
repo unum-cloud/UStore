@@ -34,7 +34,7 @@ One library serves both isolation levels: the `isolation` field of `ustore_datab
 
 Snapshots map onto the versions the store already keeps.
 `ustore_database_init_ram` starts a database in memory alone, while one `ustore_database_open_ram` serves persists in its directory as one binary image, rewritten whole on a flushed commit and on close.
-A compaction merges one collection per unit, vacuuming its store as a fresh stamp lists it, the merges running at once on the threads of the executor, then reclaims in one more unit, freeing the retired stores and rewriting the image, and a save writes the snapshot's collections as an image into the directory it names, removing `ram.image.tmp` when cancelled.
+A compaction merges with one task per collection, vacuuming its store as a fresh stamp lists it, the tasks running at once on the threads of the executor, then reclaims in one more task, freeing the retired stores and rewriting the image, and a save writes the snapshot's collections as an image into the directory it names, removing `ram.image.tmp` when cancelled.
 
 ## RocksDB
 
@@ -50,7 +50,7 @@ This is one design for durability and two-phase commits rather than the settled 
 `ustore_database_view_rocksdb` opens a directory through `DB::OpenForReadOnly` instead, with the data directories the database was opened with, since RocksDB finds table files placed outside the directory only through them.
 The router refuses every call that would change such a database with `ustore_status_read_only_k` before the engine sees it.
 A snapshot records the handle of every family it sees, and a family dropped while a snapshot is open stays retired until the last snapshot is freed, so a save copies exactly the snapshot's collections and names.
-A compaction flushes every family, the flushes running at once on the threads of the executor and each weighing the bytes of its memtables, then compacts them one at a time in the same order, each weighing the bytes of its memtables and table files, skipping a family dropped meanwhile.
+A compaction flushes every family, then compacts each one's whole key range, one task per family in each phase, the tasks running at once on the threads of the executor while RocksDB runs one exclusive manual compaction at a time, each weighing the bytes RocksDB estimates when its phase is listed, of its memtables for the flush and of its memtables and table files for the merge, and skipping a family dropped meanwhile.
 
 ## LevelDB
 
@@ -69,7 +69,7 @@ Every collection a call names resolves through `_collections` first, so no call 
 A create writes the collections entry and the name in one synced batch.
 A drop removes the entry and the name first, synced, and then the collection's run, so a crash leaves an unlisted run rather than a listed empty collection.
 Its isolation stops at reading from a snapshot, whose read stamp reads zero, as LevelDB keeps sequence numbers private.
-A description reports zero keys, since LevelDB keeps no count, and a compaction compacts one collection's run at a time, in key order.
+A description reports zero keys, since LevelDB keeps no count, and a compaction's merge repeats once per collection's run, in key order, the system collections last, as LevelDB runs one manual compaction at a time.
 A save copies the snapshot into a new database a memtable-sized batch at a time, and destroys that database when cancelled.
 
 ## NVMe
@@ -134,9 +134,9 @@ A call without an executor works in a scratch of its own on the calling thread, 
 An arena, made by `ustore_arena_init` on host pages or on the device of its executor, every transaction handle and every cursor carry a claim word, which the router takes before a call and releases once the engine returns, so a second call on any of them is refused as contended.
 The router refuses a `NULL` arena and an arena living where the call's executor does not compute, serves every call through the verb table of its executor's residency, `engine_t::host` or `engine_t::vram_nvidia`, leaves every output of a call `NULL` or zero until the engine writes it, and again after a failure or a cancellation, and refuses to reset a transaction through a database it does not belong to.
 Every handle carries an `access`, and the router refuses every call naming a transaction, collection creates and drops, clears and compactions with `ustore_status_read_only_k` on a database `ustore_database_view_rocksdb` opened.
-A compaction is a plan: the engine's `compact_open` lists its units once, the plan's only allocation, and `compact_advance` runs one by its index, while the router's `drive_compaction` fans a run of concurrent units of one phase out over the executor's pool, reports after each unit, starts none after a cancel and marks each one done, so a live plan resumes past every unit that ran.
-NVMe compacts in a flush, then merge rounds over every level, each a unit run alone on the call's thread, since a round fans its own merge out over the pool.
-The router refuses a compaction and a plan's finish before taking any claim, so `uninitialized`, `invalid_argument`, `read_only` and `unsupported` come ahead of `contended`; a database's `compaction` claim admits one plan from its open to its finish, or one call naming no plan while it runs, and a plan's own claim makes its finish wait for the call continuing it.
+A compaction is a plan: each engine's `compact_plan_t` carries `tasks()`, `run(task, context)`, `advance()` and `finish()`, as USearch's refine plan does, its `compact_plan_open` reserving everything the plan keeps, the plan's only allocation, and `run_plan` of `src/utilities/progress.hpp` fans each phase's tasks out over the executor's pool, then ticks the phase's units at its barrier, where a cancel stops, so a live plan resumes at the phase it reached and runs its idempotent tasks again after a failure.
+NVMe compacts in a flush, then up to `compaction_passes_k` merge passes over every level, each one task run on the call's thread, since the store flushes and merges every collection under its one claim and a pass fans its own merge out over the pool.
+The router refuses a compaction and a plan's finish before taking any claim, so `uninitialized`, `invalid_argument`, `read_only` and `unsupported` come ahead of `contended`; a database's `compaction` claim admits one plan from its open to its finish, or one call naming no plan while it runs, and a plan's `named_calls` makes its finish wait for the call continuing it.
 Every handle, arenas and ingests included, counts the calls naming it in `named_calls`, raised at the call's claim and lowered at its end, with or without an executor, and each free waits for zero, so no binding keeps counts of its own.
 A transaction, a snapshot and a cursor each hold their database open, and a cursor also holds the transaction or snapshot it reads through, so every free drops one hold and the last one frees the handle through its engine.
 `ustore_executor_drain` waits until the claim is free, then parks an owned pool for `ustore_mood_parked_k`, and `ustore_executor_free` waits the same way before freeing the scratch.

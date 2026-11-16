@@ -34,7 +34,7 @@
 #include "ustore/blobs/nvme_database.hpp"              // `basic_database`, `lookup_result_t`
 #include "ustore/blobs/nvme_transactions.hpp"          // `watch_schedule_t`
 #include "ustore/blobs/nvme_tree.hpp"                  // `user_collection_config_t`, `validate`
-#include "ustore/blobs/vram_nvidia_compaction.hpp"     // `cuda_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp"     // `cuda_compactor_t`, `hip_compactor_t`
 #include "ustore/docs/nvme_store.hpp"                  // `docs::nvme_store`
 #include "ustore/graph/nvme_store.hpp"                 // `graph::nvme_store`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
@@ -292,6 +292,9 @@ struct nvme_variant {
     /** The verbs of this class's pages collections. */
     static pages_verbs<vendored_residency_t::host_k> const pages_verbs_k;
 
+    /** One compaction of a database of this class in flight. */
+    struct compact_plan_t;
+
     /** The table every handle the open of this class hands out is stamped with. */
     static engine_t const engine_k;
 
@@ -303,9 +306,11 @@ struct nvme_variant {
  *  @brief The device merges of a store of @p cpu_class_: an executor of their own on the device of the caller's, what
  *      reads run sections into device memory over a cuFile disk of its own, and the compactor over both.
  *
- *  Sections read by DMA where the executor's GPUDirect Storage mode allows it and cuFile reaches the device, since
- *  compat mode bounces through host pages, slower than uploading the indexes the runs already hold in memory. The
- *  members die in reverse, the compactor first, so it frees its scratch while the reader and the executor live.
+ *  Sections read by DMA on an NVIDIA device where the executor's GPUDirect Storage mode allows it
+ *  and cuFile reaches the device, since compat mode bounces through host pages, slower than
+ *  uploading the indexes the runs already hold in memory; an AMD device uploads them from memory
+ *  alone. The members die in reverse, the compactor first, so it frees its scratch while the
+ *  reader and the executor live.
  */
 template <cpu_class_t cpu_class_>
 class device_compaction {
@@ -318,10 +323,11 @@ class device_compaction {
     device_compaction(device_compaction const&) = delete;
     device_compaction& operator=(device_compaction const&) = delete;
 
-    /** Spawns the executor on the device @p compactions computes on, and on an NVIDIA one opens
-     *  the reader over @p volume, mounted over the data directories of @p resources, and binds
-     *  the compactor over both; an AMD device binds no compactor yet, so a merge placed on it
-     *  answers @c unsupported_k. */
+    /** Spawns the executor on the device @p compactions computes on and binds the compactor over
+     *  it, refusing with @c unsupported_k where the device loaded no bundle of the library's
+     *  kernels; on an NVIDIA device the compactor reads run sections through the reader over
+     *  @p volume, mounted over the data directories of @p resources, and on an AMD one it uploads
+     *  them from memory. */
     status_t open(ustore_executor_handle_t const& compactions, resources_config_t const& resources,
                   volume_t const& volume) noexcept {
         hip_executor_t const* const amd = std::get_if<hip_executor_t>(&compactions.device);
@@ -338,21 +344,42 @@ class device_compaction {
                                                    caller ? caller->gds() : ustore_gds_compatibility_k, executor_);
             spawned.failed())
             return spawned;
-        if (amd) return {};
-        cuda_executor_t* const executor = &std::get<cuda_executor_t>(executor_);
-        if (status_t const opened = open_sections(drivers.cufile, executor->gds(), resources, volume); opened.failed())
-            return opened;
-        expected<cuda_compactor_t> made = cuda_compactor_t::make(
-            *executor, sections_ ? device_sections_reader_t {&sections_.value()} : device_sections_reader_t {});
-        if (!made) return made.status();
-        compactor_.emplace(std::move(*made));
-        return {};
+        return std::visit([&](auto& executor) noexcept { return bind_(executor, drivers, resources, volume); },
+                          executor_);
     }
 
-    /** The compactor every merge runs on, once @c open bound it. */
-    cuda_compactor_t* compactor() noexcept { return compactor_ ? &compactor_.value() : nullptr; }
+    /** The compactor every merge runs on: the device one @c open bound, or the host's before. */
+    compactor_ref_t compactor() noexcept {
+        return std::visit(
+            []<typename compactor_type_>(compactor_type_& compactor) noexcept -> compactor_ref_t {
+                if constexpr (std::is_same_v<compactor_type_, std::monostate>) return host_compactor_t {};
+                else return &compactor;
+            },
+            compactor_);
+    }
 
   private:
+
+    /** Refuses an executor slot no spawn filled, which a successful spawn never leaves. */
+    status_t bind_(std::monostate&, gpu_drivers_t const&, resources_config_t const&, volume_t const&) noexcept {
+        return {status_code_t::internal_k, "The compactions spawned no executor"};
+    }
+
+    /** Binds the compactor over @p executor, reading run sections over @p volume where cuFile
+     *  reaches an NVIDIA device, as no AMD device reads them by DMA. */
+    template <typename executor_type_>
+    status_t bind_(executor_type_& executor, gpu_drivers_t const& drivers, resources_config_t const& resources,
+                   volume_t const& volume) noexcept {
+        if constexpr (std::is_same_v<executor_type_, cuda_executor_t>) {
+            status_t const opened = open_sections(drivers.cufile, executor.gds(), resources, volume);
+            if (opened.failed()) return opened;
+        }
+        expected<device_compactor<executor_type_>> made = device_compactor<executor_type_>::make(
+            executor, sections_ ? device_sections_reader_t {&sections_.value()} : device_sections_reader_t {});
+        if (!made) return made.status();
+        compactor_.template emplace<device_compactor<executor_type_>>(std::move(*made));
+        return {};
+    }
 
     /** Opens the reader over every raw medium of @p resources, or over the run files of @p volume
      *  on directories, where @p gds lets bytes move by DMA and cuFile reaches the device,
@@ -411,7 +438,7 @@ class device_compaction {
 
     std::variant<std::monostate, cuda_executor_t, hip_executor_t> executor_;
     std::optional<sections_reader_of<cpu_class_>> sections_;
-    std::optional<cuda_compactor_t> compactor_;
+    std::variant<std::monostate, cuda_compactor_t, hip_compactor_t> compactor_;
 };
 
 /** Everything one open database holds, behind its database handle of the C ABI. */
@@ -1819,29 +1846,100 @@ class compaction_fan_out {
     ustore_arena_t scratch_;
 };
 
-/** Implements @c ustore_database_compact: flushing every collection, then merging every level
- *  over its bounds, reporting one unit per pass, as a pass merges every collection at once. Any
- *  call on the executor that opened the database fans each host merge out over its threads. */
+/**
+ *  @brief One compaction of an NVMe database in flight: a flush writing every collection's memory
+ *      runs, then up to @c compaction_passes_k merge passes, each merging the levels due over their
+ *      bounds, one task each, as the store flushes and merges every collection under its one claim.
+ *
+ *  A merge task fans its own merge out over the threads of the executor that opened the database
+ *  whenever the call holds it, so the driver runs it on the call's thread. A flush or a merge run
+ *  again writes or merges only what is left, and each weighs one. The plan keeps no list, so
+ *  neither @ref run, @ref advance nor @ref finish allocates.
+ */
 template <cpu_class_t cpu_class_>
-status_t database_compact(ustore_database_compact_t const& arguments, view_t const& view) noexcept {
-    database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
-    if (status_t const flushed = state.store->flush(); flushed.failed()) return flushed;
-    std::optional<compaction_fan_out<cpu_class_>> threads;
-    compaction_fan_out_t fan_out;
-    auto fan_out_on = [&]<typename mount_type_>(mount_type_& mount) noexcept {
-        if constexpr (std::is_same_v<mount_type_, storage_mount_of<cpu_class_>>)
-            fan_out = compaction_fan_out_t {threads.emplace(view_of(view.executor->pool), mount.channels(), view)};
-        return status_t {};
-    };
-    if (view.executor && view.executor == state.executor)
-        if (status_t const visited = state.resources->storage.visit(fan_out_on); visited.failed()) return visited;
-    progress_t progress {arguments.progress, arguments.progress_state, compaction_passes_k};
-    for (std::size_t pass = 0; pass != compaction_passes_k; ++pass) {
-        if (state.store->needs_compaction())
-            if (status_t const compacted = state.store->compact(fan_out); compacted.failed()) return compacted;
-        if (!progress.advance(1)) return progress_cancelled_k;
+struct nvme_variant<cpu_class_>::compact_plan_t {
+
+    /** A phase's one task, read from the phase alone. */
+    struct task_t {};
+
+    /** The database the plan compacts, which outlives the plan. */
+    database_state<cpu_class_>* database = nullptr;
+
+    compact_plan_t() noexcept = default;
+    compact_plan_t(compact_plan_t const&) = delete;
+    compact_plan_t& operator=(compact_plan_t const&) = delete;
+
+    /** Task @p position of the current phase, an empty one past the end. */
+    task_t operator[](std::size_t) const noexcept { return {}; }
+
+    /** The current phase's tasks, positionally; none once the plan is over. */
+    indexed_range<compact_plan_t> tasks() const noexcept { return {this, phase_ == phase_t::done_k ? 0u : 1u}; }
+
+    /** Runs the current phase's task on the calling thread, which @p context names. */
+    status_t run(task_t const&, view_t const& context) noexcept {
+        if (phase_ == phase_t::flush_k) return database->store->flush();
+        if (phase_ != phase_t::merge_k || !database->store->needs_compaction()) return {};
+        std::optional<compaction_fan_out<cpu_class_>> threads;
+        compaction_fan_out_t fan_out;
+        auto fan_out_on = [&]<typename mount_type_>(mount_type_& mount) noexcept {
+            if constexpr (std::is_same_v<mount_type_, storage_mount_of<cpu_class_>>)
+                fan_out = compaction_fan_out_t {
+                    threads.emplace(view_of(context.executor->pool), mount.channels(), context)};
+            return status_t {};
+        };
+        if (context.executor && context.executor == database->executor)
+            if (status_t const visited = database->resources->storage.visit(fan_out_on); visited.failed())
+                return visited;
+        return database->store->compact(fan_out);
     }
-    return {};
+
+    /** The barrier between phases and passes, one caller after the task ran: picks the next pass or
+     *  phase, and answers whether one follows. */
+    bool advance() noexcept {
+        if (phase_ == phase_t::flush_k) phase_ = phase_t::merge_k;
+        else if (phase_ == phase_t::merge_k && ++merged_passes_ == compaction_passes_k) phase_ = phase_t::done_k;
+        return phase_ != phase_t::done_k;
+    }
+
+    /** Skips what is left of the plan, keeping what its phases compacted. */
+    void stop() noexcept { phase_ = phase_t::done_k; }
+
+    /** Success, as no barrier fails; a failed task answers its own call. */
+    status_t status() const noexcept { return {}; }
+
+    phase_t phase() const noexcept { return phase_; }
+
+    /** The position of the phase in hand, the flush first and each merge pass after, and the count
+     *  of phases run once done. */
+    std::size_t ordinal() const noexcept { return phase_ == phase_t::flush_k ? 0 : 1 + merged_passes_; }
+
+    /** Units of the phase in hand done at its barrier: all, as each phase runs to its end. */
+    std::size_t completed() const noexcept { return total(); }
+
+    /** Units of the phase in hand: one for the flush or a merge pass. */
+    std::size_t total() const noexcept { return tasks().size(); }
+
+    /** Stops the plan where it stands, keeping what its phases compacted. */
+    status_t finish() noexcept {
+        stop();
+        return status();
+    }
+
+  private:
+    phase_t phase_ = phase_t::flush_k;
+
+    /** Merge passes whose barrier the plan crossed. */
+    std::size_t merged_passes_ = 0;
+};
+
+/** Opens the plan of @c ustore_database_compact, which keeps nothing but the database. */
+template <cpu_class_t cpu_class_>
+expected<void*> compact_plan_open(ustore_database_compact_t const& arguments, view_t const&) noexcept {
+    using compact_plan_t = typename nvme_variant<cpu_class_>::compact_plan_t;
+    compact_plan_t* const plan = new (std::nothrow) compact_plan_t {};
+    if (!plan) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the plan"};
+    plan->database = &database_state_of<cpu_class_>(arguments);
+    return static_cast<void*>(plan);
 }
 
 /** Implements @c ustore_database_flush, writing every collection's memory runs and publishing the
@@ -2210,8 +2308,7 @@ expected<compactor_ref_t> compactor_of(database_state<cpu_class_>& state, resour
     if (!volume) return status_t {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     device_compaction<cpu_class_>& compaction = state.compaction.emplace();
     if (status_t const opened = compaction.open(*compactions, resources, *volume); opened.failed()) return opened;
-    if (cuda_compactor_t* const compactor = compaction.compactor()) return compactor_ref_t {compactor};
-    return compactor_ref_t {};
+    return compaction.compactor();
 }
 
 /** Mounts the store of @p state over the storage its resources opened, which must be the one on files, merging on

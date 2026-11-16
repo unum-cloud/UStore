@@ -5,10 +5,10 @@
  *  @brief The vendor-neutral face of the GPU residency: every vendor's driver, the device
  *      listing, and the kernels every vendor's executor launches.
  *
- *  One binary drives NVIDIA and AMD devices at once, each vendor through a runtime its caller loads
- *  once and declared without its SDK, so every unit names both: NVIDIA devices are listed first,
- *  then AMD, and a vendor whose runtime is absent contributes no devices. Every vendor's device
- *  header provides the same surface, which @c gpu_executor_concept names.
+ *  One binary drives NVIDIA, AMD and Apple devices at once, each vendor through a runtime its
+ *  caller loads once and declared without its SDK, so every unit names all three: NVIDIA devices
+ *  are listed first, then AMD, then Apple, and a vendor whose runtime is absent lists no devices.
+ *  Every vendor's device header provides the surface @c gpu_executor_concept names.
  *
  *  The library embeds bundles of kernels, which a device loads into a @c kernel_table the process
  *  keeps, and every executor spawned over that table launches through it, finding each kernel by
@@ -19,6 +19,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uintptr_t`
+#include <cstring> // `std::memcpy`
 
 #include <concepts>    // `std::same_as`, `std::convertible_to`
 #include <span>        // `std::span`
@@ -32,6 +33,7 @@
 #include "ustore/utilities/tapes.hpp"                  // `tape_source_t`, `tape_segment_t`, `tape_block_threads_k`
 #include "ustore/utilities/types.hpp"                  // `gpu_device_t`, `status_t`
 #include "ustore/utilities/vram_amd_device.hpp"        // `hip_api_t`, `hip_executor_t`, `list_amd_gpu_devices`
+#include "ustore/utilities/vram_apple_device.hpp"      // `metal_api_t`, `metal_executor_t`, `list_apple_gpu_devices`
 #include "ustore/utilities/vram_nvidia_device.hpp"     // `cuda_api_t`, `cuda_executor_t`, `list_nvidia_gpu_devices`
 
 namespace unum::ustore::utilities {
@@ -66,19 +68,26 @@ concept gpu_executor_concept = requires(executor_type_& executor, executor_type_
 
 static_assert(gpu_executor_concept<cuda_executor_t>);
 static_assert(gpu_executor_concept<hip_executor_t>);
+static_assert(gpu_executor_concept<metal_executor_t>);
 
 /** Every vendor's driver table and cuFile's, which a process builds once and hands to every GPU call; a library that
  *  is absent keeps an empty table. */
 struct gpu_drivers_t {
     cuda_api_t cuda;
     hip_api_t hip;
+    metal_api_t metal;
     cufile_api_t cufile;
 
     /** The primary context of every NVIDIA device by CUDA ordinal, null until @c retain_context
      *  retains it, and never released, as the driver releases them at exit. */
     cuda_context_handle_t cuda_contexts[gpu_devices_capacity_k] = {};
 
-    gpu_drivers_t() noexcept : cuda(cuda_api_t::load()), hip(hip_api_t::load()), cufile(cufile_api_t::load()) {}
+    /** Every Apple device Metal lists, retained for the process. */
+    metal_devices_t metal_devices;
+
+    gpu_drivers_t() noexcept
+        : cuda(cuda_api_t::load()), hip(hip_api_t::load()), metal(metal_api_t::load()), cufile(cufile_api_t::load()),
+          metal_devices(metal) {}
     gpu_drivers_t(gpu_drivers_t const&) = delete;
     gpu_drivers_t& operator=(gpu_drivers_t const&) = delete;
 
@@ -95,11 +104,12 @@ struct gpu_drivers_t {
     }
 };
 
-/** Writes into @p into every device @p drivers reach, NVIDIA first, then AMD, as each driver reports it, and answers
- *  how many it wrote. */
+/** Writes into @p into every device @p drivers reach, NVIDIA first, then AMD, then Apple, as each
+ *  driver reports it, and answers how many it wrote. */
 inline std::size_t list_gpu_devices(gpu_drivers_t const& drivers, std::span<gpu_device_t> into) noexcept {
-    std::size_t const count = list_nvidia_gpu_devices(drivers.cuda, into);
-    return count + list_amd_gpu_devices(drivers.hip, into.subspan(count));
+    std::size_t count = list_nvidia_gpu_devices(drivers.cuda, into);
+    count += list_amd_gpu_devices(drivers.hip, into.subspan(count));
+    return count + list_apple_gpu_devices(drivers.metal_devices, into.subspan(count));
 }
 
 #pragma region Kernels
@@ -143,6 +153,30 @@ inline constexpr char const* vram_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                       "ustore_docs_pack_bools",
                                                       "ustore_docs_drop_terminators_u32",
                                                       "ustore_docs_drop_terminators_u64"};
+
+/** The C names every Apple bundle exports its kernels under: every other vendor's but the
+ *  compaction's merges and folds, which no Apple device runs. */
+inline constexpr char const* vram_apple_kernel_names_k[] = {"ustore_tape_offsets_u32",
+                                                            "ustore_tape_offsets_u64",
+                                                            "ustore_tape_gather",
+                                                            "ustore_tape_densify",
+                                                            "ustore_substrings_contains_per_thread",
+                                                            "ustore_substrings_contains_per_group",
+                                                            "ustore_substrings_contains_per_chunk",
+                                                            "ustore_regex_contains_per_thread",
+                                                            "ustore_regex_contains_per_group",
+                                                            "ustore_regex_contains_per_chunk",
+                                                            "ustore_subdocuments_contains_per_thread",
+                                                            "ustore_subdocuments_contains_per_group",
+                                                            "ustore_subdocuments_contains_per_chunk",
+                                                            "ustore_subdocuments_find_per_group",
+                                                            "ustore_subdocuments_find_per_chunk",
+                                                            "ustore_docs_gather_scalars",
+                                                            "ustore_docs_measure_texts",
+                                                            "ustore_docs_write_texts",
+                                                            "ustore_docs_pack_bools",
+                                                            "ustore_docs_drop_terminators_u32",
+                                                            "ustore_docs_drop_terminators_u64"};
 
 /** One bundle loaded on one device, its kernels resolved by their C names once. */
 template <typename module_type_>
@@ -222,6 +256,40 @@ status_t launch(hip_executor_t& executor, hip_function_handle_t function, unsign
                                  nullptr) != hip_success_k)
         return {status_code_t::device_k, "The device refused the launch"};
     return {};
+}
+
+/** Bytes @p argument_types_ take packed in order, each at its alignment, as a struct lays them. */
+template <typename... argument_types_>
+consteval std::size_t packed_arguments_bytes() noexcept {
+    std::size_t used = 0;
+    ((used = round_up_to_multiple(used, alignof(argument_types_)) + sizeof(argument_types_)), ...);
+    return used;
+}
+
+/**
+ *  @brief Commits @p function on @p executor's queue as @p blocks threadgroups of @p threads
+ *      threads each, with @p shared_bytes of threadgroup memory and @p arguments packed as one.
+ *
+ *  The arguments sit in order as one struct, each at its own alignment, and every pointer among
+ *  them is a host address the kernel translates through the device's block table.
+ *
+ *  @par Statuses:
+ *  - @c status_code_t::device_k The bundle holds no such kernel, or the device refused the
+ *    encoder, the block table or the commit.
+ */
+template <typename... argument_types_>
+status_t launch(metal_executor_t& executor, metal_function_handle_t function, unsigned blocks, unsigned threads,
+                unsigned shared_bytes, argument_types_... arguments) noexcept {
+    static_assert((std::is_trivially_copyable_v<argument_types_> && ...), "Kernels take their arguments by bytes");
+    constexpr std::size_t packed_bytes_k = packed_arguments_bytes<argument_types_...>();
+    static_assert(packed_bytes_k <= metal_arguments_capacity_k, "Metal binds at most 4 KB of arguments by bytes");
+    if (!function) return {status_code_t::device_k, "The bundle holds no such kernel"};
+    alignas(16) byte_t packed[packed_bytes_k ? packed_bytes_k : 1] = {};
+    std::size_t used = 0;
+    ((used = round_up_to_multiple(used, alignof(argument_types_)),
+      std::memcpy(packed + used, &arguments, sizeof(argument_types_)), used += sizeof(argument_types_)),
+     ...);
+    return metal_dispatch(executor.stream(), function, {packed, packed_bytes_k}, blocks, threads, shared_bytes);
 }
 
 /**
@@ -354,11 +422,14 @@ device_blocks_t* device_blocks_of(ustore_arena_t arena, executor_type_ const& ex
     return memory && memory->device == executor.device() ? &memory->blocks : nullptr;
 }
 
-/** Whether @p pointer lies on a device of a vendor other than @p executor_type_'s, which @p drivers answer. */
+/** Whether @p pointer lies on a device of a vendor other than @p executor_type_'s, which
+ *  @p drivers answer; Apple's unified memory reads as host memory to every vendor. */
 template <gpu_executor_concept executor_type_>
 bool on_another_vendor(gpu_drivers_t const& drivers, void const* pointer) noexcept {
     if constexpr (executor_type_::vendor_k == gpu_vendor_t::nvidia_k) return hip_device_of(drivers.hip, pointer) >= 0;
-    else return cuda_device_of(drivers.cuda, pointer) >= 0;
+    else if constexpr (executor_type_::vendor_k == gpu_vendor_t::amd_k)
+        return cuda_device_of(drivers.cuda, pointer) >= 0;
+    else return cuda_device_of(drivers.cuda, pointer) >= 0 || hip_device_of(drivers.hip, pointer) >= 0;
 }
 
 #pragma endregion Device Arenas

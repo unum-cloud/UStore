@@ -310,11 +310,11 @@ inline std::size_t expect_page(pulled_keys_t const& pulled, std::span<ustore_key
 #pragma region Wrapper Round Trips
 
 /** Checks that every key @p reference names holds a value of @p expected_length, or is missing. */
-template <typename locations_type_>
-std::size_t check_length(blobs_read_ref<locations_type_>& reference, ustore_length_t expected_length) {
+template <typename reference_type_>
+std::size_t check_length(reference_type_& reference, ustore_length_t expected_length) {
     std::size_t failures = 0;
     bool const expects_missing = expected_length == missing_length_k;
-    using extractor_t = places_arg_extractor<locations_type_>;
+    using extractor_t = places_arg_extractor<typename reference_type_::locations_plain_t>;
     ustore_size_t const count = extractor_t {}.count(reference.locations());
 
     auto maybe_retrieved = reference.value();
@@ -335,15 +335,15 @@ std::size_t check_length(blobs_read_ref<locations_type_>& reference, ustore_leng
     auto maybe_indicators = reference.present();
     failures += expect(maybe_indicators);
     for (std::size_t index = 0; index != count; ++index)
-        failures += expect(static_cast<bool>(maybe_indicators->at(index)) == !expects_missing);
+        failures += expect(static_cast<bool>(maybe_indicators->view().at(index)) == !expects_missing);
     return failures;
 }
 
 /** Checks that the keys @p reference names hold @p values, byte for byte. */
-template <template <typename> typename reference_type_, typename locations_type_>
-std::size_t check_equalities(reference_type_<locations_type_>& reference, std::span<value_view_t const> values) {
+template <typename reference_type_>
+std::size_t check_equalities(reference_type_& reference, std::span<value_view_t const> values) {
     std::size_t failures = 0;
-    using extractor_t = places_arg_extractor<locations_type_>;
+    using extractor_t = places_arg_extractor<typename reference_type_::locations_plain_t>;
     ustore_size_t const count = extractor_t {}.count(reference.locations());
 
     auto maybe_retrieved = reference.value();
@@ -404,8 +404,8 @@ std::size_t round_trip(blobs_ref<locations_type_>& reference, triplet_t const& t
 }
 
 /** Checks that @p reference holds @p triplet. */
-template <template <typename> typename reference_type_, typename locations_type_>
-std::size_t check_equalities(reference_type_<locations_type_>& reference, triplet_t const& triplet) {
+template <typename reference_type_>
+std::size_t check_equalities(reference_type_& reference, triplet_t const& triplet) {
     return check_equalities(reference, triplet.views());
 }
 
@@ -476,7 +476,7 @@ inline expected<compared_collections_t> open_compared(config_t const& config, us
     if (reference_status.failed()) return reference_status;
     compared.databases = {std::move(tested), std::move(reference)};
     for (std::size_t side = 0; side != 2; ++side) {
-        if (status_t const status = compared.databases[side].clear(ustore_drop_collection_k); status.failed())
+        if (status_t const status = compared.databases[side].on().clear(ustore_drop_collection_k); status.failed())
             return status;
         auto [collection, collection_status] = create_collection(compared.databases[side], "ranges", modality);
         if (collection_status.failed()) return collection_status;

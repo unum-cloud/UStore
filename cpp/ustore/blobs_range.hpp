@@ -2,7 +2,8 @@
  *  @file cpp/ustore/blobs_range.hpp
  *  @author Ash Vardanian
  *  @date June 26, 2022
- *  @brief A cursor over the keys and values of one binary collection, the streams of keys and pairs, and slices.
+ *  @brief A cursor over the keys and values of one binary collection, the streams of keys and
+ *      pairs, slices, and the samples and measures of the modalities keyed by UUIDs.
  */
 
 #pragma once
@@ -12,16 +13,18 @@
 #include <iterator>    // `std::forward_iterator_tag`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
+#include <type_traits> // `std::is_nothrow_invocable_r_v`
 #include <utility>     // `std::pair`, `std::move`, `std::exchange`, `std::swap`
 
 #include "ustore/ranges.hpp" // `strings_of`
-#include "ustore/status.hpp" // `status_t`, `expected`
+#include "ustore/status.hpp" // `status_t`, `expected`, `answer`, `called_`, `outputs`
 #include "ustore/types.hpp"  // `arena_t`, `receiver_t`
 #include "ustore/ustore.h"
 
 namespace unum::ustore {
 
-/** What one pull of a cursor hands over inside the arena it was given: the keys, and the values of the keys. */
+/** What one pull of a cursor hands over inside the arena it was given: the keys, and the values of
+ *  the keys. */
 struct blobs_page_t {
     std::span<ustore_key_t const> keys;
     sz::strings_view_t values {strings_of({}, 0)};
@@ -36,14 +39,20 @@ struct match_t {
     ustore_predicate_t predicate {};
 };
 
-/** The predicate the ABI asks through @p callable, called as <tt>callable(keys, admissions)</tt>
- *  over spans once per page, at @p cost; @p callable must outlive the scan or the cursor given
- *  it. */
-template <typename callable_type_>
+/** Whether @p predicate_type_ can admit keys: given the keys of a page, it writes one admission per
+ *  key, and never throws. */
+template <typename predicate_type_>
+concept predicate_concept =
+    std::is_nothrow_invocable_r_v<void, predicate_type_&, std::span<ustore_key_t const>, std::span<ustore_admission_t>>;
+
+/** The predicate the ABI asks through @p callable, called once per page at @p cost as
+ *  <tt>callable(keys, admissions)</tt> over spans; @p callable is the trampoline's state, so it
+ *  must outlive the scan or the cursor given it. */
+template <predicate_concept callable_type_>
 ustore_predicate_t predicate_of(callable_type_& callable,
                                 ustore_predicate_cost_t cost = ustore_predicate_cheap_k) noexcept {
     auto const trampoline = [](ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count,
-                               void* state) {
+                               void* state) noexcept {
         std::size_t const size = static_cast<std::size_t>(count);
         (*static_cast<callable_type_*>(state))(std::span<ustore_key_t const> {keys, size},
                                                std::span<ustore_admission_t> {admissions, size});
@@ -51,21 +60,41 @@ ustore_predicate_t predicate_of(callable_type_& callable,
     return {trampoline, &callable, cost};
 }
 
-/** Copies what @p match narrows by into the arguments @p call takes, as far as they take each part. */
+/** Whether the arguments @p call_type_ take patterns over values, as blobs and strings do. */
+template <typename call_type_>
+concept takes_patterns_concept = requires(call_type_& call) { call.patterns; };
+
+/** Whether the arguments @p call_type_ take a JSONPath or XPath filter, as documents
+ *  and pages do. */
+template <typename call_type_>
+concept takes_filter_concept = requires(call_type_& call) { call.filter; };
+
+/** Whether the arguments @p call_type_ export values beside the keys they pull. */
+template <typename call_type_>
+concept takes_values_concept = requires(call_type_& call) { call.values; };
+
+/** Whether the arguments @p call_type_ export one BM25 score per key. */
+template <typename call_type_>
+concept takes_scores_concept = requires(call_type_& call) { call.scores; };
+
+/** Copies what @p match narrows by into the arguments @p call takes, as far as they
+ *  take each part. */
 template <typename call_type_>
 void narrow(call_type_& call, match_t const& match) noexcept {
-    if constexpr (requires { call.patterns; }) call.patterns = match.patterns;
-    if constexpr (requires { call.filter; }) call.filter = match.filter;
+    if constexpr (takes_patterns_concept<call_type_>) call.patterns = match.patterns;
+    if constexpr (takes_filter_concept<call_type_>) call.filter = match.filter;
     call.predicate = match.predicate;
 }
 
 /**
- *  @brief Owns a walk over the keys of one collection from its open until its destruction, which every pull resumes
- *      past the last key the pull before it handed out, at the view its receiver read at the open.
+ *  @brief Owns a walk over the keys of one collection from its open until its destruction, which
+ *      every pull resumes past the last key the pull before it handed out, at the view its receiver
+ *      read at the open.
  *
- *  The explicit form of the streams below: every pull takes the caller's arena, which holds the page until its next
- *  call, so a binding hands the cursor any arena it keeps. It moves but never copies. One template serves the cursors
- *  of blobs, documents, pages and graph vertices, each spelled by its C handle and calls.
+ *  The explicit form of the streams below: every pull takes the caller's arena, which holds the
+ *  page until its next call, so a binding hands the cursor any arena it keeps. It moves but never
+ *  copies. One template serves the cursors of blobs, documents, pages and graph vertices, each
+ *  spelled by its C handle and calls.
  */
 template <typename handle_type_, typename init_type_, typename next_type_, void (*init_)(init_type_*),
           void (*next_)(next_type_*), void (*free_)(handle_type_)>
@@ -88,7 +117,7 @@ class keys_cursor {
         next.outcome = &outcome;
         next.cursor = cursor_;
         next.keys = &keys;
-        if constexpr (requires { next.values; }) next.values = values;
+        if constexpr (takes_values_concept<next_type_>) next.values = values;
         next.written = &written;
         next.arena = arena;
         next.wanted = wanted;
@@ -132,7 +161,8 @@ class keys_cursor {
         return keys_cursor {receiver, cursor};
     }
 
-    /** Pulls up to @p wanted keys into @p arena, fewer once the walk nears its end and none past it. */
+    /** Pulls up to @p wanted keys into @p arena, fewer once the walk nears its end and none past
+     *  it. */
     expected<std::span<ustore_key_t const>> next(std::size_t wanted, arena_t& arena) noexcept {
         return pull_(wanted, arena, nullptr, {});
     }
@@ -140,7 +170,7 @@ class keys_cursor {
     /** Pulls up to @p wanted keys with their values into @p arena in one call, the other fields of
      *  @p options, such as the encoding pages render in, taken as they are. */
     expected<blobs_page_t> next_pairs(std::size_t wanted, arena_t& arena, next_type_ options = {}) noexcept
-        requires requires(next_type_ next) { next.values; }
+        requires takes_values_concept<next_type_>
     {
         ustore_strings_view_t values {};
         auto [keys, status] = pull_(wanted, arena, &values, options);
@@ -157,7 +187,8 @@ using blobs_cursor_t = keys_cursor<ustore_blobs_cursor_t, ustore_blobs_cursor_in
 using docs_cursor_t = keys_cursor<ustore_docs_cursor_t, ustore_docs_cursor_init_t, ustore_docs_cursor_next_t,
                                   &ustore_docs_cursor_init, &ustore_docs_cursor_next, &ustore_docs_cursor_free>;
 
-/** A walk over the keys of one pages collection, whose pairs are pages rendered as their options name. */
+/** A walk over the keys of one pages collection, whose pairs are pages rendered as their options
+ *  name. */
 using pages_cursor_t = keys_cursor<ustore_pages_cursor_t, ustore_pages_cursor_init_t, ustore_pages_cursor_next_t,
                                    &ustore_pages_cursor_init, &ustore_pages_cursor_next, &ustore_pages_cursor_free>;
 
@@ -191,7 +222,7 @@ expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, u
     scan.arena = arena;
     scan.wanted = wanted;
     narrow(scan, match);
-    if constexpr (requires { scan.scores; }) scan.scores = scores;
+    if constexpr (takes_scores_concept<scan_type_>) scan.scores = scores;
     scan_(&scan);
     if (status_t const status {outcome}; status.failed()) return status;
     if (!offsets) return std::span<ustore_key_t const> {};
@@ -199,8 +230,8 @@ expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, u
 }
 
 /** Scans up to @p wanted keys of @p collection, which holds @p modality, from @p start into
- *  @p arena through the scan of that modality: the documents, the vertices, the pages or the keys
- *  of blobs. */
+ *  @p arena through the scan of that modality: the documents, the vertices, the pages or the
+ *  keys of blobs. */
 inline expected<std::span<ustore_key_t const>> scan_keys(receiver_t receiver, ustore_modality_t modality,
                                                          ustore_collection_id_t collection, ustore_key_t start,
                                                          std::size_t wanted, arena_t& arena) noexcept {
@@ -251,7 +282,8 @@ class keys_stream_t {
         return {};
     }
 
-    /** Pulls the page past the one in hand, which is empty once that page ended at the largest key. */
+    /** Pulls the page past the one in hand, which is empty once that page ended at
+     *  the largest key. */
     status_t prefetch() noexcept {
         if (fetched_keys_.empty() || fetched_keys_.back() == largest_key_k) {
             fetched_keys_ = {};
@@ -297,7 +329,8 @@ class keys_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed pull ends the stream since a reference carries no status. */
+    /** Advances like @c advance, but a failed pull ends the stream since a reference carries no
+     *  status. */
     keys_stream_t& operator++() noexcept {
         if (advance().succeeded()) return *this;
         fetched_keys_ = {};
@@ -397,7 +430,8 @@ class pairs_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed pull ends the stream since a reference carries no status. */
+    /** Advances like @c advance, but a failed pull ends the stream since a reference carries no
+     *  status. */
     pairs_stream_t& operator++() noexcept {
         if (advance().succeeded()) return *this;
         fetched_ = {};
@@ -415,7 +449,8 @@ class pairs_stream_t {
     /** Pulls the page after the one in hand, which @c keys_batch exposes. */
     status_t seek_to_next_batch() noexcept { return prefetch(); }
 
-    /** Exposes the keys of the whole page in hand, passed keys included, for use with @c seek_to_next_batch. */
+    /** Exposes the keys of the whole page in hand, passed keys included, for use with @c
+     *  seek_to_next_batch. */
     std::span<ustore_key_t const> keys_batch() noexcept {
         fetched_offset_ = fetched_.keys.size();
         return fetched_.keys;
@@ -444,6 +479,116 @@ struct size_estimates_t {
     size_range_t bytes_in_values;
     size_range_t bytes_on_disk;
 };
+
+/** Where a sample writes the keys of its one task. */
+template <>
+struct outputs<std::span<ustore_key_t const>> {
+
+    /** Output for two offsets into @c keys, inside the arena. */
+    ustore_length_t const* offsets = nullptr;
+
+    /** Output for the keys drawn, inside the arena. */
+    ustore_key_t const* keys = nullptr;
+
+    std::span<ustore_key_t const> answer() const noexcept {
+        if (!offsets) return {};
+        return {keys + offsets[0], keys + offsets[1]};
+    }
+};
+
+/** Where a measure writes the bounds of its one range. */
+template <>
+struct outputs<size_estimates_t> {
+
+    /** Outputs for the bounds on the entries of the range, inside the arena. */
+    ustore_size_t const* min_cardinalities = nullptr;
+    ustore_size_t const* max_cardinalities = nullptr;
+
+    /** Outputs for the bounds on the bytes of the values of the range, inside the arena. */
+    ustore_size_t const* min_value_bytes = nullptr;
+    ustore_size_t const* max_value_bytes = nullptr;
+
+    /** Outputs for the bounds on the disk space the range takes, inside the arena. */
+    ustore_size_t const* min_space_usages = nullptr;
+    ustore_size_t const* max_space_usages = nullptr;
+
+    size_estimates_t answer() const noexcept {
+        return {{*min_cardinalities, *max_cardinalities},
+                {*min_value_bytes, *max_value_bytes},
+                {*min_space_usages, *max_space_usages}};
+    }
+};
+
+/** Points the six bound outputs of @p measure at @p written. */
+template <typename measure_type_>
+void measure_outputs_(measure_type_& measure, outputs<size_estimates_t>& written) noexcept {
+    measure.min_cardinalities = &written.min_cardinalities;
+    measure.max_cardinalities = &written.max_cardinalities;
+    measure.min_value_bytes = &written.min_value_bytes;
+    measure.max_value_bytes = &written.max_value_bytes;
+    measure.min_space_usages = &written.min_space_usages;
+    measure.max_space_usages = &written.max_space_usages;
+}
+
+/**
+ *  @brief Draws up to @p wanted keys of @p collection at random into @p arena through
+ *      @p sample_, the sample of one modality keyed by UUIDs, as the documents, the vertices and
+ *      the pages are.
+ *  @param[in] collection Collection to draw from, borrowed until the call is final.
+ */
+template <ustore_completion_t completion_, typename sample_type_, void (*sample_)(sample_type_*)>
+answer<completion_, std::span<ustore_key_t const>> sample_keys_(receiver_t const& receiver,
+                                                                ustore_collection_id_t const& collection,
+                                                                std::size_t wanted, arena_t& arena,
+                                                                ustore_watch_t watch) noexcept {
+    using answer_t = std::span<ustore_key_t const>;
+    return called_<completion_, answer_t>([&](ustore_outcome_t* outcome, outputs<answer_t>* written) noexcept {
+        sample_type_ sample {};
+        sample.database = receiver.database;
+        sample.executor = receiver.executor;
+        sample.outcome = outcome;
+        sample.completion = completion_;
+        sample.view = receiver.view(watch);
+        sample.count = 1;
+        sample.collections = {&collection, 0};
+        sample.offsets = &written->offsets;
+        sample.keys = &written->keys;
+        sample.arena = arena;
+        sample.wanted = wanted;
+        sample_(&sample);
+    });
+}
+
+/**
+ *  @brief Estimates the entries and the space between @p start_key, inclusive, and @p end_key,
+ *      exclusive, of @p collection into @p arena through @p measure_, the measure of one modality
+ *      keyed by UUIDs.
+ *  @param[in] collection Collection to measure, borrowed until the call is final.
+ *  @param[in] start_key First key of the range, borrowed until the call is final.
+ *  @param[in] end_key Key the range stops before, borrowed until the call is final.
+ */
+template <ustore_completion_t completion_, typename measure_type_, void (*measure_)(measure_type_*)>
+answer<completion_, size_estimates_t> measure_keys_(receiver_t const& receiver,
+                                                    ustore_collection_id_t const& collection,
+                                                    ustore_key_t const& start_key, ustore_key_t const& end_key,
+                                                    arena_t& arena, ustore_watch_t watch) noexcept {
+    return called_<completion_, size_estimates_t>(
+        [&](ustore_outcome_t* outcome, outputs<size_estimates_t>* written) noexcept {
+            measure_type_ measure {};
+            measure.database = receiver.database;
+            measure.executor = receiver.executor;
+            measure.outcome = outcome;
+            measure.completion = completion_;
+            measure.view = receiver.view(watch);
+            measure.count = 1;
+            measure.collections = {&collection, 0};
+            measure.start_keys = {&start_key, 0};
+            measure.end_keys = {&end_key, 0};
+            measure_outputs_(measure, *written);
+            measure.arena = arena;
+            measure_(&measure);
+        });
+}
 
 /** A slice of keys in one collection, which streams its keys through the scan of the collection's
  *  @c modality, and, in a blobs collection, streams its pairs and estimates its size. */
@@ -478,7 +623,8 @@ class blobs_range_t {
 
     expected<pairs_stream_t> pairs_end() noexcept { return pairs_stream_t::make(receiver_, collection_, end_key_, 1); }
 
-    /** Estimates the size of the slice through a one-off arena, since a single range answers a fixed-size report. */
+    /** Estimates the size of the slice through a one-off arena, since a single range answers a
+     *  fixed-size report. */
     expected<size_estimates_t> size_estimates() noexcept {
         auto [arena, arena_status] = arena_t::make(receiver_.executor);
         if (arena_status.failed()) return arena_status;

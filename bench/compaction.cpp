@@ -285,8 +285,8 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
     for (std::size_t first = 0; first < records; first += batch) {
         std::size_t const count = fu::min_of(batch, records - first);
         for (std::size_t row = 0; row != count; ++row) {
-            keys[row] = key_of(settings.shared.seed.value, first + row);
-            fill_value(settings.shared.seed.value, first + row, {tape.data() + row * value_size, value_size});
+            keys[row] = key_of(settings.shared.seed, first + row);
+            fill_value(settings.shared.seed, first + row, {tape.data() + row * value_size, value_size});
         }
         ustore_blobs_write_t write {
             .database = database,
@@ -319,10 +319,10 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
     if (st::failed(keys.resize(samples)) || st::failed(indices.resize(samples)) ||
         st::failed(expected.resize(value_size)))
         return "Failed to allocate the samples";
-    splitmix64_t random {settings.shared.seed.value};
+    splitmix64_t random {settings.shared.seed};
     for (std::size_t sample = 0; sample != samples; ++sample) {
         indices[sample] = static_cast<std::size_t>(random.below(settings.records()));
-        keys[sample] = key_of(settings.shared.seed.value, indices[sample]);
+        keys[sample] = key_of(settings.shared.seed, indices[sample]);
     }
     ustore_outcome_t outcome {};
     ustore_arena_t arena = nullptr;
@@ -340,7 +340,7 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
     ustore_blobs_read(&read);
     char const* reason = outcome.status == ustore_status_success_k ? nullptr : outcome.message;
     for (std::size_t sample = 0; !reason && sample != samples; ++sample) {
-        fill_value(settings.shared.seed.value, indices[sample], expected);
+        fill_value(settings.shared.seed, indices[sample], expected);
         bool const wide = values.layout == ustore_strings_u64_tape_k;
         std::uint64_t const begin = wide ? values.data.u64_tape.offsets[sample] : values.data.u32_tape.offsets[sample];
         std::uint64_t const end = wide ? values.data.u64_tape.offsets[sample + 1]

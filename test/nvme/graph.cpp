@@ -231,7 +231,7 @@ case_result_t hub_past_value_bound(char const* directory) {
         auto [database, open_status] = open_nvme(home.c_str());
         failures += expect(open_status.succeeded());
         if (failures) return failures;
-        auto [graph, graph_status] = database.create<graph_collection_t>("hub");
+        auto [graph, graph_status] = database.on().create<graph_collection_t>("hub");
         failures += expect(graph_status.succeeded());
         if (failures) return failures;
         std::vector<edge_t> batch;
@@ -244,13 +244,13 @@ case_result_t hub_past_value_bound(char const* directory) {
             failures += expect(written.succeeded());
         }
         failures += check(graph);
-        failures += expect(database.compact().succeeded());
+        failures += expect(database.on().compact().succeeded());
         failures += check(graph);
     }
     auto [database, reopen_status] = open_nvme(home.c_str());
     failures += expect(reopen_status.succeeded());
     if (failures) return failures;
-    auto [graph, graph_status] = database.find<graph_collection_t>("hub");
+    auto [graph, graph_status] = database.on().find<graph_collection_t>("hub");
     failures += expect(graph_status.succeeded());
     if (failures) return failures;
     failures += check(graph);
@@ -266,33 +266,33 @@ case_result_t concurrent_adds_commit(char const* directory) {
     auto [database, open_status] = open_nvme(home.c_str());
     failures += expect(open_status.succeeded());
     if (failures) return failures;
-    auto [graph, graph_status] = database.create<graph_collection_t>("adds");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("adds");
     failures += expect(graph_status.succeeded());
     if (failures) return failures;
     std::array<ustore_key_t, 1> const hub {key_from_integer(0)};
     failures += expect(graph.write_vertices(strided(hub)).succeeded());
 
-    transaction_t first = *database.transaction();
-    transaction_t second = *database.transaction();
-    auto [first_graph, first_status] = first.find<graph_collection_t>("adds");
-    auto [second_graph, second_status] = second.find<graph_collection_t>("adds");
+    transaction_t first = *database.on().transaction();
+    transaction_t second = *database.on().transaction();
+    auto [first_graph, first_status] = first.on().find<graph_collection_t>("adds");
+    auto [second_graph, second_status] = second.on().find<graph_collection_t>("adds");
     failures += expect(first_status.succeeded() && second_status.succeeded());
     if (failures) return failures;
     failures += expect(first_graph.write_edge(edge_of(0, 1, 1)).succeeded());
     failures += expect(second_graph.write_edge(edge_of(0, 2, 2)).succeeded());
-    failures += expect(first.commit().has_value());
-    failures += expect(second.commit().has_value());
+    failures += expect(first.on().commit().has_value());
+    failures += expect(second.on().commit().has_value());
     failures += expect_degree(graph, 0, 2);
 
     // A transaction reads its own changes merged into the committed adjacency
-    transaction_t reading = *database.transaction();
-    auto [reading_graph, reading_status] = reading.find<graph_collection_t>("adds");
+    transaction_t reading = *database.on().transaction();
+    auto [reading_graph, reading_status] = reading.on().find<graph_collection_t>("adds");
     failures += expect(reading_status.succeeded());
     if (failures) return failures;
     failures += expect(reading_graph.write_edge(edge_of(3, 0, 3)).succeeded());
     failures += expect_eq(*reading_graph.degree(key_from_integer(0)), 3u);
     failures += expect_eq(*reading_graph.degree(key_from_integer(0), ustore_vertex_role_target_k), 1u);
-    failures += expect(reading.commit().has_value());
+    failures += expect(reading.on().commit().has_value());
     failures += expect_degree(graph, 0, 3);
 
     std::size_t refused = 0;
@@ -300,16 +300,16 @@ case_result_t concurrent_adds_commit(char const* directory) {
     for (std::size_t thread = 0; thread != adding_threads_k; ++thread)
         threads.emplace_back([&, thread] {
             for (std::size_t round = 0; round != transactions_per_thread_k; ++round) {
-                auto [transaction, begin_status] = database.transaction();
+                auto [transaction, begin_status] = database.on().transaction();
                 if (begin_status.failed()) {
                     fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
                     continue;
                 }
-                auto [adding, adding_status] = transaction.find<graph_collection_t>("adds");
+                auto [adding, adding_status] = transaction.on().find<graph_collection_t>("adds");
                 std::uint64_t const leaf = 1000 + thread * transactions_per_thread_k + round;
                 bool const committed = adding_status.succeeded() &&
                                        adding.write_edge(edge_of(0, leaf, leaf)).succeeded() &&
-                                       transaction.commit().has_value();
+                                       transaction.on().commit().has_value();
                 if (!committed) fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
             }
         });
@@ -329,7 +329,7 @@ case_result_t vertex_removal(char const* directory) {
     auto [database, open_status] = open_nvme(home.c_str());
     failures += expect(open_status.succeeded());
     if (failures) return failures;
-    auto [graph, graph_status] = database.create<graph_collection_t>("removal");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("removal");
     failures += expect(graph_status.succeeded());
     if (failures) return failures;
     // A vertex changes through the graph calls alone, as on the in-memory engine, never through a blobs write
@@ -351,13 +351,13 @@ case_result_t vertex_removal(char const* directory) {
 
     // The removal's own transaction reads the vertex, which an edge landing meanwhile changes
     failures += expect(graph.write_edge(edge_of(1, 3, 6)).succeeded());
-    transaction_t removing = *database.transaction();
-    auto [removing_graph, removing_status] = removing.find<graph_collection_t>("removal");
+    transaction_t removing = *database.on().transaction();
+    auto [removing_graph, removing_status] = removing.on().find<graph_collection_t>("removal");
     failures += expect(removing_status.succeeded());
     if (failures) return failures;
     failures += expect(removing_graph.remove_vertex(key_from_integer(3)).succeeded());
     failures += expect(graph.write_edge(edge_of(3, 2, 7)).succeeded());
-    failures += expect(removing.commit().failed());
+    failures += expect(removing.on().commit().failed());
     failures += expect_degree(graph, 3, 2);
     failures += expect_degree(graph, 2, 2);
     return failures;
@@ -373,8 +373,8 @@ case_result_t fixed_width_refuses_graph(char const* directory) {
     auto [database, open_status] = open_nvme(home.c_str(), 0, 0, 8);
     failures += expect(open_status.succeeded());
     if (failures) return failures;
-    failures += expect(database.create<graph_collection_t>("graph").status() == status_code_t::unsupported_k);
-    auto [blobs, blobs_status] = database.create<blobs_collection_t>("blobs");
+    failures += expect(database.on().create<graph_collection_t>("graph").status() == status_code_t::unsupported_k);
+    auto [blobs, blobs_status] = database.on().create<blobs_collection_t>("blobs");
     failures += expect(blobs_status.succeeded());
     if (failures) return failures;
     ustore_key_t const key = key_from_integer(1);
@@ -394,7 +394,7 @@ case_result_t bottom_applies_chains(char const* directory) {
     auto [database, open_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
     failures += expect(open_status.succeeded());
     if (failures) return failures;
-    auto [graph, graph_status] = database.create<graph_collection_t>("bottom");
+    auto [graph, graph_status] = database.on().create<graph_collection_t>("bottom");
     failures += expect(graph_status.succeeded());
     if (failures) return failures;
 
@@ -406,12 +406,12 @@ case_result_t bottom_applies_chains(char const* directory) {
         failures += expect(graph.write_edges(edges_of(batch)).succeeded());
         failures += expect(graph.remove_edges(edges_of(batch)).succeeded());
     }
-    failures += expect(database.compact().succeeded());
+    failures += expect(database.on().compact().succeeded());
     failures += expect_degree(graph, 0, 0);
     failures += expect_degree(graph, 1, 0);
 
     // Unapplied, the newest record of every half-edge is its removal, two of 48 bytes per edge at the bottom
-    auto [description, describe_status] = database.describe();
+    auto [description, describe_status] = database.on().describe();
     failures += expect(describe_status.succeeded());
     std::size_t const removal_bytes = 2 * bottom_rounds_k * bottom_round_edges_k * 48;
     if (describe_status.succeeded()) failures += expect(description.disk_bytes < removal_bytes / 2);
@@ -434,7 +434,7 @@ case_result_t fold_survives_maintenance(char const* directory, random_t random) 
         auto [database, open_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
         failures += expect(open_status.succeeded());
         if (failures) return failures;
-        auto [graph, graph_status] = database.create<graph_collection_t>("maintenance");
+        auto [graph, graph_status] = database.on().create<graph_collection_t>("maintenance");
         failures += expect(graph_status.succeeded());
         if (failures) return failures;
 
@@ -467,13 +467,13 @@ case_result_t fold_survives_maintenance(char const* directory, random_t random) 
             if (call == model_calls_k / 2) failures += expect_model(graph, model, arena);
         }
         failures += expect_model(graph, model, arena);
-        failures += expect(database.compact().succeeded());
+        failures += expect(database.on().compact().succeeded());
         failures += expect_model(graph, model, arena);
     }
     auto [database, reopen_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
     failures += expect(reopen_status.succeeded());
     if (failures) return failures;
-    auto [graph, graph_status] = database.find<graph_collection_t>("maintenance");
+    auto [graph, graph_status] = database.on().find<graph_collection_t>("maintenance");
     failures += expect(graph_status.succeeded());
     if (failures) return failures;
     failures += expect_model(graph, model, arena);

@@ -2,115 +2,123 @@
  *  @file cpp/ustore/status.hpp
  *  @author Ash Vardanian
  *  @date July 4, 2022
- *  @brief Statuses with static messages and the expected wrapper that every fallible C++ call returns, re-exported from
- *      <tt>ustore/utilities/types.hpp</tt>, and the deferred call that a call submitted to an executor answers.
+ *  @brief Statuses with static messages and the expected wrapper that every fallible C++ call
+ *      returns, re-exported from <tt>ustore/utilities/types.hpp</tt>, and the deferred call that a
+ *      call submitted to an executor answers.
+ *
+ *  Every verb is written once, as a template on its completion: a blocking receiver answers an @c
+ *  outcome, the status alone or an @c expected value, and a deferred one answers a @c deferred call
+ *  its one owner polls or waits on.
  */
 
 #pragma once
 
-#include <new>     // `std::nothrow`
-#include <tuple>   // `std::apply`, `std::tuple`
-#include <utility> // `std::exchange`, `std::move`, `std::swap`
+#include <concepts>    // `std::invocable`
+#include <type_traits> // `std::conditional_t`, `std::is_void_v`
 
-#include "ustore/types.h"             // `ustore_outcome_t`, `ustore_outcome_wait`
-#include "ustore/utilities/types.hpp" // `status_code_t`, `status_t`, re-exported into `unum::ustore`
+#include "ustore/types.h"             // `ustore_outcome_t`, `ustore_outcome_wait`, `ustore_completion_t`
+#include "ustore/utilities/types.hpp" // `status_code_t`, `status_t`, `expected`, re-exported into `unum::ustore`
 
 namespace unum::ustore {
 
+/** Whether a receiver completed as @p completion_ submits its calls and answers @c deferred ones,
+ *  rather than blocking until each is final. */
+template <ustore_completion_t completion_>
+inline constexpr bool defers = completion_ == ustore_completion_deferred_k;
+
+/** Where a call writes what @p answer_type_ is made of: the answer itself, unless a view needs the
+ *  C-shaped fields a specialization lays out beside an @c answer that assembles the view. */
+template <typename answer_type_>
+struct outputs {
+
+    /** The answer, which the call writes in place. */
+    answer_type_ value {};
+
+    answer_type_ answer() const noexcept { return value; }
+};
+
+/** A call that outputs nothing but its status. */
+template <>
+struct outputs<void> {};
+
+/** What a blocking call answers: its status alone, or a value beside it. */
+template <typename answer_type_>
+using outcome = std::conditional_t<std::is_void_v<answer_type_>, status_t, expected<answer_type_>>;
+
+/** The status of a final call that outputs nothing else. */
+inline status_t answered_(ustore_outcome_t const& reported, outputs<void> const&) noexcept {
+    return status_t {reported};
+}
+
+/** The answer of a final call, or the status explaining why it has none. */
+template <typename answer_type_>
+    requires(!std::is_void_v<answer_type_>)
+expected<answer_type_> answered_(ustore_outcome_t const& reported, outputs<answer_type_> const& written) noexcept {
+    if (status_t const status {reported}; status.failed()) return status;
+    return written.answer();
+}
+
 /**
- *  @brief A call submitted to an executor, owning the one heap block that holds its outcome, every plain input it
- *      reads and every output it writes through, which never moves until the call is final.
+ *  @brief A submitted call: its outcome and its outputs, owned until the call is final, while the
+ *      receiver, the inputs, the arena and the handlers it was handed stay borrowed until then.
  *
- *  Submission copies the C arguments, so they live only on the stack of @c submit, while everything they point to lives
- *  in the block. An arena is a handle the call borrows, since freeing it waits for the call. @c status polls without
- *  blocking, and @c wait blocks until the call is final and hands over what it produced. The destructor waits too, so
- *  nothing the call reads goes away under it, and a block that could not be allocated reads as a call that finished
- *  with @c status_code_t::out_of_memory_k.
- *
- *  @tparam verb_type_ What one verb keeps beside its inputs: the outputs the call writes through,
- *      its C @c arguments_t, the static @c submit that hands them to the library, and @c finish,
- *      which turns the outputs of a successful call into its @c answer_t.
+ *  It never moves, as the library writes into it, and its one owner polls @c status or blocks in @c
+ *  wait; destruction waits the same way, so nothing the call writes into goes away under it.
  */
-template <typename verb_type_>
+template <typename answer_type_ = void>
 class [[nodiscard]] deferred {
-  public:
-    using verb_t = verb_type_;
-    using arguments_t = typename verb_type_::arguments_t;
-    using answer_t = typename verb_type_::answer_t;
-
-  private:
-    struct block_t {
-        ustore_outcome_t outcome {};
-        verb_type_ verb {};
-        void (*destroy)(block_t*) noexcept = nullptr;
-    };
-
-    template <typename... inputs_types_>
-    struct owning_block : block_t {
-        std::tuple<inputs_types_...> inputs;
-        explicit owning_block(inputs_types_&&... owned) noexcept : inputs(std::move(owned)...) {}
-    };
-
-    block_t* block_ = nullptr;
-
-    explicit deferred(block_t* block) noexcept : block_(block) {}
-
-    void release_() noexcept {
-        if (!block_) return;
-        ustore_outcome_wait(&block_->outcome);
-        block_->destroy(block_);
-        block_ = nullptr;
-    }
+    ustore_outcome_t outcome_ {};
+    outputs<answer_type_> outputs_ {};
 
   public:
-    deferred(deferred&& other) noexcept : block_(std::exchange(other.block_, nullptr)) {}
-    deferred& operator=(deferred&& other) noexcept {
-        std::swap(block_, other.block_);
-        return *this;
+    /** Runs @p submit with this call's outcome and outputs, where the library reports. */
+    template <typename submit_type_>
+        requires std::invocable<submit_type_ const&, ustore_outcome_t*, outputs<answer_type_>*>
+    explicit deferred(submit_type_ const& submit) noexcept {
+        submit(&outcome_, &outputs_);
     }
+
+    /** A call refused before it crossed, final from the start. */
+    explicit deferred(status_t refused) noexcept : outcome_(refused) {}
+
     deferred(deferred const&) = delete;
     deferred& operator=(deferred const&) = delete;
-    ~deferred() noexcept { release_(); }
+    ~deferred() noexcept { ustore_outcome_wait(&outcome_); }
 
-    /**
-     *  @brief Moves @p inputs into a new block, lets @p prepare fill the C arguments from them, and submits a copy.
-     *  @param[in] prepare Fills the C arguments from the verb and the owned inputs, pointing them only into the block,
-     *      and answers a status that becomes the final one, with nothing submitted, when it fails.
-     *  @param[in] inputs Everything the call reads, which the block owns until the call is final.
-     */
-    template <typename prepare_type_, typename... inputs_types_>
-    static deferred submit(prepare_type_&& prepare, inputs_types_... inputs) noexcept {
-        using owning_block_t = owning_block<inputs_types_...>;
-        owning_block_t* const block = new (std::nothrow) owning_block_t(std::move(inputs)...);
-        if (!block) return deferred {nullptr};
-        block->destroy = [](block_t* erased) noexcept { delete static_cast<owning_block_t*>(erased); };
-        arguments_t arguments {};
-        status_t const prepared = std::apply(
-            [&](inputs_types_&... owned) noexcept { return prepare(block->verb, arguments, owned...); }, block->inputs);
-        if (prepared.failed()) block->outcome = prepared;
-        else {
-            arguments.outcome = &block->outcome;
-            arguments.completion = ustore_completion_deferred_k;
-            verb_type_::submit(arguments);
-        }
-        return deferred {block};
-    }
+    /** @c status_code_t::deferred_k until the call is final, then its final status, polled without
+     *      blocking. */
+    status_code_t status() noexcept { return static_cast<status_code_t>(ustore_outcome_status(&outcome_)); }
 
-    /** The status of the call, polled through @c ustore_outcome_status: @c status_code_t::deferred_k until final. */
-    status_code_t status() const noexcept {
-        if (!block_) return status_code_t::out_of_memory_k;
-        return static_cast<status_code_t>(ustore_outcome_status(&block_->outcome));
-    }
-
-    /** Blocks until the call is final, then answers what it produced, or the status explaining why it did not. */
-    answer_t wait() && noexcept {
-        if (!block_) return status_t {status_code_t::out_of_memory_k, "Failed to allocate a deferred call"};
-        auto const code = static_cast<status_code_t>(ustore_outcome_wait(&block_->outcome));
-        status_t const status {code, block_->outcome.message};
-        answer_t answer = status.failed() ? answer_t {status} : std::move(block_->verb).finish();
-        release_();
-        return answer;
+    /** Blocks until the call is final and answers what a blocking call would have. */
+    outcome<answer_type_> wait() noexcept {
+        ustore_outcome_wait(&outcome_);
+        return answered_(outcome_, outputs_);
     }
 };
+
+/** A blocking call's outcome, or a deferred call the caller holds, as @p completion_ says. */
+template <ustore_completion_t completion_, typename answer_type_>
+using answer = std::conditional_t<defers<completion_>, deferred<answer_type_>, outcome<answer_type_>>;
+
+/** Runs @p submit with an outcome and outputs: on the stack when blocking, inside the answered
+ *  @c deferred otherwise. Every verb's one body fills its C arguments inside @p submit and names
+ *  @p completion_ there. */
+template <ustore_completion_t completion_, typename answer_type_, typename submit_type_>
+answer<completion_, answer_type_> called_(submit_type_ const& submit) noexcept {
+    if constexpr (defers<completion_>) return deferred<answer_type_>(submit);
+    else {
+        ustore_outcome_t reported {};
+        outputs<answer_type_> written {};
+        submit(&reported, &written);
+        return answered_(reported, written);
+    }
+}
+
+/** Answers a call refused before it crossed, where only the binding sees two inputs disagree. */
+template <ustore_completion_t completion_, typename answer_type_>
+answer<completion_, answer_type_> refused_(status_t status) noexcept {
+    if constexpr (defers<completion_>) return deferred<answer_type_>(status);
+    else return outcome<answer_type_>(status);
+}
 
 } // namespace unum::ustore

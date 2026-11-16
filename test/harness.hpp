@@ -247,8 +247,8 @@ std::size_t report(suite_totals_t& totals, char const* name, result_type_ (*case
     fmt::println("total {} passed, {} skipped, {} failed, seed {}", totals.passed, totals.skipped, totals.failed,
                  totals.seed);
     if (totals.failures != 0) return 1;
-    if (!totals.filter.text.empty() && totals.passed + totals.skipped + totals.failed == 0) {
-        fmt::println(stderr, "--filter '{}' matched no case, so nothing ran", totals.filter.text);
+    if (!totals.filter.pattern.empty() && totals.passed + totals.skipped + totals.failed == 0) {
+        fmt::println(stderr, "--filter '{}' matched no case, so nothing ran", totals.filter.pattern);
         return 1;
     }
     if (totals.skipped != 0 && totals.policy == skip_policy_t::refused_k) return 3;
@@ -381,7 +381,7 @@ struct suite_options_t {
     engine_options_t engine;
 
     /** The seed every random draw descends from. */
-    seed_t seed;
+    std::uint32_t seed = 42;
 
     /** Threads the concurrent cases fan out over. */
     count_t threads {hardware_threads(), 1};
@@ -398,7 +398,7 @@ struct suite_options_t {
     /** A totals seeded, filtered and policed by these options. */
     [[nodiscard]] suite_totals_t totals() const noexcept {
         suite_totals_t counts;
-        counts.seed = seed.value;
+        counts.seed = seed;
         counts.policy = no_skips == switch_t::present_k ? skip_policy_t::refused_k : skip_policy_t::tolerated_k;
         counts.filter = filter;
         counts.program = program;
@@ -406,7 +406,7 @@ struct suite_options_t {
     }
 
     /** A generator seeded by these options. */
-    [[nodiscard]] random_t random() const noexcept { return random_t {seed.value}; }
+    [[nodiscard]] random_t random() const noexcept { return random_t {seed}; }
 };
 
 /** Most flags one suite adds to the shared ones. */
@@ -416,8 +416,10 @@ constexpr std::size_t suite_flags_capacity_k = 16;
  *  @brief Parses the shared flags and @p suite_flags from @p argv into @p options, drawing a seed
  *      on @c --seed @c random, and echoes every flag.
  *
- *  Prints the usage on @c --help and one failure line on failure. A suite flag named like a shared one
- *  shadows it, so a suite may give @c --threads its own meaning.
+ *  Every flag defaults to its @c USTORE_<FLAG> variable, as the Python suites read @c USTORE_SEED
+ *  and @c USTORE_FILTER. Exits with status 0 after the usage on @c --help, and with status 1 after
+ *  one failure line. A suite flag named like a shared one shadows it, so a suite may give
+ *  @c --threads a meaning of its own.
  */
 [[nodiscard]] inline argument_status_t parse_suite_options(int argc, char const* const* argv, suite_options_t& options,
                                                            std::span<flag_t const> suite_flags = {}) {
@@ -445,12 +447,10 @@ constexpr std::size_t suite_flags_capacity_k = 16;
     for (flag_t const& flag : suite_flags) flags[count++] = flag;
 
     std::span<flag_t const> const every_flag {flags.data(), count};
-    arguments_t const parsed = parse_arguments(argc, argv, every_flag, {});
-    if (parsed.status == argument_status_t::help_k) print_usage(argv[0], every_flag);
-    else if (parsed.status != argument_status_t::parsed_k) print_error(parsed);
-    else print_flags(every_flag);
+    parse_or_exit(argc, argv, argv[0], every_flag);
+    print_flags(every_flag);
     options.program = argc != 0 ? argv[0] : "";
-    return parsed.status;
+    return argument_status_t::parsed_k;
 }
 
 #pragma endregion Flags

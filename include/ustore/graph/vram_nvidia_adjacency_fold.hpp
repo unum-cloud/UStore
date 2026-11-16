@@ -22,7 +22,7 @@
 namespace unum::ustore::graph {
 
 /**
- *  @brief The device fold of graph adjacency, composing on one NVIDIA device
+ *  @brief The device fold of graph adjacency, composing on one NVIDIA or AMD device
  *      what @c adjacency_fold_t composes on the host, for a compaction's chains
  *      of half-edge changes all at once.
  *
@@ -41,7 +41,7 @@ struct vram_nvidia_adjacency_fold_t {
      *  The compose runs on the device of @p executor, in device memory carved off @p blocks.
      *
      *  @tparam executor_type_ The executor whose stream the device work queues on, as
-     *      in @c utilities::cuda_executor_t.
+     *      in @c utilities::cuda_executor_t or @c utilities::hip_executor_t.
      *  @tparam blocks_type_ The device runs the compose carves from, as
      *      in @c utilities::device_blocks_t.
      *

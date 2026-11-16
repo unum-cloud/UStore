@@ -33,7 +33,7 @@
 #include <smashtable/shared.hpp>
 
 #include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compacted_sorted_run_t`, `compaction_kind_t`
-#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `device_compactor`
 #include "ustore/graph/adjacency_fold.hpp"         // `adjacency_fold_t`, `save_delta`
 #include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
 #include "ustore/utilities/nvme_linux_cufile_disk.hpp" // `linux_cufile_files_disk`, `linux_cufile_disk_config_t`
@@ -1182,24 +1182,46 @@ struct options_t {
     /** Random keys the large cases draw from, which puts their merges past the GPU threshold. */
     count_t large_universe {600'000};
 
-    /** The process's drivers, which retained device zero's primary context, or none without a device. */
+    /** The process's drivers, which reach device zero of @c vendor, or none without a device. */
     gpu_drivers_t const* drivers = nullptr;
 
-    /** Device zero's table of the library's kernels, or none where the build links no bundle. */
-    kernel_table<cuda_module_t> const* kernels = nullptr;
+    /** The vendor whose device zero the device cases run on, NVIDIA where both have one. */
+    gpu_vendor_t vendor = gpu_vendor_t::unknown_k;
+
+    /** NVIDIA device zero's table of the library's kernels, or none without a bundle. */
+    kernel_table<cuda_module_t> const* cuda_kernels = nullptr;
+
+    /** AMD device zero's table of the library's kernels, or none without a bundle. */
+    kernel_table<hip_module_t> const* hip_kernels = nullptr;
 };
 
-/** Loads the library's bundle onto device zero into @p tables and answers its table, or null where
- *  this build of the suite links no bundle, as its host build does. */
+/** Loads the library's bundle onto NVIDIA device zero into @p tables and answers its table, or null
+ *  where this build of the suite links no bundle, as its host build does. */
 kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t& drivers, kernel_tables<cuda_module_t>& tables) noexcept;
 
-/** Spawns an executor on CUDA device zero with a stream of its own, its scratch capped at @p scratch_limit bytes, or
- *  refuses with @c device_k where no driver reaches the device. */
-expected<cuda_executor_t> spawn_device_zero(options_t const& options, std::size_t scratch_limit) noexcept {
-    if (options.drivers == nullptr || options.drivers->cuda_contexts[0] == nullptr)
-        return status_t {status_code_t::device_k, "No CUDA device zero"};
-    return cuda_executor_t::spawn(options.drivers->cuda, options.drivers->cuda_contexts[0], 0, nullptr, scratch_limit,
-                                  ustore_gds_automatic_k, options.kernels);
+/** Loads the library's bundle onto AMD device zero into @p tables and answers its table, or null
+ *  where this build of the suite links no bundle, as its host build does. */
+kernel_table<hip_module_t> const* suite_kernels(gpu_drivers_t& drivers, kernel_tables<hip_module_t>& tables) noexcept;
+
+/** Spawns an executor of @p executor_type_ on its vendor's device zero with a stream of its own,
+ *  its scratch capped at @p scratch_limit bytes, or refuses with @c device_k where no driver
+ *  reaches the device. */
+template <typename executor_type_>
+expected<executor_type_> spawn_device_zero(options_t const& options, std::size_t scratch_limit) noexcept {
+    if (options.drivers == nullptr || options.vendor != executor_type_::vendor_k)
+        return status_t {status_code_t::device_k, "No device zero of the executor's vendor"};
+    if constexpr (std::is_same_v<executor_type_, hip_executor_t>)
+        return hip_executor_t::spawn(options.drivers->hip, 0, nullptr, scratch_limit, options.hip_kernels);
+    else
+        return cuda_executor_t::spawn(options.drivers->cuda, options.drivers->cuda_contexts[0], 0, nullptr,
+                                      scratch_limit, ustore_gds_automatic_k, options.cuda_kernels);
+}
+
+/** Runs @p device_case over the executor type of the vendor the device cases run on. */
+template <typename device_case_type_>
+case_result_t on_device_zero(options_t const& options, device_case_type_ const& device_case) {
+    if (options.vendor == gpu_vendor_t::amd_k) return device_case.template operator()<hip_executor_t>();
+    return device_case.template operator()<cuda_executor_t>();
 }
 
 /** Bounds of one-mebibyte sorted runs. */
@@ -1293,17 +1315,19 @@ case_result_t gpu_devices_listed() {
     return failures;
 }
 
-/** Runs a compaction on the first CUDA device and expects the host's output back in every field. */
-template <typename key_slot_type_>
-case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
-                       test_lsm_level<key_slot_type_> const& upper, test_lsm_level<key_slot_type_> const& lower,
-                       compaction_output<key_slot_type_> const& host, options_t const& options) {
+/** Runs a compaction on device zero through @p executor_type_ and expects the host's output back
+ *  in every field. */
+template <typename executor_type_, typename key_slot_type_>
+case_result_t gpu_case_on(compaction_kind_t kind, sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                          test_lsm_level<key_slot_type_> const& upper, test_lsm_level<key_slot_type_> const& lower,
+                          compaction_output<key_slot_type_> const& host, options_t const& options) {
+    using compactor_t = device_compactor<executor_type_>;
     if constexpr (!std::is_same_v<typename key_slot_type_::stored_key_t, st::key128_t>)
         return case_result_t::skipped("the bundle carries merge kernels for 16-byte keys alone");
-    expected<cuda_executor_t> executor = spawn_device_zero(options, 0);
-    if (!executor) return case_result_t::skipped("no CUDA device");
-    expected<cuda_compactor_t> compactor = cuda_compactor_t::make(*executor);
-    if (!compactor) return case_result_t::skipped("no CUDA compactor");
+    expected<executor_type_> executor = spawn_device_zero<executor_type_>(options, 0);
+    if (!executor) return case_result_t::skipped("no GPU device");
+    expected<compactor_t> compactor = compactor_t::make(*executor);
+    if (!compactor) return case_result_t::skipped("no device compactor");
     std::size_t failures = 0;
     compaction_output<key_slot_type_> device;
     st::status_t const status = compactor->compact(kind, views_of(upper), views_of(lower), extents_of(upper, lower),
@@ -1324,10 +1348,10 @@ case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds
 
     // An executor whose scratch limit no merge fits refuses before it allocates, so the tree merges on the host
     // instead.
-    expected<cuda_executor_t> narrow_executor = spawn_device_zero(options, 1);
+    expected<executor_type_> narrow_executor = spawn_device_zero<executor_type_>(options, 1);
     failures += expect(narrow_executor.has_value());
     if (!narrow_executor) return failures;
-    expected<cuda_compactor_t> narrow = cuda_compactor_t::make(*narrow_executor);
+    expected<compactor_t> narrow = compactor_t::make(*narrow_executor);
     failures += expect(narrow.has_value());
     if (!narrow) return failures;
     compaction_output<key_slot_type_> refused;
@@ -1337,6 +1361,16 @@ case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds
     failures += expect(refusal == st::status_t::out_of_memory_heap_k);
     failures += expect_eq(narrow->device_allocations(), std::uint64_t {0});
     return failures;
+}
+
+/** Runs a compaction on device zero of either vendor, as @c gpu_case_on. */
+template <typename key_slot_type_>
+case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                       test_lsm_level<key_slot_type_> const& upper, test_lsm_level<key_slot_type_> const& lower,
+                       compaction_output<key_slot_type_> const& host, options_t const& options) {
+    return on_device_zero(options, [&]<typename executor_type_>() {
+        return gpu_case_on<executor_type_>(kind, bounds, stamps, upper, lower, host, options);
+    });
 }
 
 /** Checks one compaction of @p upper into @p lower on the host against the reference, then on the GPU against the
@@ -1846,15 +1880,18 @@ double milliseconds_since(std::chrono::steady_clock::time_point start) noexcept 
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
-/** Merges the levels of @p graph_case on the host and on the first CUDA device, composing its chains with the graph's
- *  device fold, and expects identical outputs; with @p order reversed, the host reads every change's records in
- *  reverse, which the device output must expose. */
-case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_index, sequence_order_t order,
-                             options_t const& options) {
-    expected<cuda_executor_t> executor = spawn_device_zero(options, 0);
-    if (!executor) return case_result_t::skipped("no CUDA device");
-    expected<cuda_compactor_t> compactor = cuda_compactor_t::make(*executor);
-    if (!compactor) return case_result_t::skipped("no CUDA compactor");
+/** Merges the levels of @p graph_case on the host and on device zero through @p executor_type_,
+ *  composing its chains with the graph's device fold, and expects identical outputs; with
+ *  @p order reversed, the host reads every change's records in reverse, and the device output
+ *  must show that the order differs. */
+template <typename executor_type_>
+case_result_t graph_gpu_case_on(graph_case_t const& graph_case, std::size_t case_index, sequence_order_t order,
+                                options_t const& options) {
+    using compactor_t = device_compactor<executor_type_>;
+    expected<executor_type_> executor = spawn_device_zero<executor_type_>(options, 0);
+    if (!executor) return case_result_t::skipped("no GPU device");
+    expected<compactor_t> compactor = compactor_t::make(*executor);
+    if (!compactor) return case_result_t::skipped("no device compactor");
     std::size_t failures = 0;
     random_t random = options.random.fork(case_index);
     graph_levels_t levels;
@@ -1922,6 +1959,14 @@ case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_in
     return failures;
 }
 
+/** Merges the levels of @p graph_case on device zero of either vendor, as @c graph_gpu_case_on. */
+case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_index, sequence_order_t order,
+                             options_t const& options) {
+    return on_device_zero(options, [&]<typename executor_type_>() {
+        return graph_gpu_case_on<executor_type_>(graph_case, case_index, order, options);
+    });
+}
+
 #pragma endregion Graph Folds
 
 #pragma region Sections By Extent
@@ -1979,11 +2024,11 @@ std::size_t lay_sections(test_lsm_level<key_slot_type_>& level,
 case_result_t gpu_reads_sections_by_extent(options_t const& options, std::string_view directory) {
     using key_slot_t = variable_width_key_slot<st::key128_t>;
     if (directory.empty()) return case_result_t::skipped(needs_directory_k);
-    if (options.drivers == nullptr) return case_result_t::skipped("no CUDA device");
+    if (options.vendor != gpu_vendor_t::nvidia_k) return case_result_t::skipped("no CUDA device");
     linux_cufile_probe_t const probe = linux_cufile_disk_t::probe(options.drivers->cufile);
     if (probe == linux_cufile_probe_t::absent_k || probe == linux_cufile_probe_t::refused_k)
         return case_result_t::skipped("needs cuFile in direct or compat mode");
-    expected<cuda_executor_t> executor = spawn_device_zero(options, 0);
+    expected<cuda_executor_t> executor = spawn_device_zero<cuda_executor_t>(options, 0);
     if (!executor) return case_result_t::skipped("no CUDA device");
 
     std::size_t failures = 0;
@@ -2102,8 +2147,17 @@ int main(int argc, char** argv) {
     options.random = suite.random();
     suite_totals_t totals = suite.totals();
     gpu_drivers_t drivers;
-    kernel_tables<cuda_module_t> kernels;
-    if (drivers.retain_context(0)) options.drivers = &drivers, options.kernels = suite_kernels(drivers, kernels);
+    kernel_tables<cuda_module_t> cuda_kernels;
+    kernel_tables<hip_module_t> hip_kernels;
+    gpu_device_t amd_device;
+    if (drivers.retain_context(0)) {
+        options.drivers = &drivers, options.vendor = gpu_vendor_t::nvidia_k;
+        options.cuda_kernels = suite_kernels(drivers, cuda_kernels);
+    }
+    else if (list_amd_gpu_devices(drivers.hip, {&amd_device, 1})) {
+        options.drivers = &drivers, options.vendor = gpu_vendor_t::amd_k;
+        options.hip_kernels = suite_kernels(drivers, hip_kernels);
+    }
 
     report(totals, "compaction.uuid_orders_like_memcmp", uuid_orders_like_memcmp, options);
     report(totals, "compaction.survivor_first_orders_the_survivor_first", survivor_first_orders_the_survivor_first);

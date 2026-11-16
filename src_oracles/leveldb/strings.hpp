@@ -70,7 +70,7 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
     database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
-                                                  entry_layout_t::strings_to_uuids_k);
+                                                  entry_layout_t::strings_to_uuids_k, view);
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteBatch batch;
@@ -92,7 +92,7 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
     database_t& database = *state_of<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
-                                                  entry_layout_t::strings_to_uuids_k);
+                                                  entry_layout_t::strings_to_uuids_k, view);
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteBatch batch;
@@ -129,7 +129,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
 
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
-                                                  entry_layout_t::strings_to_uuids_k);
+                                                  entry_layout_t::strings_to_uuids_k, view);
     if (resolved.failed()) return resolved;
 
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
@@ -169,7 +169,8 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     std::size_t const count = arguments.count;
     ustore_scan_direction_t const direction = arguments.direction;
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    status_t const resolved = resolve_collections(database, collections, count, entry_layout_t::strings_to_uuids_k);
+    status_t const resolved = resolve_collections(database, collections, count, entry_layout_t::strings_to_uuids_k,
+                                                  view);
     if (resolved.failed()) return resolved;
 
     auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
@@ -217,7 +218,7 @@ status_t strings_sample(ustore_strings_sample_t const& arguments, view_t const& 
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     sample_batch_t const samples = samples_of(arguments);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
-                                                  entry_layout_t::strings_to_uuids_k);
+                                                  entry_layout_t::strings_to_uuids_k, view);
     if (resolved.failed()) return resolved;
 
     auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
@@ -272,7 +273,7 @@ status_t strings_measure(ustore_strings_measure_t const& arguments, strings_arg_
     ustore_scan_direction_t const direction = arguments.direction;
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     status_t const resolved = resolve_collections(database, collections, arguments.count,
-                                                  entry_layout_t::strings_to_uuids_k);
+                                                  entry_layout_t::strings_to_uuids_k, view);
     if (resolved.failed()) return resolved;
 
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);

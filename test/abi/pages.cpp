@@ -337,9 +337,9 @@ case_result_t database_pages_random_streams(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     if (!serves_pages(database)) return case_result_t::skipped("the engine serves no pages yet", failures);
-    bool const snapshots = database.supports_snapshots();
+    bool const snapshots = database.on().supports_snapshots();
 
     std::mt19937_64 random(42);
     for (std::uint64_t stream_index = 0; stream_index != 8; ++stream_index) {
@@ -516,9 +516,10 @@ case_result_t database_pages_transactions(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     if (!serves_pages(database)) return case_result_t::skipped("the engine serves no pages yet", failures);
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
 
     auto [pages, pages_status] = create_pages_collection(database, "pages");
     pages_client_t head {database, pages};
@@ -529,8 +530,8 @@ case_result_t database_pages_transactions(config_t const& config) {
     element_key_t const page = element_key_of(key_from_integer(7));
     failures += expect(head.import(page, "<doc><p>one</p></doc>").succeeded());
 
-    auto [first, first_status] = database.transaction();
-    auto [second, second_status] = database.transaction();
+    auto [first, first_status] = database.on().transaction();
+    auto [second, second_status] = database.on().transaction();
     failures += expect(first_status.succeeded() && second_status.succeeded());
     if (failures) return failures;
     pages_client_t first_client {database, pages, first.transaction()};
@@ -556,12 +557,12 @@ case_result_t database_pages_transactions(config_t const& config) {
     failures += expect_eq(first_client.read(page, {}, ustore_page_encoding_xml_k,
                                             ustore_transaction_view(first.transaction(), ustore_watch_none_k)),
                           std::string("<p>two</p><doc><p>one</p></doc>"));
-    failures += expect(first.commit().has_value());
+    failures += expect(first.on().commit().has_value());
     failures += expect_eq(head.read(page), std::string("<p>two</p><doc><p>one</p></doc>"));
 
     // A page rewritten whole conflicts, while a page kept as its edits lands both, folded
     // in commit order
-    bool const both_landed = second.commit().has_value();
+    bool const both_landed = second.on().commit().has_value();
     failures += expect_eq(head.read(page), std::string(both_landed ? "lead<p>two</p><doc><p>one</p></doc>"
                                                                    : "<p>two</p><doc><p>one</p></doc>"));
     return failures;
@@ -574,9 +575,10 @@ case_result_t database_pages_edit_after_removal(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     if (!serves_pages(database)) return case_result_t::skipped("the engine serves no pages yet", failures);
-    if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
+    if (!database.on().supports_transactions())
+        return case_result_t::skipped("the engine keeps no transactions", failures);
 
     auto [pages, pages_status] = create_pages_collection(database, "pages");
     pages_client_t head {database, pages};
@@ -587,7 +589,7 @@ case_result_t database_pages_edit_after_removal(config_t const& config) {
     element_key_t const page = element_key_of(key_from_integer(9));
     failures += expect(head.import(page, "<doc><p>one</p></doc>").succeeded());
 
-    auto [editing, editing_status] = database.transaction();
+    auto [editing, editing_status] = database.on().transaction();
     auto [editing_arena, editing_arena_status] = arena_t::make();
     failures += expect(editing_status.succeeded() && editing_arena_status.succeeded());
     if (failures) return failures;
@@ -599,7 +601,7 @@ case_result_t database_pages_edit_after_removal(config_t const& config) {
 
     failures += expect(head.edit(modification_t::remove_k, page, {{}}).succeeded());
     failures += expect_eq(head.read(page), std::string(page_absent_k));
-    failures += expect_status(editing.commit(), status_code_t::write_conflict_k);
+    failures += expect_status(editing.on().commit(), status_code_t::write_conflict_k);
     failures += expect_eq(head.read(page), std::string(page_absent_k));
     return failures;
 }
@@ -611,7 +613,7 @@ case_result_t database_pages_all_or_nothing(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(database.on().clear(ustore_drop_collection_k).succeeded());
     if (!serves_pages(database)) return case_result_t::skipped("the engine serves no pages yet", failures);
 
     auto [pages, pages_status] = create_pages_collection(database, "pages");
@@ -671,7 +673,7 @@ case_result_t pages_refusals(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(owner.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(owner.on().clear(ustore_drop_collection_k).succeeded());
     ustore_database_t const database = owner;
     auto [pages, pages_status] = create_collection(database, "pages", ustore_modality_pages_k);
     failures += expect(pages_status.succeeded());

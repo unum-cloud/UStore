@@ -39,13 +39,15 @@
 #include <smashtable/immutable_splus_tree.hpp>   // `st::immutable_splus_tree_view`
 #include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`, `st::assume_uninitialized`
 
-#include "ustore/blobs/nvme_key_slot.hpp"      // `stored_key_concept`
-#include "ustore/utilities/algorithm.hpp"      // `loser_tree`
-#include "ustore/utilities/blocking_files.hpp" // `path_max_bytes_k`
-#include "ustore/utilities/folds.hpp"          // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
-#include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
-#include "ustore/utilities/ram_buffers.hpp"    // `local_arena_t`, `arena_allocator`
-#include "ustore/utilities/types.hpp"          // `round_up_to_multiple`, `expected`, `uuid128_t`
+#include "ustore/blobs/nvme_key_slot.hpp"          // `stored_key_concept`
+#include "ustore/utilities/algorithm.hpp"          // `loser_tree`
+#include "ustore/utilities/blocking_files.hpp"     // `path_max_bytes_k`
+#include "ustore/utilities/folds.hpp"              // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
+#include "ustore/utilities/ram_buffers.hpp"        // `local_arena_t`, `arena_allocator`
+#include "ustore/utilities/types.hpp"              // `round_up_to_multiple`, `expected`, `uuid128_t`
+#include "ustore/utilities/vram_amd_device.hpp"    // `hip_executor_t`
+#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_executor_t`
 
 namespace unum::ustore::blobs {
 
@@ -2021,11 +2023,18 @@ class ring_sections_reader {
     utilities::registered_memory_t registered_;
 };
 
-class cuda_compactor_t;
+template <typename executor_type_>
+class device_compactor;
+
+/** The device compactor of an NVIDIA device. */
+using cuda_compactor_t = device_compactor<utilities::cuda_executor_t>;
+
+/** The device compactor of an AMD device. */
+using hip_compactor_t = device_compactor<utilities::hip_executor_t>;
 
 /** The compactor a database's merges run on, picked once at mount by whoever opens it: the calling thread, or a warm
- *  device compactor that opener owns. */
-using compactor_ref_t = std::variant<host_compactor_t, cuda_compactor_t*>;
+ *  device compactor of either vendor that opener owns. */
+using compactor_ref_t = std::variant<host_compactor_t, cuda_compactor_t*, hip_compactor_t*>;
 
 #pragma endregion Device
 

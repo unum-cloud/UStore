@@ -39,6 +39,10 @@ endforeach ()
 
 # Everything below is this project's own: the siblings it builds on, at the commits their submodules pin.
 
+# StringZilla compiles its Metal layer, the unified allocator and the registry the Apple executor binds through, for
+# the families UStore serves.
+set(STRINGZILLA_METAL_ARCH "${USTORE_METAL_ARCH}")
+
 # A toolkit installed outside the PATH, which is where the distribution packages put it
 if (USTORE_CUDA_ARCH)
     if (NOT DEFINED CMAKE_CUDA_COMPILER)

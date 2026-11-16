@@ -53,13 +53,13 @@ using time_point_t = steady_clock_t::time_point;
 struct shared_settings_t {
 
     /** Untimed calls ahead of each sampled row. */
-    std::chrono::nanoseconds warmup = std::chrono::seconds {1};
+    std::chrono::milliseconds warmup = std::chrono::seconds {1};
 
     /** Timed calls of each sampled row. */
-    std::chrono::nanoseconds time_limit = std::chrono::seconds {10};
+    std::chrono::milliseconds time_limit = std::chrono::seconds {10};
 
     /** Seed every generated input and key stream derives from. */
-    seed_t seed;
+    std::uint32_t seed = 42;
 
     /** Rows to run. */
     filter_t filter;
@@ -74,15 +74,16 @@ inline constexpr std::size_t bench_flags_capacity_k = 24;
 /**
  *  @brief Parses @p flags and the shared ones from @p argv into @p settings, then echoes every one.
  *
- *  Exits with status 0 after printing the usage on @c --help, and with status 1 after one failure line.
+ *  Every flag defaults to its @c USTORE_<FLAG> variable. Exits with status 0 after printing the
+ *  usage on @c --help, and with status 1 after one failure line.
  */
 inline void read_settings(int argc, char const* const* argv, shared_settings_t& settings,
                           std::span<flag_t const> flags) {
     std::array<flag_t, bench_flags_capacity_k + 4> every_flag;
     std::size_t count = 0;
     for (flag_t const& flag : flags) every_flag[count++] = flag;
-    every_flag[count++] = {"--warmup", "duration", "untimed calls ahead of each sampled row, like 1s", &settings.warmup,
-                           "Warm-up"};
+    every_flag[count++] = {"--warmup", "duration", "untimed calls ahead of each sampled row, like 1s",
+                           &settings.warmup};
     every_flag[count++] = {"--time-limit", "duration", "timed calls of each sampled row, like 10s",
                            &settings.time_limit};
     every_flag[count++] = {"--seed", "number", "seed of every generated input and key stream, or random",
@@ -91,15 +92,7 @@ inline void read_settings(int argc, char const* const* argv, shared_settings_t& 
                            &settings.filter};
 
     std::span<flag_t const> const parsed_flags {every_flag.data(), count};
-    arguments_t const parsed = parse_arguments(argc, argv, parsed_flags, {});
-    if (parsed.status == argument_status_t::help_k) {
-        print_usage(argv[0], parsed_flags);
-        std::exit(0);
-    }
-    if (parsed.status != argument_status_t::parsed_k) {
-        print_error(parsed);
-        std::exit(1);
-    }
+    parse_or_exit(argc, argv, argv[0], parsed_flags);
     print_flags(parsed_flags);
 }
 

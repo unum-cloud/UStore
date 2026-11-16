@@ -38,6 +38,7 @@ option(USTORE_BUILD_TEST "Compile the C++ suites in test/" OFF)
 option(USTORE_BUILD_BENCH "Compile the C++ benchmarks in bench/" OFF)
 option(USTORE_BUILD_TOOLS "Compile the CLI and the dataset tools in tools/" OFF)
 option(USTORE_BUILD_SHARED "Compile the static and shared C libraries in the default build" OFF)
+option(USTORE_BUILD_STUB "Compile a brute-force stand-in for the C 99 interface" OFF)
 option(USTORE_BUILD_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
 set(USTORE_CUDA_ARCH
     ""
@@ -46,6 +47,10 @@ set(USTORE_CUDA_ARCH
 set(USTORE_ROCM_ARCH
     ""
     CACHE STRING "AMD processors the device bundles embed code objects for: empty, all, native or a list like gfx942"
+)
+set(USTORE_METAL_ARCH
+    ""
+    CACHE STRING "Apple GPU family the Metal class units serve: empty, all or one like apple9"
 )
 option(USTORE_WERROR "Treat compiler warnings as errors" OFF)
 option(USTORE_BUNDLE_SIBLINGS "Copy the ForkUnion and StringZilla objects into ustore_static; Cargo links their own" ON)
@@ -362,7 +367,7 @@ if (${USTORE_WITH_NVME})
         PRIVATE $<BUILD_INTERFACE:ustore_header>
     )
     set_target_properties(ustore_nvme_compaction PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    if (ustore_cuda_codes_)
+    if (ustore_cuda_codes_ OR ustore_rocm_codes_)
         set(ustore_device_compaction_ ON)
     endif ()
     list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_nvme_compaction>)
@@ -406,10 +411,24 @@ endforeach ()
 # so its bundle holds UStore's kernels alone over the building blocks StringZilla opens wherever the vendor compiles
 set(ustore_gpu_gates_)
 set(ustore_vram_objects_)
-foreach (class_ IN LISTS ustore_nvidia_classes_ ustore_amd_classes_)
+foreach (class_ IN LISTS ustore_nvidia_classes_ ustore_amd_classes_ ustore_apple_classes_)
     set(macro_ ${ustore_class_${class_}_macro_})
     list(APPEND ustore_gpu_gates_ "USTORE_TARGET_${macro_}=$<BOOL:${ustore_class_${class_}_kept_}>")
     if (NOT ustore_class_${class_}_kept_)
+        continue()
+    endif ()
+    # An Apple class unit is host C++ embedding its MSL source, which the device compiles at the class's first spawn
+    if (ustore_class_${class_}_vendor_ STREQUAL "apple")
+        add_library(ustore_vram_${class_} OBJECT src/vram/${ustore_class_${class_}_source_})
+        target_compile_features(ustore_vram_${class_} PRIVATE cxx_std_20)
+        target_include_directories(ustore_vram_${class_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(ustore_vram_${class_} PRIVATE ${ustore_class_${class_}_gates_})
+        target_compile_options(
+            ustore_vram_${class_}
+            PRIVATE "--embed-dir=${CMAKE_CURRENT_SOURCE_DIR}/include" "--embed-dir=${CMAKE_CURRENT_SOURCE_DIR}/src"
+                    "--embed-dir=${stringzilla_SOURCE_DIR}/include"
+        )
+        list(APPEND ustore_vram_objects_ $<TARGET_OBJECTS:ustore_vram_${class_}>)
         continue()
     endif ()
     add_library(ustore_vram_${class_} OBJECT ${ustore_library_exclusion_})
@@ -462,6 +481,11 @@ target_link_libraries(
 )
 # Every GPU runtime and cuFile open through `dlopen` at first use, which glibc before 2.34 keeps in `libdl`
 target_link_libraries(ustore_static PUBLIC ${CMAKE_DL_LIBS})
+# On Apple platforms the Metal layer calls Metal and the Objective-C runtime directly, which every Mac carries
+if (USTORE_METAL_ARCH AND APPLE)
+    target_link_libraries(ustore_static PUBLIC "-framework Metal" "-framework Foundation" objc)
+    target_link_libraries(ustore_shared PRIVATE "-framework Metal" "-framework Foundation" objc)
+endif ()
 target_link_libraries(ustore_shared PRIVATE ${CMAKE_DL_LIBS})
 # The shared library exports the C ABI alone. On ELF a version script does it, since the standard library's inline
 # definitions, like `std::bad_variant_access`, keep default visibility under any preset, as do the archives linked
@@ -478,13 +502,18 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
     target_compile_definitions(
         ${library_}
         PUBLIC ${ustore_engine_definitions_}
-        INTERFACE USTORE_VERSION="${ustore_version_name_}"
+        PUBLIC USTORE_VERSION="${ustore_version_name_}"
     )
     # Collection identifiers draw their entropy from `BCryptGenRandom` on Windows
     target_link_libraries(${library_} PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt> $<BUILD_INTERFACE:ustore_warnings>)
     # Every unit reads which CPU and GPU classes compiled and which ForkUnion and StringZilla capabilities the toolchain
     # builds, so the units instantiating a class and the open picking one name the same rungs and strings kits
     target_compile_definitions(${library_} PRIVATE ${ustore_cpu_gates_} ${ustore_gpu_gates_})
+    # The Apple executor allocates, binds and waits through StringZilla's Metal layer
+    if (USTORE_METAL_ARCH)
+        target_compile_definitions(${library_} PRIVATE STRINGZILLA_ARCH_METAL_=1)
+        target_compile_options(${library_} PRIVATE "--embed-dir=${stringzilla_SOURCE_DIR}/include")
+    endif ()
     target_link_libraries(
         ${library_} PRIVATE $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>
                             $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
@@ -952,6 +981,10 @@ if (${USTORE_BUILD_BENCH})
     endif ()
 endif ()
 
+if (USTORE_BUILD_STUB)
+    add_subdirectory(src_stub)
+endif ()
+
 if (${USTORE_BUILD_PYTHON})
     add_subdirectory(python)
 endif ()
@@ -963,7 +996,7 @@ endif ()
 set(ustore_install_sdk_targets_ ustore_header ustore_shared)
 set(ustore_install_static_targets_ ustore_static ${ustore_engine_archives_})
 set(ustore_static_dependencies_)
-if (ustore_device_compaction_)
+if (ustore_device_compaction_ AND ustore_cuda_codes_)
     set(ustore_static_dependencies_ "find_dependency(CUDAToolkit)")
 endif ()
 include(cmake/ustore_install.cmake)

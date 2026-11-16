@@ -235,8 +235,8 @@ case_result_t concurrent_edits_commit(char const* directory) {
     failures += expect(expected_pages.set_attribute(page, page, "class", "x").succeeded());
     std::string const after_both = expected_pages.read(page);
 
-    auto [first, first_status] = drive.transaction();
-    auto [second, second_status] = drive.transaction();
+    auto [first, first_status] = drive.on().transaction();
+    auto [second, second_status] = drive.on().transaction();
     failures += expect(first_status.succeeded() && second_status.succeeded());
     if (failures) return failures;
     pages_client_t first_pages {drive, stored_pages.collection, first.transaction(), std::move(stored_pages.arena)};
@@ -250,8 +250,8 @@ case_result_t concurrent_edits_commit(char const* directory) {
     failures += expect(second_pages.set_attribute(page, page, "class", "x").succeeded());
     failures += expect_eq(first_pages.read(page), after_insert);
     failures += expect_eq(head_pages.read(page), std::string(markup));
-    failures += expect(first.commit().has_value());
-    failures += expect(second.commit().has_value());
+    failures += expect(first.on().commit().has_value());
+    failures += expect(second.on().commit().has_value());
     failures += expect_eq(head_pages.read(page), after_both);
     return failures;
 }
@@ -357,13 +357,13 @@ case_result_t fold_survives_maintenance(char const* directory, random_t random) 
             landed += wanted.succeeded();
             if (roll >= 6 && roll < 40 && !missing) given[index].push_back(key_from_integer(next_given++));
             // A compaction flushes the memory runs first, so the records land in runs over bases in older ones
-            if (call % flush_calls_k == 0) failures += expect(drive.compact().succeeded());
+            if (call % flush_calls_k == 0) failures += expect(drive.on().compact().succeeded());
             if (call % checkpoint_calls_k == 0) failures += compare_all(stored_pages, "after a checkpoint");
         }
         fmt::println("  {} of {} calls landed", landed, model_calls_k);
         failures += expect(landed * 10 > model_calls_k * 9);
         failures += compare_all(stored_pages, "after every call");
-        failures += expect(drive.compact().succeeded());
+        failures += expect(drive.on().compact().succeeded());
         failures += compare_all(stored_pages, "after a compaction");
     }
 

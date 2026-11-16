@@ -826,7 +826,7 @@ int main(int argc, char** argv) {
     report(totals, "json_paths.missing", json_paths_missing);
     report(totals, "json_paths.refusals", json_paths_refusals);
     report(totals, "json_paths.printing", json_paths_printing);
-    report(totals, "json_paths.random", json_paths_random, std::uint64_t {options.seed.value});
+    report(totals, "json_paths.random", json_paths_random, std::uint64_t {options.seed});
 
     return suite_exit_code(totals);
 }
