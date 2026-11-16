@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/ustoreTargets.cmake")
+if (EXISTS "${CMAKE_CURRENT_LIST_DIR}/ustoreStaticTargets.cmake")
+    @ustore_static_dependencies_@
+    include("${CMAKE_CURRENT_LIST_DIR}/ustoreStaticTargets.cmake")
+endif ()

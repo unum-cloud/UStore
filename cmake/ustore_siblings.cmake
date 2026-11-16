@@ -1,25 +1,43 @@
 # The sibling helper, the switches forwarded to the siblings, and the siblings themselves.
 
-# A sibling builds from its nested checkout, or else from the commit its submodule pins, fetched unless
-# `FETCHCONTENT_SOURCE_DIR_<NAME>` names a local checkout, as in a workspace that keeps the siblings side by side. The
-# caller passes that override variable, so nothing derives its name.
+include(FetchContent)
+
+# A sibling builds in place from its submodule when a recursive clone checked one out, or else from the commit that
+# submodule pins, fetched, so a plain clone or a `FetchContent` of UStore still configures.
+# The caller names the sibling's `FETCHCONTENT_SOURCE_DIR_<NAME>`, so nothing derives it.
+# A non-empty one points the sibling at a local checkout, as in a workspace keeping the siblings side by side, and
+# outranks the submodule.
+# A parent project that already added the sibling keeps its copy.
+# Every sibling is a system dependency that builds only what UStore's targets link, so its own warnings never fail a
+# build under USTORE_WERROR.
 function (ustore_sibling name_ override_ repository_ tag_)
     if (TARGET ${name_}::header)
         return()
     endif ()
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED ${override_})
-        add_subdirectory(${name_} EXCLUDE_FROM_ALL SYSTEM)
-    else ()
-        message(STATUS "ustore: ${name_} submodule absent or overridden, fetching ${tag_}")
-        FetchContent_Declare(
-            ${name_}
-            GIT_REPOSITORY ${repository_}
-            GIT_TAG ${tag_}
-            EXCLUDE_FROM_ALL SYSTEM
-        )
-        FetchContent_MakeAvailable(${name_})
+    if (EXISTS "${PROJECT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT ${override_})
+        add_subdirectory("${PROJECT_SOURCE_DIR}/${name_}" "${PROJECT_BINARY_DIR}/${name_}" EXCLUDE_FROM_ALL SYSTEM)
+        return()
     endif ()
+    message(STATUS "ustore: ${name_} from its local checkout, or else fetched at ${tag_}")
+    FetchContent_Declare(
+        ${name_}
+        GIT_REPOSITORY ${repository_}
+        GIT_TAG ${tag_}
+        EXCLUDE_FROM_ALL SYSTEM
+    )
+    FetchContent_MakeAvailable(${name_})
 endfunction ()
+
+# The siblings build for the floor, the build kind and the sanitizer UStore builds for.
+# ThreadSanitizer then sees their barriers, and ForkUnion leaves out the instructions it cannot see.
+# A sibling this project never adds leaves its switches unread.
+foreach (sibling_ IN ITEMS NUMKONG STRINGZILLA FORKUNION SMASHTABLE)
+    set(${sibling_}_MARCH "${USTORE_MARCH}")
+    set(${sibling_}_MULTIVERSIONED "${USTORE_MULTIVERSIONED}")
+    set(${sibling_}_BUILD_SANITIZERS "${USTORE_BUILD_SANITIZERS}")
+endforeach ()
+
+# Everything below is this project's own: the siblings it builds on, at the commits their submodules pin.
 
 # A toolkit installed outside the PATH, which is where the distribution packages put it
 if (USTORE_CUDA_ARCH)
@@ -33,25 +51,16 @@ if (USTORE_CUDA_ARCH)
     check_language(CUDA)
 endif ()
 
-# The siblings build for the floor, the build kind and the sanitizer UStore builds for, so ThreadSanitizer sees their
-# barriers and ForkUnion drops the atomics it cannot see. StringZilla's own GPU tiers stay off, as the library's bundles
-# walk its values and they would link a GPU runtime.
-foreach (sibling_ IN ITEMS FORKUNION STRINGZILLA SMASHTABLE)
-    set(${sibling_}_MARCH "${USTORE_MARCH}")
-    set(${sibling_}_MULTIVERSIONED "${USTORE_MULTIVERSIONED}")
-    set(${sibling_}_BUILD_SANITIZERS "${USTORE_BUILD_SANITIZERS}")
-endforeach ()
-
 # ForkUnion's C ABI, linked statically into every engine and suite
 ustore_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
-    625811b9446897342126a01674f5d548c6de7110
+    b9c6f4c4c3b417061c67859517b945716916bd51
 )
 
 # SmashTable's containers, header-only
 ustore_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable.git
-    5b99bfb577ad668cf0f2a22dd2fa085bc08d422f
+    c2a4b7310423d671099ebd3e3f250383959cd413
 )
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
@@ -59,5 +68,5 @@ ustore_sibling(
 # numkong::header link, once something includes its headers.
 ustore_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla.git
-    4ac15c46016516fd8d22bf453126c70d9a88bb81
+    e224583f7477e5a858e99897229e9665862bc071
 )

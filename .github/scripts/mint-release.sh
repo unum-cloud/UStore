@@ -11,9 +11,9 @@ previous=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-pare
 git diff --quiet HEAD || { echo "mint-release: commit or stash your changes first"; exit 1; }
 
 IFS=. read -r major minor patch <<< "$core"
-export version core major minor patch
+export version major minor patch
 echo "$version" > VERSION
-perl -pi -e 's/^(version = ")[^"]+/$1$ENV{version}/' pyproject.toml Cargo.toml
+perl -pi -e 's/^(version = ")[^"]+/$1$ENV{version}/' Cargo.toml pixi.toml mojo/pixi.toml
 perl -pi -e 's/^(#define USTORE_VERSION_MAJOR )[0-9]+$/$1$ENV{major}/; s/^(#define USTORE_VERSION_MINOR )[0-9]+$/$1$ENV{minor}/; s/^(#define USTORE_VERSION_PATCH )[0-9]+$/$1$ENV{patch}/' c/ustore/types.h
 git commit -am "Release: v$version"
 .github/scripts/check-release.sh "v$version" # catches a missed site even where `core.hooksPath` is unset

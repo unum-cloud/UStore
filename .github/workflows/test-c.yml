@@ -272,23 +272,23 @@ jobs:
       - name: Restore Fetched Dependencies
         uses: actions/cache@v6
         with:
-          path: build_debug/_deps
-          key: deps-${{ runner.os }}-${{ runner.arch }}-debug-${{ hashFiles('cmake/*.cmake') }}
+          path: build_asan/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-asan-${{ hashFiles('cmake/*.cmake') }}
 
       - name: Configure
-        run: cmake --preset debug
+        run: cmake --preset asan
       # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
       - name: Build the C Tests with MSVC
         if: runner.os == 'Windows'
-        run: cmake --build --preset debug --target ustore_test_c ustore_test_c_shared
+        run: cmake --build --preset asan --target ustore_test_c ustore_test_c_shared
       # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
       - name: Run the C Tests against the Static and Shared Libraries
         if: runner.os == 'Windows'
-        run: ctest --preset debug --tests-regex '^ustore_test_c(_shared)?$'
+        run: ctest --preset asan --tests-regex '^ustore_test_c(_shared)?$'
       - name: Build
-        run: cmake --build --preset debug
+        run: cmake --build --preset asan
       - name: Test
-        run: ctest --preset debug
+        run: ctest --preset asan
 
   test_ubuntu_tsan:
     name: Test TSan on Ubuntu x86-64
@@ -354,7 +354,7 @@ jobs:
           set -eux
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
-            cmake ninja-build qemu-user gcc-riscv64-linux-gnu g++-riscv64-linux-gnu libc6-dev-riscv64-cross
+            cmake ninja-build qemu-user gcc-16-riscv64-linux-gnu g++-16-riscv64-linux-gnu libc6-dev-riscv64-cross
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
           echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main" \
             > /etc/apt/sources.list.d/llvm.list

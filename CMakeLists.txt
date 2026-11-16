@@ -1,14 +1,15 @@
 cmake_minimum_required(VERSION 3.28)
 
-file(READ "VERSION" ustore_version_)
-string(STRIP ${ustore_version_} ustore_version_)
-# CMake versions are numeric, so the pre-release suffix of VERSION stays in ustore_version_ only.
-string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" ustore_version_number_ ${ustore_version_})
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" ustore_version_name_ LIMIT_COUNT 1)
+# `project()` takes the numeric core alone, so a candidate's suffix stays in the name.
+if (NOT ustore_version_name_ MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)")
+    message(FATAL_ERROR "VERSION must start with MAJOR.MINOR.PATCH, not '${ustore_version_name_}'")
+endif ()
 project(
     ustore
+    VERSION ${CMAKE_MATCH_1}
     LANGUAGES C CXX
-    VERSION ${ustore_version_number_}
-    HOMEPAGE_URL "https://github.com/unum-cloud/UStore"
+    HOMEPAGE_URL "https://www.unum.cloud/docs/ustore"
     DESCRIPTION "GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass"
 )
 
@@ -123,14 +124,17 @@ if (${USTORE_WITH_LINUX_SPDK})
     include(cmake/spdk.cmake)
 endif ()
 
+include(cmake/ustore_siblings.cmake)
+# The floor lands after the siblings, so MSVC's `native` reads which capabilities StringZilla found this host runs.
+set(ustore_native_probe_library_ stringzilla)
+set(ustore_native_probe_capabilities_ icelake skylake haswell neon)
+include(cmake/ustore_platform.cmake)
+
 # Modalities:
 include(cmake/fmt.cmake)
-# Its objects go inside the UStore libraries, so an install publishes no yyjson header, archive or config of its own
-set(YYJSON_INSTALL OFF)
 include(cmake/yyjson.cmake)
-
-include(cmake/ustore_siblings.cmake)
-include(cmake/ustore_platform.cmake)
+# A system {fmt} has no source tree, so the headers' include path comes from the target itself.
+get_target_property(ustore_fmt_include_dir_ fmt::fmt INTERFACE_INCLUDE_DIRECTORIES)
 
 # The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
 # headers they reach into. The package installs UStore's own headers alone, so a consumer brings each sibling's.
@@ -149,7 +153,7 @@ target_include_directories(
 )
 target_include_directories(
     ustore_header SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
-                                   $<BUILD_INTERFACE:${ustore_fmt_include_dir_}>
+                                   "$<BUILD_INTERFACE:${ustore_fmt_include_dir_}>"
 )
 target_link_libraries(
     ustore_header INTERFACE $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
@@ -474,7 +478,7 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
     target_compile_definitions(
         ${library_}
         PUBLIC ${ustore_engine_definitions_}
-        INTERFACE USTORE_VERSION="${ustore_version_}"
+        INTERFACE USTORE_VERSION="${ustore_version_name_}"
     )
     # Collection identifiers draw their entropy from `BCryptGenRandom` on Windows
     target_link_libraries(${library_} PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt> $<BUILD_INTERFACE:ustore_warnings>)
@@ -952,4 +956,22 @@ if (${USTORE_BUILD_PYTHON})
     add_subdirectory(python)
 endif ()
 
+# `find_package(ustore)` names the libraries `ustore::shared` and `ustore::static`. The `sdk` takes the shared library,
+# which links every engine inside, with the C headers and the C++ wrappers; `static` takes the archive and the engine
+# archives it links, `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`. The archive holds the device merger,
+# whose consumers also link the static CUDA runtime it calls where it has one.
+set(ustore_install_sdk_targets_ ustore_header ustore_shared)
+set(ustore_install_static_targets_ ustore_static ${ustore_engine_archives_})
+set(ustore_static_dependencies_)
+if (ustore_device_compaction_)
+    set(ustore_static_dependencies_ "find_dependency(CUDAToolkit)")
+endif ()
 include(cmake/ustore_install.cmake)
+# The header-only templates install as their own `core` component.
+if (USTORE_INSTALL)
+    install(
+        DIRECTORY include/ustore
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        COMPONENT core
+    )
+endif ()

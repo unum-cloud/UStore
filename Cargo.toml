@@ -40,12 +40,12 @@ serde = ["dep:serde", "jsontape/serde"]
 
 [dependencies]
 # The siblings' crates carry the trees `build.rs` hands CMake, and ForkUnion and StringZilla link their own archives.
-forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", default-features = false }
+forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", rev = "b9c6f4c4c3b417061c67859517b945716916bd51", default-features = false }
 jsontape = "0.1.4"
 serde = { version = "1", optional = true }
-smashtable = { version = "1.0.0-rc.1", git = "https://github.com/ashvardanian/SmashTable" }
+smashtable = { version = "1.0.0-rc.1", git = "https://github.com/ashvardanian/SmashTable", rev = "c2a4b7310423d671099ebd3e3f250383959cd413" }
 stringtape = "2.5.0"
-stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", default-features = false }
+stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", rev = "e224583f7477e5a858e99897229e9665862bc071", default-features = false }
 
 [build-dependencies]
 cmake = "0.1"

@@ -50,11 +50,10 @@
     {
       "name": "debug",
       "inherits": "llvm",
-      "displayName": "Debug - suites under AddressSanitizer",
-      "description": "Unoptimized suites and the CLI on every engine, with AddressSanitizer and UndefinedBehaviorSanitizer over UStore's own targets; the storage engines and siblings keep their own flags.",
+      "displayName": "Debug - unoptimized suites",
+      "description": "Unoptimized suites and the CLI on every engine, with full DWARF for stepping through them.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "USTORE_BUILD_SANITIZERS": "address",
         "USTORE_BUILD_TEST": "ON",
         "USTORE_BUILD_TOOLS": "ON",
         "USTORE_BUILD_SHARED": "ON"
@@ -123,11 +122,20 @@
       "name": "tsan",
       "inherits": "llvm",
       "displayName": "TSan - concurrency suites under ThreadSanitizer",
-      "description": "ThreadSanitizer over UStore's own targets in RelWithDebInfo, in a tree of its own because Debug arms AddressSanitizer, which cannot share a process with it. The storage engines and siblings keep their release flags, and UStore's targets drop to -O1.",
+      "description": "ThreadSanitizer over UStore's own targets in RelWithDebInfo, in a tree of its own because AddressSanitizer cannot share a process with it. The storage engines and siblings keep their release flags, and UStore's targets drop to -O1.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "USTORE_BUILD_SANITIZERS": "thread",
         "USTORE_BUILD_TEST": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "inherits": "debug",
+      "displayName": "ASan - suites under AddressSanitizer",
+      "description": "The debug tree with AddressSanitizer and UndefinedBehaviorSanitizer over UStore's own targets; the storage engines and siblings keep their own flags.",
+      "cacheVariables": {
+        "USTORE_BUILD_SANITIZERS": "address"
       }
     },
     {
@@ -155,6 +163,18 @@
         "USTORE_WITH_NVME": "ON",
         "CMAKE_CUDA_HOST_COMPILER": "clang++",
         "USTORE_CUDA_ARCH": "native"
+      }
+    },
+    {
+      "name": "rocm",
+      "inherits": "dev",
+      "displayName": "ROCm - the NVMe engine with GPU compaction",
+      "description": "The dev tree plus the NVMe engine and its HIP compaction, every unit compiled by ROCm's own Clang for the GPUs of this machine alone.",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/rocm/lib/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "/opt/rocm/lib/llvm/bin/clang++",
+        "USTORE_WITH_NVME": "ON",
+        "USTORE_ROCM_ARCH": "native"
       }
     },
     {
@@ -253,7 +273,7 @@
       "name": "cross",
       "hidden": true,
       "inherits": ["base", "linux"],
-      "description": "The suites over the RAM and NVMe engines, cross-compiled and statically linked; their tests run under the QEMU user-mode emulator the toolchain file names.",
+      "description": "The suites over the RAM and NVMe engines, cross-compiled; their tests run under the QEMU user-mode emulator the toolchain file names, over the cross C library.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "USTORE_BUILD_TEST": "ON",
@@ -261,10 +281,16 @@
       }
     },
     {
+      "name": "linux_arm64",
+      "inherits": "cross",
+      "displayName": "Linux ARM64 under QEMU",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-aarch64-llvm.cmake"
+    },
+    {
       "name": "linux_riscv64",
       "inherits": "cross",
       "displayName": "Linux RISC-V under QEMU",
-      "toolchainFile": "${sourceDir}/cmake/toolchain-riscv64-llvm.cmake"
+      "toolchainFile": "${sourceDir}/cmake/toolchain-riscv64-gnu.cmake"
     },
     {
       "name": "linux_ppc64le",
@@ -424,8 +450,23 @@
       "jobs": 0
     },
     {
+      "name": "asan",
+      "configurePreset": "asan",
+      "jobs": 0
+    },
+    {
       "name": "cuda",
       "configurePreset": "cuda",
+      "jobs": 0
+    },
+    {
+      "name": "rocm",
+      "configurePreset": "rocm",
+      "jobs": 0
+    },
+    {
+      "name": "linux_cuda_rocm",
+      "configurePreset": "linux_cuda_rocm",
       "jobs": 0
     },
     {
@@ -438,12 +479,14 @@
     { "name": "android_arm64", "configurePreset": "android_arm64", "jobs": 0 },
     { "name": "wasm32_emscripten", "configurePreset": "wasm32_emscripten", "jobs": 0 },
     { "name": "wasm64_emscripten", "configurePreset": "wasm64_emscripten", "jobs": 0 },
+    { "name": "linux_arm64", "configurePreset": "linux_arm64", "jobs": 0 },
     { "name": "linux_riscv64", "configurePreset": "linux_riscv64", "jobs": 0 },
     { "name": "linux_ppc64le", "configurePreset": "linux_ppc64le", "jobs": 0 },
     { "name": "xeon4_hopper", "configurePreset": "xeon4_hopper", "jobs": 0 },
     { "name": "xeon6_blackwell", "configurePreset": "xeon6_blackwell", "jobs": 0 },
     { "name": "grace_hopper", "configurePreset": "grace_hopper", "jobs": 0 },
-    { "name": "vera_rubin", "configurePreset": "vera_rubin", "jobs": 0 }
+    { "name": "vera_rubin", "configurePreset": "vera_rubin", "jobs": 0 },
+    { "name": "venice_mi450", "configurePreset": "venice_mi450", "jobs": 0 }
   ],
   "testPresets": [
     {
@@ -460,11 +503,7 @@
     {
       "name": "debug",
       "inherits": "base",
-      "configurePreset": "debug",
-      "environment": {
-        "ASAN_OPTIONS": "detect_leaks=1 halt_on_error=1",
-        "UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1"
-      }
+      "configurePreset": "debug"
     },
     {
       "name": "relwithdebinfo",
@@ -485,6 +524,15 @@
       }
     },
     {
+      "name": "asan",
+      "inherits": "base",
+      "configurePreset": "asan",
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1 halt_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1"
+      }
+    },
+    {
       "name": "dev",
       "inherits": "base",
       "configurePreset": "dev"
@@ -494,12 +542,35 @@
       "inherits": "base",
       "configurePreset": "cuda"
     },
+    {
+      "name": "rocm",
+      "inherits": "base",
+      "configurePreset": "rocm"
+    },
+    { "name": "linux_arm64", "inherits": "base", "configurePreset": "linux_arm64" },
     { "name": "linux_riscv64", "inherits": "base", "configurePreset": "linux_riscv64" },
     { "name": "linux_ppc64le", "inherits": "base", "configurePreset": "linux_ppc64le" },
     { "name": "msvc2026_x64", "inherits": "base", "configurePreset": "msvc2026_x64", "configuration": "Release" },
     { "name": "msvc2026_arm64", "inherits": "base", "configurePreset": "msvc2026_arm64", "configuration": "Release" }
   ],
   "workflowPresets": [
+    {
+      "name": "debug",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "debug"
+        },
+        {
+          "type": "build",
+          "name": "debug"
+        },
+        {
+          "type": "test",
+          "name": "debug"
+        }
+      ]
+    },
     {
       "name": "release",
       "steps": [
@@ -514,6 +585,23 @@
         {
           "type": "test",
           "name": "release"
+        }
+      ]
+    },
+    {
+      "name": "tsan",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "tsan"
+        },
+        {
+          "type": "build",
+          "name": "tsan"
+        },
+        {
+          "type": "test",
+          "name": "tsan"
         }
       ]
     },

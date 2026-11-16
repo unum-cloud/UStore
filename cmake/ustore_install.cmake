@@ -1,115 +1,119 @@
-# The install rules, the export sets, the CMake package files, and the preview SDK archive.
+# The install rules, the export sets, the CMake and pkg-config package files, and the preview SDK archive.
+#
+# The root names what installs before including this file, as each project ships its own set of libraries:
+#
+# - `ustore_install_sdk_targets_`: the libraries of the `sdk` component, exported as `ustoreTargets`;
+# - `ustore_install_static_targets_`: the archives of the `static` component, exported as `ustoreStaticTargets`;
+# - `ustore_install_programs_`: the executables the `sdk` component ships beside its libraries, exported by neither.
+#
+# An empty list installs nothing for its component, and `cmake/ustoreConfig.cmake.in` loads the export sets the prefix
+# holds. A component no list covers, like a header-only core, installs from the root after this file.
 
-# Both libraries install with a CMake package, `find_package(ustore)` naming them `ustore::shared` and `ustore::static`,
-# in three components. The `sdk` takes the shared library, which links every engine inside, with the C headers and the
-# C++ wrappers; `static` takes the archive and the engine archives it links, `ustore::rocksdb`, `ustore::leveldb` and
-# `ustore::uring`; `core` takes the header-only templates. Each library component exports its own set, so the package
-# loads whichever the prefix holds.
 if (USTORE_INSTALL)
+    include(GNUInstallDirs)
     include(CMakePackageConfigHelpers)
     set(ustore_config_install_dir_ "${CMAKE_INSTALL_LIBDIR}/cmake/ustore")
-    # The archive holds the device merger, whose consumers also link the static CUDA runtime it calls where it has one.
-    set(ustore_static_archives_ ustore_static ${ustore_engine_archives_})
-    set(ustore_static_dependencies_)
-    if (ustore_device_compaction_)
-        set(ustore_static_dependencies_ "find_dependency(CUDAToolkit)")
+    if (ustore_install_sdk_targets_)
+        install(
+            TARGETS ${ustore_install_sdk_targets_}
+            EXPORT ustoreTargets
+            COMPONENT sdk
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+        install(
+            EXPORT ustoreTargets
+            NAMESPACE ustore::
+            DESTINATION ${ustore_config_install_dir_}
+            COMPONENT sdk
+        )
     endif ()
-    install(
-        TARGETS ustore_header ustore_shared
-        EXPORT ustoreTargets
-        COMPONENT sdk
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    )
-    install(
-        TARGETS ${ustore_static_archives_}
-        EXPORT ustoreStaticTargets
-        COMPONENT static
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    )
-    install(
-        EXPORT ustoreTargets
-        NAMESPACE ustore::
-        DESTINATION ${ustore_config_install_dir_}
-        COMPONENT sdk
-    )
-    install(
-        EXPORT ustoreStaticTargets
-        NAMESPACE ustore::
-        DESTINATION ${ustore_config_install_dir_}
-        COMPONENT static
-    )
-    file(
-        CONFIGURE
-        OUTPUT
-        "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfig.cmake"
-        CONTENT
-        [[include(CMakeFindDependencyMacro)
-find_dependency(Threads)
-include("${CMAKE_CURRENT_LIST_DIR}/ustoreTargets.cmake")
-if (EXISTS "${CMAKE_CURRENT_LIST_DIR}/ustoreStaticTargets.cmake")
-    @ustore_static_dependencies_@
-    include("${CMAKE_CURRENT_LIST_DIR}/ustoreStaticTargets.cmake")
-endif ()
-]]
-        @ONLY
+    if (ustore_install_static_targets_)
+        install(
+            TARGETS ${ustore_install_static_targets_}
+            EXPORT ustoreStaticTargets
+            COMPONENT static
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+        install(
+            EXPORT ustoreStaticTargets
+            NAMESPACE ustore::
+            DESTINATION ${ustore_config_install_dir_}
+            COMPONENT static
+        )
+    endif ()
+    if (ustore_install_programs_)
+        install(
+            TARGETS ${ustore_install_programs_}
+            COMPONENT sdk
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    endif ()
+
+    # A major version is the only break the C interface admits, so a consumer asking for one accepts its later minors.
+    configure_package_config_file(
+        "${PROJECT_SOURCE_DIR}/cmake/ustoreConfig.cmake.in" "${PROJECT_BINARY_DIR}/ustoreConfig.cmake"
+        INSTALL_DESTINATION ${ustore_config_install_dir_}
     )
     write_basic_package_version_file(
-        "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfigVersion.cmake"
+        "${PROJECT_BINARY_DIR}/ustoreConfigVersion.cmake"
         VERSION ${PROJECT_VERSION}
         COMPATIBILITY SameMajorVersion
     )
     install(
-        FILES "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfigVersion.cmake"
+        FILES "${PROJECT_BINARY_DIR}/ustoreConfig.cmake" "${PROJECT_BINARY_DIR}/ustoreConfigVersion.cmake"
         DESTINATION ${ustore_config_install_dir_}
         COMPONENT sdk
     )
     install(
-        DIRECTORY c/ustore cpp/ustore
+        DIRECTORY "${PROJECT_SOURCE_DIR}/c/ustore"
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         COMPONENT sdk
     )
+    if (IS_DIRECTORY "${PROJECT_SOURCE_DIR}/cpp/ustore")
+        install(
+            DIRECTORY "${PROJECT_SOURCE_DIR}/cpp/ustore"
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            COMPONENT sdk
+        )
+    endif ()
     install(
-        DIRECTORY include/ustore
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-        COMPONENT core
-    )
-    install(
-        FILES LICENSE
+        FILES "${PROJECT_SOURCE_DIR}/LICENSE"
         DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/ustore
         COMPONENT sdk
     )
 
-    # A `.pc` for the consumers CMake never reaches. Spelling the prefix against `${pcfiledir}` keeps it correct after
-    # `cmake --install --prefix` moves the tree. `GNUInstallDirs` returns a relative path unless a distro forced an
-    # absolute one, and only the former may follow a prefix.
-    cmake_path(
-        RELATIVE_PATH CMAKE_INSTALL_PREFIX BASE_DIRECTORY "${CMAKE_INSTALL_FULL_LIBDIR}/pkgconfig" OUTPUT_VARIABLE
-        ustore_pc_relative_prefix_
-    )
-    set(ustore_pc_prefix_ "\${pcfiledir}/${ustore_pc_relative_prefix_}")
-    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
-        set(ustore_pc_libdir_ "${CMAKE_INSTALL_LIBDIR}")
-    else ()
-        set(ustore_pc_libdir_ "\${exec_prefix}/${CMAKE_INSTALL_LIBDIR}")
+    # A `.pc` naming the shared library, for the consumers CMake never reaches, wherever the `sdk` installs one.
+    # Spelling the prefix against `${pcfiledir}` keeps it correct after `cmake --install --prefix` moves the tree.
+    # `file(RELATIVE_PATH)` ends a path to an ancestor with a slash, which the `.` closes.
+    # `GNUInstallDirs` returns a relative path unless a distribution forced an absolute one, and only the former may
+    # follow a prefix.
+    if (ustore_shared IN_LIST ustore_install_sdk_targets_)
+        file(RELATIVE_PATH ustore_pc_to_prefix_ "${CMAKE_INSTALL_FULL_LIBDIR}/pkgconfig" "${CMAKE_INSTALL_PREFIX}")
+        set(ustore_pc_prefix_ "\${pcfiledir}/${ustore_pc_to_prefix_}.")
+        if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+            set(ustore_pc_libdir_ "${CMAKE_INSTALL_LIBDIR}")
+        else ()
+            set(ustore_pc_libdir_ "\${exec_prefix}/${CMAKE_INSTALL_LIBDIR}")
+        endif ()
+        if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+            set(ustore_pc_includedir_ "${CMAKE_INSTALL_INCLUDEDIR}")
+        else ()
+            set(ustore_pc_includedir_ "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+        endif ()
+        configure_file("${PROJECT_SOURCE_DIR}/cmake/ustore.pc.in" "${PROJECT_BINARY_DIR}/ustore.pc" @ONLY)
+        install(
+            FILES "${PROJECT_BINARY_DIR}/ustore.pc"
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+            COMPONENT sdk
+        )
     endif ()
-    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
-        set(ustore_pc_includedir_ "${CMAKE_INSTALL_INCLUDEDIR}")
-    else ()
-        set(ustore_pc_includedir_ "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
-    endif ()
-    configure_file(cmake/ustore.pc.in "${CMAKE_CURRENT_BINARY_DIR}/ustore.pc" @ONLY)
-    install(
-        FILES "${CMAKE_CURRENT_BINARY_DIR}/ustore.pc"
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
-        COMPONENT sdk
-    )
 endif ()
 
-# The preview SDK: `cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, the stripped
-# shared library with the C headers, the C++ wrappers, the CMake package, the `.pc` and the license, as
-# `ustore-<version>-<platform>-sdk.tar.gz`. A parent project packages itself.
+# The preview SDK: `cpack --config <build>/CPackConfig.cmake` archives the `sdk` component alone, stripped, under one
+# top-level directory, as `ustore-<version>-<platform>-sdk.tar.gz`, or a `.zip` on Windows.
+# A parent project packages itself.
 if (USTORE_INSTALL AND PROJECT_IS_TOP_LEVEL)
     set(CPACK_PACKAGE_NAME ${PROJECT_NAME})
     if (WIN32)

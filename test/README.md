@@ -89,7 +89,7 @@ cmake --preset debug -DUSTORE_BUILD_TEST=1 -DUSTORE_BUILD_TOOLS=1 -DUSTORE_WITH_
 cmake --build --preset debug
 ```
 
-The presets are `check`, `debug`, `dev`, `profile`, `release`, `relwithdebinfo`, `trace` and `tsan`, each building into `build_<preset>`, and sanitizers come with the `debug` and `tsan` presets rather than with an option.
+The presets are `asan`, `check`, `debug`, `dev`, `profile`, `release`, `relwithdebinfo`, `trace` and `tsan`, each building into `build_<preset>`, and sanitizers come with the `asan` and `tsan` presets rather than with an option.
 Executables land in `build_debug/build/bin/`.
 
 ## Running
