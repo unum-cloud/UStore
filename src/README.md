@@ -34,7 +34,7 @@ One library serves both isolation levels: the `isolation` field of `ustore_datab
 
 Snapshots map onto the versions the store already keeps.
 `ustore_database_init_ram` starts a database in memory alone, while one `ustore_database_open_ram` serves persists in its directory as one binary image, rewritten whole on a flushed commit and on close.
-A compaction vacuums one collection at a time, reporting one unit per collection, then frees the retired stores and rewrites the image, and a save writes the snapshot's collections as an image into the directory it names, removing `ram.image.tmp` when cancelled.
+A compaction merges one collection per unit, vacuuming its store as a fresh stamp lists it, the merges running at once on the threads of the executor, then reclaims in one more unit, freeing the retired stores and rewriting the image, and a save writes the snapshot's collections as an image into the directory it names, removing `ram.image.tmp` when cancelled.
 
 ## RocksDB
 
@@ -50,7 +50,7 @@ This is one design for durability and two-phase commits rather than the settled 
 `ustore_database_view_rocksdb` opens a directory through `DB::OpenForReadOnly` instead, with the data directories the database was opened with, since RocksDB finds table files placed outside the directory only through them.
 The router refuses every call that would change such a database with `ustore_status_read_only_k` before the engine sees it.
 A snapshot records the handle of every family it sees, and a family dropped while a snapshot is open stays retired until the last snapshot is freed, so a save copies exactly the snapshot's collections and names.
-A compaction flushes and compacts one family at a time, reporting the bytes of its memtable and table files.
+A compaction flushes every family, the flushes running at once on the threads of the executor and each weighing the bytes of its memtables, then compacts them one at a time in the same order, each weighing the bytes of its memtables and table files, skipping a family dropped meanwhile.
 
 ## LevelDB
 
@@ -76,7 +76,7 @@ A save copies the snapshot into a new database a memtable-sized batch at a time,
 
 `src/nvme/` is the hyper-converged engine, and the one UStore's hardware paths serve.
 A `database` holds collections, each in an `nvme_store` over an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions.
-`src/nvme/variants.hpp` serves every slot of `engine_t` the RAM engine serves, its snapshots as stamps pinned in the database's commit ledger, once per CPU class of `src/lib.hpp`, and `src/nvme/engine.cpp` opens a database with the newest class its ceiling fits, the running CPU's or the pinned `cpu_class`'s.
+`src/nvme/variants.hpp` serves every slot of `engine_t` the RAM engine serves, its snapshots as stamps pinned in the database's commit ledger, once per CPU class of `src/lib.hpp`, and `src/nvme/engine.cpp` opens a database with the newest class its ceiling fits, the running CPU's masks intersected with the `cpu_class_ceiling`'s.
 Every collection of the C ABI is one collection of the database under its UUID, keyed by the 16 bytes of `ustore_key_t`.
 Its `_collections` system collection maps every collection onto its name, the database's own schema recording its modality, and a strings collection and the names live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole strings, whose writes and watches join a transaction as a share of it.
 A graph collection lives in the graph store of `include/ustore/graph/nvme_store.hpp`, one key per vertex folded from half-edge change deltas, and `src/nvme/graph.hpp` serves the graph calls of the table over it.
@@ -134,6 +134,9 @@ A call without an executor works in a scratch of its own on the calling thread, 
 An arena, made by `ustore_arena_init` on host pages or on the device of its executor, every transaction handle and every cursor carry a claim word, which the router takes before a call and releases once the engine returns, so a second call on any of them is refused as contended.
 The router refuses a `NULL` arena and an arena living where the call's executor does not compute, serves every call through the verb table of its executor's residency, `engine_t::host` or `engine_t::vram_nvidia`, leaves every output of a call `NULL` or zero until the engine writes it, and again after a failure or a cancellation, and refuses to reset a transaction through a database it does not belong to.
 Every handle carries an `access`, and the router refuses every call naming a transaction, collection creates and drops, clears and compactions with `ustore_status_read_only_k` on a database `ustore_database_view_rocksdb` opened.
+A compaction is a plan: the engine's `compact_open` lists its units once, the plan's only allocation, and `compact_advance` runs one by its index, while the router's `drive_compaction` fans a run of concurrent units of one phase out over the executor's pool, reports after each unit, starts none after a cancel and marks each one done, so a live plan resumes past every unit that ran.
+NVMe compacts in a flush, then merge rounds over every level, each a unit run alone on the call's thread, since a round fans its own merge out over the pool.
+The router refuses a compaction and a plan's finish before taking any claim, so `uninitialized`, `invalid_argument`, `read_only` and `unsupported` come ahead of `contended`; a database's `compaction` claim admits one plan from its open to its finish, or one call naming no plan while it runs, and a plan's own claim makes its finish wait for the call continuing it.
 Every handle, arenas and ingests included, counts the calls naming it in `named_calls`, raised at the call's claim and lowered at its end, with or without an executor, and each free waits for zero, so no binding keeps counts of its own.
 A transaction, a snapshot and a cursor each hold their database open, and a cursor also holds the transaction or snapshot it reads through, so every free drops one hold and the last one frees the handle through its engine.
 `ustore_executor_drain` waits until the claim is free, then parks an owned pool for `ustore_mood_parked_k`, and `ustore_executor_free` waits the same way before freeing the scratch.

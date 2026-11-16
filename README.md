@@ -18,14 +18,20 @@ Built around Kernel Bypass
 </p>
 
 <p align="center">
-Blobs • Documents • Graphs
+Blobs • Strings • Documents • Graphs • Pages
 <br/>
-C • C++ • Python • Rust
+<a href="https://github.com/unum-cloud/UStore/blob/main/c/README.md">C</a> •
+<a href="https://github.com/unum-cloud/UStore/blob/main/cpp/README.md">C++</a> •
+<a href="https://github.com/unum-cloud/UStore/blob/main/python/README.md">Python</a> •
+<a href="https://github.com/unum-cloud/UStore/blob/main/rust/README.md">Rust</a> •
+<a href="https://github.com/unum-cloud/UStore/blob/main/mojo/README.md">Mojo</a>
+<br/>
+Linux • macOS • Windows
+<br/>
+x86 • Arm • RISC-V • POWER • CUDA • ROCm
 </p>
 
 ---
-
-![UStore banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/UStore-v1.png?raw=true)
 
 UStore is an embedded transactional database engine that keeps blobs, documents, graphs, strings and markup pages in collections addressed by 128-bit UUID keys, with transactions spanning collections behind one C ABI.
 Its NVMe engine reaches drives through kernel bypass with io_uring and SPDK, lays immutable sorted runs into 1 GB slots of raw drives or into files under JSON manifests, searches them with SIMD S+ trees, and merges them on GPUs that read through GPUDirect Storage.
@@ -50,24 +56,38 @@ target_link_libraries(my_app PRIVATE ustore::static)
 ```
 
 `ustore::static` is an archive that links the storage engines' archives installed beside it, `ustore::shared` exports the C ABI alone, and `-DUSTORE_INSTALL=ON` installs both with a CMake package for `find_package(ustore)`.
-`database_t::init_ram` starts an empty database of the in-memory engine.
+The program opens a database in memory, writes a blob, a document and an edge in one transaction, and reads them back, as every binding's Quickstart does.
 
 ```cpp
+#include <cassert>
+
 #include <ustore/ustore.hpp>
 
 using namespace unum::ustore;
 
 int main() {
-    auto [db, status] = database_t::init_ram();
-    if (status.failed())
-        return 1;
+    auto [db, open_status] = database_t::init_ram();
+    auto posters = db.on().create<blobs_collection_t>("posters");
+    auto movies = db.on().create<docs_collection_t>("movies");
+    auto similar = db.on().create<graph_collection_t>("similar");
+    assert(open_status.succeeded() && posters && movies && similar);
 
-    auto [greetings, collection_status] = db.find_or_create("greetings");
-    if (collection_status.failed() || greetings[key_from_integer(42)].assign("Hi").failed())
-        return 1;
+    // One transaction writes a blob, a document and an edge, and commits all three or none
+    ustore_key_t const avatar = key_from_integer(1), titanic = key_from_integer(2);
+    auto [transaction, transaction_status] = db.on().transaction();
+    transaction_ref_t const inside = transaction.on();
+    status_t const poster = inside["posters"]->at(avatar).assign("\x89PNG");
+    status_t const movie = inside.find<docs_collection_t>("movies")->at(avatar).assign(
+        R"({"title":"Avatar","year":2009})");
+    status_t const edge = inside.find<graph_collection_t>("similar")->write_edge(edge_t {avatar, titanic});
+    expected<commit_stamp_t> const committed = inside.commit();
+    assert(transaction_status.succeeded() && poster.succeeded() && movie.succeeded() && edge.succeeded() && committed);
 
-    auto value = greetings[key_from_integer(42)].value();
-    return value && *value == "Hi" ? 0 : 1;
+    // Reads at the head see the commit: the poster, the title and the one edge leaving Avatar
+    auto const stored = (*posters)[avatar].value();
+    auto const title = (*movies)[collection_key_field_t {avatar, "title"}].value(ustore_docs_field_type_string_k);
+    auto const degree = similar->degree(avatar, ustore_vertex_role_source_k);
+    assert(stored && *stored == "\x89PNG" && title && *title == "Avatar" && degree && *degree == 1);
 }
 ```
 
@@ -85,33 +105,15 @@ auto [db, status] = database_t::open_rocksdb({.directory = bytes_of("/var/lib/us
 
 The C ABI and its argument structs are described in [`c/README.md`](https://github.com/unum-cloud/UStore/blob/main/c/README.md), and the C++ wrappers in [`cpp/README.md`](https://github.com/unum-cloud/UStore/blob/main/cpp/README.md).
 
-## Multiversioned and Monoversioned Builds
-
-UStore compiles in one of two shapes, picked by `USTORE_MULTIVERSIONED`.
-
-- __Multiversioned builds are for distribution.__
-  One binary runs well across diverse machines, because each CPU and each GPU picks its own class at runtime.
-  This is the default, and the shape of the Python wheels and the Rust crate.
-- __Monoversioned builds are for throughput.__
-  For common hardware and data-center deployments, the binary carries only the best code for one machine.
-  These are the leanest binaries: they start fast and take little memory and disk.
-  Outside that machine they refuse cleanly with `ustore_status_unsupported_k`, never crashing and never falling back to slower code in silence.
-- __The switches.__
-  `USTORE_MULTIVERSIONED=OFF` picks the second shape and `USTORE_MARCH` names its CPU floor.
-  The `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper`, `vera_rubin` and `venice_mi450` presets spell whole machines.
-
-A monoversioned build compiles the single `monoversioned` CPU class in place of the ladder of named ones.
-It needs no monoversioned GPU class, as a preset's one GPU architecture already matches a named class, and CMake builds only the class units carrying code for it.
-
 ## Architecture
 
-| Layer      | What it is                                                             | Where                      |
-| :--------- | :--------------------------------------------------------------------- | :------------------------- |
-| Bindings   | C, C++, Python and Rust, each forwarding rather than reimplementing    | `cpp/`, `python/`, `rust/` |
-| C ABI      | One argument struct per call, 128-bit UUID keys                        | `c/ustore/*.h`             |
-| Modalities | Documents and graphs, written once over any engine                     | `src/*.cpp`                |
-| Engines    | `ram` and `nvme` are ours, `rocksdb` and `leveldb` are checked against | `src/`, `src_oracles/`     |
-| Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                          |
+| Layer      | What it is                                                             | Where                               |
+| :--------- | :--------------------------------------------------------------------- | :---------------------------------- |
+| Bindings   | C++, Python, Rust and Mojo, each forwarding rather than reimplementing | `cpp/`, `python/`, `rust/`, `mojo/` |
+| C ABI      | One argument struct per call, 128-bit UUID keys                        | `c/ustore/*.h`                      |
+| Modalities | Documents and graphs, written once over any engine                     | `src/*.cpp`                         |
+| Engines    | `ram` and `nvme` are ours, `rocksdb` and `leveldb` are checked against | `src/`, `src_oracles/`              |
+| Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                                   |
 
 - __The C ABI__ in `c/ustore/*.h` is the only interface: every call takes one argument struct, and every binding forwards to it.
 - __The modalities__ in `src/docs_layer.hpp` and `src/graph_layer.hpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
@@ -266,6 +268,34 @@ It runs on every platform through blocking positioned I/O, mounts io_uring on Li
 Each io_uring ring registers its buffers where `RLIMIT_MEMLOCK` allows and addresses them by pointer otherwise, staying on io_uring either way.
 A database on NVMe is a `<database>.ustore.json` manifest and one `.ustore` file per sorted run, on filesystems or in 1 GB slots of raw drives, as [`docs/format.md`](https://github.com/unum-cloud/UStore/blob/main/docs/format.md) describes.
 
+## Keys & Values
+
+Keys are 128-bit UUIDs in `c/ustore/db.h`, compared bytewise, and `key_from_integer` spells a non-negative integer as its big-endian bytes, so keys made from integers order as the integers.
+Collections are named by UUIDv7 identifiers the catalog mints once and never reuses, and the main collection by the nil UUID.
+Fixed-width keys compare as machine words, while variable-length keys force character-wise comparisons and force keys and values to be joined on disk.
+Map strings onto keys once, at the edge of the application, and address documents, graphs and blobs by the resulting identifiers.
+
+Value lengths are `ustore_length_t`, a 64-bit unsigned integer, and a batch of values is one `ustore_strings_view_t`: an Apache Arrow tape of 32-bit offsets as in `binary`, of 64-bit offsets as in `large_binary`, or an accessor callback over any other layout.
+A call writes its tapes with 32-bit offsets while the bytes fit in 4 GB and 64-bit beyond, so neither one value nor one batch stops at 4 GB.
+
+## Multiversioned and Monoversioned Builds
+
+UStore compiles in one of two shapes, picked by `USTORE_MULTIVERSIONED`.
+
+- __Multiversioned builds are for distribution.__
+  One binary runs well across diverse machines, because each CPU and each GPU picks its own class at runtime.
+  This is the default, and the shape of the Python wheels and the Rust crate.
+- __Monoversioned builds are for throughput.__
+  For common hardware and data-center deployments, the binary carries only the best code for one machine.
+  These are the leanest binaries: they start fast and take little memory and disk.
+  Outside that machine they refuse cleanly with `ustore_status_unsupported_k`, never crashing and never falling back to slower code in silence.
+- __The switches.__
+  `USTORE_MULTIVERSIONED=OFF` picks the second shape and `USTORE_MARCH` names its CPU floor.
+  The `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper`, `vera_rubin` and `venice_mi450` presets spell whole machines.
+
+A monoversioned build compiles the single `monoversioned` CPU class in place of the ladder of named ones.
+It needs no monoversioned GPU class, as a preset's one GPU architecture already matches a named class, and CMake builds only the class units carrying code for it.
+
 ## Compatibility
 
 Builds target the baseline instruction set of each architecture, so one artifact runs on any CPU of it.
@@ -280,7 +310,7 @@ The C headers are C11, checked by `c/test.c` under every platform's compiler aga
 
 Every column but NVMe is exercised by CI on all four platforms: `.github/workflows/prerelease.yml` builds and tests the C ABI and each engine, the Python extension and the Rust crate.
 The NVMe column records the suites in [`test/`](https://github.com/unum-cloud/UStore/tree/main/test) on two Linux x86-64 machines rather than CI, which does not build NVMe; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP and is mounted by the engine.
-GPU compaction targets NVIDIA Hopper and Blackwell alike, launches three kernels per merge through the CUDA driver API without linking the CUDA runtime, and its output must match CPU compaction on the same runs.
+GPU compaction targets NVIDIA Hopper and Blackwell alike through the CUDA driver API, and AMD CDNA through HIP's module API, untested on hardware; it launches three kernels per merge without linking either runtime, and its output must match CPU compaction on the same runs.
 The engines and the layout of `src/` are described in [`src/README.md`](https://github.com/unum-cloud/UStore/blob/main/src/README.md).
 
 ### Why Not RocksDB
@@ -292,16 +322,6 @@ Keys are variable-length strings, and the classes rely on virtual calls and inhe
 UStore puts a C ABI in front of the same engines instead.
 Each call takes one argument struct, so optional arguments keep their defaults and the argument order stops mattering.
 Outputs are allocated from an arena the caller owns and reuses across calls.
-
-## Keys & Values
-
-Keys are 128-bit UUIDs in `c/ustore/db.h`, compared bytewise, and `key_from_integer` spells a non-negative integer as its big-endian bytes, so keys made from integers order as the integers.
-Collections are named by UUIDv7 identifiers the catalog mints once and never reuses, and the main collection by the nil UUID.
-Fixed-width keys compare as machine words, while variable-length keys force character-wise comparisons and force keys and values to be joined on disk.
-Map strings onto keys once, at the edge of the application, and address documents, graphs and blobs by the resulting identifiers.
-
-Value lengths are `ustore_length_t`, a 64-bit unsigned integer, and a batch of values is one `ustore_strings_view_t`: an Apache Arrow tape of 32-bit offsets as in `binary`, of 64-bit offsets as in `large_binary`, or an accessor callback over any other layout.
-A call writes its tapes with 32-bit offsets while the bytes fit in 4 GB and 64-bit beyond, so neither one value nor one batch stops at 4 GB.
 
 ## Repository Layout
 
@@ -328,7 +348,7 @@ Conventions, hooks and the commit format are described in [`CONTRIBUTING.md`](ht
 
 ## Citation
 
-If UStore helps your research or product, please cite it:
+If UStore helps your work, please cite it:
 
 ```bibtex
 @software{Vardanian_UStore,

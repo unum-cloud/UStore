@@ -1,58 +1,92 @@
 # UStore for C++
 
 `cpp/` holds the C++ wrappers of UStore's public C SDK.
-The `*.hpp` headers of `cpp/ustore/` wrap the same calls in C++ with RAII handles, batched references and typed ranges, and add no ABI of their own.
-UStore's sources split into four folders:
+The `*.hpp` headers of `cpp/ustore/` wrap the same calls in C++20 with RAII handles, batched references and typed ranges, and add no ABI of their own.
+Everything lives in `unum::ustore`, `#include <ustore/ustore.hpp>` brings in all of it, and nothing throws:
 
-- `c/`: the public C SDK every wrapper forwards to, the C ABI in `c/ustore/*.h`, with [its own guide](https://github.com/unum-cloud/UStore/blob/main/c/README.md), whose [Installation](https://github.com/unum-cloud/UStore/blob/main/c/README.md#installation) covers the wrappers too.
-- `cpp/`: these wrappers in `cpp/ustore/*.hpp`, in `unum::ustore`, and this guide.
-- `include/`: the first-party classes and templates that advanced users may reuse to build their own low-level stores, each subfolder `ustore/<dir>/` opening `unum::ustore::<dir>`, with [its own guide](../include/ustore/README.md).
-- `src/`: UStore's own instantiations of those templates, the engines behind the C ABI.
+- `database_t`, `transaction_t` and `snapshot_t`: the head, a group of changes, and a point in time, each owning its C handle.
+- `blobs_collection_t`, `docs_collection_t`, `graph_collection_t`, `pages_collection_t` and `strings_collection_t`: cheap handles of one collection each.
+- `arena_t`: where every output whose length scales with the call lands.
+- `executor_handle_t` and `deferred`: the threads a call runs on, and a call submitted there.
 
-`c/` and `cpp/` are both include roots, so every header is spelled `<ustore/...>` in the tree and once installed.
-`cpp/ustore/` holds one header per part of the wrappers:
+## Installation
 
-- `ustore.hpp`: every C++ header below.
-- `db.hpp`: `database_t`, `transaction_t`, `snapshot_t` and receivers.
-- `blobs_collection.hpp`: binary collections and their deferred twins.
-- `blobs_ref.hpp`: batched references to binary values.
-- `blobs_range.hpp`: cursors over keys, the streams built on them, and key ranges.
-- `docs_collection.hpp`: document collections and their deferred twins.
-- `docs_ref.hpp`: batched references to documents.
-- `docs_table.hpp`: gathered tables.
-- `graph_collection.hpp`: graph collections and their deferred twins.
-- `graph_stream.hpp`: adjacency streams.
-- `strings_collection.hpp`: string-keyed collections, cursors, prefix walks and deferred twins.
-- `status.hpp`: `deferred`, and `status_code_t`, `status_t` and `expected` re-exported from `ustore/utilities/types.hpp`.
-- `types.hpp`: arenas, stamps, receivers and executors, and the keys, edges and value views re-exported from `ustore/utilities/types.hpp`.
-- `ranges.hpp`: strided ranges, argument adapters, read views and tapes.
+The wrappers are headers over the C library, so they install, link and build exactly as [the C SDK](https://github.com/unum-cloud/UStore/blob/main/c/README.md#installation) does: `c/` and `cpp/` are both include roots, and every header is spelled `<ustore/...>` in the tree and once installed.
 
-## Conventions
-
-Everything lives in `unum::ustore`, and `#include <ustore/ustore.hpp>` brings in all of it.
-Fallible calls return a `status_t`, a `status_code_t` beside a static message, or an `expected` that holds either a value or the `status_t` explaining its absence; both are `[[nodiscard]]`.
-Dereferencing an `expected<value_type>` yields the `value_type`, and `auto [value, status]` decomposes one whose value is default constructible.
-`key_from_integer` spells a non-negative integer as a key, and `key_after` answers the key right after another.
-Nothing copies values out of the arena, and nothing throws.
-
-```cpp
-using namespace unum::ustore;
-
-auto [db, status] = database_t::init_ram();
-if (status.failed())
-    std::fprintf(stderr, "%s\n", status.message);
+```cmake
+FetchContent_Declare(ustore GIT_REPOSITORY https://github.com/unum-cloud/UStore.git GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(ustore)
+target_link_libraries(your_target PRIVATE ustore::static)
 ```
 
-`database_t::init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb`, `open_leveldb` and `open_nvme` wrap [the C opens](https://github.com/unum-cloud/UStore/blob/main/c/README.md#opening-the-database) of the same names, taking their argument structs as options.
+From a checkout, `test/compilation.cpp` calls every wrapper in each accepted form, so a change that breaks a call site fails to build:
 
-## Blobs
+```sh
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D USTORE_BUILD_TEST=1
+cmake --build build_release --target ustore_test_compilation && ctest --test-dir build_release -R compilation
+```
 
-No collection exists until one is created, so every call names one.
-A collection handle is cheap to construct and holds no state, and its `[]` operator returns a `blobs_ref` over one key or a batch of keys that reads and writes through the C interface:
+## Quickstart
+
+The program opens a database in memory, writes a blob, a document and an edge in one transaction, and reads them back.
+A handle taken from a transaction reads and writes through it, while collections are created at the head.
 
 ```cpp
-auto [blobs, create_status] = db.create<blobs_collection_t>("blobs");
+#include <cassert>
 
+#include <ustore/ustore.hpp>
+
+using namespace unum::ustore;
+
+int main() {
+    auto [db, open_status] = database_t::init_ram();
+    auto posters = db.on().create<blobs_collection_t>("posters");
+    auto movies = db.on().create<docs_collection_t>("movies");
+    auto similar = db.on().create<graph_collection_t>("similar");
+    assert(open_status.succeeded() && posters && movies && similar);
+
+    // One transaction writes a blob, a document and an edge, and commits all three or none
+    ustore_key_t const avatar = key_from_integer(1), titanic = key_from_integer(2);
+    auto [transaction, transaction_status] = db.on().transaction();
+    transaction_ref_t const inside = transaction.on();
+    status_t const poster = inside["posters"]->at(avatar).assign("\x89PNG");
+    status_t const movie = inside.find<docs_collection_t>("movies")->at(avatar).assign(
+        R"({"title":"Avatar","year":2009})");
+    status_t const edge = inside.find<graph_collection_t>("similar")->write_edge(edge_t {avatar, titanic});
+    expected<commit_stamp_t> const committed = inside.commit();
+    assert(transaction_status.succeeded() && poster.succeeded() && movie.succeeded() && edge.succeeded() && committed);
+
+    // Reads at the head see the commit: the poster, the title and the one edge leaving Avatar
+    auto const stored = (*posters)[avatar].value();
+    auto const title = (*movies)[collection_key_field_t {avatar, "title"}].value(ustore_docs_field_type_string_k);
+    auto const degree = similar->degree(avatar, ustore_vertex_role_source_k);
+    assert(stored && *stored == "\x89PNG" && title && *title == "Avatar" && degree && *degree == 1);
+}
+```
+
+## Collections
+
+No collection exists until one is created, and each collection type names the modality it holds as `modality_k`.
+`create` records it and refuses a name starting with `_`, which system collections keep, `find` refuses a collection holding another modality with `status_code_t::invalid_argument_k`, and `find_or_create` creates only when no collection carries the name.
+A collection handle is cheap to construct and holds no state, so threads share one, each passing its own arena.
+A snapshot hands out the read-only twin of every collection, such as `docs_read_collection_t` for `find<docs_collection_t>`, so nothing writes through it.
+
+```cpp
+auto [blobs, create_status] = db.on().create<blobs_collection_t>("blobs");
+expected<docs_collection_t> people = db.on().find_or_create<docs_collection_t>("people");
+expected<blobs_collection_t> same = db.on().find("blobs");
+expected<graph_collection_t> refused = db.on().find<graph_collection_t>("blobs"); // invalid_argument_k
+blobs_collection_t named = *db.on()["articles"];                                   // found or created
+```
+
+## Reads and Writes
+
+A blobs collection's `[]` operator returns a `blobs_ref` over one key or a batch of keys that reads and writes through the C interface.
+Read without an arena, `value`, `present` and `length` are shorthand: a single key answers an `owned_value_t`, a `bool` or a length, and a batch the owned views of a one-off arena.
+Given an `arena_t&`, as `blobs.read(keys, arena)` or `blobs[keys].value(arena)`, the same reads answer plain views into that arena.
+`remove` removes the keys, while `clear_values` keeps them and empties their values.
+
+```cpp
 status_t status = blobs[key_from_integer(42)].assign("purpose of life");
 expected<owned_value_t> value = blobs[key_from_integer(42)].value();
 bool const matches = value && *value == "purpose of life";
@@ -68,37 +102,36 @@ for (value_view_t found : *values)
     std::printf("%zu bytes\n", found.size());
 ```
 
-Read without an arena, `value`, `present` and `length` are shorthand: a single key answers an `owned_value_t`, a `bool` or a length, and a batch an `owned<values_view_t>`, an owned `bits_view_t` or owned `lengths_view_t`.
-Given an `arena_t&`, as `blobs.read(keys, arena)` or `blobs[keys].value(arena)`, `.present(arena)` and `.length(arena)` are, the same reads answer plain views into that arena.
-`remove` removes the keys, while `clear_values` keeps them and empties their values.
-`keys` and `pairs` range over a collection in key order from a `start_key` to an `end_key`, and `size_range` estimates how many keys it holds.
-Each stream is shorthand for a range-based loop, which has no place for an arena, so it pulls pages from a cursor into one arena it owns for its lifetime.
-
-## Arenas
-
-Shorthand and verbs trade convenience for reuse, as in every binding:
-
-- __Shorthand makes a one-off arena.__
-  `blobs[key].value()` calls `ustore_arena_init`, reads into that arena, and hands it to its answer, which frees it on destruction, so nothing is copied and no handle keeps state.
-  A scalar answer, such as a presence or a degree, is copied out and the arena freed at once.
-  The price is one arena per call, so a loop reads through a verb instead.
-- __Verbs reuse a caller's arena.__
-  `arena_t::make(executor)` places one where its executor computes, or on host pages for calls on the calling thread, and a loop passing it to every call allocates once.
-  Every call rewinds it, so its views last until the next call given that arena; to keep them longer, pass that call another arena.
+`ingest` opens an `ingest_t` that lands every row appended to it as one commit of its own, joining no transaction, and `finish` answers that commit's stamp.
+Blobs, documents, pages and strings append keys beside values, and graphs append edges.
 
 ```cpp
-auto [arena, arena_status] = arena_t::make(executor);
-for (std::span<ustore_key_t const> batch : batches) {
-    auto [values, read_status] = db.on(executor).find("blobs")->read(batch, arena);
-    if (read_status.failed()) break;
-    consume(values); // valid until the next call given `arena`
-}
+expected<ingest_t> ingest = db.on().ingest(blobs, ustore_ingest_unsorted_k);
+std::array<ustore_key_t, 2> rows {key_from_integer(2), key_from_integer(1)};
+std::array<std::string_view, 2> bytes {"two", "one"};
+status = ingest->append(rows, bytes);       // copied before the call returns
+expected<commit_stamp_t> landed = ingest->finish();
 ```
 
-An `owned_value_t` derives from the `value_view_t` it holds, so it compares and converts like one, and `view()` slices that plain view off.
-Collections, transactions and snapshots hold no arena, so threads share one handle, each passing its own arena.
+### Strings
 
-Walks split the same way: the `keys`, `pairs` and `prefixed` streams own one arena each, while `blobs_cursor_t` and `strings_cursor_t` take the caller's on every pull, so a loop reuses one arena it keeps:
+A `strings_collection_t` keys arbitrary bytes by variable-length strings, kept in the order of their text, where `value` and `present` of one string are shorthand and `read` and `prefixed_page` export into the arena they are given.
+
+```cpp
+auto [words, words_status] = db.on().create<strings_collection_t>("words");
+status = words.assign("apple", key_from_integer(1));
+status = words.assign("apricot", key_from_integer(2));
+expected<ustore_key_t> apple = words.value("apple");
+expected<sz::strings_view_t> page = words.prefixed_page("ap", 16, arena);
+expected<std::size_t> count = words.size("ap");
+```
+
+## Scans
+
+`keys` and `pairs` range over a collection in key order from a `start_key` to an `end_key`, and `size_range` estimates how many keys it holds.
+Each stream is shorthand for a range-based loop, which has no place for an arena, so it pulls pages from a cursor into one arena it owns for its lifetime.
+`blobs_cursor_t` and `strings_cursor_t` take the caller's arena on every pull instead, so a loop reuses one arena it keeps.
+`make` opens the walk at the view its receiver reads and from an optional start key, `next` pulls keys alone and `next_pairs` keys with their values, and a page shorter than `wanted` exhausts the walk for good.
 
 ```cpp
 auto [cursor, cursor_status] = blobs_cursor_t::make(db.receiver(), blobs);
@@ -111,57 +144,71 @@ for (std::size_t pulled = wanted; cursor_status.succeeded() && pulled == wanted;
 }
 ```
 
-`make` opens the walk at the view its receiver reads and from an optional start key, `next` pulls keys alone and `next_pairs` keys with their values, and a page shorter than `wanted` exhausts the walk for good.
 `strings_cursor_t::make` takes a prefix and an optional start string, and its `next` pulls strings in the order of their text.
 
-## Named Collections and Transactions
+`sample` draws entries at random and `measure` bounds how many entries and bytes a range holds, on strings, documents and pages, while graphs spell them `sample_vertices` and `measure_vertices`.
+Both export into the arena they are given and answer deferred calls on a deferred handle.
 
 ```cpp
-expected<docs_collection_t> people = db.find_or_create<docs_collection_t>("people");
-
-expected<transaction_t> transaction = db.transaction();
-blobs_collection_t inside = *transaction->find("blobs");
-status = inside[key_from_integer(42)].assign("written inside a transaction");
-expected<commit_stamp_t> committed = transaction->commit();
-
-expected<snapshot_t> snapshot = db.snapshot();
-auto pinned = (*snapshot->find("blobs"))[key_from_integer(42)].value();
+expected<std::span<ustore_key_t const>> drawn = people.sample(16, arena);
+expected<size_estimates_t> bounds = people.measure(smallest_key_k, largest_key_k, arena);
+expected<strings_pages_t> words_drawn = words.sample(16, arena);
+expected<size_estimates_t> from_ap = words.measure("ap", value_view_t::make_empty(), arena);
 ```
 
-Each collection type names the modality it holds as `modality_k`, so `create` records it and refuses a name starting with `_`, which system collections keep, `find` refuses a collection holding another with `status_code_t::invalid_argument_k`, and `find_or_create` creates only when no collection carries the name.
-A handle taken from a transaction reads and writes through it, and a transaction commits only when `commit` is called, answering the commit's position in commit order.
-A snapshot hands out the read-only twin of every collection, such as `docs_read_collection_t` for `find<docs_collection_t>`, so nothing writes through it, and `save(path)` writes it out as a new database.
-
-## Describing, Clearing and Compacting
-
-`describe`, `clear` and `compact` wrap [the C calls](https://github.com/unum-cloud/UStore/blob/main/c/README.md#describing-clearing-and-compacting) of the same names, and a save or a compaction takes an optional progress callable:
+A `changes_cursor_t` is a feed of what was committed to one collection after a stamp, oldest first, which pins that stamp as a snapshot does.
 
 ```cpp
-expected<ustore_database_description_t> description = db.describe();
-if (description)
-    std::printf("%s holds %llu keys\n", ustore_engine_name(description->engine),
-                (unsigned long long)description->keys);
-status = db.clear(ustore_drop_pairs_k);
+auto [feed, feed_status] = db.on().changes_cursor(blobs, committed_at);
+auto [changes, changes_status] = feed.next_pairs(256, arena);
+for (std::size_t index = 0; changes_status.succeeded() && index != changes.keys.size(); ++index)
+    std::printf("%s at %llu\n", ustore_change_kind_name(changes.kinds[index]),
+                (unsigned long long)changes.stamps[index]);
+```
+
+## Transactions
+
+`db.on().transaction()` begins a `transaction_t`, whose `on()` hands out collections that read and write through it, and the transaction commits only when `commit` is called, answering the commit's position in commit order.
+A transaction serves one call at a time, and its `stage`, `rollback` and `reset` run the two-phase commit and start over, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#transactions) describe.
+
+```cpp
+expected<transaction_t> transaction = db.on().transaction();
+blobs_collection_t inside = *transaction->on().find("blobs");
+status = inside[key_from_integer(42)].assign("written inside a transaction");
+expected<read_stamp_t> staged = transaction->on().stage();
+expected<commit_stamp_t> committed = transaction->on().commit();
+```
+
+A conflicting commit answers `status_code_t::write_conflict_k`, `read_conflict_k` or `phantom_conflict_k`, and keeps the transaction's contents for a retry.
+
+## Snapshots
+
+`db.on().snapshot()` pins the whole database at one point, and its `on()` hands out the read-only twin of every collection.
+`read_stamp()` is the stamp it reads at, and `save(path)` writes it out as a new database of the same engine, taking an optional progress callable.
+A progress callable answers `ustore_continue_k` or `ustore_cancel_k` and is `noexcept`, so one that may throw does not compile, and the call borrows it until it is final, so a temporary does not compile either.
+
+```cpp
+expected<snapshot_t> snapshot = db.on().snapshot();
+auto pinned = (*snapshot->on().find("blobs"))[key_from_integer(42)].value();
+read_stamp_t const at = snapshot->read_stamp();
 
 ustore_size_t const budget = 1ull << 30;
 auto within_budget = [&](ustore_size_t finished, ustore_size_t total) noexcept {
     std::fprintf(stderr, "saved %llu of %llu bytes\n", (unsigned long long)finished, (unsigned long long)total);
     return finished <= budget ? ustore_continue_k : ustore_cancel_k;
 };
-status = snapshot->save("/var/backups/ustore", within_budget);
-status = db.compact();
+status = snapshot->on().save("/var/backups/ustore", within_budget);
 ```
-
-`clear` empties every collection as its `ustore_drop_mode_t` names, so `ustore_drop_collection_k` drops every named collection, which the `ram` and RocksDB engines refuse while a snapshot is open.
-A progress callable answers `ustore_continue_k` or `ustore_cancel_k` and is `noexcept`, so one that may throw does not compile, and the call borrows it until it is final, so a temporary does not compile either.
 
 ## Documents
 
-A `docs_collection_t` hands out `docs_ref` proxies, which read and write JSON through `ustore_docs_read` and `ustore_docs_write`:
+A `docs_collection_t` hands out `docs_ref` proxies, which read and write JSON through `ustore_docs_read` and `ustore_docs_write`, whole or by a field such as `/person`.
+Besides `assign`, a reference offers `insert`, `update`, `upsert`, `patch` and `merge`, and `as` switches the format every later call exchanges.
+Field access through a proxy is shorthand like any other read without an arena, while `gist` and `gather` export into the arena they are given.
 
 ```cpp
-auto [people, people_status] = db.create<docs_collection_t>("people");
-status_t status = people[key_from_integer(1)].assign(R"({"person": "Alice", "age": 27, "height": 1})");
+auto [people, people_status] = db.on().create<docs_collection_t>("people");
+status = people[key_from_integer(1)].assign(R"({"person": "Alice", "age": 27, "height": 1})");
 status = people[key_from_integer(2)].assign(R"({"person": "Bob", "age": "27", "weight": 2})");
 
 expected<owned_value_t> document = people[key_from_integer(1)].value();
@@ -173,18 +220,31 @@ expected<values_view_t> documents = people[{key_from_integer(1), key_from_intege
 expected<sz::strings_view_t> paths = people[{key_from_integer(1), key_from_integer(2)}].gist(arena);
 ```
 
-Field access through a proxy is shorthand like any other read without an arena, while `gist` and `gather` export into the arena they are given.
-Besides `assign`, a reference offers `insert`, `update` and `upsert`, and `as` switches the format every later call exchanges.
+### Pages
 
-## Tables
+A `pages_collection_t` holds ordered element trees, such as XML, where the page key doubles as the key of its root.
+`import` replaces whole pages, `insert` answers the keys it minted, and `move`, `splice`, `set_attributes`, `remove_attributes` and `remove` edit by element key, one task each, where an empty column stands for the root, the front or a minted key.
 
-`gather` reads fields of many documents into a `docs_table`, converting each field into its column type on a best-effort basis.
-A header whose column types are known at compile time is built column by column:
+```cpp
+auto [pages, pages_status] = db.on().create<pages_collection_t>("pages");
+std::array<ustore_key_t, 1> page {key_from_integer(7)};
+std::array<std::string_view, 1> markup {"<doc><p>one</p></doc>"}, fragment {"<p>two</p>"};
+status = pages.import(page, markup);
+expected<keys_view_t> landed = pages.insert(page, fragment, arena); // at the front of the root
+std::array<ustore_key_t, 1> element {(*landed)[0]};
+std::array<std::string_view, 1> name {"id"}, value {"x"};
+status = pages.set_attributes(page, element, name, value);
+expected<values_view_t> rendered = pages.read(page, arena, {}, ustore_page_encoding_xml_k);
+```
+
+### Gathered Tables
+
+`gather` reads fields of many documents into a `docs_table`, converting each field into its column type on a best-effort basis, and every cell carries `valid`, `converted` and `collides` flags beside its `value`.
+A header whose column types are known at compile time is built column by column, and one known only at runtime views an array of fields and an array of types.
 
 ```cpp
 auto header = make_table_header() //
                   .with<std::int32_t>("age")
-                  .with<std::string_view>("age")
                   .with<std::string_view>("person");
 
 std::array<ustore_key_t, 3> keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
@@ -195,34 +255,18 @@ for (std::size_t row = 0; row != ages.size(); ++row)
         std::printf("%d\n", ages[row].value);
 ```
 
-A header whose column types are known only at runtime views an array of `field_type_t`, and its columns are typed at the point of use:
-
-```cpp
-field_type_t const columns[] = {
-    {"age", ustore_docs_field_type_i32_k},
-    {"age", ustore_docs_field_type_string_k},
-    {"person", ustore_docs_field_type_string_k},
-};
-auto dynamic = people[keys].gather(make_table_header(columns), arena);
-auto names = dynamic->column(2).as<std::string_view>();
-```
-
-A table is a view: one `ustore_docs_column_view_t` per column lives in the arena, while its index and header view the keys and the header the gather was given.
-Every cell carries `valid`, `converted` and `collides` flags beside its `value`, which is meaningful only when `valid`.
-
 ## Graphs
 
-A `graph_collection_t` batches edges and vertices, and can be used from inside a transaction like any other handle:
+A `graph_collection_t` batches edges and vertices, and can be used from inside a transaction like any other handle.
+`degree` and `present` of one vertex are shorthand, copying a scalar out of a one-off arena, while edges, neighbors and the degrees of a batch land in the arena the call is given.
+The edges of a batch come in the order of its vertices, and their `offsets` split them by vertex, so `of_vertex(i)` views the edges of vertex `i` and a missing vertex has none.
+`edges` streams every edge of the collection, and `vertex_stream` every vertex, both reading ahead in batches.
 
 ```cpp
-auto [graph, status] = db.create<graph_collection_t>("graph");
+auto [graph, graph_status] = db.on().create<graph_collection_t>("graph");
 status = graph.write_edge(edge_t {key_from_integer(1), key_from_integer(2), key_from_integer(9)});
 
-std::array<edge_t, 2> triplets {edge_t {key_from_integer(2), key_from_integer(3), key_from_integer(10)}, edge_t {key_from_integer(3), key_from_integer(4), key_from_integer(11)}};
-status = graph.write_edges(edges(triplets));
-
 expected<ustore_vertex_degree_t> degree = graph.degree(key_from_integer(2));
-expected<bool> present = graph.present(key_from_integer(2));
 auto successors = graph.successors(key_from_integer(2), arena);
 auto between = graph.edges_between(key_from_integer(1), key_from_integer(2), arena);
 auto touching = graph.read_edges(key_from_integer(3), arena, ustore_vertex_role_target_k);
@@ -232,125 +276,119 @@ expected<edges_view_t> leaving = graph.read_edges(strided(vertices).immutable(),
 edges_view_t of_missing = leaving->of_vertex(1); // empty, as vertex 7 is missing
 ```
 
-`degree` and `present` of one vertex are shorthand, copying a scalar out of a one-off arena, while edges, neighbors and the degrees of a batch land in the arena the call is given.
-The edges of a batch come in the order of its vertices, and their `offsets` split them by vertex, so `of_vertex(i)` views the edges of vertex `i` and a missing vertex has none.
-`edges` streams every edge of the collection, and `vertex_stream` every vertex, both reading ahead in batches.
+## Receivers & Deferred Calls
 
-## Strings
-
-A `strings_collection_t` keys arbitrary bytes by variable-length strings, kept in the order of their text:
-
-```cpp
-auto [words, status] = db.create<strings_collection_t>("words");
-status = words.assign("apple", "red");
-status = words.assign("apricot", "orange");
-
-expected<owned_value_t> apple = words.value("apple");
-std::array<value_view_t, 2> const asked {"apple", "cherry"};
-expected<values_view_t> found = words.read(asked, arena);
-expected<sz::strings_view_t> page = words.prefixed_page("ap", 16, arena);
-expected<std::size_t> count = words.size("ap");
-```
-
-`value` and `present` of one string are shorthand, while `read` and `prefixed_page` export into the arena they are given.
-`prefixed` and `prefix_begin` stream every string of a prefix through one arena of their own, pulling pages from a `strings_cursor_t`.
-
-## Receivers and Deferred Calls
-
-The receiver chooses where a call runs, and the verb stays.
-`db.on(executor)`, `transaction->on(executor)` and `snapshot->on(executor)` hand out the same collections, proxies and operators, whose calls block on the executor:
+The receiver chooses where a call runs, and the verb stays, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#receivers--deferred-calls) describe in full.
+`db.on(executor)`, `transaction->on(executor)` and `snapshot->on(executor)` hand out the same collections, proxies and operators, whose calls block on the executor, and `deferred(executor)` hands out the deferred twin of every collection, whose verbs answer a `deferred<verb>` once submitted.
+RAII carries the lifetime rules: a deferred verb takes owned inputs, a `std::array`, an `st::vector` or a `values_tape_t`, so a borrowed span does not compile, while its arena is an `arena_t&` borrowed until the call is final.
+`status()` polls without blocking, `std::move(call).wait()` answers what the call produced, and a `deferred` dropped unwaited waits in its destructor.
 
 ```cpp
-auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 4});
-blobs_collection_t on_executor = *db.on(executor).find("blobs");
-status = on_executor[key_from_integer(42)].assign("purpose of life");
-```
-
-`deferred(executor)` hands out the deferred twin of every collection, whose verbs mirror [the C calls](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors-blocking-and-deferred-calls) and answer a `deferred<verb>` once submitted.
-`find<graph_collection_t>(name)` picks the twin by modality, read-only at a snapshot, while the deferred database's `[]` takes a binary collection by the identifier `create` or `find` resolved, so addressing it never blocks.
-`status()` polls without blocking, `std::move(call).wait()` answers what the call produced, and a `deferred` dropped unwaited waits in its destructor:
-
-```cpp
-deferred_database_t later = db.deferred(executor);
-auto [arena, arena_status] = arena_t::make(executor);
+database_on<ustore_completion_deferred_k> const later = db.deferred(executor);
 std::array<ustore_key_t, 2> const keys {key_from_integer(1), key_from_integer(2)};
 std::array<sz::string_view_t, 2> const texts {R"({"person": "Alice"})", R"({"person": "Bob"})"};
-
 sz::expected<values_tape_t> values = sz::strings_view_t(texts).gather();
 if (!values) return;
-deferred<blobs_write_t> writing = later[blobs].write(keys, std::move(values.value));
-status = std::move(writing).wait();
-deferred<blobs_read_t> reading = later[blobs].read(keys, arena);
-expected<values_view_t> read = std::move(reading).wait();
-for (value_view_t found : *read)
-    std::printf("%zu bytes\n", found.size());
-```
-
-Documents are written and read whole or by field, under any modification, and a gather answers a table together with the rows and columns it views outside the arena:
-
-```cpp
-deferred_docs_collection_t people = *later.find<docs_collection_t>("people");
-sz::expected<values_tape_t> documents = sz::strings_view_t(texts).gather();
-if (!documents) return;
-status = people.write(keys, std::move(documents.value), {}, ustore_docs_modify_merge_k).wait();
-
-std::array<sz::string_view_t, 1> const columns {"person"};
-sz::expected<values_tape_t> fields = sz::strings_view_t(columns).gather();
-if (!fields) return;
-auto gathered = people.gather(keys, std::move(fields.value), std::array {ustore_docs_field_type_string_k}, arena).wait();
-auto names = gathered->table.column(0).as<std::string_view>();
-```
-
-Graphs read edges and degrees for one role of every vertex, and write and remove edges and vertices:
-
-```cpp
-deferred_graph_collection_t graph = *later.find<graph_collection_t>("graph");
-std::array<edge_t, 2> const chain {edge_t {key_from_integer(1), key_from_integer(2)}, edge_t {key_from_integer(2), key_from_integer(3)}};
-status = graph.write_edges(chain).wait();
-expected<edges_view_t> leaving = graph.read_edges(keys, arena, ustore_vertex_role_source_k).wait();
-expected<std::span<ustore_vertex_degree_t const>> degrees = graph.degrees(keys, arena).wait();
-```
-
-Strings are written and read in batches, and a scan answers a page of strings for every prefix:
-
-```cpp
-deferred_strings_collection_t words = *later.find<strings_collection_t>("words");
-std::array<sz::string_view_t, 2> const spellings {"apple", "apricot"};
-sz::expected<values_tape_t> strings = sz::strings_view_t(spellings).gather();
-sz::expected<values_tape_t> meanings = sz::strings_view_t(texts).gather();
-sz::expected<values_tape_t> prefixes = sz::strings_view_t(std::span {spellings}.first(1)).gather();
-if (!strings || !meanings || !prefixes) return;
-status = words.write(std::move(strings.value), std::move(meanings.value)).wait();
-expected<strings_scan_t::finished_t> scanned = words.scan(std::move(prefixes.value), 16, arena).wait();
-```
-
-A transaction defers its own verbs too, `reset` among them:
-
-```cpp
-deferred_transaction_t deferred_transaction = transaction->deferred(executor);
-status = deferred_transaction.find("blobs")->remove(keys).wait();
-expected<read_stamp_t> staged = deferred_transaction.stage().wait();
-expected<commit_stamp_t> stamp = deferred_transaction.commit().wait();
+auto const deferred_blobs = later[blobs];
+status = deferred_blobs.write(keys, values.value).wait();
+deferred<values_view_t> reading = deferred_blobs.read(keys, arena);
+expected<values_view_t> read = reading.wait();
+expected<commit_stamp_t> stamp = transaction->deferred(executor).commit().wait();
 ```
 
 The deferred database also creates, drops and lists collections, and describes, clears and compacts itself, while the deferred snapshot saves itself through `save`.
-Opening blocks instead, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb` and `open_leveldb` take the executor to block on as their last argument, while `open_nvme` blocks on the executor its options name and reads how to move bytes from it once:
 
-```cpp
-expected<database_t> opened = database_t::open_rocksdb({.directory = bytes_of("/var/lib/ustore")}, executor);
-```
+## Executors
 
+An executor owns the threads that run calls, serves one call at a time, and is shared by any number of databases, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
+`executor_handle_t::for_ram` spawns host threads, and the handle frees the executor on destruction, waiting for the calls naming it.
+Opening blocks, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb` and `open_leveldb` take the executor to block on as their last argument, while `open_nvme` blocks on the executor its options name.
 Either way the database runs its own calls on the calling thread until a receiver names an executor.
 
+```cpp
+auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 4});
+expected<database_t> opened = database_t::open_rocksdb({.directory = bytes_of("/var/lib/ustore")}, executor);
+blobs_collection_t on_executor = *opened->on(executor).find_or_create("blobs");
+status = on_executor[key_from_integer(42)].assign("purpose of life");
+auto [arena, arena_status] = arena_t::make(executor); // placed where the executor computes
+```
+
+`executor_handle_t::gpu_devices` lists the GPUs the process drives, where a device's position is the ordinal `for_vram` takes.
+
+```cpp
+std::array<ustore_gpu_device_t, 8> devices {};
+expected<std::size_t> count = executor_handle_t::gpu_devices(devices); // may exceed what fits
+for (std::size_t index = 0; count && index != *count && index != devices.size(); ++index)
+    std::printf("%s %s\n", ustore_gpu_vendor_name(devices[index].vendor), devices[index].name);
+```
+
+## Batches and Arenas
+
+Shorthand and verbs trade convenience for reuse, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe: `blobs[key].value()` reads into a one-off arena its answer owns and frees on destruction, while a verb given an `arena_t&` reuses it.
+Every call rewinds its arena, so its views last until the next call given that arena; to keep them longer, pass that call another arena.
+Keys come as `ustore_key_t`, spelled from integers by `key_from_integer`, and a batch is a `std::array`, a `std::span`, an initializer list or a `strided` range.
+
+```cpp
+auto [arena, arena_status] = arena_t::make(executor);
+for (std::span<ustore_key_t const> batch : batches) {
+    auto [values, read_status] = db.on(executor).find("blobs")->read(batch, arena);
+    if (read_status.failed()) break;
+    consume(values); // valid until the next call given `arena`
+}
+```
+
+`keys_view_from_arrow` and `strings_view_from_arrow` view an Arrow column as call inputs in place, while `keys_view_to_arrow`, `strings_view_to_arrow` and `docs_column_view_to_arrow` export what a call wrote into an arena as an `arrow_export_t`, which reads that arena until its next call and releases its own nodes on destruction.
+
+```cpp
+expected<values_view_t> values = blobs.read(keys, arena);
+expected<arrow_export_t> column = strings_view_to_arrow(*values, arena);
+ArrowSchema& schema = column->schema();          // `binary` or `large_binary`
+ArrowArray const& array = column->array().array; // the arena's own buffers
+expected<values_view_t> back = strings_view_from_arrow(schema, array);
+status = blobs.write(keys, *back);
+```
+
+An `owned_value_t` derives from the `value_view_t` it holds, so it compares and converts like one, and `view()` slices that plain view off.
+
+## Errors
+
+Fallible calls return a `status_t`, a `status_code_t` beside a static message, or an `expected` that holds either a value or the `status_t` explaining its absence, and both are `[[nodiscard]]`.
+Dereferencing an `expected<value_type>` yields the `value_type`, `auto [value, status]` decomposes one whose value is default constructible, and an `expected` compares with a `status_code_t` directly.
+Nothing throws, and a callable that may throw, such as a progress callback, does not compile.
+
+```cpp
+auto [db, status] = database_t::init_ram();
+if (status.failed())
+    std::fprintf(stderr, "%s\n", status.message);
+expected<blobs_collection_t> missing = db.on().find("nowhere");
+if (missing == status_code_t::not_found_k)
+    std::fprintf(stderr, "%s\n", missing.status().message);
+```
+
+## Platform Notes
+
+### Engines
+
+`database_t::init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb`, `open_leveldb` and `open_nvme` wrap [the C opens](https://github.com/unum-cloud/UStore/blob/main/c/README.md#engines) of the same names, taking their argument structs as options, so the RAM and NVMe opens take `cpu_class_ceiling` as the C field.
+`describe`, `clear` and `compact` wrap the C calls of the same names, and a compaction given a `database_compact_plan_t` stays open after a cancel until `compact_plan_finish`.
+
+```cpp
+expected<ustore_database_description_t> description = db.on().describe();
+status = db.on().clear(ustore_drop_pairs_k);
+database_compact_plan_t plan;
+status = db.on().compact(within_budget, &plan); // a cancel leaves the plan live
+std::printf("stopped in %s\n", ustore_phase_name(plan.phase().phase));
+status = db.on().compact({}, &plan);            // continues from the unit it stopped at
+status = db.on().compact_plan_finish(std::move(plan));
+```
+
+### Design
+
 - __Deferred inputs are owned, arenas borrowed.__
-  Keys, vertices, edges and column types come as a `std::array` or an `st::vector`, and values, strings and fields as a `values_tape_t`, StringZilla's `sz::strings_t` that `sz::strings_view_t::gather` fills, so a borrowed span or view does not compile.
-  The arena comes as an `arena_t&`, borrowed until the call is final, which is safe because freeing an arena waits for the deferred calls naming it, while a temporary arena does not compile.
-- __Submission copies the arguments.__
-  A `deferred<verb>` keeps one heap block that never moves, holding the outcome, the owned inputs and the outputs the call writes through, while the C argument structure dies on the stack it was filled on.
-  `status()` polls through `ustore_outcome_status`, and `wait()` and the destructor wait.
+  A `deferred<verb>` keeps one heap block that never moves, holding the outcome, the owned inputs and the outputs, while the C argument structure dies on the stack it was filled on.
 - __Answers view the arena.__
-  A finished read answers the views a blocking one does, valid until the next call given that arena, and a finished gather owns its rows, columns and field names beside a table whose cells stay in the arena.
-- __A transaction serves one call at a time.__
-  Wait on one deferred call through it before submitting the next, which otherwise finishes at once with `status_code_t::contended_k`.
-- __The wrappers have no life of their own.__
-  They start no threads, keep no counts and hold no hidden arena: freeing a database, transaction or snapshot waits in C for the deferred calls naming it.
+  A finished read answers the views a blocking one does, and a finished gather owns its rows, columns and field names beside a table whose cells stay in the arena.
+- __No exceptions.__
+  Every failure is a `status_t` or an `expected`, and every callable the wrappers take is `noexcept`.
+- __No life of its own.__
+  The wrappers start no threads, keep no counts and hold no hidden arena: freeing a database, transaction or snapshot waits in C for the deferred calls naming it.

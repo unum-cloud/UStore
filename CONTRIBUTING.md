@@ -18,6 +18,9 @@ Later, bring every sibling to the tip of its branch before bumping the pointers 
 git submodule foreach --quiet 'git pull --ff-only --quiet'
 ```
 
+`cmake/ustore_siblings.cmake` builds each sibling from its nested checkout when it is there, and otherwise fetches the commit its submodule pins, unless `FETCHCONTENT_SOURCE_DIR_<NAME>` names a local checkout.
+Machine specifics such as a compiler path go into a gitignored `CMakeUserPresets.json`, whose presets inherit the ones in `CMakePresets.json`.
+
 The repository carries its own hooks, and configuring CMake arms them; to arm them without a build:
 
 ```sh
@@ -26,6 +29,8 @@ git config core.hooksPath .githooks
 
 `.githooks/pre-commit` checks the added lines of every staged file against the rules below and runs `clang-format` 22, `ruff`, `dprint` and `cmake-format` when they are installed.
 `.githooks/commit-msg` checks the subject and rejects AI-assistant attribution.
+
+## Building
 
 The `release` and `relwithdebinfo` presets build with whatever toolchain the environment provides, MSVC, AppleClang, GCC or Clang.
 `debug`, `check`, `dev`, `trace`, `tsan`, `profile` and `cuda` take Clang and lld, whose sanitizer, tracing and line-table flags they use.
@@ -43,45 +48,19 @@ That class takes the waiter, atomic reference and string kernels StringZilla and
 A handle pinned below it, or opened on a CPU lacking it, gets `ustore_status_unsupported_k`, and both switches are seeded from the environment variables of the same name.
 `USTORE_CUDA_ARCH` adds NVMe's GPU compaction, whose kernels need only plain codes: `all` compiles a cubin per generation from Ampere through Blackwell and the Ampere PTX for every later GPU, `native` the code of each visible GPU, and one code like `100f` its cubin alone.
 The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set `USTORE_MARCH` with `USTORE_MULTIVERSIONED=OFF` and the one CUDA code of their GPU, and CI compiles each of them.
+`USTORE_METAL_ARCH` adds the Apple GPU classes, whose kernels travel as MSL source that each device compiles at the first spawn of its class, so no Metal toolchain is needed: `all` keeps `apple7`, `apple9` and `apple10`, and one family keeps its class alone.
+The `metal` preset builds them on macOS, and off Apple platforms the same switch compiles the Metal host units against the SDK declarations StringZilla ships, linking none.
 
-## Dispatch Classes
+`CMakeLists.txt` builds two libraries from the same sources, every engine adding its own:
 
-A CPU class bundles the waiter, the atomic reference and the StringZilla kit its silicon generation guarantees, in `src/engine.hpp`.
-Only a class whose kit, waiter or atomic reference differs from its parent's carries a variant, and a `static_assert` refuses a compiled class that no longer advances.
+- __`ustore_static`__, aliased `ustore::static` and `ustore::ustore`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. The suites, benchmarks and tools inside the tree link it as `ustore::static` and reach the siblings through it.
+- __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, a `ustore_*` version script on Linux, Android and FreeBSD and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
 
-| Value | Name            | Parent          | Waiter        | Atomics           | Strings kit                |
-| ----: | :-------------- | :-------------- | :------------ | :---------------- | :------------------------- |
-|     0 | `unknown`       |                 |               |                   | picks the newest that fits |
-|     1 | `serial`        |                 | PAUSE, YIELD  | standard          | serial                     |
-|     2 | `monoversioned` |                 | preferred     | preferred         | what the floor compiled    |
-|     3 | `intel-haswell` | `serial`        | PAUSE         | standard          | Haswell, Westmere          |
-|     4 | `intel-sierra`  | `intel-haswell` | TPAUSE        | CMPCCXADD         | Haswell, Goldmont          |
-|     5 | `intel-skylake` | `intel-haswell` | PAUSE         | standard          | Skylake                    |
-|     6 | `intel-icelake` | `intel-skylake` | PAUSE         | standard          | Ice Lake, Goldmont         |
-|    12 | `aws-g2`        | `serial`        | YIELD         | standard          | NEON, AES, SHA             |
-|    13 | `apple-m2`      | `aws-g2`        | YIELD         | LSE under RCpc    | NEON, AES, SHA             |
-|    15 | `aws-g5`        | `apple-m2`      | WFE           | LSE under RCpc    | NEON, AES, SHA             |
-|    17 | `alibaba-c930`  | `serial`        | WRS           | Zacas             | RVV                        |
-|    18 | `ibm-power10`   | `serial`        | `pause_short` | ISA 3.0 AMOs      | Power VSX                  |
-
-The serial floor spins on PAUSE or YIELD, a hint every core of its architecture has, rather than yielding to the scheduler.
-
-A GPU class names one generation of one vendor: `nvidia-ampere`, `nvidia-ada`, `nvidia-hopper`, `nvidia-blackwell`, `nvidia-blackwellrtx`, `amd-cdna3`, `amd-cdna4` and `amd-cdna5`.
-Its value 0 is `unknown`, which a listed device carries when no compiled code runs on it.
-
-### Picking Rules
-
-The CPU pick reads the libraries' detected masks, StringZilla's `sz_capabilities_detected_cpu` and ForkUnion's `cpu_capabilities`, never their enabled ones, as UStore compiles its own kits.
-A pinned value no class takes is `ustore_status_invalid_argument_k`, and a pinned class whose masks the machine lacks is `ustore_status_unsupported_k`.
-The ladder then takes the newest compiled class whose masks fit under the pin or the machine, and a build that compiled none refuses with `ustore_status_unsupported_k`.
-
-Every GPU class compiles its own bundle of its vendor's kernels for the configured codes naming its generation, so the classes partition those codes.
-Each vendor's oldest class is its floor, which carries later NVIDIA GPUs through Ampere's own PTX; a configured code no class claims, like Turing's, RDNA's or one newer than every class, stops the configure.
-A monoversioned build keeps only the newest class of each vendor holding codes.
-The GPU pick walks the device's vendor ladder newest first and takes the first class whose bundle the device's driver loads, at or under the `gpu_class` an executor pins.
-A class unit reads its class from its own `USTORE_TARGET_<VENDOR>_<CLASS>` and writes StringZilla's GPU floor target off, so its bundle holds UStore's kernels alone over StringZilla's building blocks.
-It scans with its generation's kit: `ampere_scan_t` for every NVIDIA class, `cdna3_scan_t` for CDNA3 and CDNA4, and `cdna5_scan_t`.
-A future NVIDIA GPU takes the newest class whose PTX its driver compiles, and a device no class serves lists `unknown` and refuses executors with `ustore_status_unsupported_k`.
+`c/test.c` builds against both, as `ustore_test_c` and `ustore_test_c_shared`, and CTest runs both.
+`USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::static` and `ustore::shared`.
+The install splits into components: `sdk` holds the shared library, `c/ustore/`, `cpp/ustore/`, the package and the license, `static` the archive with the engines' archives, and `core` the header-only `include/ustore/`.
+`cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, stripped, as the preview SDK `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows.
+A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration carries it.
 
 ## Layout and Namespaces
 
@@ -108,7 +87,7 @@ Namespaces mirror directories and nothing else: a directory adds a namespace com
 The pre-commit hook refuses a namespace no directory backs, a nameless one, and one a file opens twice.
 A file name never repeats its directory — `include/ustore/blobs/nvme_tree.hpp`, never `include/ustore/blobs/blobs_nvme_tree.hpp`.
 
-## C++
+## Code Rules
 
 ### Naming
 
@@ -194,6 +173,175 @@ The executor owns a `fu_topology_t` and a `fu_pool_t` created through `fu_topolo
 A pool another library lends through `ustore_executor_on_pool` is wrapped by `lent_pool_t` instead, which dispatches on it but never deletes or parks it.
 The arenas place their blocks with `fu_allocate_on_domain_id` and release them with `fu_free_on_domain_id`.
 
+### Query Views
+
+A batched kernel takes its queries as one flat transparent view over a static extent, like a `std::array` of views sized by the batch's extent, never as a span of pointers it chases one query at a time.
+A query type that owns packed storage exposes a view of it, and the kernel reads that view.
+`.githooks/pre-commit` refuses a `std::span` of pointers to const under `include/`, except a span of C strings, which names things rather than batching queries.
+
+### Planned Operations
+
+A long or multi-phase operation starts as a plan, like *Example (USearch): `plan_refine`*, and its blocking verb is only a loop over a one-shot plan, on every residency.
+Each operation has one plan type and one finish, like `ustore_<family>_<op>_plan_t` and `ustore_<family>_<op>_plan_finish`, in every family that offers the operation, and no verb describes a plan.
+The plan is a lazy handle field on its verb: `NULL` runs the operation once, a `NULL` pointee opens a plan, and a live plan continues.
+The finish frees the plan whatever it answers, and finishing a finished plan answers `invalid_argument`.
+Cursors are not plans, and keep their `init`, `next` and `free` verbs; `next` refuses a `NULL` cursor or a foreign handle, and `free(NULL)` does nothing.
+An engine plan owns its input and output lists, copying the `{count, handles}` pairs it was given, and the glue opens each operation through its own plan-open table entry, with no `std::variant` and no opener callable.
+A free waits for the calls naming its single handle, which the library counts on the handle, so a binding keeps no counts of its own.
+Every handle a list names, like a plan's sources and targets, must outlive the call and the plan's finish; the headers say so, and nothing counts the handles in a list.
+
+Its parts are named by kind, and the kinds never mix.
+A phase is a different kind of work, ended by an `advance()` barrier.
+Phases are one `u8` enum shared by every plan, starting at `none_k = 0`, and mirrored by one C enum with `ustore_phase_name` and `ustore_phase_from_name`, with a `static_assert` per value where the glue casts it; progress reports `ustore_phase_progress_t{phase, ordinal, completed, total}` and no strings.
+A repetition is the same work again, named for what repeats and counted, like a round or a depth.
+A task is an independent unit of one phase that any thread runs in any order, ForkUnion's word; "step" names only sequential work.
+`tasks()` lists the current phase's tasks, `run(task, context)` runs any of them on the calling thread, `advance()` is the barrier answering whether another phase follows, and `finish()` publishes and releases.
+After the last phase, `advance()` keeps answering false and changes nothing.
+Planning claims and reserves everything a task writes, so a task never fails for lack of memory and a plan stopped between tasks leaves the data correct.
+Per-thread state lives in the traversal context `run` is handed.
+An operation is a plan only when its work crosses a barrier between phases, runs long enough to stop and resume, or writes stored data; a pass whose threads each finish their own share is a direct verb over the caller's contexts.
+A plan owns only what crosses its barriers: scratch belongs to the context, results land in the caller's outputs, named at planning, and whatever follows from other members is computed rather than stored.
+`run`, `advance` and `finish` never allocate.
+A report's verdict-like enum starts at `none = 0`, so a zeroed report never reads as progress.
+
+UStore's one long operation is compaction: `ustore_database_compact` takes a `ustore_database_compact_plan_t`, and `ustore_database_compact_plan_finish` frees it.
+Its phases are `flush`, `merge` and `reclaim`, between `none` and `done`, and each engine runs the ones it has: RAM a merge per collection, then one reclaim; NVMe a flush, then merge rounds; RocksDB a flush per column family, then a merge per family; LevelDB a merge per collection's key range.
+An engine's `compact_open` lists its units once, the plan's only allocation, marking which may run at once, and `compact_advance` runs any one unit, in place of `tasks`, `run` and `advance`: RAM merges and RocksDB flushes are tasks the router's driver fans out over the executor, while RocksDB and LevelDB merges and NVMe rounds are steps, one after another.
+The driver reports `ustore_phase_progress_t` as units finish, a cancel lets running units finish and starts no more, and a plan the cancel leaves live continues past every unit that finished.
+
+A member of a plan, cursor or walk names what it holds and when it holds it, like `picked_this_round_` or `visited_`.
+A pair that trades places shares one stem and differs in one word, like `picked_this_round_` and `picked_next_round_`, and the verb moving between them is named for the barrier it runs at, like `advance_round_`.
+No member is `bits`, `current`, `state`, `data`, `flags`, `tmp` or `scratch` alone, and none is named by its type.
+Sizes come from the owner, never from a helper on the state.
+
+### Refusals
+
+A call the library cannot run answers one status, picked by what is wrong, in this order: `invalid_argument`, `read_only`, `config_mismatch`, `unsupported`, `contended`, `overflow`.
+A `NULL` handle the call operates on answers `uninitialized` before any of them.
+A malformed argument or list, one that is empty, `NULL` or names a handle twice, answers `invalid_argument`.
+A write to a handle opened read-only answers `read_only`.
+Handles of another kind, or of a geometry the call cannot join, answer `config_mismatch`.
+A well-formed case nothing implements yet, like UStore's blob write on an executor that computes on a device, answers `unsupported`.
+An option the library cannot honour is refused with `unsupported`, never ignored.
+A handle another call holds answers `contended` rather than waiting, and a size past its counter answers `overflow`.
+A refusal moves nothing: every output and handle reads as it did before the call.
+Each header lists a verb's refusals under `@par Statuses` in this order and in these words, and the stub library answers every one of them.
+
+### Statuses
+
+Statuses 0 to 19 carry the same numbers and meanings in every Unum library: success 0, deferred 1, out_of_memory 2, shape_mismatch 3, unsupported_layout 4, unknown_kind 5, read_only 6, io 7, device 8, malformed 9, internal 10, overflow 11, uninitialized 12, config_mismatch 13, contended 14, cancelled 15, unsupported 16, invalid_argument 17, not_found 18, already_exists 19.
+A library leaves out the ones it cannot answer but never renumbers the rest, and numbers its own statuses from 20.
+Every enum the C interface names, statuses included, has a `ustore_*_name` answering "unrecognized" for a value it does not know and a `ustore_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
+CPU and GPU class values are ABI: each class keeps the number USearch gives the same hardware, written explicitly, with unused numbers reserved rather than reused.
+`ustore_version_name` answers the full version, pre-release suffix included, in the engine and in the stub alike.
+
+### Compile-Time Choices
+
+Code picks between alternatives at compile time through three gates, each for one kind of choice.
+
+`#if` picks a toolchain or a platform, and nothing else.
+A feature the compiler or the operating system lacks is a `#if`; a choice between two algorithms is not.
+
+```cpp
+#if defined(_WIN32) // allowed: the platform decides
+using file_handle_t = void*;
+#else
+using file_handle_t = int;
+#endif
+```
+
+A `requires` clause picks an overload when a whole function differs.
+Every constrained overload has an unconstrained fallback beside it, so a type the constraint rejects still finds a function.
+
+```cpp
+template <typename index_type_>
+status_t run_plan(index_type_& index) noexcept requires is_nvme_index<index_type_> { /* NVMe rounds */ }
+
+template <typename index_type_>
+status_t run_plan(index_type_& index) noexcept { /* every other residency */ }
+```
+
+`if constexpr` branches on a named concept or a `constexpr bool`, one level deep.
+An `else if constexpr` chain is still one level.
+
+```cpp
+template <typename query_type_>
+concept hinted_query = requires(query_type_& query) { query.find_hinted(0u); };
+
+if constexpr (hinted_query<query_type_>) seeds = query.find_hinted(shard); // allowed: a named concept
+else if constexpr (serial_class_k) seeds = {};                            // allowed: one chain, one level
+```
+
+The hook refuses each of these, in the directories its `gated_source_directories` names:
+
+```cpp
+if constexpr (requires { query.find_hinted(0u); }) { /* ... */ }   // refused: name the probe as a concept
+
+if constexpr (is_ram_k) {
+    if constexpr (is_serial_k) { /* ... */ }                        // refused: a second choice inside the first
+}
+
+template <typename value_type_, typename = std::enable_if_t<std::is_integral_v<value_type_>>>
+value_type_ clamp(value_type_ value) noexcept;                      // refused: write `requires` on the overload
+
+struct sorted_tag_t {};
+void insert(entry_t entry, sorted_tag_t) noexcept;                  // refused: a tag that only picks an overload
+```
+
+Control flow nests at most three deep: `if`, `for`, `while`, `switch`, `do`, `try` and `catch` each count, and so does `if constexpr`.
+An `else` or `catch` body sits at its `if`'s or `try`'s depth, so an `else if` chain stays flat.
+A body without braces counts like a braced one, while a lambda or a plain block adds nothing.
+Both sides of a `#if` count from the depth the `#if` began at.
+
+```cpp
+for (shard_t& shard : shards)                       // 1
+    for (node_t node : shard.nodes)                 // 2
+        if (node.live)                              // 3
+            while (node.next != end) step(node);    // refused: 4 deep
+```
+
+To flatten, return early from failures, extract the inner loop into a function named for what it does, or split an overload per case.
+
+The checks are `check_constexpr_conditions_named`, `check_constexpr_branches_flat`, `check_enable_if_and_tags_absent` and `check_constexpr_nesting`.
+They judge only the lines a commit adds, so existing code flattens as it is touched.
+
+### Split String Literals
+
+A string literal split across lines by hand ends every fragment but the last with a trailing `//`.
+Without the pin, clang-format joins the fragments or restacks them into a staircase.
+This holds in C, C++, CUDA and HIP sources alike.
+
+```cpp
+char const help[] =                                 //
+    "Usage: probe [options]\n"                      // allowed: every fragment but the last is pinned
+    "Runs one probe.\n";
+
+char const help[] = "Usage: probe [options]\n"
+                    "Runs one probe.\n";            // refused: the first fragment is unpinned
+```
+
+The check is `check_split_string_literal_pinned`.
+A comment that explains the line pins it just as well, and a bare `//` on a member line is not taken for a member's documentation.
+
+### Vocabulary
+
+The first rows are shared by every U* project, and UStore's own follow.
+
+| Concept                                                          | Word                                                      | Refused                                         |
+| :--------------------------------------------------------------- | :-------------------------------------------------------- | :---------------------------------------------- |
+| a kind of work in a plan, ended by a barrier                     | phase                                                     | stage, step, pass                               |
+| the same work again, counted                                     | repetition, named for what repeats: round, depth, nesting | phase, pass                                     |
+| an independent unit of one phase, run by any thread in any order | task                                                      | step, chunk                                     |
+| sequential work                                                  | step                                                      | task                                            |
+| a per-capability kernel bundle                                   | kit                                                       | trait                                           |
+| a compiled alternative per class, dtype or residency             | variant                                                   | arm, cell                                       |
+| RAM, VRAM or NVMe                                                | residency                                                 | home, memory side                               |
+| an exported operation and its table entry                        | verb; trampoline                                          | …                                               |
+| a fixed-shape collection a verb fills                            | outputs                                                   | landing, lander                                 |
+| a member of a plan, cursor or walk                               | what it holds and when it holds it                        | bits, current, state, data, flags, tmp, scratch |
+| one piece of a compaction the driver runs and reports            | unit                                                      | chunk, batch                                    |
+| the handles of the C ABI                                         | database, collection, transaction, snapshot               | db, table, txn, snap                            |
+
 ### Documentation and Comments
 
 - Every file opens with `@file`, `@author`, `@date` and `@brief`, in that order and contiguous; `@file` names the path from the repository root and `@date` reads like `January 9, 2023`.
@@ -217,6 +365,46 @@ An include's trailing comment lists in backticks the symbols the file takes from
 Sibling projects are reached through the aliases `fu`, `st` and `sz`, declared once in `cpp/ustore/types.hpp`, never through spelled-out `ashvardanian::` namespaces or local aliases.
 C++ prints through `fmt::println` — no iostreams, no `printf`.
 Discard a result through `[[maybe_unused]] T const result = call();`, never `(void)call();`, and declare return types before the name, never after an arrow.
+
+## Dispatch Classes
+
+A CPU class bundles the waiter, the atomic reference and the StringZilla kit its silicon generation guarantees, in `src/engine.hpp`.
+Only a class whose kit, waiter or atomic reference differs from its parent's carries a variant, and a `static_assert` refuses a compiled class that no longer advances.
+
+| Value | Name            | Parent          | Waiter        | Atomics           | Strings kit                |
+| ----: | :-------------- | :-------------- | :------------ | :---------------- | :------------------------- |
+|     0 | `unknown`       |                 |               |                   | picks the newest that fits |
+|     1 | `serial`        |                 | PAUSE, YIELD  | standard          | serial                     |
+|     2 | `monoversioned` |                 | preferred     | preferred         | what the floor compiled    |
+|     3 | `intel-haswell` | `serial`        | PAUSE         | standard          | Haswell, Westmere          |
+|     4 | `intel-sierra`  | `intel-haswell` | TPAUSE        | CMPCCXADD         | Haswell, Goldmont          |
+|     5 | `intel-skylake` | `intel-haswell` | PAUSE         | standard          | Skylake                    |
+|     6 | `intel-icelake` | `intel-skylake` | PAUSE         | standard          | Ice Lake, Goldmont         |
+|    12 | `aws-g2`        | `serial`        | YIELD         | standard          | NEON, AES, SHA             |
+|    13 | `apple-m2`      | `aws-g2`        | YIELD         | LSE under RCpc    | NEON, AES, SHA             |
+|    15 | `aws-g5`        | `apple-m2`      | WFE           | LSE under RCpc    | NEON, AES, SHA             |
+|    17 | `alibaba-c930`  | `serial`        | WRS           | Zacas             | RVV                        |
+|    18 | `ibm-power10`   | `serial`        | `pause_short` | ISA 3.0 AMOs      | Power VSX                  |
+
+The serial floor spins on PAUSE or YIELD, a hint every core of its architecture has, rather than yielding to the scheduler.
+
+A GPU class names one generation of one vendor: `nvidia-ampere`, `nvidia-ada`, `nvidia-hopper`, `nvidia-blackwell`, `nvidia-blackwellrtx`, `amd-cdna3`, `amd-cdna4`, `amd-cdna5`, `apple-metal7`, `apple-metal9` and `apple-metal10`.
+Its value 0 is `unknown`, which a listed device carries when no compiled code runs on it.
+
+### Picking Rules
+
+The CPU pick reads the libraries' detected masks, StringZilla's `sz_capabilities_detected_cpu` and ForkUnion's `cpu_capabilities`, never their enabled ones, as UStore compiles its own kits.
+A `cpu_class_ceiling` no class takes is `ustore_status_invalid_argument_k`, and a known one intersects with the machine's masks, so a class the machine lacks narrows the pick rather than refusing it.
+The ladder then takes the newest compiled class whose masks fit under that intersection, and a build that compiled none, as a monoversioned build for a newer CPU, refuses with `ustore_status_unsupported_k`.
+A description reports the class picked, never the ceiling.
+
+Every GPU class compiles its own bundle of its vendor's kernels for the configured codes naming its generation, so the classes partition those codes.
+Each vendor's oldest class is its floor, which carries later NVIDIA GPUs through Ampere's own PTX; a configured code no class claims, like Turing's, RDNA's or one newer than every class, stops the configure.
+A monoversioned build keeps only the newest class of each vendor holding codes.
+The GPU pick walks the device's vendor ladder newest first and takes the first class whose bundle the device's driver loads, at or under the executor's `gpu_class_ceiling`, and a device that loads none there refuses with `ustore_status_unsupported_k`.
+A class unit reads its class from its own `USTORE_TARGET_<VENDOR>_<CLASS>` and writes StringZilla's GPU floor target off, so its bundle holds UStore's kernels alone over StringZilla's building blocks.
+It scans with its generation's kit: `ampere_scan_t` for every NVIDIA class, `cdna3_scan_t` for CDNA3 and CDNA4, and `cdna5_scan_t`.
+A future NVIDIA GPU takes the newest class whose PTX its driver compiles, and a device no class serves lists `unknown` and refuses executors with `ustore_status_unsupported_k`.
 
 ## Tests and Benchmarks
 
@@ -258,18 +446,60 @@ USTORE_TEST_PATH=/tmp/db ./twitter -tw 1000 --max_input_files 4 --mlimit 1048576
 Flags are long kebab-case words with no short forms or aliases, sizes carry IEC suffixes, durations carry `ms` or `s`, and lists are comma-separated.
 A namespace-scope `_k` constant names an invariant — a format, an alignment, an ABI limit — while workload sizes, thread counts and paths are option fields with defaults.
 
-## Library Builds
+## Bindings
 
-`CMakeLists.txt` builds two libraries from the same sources, every engine adding its own:
+Every binding is a thin layer over the C interface, and these rules hold in each of them.
+Typed bindings are those whose compiler checks callback signatures, and dynamic bindings are the rest; in UStore the typed ones are Rust, Mojo and C++, and the dynamic ones are Python.
 
-- __`ustore_static`__, aliased `ustore::static` and `ustore::ustore`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. The suites, benchmarks and tools inside the tree link it as `ustore::static` and reach the siblings through it.
-- __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, a `ustore_*` version script on Linux, Android and FreeBSD and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
+The C library decides what is valid.
+A binding forwards its status, turns each status into its language's error in one place, re-checks nothing the library refuses, and keeps no copy of state the library already holds.
+Name tables come from the library's `ustore_*_name` and `ustore_*_from_name` pairs, never from a switch written in the binding.
 
-`c/test.c` builds against both, as `ustore_test_c` and `ustore_test_c_shared`, and CTest runs both.
-`USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::static` and `ustore::shared`.
-The install splits into components: `sdk` holds the shared library, `c/ustore/`, `cpp/ustore/`, the package and the license, `static` the archive with the engines' archives, and `core` the header-only `include/ustore/`.
-`cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, stripped, as the preview SDK `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows.
-A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration carries it.
+One mechanism reports every outcome: `ustore_outcome_status` reads it without waiting, and `ustore_outcome_wait` parks until it is final.
+Nothing in a binding takes a lock, sends a notification or adds synchronization of its own.
+The object that submitted a deferred call is the only one that polls its outcome, so no other thread ever waits on it, and whatever a second caller asks, the library answers.
+A blocking `wait` calls `ustore_outcome_wait`.
+An asynchronous bridge never parks a thread: it reads `ustore_outcome_status` and, while the call is deferred, yields to its runtime.
+A runtime with a timer pauses between reads with a backoff growing from about 1 µs to 1 ms, like Python's `asyncio.sleep`, Swift's `Task.sleep`, JavaScript's `setTimeout` and C#'s `Task.Delay`.
+A Rust future yields only: `poll` reads the status and, while it is deferred, calls `wake_by_ref` and returns `Poll::Pending`, with no sleep and no timer thread.
+
+A callback never raises into the library.
+Its fault never unwinds through C frames and never waits in a latch for the call to end: typed bindings give their callback types no way to throw, like a `noexcept` C++ callback type, while dynamic bindings report the fault through their language's unraisable path, like Python's `sys.unraisablehook` and JavaScript's uncaught-exception handler, and the callback answers cancel.
+A Rust callback that panics aborts the process, as Rust does for any unwind reaching an `extern "C"` frame; nothing catches the unwind.
+A binding that hands the library no callback of its own has nothing to report.
+
+A view the library hands back lives until the next call on its arena.
+The library describes where the memory sits, and the caller checks it; the binding neither copies the view to be safe nor checks its residency on the caller's behalf.
+
+Every array a verb reads shares the call's one count, so mismatched shapes cannot be expressed.
+Where a binding's own types carry two lengths, like a slice of keys beside a matrix of values, it checks once that they agree before the call crosses into the library, and nowhere else.
+
+Each verb has one body, which fills the C struct and calls the library with no layers in between.
+What it returns is read from the struct's output slot, a trampoline receives the handler itself as its state with no hub around it, and whether a call blocks or defers follows from the type of the receiver it is called on, never from a flag.
+Verbs are never shared through a base class; a trait whose default methods hold the one body per verb is fine, like Rust's and Mojo's, since each receiver supplies only its handle.
+
+A typed binding takes the scalar as a type parameter of each call, like *Example (USearch): `search::<f32>`*, rather than letting a handle's type fix one.
+A deferred Rust call owns what it lends the library until the call is final, since the borrow checker cannot see the library holding it.
+A C++ wrapper over the C interface is a full typed binding: it has a deferred receiver, `noexcept` callback types and per-call scalar templates.
+
+A dynamic binding publishes every field of every report the library fills.
+A type the binding hands to C by cast, like a slice of parts lent as the C array, is a transparent wrapper over the C struct, like Rust's `#[repr(transparent)]` newtype, so the cast is sound by construction and nothing asserts its size or alignment.
+Tests never restate a struct's layout that the compiler already pins: no `offset_of!`, `size_of`, `MemoryLayout` or `Marshal.SizeOf` asserts against the C structs; `offsetof` tables that declare members are declarations, not tests.
+Tests of how names print and parse, and of an engine run again through the binding, stay.
+
+Bindings wrap the C ABI and never instantiate C++ templates themselves.
+A binding is usable once it covers opening and closing, binary reads and writes, named collections, transactions and scans; documents and graphs follow in any order.
+
+A binding has no life of its own: the C executor owns every thread, and every C free waits for the deferred calls naming its handle, so a binding starts no threads and counts no calls, transactions or snapshots.
+Every verb whose outputs scale with the call takes an arena made through `ustore_arena_init` and answers views borrowing it, while shorthand with no place for an arena makes a one-off arena and frees it with its result.
+A receiver chooses the executor and the completion: `on(executor)` blocks on it, and `deferred(executor)` offers the same verbs answering deferred calls.
+Opening has no database yet, so every binding's constructor blocks and takes the executor to block on as an optional argument, as `database_t::open_rocksdb(options, executor)` does in C++, while only the C opens defer through their `completion`.
+A deferred call polls only through `ustore_outcome_status`, and releasing one rides the language's own lifetime construct, which waits first.
+A walk is a cursor whose every pull takes an arena, and a language's loop shorthand owns one arena for the loop's lifetime.
+A progress callback runs on the thread that runs the call, an executor's own for a deferred one, so a binding's callback enters its runtime there.
+The Design sections of [`rust/README.md`](rust/README.md) and [`python/README.md`](python/README.md) spell these rules out in each language.
+
+`.githooks/pre-commit` refuses locks in binding sources, throwing callback types, caught unwinds and kept exceptions.
 
 ## Python
 
@@ -350,21 +580,7 @@ Start with these, in order:
 10. Upkeep of the whole database: `ustore_database_clear()` in every `ustore_drop_mode_t`, `ustore_database_compact()` and `ustore_snapshot_save()`.
 11. Outputs: every output whose length scales with the call lands in the call's `arena` through `include/ustore/utilities/ram_buffers.hpp`, while the router makes and frees arenas in `ustore_arena_init()` and `ustore_arena_free()`.
 
-Scans, saves and compactions report through the `progress_t` of `src/utilities/progress.hpp`, in the units their verbs document, and unwind with `progress_cancelled_k` once `advance` answers false, leaving nothing a caller would read: a cancelled save removes what it wrote.
+Scans and saves report through the `progress_t` of `src/utilities/progress.hpp`, in the units their verbs document, and unwind with `progress_cancelled_k` once `advance` answers false, leaving nothing a caller would read: a cancelled save removes what it wrote.
+A compaction is a plan instead, as [Planned Operations](#planned-operations) describes: the router's driver reports as its units finish and starts no unit after a cancel.
 
 The conformance suite checks every advertised isolation level against behaviour, so report the level the engine delivers, not the one it aims for.
-
-## Implementing a New Language Binding
-
-Bindings wrap the C ABI and never instantiate C++ templates themselves.
-A binding is usable once it covers opening and closing, binary reads and writes, named collections, transactions and scans; documents and graphs follow in any order.
-
-A binding has no life of its own: the C executor owns every thread, and every C free waits for the deferred calls naming its handle, so a binding starts no threads and counts no calls, transactions or snapshots.
-Every verb whose outputs scale with the call takes an arena made through `ustore_arena_init` and answers views borrowing it, while shorthand with no place for an arena makes a one-off arena and frees it with its result.
-A receiver chooses the executor and the completion: `on(executor)` blocks on it, and `deferred(executor)` offers the same verbs answering deferred calls.
-Opening has no database yet, so every binding's constructor blocks and takes the executor to block on as an optional argument, as `database_t::open_rocksdb(options, executor)` does in C++, while only the C opens defer through their `completion`.
-A deferred call polls only through `ustore_outcome_status`, and releasing one rides the language's own lifetime construct, which waits first.
-A binding spells every enum through the C `_name` and `_from_name` functions rather than tables of its own.
-A walk is a cursor whose every pull takes an arena, and a language's loop shorthand owns one arena for the loop's lifetime.
-A progress callback runs on the thread that runs the call, an executor's own for a deferred one, so a binding's callback enters its runtime there, and a failure inside it cancels the call and resurfaces when the call is waited on.
-The Design sections of [`rust/README.md`](rust/README.md) and [`python/README.md`](python/README.md) spell these rules out in each language.

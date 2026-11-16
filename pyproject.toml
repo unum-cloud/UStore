@@ -35,8 +35,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://unum.cloud/ustore"
-Documentation = "https://unum.cloud/ustore"
+Homepage = "https://www.unum.cloud/docs/ustore"
+Documentation = "https://www.unum.cloud/docs/ustore/python"
 Repository = "https://github.com/unum-cloud/UStore"
 Issues = "https://github.com/unum-cloud/UStore/issues"
 

@@ -4,8 +4,11 @@
 [package]
 authors = ["Ash Vardanian <info@unum.cloud>"]
 description = "GPU-Accelerated Multi-Modal Transactional Database Engine Built around Kernel Bypass"
+documentation = "https://www.unum.cloud/docs/ustore/mojo"
+homepage = "https://www.unum.cloud/docs/ustore"
 license = "Apache-2.0"
 name = "ustore_mojo"
+repository = "https://github.com/unum-cloud/UStore"
 version = "1.0.0-rc.1"
 
 [package.build]

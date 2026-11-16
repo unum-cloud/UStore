@@ -4,7 +4,7 @@ message: "If you use this software, please cite it as below."
 type: software
 license: Apache-2.0
 repository-code: https://github.com/unum-cloud/UStore
-url: https://www.unum.cloud/ustore
+url: https://www.unum.cloud/docs/ustore
 doi: 10.5281/zenodo.7537042
 abstract: >-
   UStore is an embedded transactional database engine that keeps blobs, documents, graphs, strings

@@ -36,7 +36,7 @@ The types are templates of `include/ustore/`, which `variants.hpp` instantiates 
 - `utilities/nvme_mounts.hpp` — the transport probe, the erased files disk, the mount and the shared resources.
 - `blobs/nvme_key_slot.hpp` — identifiers, value layouts, stored keys and values, key slots and the sorted run index.
 - `blobs/nvme_sorted_run.hpp` — `lsm_sorted_run`.
-- `blobs/nvme_compaction.hpp`, `vram_nvidia_compaction.hpp` and `vram_nvidia_compaction.cuh` — the host compactor, the host face of the device one, and its kernels.
+- `blobs/nvme_compaction.hpp`, `vram_nvidia_compaction.hpp` and `vram_nvidia_compaction.cuh` — the host compactor, the host face of the device one over a CUDA, a HIP or a Metal executor, and its kernels, whose Apple twins are the MSL of `src/vram/vram_compaction_apple.metal`.
 - `blobs/nvme_tree.hpp` — configurations and schemas, the merger and `lsm_tree`; `blobs/nvme_lsm_level.hpp` holds `lsm_level`.
 - `blobs/nvme_store.hpp` — `nvme_store` and its snapshot; `blobs/nvme_value_cache.hpp` holds the value cache and `blobs/nvme_store_cursor.hpp` holds `nvme_store_cursor`.
 - `blobs/nvme_transactions.hpp` — `transaction_deltas`, the read sets, `transaction_registry` and `transaction_core`, which both databases compose.
@@ -150,8 +150,10 @@ Only `ram` is refused, since the database the ABI names keeps its volumes in fil
 
 Compaction merges sorted key slots and plans how their stored values migrate into the new sorted runs, and `compaction_kind_t` names the merge: overlapping or sorted runs, into an intermediate or the bottom level, where remove deltas are dropped.
 The host and GPU compactors share one comparator, survival rule, sorted run split and placement, so their outputs match field by field.
-The GPU compactor launches three kernels of the library's bundle per merge, ranking, packing and placing, links no CUDA runtime, CUB or Thrust, takes its devices, streams and buffers from `include/ustore/utilities/vram_nvidia_device.hpp`, and is chosen once a device is present and a merge exceeds `cuda_compaction_threshold_k`, 900,000 key slots.
-GPU compaction is part of v1 and runs on both Hopper and Blackwell.
+The GPU compactor, `device_compactor` over an executor as `cuda_compactor_t` on NVIDIA, `hip_compactor_t` on AMD and `metal_compactor_t` on Apple, launches three kernels of the library's bundle per merge, ranking, packing and placing, links no CUDA, HIP or Metal runtime, CUB or Thrust, takes its devices, streams and buffers from `include/ustore/utilities/vram_nvidia_device.hpp`, `vram_amd_device.hpp` and `vram_apple_device.hpp`, and is chosen once a device is present and a merge exceeds `cuda_compaction_threshold_k`, 900,000 key slots.
+An NVIDIA device reads run sections by extent through cuFile where GPUDirect Storage allows it, and AMD and Apple devices upload them from the runs' memory.
+Metal has no 64-bit atomics, so where CUDA and HIP pack the survivors and write the folded adjacency in one chained scan, an Apple device runs the select of `src/vram/vram_kernels_apple.metal` first, and sorts a graph chain of at most 4096 records in its 32 KiB of threadgroup memory, folding longer ones on the host.
+GPU compaction is part of v1 and runs on both Hopper and Blackwell; the AMD bundle carries the same kernels for CDNA and the Apple bundle for Apple7 and later, both untested on hardware.
 
 ## Storage I/O
 

@@ -5,14 +5,14 @@ The tools run on the embedded C ABI of `c/ustore/db.h` and never see which engin
 ## Command-Line Interface
 
 `cli.cpp` builds into one executable, `ustore_cli`, when CMake is configured with `-DUSTORE_BUILD_TOOLS=1`.
-It opens the database in the `--directory` it is given, runs one command and exits, with status 1 when the flags do not parse or the command fails.
+It opens the database in the `--directory` it is given, runs one command and exits, with status 1 when the flags do not parse or the command fails, and 130 when a signal stops it.
 Status lines go to standard error, so an export to `--output -` leaves standard output carrying only Arrow bytes.
 
 ```sh
 cmake --preset release -DUSTORE_BUILD_TOOLS=1 -DUSTORE_WITH_ROCKSDB=1
 cmake --build --preset release --target ustore_cli
 build_release/build/bin/ustore_cli --engine rocksdb --directory /dev/shm/ustore \
-    collection import --input data/twitter/tweets.ndjson --id-field id --memory-limit 1GB --collection tweets
+    collection import --input data/twitter/tweets.ndjson --id-field id --memory-limit 1G --collection tweets
 ```
 
 Arrow streams and files carry every modality, and `-` reads standard input or writes standard output, so object stores are reached through their own tools:
@@ -35,26 +35,43 @@ ustore_cli --directory /mnt/db collection export --collection movies --output mo
 | `snapshot save <path>`  | Takes a snapshot of the head and saves it to a path as a new database                   |
 | `snapshot export <dir>` | Writes every named collection of one snapshot into an empty directory as `<name>.arrow` |
 | `snapshot import <dir>` | Recreates every collection of an exported directory, on any engine                      |
+| `manifest <path>`       | Prints the manifest an NVMe database opens with, without opening it                     |
+| `recover <dirs...>`     | Writes a fresh manifest of an NVMe `--database` from the runs its data directories hold  |
 
-| Flag                    | Meaning                                                               |
-| :---------------------- | :-------------------------------------------------------------------- |
-| `--directory <path>`    | Database directory; required                                          |
-| `--collection <name>`   | Collection a command acts on; required                                |
-| `--input <file>`        | File a collection import reads, or `-` for standard input             |
-| `--output <file>`       | File a collection export writes, or `-` for standard output           |
-| `--id-field <field>`    | Field holding the keys of imported documents, integers or UUID text   |
-| `--memory-limit <size>` | Bytes an NDJSON or CSV import or export buffers per batch, like `1GB` |
-| `--modality <name>`     | What a created collection holds: blobs, docs, graph, strings, pages   |
-| `--format <name>`       | `automatic`, `ndjson`, `csv`, `arrows` for streams, `arrow` for files |
-| `--ingest <order>`      | Lands an Arrow import as one commit of `sorted` or `unsorted` keys    |
-| `--alignment <bytes>`   | Where an Arrow export starts every buffer: 64 or 4096                 |
-| `--batch-rows <count>`  | Most rows per batch of an Arrow export                                |
+| Flag                        | Meaning                                                                  |
+| :-------------------------- | :----------------------------------------------------------------------- |
+| `--directory <path>`        | Database directory; required                                             |
+| `--engine <name>`           | `ram`, the default, `rocksdb`, `leveldb` or `nvme`                       |
+| `--isolation <name>`        | Isolation of `ram`: `strict-serializable`, the default, or `snapshot`    |
+| `--engine-transport <name>` | Transport of `nvme`: `automatic`, `blocking`, `linux-uring` and others   |
+| `--collection <name>`       | Collection a command acts on; required                                   |
+| `--input <file>`            | File a collection import reads, or `-` for standard input                |
+| `--output <file>`           | File a collection export writes, or `-` for standard output              |
+| `--id-field <field>`        | Field holding the keys of imported documents, integers or UUID text      |
+| `--memory-limit <bytes>`    | Bytes an NDJSON or CSV import or export buffers per batch, like `1G`     |
+| `--modality <name>`         | What a created collection holds: blobs, docs, graph, strings, pages      |
+| `--format <name>`           | `automatic`, `ndjson`, `csv`, `arrows` for streams, `arrow` for files    |
+| `--ingest <order>`          | How an Arrow import lands: `batched`, the default, `sorted` or `unsorted` |
+| `--alignment <bytes>`       | Where an Arrow export starts every buffer: 64 or 4096                    |
+| `--batch-rows <count>`      | Most rows per batch of an Arrow export                                   |
+| `--database <name>`         | NVMe database a `manifest` or `recover` names                            |
+
+Every flag takes its default from a `USTORE_<FLAG>` variable, its name upper-cased with dashes turned into underscores, so `USTORE_DIRECTORY=/mnt/db` stands for `--directory /mnt/db` and a flag given on the command line wins; `--help` prints each one beside its flag as `[env: …]`.
+Byte counts are an integer with an optional `K`, `M`, `G` or `T` for its binary multiple, like `64M`.
+A value that does not parse, given as a flag or a variable, prints one line, like `--batch-rows="0" does not parse, expected a positive count`, and exits with 1 before anything opens.
+The engine, isolation, transport and modality names are the spellings of `c/ustore/db.h`, read through its `ustore_*_from_name` calls.
 
 The file extension selects the format unless `--format` names one: `.arrows` is an Arrow stream, `.arrow` and `.feather` Arrow files, and `.ndjson` and `.csv` documents.
 Standard input is an Arrow file when it starts with the file's magic, and a stream otherwise; standard output is a stream unless `--format arrow` asks for a file.
 An Arrow import creates a missing collection, holding the `--modality` given, else the schema's `ustore.modality`, else what its columns spell.
-Without `--ingest` it writes a batch at a time through the writes of the modality; with it, every batch is appended to one ingest of `c/ustore/db.h`, which lands the stream as one commit, an engine that ingests nothing refuses as unsupported, and a refused ingest drops the collection it created.
+With `--ingest batched`, the default, it writes a batch at a time through the writes of the modality; with it, every batch is appended to one ingest of `c/ustore/db.h`, which lands the stream as one commit, an engine that ingests nothing refuses as unsupported, and a refused ingest drops the collection it created.
 `--help` prints the commands and the flags.
+
+Each step of a long command (import, export, snapshot save, export and import, recover) prints at most once a second to standard error how far it got, as `<phase>: <completed> of <total> <unit>`, like `import: 1048576 of 8388608 bytes`, or as `<phase>: <completed> <unit>` where the total is unknown up front: an export's rows, or an import read from standard input.
+The same handler is the progress callback the library calls, so the engine and the tool report alike.
+The first SIGINT or SIGTERM stops the command at its next barrier, between batches, collections, files, slots or runs: it prints `stopped in <phase>` and exits with 130.
+A stopped import keeps the batches it wrote, and drops an `--ingest sorted` or `unsorted` import whole; an export writes `<output>.tmp` beside its `--output` and renames it over the target only once whole, so a stopped export removes the temporary and leaves a file already at the target as it was; a stopped `snapshot export` also removes every file it landed; a stopped `recover` writes no manifest.
+A second signal ends the process at once.
 
 `snapshot save` writes the engine's own image, which keeps internal forms such as half-edges and page trees but loads only on the engine that wrote it.
 `snapshot export` is the portable form: it takes one snapshot, so every collection reads at the same stamp, and writes one Arrow file per named collection, whose schema metadata carries `ustore.modality` and `ustore.collection`.
@@ -89,6 +106,10 @@ Keys are `fixed_size_binary(16)` tagged `arrow.uuid`, byte strings are `binary`,
 The `.ndjson` or `.csv` extension of `path` selects the format of the other four calls: NDJSON is parsed and written with yyjson, and CSV with StringZilla.
 Paths and the ID field are `ustore_bytes_view_t`, fields are one `ustore_strings_view_t` of `fields_count` plain names or JSON pointers, and `max_batch_size` bounds the bytes buffered before each batched write.
 Imports take the `durability` of their writes, and exports the `view` they read through, where a `NULL` view reads the head.
+Each call takes an optional `progress` callback with its `progress_state`, called between batches: imports count the bytes of their input, of its size, or of zero when it is read in order from a pipe; exports count rows, documents or vertices, of zero.
+A callback answering `ustore_cancel_k` stops the call with `ustore_status_cancelled_k`; an import keeps the batches it wrote.
+An export to a file writes a sibling `<path>.tmp`, opened without following a link on POSIX systems, then flushes it, renames it over `path` and syncs the directory, as `replace_file_durably` of `include/ustore/utilities/blocking_files.hpp` does; a cancelled or failed export removes the temporary alone and never touches a file already at `path`.
+The temporary's name is fixed, so two exports to one `path` must not run at once, and a file of the caller's own at `<path>.tmp` is replaced and removed.
 Exports also take an `arena` made through `ustore_arena_init`, which every read rewinds, while a `NULL` arena has the export make a one-off arena and free it once the export is final.
 A key in a file is a non-negative integer, read as the key of that integer, or a UUID in canonical text, and an export writes every key back the same way: as its integer when its first eight bytes are zero, and as quoted UUID text otherwise.
 
