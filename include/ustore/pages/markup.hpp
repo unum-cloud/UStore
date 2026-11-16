@@ -285,106 +285,126 @@ class xml_tokenizer {
         return growth_status(tokens_.push_back(std::move(token)));
     }
 
+    using open_names_t = st::vector<name_t, rebound<name_t>>;
+
+    static status_t malformed_() noexcept { return {status_code_t::malformed_k, "The XML is malformed"}; }
+
     status_t split() noexcept {
-        status_t const malformed {status_code_t::malformed_k, "The XML is malformed"};
-        st::vector<name_t, rebound<name_t>> open {rebound<name_t>(allocator_)};
-        std::size_t const size = document_.size();
+        open_names_t open {rebound<name_t>(allocator_)};
         std::size_t at = 0;
-        while (at < size) {
-            if (document_[at] != '<') {
-                std::size_t const next = find("<", at);
-                if (document_.substr(at, next - at).find("]]>") != std::string_view::npos) return malformed;
-                if (status_t status = push(xml_token_kind_t::text_k, at, next - at); status.failed()) return status;
-                at = next;
-                continue;
-            }
-            std::string_view const rest = document_.substr(at);
-            if (rest.starts_with("<!--")) {
-                std::size_t const end = find("-->", at + 4);
-                if (end == size) return malformed;
-                if (status_t status = push(xml_token_kind_t::comment_k, at + 4, end - at - 4); status.failed())
-                    return status;
-                at = end + 3;
-            }
-            else if (rest.starts_with("<![CDATA[")) {
-                std::size_t const end = find("]]>", at + 9);
-                if (end == size) return malformed;
-                if (status_t status = push(xml_token_kind_t::cdata_k, at + 9, end - at - 9); status.failed())
-                    return status;
-                at = end + 3;
-            }
-            else if (rest.starts_with("<?")) {
-                std::size_t const end = find("?>", at + 2);
-                if (end == size) return malformed;
-                at = end + 2;
-            }
-            else if (rest.starts_with("<!")) {
-                std::size_t const end = find(">", at + 2);
-                if (end == size) return malformed;
-                // Entities declared in an internal subset would need expanding, as StringZilla's XPath refuses too
-                if (document_.substr(at, end - at).find('[') != std::string_view::npos)
-                    return {status_code_t::unsupported_k, "A DOCTYPE with an internal subset is unsupported"};
-                at = end + 1;
-            }
-            else if (rest.starts_with("</")) {
-                std::size_t const end = name_end(at + 2);
-                std::size_t const closing = skip_blanks(end);
-                if (end == at + 2 || closing == size || document_[closing] != '>' || open.empty()) return malformed;
-                name_t const expected_name = open.back();
-                if (document_.substr(expected_name.offset, expected_name.length) !=
-                    document_.substr(at + 2, end - at - 2))
-                    return malformed;
-                open.pop_back();
-                if (status_t status = push(xml_token_kind_t::close_k, at + 2, end - at - 2); status.failed())
-                    return status;
-                at = closing + 1;
-            }
-            else {
-                std::size_t const end = name_end(at + 1);
-                if (end == at + 1) return malformed;
-                if (status_t status = push(xml_token_kind_t::open_k, at + 1, end - at - 1); status.failed())
-                    return status;
-                std::size_t cursor = skip_blanks(end);
-                for (;;) {
-                    if (cursor == size) return malformed;
-                    if (document_[cursor] == '>') {
-                        ++cursor;
-                        if (status_t status = growth_status(
-                                open.push_back(name_t {std::uint32_t(at + 1), std::uint32_t(end - at - 1)}));
-                            status.failed())
-                            return status;
-                        break;
-                    }
-                    if (document_[cursor] == '/') {
-                        if (cursor + 1 == size || document_[cursor + 1] != '>') return malformed;
-                        cursor += 2;
-                        tokens_.back().kind = xml_token_kind_t::empty_k;
-                        break;
-                    }
-                    std::size_t const name_stop = name_end(cursor);
-                    if (name_stop == cursor) return malformed;
-                    std::size_t equals = skip_blanks(name_stop);
-                    if (equals == size || document_[equals] != '=') return malformed;
-                    std::size_t const quote = skip_blanks(equals + 1);
-                    if (quote == size || (document_[quote] != '"' && document_[quote] != '\'')) return malformed;
-                    std::size_t const value_end = document_.find(document_[quote], quote + 1);
-                    if (value_end == std::string_view::npos) return malformed;
-                    if (document_.substr(quote + 1, value_end - quote - 1).find('<') != std::string_view::npos)
-                        return malformed;
-                    xml_attribute_token_t attribute;
-                    attribute.name_offset = std::uint32_t(cursor),
-                    attribute.name_length = std::uint32_t(name_stop - cursor);
-                    attribute.value_offset = std::uint32_t(quote + 1);
-                    attribute.value_length = std::uint32_t(value_end - quote - 1);
-                    if (status_t status = growth_status(attributes_.push_back(std::move(attribute))); status.failed())
-                        return status;
-                    ++tokens_.back().attributes_count;
-                    cursor = skip_blanks(value_end + 1);
-                }
-                at = cursor;
-            }
+        while (at < document_.size()) {
+            status_t const stepped = document_[at] != '<' ? split_text_(at) : split_markup_(at, open);
+            if (stepped.failed()) return stepped;
         }
-        if (!open.empty()) return malformed;
+        if (!open.empty()) return malformed_();
+        return {};
+    }
+
+    /** Takes the text from @p at to the next tag as one token, moving @p at past it. */
+    status_t split_text_(std::size_t& at) noexcept {
+        std::size_t const next = find("<", at);
+        if (document_.substr(at, next - at).find("]]>") != std::string_view::npos) return malformed_();
+        if (status_t status = push(xml_token_kind_t::text_k, at, next - at); status.failed()) return status;
+        at = next;
+        return {};
+    }
+
+    /** Takes the markup at @p at, matching a closing tag against @p open, moving @p at past it. */
+    status_t split_markup_(std::size_t& at, open_names_t& open) noexcept {
+        std::size_t const size = document_.size();
+        std::string_view const rest = document_.substr(at);
+        if (rest.starts_with("<!--")) return split_delimited_(at, 4, "-->", xml_token_kind_t::comment_k);
+        if (rest.starts_with("<![CDATA[")) return split_delimited_(at, 9, "]]>", xml_token_kind_t::cdata_k);
+        if (rest.starts_with("<?")) {
+            std::size_t const end = find("?>", at + 2);
+            if (end == size) return malformed_();
+            at = end + 2;
+            return {};
+        }
+        if (rest.starts_with("<!")) {
+            std::size_t const end = find(">", at + 2);
+            if (end == size) return malformed_();
+            // An internal subset declares entities needing expansion, which StringZilla refuses too
+            if (document_.substr(at, end - at).find('[') != std::string_view::npos)
+                return {status_code_t::unsupported_k, "A DOCTYPE with an internal subset is unsupported"};
+            at = end + 1;
+            return {};
+        }
+        if (rest.starts_with("</")) return split_close_(at, open);
+        return split_open_(at, open);
+    }
+
+    /** Takes the body after an opener @p skipped bytes long at @p at, up to @p terminator, as a
+     *  @p kind token, moving @p at past the terminator. */
+    status_t split_delimited_(std::size_t& at, std::size_t skipped, std::string_view terminator,
+                              xml_token_kind_t kind) noexcept {
+        std::size_t const end = find(terminator, at + skipped);
+        if (end == document_.size()) return malformed_();
+        if (status_t status = push(kind, at + skipped, end - at - skipped); status.failed()) return status;
+        at = end + terminator.size();
+        return {};
+    }
+
+    /** Takes the closing tag at @p at, which must name the innermost of @p open. */
+    status_t split_close_(std::size_t& at, open_names_t& open) noexcept {
+        std::size_t const end = name_end(at + 2);
+        std::size_t const closing = skip_blanks(end);
+        if (end == at + 2 || closing == document_.size() || document_[closing] != '>' || open.empty())
+            return malformed_();
+        name_t const expected_name = open.back();
+        if (document_.substr(expected_name.offset, expected_name.length) != document_.substr(at + 2, end - at - 2))
+            return malformed_();
+        open.pop_back();
+        if (status_t status = push(xml_token_kind_t::close_k, at + 2, end - at - 2); status.failed()) return status;
+        at = closing + 1;
+        return {};
+    }
+
+    /** Takes the opening or empty tag at @p at with its attributes, entering an opening one into
+     *  @p open. */
+    status_t split_open_(std::size_t& at, open_names_t& open) noexcept {
+        std::size_t const size = document_.size();
+        std::size_t const end = name_end(at + 1);
+        if (end == at + 1) return malformed_();
+        if (status_t status = push(xml_token_kind_t::open_k, at + 1, end - at - 1); status.failed()) return status;
+        std::size_t cursor = skip_blanks(end);
+        for (;;) {
+            if (cursor == size) return malformed_();
+            if (document_[cursor] == '>') {
+                name_t opened {std::uint32_t(at + 1), std::uint32_t(end - at - 1)};
+                at = cursor + 1;
+                return growth_status(open.push_back(std::move(opened)));
+            }
+            if (document_[cursor] == '/') {
+                if (cursor + 1 == size || document_[cursor + 1] != '>') return malformed_();
+                tokens_.back().kind = xml_token_kind_t::empty_k;
+                at = cursor + 2;
+                return {};
+            }
+            if (status_t status = split_attribute_(cursor); status.failed()) return status;
+        }
+    }
+
+    /** Takes the attribute at @p cursor onto the last token, moving @p cursor past its value. */
+    status_t split_attribute_(std::size_t& cursor) noexcept {
+        std::size_t const size = document_.size();
+        std::size_t const name_stop = name_end(cursor);
+        if (name_stop == cursor) return malformed_();
+        std::size_t equals = skip_blanks(name_stop);
+        if (equals == size || document_[equals] != '=') return malformed_();
+        std::size_t const quote = skip_blanks(equals + 1);
+        if (quote == size || (document_[quote] != '"' && document_[quote] != '\'')) return malformed_();
+        std::size_t const value_end = document_.find(document_[quote], quote + 1);
+        if (value_end == std::string_view::npos) return malformed_();
+        if (document_.substr(quote + 1, value_end - quote - 1).find('<') != std::string_view::npos) return malformed_();
+        xml_attribute_token_t attribute;
+        attribute.name_offset = std::uint32_t(cursor), attribute.name_length = std::uint32_t(name_stop - cursor);
+        attribute.value_offset = std::uint32_t(quote + 1);
+        attribute.value_length = std::uint32_t(value_end - quote - 1);
+        if (status_t status = growth_status(attributes_.push_back(std::move(attribute))); status.failed())
+            return status;
+        ++tokens_.back().attributes_count;
+        cursor = skip_blanks(value_end + 1);
         return {};
     }
 
@@ -597,6 +617,59 @@ status_t append_escaped(st::vector<char, output_allocator_type_>& output, std::s
     return status;
 }
 
+/** Appends the opening tag of the element @p at with its attributes, self-closing when
+ *  @p content_of finds it holds nothing, and nothing for a nameless element. */
+template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
+          typename content_type_>
+status_t append_open_tag(element_tree<tree_allocator_type_> const& tree, element_index_t at,
+                         st::vector<char, output_allocator_type_>& output, content_type_ const& content_of) noexcept {
+    std::string_view const name = tree.name(at);
+    if (name.empty()) return {};
+    status_t status = append_bytes(output, "<");
+    if (status.succeeded()) status = append_bytes(output, name);
+    for (element_index_t attribute = tree[at].first_attribute; status.succeeded() && attribute != no_element_k;
+         attribute = tree.attribute(attribute).next) {
+        status = append_bytes(output, " ");
+        if (status.succeeded()) status = append_bytes(output, tree.string(tree.attribute(attribute).name));
+        if (status.succeeded()) status = append_bytes(output, "=\"");
+        if (status.succeeded())
+            status = append_escaped<strings_kit_type_>(output, tree.string(tree.attribute(attribute).value));
+        if (status.succeeded()) status = append_bytes(output, "\"");
+    }
+    if (status.succeeded()) status = append_bytes(output, content_of(at) ? ">" : "/>");
+    return status;
+}
+
+/** Appends the bytes of the element @p at before its children: a text, a comment, or a tag and
+ *  its text. */
+template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
+          typename content_type_>
+status_t append_element(element_tree<tree_allocator_type_> const& tree, element_index_t at,
+                        st::vector<char, output_allocator_type_>& output, content_type_ const& content_of) noexcept {
+    element_t const& element = tree[at];
+    if (element.kind == element_kind_t::text_k) return append_escaped<strings_kit_type_>(output, tree.text(at));
+    status_t status;
+    if (element.kind == element_kind_t::comment_k) {
+        status = append_bytes(output, "<!--");
+        if (status.succeeded()) status = append_bytes(output, tree.text(at));
+        if (status.succeeded()) status = append_bytes(output, "-->");
+        return status;
+    }
+    status = append_open_tag<strings_kit_type_>(tree, at, output, content_of);
+    if (status.succeeded()) status = append_escaped<strings_kit_type_>(output, tree.text(at));
+    return status;
+}
+
+/** Appends the closing tag of the element @p at, which only a named element holding content has. */
+template <typename tree_allocator_type_, typename output_allocator_type_, typename content_type_>
+status_t append_close_tag(element_tree<tree_allocator_type_> const& tree, element_index_t at,
+                          st::vector<char, output_allocator_type_>& output, content_type_ const& content_of) noexcept {
+    if (tree[at].kind != element_kind_t::element_k || tree.name(at).empty() || !content_of(at)) return {};
+    if (status_t closing = append_bytes(output, "</"); closing.failed()) return closing;
+    if (status_t closing = append_bytes(output, tree.name(at)); closing.failed()) return closing;
+    return append_bytes(output, ">");
+}
+
 /** Renders the subtree of @p from as XML, calling @p open and @p close around every element's bytes. */
 template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
           typename open_type_, typename close_type_>
@@ -615,43 +688,14 @@ status_t render_xml_with(element_tree<tree_allocator_type_> const& tree, element
     for (;;) {
         element_t const& element = tree[at];
         if (status_t status = open(at, output.size()); status.failed()) return status;
-        status_t status;
-        if (element.kind == element_kind_t::text_k) status = append_escaped<strings_kit_type_>(output, tree.text(at));
-        else if (element.kind == element_kind_t::comment_k) {
-            status = append_bytes(output, "<!--");
-            if (status.succeeded()) status = append_bytes(output, tree.text(at));
-            if (status.succeeded()) status = append_bytes(output, "-->");
-        }
-        else {
-            std::string_view const name = tree.name(at);
-            if (!name.empty()) {
-                status = append_bytes(output, "<");
-                if (status.succeeded()) status = append_bytes(output, name);
-                for (element_index_t attribute = element.first_attribute;
-                     status.succeeded() && attribute != no_element_k; attribute = tree.attribute(attribute).next) {
-                    status = append_bytes(output, " ");
-                    if (status.succeeded()) status = append_bytes(output, tree.string(tree.attribute(attribute).name));
-                    if (status.succeeded()) status = append_bytes(output, "=\"");
-                    if (status.succeeded())
-                        status = append_escaped<strings_kit_type_>(output,
-                                                                   tree.string(tree.attribute(attribute).value));
-                    if (status.succeeded()) status = append_bytes(output, "\"");
-                }
-                if (status.succeeded()) status = append_bytes(output, content_of(at) ? ">" : "/>");
-            }
-            if (status.succeeded()) status = append_escaped<strings_kit_type_>(output, tree.text(at));
-        }
-        if (status.failed()) return status;
+        if (status_t status = append_element<strings_kit_type_>(tree, at, output, content_of); status.failed())
+            return status;
         if (element.first_child != no_element_k) {
             at = element.first_child;
             continue;
         }
         for (;;) {
-            if (tree[at].kind == element_kind_t::element_k && !tree.name(at).empty() && content_of(at)) {
-                if (status_t closing = append_bytes(output, "</"); closing.failed()) return closing;
-                if (status_t closing = append_bytes(output, tree.name(at)); closing.failed()) return closing;
-                if (status_t closing = append_bytes(output, ">"); closing.failed()) return closing;
-            }
+            if (status_t status = append_close_tag(tree, at, output, content_of); status.failed()) return status;
             close(output.size());
             if (at == from) return {};
             if (tree[at].next_sibling != no_element_k) {

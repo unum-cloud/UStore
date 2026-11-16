@@ -1342,31 +1342,35 @@ class lsm_sorted_run {
 
     /** Where the values of the key slots at sorted positions @b [begin,end) sit, with the value offsets locating them,
      *  as one read of each section asks for them; empty for values held inline. */
+    [[nodiscard]] value_tape_window_t value_tape_window(std::uint64_t, std::uint64_t) const noexcept
+        requires holds_values_inline_k
+    {
+        return {};
+    }
+
+    /** As @c value_tape_window above, for values held in their own section. */
     [[nodiscard]] value_tape_window_t value_tape_window(std::uint64_t begin, std::uint64_t end) const noexcept {
         value_tape_window_t window;
-        if constexpr (!holds_values_inline_k) {
-            std::uint64_t const count = header_.key_slots_count;
-            if constexpr (carries_value_offsets_k) {
-                std::uint64_t const first = sorted_run_layout_t::value_offsets_offset(count) +
-                                            begin * sizeof(stored_value_offset_t);
-                std::uint64_t const aligned = round_down_to_multiple(first, portable_alignment_k);
-                std::uint64_t const last = round_up_to_multiple(
-                    first + (end - begin + 1) * sizeof(stored_value_offset_t), portable_alignment_k);
-                window.offsets = extent_.slice(aligned, last - aligned);
-                window.offsets_skipped = static_cast<std::uint32_t>(first - aligned);
-            }
-            std::uint64_t const values_begin = value_begin_(begin);
-            std::uint64_t const values_end = value_begin_(end);
-            window.first_offset = static_cast<std::uint32_t>(values_begin);
-            window.bytes = static_cast<std::uint32_t>(values_end - values_begin);
-            if (values_end != values_begin) {
-                std::uint64_t const first = sorted_run_layout_t::values_offset(count) + values_begin;
-                std::uint64_t const aligned = round_down_to_multiple(first, portable_alignment_k);
-                std::uint64_t const last = round_up_to_multiple(first + window.bytes, portable_alignment_k);
-                window.values = extent_.slice(aligned, last - aligned);
-                window.values_skipped = static_cast<std::uint32_t>(first - aligned);
-            }
+        std::uint64_t const count = header_.key_slots_count;
+        if constexpr (carries_value_offsets_k) {
+            std::uint64_t const first = sorted_run_layout_t::value_offsets_offset(count) +
+                                        begin * sizeof(stored_value_offset_t);
+            std::uint64_t const aligned = round_down_to_multiple(first, portable_alignment_k);
+            std::uint64_t const last = round_up_to_multiple(first + (end - begin + 1) * sizeof(stored_value_offset_t),
+                                                            portable_alignment_k);
+            window.offsets = extent_.slice(aligned, last - aligned);
+            window.offsets_skipped = static_cast<std::uint32_t>(first - aligned);
         }
+        std::uint64_t const values_begin = value_begin_(begin);
+        std::uint64_t const values_end = value_begin_(end);
+        window.first_offset = static_cast<std::uint32_t>(values_begin);
+        window.bytes = static_cast<std::uint32_t>(values_end - values_begin);
+        if (values_end == values_begin) return window;
+        std::uint64_t const first = sorted_run_layout_t::values_offset(count) + values_begin;
+        std::uint64_t const aligned = round_down_to_multiple(first, portable_alignment_k);
+        std::uint64_t const last = round_up_to_multiple(first + window.bytes, portable_alignment_k);
+        window.values = extent_.slice(aligned, last - aligned);
+        window.values_skipped = static_cast<std::uint32_t>(first - aligned);
         return window;
     }
 

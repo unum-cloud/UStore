@@ -84,6 +84,38 @@ __device__ inline bool chained_before(half_edge_record_t const* records, std::ui
     return first > second;
 }
 
+/** One step of a bitonic sort of the @p width indices in @p sorted, comparing every pair @p stride
+ *  apart within runs of @p size, each pair by one thread of the block. */
+template <unsigned block_threads_>
+__device__ void bitonic_step(half_edge_record_t const* records, std::uint32_t* sorted, std::uint32_t width,
+                             std::uint32_t size, std::uint32_t stride) noexcept {
+    for (std::uint32_t index = threadIdx.x; index < width; index += block_threads_) {
+        std::uint32_t const partner = index ^ stride;
+        if (partner <= index) continue;
+        bool const ascending = (index & size) == 0;
+        std::uint32_t const low = sorted[index], high = sorted[partner];
+        if (ascending ? chained_before(records, high, low) : chained_before(records, low, high))
+            sorted[index] = high, sorted[partner] = low;
+    }
+}
+
+/** Whether the record at @p position of the sorted chain @p sorted survives: the newest removal of
+ *  the vertex, or the newest record of a half-edge newer than it that does not remove the half-edge
+ *  behind it, where @p newest_operation is what @p newest_removal, the chain's first, does. */
+__device__ inline bool keeps_sorted(half_edge_record_t const* records, std::uint32_t const* sorted,
+                                    std::uint32_t position, std::uint32_t newest_removal,
+                                    half_edge_operation_t newest_operation) noexcept {
+    std::uint32_t const index = sorted[position];
+    half_edge_record_t const& record = records[index];
+    if (record_operation(record) == half_edge_operation_t::remove_vertex_k) return position == 0;
+    half_edge_record_t const& previous = records[sorted[position - (position != 0 ? 1 : 0)]];
+    bool const leads = position == 0 || record_operation(previous) == half_edge_operation_t::remove_vertex_k ||
+                       compare_record_half_edges(previous, record) != 0;
+    bool const hidden = newest_operation == half_edge_operation_t::remove_vertex_k &&
+                        (index < newest_removal || record_operation(record) == half_edge_operation_t::remove_k);
+    return leads && !hidden;
+}
+
 /** Composes chain @c blockIdx.x of @p starts and every chain a grid's width past it: sorts the
  *  chain's record indices in @p sorted, shared memory for the next power of two of the chain's
  *  records, keeps its newest removal of the vertex and the newest record of every half-edge newer
@@ -110,37 +142,17 @@ __device__ void fold_chains(half_edge_record_t const* records, std::uint32_t con
         // meets between steps.
         for (std::uint32_t size = 2; size <= width; size *= 2)
             for (std::uint32_t stride = size / 2; stride; stride /= 2) {
-                for (std::uint32_t index = thread; index < width; index += block_threads_) {
-                    std::uint32_t const partner = index ^ stride;
-                    if (partner <= index) continue;
-                    bool const ascending = (index & size) == 0;
-                    std::uint32_t const low = sorted[index], high = sorted[partner];
-                    if (ascending ? chained_before(records, high, low) : chained_before(records, low, high))
-                        sorted[index] = high, sorted[partner] = low;
-                }
+                bitonic_step<block_threads_>(records, sorted, width, size, stride);
                 __syncthreads();
             }
 
         std::uint32_t const newest_removal = sorted[0];
-        bool const removals = record_operation(records[newest_removal]) == half_edge_operation_t::remove_vertex_k;
+        half_edge_operation_t const newest_operation = record_operation(records[newest_removal]);
         std::uint64_t written = 0;
         for (std::uint32_t base = 0; base < length; base += block_threads_) {
             std::uint32_t const position = base + thread;
-            bool keeps = false;
-            if (position < length) {
-                std::uint32_t const index = sorted[position];
-                half_edge_record_t const& record = records[index];
-                if (record_operation(record) == half_edge_operation_t::remove_vertex_k) keeps = position == 0;
-                else {
-                    half_edge_record_t const& previous = records[sorted[position - (position != 0 ? 1 : 0)]];
-                    bool const leads = position == 0 ||
-                                       record_operation(previous) == half_edge_operation_t::remove_vertex_k ||
-                                       compare_record_half_edges(previous, record) != 0;
-                    bool const hidden = removals && (index < newest_removal ||
-                                                     record_operation(record) == half_edge_operation_t::remove_k);
-                    keeps = leads && !hidden;
-                }
-            }
+            bool const keeps = position < length &&
+                               keeps_sorted(records, sorted, position, newest_removal, newest_operation);
             utilities::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(keeps ? 1 : 0);
             if (keeps) kept[start + written + scan.before] = sorted[position];
             written += scan.total;

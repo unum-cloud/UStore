@@ -858,19 +858,27 @@ class basic_single_collection_database {
             // Only a vacate frees a record, so the claim is retried once the word moves rather
             // than under the lock the vacate takes.
             while (vacated.load(std::memory_order_acquire) == observed) {
-                // A flush frees every published run's record; with none published, every record
-                // is out with a commit.
-                if (collection_.memory_shape().runs != 0) {
-                    claim_guard_t const held = claim_guard_t::taken_if_free(*this);
-                    if (held.holding()) {
-                        if (status_t const adopted = adopt_channels_(); adopted.failed()) return adopted;
-                        if (status_t const flushed = flush_and_compact_(); flushed.failed()) return flushed;
-                        break;
-                    }
-                }
+                bool flushed = false;
+                if (status_t const freed = flush_for_record_(flushed); freed.failed()) return freed;
+                if (flushed) break;
                 waiter_type_ {}(&collection_.vacated(), observed, std::size_t {0});
             }
         }
+    }
+
+    /** Flushes the memory runs to free a record, when the collection published any and nobody
+     *  holds the claim, answering in @p flushed whether it did. */
+    status_t flush_for_record_(bool& flushed) noexcept {
+        flushed = false;
+        // A flush frees every published run's record; with none published, every record
+        // is out with a commit.
+        if (collection_.memory_shape().runs == 0) return {};
+        claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+        if (!held.holding()) return {};
+        if (status_t const adopted = adopt_channels_(); adopted.failed()) return adopted;
+        if (status_t const done = flush_and_compact_(); done.failed()) return done;
+        flushed = true;
+        return {};
     }
 
     /** Lays out the view @p sealed is published in, out of the room @p claimed holds, on the

@@ -1848,59 +1848,80 @@ class basic_database {
      */
     status_t claim_memory_record(collection_id_t collection_id, memory_run_claim_t& claimed) noexcept {
         for (;;) {
-            std::uint32_t const* vacated = nullptr;
-            std::uint32_t observed = 0;
-            {
-                reader_t const inside = ledger_.epochs().enter();
-                collection_entry_t* const found = entry_with_id_(collection_id);
-                if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
-                status_t const taken = std::visit(
-                    [&](auto& collection) noexcept -> status_t {
-                        vacated = &collection.vacated();
-                        observed = atomic_reference_<std::uint32_t const> {*vacated}.load(std::memory_order_acquire);
-                        return collection.try_claim(claimed);
-                    },
-                    found->held);
-                if (taken.succeeded()) {
-                    claimed.owner = this;
-                    claimed.give_back = &give_back_memory_record_;
-                    claimed.collection = collection_id;
-                    return {};
-                }
-                if (taken != status_code_t::capacity_exhausted_k) return taken;
-            }
+            auto const [vacated, observed, taken] = claim_free_record_(collection_id, claimed);
+            if (taken != status_code_t::capacity_exhausted_k) return taken;
             // Only a vacate frees a record, so the claim is retried once the word moves rather
             // than under the lock the vacate takes. Entries never move, so the word stays
             // readable if a drop destroys the store.
             atomic_reference_<std::uint32_t const> const vacated_now {*vacated};
             while (vacated_now.load(std::memory_order_acquire) == observed) {
-                bool flushable = false;
-                {
-                    reader_t const inside = ledger_.epochs().enter();
-                    collection_entry_t* const found = entry_with_id_(collection_id);
-                    if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
-                    flushable = std::visit(
-                        [](auto& collection) noexcept { return collection.memory_shape().runs != 0; }, found->held);
-                }
-                // A flush frees every published run's record; with none published, every record
-                // is out with a commit.
-                if (flushable) {
-                    claim_guard_t const held = claim_guard_t::taken_if_free(*this);
-                    if (held.holding()) {
-                        collection_entry_t* const claimed_entry = entry_with_id_(collection_id);
-                        if (!claimed_entry)
-                            return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
-                        if (status_t const flushed = std::visit(
-                                [&](auto& collection) noexcept { return flush_and_compact_(collection); },
-                                claimed_entry->held);
-                            flushed.failed())
-                            return flushed;
-                        break;
-                    }
-                }
+                bool flushed = false;
+                if (status_t const freed = flush_for_record_(collection_id, flushed); freed.failed()) return freed;
+                if (flushed) break;
                 waiter_type_ {}(vacated, observed, std::size_t {0});
             }
         }
+    }
+
+    /** What one claim of a free memory-run record answers: while every record is out, the word a
+     *  vacate moves and its value before the claim, then the claim's status. */
+    struct record_claim_t {
+        std::uint32_t const* vacated = nullptr;
+        std::uint32_t observed = 0;
+        status_t status;
+    };
+
+    /**
+     *  @brief Claims a free memory-run record of @p collection_id's store into @p claimed, inside
+     *      the epochs, reading first the word a vacate moves.
+     *  @return @c capacity_exhausted_k while every record is out, or @c write_conflict_k for a
+     *      collection gone since it was written.
+     */
+    record_claim_t claim_free_record_(collection_id_t collection_id, memory_run_claim_t& claimed) noexcept {
+        reader_t const inside = ledger_.epochs().enter();
+        collection_entry_t* const found = entry_with_id_(collection_id);
+        if (!found) return {.status = {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"}};
+        record_claim_t answer;
+        answer.status = std::visit(
+            [&](auto& collection) noexcept -> status_t {
+                answer.vacated = &collection.vacated();
+                answer.observed = atomic_reference_<std::uint32_t const> {*answer.vacated}.load(
+                    std::memory_order_acquire);
+                return collection.try_claim(claimed);
+            },
+            found->held);
+        if (answer.status.failed()) return answer;
+        claimed.owner = this;
+        claimed.give_back = &give_back_memory_record_;
+        claimed.collection = collection_id;
+        return answer;
+    }
+
+    /** Flushes @p collection_id's memory runs to free a record, when it published any and nobody
+     *  holds the claim, answering in @p flushed whether it did. */
+    status_t flush_for_record_(collection_id_t collection_id, bool& flushed) noexcept {
+        flushed = false;
+        bool flushable = false;
+        {
+            reader_t const inside = ledger_.epochs().enter();
+            collection_entry_t* const found = entry_with_id_(collection_id);
+            if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+            flushable = std::visit([](auto& collection) noexcept { return collection.memory_shape().runs != 0; },
+                                   found->held);
+        }
+        // A flush frees every published run's record; with none published, every record
+        // is out with a commit.
+        if (!flushable) return {};
+        claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+        if (!held.holding()) return {};
+        collection_entry_t* const claimed_entry = entry_with_id_(collection_id);
+        if (!claimed_entry) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+        if (status_t const done = std::visit([&](auto& collection) noexcept { return flush_and_compact_(collection); },
+                                             claimed_entry->held);
+            done.failed())
+            return done;
+        flushed = true;
+        return {};
     }
 
 #pragma endregion Write Path

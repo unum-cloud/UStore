@@ -103,6 +103,19 @@ class cuda_compactor_t {
     std::uint64_t device_allocations() const noexcept { return device_allocations_; }
 
   private:
+    /** As @c compact, for a key slot the bundles carry merge kernels for. */
+    template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+              typename allocator_type_>
+        requires compactable_key_slot_concept<key_slot_type_>
+    st::status_t compact_on_device_(compaction_kind_t kind,
+                                    std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                                    std::span<sorted_run_index_view<key_slot_type_> const> lower,
+                                    std::span<sorted_run_extents_t const> extents, sorted_run_bounds_t const& bounds,
+                                    compaction_stamps_t const& stamps, fold_type_ const& fold,
+                                    device_fold_type_ const& device_fold,
+                                    std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
+                                    compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
+
     cuda_compactor_t(utilities::cuda_executor_t& executor, device_sections_reader_t sections) noexcept
         : executor_(&executor), sections_(sections) {}
 

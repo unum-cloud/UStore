@@ -766,7 +766,7 @@ class lsm_tree {
 
         /** The picked runs, the upper level's oldest first or ascending, then the
          *  lower level's ascending. */
-        st::vector<sorted_run_t const*> runs;
+        st::vector<run_handle_t> runs;
 
         /** How many of @c runs belong to the upper level. */
         std::size_t upper_count = 0;
@@ -778,13 +778,13 @@ class lsm_tree {
         stored_key_t upper_stored_key = limit<stored_key_t>::min_k;
 
         /** The upper level's picked runs. */
-        [[nodiscard]] std::span<sorted_run_t const* const> upper() const noexcept {
-            return std::span<sorted_run_t const* const> {runs}.first(upper_count);
+        [[nodiscard]] std::span<run_handle_t const> upper() const noexcept {
+            return std::span<run_handle_t const> {runs}.first(upper_count);
         }
 
         /** The lower level's picked runs. */
-        [[nodiscard]] std::span<sorted_run_t const* const> lower() const noexcept {
-            return std::span<sorted_run_t const* const> {runs}.subspan(upper_count);
+        [[nodiscard]] std::span<run_handle_t const> lower() const noexcept {
+            return std::span<run_handle_t const> {runs}.subspan(upper_count);
         }
     };
 
@@ -891,7 +891,7 @@ class lsm_tree {
      *  @return Success, or the status that stopped it with the spare empty and @p placed for the
      *      caller to give back.
      */
-    status_t prepare_next_(std::span<sorted_run_t const* const> consumed, std::size_t number,
+    status_t prepare_next_(std::span<run_handle_t const> consumed, std::size_t number,
                            std::span<run_handle_t const> placed) noexcept {
         level_set_t const& source = levels();
         level_set_t& next = spare_();
@@ -1029,55 +1029,64 @@ class lsm_tree {
         level_t const& from = source.level(upper);
         level_t const* const below = upper + 1 != source.size() ? &source.level(upper + 1) : nullptr;
         std::size_t const lower_runs = below != nullptr ? below->size() : 0;
+        std::span<run_handle_t const> const from_runs = from.runs();
+        std::span<run_handle_t const> const below_runs = below != nullptr ? below->runs()
+                                                                          : std::span<run_handle_t const> {};
         if (picked.runs.reserve(from.size() + lower_runs) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A tree could not list the runs a merge consumes"};
 
         if (upper == 0)
             for (std::size_t index = 0; index != from.size(); ++index) [[maybe_unused]]
-                st::status_t const placed = picked.runs.push_back(&from.run(index));
+                st::status_t const placed = picked.runs.push_back(run_handle_t {from_runs[index]});
         else {
-            std::size_t chosen = 0;
-            std::uint64_t cheapest = limit<std::uint64_t>::max_k;
-            std::size_t first_overlapping = 0;
-            for (std::size_t index = 0; index != from.size(); ++index) {
-                sorted_run_t const& run = from.run(index);
-                if (choice == merge_choice_t::above_ceiling_k) {
-                    if (run.newest_stamp() <= ceiling) continue;
-                    chosen = index;
-                    break;
-                }
-                while (first_overlapping != lower_runs &&
-                       below->run(first_overlapping).upper_stored_key() < run.lower_stored_key())
-                    ++first_overlapping;
-                std::uint64_t overlapped = 0;
-                for (std::size_t lower = first_overlapping;
-                     lower != lower_runs && !(run.upper_stored_key() < below->run(lower).lower_stored_key()); ++lower)
-                    overlapped += below->run(lower).size_bytes();
-                if (overlapped >= cheapest) continue;
-                cheapest = overlapped;
-                chosen = index;
-            }
-            [[maybe_unused]] st::status_t const placed = picked.runs.push_back(&from.run(chosen));
+            [[maybe_unused]] st::status_t const placed = picked.runs.push_back(
+                run_handle_t {from_runs[chosen_run_(from, below, lower_runs, choice, ceiling)]});
         }
         picked.upper_count = picked.runs.size();
 
         stored_key_t range_lower = limit<stored_key_t>::max_k;
         stored_key_t range_upper = limit<stored_key_t>::min_k;
-        for (sorted_run_t const* run : picked.upper()) {
-            if (!run->holds_keys()) continue;
-            if (run->lower_stored_key() < range_lower) range_lower = run->lower_stored_key();
-            if (range_upper < run->upper_stored_key()) range_upper = run->upper_stored_key();
+        for (run_handle_t const picked_run : picked.upper()) {
+            sorted_run_t const& run = (*runs_)[picked_run.index];
+            if (!run.holds_keys()) continue;
+            if (run.lower_stored_key() < range_lower) range_lower = run.lower_stored_key();
+            if (range_upper < run.upper_stored_key()) range_upper = run.upper_stored_key();
         }
         picked.lower_stored_key = range_lower;
         picked.upper_stored_key = range_upper;
         for (std::size_t index = 0; index != lower_runs; ++index) {
             sorted_run_t const& run = below->run(index);
             if (!overlaps_(run, range_lower, range_upper)) continue;
-            [[maybe_unused]] st::status_t const placed = picked.runs.push_back(&run);
+            [[maybe_unused]] st::status_t const placed = picked.runs.push_back(run_handle_t {below_runs[index]});
             if (run.lower_stored_key() < picked.lower_stored_key) picked.lower_stored_key = run.lower_stored_key();
             if (picked.upper_stored_key < run.upper_stored_key()) picked.upper_stored_key = run.upper_stored_key();
         }
         return {};
+    }
+
+    /** The run of the deeper level @p from one pass consumes, as @c pick_runs_ picks it, with
+     *  @p below the @p lower_runs runs of the level under it. */
+    [[nodiscard]] static std::size_t chosen_run_(level_t const& from, level_t const* below, std::size_t lower_runs,
+                                                 merge_choice_t choice, std::uint64_t ceiling) noexcept {
+        std::size_t chosen = 0;
+        std::uint64_t cheapest = limit<std::uint64_t>::max_k;
+        std::size_t first_overlapping = 0;
+        for (std::size_t index = 0; index != from.size(); ++index) {
+            sorted_run_t const& run = from.run(index);
+            if (choice == merge_choice_t::above_ceiling_k && run.newest_stamp() <= ceiling) continue;
+            if (choice == merge_choice_t::above_ceiling_k) return index;
+            while (first_overlapping != lower_runs &&
+                   below->run(first_overlapping).upper_stored_key() < run.lower_stored_key())
+                ++first_overlapping;
+            std::uint64_t overlapped = 0;
+            for (std::size_t lower = first_overlapping;
+                 lower != lower_runs && !(run.upper_stored_key() < below->run(lower).lower_stored_key()); ++lower)
+                overlapped += below->run(lower).size_bytes();
+            if (overlapped >= cheapest) continue;
+            cheapest = overlapped;
+            chosen = index;
+        }
+        return chosen;
     }
 
     /** Whether a level of @p source deeper than @p lower holds a key between @p lower_key
@@ -1115,7 +1124,7 @@ class lsm_tree {
         // A run that overlaps nothing below moves down by its handle, and no byte is
         // read or written
         if (picked.lower().empty() && picked.upper_count == 1 && choice == merge_choice_t::overfull_k) {
-            run_handle_t const moved = runs_->handle_of(*picked.runs[0]);
+            run_handle_t const moved = picked.runs[0];
             if (status_t const prepared = prepare_next_(picked.upper(), lower,
                                                         std::span<run_handle_t const> {&moved, 1});
                 prepared.failed())
@@ -1148,7 +1157,7 @@ class lsm_tree {
                                                       device_fold);
         if (merge_status.failed()) return merge_status;
         std::span<run_handle_t const> const placed {merged};
-        if (status_t const prepared = prepare_next_(std::span<sorted_run_t const* const> {picked.runs}, lower, placed);
+        if (status_t const prepared = prepare_next_(std::span<run_handle_t const> {picked.runs}, lower, placed);
             prepared.failed()) {
             runs_->discard(*volume_, placed);
             return prepared;

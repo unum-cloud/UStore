@@ -269,15 +269,6 @@ template <typename level_type_, typename volume_type_>
     return failures;
 }
 
-/** The runs @p level names, in its order, as a merge request takes them. */
-template <typename level_type_>
-[[nodiscard]] st::vector<typename level_type_::sorted_run_t const*> runs_of(level_type_ const& level) {
-    st::vector<typename level_type_::sorted_run_t const*> runs;
-    for (std::size_t index = 0; index != level.size(); ++index) [[maybe_unused]]
-        st::status_t const placed = runs.push_back(&level.run(index));
-    return runs;
-}
-
 /** A sorted level numbered @p number naming the runs a merge wrote, which is how a case
  *  reads them back. */
 template <typename level_type_>
@@ -758,7 +749,7 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {older});
     failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
-    st::vector<sorted_run_t const*> const sources = runs_of(upper);
+    std::span<run_handle_t const> const sources = upper.runs();
 
     std::array<typename merger_t::merge_buffers_t, 4> buffers;
     typename merger_t::merge_request_t request;
@@ -1376,7 +1367,7 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {older});
     failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
-    st::vector<sorted_run_t const*> const sources = runs_of(upper);
+    std::span<run_handle_t const> const sources = upper.runs();
 
     std::array<typename merger_t::merge_buffers_t, 1> buffers;
     typename merger_t::merge_request_t request;
@@ -1523,7 +1514,7 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {older});
     failures += adopt_batch(upper, *runs, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
-    st::vector<sorted_run_t const*> const sources = runs_of(upper);
+    std::span<run_handle_t const> const sources = upper.runs();
 
     // The sizes a copy of one source index would be requested at.
     allocation_watch_t& watch = allocation_watch_g;
@@ -1965,9 +1956,9 @@ std::size_t strings_merges_match_reference(mount_type_ const& mount) {
         failures += expect(all_sources.push_back(static_cast<sorted_run_t const*>(source)) == st::status_t::success_k);
 
     typename merger_t::merge_request_t request;
-    request.upper = upper_sources;
+    request.upper = upper;
     request.upper_order = lsm_level_order_t::overlapping_k;
-    request.lower = lower_sources;
+    request.lower = lower;
     request.value_max_size = types_t::key_slot_t::size;
     request.run_bytes_limit = run_bytes_limit_k;
     request.placement = compaction_placement_t::host_k;
@@ -1993,12 +1984,9 @@ std::size_t strings_merges_match_reference(mount_type_ const& mount) {
                                                                 request, last_write_fold_t {}, no_device_fold_t {});
     failures += expect_status(folded, status_code_t::success_k);
     if (!folded) return failures;
-    st::vector<sorted_run_t const*> folded_sources;
-    for (run_handle_t const& handle : *folded)
-        failures += expect(folded_sources.push_back(runs->at(handle)) == st::status_t::success_k);
-    request.upper = folded_sources;
+    request.upper = *folded;
     request.upper_order = lsm_level_order_t::sorted_k;
-    request.lower = lower_sources;
+    request.lower = lower;
     request.depth = lsm_level_depth_t::bottom_k;
     expected<st::vector<run_handle_t>> twice = merger_t::merge(*volume, *runs, reading->channel(), writing->channel(),
                                                                request, last_write_fold_t {}, no_device_fold_t {});
@@ -2009,7 +1997,7 @@ std::size_t strings_merges_match_reference(mount_type_ const& mount) {
     // A reader pinned between the lower and the upper stamps keeps both versions of a
     // URL, newest first.
     std::uint64_t const pins[] {lower_stamps_k};
-    request.upper = upper_sources;
+    request.upper = upper;
     request.upper_order = lsm_level_order_t::overlapping_k;
     request.depth = lsm_level_depth_t::intermediate_k;
     request.stamps.pinned = pins;

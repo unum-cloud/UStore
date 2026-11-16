@@ -1200,6 +1200,53 @@ st::status_t plan_value_copies(record_type_ const* survivors,
     return coalesce_value_copies(sorted_runs, ranges);
 }
 
+/** Narrows @p taken, more key slots from @p first than fit @p target_bytes, to the most that fit,
+ *  at least one, reading @p read_prefix as @c plan_sorted_runs does. */
+template <typename key_slot_type_, typename prefix_reader_type_>
+st::status_t fit_sorted_run(sorted_run_bounds_t const& bounds, std::uint64_t first, std::uint64_t first_bytes,
+                            std::uint64_t target_bytes, prefix_reader_type_& read_prefix,
+                            std::uint64_t& taken) noexcept {
+    using st::status_t;
+    std::uint64_t fitting = 1;
+    std::uint64_t low = 2;
+    std::uint64_t high = taken - 1;
+    while (low <= high) {
+        std::uint64_t const middle = low + (high - low) / 2;
+        std::uint64_t middle_bytes = 0;
+        if (status_t const read = read_prefix(first + middle, middle_bytes); read != status_t::success_k) return read;
+        if (sorted_run_file_bytes<key_slot_type_>(bounds, middle, middle_bytes - first_bytes) <= target_bytes) {
+            fitting = middle;
+            low = middle + 1;
+        }
+        else high = middle - 1;
+    }
+    taken = fitting;
+    return status_t::success_k;
+}
+
+/** Moves the cut after @p taken key slots from @p first back to where its key begins, or past
+ *  where it ends when it began the run, raising @p shared when the cut fell inside a key. */
+template <typename key_sharing_type_>
+st::status_t keep_key_whole(std::uint64_t first, std::uint64_t key_slots_count, key_sharing_type_& shares_key,
+                            std::uint64_t& taken, bool& shared) noexcept {
+    using st::status_t;
+    if (first + taken == key_slots_count) return status_t::success_k;
+    if (status_t const status = shares_key(first + taken, shared); status != status_t::success_k) return status;
+    if (!shared) return status_t::success_k;
+    std::uint64_t boundary = first + taken;
+    bool inside = true;
+    while (inside && boundary != first + 1)
+        if (status_t const status = shares_key(--boundary, inside); status != status_t::success_k) return status;
+    // Every survivor of the run so far carries one key, so the run takes it whole, however long.
+    if (inside)
+        for (boundary = first + taken + 1; boundary != key_slots_count; ++boundary) {
+            if (status_t const status = shares_key(boundary, inside); status != status_t::success_k) return status;
+            if (!inside) break;
+        }
+    taken = boundary - first;
+    return status_t::success_k;
+}
+
 /**
  *  @brief Cuts @p key_slots_count sorted survivors into sorted runs of equal size that each
  *      fit @p bounds.
@@ -1248,44 +1295,16 @@ st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t
         std::uint64_t taken = remaining;
         std::uint64_t taken_bytes = all_bytes;
         if (sorted_run_file_bytes<key_slot_type_>(bounds, taken, taken_bytes - first_bytes) > target_bytes) {
-            std::uint64_t fitting = 1;
-            std::uint64_t low = 2;
-            std::uint64_t high = taken - 1;
-            while (low <= high) {
-                std::uint64_t const middle = low + (high - low) / 2;
-                std::uint64_t middle_bytes = 0;
-                status = read_prefix(first + middle, middle_bytes);
-                if (status != status_t::success_k) return status;
-                if (sorted_run_file_bytes<key_slot_type_>(bounds, middle, middle_bytes - first_bytes) <= target_bytes) {
-                    fitting = middle;
-                    low = middle + 1;
-                }
-                else high = middle - 1;
-            }
-            taken = fitting;
+            status = fit_sorted_run<key_slot_type_>(bounds, first, first_bytes, target_bytes, read_prefix, taken);
+            if (status != status_t::success_k) return status;
             status = read_prefix(first + taken, taken_bytes);
             if (status != status_t::success_k) return status;
         }
 
         bool shared = false;
-        if (first + taken != key_slots_count) {
-            status = shares_key(first + taken, shared);
-            if (status != status_t::success_k) return status;
-        }
+        status = keep_key_whole(first, key_slots_count, shares_key, taken, shared);
+        if (status != status_t::success_k) return status;
         if (shared) {
-            std::uint64_t boundary = first + taken;
-            while (shared && boundary != first + 1) {
-                status = shares_key(--boundary, shared);
-                if (status != status_t::success_k) return status;
-            }
-            // Every survivor of the run so far carries one key, so the run takes that key whole however long it is.
-            if (shared)
-                for (boundary = first + taken + 1; boundary != key_slots_count; ++boundary) {
-                    status = shares_key(boundary, shared);
-                    if (status != status_t::success_k) return status;
-                    if (!shared) break;
-                }
-            taken = boundary - first;
             status = read_prefix(first + taken, taken_bytes);
             if (status != status_t::success_k) return status;
         }

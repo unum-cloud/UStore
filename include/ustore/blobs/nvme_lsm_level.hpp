@@ -370,16 +370,17 @@ class lsm_level {
     /** Names every run @p other names but those @p skipped lists, in the order @p other holds
      *  them, which is how a prepared level set carries a level a merge leaves alone or
      *  consumes in part. */
-    status_t carry(lsm_level const& other, std::span<sorted_run_t const* const> skipped) noexcept {
+    status_t carry(lsm_level const& other, std::span<run_handle_t const> skipped) noexcept {
         if (runs_.reserve(runs_.size() + other.runs_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A level could not name that many runs"};
         for (std::size_t index = 0; index != other.runs_.size(); ++index) {
-            sorted_run_t const* const named = &other.run_at_(index);
+            run_handle_t const named = other.runs_[index];
             bool consumed = false;
-            for (sorted_run_t const* const picked : skipped) consumed |= picked == named;
+            for (run_handle_t const picked : skipped)
+                consumed |= picked.index == named.index && picked.generation == named.generation;
             if (consumed) continue;
-            note_(*named);
-            [[maybe_unused]] st::status_t const placed = runs_.push_back(run_handle_t {other.runs_[index]});
+            note_(other.run_at_(index));
+            [[maybe_unused]] st::status_t const placed = runs_.push_back(run_handle_t {named});
         }
         return {};
     }
