@@ -20,7 +20,11 @@ jobs:
 
       - name: Install Toolchain on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/resolute/ llvm-toolchain-resolute-23 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update && sudo apt-get install -y clang-23 lld-23 ninja-build
       - name: Install Toolchain on macOS
         if: runner.os == 'macOS'
         run: brew install ninja
@@ -41,7 +45,7 @@ jobs:
 
       # The NVMe engine calls io_uring directly, so no liburing is installed; its io_uring and SPDK suites skip on hosted runners
       - name: Configure with the NVMe Engine
-        run: cmake --preset release -D USTORE_WITH_NVME=ON
+        run: cmake --preset release -D USTORE_WITH_NVME=ON -D CMAKE_C_COMPILER=clang-23 -D CMAKE_CXX_COMPILER=clang++-23
       # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
       - name: Build the C Tests with MSVC
         if: runner.os == 'Windows'
@@ -67,7 +71,11 @@ jobs:
 
       - name: Install Toolchain on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/resolute/ llvm-toolchain-resolute-23 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update && sudo apt-get install -y clang-23 lld-23 ninja-build
       - name: Install Toolchain on macOS
         if: runner.os == 'macOS'
         run: brew install ninja
@@ -88,7 +96,7 @@ jobs:
 
       # The NVMe engine calls io_uring directly, so no liburing is installed; its io_uring and SPDK suites skip on hosted runners
       - name: Configure with the NVMe Engine
-        run: cmake --preset release -D USTORE_WITH_NVME=ON
+        run: cmake --preset release -D USTORE_WITH_NVME=ON -D CMAKE_C_COMPILER=clang-23 -D CMAKE_CXX_COMPILER=clang++-23
       # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
       - name: Build the C Tests with MSVC
         if: runner.os == 'Windows'
@@ -252,7 +260,11 @@ jobs:
 
       - name: Install Toolchain on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/resolute/ llvm-toolchain-resolute-23 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update && sudo apt-get install -y clang-23 lld-23 ninja-build
       - name: Install Toolchain on macOS
         if: runner.os == 'macOS'
         run: brew install ninja
@@ -276,7 +288,7 @@ jobs:
           key: deps-${{ runner.os }}-${{ runner.arch }}-asan-${{ hashFiles('cmake/*.cmake') }}
 
       - name: Configure
-        run: cmake --preset asan
+        run: cmake --preset asan -D CMAKE_C_COMPILER=clang-23 -D CMAKE_CXX_COMPILER=clang++-23
       # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
       - name: Build the C Tests with MSVC
         if: runner.os == 'Windows'
@@ -340,12 +352,13 @@ jobs:
       - name: Test
         run: ctest --preset tsan
 
-  # StringZilla's RVV kernels need Clang 21 or newer, and apt.llvm.org publishes Clang 23 for Trixie. The toolchain's
-  # `max` core runs both the C930 class and serial.
+  # StringZilla's RVV kernels need Clang 21 or newer, which apt.llvm.org publishes for Ubuntu 26.04; Trixie's cross
+  # compilers stop at GCC 14, short of the GCC 16 the toolchain file names. The toolchain's `max` core runs both the
+  # C930 class and serial.
   test_qemu_riscv:
     name: Test RISC-V under QEMU
     runs-on: ubuntu-26.04
-    container: debian:trixie
+    container: ubuntu:26.04
     timeout-minutes: 120
     steps:
       # `git` must precede `actions/checkout`, or it falls back to the tarball API.
@@ -356,7 +369,7 @@ jobs:
           apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
             cmake ninja-build qemu-user gcc-16-riscv64-linux-gnu g++-16-riscv64-linux-gnu libc6-dev-riscv64-cross
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main" \
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/resolute/ llvm-toolchain-resolute-23 main" \
             > /etc/apt/sources.list.d/llvm.list
           apt-get update
           apt-get install -y clang-23 lld-23 llvm-23
@@ -500,35 +513,13 @@ jobs:
   verify_models:
     name: Check Promela Models and GenMC Clients
     runs-on: ubuntu-26.04
+    container: ghcr.io/ashvardanian/fatwheels:verify@sha256:c29899edae67fe85f0fa80ec3dfaa577a24e297cd4796c0fcdddda60a9010415
     timeout-minutes: 60
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
-      - name: Pull Git Submodules
-        run: git submodule update --init --recursive
-      - name: Install Spin, Clang and the GenMC Build Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y spin cmake clang-20 llvm-20-dev libffi-dev zlib1g-dev libedit-dev
-      - name: Checkout GenMC
-        uses: actions/checkout@v7
-        with:
-          repository: MPI-SWS/genmc
-          ref: 9f6c4c0772d0c42b325681581acc6a0f3eb9b5f7
-          path: genmc
-      - name: Restore the GenMC Build
-        id: genmc
-        uses: actions/cache@v6
-        with:
-          path: genmc/build
-          key: genmc-9f6c4c0-clang-20
-      - name: Build GenMC
-        if: steps.genmc.outputs.cache-hit != 'true'
-        run: |
-          cmake -S genmc -B genmc/build -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-20 -D CMAKE_CXX_COMPILER=clang++-20 -D LLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
-          cmake --build genmc/build --parallel
+      - name: Pull the ForkUnion Submodule
+        run: git submodule update --init forkunion
       - name: Check the Models and the Clients
         run: verification/check.sh
-        env:
-          GENMC: ${{ github.workspace }}/genmc/build/bin/genmc
-          GENMC_CLANG: clang++-20
+
