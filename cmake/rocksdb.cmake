@@ -1,16 +1,7 @@
 # RocksDB: https://github.com/facebook/rocksdb/blob/main/CMakeLists.txt
 
 include(FetchContent)
-FetchContent_Declare(
-    rocksdb
-    GIT_REPOSITORY https://github.com/facebook/rocksdb
-    GIT_TAG v11.8.1
-    GIT_SHALLOW TRUE
-)
-
-FetchContent_GetProperties(rocksdb)
-
-if (NOT rocksdb_POPULATED)
+if (NOT TARGET rocksdb)
     # RocksDB keeps both paths in one build: io_uring where a ring can be created, `pread` where the kernel or a seccomp
     # profile refuses one.
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -73,8 +64,14 @@ if (NOT rocksdb_POPULATED)
     )
     # RocksDB moves a default install prefix to `/usr` on Linux, which every install rule of this project would follow
     set(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT OFF)
-    FetchContent_Populate(rocksdb)
-    add_subdirectory(${rocksdb_SOURCE_DIR} ${rocksdb_BINARY_DIR} EXCLUDE_FROM_ALL SYSTEM)
+    FetchContent_Declare(
+        rocksdb
+        GIT_REPOSITORY https://github.com/facebook/rocksdb
+        GIT_TAG v11.8.1
+        GIT_SHALLOW TRUE
+        EXCLUDE_FROM_ALL SYSTEM
+    )
+    FetchContent_MakeAvailable(rocksdb)
     add_library(rocksdb::rocksdb ALIAS rocksdb)
     # RocksDB loads fixed-width integers from unaligned addresses on purpose, and exempts those loads from the
     # undefined-behavior sanitizer only when told a sanitized build is running
